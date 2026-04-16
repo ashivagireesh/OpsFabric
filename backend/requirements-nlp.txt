@@ -1,0 +1,8 @@
+# Optional advanced NLP stack for NLP Chat Studio.
+# Install with:
+#   cd backend && source venv/bin/activate && pip install -r requirements-nlp.txt
+
+# Already included in requirements.txt:
+# rapidfuzz
+# scikit-learn
+sentence-transformers>=3.0.0

@@ -1,0 +1,44 @@
+rontend
+cd /Users/gireesha/Documents/FRAMEWORK/frontend
+npm run dev
+
+Runs on http://localhost:3001
+
+Backend
+cd /Users/gireesha/Documents/FRAMEWORK/backend
+source venv/bin/activate
+python main.py
+
+Runs on http://localhost:8001
+
+Run both at once (two terminal tabs)
+Terminal 1 — Backend:
+
+cd /Users/gireesha/Documents/FRAMEWORK/backend && source venv/bin/activate && python main.py
+
+Terminal 2 — Frontend:
+
+cd /Users/gireesha/Documents/FRAMEWORK/frontend && npm run dev
+
+Note: Always start the backend first, then the frontend. The virtual environment (venv) must be activated before running Python — it has all the required packages (FastAPI, pandas, etc.) installed inside it.
+
+
+
+cd /Users/gireesha/Documents/FRAMEWORK/backend
+source venv/bin/activate
+export OLLAMA_BASE_URL=http://127.0.0.1:11434
+python main.py
+
+
+
+ cd /Users/gireesha/Documents/FRAMEWORK/backend
+source venv/bin/activate
+export OLLAMA_BASE_URL=http://127.0.0.1:11434
+export OLLAMA_BUSINESS_MODEL_CLOUD=gpt-oss:20b-cloud
+export OLLAMA_REQUEST_TIMEOUT=300
+export OLLAMA_KEEP_ALIVE=30m
+
+PID=$(lsof -tiTCP:8001 -sTCP:LISTEN)
+[ -n "$PID" ] && kill $PID
+
+uvicorn main:app --host 0.0.0.0 --port 8001 --reload

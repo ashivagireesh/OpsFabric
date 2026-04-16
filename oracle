@@ -1,0 +1,75 @@
+
+Oracle 19c is installed and running in Docker.
+
+Installed
+
+Image: doctorkirk/oracle-19c (official Oracle registry image required login and returned 401 Unauthorized)
+Container: oracle19c
+Volume: oracle19c-data (persistent data)
+Port: 1521:1521
+Restart policy: unless-stopped
+Health: healthy
+Configured
+
+ORACLE_SID=ORCLCDB
+ORACLE_PWD=Oracle#2026
+Restricted mode was disabled so normal logins work.
+Validation done
+
+Container healthy.
+Port 1521 open.
+SQL login test succeeded:
+system/Oracle#2026@localhost:1521/ORCLCDB
+Useful commands
+
+docker ps --filter name=oracle19c
+docker logs -f oracle19c
+docker stop oracle19c
+docker start oracle19c
+SQL*Plus connect
+
+docker exec -it oracle19c /bin/bash
+sqlplus system/Oracle#2026@localhost:1521/ORCLCDB
+
+If you want, I can switch this to the official Oracle 19c image path (container-registry.oracle.com/database/enterprise:19.3.0.0) once you provide Oracle registry login access.
+
+
+
+Use these SQL Developer connection settings:
+
+Connection Name: Oracle19c-Docker
+Username: system
+Password: Oracle#2026
+Connection Type: Basic
+Hostname: localhost
+Port: 1521
+Service name: ORCLCDB
+Then click Test → Success → Connect.
+
+If Test fails:
+
+Check container is running: docker ps --filter name=oracle19c
+Start if needed: docker start oracle19c
+Retry in SQL Developer.
+
+select *From mis_agentmaster
+
+
+{
+  "agentcode": "=field('AGENTCODE')",
+  "distinct_customer_count": "=count(distinct(values('CUSTACCOUNTNUMBER')))",
+  "total_transaction_count": "=count(values('TRANSACTIONID'))",
+     "service_profiles": "=group_aggregate('SERVICENAME', obj(mintime=obj(path='SERVERTIME',agg='min'), maxtime=obj(path='SERVERTIME',agg='max'), total_transaction_count=obj(path='TRANSACTIONID',agg='count_non_null'),total_distinct_customer=obj(path='CUSTACCOUNTNUMBER',agg='distinct_count'),min_amount=obj(path='AMOUNT',agg='min'),max_amount=obj(path='AMOUNT',agg='max'),avg_amount_amount=obj(path='AMOUNT',agg='avg')), 'servicename')",
+
+  "customer_profiles": "=group_aggregate('CUSTACCOUNTNUMBER', obj(mintime=obj(path='SERVERTIME',agg='min'), maxtime=obj(path='SERVERTIME',agg='max'), total_transaction_count=obj(path='TRANSACTIONID',agg='count_non_null'), total_service_name=obj(path='SERVICENAME',agg='distinct')), 'customer')"
+}
+
+
+{
+  "agentcode": "=field('AGENTCODE')",
+  "distinct_customer_count": "=count(distinct(values('CUSTACCOUNTNUMBER')))",
+  "total_transaction_count": "=count(values('TRANSACTIONID'))",
+     "service_profiles": "=group_aggregate('SERVICENAME', obj(mintime=obj(path='SERVERTIME',agg='min'), maxtime=obj(path='SERVERTIME',agg='max'), total_transaction_count=obj(path='TRANSACTIONID',agg='count_non_null'),total_distinct_customer=obj(path='CUSTACCOUNTNUMBER',agg='distinct_count'),min_amount=obj(path='AMOUNT',agg='min'),max_amount=obj(path='AMOUNT',agg='max'),avg_amount=obj(path='AMOUNT',agg='avg')), 'servicename')",
+
+  "customer_profiles": "=group_aggregate('CUSTACCOUNTNUMBER', obj(mintime=obj(path='SERVERTIME',agg='min'), maxtime=obj(path='SERVERTIME',agg='max'), total_transaction_count=obj(path='TRANSACTIONID',agg='count_non_null'), total_service_name=obj(path='SERVICENAME',agg='value_counts')), 'customer')"
+}

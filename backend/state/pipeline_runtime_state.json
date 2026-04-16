@@ -1,0 +1,22 @@
+{
+  "pipelines": {
+    "demo-pipe": {
+      "incremental_checkpoints": {
+        "s1:id": 25
+      }
+    },
+    "demo-stream": {
+      "incremental_checkpoints": {
+        "s1:id": 25
+      }
+    },
+    "d6cce622-8c7d-46aa-8269-1baf672bf9b0": {
+      "incremental_checkpoints": {}
+    },
+    "validate-mode": {
+      "incremental_checkpoints": {
+        "s1:id": 25
+      }
+    }
+  }
+}

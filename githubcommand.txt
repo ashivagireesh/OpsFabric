@@ -1,0 +1,47 @@
+
+Use this for “only changed tracked files” (not all untracked files):
+
+
+cd /Users/gireesha/Documents/FRAMEWORK
+git status
+git add .
+git commit -m "Add new files and update changes"
+git push origin main
+
+
+
+to clear all the history 
+cd /Users/gireesha/Documents/FRAMEWORK
+git checkout --orphan fresh-start
+git add -A
+git commit -m "Fresh start"
+git branch -D main
+git branch -m main
+git push -f origin main
+
+
+
+Use GitHub clone, not the old local path.
+/Users/gireesha/Documents/FRAMEWORK exists only on your current machine.
+
+Clone on new machine
+git clone https://github.com/ashivagireesh/OpsFabric.git FRAMEWORK
+cd FRAMEWORK
+Run backend
+cd backend
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+pip install -r requirements-nlp.txt
+python main.py
+Run frontend (new terminal)
+cd FRAMEWORK/frontend
+npm install
+npm run dev
+Open app
+Frontend URL shown by Vite (usually http://localhost:3001 or http://localhost:5173)
+Backend should be on http://localhost:8001
+If repo is private on that machine, sign in to GitHub first (PAT/SSH), then clone.
+
+Important:
+

@@ -1,0 +1,29 @@
+{
+  "messaging_product": "whatsapp",
+  "recipient_type": "individual",
+  "to": "919632168665",
+  "type": "template",
+  "template": {
+    "name": "management",
+    "language": {
+      "code": "en"
+    },
+    "components": [
+      {
+        "type": "body",
+        "parameters": [
+          {
+            "type": "text",
+            "parameter_name": "employer",
+            "text": "Integra"
+          },
+          {
+            "type": "text",
+            "parameter_name": "employee",
+            "text": "Gireesha"
+          }
+        ]
+      }
+    ]
+  }
+}
