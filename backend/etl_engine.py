@@ -1487,20 +1487,20 @@ class ETLEngine:
                 out.append(value)
             return out
 
-        def _count_if(
+        def _conditional_values(
             value_path: Any,
             condition_path: Any,
             expected_value: Any,
             op: Any = "eq",
             include_null_values: Any = False,
             case_sensitive: Any = False,
-        ) -> int:
+        ) -> List[Any]:
             import re as _re
 
             value_field = str(value_path or "").strip()
             condition_field = str(condition_path or "").strip()
             if not value_field or not condition_field:
-                return 0
+                return []
 
             if isinstance(row_scope, list):
                 source_rows: List[Any] = row_scope
@@ -1509,8 +1509,8 @@ class ETLEngine:
             else:
                 source_rows = [row_scope]
 
-            # Backward compatibility:
-            # old signature was count_if(value_path, condition_path, expected_value, include_null_values=False, case_sensitive=False)
+            # Backward compatibility for old count_if signature:
+            # count_if(value_path, condition_path, expected_value, include_null_values=False, case_sensitive=False)
             if isinstance(op, bool):
                 sensitive = bool(include_null_values)
                 keep_nulls = bool(op)
@@ -1634,7 +1634,7 @@ class ETLEngine:
                     return False
                 return cond_token in expected_tokens
 
-            count = 0
+            out: List[Any] = []
             for src in source_rows:
                 if not isinstance(src, dict):
                     continue
@@ -1659,15 +1659,214 @@ class ETLEngine:
                 values_flat = _flatten_sequence(value_raw)
                 if not values_flat:
                     if value_raw is None and keep_nulls:
-                        count += 1
+                        out.append(None)
                     continue
                 for item in values_flat:
                     if item is None and not keep_nulls:
                         continue
                     if isinstance(item, str) and item.strip() == "" and not keep_nulls:
                         continue
-                    count += 1
-            return count
+                    out.append(item)
+            return out
+
+        def _agg_if(
+            value_path: Any,
+            condition_path: Any,
+            expected_value: Any,
+            agg: Any = "sum",
+            op: Any = "eq",
+            include_null_values: Any = False,
+            case_sensitive: Any = False,
+        ) -> Any:
+            values = _conditional_values(
+                value_path,
+                condition_path,
+                expected_value,
+                op=op,
+                include_null_values=include_null_values,
+                case_sensitive=case_sensitive,
+            )
+            agg_name = str(agg or "sum").strip().lower()
+
+            if agg_name in {"sum", "total"}:
+                return _sum(values)
+            if agg_name in {"avg", "average", "mean"}:
+                return _mean(values)
+            if agg_name in {"min", "minimum"}:
+                return _min_value(values)
+            if agg_name in {"max", "maximum"}:
+                return _max_value(values)
+            if agg_name in {"count", "size"}:
+                return len(_flatten_sequence(values))
+            if agg_name in {"count_non_null", "non_null_count"}:
+                flat = _flatten_sequence(values)
+                return len([v for v in flat if v is not None and str(v).strip() != ""])
+            if agg_name in {"distinct", "unique"}:
+                return _distinct(values)
+            if agg_name in {"distinct_count", "nunique", "unique_count"}:
+                return len(_distinct(values))
+            if agg_name in {"first"}:
+                flat = _flatten_sequence(values)
+                return flat[0] if flat else None
+            if agg_name in {"last"}:
+                flat = _flatten_sequence(values)
+                return flat[-1] if flat else None
+            if agg_name in {"std", "stdev", "stddev"}:
+                return _std(values)
+            return _agg(values, agg_name)
+
+        def _count_if(
+            value_path: Any,
+            condition_path: Any,
+            expected_value: Any,
+            op: Any = "eq",
+            include_null_values: Any = False,
+            case_sensitive: Any = False,
+        ) -> int:
+            return int(
+                _agg_if(
+                    value_path,
+                    condition_path,
+                    expected_value,
+                    agg="count",
+                    op=op,
+                    include_null_values=include_null_values,
+                    case_sensitive=case_sensitive,
+                ) or 0
+            )
+
+        def _sum_if(
+            value_path: Any,
+            condition_path: Any,
+            expected_value: Any,
+            op: Any = "eq",
+            include_null_values: Any = False,
+            case_sensitive: Any = False,
+        ) -> float:
+            return float(
+                _agg_if(
+                    value_path,
+                    condition_path,
+                    expected_value,
+                    agg="sum",
+                    op=op,
+                    include_null_values=include_null_values,
+                    case_sensitive=case_sensitive,
+                ) or 0.0
+            )
+
+        def _mean_if(
+            value_path: Any,
+            condition_path: Any,
+            expected_value: Any,
+            op: Any = "eq",
+            include_null_values: Any = False,
+            case_sensitive: Any = False,
+        ) -> Any:
+            return _agg_if(
+                value_path,
+                condition_path,
+                expected_value,
+                agg="mean",
+                op=op,
+                include_null_values=include_null_values,
+                case_sensitive=case_sensitive,
+            )
+
+        def _min_if(
+            value_path: Any,
+            condition_path: Any,
+            expected_value: Any,
+            op: Any = "eq",
+            include_null_values: Any = False,
+            case_sensitive: Any = False,
+        ) -> Any:
+            return _agg_if(
+                value_path,
+                condition_path,
+                expected_value,
+                agg="min",
+                op=op,
+                include_null_values=include_null_values,
+                case_sensitive=case_sensitive,
+            )
+
+        def _max_if(
+            value_path: Any,
+            condition_path: Any,
+            expected_value: Any,
+            op: Any = "eq",
+            include_null_values: Any = False,
+            case_sensitive: Any = False,
+        ) -> Any:
+            return _agg_if(
+                value_path,
+                condition_path,
+                expected_value,
+                agg="max",
+                op=op,
+                include_null_values=include_null_values,
+                case_sensitive=case_sensitive,
+            )
+
+        def _distinct_if(
+            value_path: Any,
+            condition_path: Any,
+            expected_value: Any,
+            op: Any = "eq",
+            include_null_values: Any = False,
+            case_sensitive: Any = False,
+        ) -> List[Any]:
+            result = _agg_if(
+                value_path,
+                condition_path,
+                expected_value,
+                agg="distinct",
+                op=op,
+                include_null_values=include_null_values,
+                case_sensitive=case_sensitive,
+            )
+            return result if isinstance(result, list) else []
+
+        def _distinct_count_if(
+            value_path: Any,
+            condition_path: Any,
+            expected_value: Any,
+            op: Any = "eq",
+            include_null_values: Any = False,
+            case_sensitive: Any = False,
+        ) -> int:
+            return int(
+                _agg_if(
+                    value_path,
+                    condition_path,
+                    expected_value,
+                    agg="distinct_count",
+                    op=op,
+                    include_null_values=include_null_values,
+                    case_sensitive=case_sensitive,
+                ) or 0
+            )
+
+        def _count_non_null_if(
+            value_path: Any,
+            condition_path: Any,
+            expected_value: Any,
+            op: Any = "eq",
+            include_null_values: Any = False,
+            case_sensitive: Any = False,
+        ) -> int:
+            return int(
+                _agg_if(
+                    value_path,
+                    condition_path,
+                    expected_value,
+                    agg="count_non_null",
+                    op=op,
+                    include_null_values=include_null_values,
+                    case_sensitive=case_sensitive,
+                ) or 0
+            )
 
         def _agg(path_or_values: Any, func: Any = "sum") -> Any:
             func_name = str(func or "sum").strip().lower()
@@ -2391,7 +2590,15 @@ class ETLEngine:
             "sum": _sum,
             "mean": _mean,
             "count": _count,
+            "agg_if": _agg_if,
             "count_if": _count_if,
+            "sum_if": _sum_if,
+            "mean_if": _mean_if,
+            "min_if": _min_if,
+            "max_if": _max_if,
+            "distinct_if": _distinct_if,
+            "distinct_count_if": _distinct_count_if,
+            "count_non_null_if": _count_non_null_if,
             "distinct": _distinct,
             "agg": _agg,
             "std": _std,
