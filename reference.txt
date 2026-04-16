@@ -42,3 +42,8 @@ PID=$(lsof -tiTCP:8001 -sTCP:LISTEN)
 [ -n "$PID" ] && kill $PID
 
 uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+
+
+
+to reduce size
+sqlite3 "backend/etl_platform.db" "VACUUM;"
