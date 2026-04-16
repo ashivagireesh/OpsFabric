@@ -1491,9 +1491,12 @@ class ETLEngine:
             value_path: Any,
             condition_path: Any,
             expected_value: Any,
+            op: Any = "eq",
             include_null_values: Any = False,
             case_sensitive: Any = False,
         ) -> int:
+            import re as _re
+
             value_field = str(value_path or "").strip()
             condition_field = str(condition_path or "").strip()
             if not value_field or not condition_field:
@@ -1506,26 +1509,147 @@ class ETLEngine:
             else:
                 source_rows = [row_scope]
 
+            # Backward compatibility:
+            # old signature was count_if(value_path, condition_path, expected_value, include_null_values=False, case_sensitive=False)
+            if isinstance(op, bool):
+                sensitive = bool(include_null_values)
+                keep_nulls = bool(op)
+                op_name = "eq"
+            else:
+                sensitive = bool(case_sensitive)
+                keep_nulls = bool(include_null_values)
+                op_name = str(op or "eq").strip().lower()
+
             def _normalize_cmp(value: Any) -> Any:
                 if value is None:
                     return None
+                if isinstance(value, (int, float, bool)):
+                    return value
                 text = str(value).strip()
-                return text if bool(case_sensitive) else text.lower()
+                return text if sensitive else text.lower()
+
+            def _to_text(value: Any) -> str:
+                if value is None:
+                    return ""
+                text = str(value).strip()
+                return text if sensitive else text.lower()
 
             if isinstance(expected_value, (list, tuple, set)):
-                expected_tokens = {_normalize_cmp(v) for v in expected_value}
+                expected_list = list(expected_value)
             else:
-                expected_tokens = {_normalize_cmp(expected_value)}
+                expected_list = [expected_value]
+
+            expected_tokens = {_normalize_cmp(v) for v in expected_list}
+            expected_texts = [_to_text(v) for v in expected_list if v is not None]
+
+            negate = False
+            if op_name in {"not", "ne", "!=", "<>", "not_eq", "neq", "is_not"}:
+                negate = True
+                base_op = "eq"
+            elif op_name in {"not_contains", "ncontains", "!contains", "does_not_contain"}:
+                negate = True
+                base_op = "contains"
+            elif op_name in {"not_like", "nlike", "!like"}:
+                negate = True
+                base_op = "like"
+            elif op_name in {"not_in", "nin"}:
+                negate = True
+                base_op = "in"
+            elif op_name in {"not_startswith", "not_starts_with"}:
+                negate = True
+                base_op = "startswith"
+            elif op_name in {"not_endswith", "not_ends_with"}:
+                negate = True
+                base_op = "endswith"
+            elif op_name in {"not_regex", "not_matches"}:
+                negate = True
+                base_op = "regex"
+            else:
+                base_op = op_name
+
+            if base_op in {"", "eq", "=", "==", "is"}:
+                base_op = "eq"
+            elif base_op in {"contains", "has"}:
+                base_op = "contains"
+            elif base_op in {"like", "sql_like"}:
+                base_op = "like"
+            elif base_op in {"in", "one_of"}:
+                base_op = "in"
+            elif base_op in {"startswith", "starts_with", "prefix"}:
+                base_op = "startswith"
+            elif base_op in {"endswith", "ends_with", "suffix"}:
+                base_op = "endswith"
+            elif base_op in {"regex", "re", "matches"}:
+                base_op = "regex"
+            else:
+                base_op = "eq"
+
+            regex_cache: Dict[str, Any] = {}
+
+            def _sql_like_to_regex(pattern: str) -> Any:
+                cached = regex_cache.get(pattern)
+                if cached is not None:
+                    return cached
+                escaped = _re.escape(pattern)
+                rx = "^" + escaped.replace("%", ".*").replace("_", ".") + "$"
+                flags = 0 if sensitive else _re.IGNORECASE
+                compiled = _re.compile(rx, flags)
+                regex_cache[pattern] = compiled
+                return compiled
+
+            def _match_single(condition_value: Any) -> bool:
+                cond_token = _normalize_cmp(condition_value)
+                cond_text = _to_text(condition_value)
+
+                if base_op == "eq":
+                    return cond_token in expected_tokens
+                if base_op == "in":
+                    return cond_token in expected_tokens
+                if base_op == "contains":
+                    if not expected_texts:
+                        return False
+                    return any(exp in cond_text for exp in expected_texts)
+                if base_op == "startswith":
+                    if not expected_texts:
+                        return False
+                    return any(cond_text.startswith(exp) for exp in expected_texts)
+                if base_op == "endswith":
+                    if not expected_texts:
+                        return False
+                    return any(cond_text.endswith(exp) for exp in expected_texts)
+                if base_op == "like":
+                    if not expected_texts:
+                        return False
+                    return any(bool(_sql_like_to_regex(pat).match(cond_text)) for pat in expected_texts)
+                if base_op == "regex":
+                    if not expected_texts:
+                        return False
+                    flags = 0 if sensitive else _re.IGNORECASE
+                    for pat in expected_texts:
+                        try:
+                            if _re.search(pat, cond_text, flags):
+                                return True
+                        except Exception:
+                            continue
+                    return False
+                return cond_token in expected_tokens
 
             count = 0
-            keep_nulls = bool(include_null_values)
             for src in source_rows:
                 if not isinstance(src, dict):
                     continue
                 condition_raw, condition_found = self._extract_row_value_by_path(src, condition_field)
                 if not condition_found:
                     continue
-                if _normalize_cmp(condition_raw) not in expected_tokens:
+
+                condition_values = _flatten_sequence(condition_raw)
+                if not condition_values:
+                    condition_values = [condition_raw]
+
+                matched = any(_match_single(v) for v in condition_values)
+                if negate:
+                    matched = not matched
+                if not matched:
                     continue
 
                 value_raw, value_found = self._extract_row_value_by_path(src, value_field)
@@ -1534,6 +1658,8 @@ class ETLEngine:
 
                 values_flat = _flatten_sequence(value_raw)
                 if not values_flat:
+                    if value_raw is None and keep_nulls:
+                        count += 1
                     continue
                 for item in values_flat:
                     if item is None and not keep_nulls:
