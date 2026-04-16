@@ -66,39 +66,242 @@ interface OracleColumnMappingSpec {
   enabled: boolean
 }
 
+interface CustomFieldExampleItem {
+  id: string
+  title: string
+  category: string
+  mode: CustomFieldMode
+  name: string
+  description: string
+  expression?: string
+  jsonTemplate?: string
+  tags?: string[]
+}
+
 const MAX_PATH_DEPTH = 5
 const MAX_PATH_OPTIONS = 400
 const MAX_ARRAY_INDEX_OPTIONS = 3
 const MAX_OBJECT_KEYS_PER_LEVEL = 40
 
-const CUSTOM_FIELD_EXAMPLES = [
+const CUSTOM_FIELD_EXAMPLE_REPOSITORY: CustomFieldExampleItem[] = [
   {
-    title: 'Math + Formula',
-    mode: 'value' as const,
+    id: 'value_net_amount',
+    title: 'Net Amount (Math)',
+    category: 'Math & Text',
+    mode: 'value',
     name: 'net_amount',
-    expression: 'coalesce(amount, 0) - coalesce(discount, 0) + coalesce(tax, 0)',
-    description: 'Use arithmetic and null-safe coalesce.',
+    expression: "=coalesce(field('AMOUNT'), 0) - coalesce(field('DISCOUNT'), 0) + coalesce(field('TAX'), 0)",
+    description: 'Null-safe arithmetic expression.',
+    tags: ['math', 'coalesce'],
   },
   {
-    title: 'Conditional Rule',
-    mode: 'value' as const,
-    name: 'risk_band',
-    expression: "if_(coalesce(score, 0) >= 750, 'LOW', if_(score >= 650, 'MEDIUM', 'HIGH'))",
-    description: 'Nested IF logic for business rules.',
+    id: 'value_case_tier',
+    title: 'Tier by Amount (CASE/IF)',
+    category: 'Conditional Logic',
+    mode: 'value',
+    name: 'amount_tier',
+    expression: "=if_(coalesce(field('AMOUNT'), 0) >= 10000, 'HIGH', if_(coalesce(field('AMOUNT'), 0) >= 5000, 'MEDIUM', 'LOW'))",
+    description: 'Nested if_ to create business tier.',
+    tags: ['if_', 'case'],
   },
   {
-    title: 'JSON Object + Array',
-    mode: 'json' as const,
-    name: 'enriched_profile',
+    id: 'value_sum_amount',
+    title: 'Total Amount (SUM)',
+    category: 'Aggregation',
+    mode: 'value',
+    name: 'total_amount',
+    expression: "=sum(values('AMOUNT'))",
+    description: 'Sum across grouped rows.',
+    tags: ['sum'],
+  },
+  {
+    id: 'value_avg_amount',
+    title: 'Average Amount (MEAN)',
+    category: 'Aggregation',
+    mode: 'value',
+    name: 'avg_amount',
+    expression: "=mean(values('AMOUNT'))",
+    description: 'Average across grouped rows.',
+    tags: ['mean', 'avg'],
+  },
+  {
+    id: 'value_min_max_amount',
+    title: 'Min/Max Amount',
+    category: 'Aggregation',
+    mode: 'json',
+    name: 'amount_range',
     jsonTemplate: `{
-  "customer": "=field('customer_name')",
-  "metrics": {
-    "margin_pct": "=round((coalesce(revenue,0)-coalesce(cost,0))*100/max(coalesce(revenue,1),1), 2)",
-    "city_upper": "=upper(field('city'))"
-  },
-  "flags": ["=risk_band", "=if_(coalesce(is_active,false), 'ACTIVE', 'INACTIVE')"]
+  "min_amount": "=min(values('AMOUNT'))",
+  "max_amount": "=max(values('AMOUNT'))"
 }`,
-    description: 'Use "=expression" at any nested JSON leaf.',
+    description: 'Get minimum and maximum values.',
+    tags: ['min', 'max'],
+  },
+  {
+    id: 'value_distinct_customers',
+    title: 'Distinct Customer Count',
+    category: 'Aggregation',
+    mode: 'value',
+    name: 'distinct_customer_count',
+    expression: "=count(distinct(values('CUSTACCOUNTNUMBER')))",
+    description: 'Count unique customers within group.',
+    tags: ['distinct', 'count'],
+  },
+  {
+    id: 'value_count_non_null_txn',
+    title: 'Transaction Count (Non-null)',
+    category: 'Aggregation',
+    mode: 'value',
+    name: 'transaction_count',
+    expression: "=count(values('TRANSACTIONID'))",
+    description: 'Count non-null TRANSACTIONID values.',
+    tags: ['count'],
+  },
+  {
+    id: 'value_count_if_eq',
+    title: 'count_if EQ (Success 00)',
+    category: 'Conditional Aggregation',
+    mode: 'value',
+    name: 'success_rrn_count',
+    expression: "=count_if('RRN','RESPTOCLIENT','00')",
+    description: "Count RRN where RESPTOCLIENT = '00'.",
+    tags: ['count_if', 'eq'],
+  },
+  {
+    id: 'value_count_if_not',
+    title: 'count_if NOT / !=',
+    category: 'Conditional Aggregation',
+    mode: 'value',
+    name: 'non_success_rrn_count',
+    expression: "=count_if('RRN','RESPTOCLIENT','00','!=')",
+    description: 'Count rows not equal to expected value.',
+    tags: ['count_if', 'not', '!='],
+  },
+  {
+    id: 'value_count_if_contains',
+    title: 'count_if CONTAINS',
+    category: 'Conditional Aggregation',
+    mode: 'value',
+    name: 'upi_txn_count',
+    expression: "=count_if('RRN','SERVICENAME','UPI','contains')",
+    description: "Count rows where SERVICENAME contains 'UPI'.",
+    tags: ['count_if', 'contains'],
+  },
+  {
+    id: 'value_count_if_like',
+    title: 'count_if LIKE',
+    category: 'Conditional Aggregation',
+    mode: 'value',
+    name: 'upi_prefix_count',
+    expression: "=count_if('RRN','SERVICENAME','UPI%','like')",
+    description: 'SQL-like match using % and _.',
+    tags: ['count_if', 'like'],
+  },
+  {
+    id: 'value_count_if_in',
+    title: 'count_if IN List',
+    category: 'Conditional Aggregation',
+    mode: 'value',
+    name: 'ok_or_warn_count',
+    expression: "=count_if('RRN','RESPTOCLIENT',array('00','05'),'in')",
+    description: 'Match multiple values using IN.',
+    tags: ['count_if', 'in'],
+  },
+  {
+    id: 'value_count_if_regex',
+    title: 'count_if Regex',
+    category: 'Conditional Aggregation',
+    mode: 'value',
+    name: 'upi_regex_count',
+    expression: "=count_if('RRN','SERVICENAME','^UPI-','regex')",
+    description: 'Regex match for advanced text conditions.',
+    tags: ['count_if', 'regex'],
+  },
+  {
+    id: 'value_running_latest',
+    title: 'Latest Running Sum',
+    category: 'Running & Rolling',
+    mode: 'value',
+    name: 'latest_running_sum',
+    expression: "=last(running_sum(values('AMOUNT')))",
+    description: 'Latest cumulative sum.',
+    tags: ['running_sum', 'last'],
+  },
+  {
+    id: 'value_rolling_latest',
+    title: 'Latest Rolling Mean (7)',
+    category: 'Running & Rolling',
+    mode: 'value',
+    name: 'latest_rolling_mean_7',
+    expression: "=last(rolling_mean(values('AMOUNT'), 7))",
+    description: 'Latest 7-window rolling mean.',
+    tags: ['rolling_mean', 'window'],
+  },
+  {
+    id: 'json_series',
+    title: 'Series Output JSON',
+    category: 'Running & Rolling',
+    mode: 'json',
+    name: 'amount_series',
+    jsonTemplate: `{
+  "running_sum_series": "=running_all(values('AMOUNT'), 'sum')",
+  "rolling_mean_7_series": "=rolling_all(values('AMOUNT'), 7, 'mean')",
+  "latest_running_sum": "=last(running_sum(values('AMOUNT')))",
+  "latest_rolling_mean_7": "=last(rolling_mean(values('AMOUNT'), 7))"
+}`,
+    description: 'Expose full running/rolling series + latest values.',
+    tags: ['running_all', 'rolling_all'],
+  },
+  {
+    id: 'value_group_aggregate_customer',
+    title: 'Customer Profile Aggregate',
+    category: 'Group Aggregate',
+    mode: 'value',
+    name: 'customer_profiles',
+    expression: "=group_aggregate('CUSTACCOUNTNUMBER', obj(mintime=obj(path='SERVERTIME',agg='min'), maxtime=obj(path='SERVERTIME',agg='max'), total_transaction_count=obj(path='TRANSACTIONID',agg='count_non_null')), 'customer')",
+    description: 'Customer-wise min/max time and transaction count.',
+    tags: ['group_aggregate', 'min', 'max', 'count_non_null'],
+  },
+  {
+    id: 'value_group_aggregate_service_counts',
+    title: 'Service-wise Frequency in Profile',
+    category: 'Group Aggregate',
+    mode: 'value',
+    name: 'customer_profiles',
+    expression: "=group_aggregate('CUSTACCOUNTNUMBER', obj(service_wise_count=obj(path='SERVICENAME',agg='value_counts'), total_service_name=obj(path='SERVICENAME',agg='distinct')), 'customer')",
+    description: 'Per customer service frequency + distinct service names.',
+    tags: ['group_aggregate', 'value_counts', 'distinct'],
+  },
+  {
+    id: 'json_operational_summary',
+    title: 'Operational Summary JSON',
+    category: 'JSON Templates',
+    mode: 'json',
+    name: 'ops_summary',
+    jsonTemplate: `{
+  "success_rrn_count": "=count_if('RRN','RESPTOCLIENT','00')",
+  "failure_rrn_count": "=count_if('RRN','RESPTOCLIENT','00','!=')",
+  "total_amount": "=sum(values('AMOUNT'))",
+  "avg_amount": "=mean(values('AMOUNT'))",
+  "status": "=if_(count_if('RRN','RESPTOCLIENT','00','!=') > 0, 'REVIEW', 'OK')"
+}`,
+    description: 'JSON output for operational KPIs and status.',
+    tags: ['json', 'count_if', 'sum', 'mean'],
+  },
+  {
+    id: 'json_text_and_flags',
+    title: 'Text Normalization + Flags',
+    category: 'Math & Text',
+    mode: 'json',
+    name: 'text_flags',
+    jsonTemplate: `{
+  "service_upper": "=upper(field('SERVICENAME'))",
+  "service_trimmed": "=trim(field('SERVICENAME'))",
+  "is_upi": "=contains(lower(field('SERVICENAME')), 'upi')",
+  "risk_band": "=if_(coalesce(field('AMOUNT'),0) >= 10000, 'HIGH', 'NORMAL')"
+}`,
+    description: 'Text transforms and boolean flags.',
+    tags: ['upper', 'lower', 'trim', 'contains'],
   },
 ]
 
@@ -107,9 +310,12 @@ const EXPRESSION_FUNCTION_SNIPPETS: Array<{ label: string; snippet: string }> = 
   { label: 'values(path)', snippet: "values('${1:column_name}')" },
   { label: 'coalesce(a,b,...)', snippet: "coalesce(${1:value}, ${2:fallback})" },
   { label: 'if_(cond,yes,no)', snippet: "if_(${1:condition}, ${2:yes}, ${3:no})" },
+  { label: 'count_if(value,cond,expected,op)', snippet: "count_if('${1:value_field}','${2:condition_field}','${3:00}','${4:eq}')" },
   { label: 'round(x,2)', snippet: 'round(${1:value}, ${2:2})' },
   { label: 'count(values)', snippet: 'count(${1:values})' },
   { label: 'distinct(values)', snippet: 'distinct(${1:values})' },
+  { label: 'group_aggregate(key,metrics,name)', snippet: "group_aggregate('${1:key_field}', obj(${2:metric}=obj(path='${3:value_field}',agg='${4:sum}')), '${5:key_name}')" },
+  { label: 'value_counts metric', snippet: "group_aggregate('${1:key_field}', obj(service_wise_count=obj(path='${2:SERVICENAME}',agg='value_counts')), '${3:key_name}')" },
   { label: 'running_sum(values)', snippet: "running_sum(field('${1:column_name}'))" },
   { label: 'running_mean(values)', snippet: "running_mean(field('${1:column_name}'))" },
   { label: 'rolling_sum(values,w)', snippet: "rolling_sum(field('${1:column_name}'), ${2:7})" },
@@ -128,6 +334,37 @@ const EXPRESSION_FUNCTION_SNIPPETS: Array<{ label: string; snippet: string }> = 
   { label: 'array(...)', snippet: 'array(${1:value1}, ${2:value2})' },
   { label: 'obj(...)', snippet: "obj(${1:key}=${2:value})" },
 ]
+
+const CUSTOM_FIELD_TIPS_TEXT = `Available functions:
+field(path), values(path), coalesce(...), if_(cond,a,b), upper(), lower(), trim(), length(),
+round(), abs(), min(), max(), sum(), mean(), count(), distinct(), agg(path,'sum'),
+count_if(value_path, condition_path, expected, op, include_null_values, case_sensitive),
+group_aggregate(key_path, obj(metric=obj(path='field',agg='sum')), 'key_name'),
+running_sum(), running_mean(), running_min(), running_max(), running_count(), running_std(),
+rolling_sum(values,window), rolling_mean(values,window), rolling_min(), rolling_max(), rolling_count(), rolling_std(),
+rolling(values, window, 'mean'), running_all(values,'sum'), rolling_all(values,window,'mean'), last(values),
+sqrt(), log(), exp(), ceil(), floor(), sin(), cos(), tan()
+
+count_if operators:
+eq / ==, != / not, contains / not_contains, like / not_like, in / not_in,
+startswith / not_startswith, endswith / not_endswith, regex / not_regex
+
+group_aggregate metric aggs:
+sum, mean, min, max, count, count_non_null, distinct, distinct_count, value_counts, first, last, row_count
+
+JSON template mode:
+Any string starting with "=" is evaluated as expression.
+Example:
+{
+  "score": "=round(coalesce(score,0),2)",
+  "status": "=if_(count_if('RRN','RESPTOCLIENT','00','!=') > 0, 'REVIEW', 'OK')",
+  "tags": ["=field('SERVICENAME')"]
+}
+
+Expression editor autocomplete:
+- Functions list
+- Source fields and custom fields
+Use Ctrl+Space if suggestions are not shown automatically.`
 
 type ExpressionCompletionEntry = {
   label: string
@@ -552,6 +789,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [customIncludeSourceDraft, setCustomIncludeSourceDraft] = useState(true)
   const [customPrimaryKeyFieldDraft, setCustomPrimaryKeyFieldDraft] = useState('')
   const [activeExpressionFieldId, setActiveExpressionFieldId] = useState<string | null>(null)
+  const [exampleRepoCategory, setExampleRepoCategory] = useState<string>('all')
+  const [exampleRepoSearch, setExampleRepoSearch] = useState('')
   const [oracleStudioOpen, setOracleStudioOpen] = useState(false)
   const [oracleMappingDraft, setOracleMappingDraft] = useState<OracleColumnMappingSpec[]>([])
   const [oracleOnlyMappedDraft, setOracleOnlyMappedDraft] = useState(false)
@@ -708,6 +947,40 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     })
     return out
   }, [expressionFieldOptions])
+  const customFieldExampleCategoryOptions = useMemo(
+    () => {
+      const categories = Array.from(
+        new Set(CUSTOM_FIELD_EXAMPLE_REPOSITORY.map((item) => item.category))
+      ).sort((a, b) => a.localeCompare(b))
+      return [
+        { value: 'all', label: 'All Categories' },
+        ...categories.map((category) => ({ value: category, label: category })),
+      ]
+    },
+    []
+  )
+  const filteredCustomFieldExamples = useMemo(
+    () => {
+      const search = exampleRepoSearch.trim().toLowerCase()
+      return CUSTOM_FIELD_EXAMPLE_REPOSITORY.filter((item) => {
+        if (exampleRepoCategory !== 'all' && item.category !== exampleRepoCategory) return false
+        if (!search) return true
+        const haystack = [
+          item.title,
+          item.category,
+          item.name,
+          item.description,
+          item.expression || '',
+          item.jsonTemplate || '',
+          ...(item.tags || []),
+        ]
+          .join(' ')
+          .toLowerCase()
+        return haystack.includes(search)
+      })
+    },
+    [exampleRepoCategory, exampleRepoSearch]
+  )
   const configuredPrimaryKeyField = String(
     nodeConfig.custom_primary_key_field || nodeConfig.custom_group_by_field || ''
   ).trim()
@@ -878,6 +1151,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setCustomIncludeSourceDraft(Boolean(nodeConfig.custom_include_source_fields ?? true))
     setCustomPrimaryKeyFieldDraft(configuredPrimaryKeyField)
     setActiveExpressionFieldId(null)
+    setExampleRepoCategory('all')
+    setExampleRepoSearch('')
     setCustomFieldStudioOpen(true)
   }
 
@@ -1980,15 +2255,95 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               overflowY: 'auto',
             }}
           >
-            <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Examples</Text>
+            <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Example Repository</Text>
             <br />
             <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
-              Click Add Example to insert ready-to-edit templates.
+              Filter by category, search, then click Add Example to insert ready-to-edit templates.
             </Text>
+            <Space direction="vertical" size={8} style={{ marginTop: 10, width: '100%' }}>
+              <Select
+                value={exampleRepoCategory}
+                onChange={setExampleRepoCategory}
+                options={customFieldExampleCategoryOptions}
+                style={{ width: '100%' }}
+              />
+              <Input
+                value={exampleRepoSearch}
+                onChange={(e) => setExampleRepoSearch(e.target.value)}
+                placeholder="Search examples (count_if, group_aggregate, rolling...)"
+                style={commonInputStyle}
+              />
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                {filteredCustomFieldExamples.length} example{filteredCustomFieldExamples.length === 1 ? '' : 's'} shown
+              </Text>
+            </Space>
             <Space direction="vertical" size={10} style={{ marginTop: 10, width: '100%' }}>
-              {CUSTOM_FIELD_EXAMPLES.map((example) => (
+              {filteredCustomFieldExamples.length > 0 ? (
+                filteredCustomFieldExamples.map((example) => (
+                  <div
+                    key={example.id}
+                    style={{
+                      background: 'var(--app-card-bg)',
+                      border: '1px solid var(--app-border-strong)',
+                      borderRadius: 8,
+                      padding: 10,
+                    }}
+                  >
+                    <Space size={6} wrap style={{ marginBottom: 4 }}>
+                      <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>{example.title}</Text>
+                      <Tag style={{ marginInlineEnd: 0 }}>{example.mode === 'value' ? 'Single Value' : 'JSON'}</Tag>
+                      <Tag style={{ marginInlineEnd: 0 }}>{example.category}</Tag>
+                    </Space>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{example.description}</Text>
+                    {(example.tags || []).length > 0 ? (
+                      <Space size={4} wrap style={{ marginTop: 6 }}>
+                        {(example.tags || []).slice(0, 5).map((tag) => (
+                          <Tag
+                            key={`${example.id}_${tag}`}
+                            style={{
+                              marginInlineEnd: 0,
+                              background: 'var(--app-input-bg)',
+                              border: '1px solid var(--app-border-strong)',
+                              color: 'var(--app-text-subtle)',
+                              fontSize: 10,
+                            }}
+                          >
+                            {tag}
+                          </Tag>
+                        ))}
+                      </Space>
+                    ) : null}
+                    <Input.TextArea
+                      value={example.mode === 'value' ? example.expression : example.jsonTemplate}
+                      readOnly
+                      rows={example.mode === 'value' ? 2 : 8}
+                      style={{
+                        marginTop: 8,
+                        background: 'var(--app-input-bg)',
+                        border: '1px solid var(--app-border-strong)',
+                        color: 'var(--app-text)',
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                      }}
+                    />
+                    <Button
+                      size="small"
+                      style={{ marginTop: 8, width: '100%' }}
+                      onClick={() =>
+                        addCustomFieldDraft({
+                          name: example.name,
+                          mode: example.mode,
+                          expression: example.mode === 'value' ? String(example.expression || '') : '',
+                          jsonTemplate: example.mode === 'json' ? String(example.jsonTemplate || '') : '',
+                        })
+                      }
+                    >
+                      Add Example
+                    </Button>
+                  </div>
+                ))
+              ) : (
                 <div
-                  key={example.title}
                   style={{
                     background: 'var(--app-card-bg)',
                     border: '1px solid var(--app-border-strong)',
@@ -1996,64 +2351,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     padding: 10,
                   }}
                 >
-                  <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>{example.title}</Text>
-                  <br />
-                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{example.description}</Text>
-                  <Input.TextArea
-                    value={example.mode === 'value' ? example.expression : example.jsonTemplate}
-                    readOnly
-                    rows={example.mode === 'value' ? 2 : 6}
-                    style={{
-                      marginTop: 8,
-                      background: 'var(--app-input-bg)',
-                      border: '1px solid var(--app-border-strong)',
-                      color: 'var(--app-text)',
-                      fontFamily: 'monospace',
-                      fontSize: 12,
-                    }}
-                  />
-                  <Button
-                    size="small"
-                    style={{ marginTop: 8, width: '100%' }}
-                    onClick={() =>
-                      addCustomFieldDraft({
-                        name: example.name,
-                        mode: example.mode,
-                        expression: example.mode === 'value' ? example.expression : '',
-                        jsonTemplate: example.mode === 'json' ? example.jsonTemplate : '',
-                      })
-                    }
-                  >
-                    Add Example
-                  </Button>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                    No examples matched. Change filter or search text.
+                  </Text>
                 </div>
-              ))}
+              )}
             </Space>
             <div style={{ marginTop: 12 }}>
               <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Expression Tips</Text>
               <Input.TextArea
-                value={
-`Available functions:
-field(path), coalesce(...), if_(cond,a,b), upper(), lower(), trim(), length(),
-round(), abs(), min(), max(), sum(), mean(), count(), distinct(), agg(path,'sum'),
-running_sum(), running_mean(), running_min(), running_max(), running_count(), running_std(),
-rolling_sum(values,window), rolling_mean(values,window), rolling_min(), rolling_max(), rolling_count(), rolling_std(),
-rolling(values, window, 'mean'), running_all(values,'sum'), rolling_all(values,window,'mean'), last(values),
-sqrt(), log(), exp(), ceil(), floor(), sin(), cos(), tan()
-
-JSON template mode:
-Any string starting with "=" is evaluated as expression.
-Example: { "score": "=round(coalesce(score,0),2)", "tags": ["=risk_band"] }
-Group aggregate example: { "total": "=sum(field('premium'))", "avg": "=agg('premium','mean')" }
-Running example: { "run": "=running_sum(field('daily.sales'))", "latest_run": "=last(running_sum(field('daily.sales')))" }
-Rolling example: { "roll7": "=rolling_mean(field('daily.sales'), 7)", "latest_roll7": "=last(rolling_mean(field('daily.sales'), 7))" }
-Full-series example: { "run_series": "=running_all(values('daily.sales'),'sum')", "roll7_series": "=rolling_all(values('daily.sales'),7,'mean')" }
-
-Expression editor has autocomplete:
-- Functions list
-- Source fields and custom fields
-Use Ctrl+Space if suggestions are not shown automatically.`
-                }
+                value={CUSTOM_FIELD_TIPS_TEXT}
                 readOnly
                 rows={8}
                 style={{
