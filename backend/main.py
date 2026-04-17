@@ -12,7 +12,8 @@ import math
 import base64
 import smtplib
 import ssl
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
+from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 from contextlib import asynccontextmanager
@@ -44,6 +45,9 @@ from etl_engine import ETLEngine
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    recovered = _recover_stale_running_executions()
+    if recovered:
+        logger.warning(f"Recovered {recovered} stale running execution(s) on startup")
     if not scheduler.running:
         scheduler.start()
     _reload_all_pipeline_schedule_jobs()
@@ -84,6 +88,68 @@ _H2O_ALGO_CANONICAL = {
     "stackedensemble": "StackedEnsemble",
 }
 _H2O_ALLOWED_ALGOS = sorted(set(_H2O_ALGO_CANONICAL.values()))
+
+
+def _recover_stale_running_executions() -> int:
+    """
+    Mark executions that were left in 'running' (typically after backend restart/crash)
+    as failed so UI polling/history do not stay stuck forever.
+    """
+    db = SessionLocal()
+    try:
+        stale_runs = db.query(models.Execution).filter(
+            models.Execution.status == "running"
+        ).all()
+        if not stale_runs:
+            return 0
+        now = datetime.utcnow()
+        for run in stale_runs:
+            logs = run.logs if isinstance(run.logs, list) else []
+            has_running_log = any(
+                isinstance(entry, dict)
+                and str(entry.get("status") or "").strip().lower() == "running"
+                for entry in logs
+            )
+            has_error_log = any(
+                isinstance(entry, dict)
+                and str(entry.get("status") or "").strip().lower() == "error"
+                for entry in logs
+            )
+            if logs and not has_running_log:
+                run.status = "failed" if has_error_log else "success"
+                if run.status == "failed" and not run.error_message:
+                    err_msgs = [
+                        str(entry.get("message") or "").strip()
+                        for entry in logs
+                        if isinstance(entry, dict)
+                        and str(entry.get("status") or "").strip().lower() == "error"
+                    ]
+                    if err_msgs:
+                        run.error_message = err_msgs[-1]
+                if run.status == "success" and (run.rows_processed or 0) <= 0:
+                    inferred_rows = 0
+                    for entry in logs:
+                        if not isinstance(entry, dict):
+                            continue
+                        try:
+                            inferred_rows += int(entry.get("rows") or 0)
+                        except Exception:
+                            continue
+                    if inferred_rows > 0:
+                        run.rows_processed = inferred_rows
+            else:
+                run.status = "failed"
+                if not run.error_message:
+                    run.error_message = "Execution interrupted by backend restart."
+            run.finished_at = now
+        db.commit()
+        return len(stale_runs)
+    except Exception as exc:
+        db.rollback()
+        logger.error(f"Failed to recover stale executions: {exc}")
+        return 0
+    finally:
+        db.close()
 
 
 # ─── WEBSOCKET MANAGER ────────────────────────────────────────────────────────
@@ -205,7 +271,10 @@ def _extract_schedule_from_nodes(nodes: Any) -> Dict[str, Any]:
     }
 
 
-def _extract_execution_runtime_from_nodes(nodes: Any) -> Dict[str, Any]:
+def _extract_execution_runtime_from_nodes(
+    nodes: Any,
+    triggered_by: Optional[str] = None,
+) -> Dict[str, Any]:
     """Derive ETL execution runtime options from trigger node config."""
     runtime = {
         "execution_mode": DEFAULT_EXECUTION_MODE,
@@ -228,6 +297,23 @@ def _extract_execution_runtime_from_nodes(nodes: Any) -> Dict[str, Any]:
 
     if not trigger_nodes:
         return runtime
+
+    trigger_kind_by_source = {
+        "manual": "manual_trigger",
+        "schedule": "schedule_trigger",
+        "webhook": "webhook_trigger",
+    }
+    preferred_trigger_kind = trigger_kind_by_source.get(str(triggered_by or "").strip().lower())
+    if preferred_trigger_kind:
+        matching = []
+        for node in trigger_nodes:
+            node_data = node.get("data") if isinstance(node.get("data"), dict) else {}
+            node_type = str(node_data.get("nodeType") or node.get("type") or "")
+            if node_type == preferred_trigger_kind:
+                matching.append(node)
+        if matching:
+            trigger_nodes = matching
+
     priority = {"schedule_trigger": 0, "manual_trigger": 1, "webhook_trigger": 2}
 
     def _trigger_score(node: dict) -> Tuple[int, int]:
@@ -265,10 +351,92 @@ def _extract_execution_runtime_from_nodes(nodes: Any) -> Dict[str, Any]:
 def _flush_logs(execution, logs: list, db):
     """Persist current logs snapshot to DB so the poll endpoint sees live progress."""
     try:
-        execution.logs = list(logs)
+        execution.logs = _json_safe_value(list(logs))
         db.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            f"Execution {getattr(execution, 'id', '<unknown>')} log flush failed: {exc}"
+        )
+
+
+def _json_safe_value(value: Any) -> Any:
+    """
+    Convert nested values into JSON-safe primitives for DB JSON columns.
+    This prevents commit failures when rows contain datetime/decimal/bytes, etc.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, (datetime, date, time)):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+
+    if isinstance(value, Decimal):
+        try:
+            return float(value)
+        except Exception:
+            return str(value)
+
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except Exception:
+            return base64.b64encode(value).decode("ascii")
+
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for k, v in value.items():
+            out[str(k)] = _json_safe_value(v)
+        return out
+
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_value(item) for item in value]
+
+    # Support numpy/pandas scalar-style objects when present.
+    item_method = getattr(value, "item", None)
+    if callable(item_method):
+        try:
+            return _json_safe_value(item_method())
+        except Exception:
+            pass
+
+    return str(value)
+
+
+def _apply_execution_terminal_payload(execution, payload: Dict[str, Any]) -> None:
+    execution.status = payload.get("status", "failed")
+    execution.finished_at = payload.get("finished_at") or datetime.utcnow()
+    execution.error_message = payload.get("error_message")
+    if payload.get("node_results") is not None:
+        execution.node_results = _json_safe_value(payload["node_results"])
+    if payload.get("logs") is not None:
+        execution.logs = _json_safe_value(payload["logs"])
+    if payload.get("rows_processed") is not None:
+        execution.rows_processed = payload["rows_processed"]
+
+
+def _persist_execution_terminal_payload(execution_id: str, payload: Dict[str, Any]) -> bool:
+    recovery_db = SessionLocal()
+    try:
+        execution = recovery_db.query(models.Execution).filter(
+            models.Execution.id == execution_id
+        ).first()
+        if execution is None:
+            return False
+        _apply_execution_terminal_payload(execution, payload)
+        recovery_db.commit()
+        return True
+    except Exception as exc:
+        recovery_db.rollback()
+        logger.error(
+            f"Failed to persist terminal state for execution {execution_id}: {exc}"
+        )
+        return False
+    finally:
+        recovery_db.close()
 
 
 def _compact_node_result_for_history(value: Any, max_rows: int) -> Any:
@@ -350,6 +518,14 @@ def _compact_execution_node_results_for_history(node_results: Any) -> Any:
 async def _run_pipeline_execution_task(execution_id: str, pipeline_id: str):
     bg_db = SessionLocal()
     bg_exec = None
+    terminal_payload: Dict[str, Any] = {
+        "status": "failed",
+        "error_message": "Execution ended unexpectedly",
+        "finished_at": None,
+        "node_results": None,
+        "logs": None,
+        "rows_processed": None,
+    }
     try:
         bg_exec = bg_db.query(models.Execution).filter(
             models.Execution.id == execution_id
@@ -360,12 +536,22 @@ async def _run_pipeline_execution_task(execution_id: str, pipeline_id: str):
         if not bg_exec:
             return
         if not pipeline:
-            bg_exec.status = "failed"
-            bg_exec.error_message = "Pipeline not found"
+            terminal_payload.update({
+                "status": "failed",
+                "error_message": "Pipeline not found",
+            })
             return
 
         pipeline_data = {"nodes": pipeline.nodes or [], "edges": pipeline.edges or []}
-        runtime_config = _extract_execution_runtime_from_nodes(pipeline.nodes or [])
+        runtime_config = _extract_execution_runtime_from_nodes(
+            pipeline.nodes or [],
+            triggered_by=getattr(bg_exec, "triggered_by", None),
+        )
+        if (
+            str(getattr(bg_exec, "triggered_by", "")).strip().lower() == "manual"
+            and str(runtime_config.get("execution_mode", "")).strip().lower() == "streaming"
+        ):
+            runtime_config["streaming_max_batches"] = 1
         result = await etl_engine.execute_pipeline(
             pipeline_data,
             execution_id,
@@ -375,26 +561,40 @@ async def _run_pipeline_execution_task(execution_id: str, pipeline_id: str):
             runtime_config=runtime_config,
             pipeline_id=pipeline.id,
         )
-        bg_exec.status = "success"
-        bg_exec.node_results = _compact_execution_node_results_for_history(result["node_results"])
-        bg_exec.logs = result["logs"]
-        bg_exec.rows_processed = result["rows_processed"]
+        terminal_payload.update({
+            "status": "success",
+            "error_message": None,
+            "node_results": _compact_execution_node_results_for_history(result["node_results"]),
+            "logs": result["logs"],
+            "rows_processed": result["rows_processed"],
+        })
         logger.info(f"✅ Execution {execution_id} completed — {result['rows_processed']} rows")
 
     except Exception as exc:
         logger.error(f"❌ Execution {execution_id} failed: {exc}")
-        if bg_exec is not None:
-            bg_exec.status = "failed"
-            bg_exec.error_message = str(exc)
+        terminal_payload.update({
+            "status": "failed",
+            "error_message": str(exc),
+        })
 
     finally:
+        terminal_payload["finished_at"] = datetime.utcnow()
+        committed = False
         if bg_exec is not None:
-            bg_exec.finished_at = datetime.utcnow()
+            _apply_execution_terminal_payload(bg_exec, terminal_payload)
         try:
             bg_db.commit()
-        except Exception:
-            pass
-        bg_db.close()
+            committed = True
+        except Exception as exc:
+            bg_db.rollback()
+            logger.error(
+                f"Execution {execution_id} final commit failed in worker session: {exc}"
+            )
+        finally:
+            bg_db.close()
+
+        if not committed:
+            _persist_execution_terminal_payload(execution_id, terminal_payload)
 
 
 def _start_pipeline_execution(
@@ -7395,6 +7595,100 @@ async def list_executions(
         })
     return result
 
+
+def _try_finalize_stale_running_execution(execution: models.Execution, db: Session) -> None:
+    """
+    Safety net: if an execution row is stuck in `running` but logs are terminal,
+    finalize it so frontend polling does not continue forever.
+    """
+    try:
+        if execution is None or execution.status != "running":
+            return
+        logs = execution.logs if isinstance(execution.logs, list) else []
+        if not logs:
+            return
+        stale_after_s = max(15, int(str(_os.getenv("EXECUTION_STALE_AUTOFINALIZE_SECONDS", "120")).strip() or "120"))
+        now = datetime.utcnow()
+        if execution.started_at is not None:
+            try:
+                started_at = execution.started_at
+                if getattr(started_at, "tzinfo", None) is not None:
+                    now_for_started = datetime.now(started_at.tzinfo)
+                else:
+                    now_for_started = now
+                age_s = (now_for_started - started_at).total_seconds()
+                if age_s < stale_after_s:
+                    return
+            except Exception:
+                pass
+
+        latest_log_ts: Optional[datetime] = None
+        for entry in logs:
+            if not isinstance(entry, dict):
+                continue
+            ts_raw = str(entry.get("timestamp") or "").strip()
+            if not ts_raw:
+                continue
+            try:
+                parsed = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if latest_log_ts is None or parsed > latest_log_ts:
+                latest_log_ts = parsed
+        if latest_log_ts is not None:
+            try:
+                if getattr(latest_log_ts, "tzinfo", None) is not None:
+                    now_for_log = datetime.now(latest_log_ts.tzinfo)
+                else:
+                    now_for_log = now
+                if (now_for_log - latest_log_ts).total_seconds() < stale_after_s:
+                    return
+            except Exception:
+                pass
+
+        has_running_log = any(
+            str((entry or {}).get("status") or "").strip().lower() == "running"
+            for entry in logs
+            if isinstance(entry, dict)
+        )
+        if has_running_log:
+            return
+
+        has_error = any(
+            str((entry or {}).get("status") or "").strip().lower() == "error"
+            for entry in logs
+            if isinstance(entry, dict)
+        )
+        inferred_rows = 0
+        for entry in logs:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                inferred_rows += int(entry.get("rows") or 0)
+            except Exception:
+                continue
+
+        execution.status = "failed" if has_error else "success"
+        execution.finished_at = execution.finished_at or datetime.utcnow()
+        if inferred_rows > 0 and (execution.rows_processed or 0) <= 0:
+            execution.rows_processed = inferred_rows
+        if has_error and not execution.error_message:
+            error_logs = [
+                str((entry or {}).get("message") or "").strip()
+                for entry in logs
+                if isinstance(entry, dict)
+                and str((entry or {}).get("status") or "").strip().lower() == "error"
+            ]
+            if error_logs:
+                execution.error_message = error_logs[-1]
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            f"Failed stale execution auto-finalize for {getattr(execution, 'id', '<unknown>')}: {exc}"
+        )
+
+
 @app.get("/api/executions/{execution_id}")
 async def get_execution(
     execution_id: str,
@@ -7404,6 +7698,7 @@ async def get_execution(
     e = db.query(models.Execution).filter(models.Execution.id == execution_id).first()
     if not e:
         raise HTTPException(status_code=404, detail="Execution not found")
+    _try_finalize_stale_running_execution(e, db)
     node_results = e.node_results or {}
     return {
         "id": e.id,
@@ -8683,6 +8978,172 @@ def _looks_like_pipeline_metadata_row(row: dict) -> bool:
     if keys.issubset(_PIPELINE_METADATA_KEYS) and bool(keys.intersection(_PIPELINE_METADATA_MARKERS)):
         return True
     return False
+
+
+def _safe_json_text(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return str(value)
+
+
+def _flatten_json_row_for_visualization(
+    row: Any,
+    max_depth: int = 6,
+    array_index_limit: int = 5,
+) -> Dict[str, Any]:
+    import math
+
+    out: Dict[str, Any] = {}
+    safe_depth = max(1, min(int(max_depth or 6), 12))
+    safe_array_limit = max(0, min(int(array_index_limit or 5), 50))
+
+    def _assign(path: str, value: Any) -> None:
+        key = path if path else "value"
+        if isinstance(value, (dict, list)):
+            out[key] = _safe_json_text(value)
+            return
+        out[key] = value
+
+    def _as_float(value: Any) -> Optional[float]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                f = float(value)
+            except Exception:
+                return None
+            return f if math.isfinite(f) else None
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                f = float(text)
+            except Exception:
+                return None
+            return f if math.isfinite(f) else None
+        return None
+
+    def _emit_numeric_array_stats(base_key: str, values: List[Any]) -> None:
+        numeric_values: List[float] = []
+        for item in values:
+            as_num = _as_float(item)
+            if as_num is not None:
+                numeric_values.append(as_num)
+        if not numeric_values:
+            return
+        out[f"{base_key}._sum"] = sum(numeric_values)
+        out[f"{base_key}._avg"] = sum(numeric_values) / len(numeric_values)
+        out[f"{base_key}._min"] = min(numeric_values)
+        out[f"{base_key}._max"] = max(numeric_values)
+        out[f"{base_key}._count_numeric"] = len(numeric_values)
+
+    def _walk(value: Any, path: str, depth: int) -> None:
+        if depth > safe_depth:
+            _assign(path, value)
+            return
+
+        if isinstance(value, dict):
+            if path:
+                out[path] = _safe_json_text(value)
+            if not value:
+                _assign(path, {})
+                return
+            for raw_key, child in list(value.items())[:200]:
+                key = str(raw_key)
+                child_path = f"{path}.{key}" if path else key
+                _walk(child, child_path, depth + 1)
+            return
+
+        if isinstance(value, list):
+            count_key = f"{path}._count" if path else "value._count"
+            out[count_key] = len(value)
+            if path:
+                out[path] = _safe_json_text(value)
+            elif "value" not in out:
+                out["value"] = _safe_json_text(value)
+
+            if not value or safe_array_limit <= 0:
+                return
+
+            sample_items = value[:safe_array_limit]
+
+            if all(not isinstance(item, (dict, list)) for item in sample_items):
+                values_key = f"{path}._values" if path else "value._values"
+                out[values_key] = _safe_json_text(sample_items)
+                first_key = f"{path}._first" if path else "value._first"
+                out[first_key] = sample_items[0] if sample_items else None
+                _emit_numeric_array_stats(f"{path}._values" if path else "value._values", sample_items)
+            else:
+                dict_keys: List[str] = []
+                for item in sample_items:
+                    if not isinstance(item, dict):
+                        continue
+                    for k in list(item.keys())[:100]:
+                        sk = str(k)
+                        if sk not in dict_keys:
+                            dict_keys.append(sk)
+                for key in dict_keys[:100]:
+                    values: List[Any] = []
+                    for item in sample_items:
+                        if not isinstance(item, dict) or key not in item:
+                            continue
+                        child_value = item.get(key)
+                        values.append(child_value)
+                    if values:
+                        wildcard_key = f"{path}[].{key}" if path else f"value[].{key}"
+                        first_value = None
+                        for candidate in values:
+                            if candidate is not None:
+                                first_value = candidate
+                                break
+                        if isinstance(first_value, (dict, list)):
+                            out[wildcard_key] = _safe_json_text(first_value)
+                        else:
+                            out[wildcard_key] = first_value
+                        out[f"{wildcard_key}._values"] = _safe_json_text(values)
+                        _emit_numeric_array_stats(wildcard_key, values)
+
+            for idx, item in enumerate(sample_items):
+                idx_path = f"{path}[{idx}]" if path else f"value[{idx}]"
+                _walk(item, idx_path, depth + 1)
+            return
+
+        _assign(path, value)
+
+    if isinstance(row, dict):
+        _walk(row, "", 0)
+    else:
+        _walk(row, "value", 0)
+    return out
+
+
+def _rows_have_nested_json_values(rows: List[Any], sample_limit: int = 300) -> bool:
+    for row in rows[: max(1, sample_limit)]:
+        if not isinstance(row, dict):
+            continue
+        for value in row.values():
+            if isinstance(value, (dict, list)):
+                return True
+    return False
+
+
+def _flatten_json_rows_for_visualization(
+    rows: List[Any],
+    max_depth: int = 6,
+    array_index_limit: int = 5,
+) -> List[Dict[str, Any]]:
+    flattened: List[Dict[str, Any]] = []
+    for row in rows:
+        flattened.append(
+            _flatten_json_row_for_visualization(
+                row,
+                max_depth=max_depth,
+                array_index_limit=array_index_limit,
+            )
+        )
+    return flattened
 
 
 def _read_tabular_output_file(file_path: str) -> list:

@@ -8,7 +8,7 @@ import json
 import math
 import os
 import uuid
-from datetime import datetime
+from datetime import date, datetime, time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 from loguru import logger
@@ -470,6 +470,17 @@ class ETLEngine:
         logs: List[dict] = []
         total_rows = 0
         stream_iterations = runtime["streaming_max_batches"] if mode == "streaming" else 1
+        if mode == "streaming":
+            stream_capable_sources = {"kafka_source", "webhook_trigger"}
+            has_stream_capable_source = any(
+                str((node.get("data") or {}).get("nodeType") or node.get("type") or "")
+                in stream_capable_sources
+                for node in nodes.values()
+            )
+            # Guardrail: static batch-style pipelines should not loop in streaming mode
+            # unless an incremental field or streaming source is configured.
+            if not runtime["incremental_field"] and not has_stream_capable_source:
+                stream_iterations = 1
 
         for stream_idx in range(stream_iterations):
             if mode == "streaming":
@@ -515,6 +526,8 @@ class ETLEngine:
                         "label": label,
                         "log_entry": dict(log_entry),
                     })
+                if on_node_done:
+                    on_node_done(logs)
 
                 try:
                     upstream_data = []
@@ -1362,6 +1375,112 @@ class ETLEngine:
                     nums.append(num)
             return nums
 
+        def _looks_date_only_text(text: str) -> bool:
+            import re as _re
+            t = str(text or "").strip()
+            if not t:
+                return False
+            if _re.fullmatch(r"\d{8}", t):
+                return True
+            if _re.fullmatch(r"\d{4}-\d{2}-\d{2}", t):
+                return True
+            if _re.fullmatch(r"\d{2}-\d{2}-\d{2,4}", t):
+                return True
+            if _re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}", t):
+                return True
+            return False
+
+        def _parse_temporal_value(value: Any) -> Optional[datetime]:
+            if value is None:
+                return None
+            to_py = getattr(value, "to_pydatetime", None)
+            if callable(to_py):
+                try:
+                    value = to_py()
+                except Exception:
+                    pass
+            if isinstance(value, datetime):
+                return value
+            if isinstance(value, date):
+                return datetime.combine(value, time.min)
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return None
+                for fmt in (
+                    "%Y-%m-%d",
+                    "%Y%m%d",
+                    "%d-%m-%Y",
+                    "%d-%m-%y",
+                    "%d/%m/%Y",
+                    "%d/%m/%y",
+                    "%m/%d/%Y",
+                    "%m/%d/%y",
+                ):
+                    try:
+                        return datetime.strptime(text, fmt)
+                    except Exception:
+                        continue
+                try:
+                    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+                except Exception:
+                    return None
+            return None
+
+        def _format_temporal_output(value: Any, date_only_hint: bool = False) -> Any:
+            to_py = getattr(value, "to_pydatetime", None)
+            if callable(to_py):
+                try:
+                    value = to_py()
+                except Exception:
+                    pass
+            if isinstance(value, datetime):
+                is_midnight = (
+                    value.hour == 0
+                    and value.minute == 0
+                    and value.second == 0
+                    and value.microsecond == 0
+                )
+                if date_only_hint or is_midnight:
+                    return value.date().isoformat()
+                return value.strftime("%Y-%d-%m %H:%M:%S")
+            if isinstance(value, date):
+                return value.isoformat()
+            if isinstance(value, time):
+                return value.isoformat()
+            return value
+
+        def _temporal_sequence(values: Any) -> Tuple[List[datetime], bool]:
+            import re as _re
+            parsed: List[datetime] = []
+            all_date_only = True
+            flat = _flatten_sequence(values)
+            for raw in flat:
+                if raw is None:
+                    continue
+                dt_value = _parse_temporal_value(raw)
+                if dt_value is None:
+                    return [], False
+                parsed.append(dt_value)
+
+                explicit_time = False
+                if isinstance(raw, str):
+                    text = raw.strip()
+                    if _looks_date_only_text(text):
+                        explicit_time = False
+                    else:
+                        explicit_time = bool(
+                            _re.search(r"([Tt ]\d{1,2}:)|\bAM\b|\bPM\b", text, flags=_re.IGNORECASE)
+                        )
+                if explicit_time or not (
+                    dt_value.hour == 0
+                    and dt_value.minute == 0
+                    and dt_value.second == 0
+                    and dt_value.microsecond == 0
+                ):
+                    all_date_only = False
+            return parsed, all_date_only
+
         _missing = object()
         scalar_cache: Dict[str, Tuple[bool, Any]] = {}
         series_cache: Dict[str, List[Any]] = {}
@@ -1449,6 +1568,9 @@ class ETLEngine:
             flat = [v for v in _flatten_sequence(seq) if v is not None]
             if not flat:
                 return None
+            temporal_values, temporal_date_only = _temporal_sequence(flat)
+            if len(temporal_values) == len(flat) and temporal_values:
+                return _format_temporal_output(min(temporal_values), temporal_date_only)
             nums = _numeric_sequence(flat)
             if len(nums) == len(flat):
                 return min(nums)
@@ -1462,6 +1584,9 @@ class ETLEngine:
             flat = [v for v in _flatten_sequence(seq) if v is not None]
             if not flat:
                 return None
+            temporal_values, temporal_date_only = _temporal_sequence(flat)
+            if len(temporal_values) == len(flat) and temporal_values:
+                return _format_temporal_output(max(temporal_values), temporal_date_only)
             nums = _numeric_sequence(flat)
             if len(nums) == len(flat):
                 return max(nums)
@@ -3298,7 +3423,92 @@ class ETLEngine:
         elif node_type == "json_destination":
             out_path = self._resolve_output_path(config.get("file_path", ""), ".json")
             orient = config.get("orient", "records") or "records"
-            df.to_json(out_path, orient=orient, indent=2, force_ascii=False)
+            try:
+                indent = int(config.get("indent", 2))
+            except Exception:
+                indent = 2
+            indent = max(0, min(indent, 8))
+
+            date_format = str(config.get("date_format", "iso") or "iso").strip().lower()
+            if date_format not in {"iso", "epoch"}:
+                date_format = "iso"
+
+            date_unit = str(config.get("date_unit", "ms") or "ms").strip().lower()
+            if date_unit not in {"s", "ms", "us", "ns"}:
+                date_unit = "ms"
+            datetime_output_pattern = str(
+                config.get("datetime_output_pattern", "%Y-%d-%m %H:%M:%S") or "%Y-%d-%m %H:%M:%S"
+            ).strip() or "%Y-%d-%m %H:%M:%S"
+
+            date_only_midnight = bool(config.get("date_only_midnight", True))
+            df_json = df.copy()
+            if date_format == "iso" and date_only_midnight and not df_json.empty:
+                for col in list(df_json.columns):
+                    series = df_json[col]
+                    if pd.api.types.is_datetime64_any_dtype(series):
+                        dt = pd.to_datetime(series, errors="coerce")
+                        valid = dt.dropna()
+                        if valid.empty:
+                            continue
+                        is_midnight = (
+                            (valid.dt.hour == 0)
+                            & (valid.dt.minute == 0)
+                            & (valid.dt.second == 0)
+                            & (valid.dt.microsecond == 0)
+                        )
+                        if bool(is_midnight.all()):
+                            df_json[col] = dt.dt.strftime("%Y-%m-%d").where(dt.notna(), None)
+                        else:
+                            df_json[col] = dt.dt.strftime(datetime_output_pattern).where(dt.notna(), None)
+                        continue
+                    if pd.api.types.is_object_dtype(series):
+                        non_null = series.dropna()
+                        if non_null.empty:
+                            continue
+                        temporal_sample = non_null.head(100)
+                        has_temporal = any(
+                            isinstance(v, (datetime, date, time, pd.Timestamp))
+                            for v in temporal_sample
+                        )
+                        if not has_temporal:
+                            continue
+
+                        def _normalize_temporal_obj(value: Any) -> Any:
+                            if value is None:
+                                return None
+                            if isinstance(value, float) and math.isnan(value):
+                                return None
+                            if isinstance(value, pd.Timestamp):
+                                try:
+                                    value = value.to_pydatetime()
+                                except Exception:
+                                    return str(value)
+                            if isinstance(value, datetime):
+                                if (
+                                    value.hour == 0
+                                    and value.minute == 0
+                                    and value.second == 0
+                                    and value.microsecond == 0
+                                ):
+                                    return value.date().isoformat()
+                                return value.strftime(datetime_output_pattern)
+                            if isinstance(value, date):
+                                return value.isoformat()
+                            if isinstance(value, time):
+                                return value.isoformat()
+                            return value
+
+                        df_json[col] = series.map(_normalize_temporal_obj)
+
+            df_json.to_json(
+                out_path,
+                orient=orient,
+                indent=indent,
+                force_ascii=False,
+                date_format=date_format,
+                date_unit=date_unit,
+                default_handler=str,
+            )
             logger.info(f"✅ JSON written: {out_path} ({len(df)} rows)")
             return [{"status": "written", "rows": len(df), "path": out_path}]
 
@@ -3517,23 +3727,68 @@ class ETLEngine:
             def _quote_ident(name: str) -> str:
                 return '"' + str(name or "").replace('"', '""') + '"'
 
+            def _json_safe(value: Any) -> Any:
+                if value is None:
+                    return None
+                if isinstance(value, float) and math.isnan(value):
+                    return None
+                if isinstance(value, (str, int, float, bool)):
+                    return value
+                if isinstance(value, datetime):
+                    if (
+                        value.hour == 0
+                        and value.minute == 0
+                        and value.second == 0
+                        and value.microsecond == 0
+                    ):
+                        return value.date().isoformat()
+                    return value.strftime("%Y-%d-%m %H:%M:%S")
+                if isinstance(value, date):
+                    return value.isoformat()
+                if isinstance(value, time):
+                    return value.isoformat()
+                if isinstance(value, pd.Timestamp):
+                    try:
+                        py_dt = value.to_pydatetime()
+                        if (
+                            py_dt.hour == 0
+                            and py_dt.minute == 0
+                            and py_dt.second == 0
+                            and py_dt.microsecond == 0
+                        ):
+                            return py_dt.date().isoformat()
+                        return py_dt.strftime("%Y-%d-%m %H:%M:%S")
+                    except Exception:
+                        return str(value)
+                if isinstance(value, dict):
+                    return {str(k): _json_safe(v) for k, v in value.items()}
+                if isinstance(value, (list, tuple, set)):
+                    return [_json_safe(v) for v in value]
+                try:
+                    if pd.isna(value):
+                        return None
+                except Exception:
+                    pass
+                return str(value)
+
             def _normalize_value(value: Any) -> Any:
                 if value is None:
                     return None
                 if isinstance(value, float) and math.isnan(value):
                     return None
                 if isinstance(value, dict):
-                    return json.dumps(value, ensure_ascii=False)
+                    return json.dumps(_json_safe(value), ensure_ascii=False)
                 if isinstance(value, (list, tuple)):
-                    return json.dumps(list(value), ensure_ascii=False)
+                    return json.dumps(_json_safe(list(value)), ensure_ascii=False)
                 if isinstance(value, set):
-                    return json.dumps(list(value), ensure_ascii=False)
+                    return json.dumps(_json_safe(list(value)), ensure_ascii=False)
+                if isinstance(value, pd.Timestamp):
+                    return value.to_pydatetime()
+                if isinstance(value, (datetime, date, time)):
+                    return value
                 try:
-                    import pandas as _pd
-                    if _pd.isna(value):
+                    if pd.isna(value):
                         return None
-                    if isinstance(value, _pd.Timestamp):
-                        return value.to_pydatetime()
                 except Exception:
                     pass
                 return value

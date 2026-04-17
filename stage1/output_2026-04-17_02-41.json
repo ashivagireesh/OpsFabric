@@ -1,0 +1,1186 @@
+[
+  {
+    "AGENTCODE":"UBI4000428",
+    "CUSTOMER_INFO":{
+      "agentcode":"UBI4000428",
+      "distinct_customer_count":92,
+      "distinct_txndate_count":0,
+      "distinct_service_count":3,
+      "total_transaction_count":420,
+      "service_profiles":[
+        {
+          "servicename":"AEPS WITHDRAWAL V2",
+          "mintime":"01-01-26 01:36:54.000000000 PM",
+          "maxtime":"30-01-26 11:57:01.000000000 AM",
+          "total_transaction_count":302,
+          "total_distinct_customer":68,
+          "min_amount":"100",
+          "max_amount":"25000",
+          "avg_amount":3510.4304635762
+        },
+        {
+          "servicename":"AEPS DEPOSIT V2",
+          "mintime":"01-01-26 05:56:38.000000000 PM",
+          "maxtime":"30-01-26 12:13:28.000000000 PM",
+          "total_transaction_count":108,
+          "total_distinct_customer":28,
+          "min_amount":"20",
+          "max_amount":"25000",
+          "avg_amount":5161.1111111111
+        },
+        {
+          "servicename":"TPD DEPOSIT",
+          "mintime":"10-01-26 04:45:44.000000000 PM",
+          "maxtime":"30-01-26 02:28:15.000000000 PM",
+          "total_transaction_count":10,
+          "total_distinct_customer":4,
+          "min_amount":"400",
+          "max_amount":"1000",
+          "avg_amount":606.0
+        }
+      ],
+      "customer_profiles":[
+        {
+          "customer":"153212120000012",
+          "mintime":"01-01-26 11:19:01.000000000 AM",
+          "maxtime":"30-01-26 02:30:31.000000000 PM",
+          "total_transaction_count":10,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":10
+            }
+          ]
+        },
+        {
+          "customer":"153212120000004",
+          "mintime":"01-01-26 12:58:35.000000000 PM",
+          "maxtime":"27-02-26 06:06:54.000000000 PM",
+          "total_transaction_count":12,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":12
+            }
+          ]
+        },
+        {
+          "customer":"153210100050871",
+          "mintime":"01-01-26 12:59:21.000000000 PM",
+          "maxtime":"04-03-26 12:59:21.000000000 PM",
+          "total_transaction_count":4,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":4
+            }
+          ]
+        },
+        {
+          "customer":"153210100069578",
+          "mintime":"03-01-26 04:10:10.000000000 PM",
+          "maxtime":"03-03-26 04:10:10.000000000 PM",
+          "total_transaction_count":4,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":4
+            }
+          ]
+        },
+        {
+          "customer":"153210100083781",
+          "mintime":"12-01-26 08:16:06.000000000 AM",
+          "maxtime":"25-02-26 08:30:37.000000000 AM",
+          "total_transaction_count":5,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":5
+            }
+          ]
+        },
+        {
+          "customer":"320102120004998",
+          "mintime":"12-01-26 08:27:41.000000000 AM",
+          "maxtime":"12-02-26 08:27:41.000000000 AM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153210100071102",
+          "mintime":"04-01-26 11:28:41.000000000 AM",
+          "maxtime":"19-02-26 10:42:48.000000000 AM",
+          "total_transaction_count":10,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":10
+            }
+          ]
+        },
+        {
+          "customer":"153210100055973",
+          "mintime":"12-01-26 03:42:27.000000000 PM",
+          "maxtime":"30-01-26 04:43:54.000000000 PM",
+          "total_transaction_count":7,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":7
+            }
+          ]
+        },
+        {
+          "customer":"153210100093195",
+          "mintime":"15-01-26 04:45:58.000000000 PM",
+          "maxtime":"30-01-26 11:57:01.000000000 AM",
+          "total_transaction_count":10,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":5
+            },
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":5
+            }
+          ]
+        },
+        {
+          "customer":"591402120004570",
+          "mintime":"15-01-26 03:27:48.000000000 PM",
+          "maxtime":"15-02-26 03:27:48.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153212120000014",
+          "mintime":"24-01-26 12:03:45.000000000 PM",
+          "maxtime":"24-02-26 12:03:45.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153210100024593",
+          "mintime":"01-01-26 09:40:23.000000000 AM",
+          "maxtime":"15-02-26 10:30:05.000000000 AM",
+          "total_transaction_count":18,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":18
+            }
+          ]
+        },
+        {
+          "customer":"153212010001122",
+          "mintime":"06-01-26 07:38:27.000000000 AM",
+          "maxtime":"25-02-26 07:53:56.000000000 AM",
+          "total_transaction_count":5,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":5
+            }
+          ]
+        },
+        {
+          "customer":"153210100102688",
+          "mintime":"15-01-26 12:11:40.000000000 PM",
+          "maxtime":"15-02-26 12:11:40.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153212120000063",
+          "mintime":"08-01-26 03:30:54.000000000 PM",
+          "maxtime":"08-02-26 03:30:54.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153210100067093",
+          "mintime":"08-01-26 11:40:10.000000000 AM",
+          "maxtime":"30-01-26 12:13:28.000000000 PM",
+          "total_transaction_count":10,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":10
+            }
+          ]
+        },
+        {
+          "customer":"153210100071324",
+          "mintime":"01-01-26 08:57:26.000000000 AM",
+          "maxtime":"04-02-26 01:48:19.000000000 PM",
+          "total_transaction_count":5,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":5
+            }
+          ]
+        },
+        {
+          "customer":"147510100001079",
+          "mintime":"15-01-26 03:05:26.000000000 PM",
+          "maxtime":"15-02-26 03:05:26.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153210100078211",
+          "mintime":"03-01-26 03:00:59.000000000 PM",
+          "maxtime":"03-02-26 03:00:59.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"591402010011990",
+          "mintime":"21-01-26 01:51:40.000000000 PM",
+          "maxtime":"21-02-26 01:51:40.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"568302120009464",
+          "mintime":"08-01-26 06:15:26.000000000 PM",
+          "maxtime":"08-02-26 06:15:26.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153212120000047",
+          "mintime":"15-01-26 03:03:17.000000000 PM",
+          "maxtime":"15-02-26 03:03:17.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"300202010918097",
+          "mintime":"18-01-26 12:13:34.000000000 PM",
+          "maxtime":"18-02-26 12:13:34.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"591402010008436",
+          "mintime":"12-01-26 11:53:00.000000000 AM",
+          "maxtime":"29-01-26 11:19:02.000000000 AM",
+          "total_transaction_count":12,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":12
+            }
+          ]
+        },
+        {
+          "customer":"752202010004085",
+          "mintime":"19-01-26 10:28:14.000000000 AM",
+          "maxtime":"29-01-26 12:15:30.000000000 PM",
+          "total_transaction_count":13,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":13
+            }
+          ]
+        },
+        {
+          "customer":"568302120014366",
+          "mintime":"08-01-26 01:42:49.000000000 PM",
+          "maxtime":"08-02-26 01:42:49.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153210100083161",
+          "mintime":"05-01-26 01:54:24.000000000 PM",
+          "maxtime":"14-02-26 02:01:21.000000000 PM",
+          "total_transaction_count":8,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":6
+            },
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153210100071412",
+          "mintime":"21-01-26 12:25:10.000000000 PM",
+          "maxtime":"21-02-26 12:25:10.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153210100069408",
+          "mintime":"08-01-26 09:44:36.000000000 AM",
+          "maxtime":"08-02-26 09:44:36.000000000 AM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153210100078336",
+          "mintime":"18-01-26 09:54:05.000000000 AM",
+          "maxtime":"18-02-26 09:54:05.000000000 AM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153210100051515",
+          "mintime":"03-01-26 08:18:57.000000000 AM",
+          "maxtime":"03-02-26 08:18:57.000000000 AM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153212120000065",
+          "mintime":"11-01-26 10:22:46.000000000 AM",
+          "maxtime":"30-01-26 05:55:16.000000000 PM",
+          "total_transaction_count":7,
+          "total_service_name":[
+            {
+              "value":"TPD DEPOSIT",
+              "count":3
+            },
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":2
+            },
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153212120000055",
+          "mintime":"10-01-26 01:52:07.000000000 PM",
+          "maxtime":"26-02-26 07:47:45.000000000 PM",
+          "total_transaction_count":13,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            },
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":10
+            }
+          ]
+        },
+        {
+          "customer":"153210100036552",
+          "mintime":"18-01-26 10:26:35.000000000 AM",
+          "maxtime":"18-02-26 10:26:35.000000000 AM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"305102012002107",
+          "mintime":"05-01-26 12:46:18.000000000 PM",
+          "maxtime":"05-02-26 12:46:18.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153212010001035",
+          "mintime":"02-01-26 04:49:14.000000000 PM",
+          "maxtime":"28-02-26 10:47:54.000000000 AM",
+          "total_transaction_count":5,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":5
+            }
+          ]
+        },
+        {
+          "customer":"153212120000062",
+          "mintime":"05-01-26 09:38:24.000000000 AM",
+          "maxtime":"05-02-26 09:38:24.000000000 AM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153212010000436",
+          "mintime":"14-01-26 09:49:33.000000000 AM",
+          "maxtime":"30-01-26 11:22:22.000000000 AM",
+          "total_transaction_count":10,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":10
+            }
+          ]
+        },
+        {
+          "customer":"153212120000032",
+          "mintime":"17-01-26 04:03:03.000000000 PM",
+          "maxtime":"25-02-26 01:28:30.000000000 PM",
+          "total_transaction_count":5,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":5
+            }
+          ]
+        },
+        {
+          "customer":"591302120002571",
+          "mintime":"14-01-26 10:03:35.000000000 AM",
+          "maxtime":"30-01-26 05:04:55.000000000 PM",
+          "total_transaction_count":5,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":3
+            },
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153212120000034",
+          "mintime":"05-01-26 11:11:42.000000000 AM",
+          "maxtime":"05-02-26 11:11:42.000000000 AM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153210100040139",
+          "mintime":"05-01-26 09:46:45.000000000 AM",
+          "maxtime":"25-02-26 10:14:20.000000000 AM",
+          "total_transaction_count":7,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":7
+            }
+          ]
+        },
+        {
+          "customer":"153210100100750",
+          "mintime":"05-01-26 09:49:31.000000000 AM",
+          "maxtime":"09-02-26 12:01:45.000000000 PM",
+          "total_transaction_count":5,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":5
+            }
+          ]
+        },
+        {
+          "customer":"153210100078804",
+          "mintime":"01-01-26 02:28:16.000000000 PM",
+          "maxtime":"30-01-26 03:52:24.000000000 PM",
+          "total_transaction_count":8,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":8
+            }
+          ]
+        },
+        {
+          "customer":"153210100034606",
+          "mintime":"20-01-26 04:32:19.000000000 PM",
+          "maxtime":"20-02-26 04:32:19.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"591402010004545",
+          "mintime":"07-01-26 11:49:20.000000000 AM",
+          "maxtime":"07-02-26 11:49:20.000000000 AM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153212120000064",
+          "mintime":"10-01-26 04:45:44.000000000 PM",
+          "maxtime":"10-02-26 04:45:44.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"TPD DEPOSIT",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"591402010016567",
+          "mintime":"02-01-26 09:47:48.000000000 AM",
+          "maxtime":"07-02-26 10:53:07.000000000 AM",
+          "total_transaction_count":5,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":5
+            }
+          ]
+        },
+        {
+          "customer":"153210100070990",
+          "mintime":"13-01-26 04:08:43.000000000 PM",
+          "maxtime":"30-01-26 10:05:09.000000000 AM",
+          "total_transaction_count":7,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":7
+            }
+          ]
+        },
+        {
+          "customer":"568302120010613",
+          "mintime":"13-01-26 05:33:59.000000000 PM",
+          "maxtime":"13-02-26 05:33:59.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153210100031690",
+          "mintime":"19-01-26 09:23:10.000000000 AM",
+          "maxtime":"28-02-26 12:39:48.000000000 PM",
+          "total_transaction_count":4,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":4
+            }
+          ]
+        },
+        {
+          "customer":"153210100089165",
+          "mintime":"02-01-26 01:56:10.000000000 PM",
+          "maxtime":"26-02-26 04:44:50.000000000 PM",
+          "total_transaction_count":8,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":4
+            },
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":4
+            }
+          ]
+        },
+        {
+          "customer":"153210100031070",
+          "mintime":"17-01-26 01:52:21.000000000 PM",
+          "maxtime":"17-02-26 01:52:21.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153210100046920",
+          "mintime":"22-01-26 05:53:44.000000000 PM",
+          "maxtime":"30-01-26 04:23:40.000000000 PM",
+          "total_transaction_count":7,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":7
+            }
+          ]
+        },
+        {
+          "customer":"153210100070954",
+          "mintime":"21-01-26 05:50:16.000000000 PM",
+          "maxtime":"30-01-26 04:01:01.000000000 PM",
+          "total_transaction_count":8,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":8
+            }
+          ]
+        },
+        {
+          "customer":"153210100023512",
+          "mintime":"06-01-26 06:00:44.000000000 PM",
+          "maxtime":"26-02-26 07:03:55.000000000 PM",
+          "total_transaction_count":10,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":10
+            }
+          ]
+        },
+        {
+          "customer":"459502120009378",
+          "mintime":"28-02-26 05:46:02.000000000 PM",
+          "maxtime":"30-01-26 05:46:02.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153210100070361",
+          "mintime":"13-01-26 10:52:33.000000000 AM",
+          "maxtime":"28-02-26 12:37:46.000000000 PM",
+          "total_transaction_count":6,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":4
+            },
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153210100063404",
+          "mintime":"02-01-26 02:24:59.000000000 PM",
+          "maxtime":"02-02-26 02:24:59.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"147510011002487",
+          "mintime":"13-01-26 01:19:35.000000000 PM",
+          "maxtime":"25-02-26 12:12:31.000000000 PM",
+          "total_transaction_count":4,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":4
+            }
+          ]
+        },
+        {
+          "customer":"153212120000046",
+          "mintime":"25-01-26 07:39:34.000000000 PM",
+          "maxtime":"25-02-26 07:39:34.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153212120000013",
+          "mintime":"04-01-26 10:23:22.000000000 AM",
+          "maxtime":"10-02-26 11:28:02.000000000 AM",
+          "total_transaction_count":4,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":4
+            }
+          ]
+        },
+        {
+          "customer":"153210100070398",
+          "mintime":"01-01-26 03:55:31.000000000 PM",
+          "maxtime":"01-02-26 03:55:31.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153210100071096",
+          "mintime":"25-01-26 01:29:56.000000000 PM",
+          "maxtime":"25-02-26 01:29:56.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153210100050783",
+          "mintime":"25-01-26 05:58:42.000000000 PM",
+          "maxtime":"30-01-26 11:43:23.000000000 AM",
+          "total_transaction_count":4,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":4
+            }
+          ]
+        },
+        {
+          "customer":"591402120000587",
+          "mintime":"18-01-26 04:48:05.000000000 PM",
+          "maxtime":"27-02-26 04:17:07.000000000 PM",
+          "total_transaction_count":6,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":6
+            }
+          ]
+        },
+        {
+          "customer":"591402010004393",
+          "mintime":"13-01-26 01:07:08.000000000 PM",
+          "maxtime":"30-01-26 10:14:25.000000000 AM",
+          "total_transaction_count":4,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":4
+            }
+          ]
+        },
+        {
+          "customer":"153212120000025",
+          "mintime":"16-01-26 07:20:01.000000000 PM",
+          "maxtime":"16-02-26 07:20:01.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153210100040263",
+          "mintime":"27-01-26 01:15:32.000000000 PM",
+          "maxtime":"30-01-26 11:54:16.000000000 AM",
+          "total_transaction_count":4,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":4
+            }
+          ]
+        },
+        {
+          "customer":"153212120000037",
+          "mintime":"01-01-26 05:56:38.000000000 PM",
+          "maxtime":"01-02-26 05:56:38.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"591402010005477",
+          "mintime":"01-01-26 01:36:54.000000000 PM",
+          "maxtime":"01-02-26 01:36:54.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153212010000509",
+          "mintime":"16-01-26 07:25:02.000000000 AM",
+          "maxtime":"30-01-26 07:19:02.000000000 AM",
+          "total_transaction_count":4,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":4
+            }
+          ]
+        },
+        {
+          "customer":"568302120012408",
+          "mintime":"01-01-26 07:12:25.000000000 PM",
+          "maxtime":"01-02-26 07:12:25.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153210100051250",
+          "mintime":"28-02-26 05:50:54.000000000 PM",
+          "maxtime":"30-01-26 05:50:54.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153212120000027",
+          "mintime":"01-01-26 06:42:34.000000000 PM",
+          "maxtime":"09-02-26 12:10:10.000000000 PM",
+          "total_transaction_count":4,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":4
+            }
+          ]
+        },
+        {
+          "customer":"568302120009726",
+          "mintime":"28-02-26 06:45:05.000000000 PM",
+          "maxtime":"29-01-26 06:45:05.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153210100071494",
+          "mintime":"28-02-26 03:33:59.000000000 PM",
+          "maxtime":"30-01-26 03:33:59.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153212120000029",
+          "mintime":"19-01-26 02:28:25.000000000 PM",
+          "maxtime":"19-02-26 02:28:25.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"147510011002479",
+          "mintime":"16-01-26 03:18:46.000000000 PM",
+          "maxtime":"16-02-26 03:18:46.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153210100020746",
+          "mintime":"22-01-26 10:16:43.000000000 AM",
+          "maxtime":"22-02-26 10:16:43.000000000 AM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153210100093575",
+          "mintime":"28-02-26 05:29:43.000000000 PM",
+          "maxtime":"29-01-26 05:29:43.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153210100038639",
+          "mintime":"28-02-26 03:16:41.000000000 PM",
+          "maxtime":"30-01-26 03:16:41.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153212120000069",
+          "mintime":"28-02-26 02:28:15.000000000 PM",
+          "maxtime":"30-01-26 02:28:15.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"TPD DEPOSIT",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153210100066988",
+          "mintime":"28-02-26 02:16:25.000000000 PM",
+          "maxtime":"30-01-26 02:16:25.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153210100033892",
+          "mintime":"24-01-26 12:51:02.000000000 PM",
+          "maxtime":"24-02-26 12:51:02.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"591402120001985",
+          "mintime":"24-01-26 02:08:17.000000000 PM",
+          "maxtime":"24-02-26 02:08:17.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153210100083198",
+          "mintime":"24-01-26 02:47:19.000000000 PM",
+          "maxtime":"24-02-26 02:47:19.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS WITHDRAWAL V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"568302120011885",
+          "mintime":"26-01-26 04:48:02.000000000 PM",
+          "maxtime":"26-02-26 04:48:02.000000000 PM",
+          "total_transaction_count":3,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":3
+            }
+          ]
+        },
+        {
+          "customer":"153212120000068",
+          "mintime":"28-02-26 11:22:56.000000000 AM",
+          "maxtime":"29-01-26 11:22:56.000000000 AM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153212120000005",
+          "mintime":"21-01-26 05:38:39.000000000 PM",
+          "maxtime":"21-02-26 05:38:39.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"153212120000066",
+          "mintime":"24-01-26 12:40:56.000000000 PM",
+          "maxtime":"24-02-26 12:40:56.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"TPD DEPOSIT",
+              "count":2
+            }
+          ]
+        },
+        {
+          "customer":"568302120011489",
+          "mintime":"26-01-26 05:01:17.000000000 PM",
+          "maxtime":"26-02-26 05:01:17.000000000 PM",
+          "total_transaction_count":2,
+          "total_service_name":[
+            {
+              "value":"AEPS DEPOSIT V2",
+              "count":2
+            }
+          ]
+        }
+      ],
+      "time_series":[
+
+      ]
+    },
+    "SUCCESS_TXN":372
+  }
+]

@@ -407,19 +407,19 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
               exec.logs?.forEach((log: { nodeId: string; status: string; rows: number }) => {
                 get().setNodeStatus(log.nodeId, log.status === 'success' ? 'success' : 'error', log.rows)
               })
-              set({ isExecuting: false })
+              set({ isExecuting: false, executionId: null })
               ws?.close()
               return
             }
           } catch { break }
         }
-        set({ isExecuting: false })
+        set({ isExecuting: false, executionId: null })
         ws?.close()
       }
       poll()
 
     } catch (e) {
-      set({ isExecuting: false })
+      set({ isExecuting: false, executionId: null })
       console.error('Execution failed:', e)
     }
   },
