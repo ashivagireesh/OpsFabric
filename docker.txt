@@ -1,0 +1,9 @@
+docker ps -a | grep oracle19c
+docker start oracle19c
+docker logs -f oracle19c
+If Docker hangs again:
+
+bash
+
+osascript -e 'quit app "Docker"'
+open -a Docker

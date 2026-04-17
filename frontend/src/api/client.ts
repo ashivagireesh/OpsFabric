@@ -261,6 +261,34 @@ const api = {
     }
   },
 
+  getPipelineProfileState: async (pipelineId: string, nodeId?: string, limit = 10) => {
+    try {
+      const params: Record<string, unknown> = { limit }
+      if (nodeId) params.node_id = nodeId
+      const r = await http.get(`/api/pipelines/${pipelineId}/profile-state`, { params })
+      return r.data
+    } catch {
+      return {
+        pipeline_id: pipelineId,
+        node_id: nodeId || null,
+        limit,
+        total_nodes: 0,
+        total_entities: 0,
+        total_meta_entries: 0,
+        available_node_ids: [],
+        nodes: [],
+        generated_at: new Date().toISOString(),
+      }
+    }
+  },
+
+  clearPipelineProfileState: async (pipelineId: string, nodeId?: string) => {
+    const params: Record<string, unknown> = {}
+    if (nodeId) params.node_id = nodeId
+    const r = await http.delete(`/api/pipelines/${pipelineId}/profile-state`, { params })
+    return r.data
+  },
+
   executePipeline: async (id: string) => {
     try {
       const r = await http.post(`/api/pipelines/${id}/execute`)
@@ -302,6 +330,15 @@ const api = {
         : String(err?.message || 'Failed to detect source fields')
       throw new Error(message)
     }
+  },
+
+  validateCustomFields: async (payload: {
+    config: Record<string, unknown>
+    rows: Array<Record<string, unknown>>
+    max_rows?: number
+  }) => {
+    const r = await http.post('/api/custom-fields/validate', payload)
+    return r.data
   },
 
   // ── MLOps Workflows ───────────────────────────────────────────────────────

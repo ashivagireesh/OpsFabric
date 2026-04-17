@@ -31,18 +31,17 @@ python main.py
 
 
 
- cd /Users/gireesha/Documents/FRAMEWORK/backend
+cd /Users/gireesha/Documents/FRAMEWORK/backend
 source venv/bin/activate
 export OLLAMA_BASE_URL=http://127.0.0.1:11434
 export OLLAMA_BUSINESS_MODEL_CLOUD=gpt-oss:20b-cloud
 export OLLAMA_REQUEST_TIMEOUT=300
 export OLLAMA_KEEP_ALIVE=30m
 
-PID=$(lsof -tiTCP:8001 -sTCP:LISTEN)
-[ -n "$PID" ] && kill $PID
+pids=($(lsof -tiTCP:8001 -sTCP:LISTEN))
+[ ${#pids[@]} -gt 0 ] && kill -9 ${pids[@]}
 
 uvicorn main:app --host 0.0.0.0 --port 8001 --reload
-
 
 
 to reduce size

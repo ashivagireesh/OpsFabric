@@ -4,11 +4,12 @@ Supports: Databases, Files, APIs, Cloud Storage, Message Queues
 """
 import asyncio
 import ast
+import copy
 import json
 import math
 import os
 import uuid
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 from loguru import logger
@@ -558,6 +559,16 @@ class ETLEngine:
                                 chunk,
                                 incoming_by_source={},
                                 incoming_order=[],
+                                execution_context={
+                                    "execution_id": execution_id,
+                                    "pipeline_id": pipeline_id,
+                                    "node_id": nid,
+                                    "mode": mode,
+                                    "stream_iteration": stream_idx,
+                                    "runtime": runtime,
+                                    "pipeline_state": pipeline_state,
+                                    "profile_state_by_node": pipeline_state.setdefault("profile_documents", {}),
+                                },
                             )
                             if isinstance(chunk_output, list):
                                 output.extend(chunk_output)
@@ -570,6 +581,16 @@ class ETLEngine:
                             upstream_data,
                             incoming_by_source=incoming_by_source,
                             incoming_order=incoming_order,
+                            execution_context={
+                                "execution_id": execution_id,
+                                "pipeline_id": pipeline_id,
+                                "node_id": nid,
+                                "mode": mode,
+                                "stream_iteration": stream_idx,
+                                "runtime": runtime,
+                                "pipeline_state": pipeline_state,
+                                "profile_state_by_node": pipeline_state.setdefault("profile_documents", {}),
+                            },
                         )
 
                     incremental_note = ""
@@ -665,6 +686,7 @@ class ETLEngine:
         upstream: list,
         incoming_by_source: Optional[Dict[str, list]] = None,
         incoming_order: Optional[List[str]] = None,
+        execution_context: Optional[Dict[str, Any]] = None,
     ) -> list:
         """Dispatch to the correct connector/transform handler."""
         await asyncio.sleep(0.3)  # Simulate async I/O
@@ -709,7 +731,7 @@ class ETLEngine:
         elif node_type == "filter_transform":
             return self._transform_filter(upstream, config)
         elif node_type == "map_transform":
-            return self._transform_map(upstream, config)
+            return self._transform_map(upstream, config, execution_context=execution_context)
         elif node_type == "rename_transform":
             return self._transform_rename(upstream, config)
         elif node_type == "aggregate_transform":
@@ -1311,7 +1333,21 @@ class ETLEngine:
 
             expression = str(item.get("expression") or item.get("expr") or "").strip()
             json_template = item.get("json_template", item.get("template"))
-            enabled = bool(item.get("enabled", True))
+            enabled_raw = item.get("enabled", True)
+            if isinstance(enabled_raw, bool):
+                enabled = enabled_raw
+            elif isinstance(enabled_raw, (int, float)):
+                enabled = enabled_raw != 0
+            elif isinstance(enabled_raw, str):
+                norm = enabled_raw.strip().lower()
+                if norm in {"0", "false", "no", "off", "n"}:
+                    enabled = False
+                elif norm in {"1", "true", "yes", "on", "y"}:
+                    enabled = True
+                else:
+                    enabled = True
+            else:
+                enabled = True
             if not enabled:
                 continue
 
@@ -1340,12 +1376,277 @@ class ETLEngine:
         except Exception:
             return None
 
+    def _stable_json_token(self, value: Any) -> str:
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            return str(value)
+
+    def _json_safe_value(self, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, float) and math.isnan(value):
+            return None
+        if isinstance(value, (str, int, float, bool)):
+            return value
+
+        to_py = getattr(value, "to_pydatetime", None)
+        if callable(to_py):
+            try:
+                value = to_py()
+            except Exception:
+                pass
+
+        if isinstance(value, datetime):
+            if (
+                value.hour == 0
+                and value.minute == 0
+                and value.second == 0
+                and value.microsecond == 0
+            ):
+                return value.date().isoformat()
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(value, date):
+            return value.isoformat()
+        if isinstance(value, time):
+            return value.isoformat()
+        if isinstance(value, dict):
+            return {str(k): self._json_safe_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [self._json_safe_value(v) for v in value]
+        return str(value)
+
+    def _split_profile_path(self, path: Any) -> List[Any]:
+        import re
+
+        text = str(path or "").strip()
+        if not text:
+            return []
+        out: List[Any] = []
+        for part in text.split("."):
+            token = part.strip()
+            if not token:
+                continue
+            pieces = re.findall(r"([^\[\]]+)|\[(\d+)\]", token)
+            if not pieces:
+                out.append(token)
+                continue
+            for name, idx in pieces:
+                if name:
+                    out.append(name)
+                elif idx:
+                    try:
+                        out.append(int(idx))
+                    except Exception:
+                        out.append(idx)
+        return out
+
+    def _get_profile_path_value(self, data: Any, path: Any, default: Any = None) -> Any:
+        tokens = self._split_profile_path(path)
+        if not tokens:
+            return data if data is not None else default
+
+        current = data
+        for token in tokens:
+            if isinstance(token, int):
+                if isinstance(current, list) and 0 <= token < len(current):
+                    current = current[token]
+                    continue
+                return default
+
+            if isinstance(current, dict):
+                if token in current:
+                    current = current[token]
+                    continue
+                token_norm = str(token).strip().lower()
+                matched_key = None
+                for k in current.keys():
+                    if str(k).strip().lower() == token_norm:
+                        matched_key = k
+                        break
+                if matched_key is None:
+                    return default
+                current = current.get(matched_key)
+                continue
+
+            return default
+
+        return current if current is not None else default
+
+    def _set_profile_path_value(self, data: Dict[str, Any], path: Any, value: Any) -> None:
+        tokens = self._split_profile_path(path)
+        if not tokens:
+            return
+
+        current: Any = data
+        for idx, token in enumerate(tokens):
+            is_last = idx == len(tokens) - 1
+            next_token = tokens[idx + 1] if not is_last else None
+
+            if isinstance(token, int):
+                if not isinstance(current, list):
+                    return
+                while len(current) <= token:
+                    current.append({} if not isinstance(next_token, int) else [])
+                if is_last:
+                    current[token] = value
+                else:
+                    nxt = current[token]
+                    if isinstance(next_token, int) and not isinstance(nxt, list):
+                        nxt = []
+                        current[token] = nxt
+                    elif not isinstance(next_token, int) and not isinstance(nxt, dict):
+                        nxt = {}
+                        current[token] = nxt
+                    current = nxt
+                continue
+
+            key = str(token)
+            if not isinstance(current, dict):
+                return
+            if is_last:
+                current[key] = value
+                return
+
+            nxt = current.get(key)
+            if isinstance(next_token, int):
+                if not isinstance(nxt, list):
+                    nxt = []
+                    current[key] = nxt
+            else:
+                if not isinstance(nxt, dict):
+                    nxt = {}
+                    current[key] = nxt
+            current = nxt
+
+    def _parse_profile_event_time(self, value: Any) -> Optional[datetime]:
+        import re
+
+        if value is None:
+            return None
+
+        to_py = getattr(value, "to_pydatetime", None)
+        if callable(to_py):
+            try:
+                value = to_py()
+            except Exception:
+                pass
+
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime.combine(value, time.min)
+        if isinstance(value, (int, float)):
+            try:
+                ts = float(value)
+                # Support epoch-millis as well.
+                if ts > 1_000_000_000_000:
+                    ts = ts / 1000.0
+                return datetime.utcfromtimestamp(ts)
+            except Exception:
+                return None
+        if isinstance(value, str):
+            text = " ".join(value.strip().split())
+            if not text:
+                return None
+            normalized = re.sub(
+                r"\.(\d{1,9})",
+                lambda m: "." + m.group(1)[:6].ljust(6, "0"),
+                text,
+                count=1,
+            )
+            candidates = [normalized]
+            if normalized.endswith("Z"):
+                candidates.append(normalized[:-1] + "+00:00")
+
+            formats = (
+                "%Y-%m-%d",
+                "%Y%m%d",
+                "%d-%m-%Y",
+                "%d-%m-%y",
+                "%d/%m/%Y",
+                "%d/%m/%y",
+                "%m/%d/%Y",
+                "%m/%d/%y",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%d-%m %H:%M:%S",
+                "%Y-%d-%m %H:%M:%S.%f",
+                "%d-%m-%Y %H:%M:%S",
+                "%d-%m-%Y %H:%M:%S.%f",
+                "%d-%m-%y %H:%M:%S",
+                "%d-%m-%y %H:%M:%S.%f",
+                "%d/%m/%Y %H:%M:%S",
+                "%d/%m/%Y %H:%M:%S.%f",
+                "%d/%m/%y %H:%M:%S",
+                "%d/%m/%y %H:%M:%S.%f",
+                "%d-%m-%Y %I:%M:%S %p",
+                "%d-%m-%Y %I:%M:%S.%f %p",
+                "%d-%m-%y %I:%M:%S %p",
+                "%d-%m-%y %I:%M:%S.%f %p",
+                "%d/%m/%Y %I:%M:%S %p",
+                "%d/%m/%Y %I:%M:%S.%f %p",
+                "%d/%m/%y %I:%M:%S %p",
+                "%d/%m/%y %I:%M:%S.%f %p",
+            )
+            for candidate in candidates:
+                for fmt in formats:
+                    try:
+                        return datetime.strptime(candidate, fmt)
+                    except Exception:
+                        continue
+                try:
+                    return datetime.fromisoformat(candidate)
+                except Exception:
+                    continue
+        return None
+
+    def _parse_profile_windows(self, value: Any, default_windows: Optional[List[int]] = None) -> List[int]:
+        fallback = default_windows if isinstance(default_windows, list) and default_windows else [1, 7, 30]
+        raw_parts: List[Any] = []
+        if isinstance(value, list):
+            raw_parts = list(value)
+        elif isinstance(value, tuple):
+            raw_parts = list(value)
+        elif isinstance(value, (int, float)):
+            raw_parts = [value]
+        elif isinstance(value, str):
+            text = value.strip()
+            if text:
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, list):
+                        raw_parts = list(parsed)
+                    else:
+                        raw_parts = [p.strip() for p in text.replace("\n", ",").split(",")]
+                except Exception:
+                    raw_parts = [p.strip() for p in text.replace("\n", ",").split(",")]
+
+        out: List[int] = []
+        seen = set()
+        for item in raw_parts:
+            try:
+                day = int(float(item))
+            except Exception:
+                continue
+            if day <= 0:
+                continue
+            if day in seen:
+                continue
+            seen.add(day)
+            out.append(day)
+        if not out:
+            out = [int(v) for v in fallback if int(v) > 0]
+        out.sort()
+        return out
+
     def _build_expression_context(
         self,
         row: Any,
         custom_values: Dict[str, Any],
         dataset_rows: Optional[List[Any]] = None,
         row_index: Optional[int] = None,
+        extra_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if isinstance(row, (dict, list)):
             row_scope: Any = row
@@ -1391,6 +1692,8 @@ class ETLEngine:
             return False
 
         def _parse_temporal_value(value: Any) -> Optional[datetime]:
+            import re as _re
+
             if value is None:
                 return None
             to_py = getattr(value, "to_pydatetime", None)
@@ -1404,10 +1707,23 @@ class ETLEngine:
             if isinstance(value, date):
                 return datetime.combine(value, time.min)
             if isinstance(value, str):
-                text = value.strip()
+                text = " ".join(value.strip().split())
                 if not text:
                     return None
-                for fmt in (
+                # Normalize fractional seconds: keep up to microseconds for strptime/fromisoformat.
+                normalized = _re.sub(
+                    r"\.(\d{1,9})",
+                    lambda m: "." + m.group(1)[:6].ljust(6, "0"),
+                    text,
+                    count=1,
+                )
+
+                candidates = [normalized]
+                if normalized.endswith("Z"):
+                    candidates.append(normalized[:-1] + "+00:00")
+
+                parse_formats = (
+                    # Date only
                     "%Y-%m-%d",
                     "%Y%m%d",
                     "%d-%m-%Y",
@@ -1416,15 +1732,41 @@ class ETLEngine:
                     "%d/%m/%y",
                     "%m/%d/%Y",
                     "%m/%d/%y",
-                ):
+                    # 24h datetime
+                    "%Y-%m-%d %H:%M:%S",
+                    "%Y-%m-%d %H:%M:%S.%f",
+                    "%Y-%d-%m %H:%M:%S",
+                    "%Y-%d-%m %H:%M:%S.%f",
+                    "%d-%m-%Y %H:%M:%S",
+                    "%d-%m-%Y %H:%M:%S.%f",
+                    "%d-%m-%y %H:%M:%S",
+                    "%d-%m-%y %H:%M:%S.%f",
+                    "%d/%m/%Y %H:%M:%S",
+                    "%d/%m/%Y %H:%M:%S.%f",
+                    "%d/%m/%y %H:%M:%S",
+                    "%d/%m/%y %H:%M:%S.%f",
+                    # 12h datetime with AM/PM
+                    "%d-%m-%Y %I:%M:%S %p",
+                    "%d-%m-%Y %I:%M:%S.%f %p",
+                    "%d-%m-%y %I:%M:%S %p",
+                    "%d-%m-%y %I:%M:%S.%f %p",
+                    "%d/%m/%Y %I:%M:%S %p",
+                    "%d/%m/%Y %I:%M:%S.%f %p",
+                    "%d/%m/%y %I:%M:%S %p",
+                    "%d/%m/%y %I:%M:%S.%f %p",
+                )
+
+                for candidate_text in candidates:
+                    for fmt in parse_formats:
+                        try:
+                            return datetime.strptime(candidate_text, fmt)
+                        except Exception:
+                            continue
                     try:
-                        return datetime.strptime(text, fmt)
+                        return datetime.fromisoformat(candidate_text)
                     except Exception:
                         continue
-                try:
-                    return datetime.fromisoformat(text.replace("Z", "+00:00"))
-                except Exception:
-                    return None
+                return None
             return None
 
         def _format_temporal_output(value: Any, date_only_hint: bool = False) -> Any:
@@ -2464,13 +2806,33 @@ class ETLEngine:
                     continue
                 if key_value is None and not keep_null_key:
                     continue
+
+                normalized_key_value = key_value
+                parsed_key_dt = _parse_temporal_value(key_value)
+                if parsed_key_dt is not None:
+                    key_date_only_hint = False
+                    if isinstance(key_value, str):
+                        key_text = key_value.strip()
+                        if _looks_date_only_text(key_text):
+                            key_date_only_hint = True
+                    elif isinstance(key_value, datetime):
+                        key_date_only_hint = (
+                            key_value.hour == 0
+                            and key_value.minute == 0
+                            and key_value.second == 0
+                            and key_value.microsecond == 0
+                        )
+                    elif isinstance(key_value, date):
+                        key_date_only_hint = True
+                    normalized_key_value = _format_temporal_output(parsed_key_dt, key_date_only_hint)
+
                 try:
-                    token = json.dumps(key_value, ensure_ascii=False, sort_keys=True, default=str)
+                    token = json.dumps(normalized_key_value, ensure_ascii=False, sort_keys=True, default=str)
                 except Exception:
-                    token = str(key_value)
+                    token = str(normalized_key_value)
                 if token not in buckets:
                     buckets[token] = {
-                        "key": key_value,
+                        "key": normalized_key_value,
                         "states": [_init_metric_state(spec.get("agg", "count")) for spec in runtime_specs],
                     }
                     order.append(token)
@@ -2821,6 +3183,8 @@ class ETLEngine:
             if isinstance(k, str) and k.isidentifier():
                 context[k] = v
             context[k] = v
+        if isinstance(extra_context, dict):
+            context.update(extra_context)
         return context
 
     def _eval_expression_ast(self, node: ast.AST, context: Dict[str, Any], depth: int = 0) -> Any:
@@ -3087,19 +3451,871 @@ class ETLEngine:
 
         return walk(obj)
 
-    def _transform_custom_fields(self, data: list, config: dict, custom_specs: List[dict]) -> list:
+    def _transform_custom_fields(
+        self,
+        data: list,
+        config: dict,
+        custom_specs: List[dict],
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> list:
         include_source = bool(config.get("custom_include_source_fields", True))
         primary_key_field = str(
             config.get("custom_primary_key_field")
             or config.get("custom_group_by_field")
             or ""
         ).strip()
+        profile_enabled = bool(config.get("custom_profile_enabled", False))
+        profile_emit_mode = str(config.get("custom_profile_emit_mode") or "changed_only").strip().lower()
+        if profile_emit_mode not in {"changed_only", "all_entities"}:
+            profile_emit_mode = "changed_only"
+        profile_required_fields = self._parse_selected_fields(config.get("custom_profile_required_fields", ""))
+        profile_event_time_field = str(config.get("custom_profile_event_time_field") or "").strip()
+        profile_default_windows = self._parse_profile_windows(config.get("custom_profile_window_days"), [1, 7, 30])
+        try:
+            profile_retention_days = int(config.get("custom_profile_retention_days", 45))
+        except Exception:
+            profile_retention_days = 45
+        if profile_retention_days <= 0:
+            profile_retention_days = 45
+        profile_include_change_fields = bool(config.get("custom_profile_include_change_fields", False))
+
         result: list = []
         warning_count = 0
         base_rows: List[Dict[str, Any]] = [
             row if isinstance(row, dict) else {"value": row}
             for row in data
         ]
+
+        if profile_enabled and not primary_key_field:
+            if warning_count < 5:
+                logger.warning(
+                    "Custom profile/document mode requires Primary Key / Group By field. Falling back to regular custom fields mode."
+                )
+            profile_enabled = False
+
+        if profile_enabled:
+            node_id = str((execution_context or {}).get("node_id") or "map_transform")
+            profile_state_by_node = (
+                (execution_context or {}).get("profile_state_by_node")
+                if isinstance((execution_context or {}).get("profile_state_by_node"), dict)
+                else None
+            )
+            node_profile_store: Dict[str, Any]
+            if isinstance(profile_state_by_node, dict):
+                existing_node_state = profile_state_by_node.get(node_id)
+                if not isinstance(existing_node_state, dict):
+                    existing_node_state = {}
+                    profile_state_by_node[node_id] = existing_node_state
+                node_profile_store = existing_node_state
+            else:
+                node_profile_store = {}
+
+            documents_store = node_profile_store.get("documents")
+            if not isinstance(documents_store, dict):
+                documents_store = {}
+                node_profile_store["documents"] = documents_store
+
+            meta_store = node_profile_store.get("meta")
+            if not isinstance(meta_store, dict):
+                meta_store = {}
+                node_profile_store["meta"] = meta_store
+
+            changed_tokens: List[str] = []
+            changed_token_set: set = set()
+            changed_fields_by_token: Dict[str, List[str]] = {}
+            seen_entity_tokens: List[str] = []
+            seen_entity_set: set = set()
+            entity_value_by_token: Dict[str, Any] = {}
+            last_source_by_token: Dict[str, Dict[str, Any]] = {}
+
+            for row_idx, base_row in enumerate(base_rows):
+                row_obj = base_row if isinstance(base_row, dict) else {"value": base_row}
+                pk_value, pk_found = self._extract_row_value_by_path(row_obj, primary_key_field)
+                if not pk_found or pk_value is None or str(pk_value).strip() == "":
+                    if warning_count < 5:
+                        logger.warning(
+                            f"Custom profile row {row_idx + 1} skipped: missing entity key field '{primary_key_field}'."
+                        )
+                    warning_count += 1
+                    continue
+
+                missing_required: List[str] = []
+                for required_field in profile_required_fields:
+                    req_value, req_found = self._extract_row_value_by_path(row_obj, required_field)
+                    if not req_found or req_value is None or str(req_value).strip() == "":
+                        missing_required.append(required_field)
+                if missing_required:
+                    if warning_count < 5:
+                        logger.warning(
+                            f"Custom profile row {row_idx + 1} skipped: missing required fields {', '.join(missing_required)}."
+                        )
+                    warning_count += 1
+                    continue
+
+                token = self._stable_json_token(pk_value)
+                if token not in seen_entity_set:
+                    seen_entity_set.add(token)
+                    seen_entity_tokens.append(token)
+                entity_value_by_token[token] = pk_value
+                last_source_by_token[token] = row_obj
+
+                previous_doc = documents_store.get(token)
+                if not isinstance(previous_doc, dict):
+                    previous_doc = {}
+                previous_meta = meta_store.get(token)
+                if not isinstance(previous_meta, dict):
+                    previous_meta = {}
+
+                working_doc: Dict[str, Any] = copy.deepcopy(previous_doc)
+                working_meta: Dict[str, Any] = copy.deepcopy(previous_meta)
+                custom_values: Dict[str, Any] = {}
+                changed_fields: List[str] = []
+
+                event_time_value = None
+                if profile_event_time_field:
+                    event_time_value, _ = self._extract_row_value_by_path(row_obj, profile_event_time_field)
+                if event_time_value is None:
+                    for fallback_time_field in (
+                        "txn_time",
+                        "transaction_time",
+                        "timestamp",
+                        "created_at",
+                        "updated_at",
+                        "SERVERTIME",
+                        "TXNDATE",
+                    ):
+                        fallback_value, found = self._extract_row_value_by_path(row_obj, fallback_time_field)
+                        if found and fallback_value is not None and str(fallback_value).strip() != "":
+                            event_time_value = fallback_value
+                            break
+                current_event_dt = self._parse_profile_event_time(event_time_value) or datetime.utcnow()
+                current_event_time = current_event_dt.strftime("%Y-%m-%d %H:%M:%S")
+                active_profile_field: Dict[str, str] = {"name": "", "mode": "value"}
+                _missing = object()
+
+                def _resolve_profile_path(path: Any) -> str:
+                    path_text = str(path or "").strip()
+                    if not path_text:
+                        return path_text
+
+                    # In JSON profile templates, allow shorthand paths:
+                    # append_unique('ids', x) will map to "<field_name>.ids".
+                    mode = str(active_profile_field.get("mode") or "value").strip().lower()
+                    field_name = str(active_profile_field.get("name") or "").strip()
+                    if mode != "json" or not field_name:
+                        return path_text
+                    if path_text == field_name or path_text.startswith(f"{field_name}."):
+                        return path_text
+                    if path_text in custom_values:
+                        return path_text
+                    existing_root = self._get_profile_path_value(working_doc, path_text, _missing)
+                    if existing_root is not _missing:
+                        return path_text
+                    scoped = f"{field_name}.{path_text}"
+                    existing_scoped = self._get_profile_path_value(working_doc, scoped, _missing)
+                    if existing_scoped is not _missing:
+                        return scoped
+                    return scoped
+
+                def _profile_prev(path: Any = None, default: Any = None) -> Any:
+                    if path is None or str(path).strip() == "":
+                        return copy.deepcopy(working_doc)
+                    path_text = _resolve_profile_path(path)
+                    if path_text in custom_values:
+                        value = custom_values.get(path_text)
+                    else:
+                        value = self._get_profile_path_value(working_doc, path_text, None)
+                    return default if value is None else copy.deepcopy(value)
+
+                def _num(value: Any, default: Any = 0) -> float:
+                    n = self._to_number(value)
+                    if n is not None:
+                        return float(n)
+                    d = self._to_number(default)
+                    return float(d) if d is not None else 0.0
+
+                def _safe_div(numerator: Any, denominator: Any, default: Any = None) -> Any:
+                    den = self._to_number(denominator)
+                    if den in (None, 0):
+                        return default
+                    num = self._to_number(numerator)
+                    if num is None:
+                        return default
+                    return float(num) / float(den)
+
+                def _inc(path_or_value: Any, amount: Any = 1, default: Any = 0) -> Any:
+                    if isinstance(path_or_value, str):
+                        base_value = _profile_prev(_resolve_profile_path(path_or_value), default)
+                    else:
+                        base_value = path_or_value
+                    total = _num(base_value, default) + _num(amount, 0)
+                    return int(total) if float(total).is_integer() else float(total)
+
+                def _map_inc(path_or_map: Any, key: Any, amount: Any = 1, default: Any = 0) -> Dict[str, Any]:
+                    if isinstance(path_or_map, str):
+                        base_map = _profile_prev(_resolve_profile_path(path_or_map), {})
+                    else:
+                        base_map = path_or_map
+                    current_map = dict(base_map) if isinstance(base_map, dict) else {}
+                    map_key = str(key) if key is not None else "null"
+                    current_value = current_map.get(map_key, default)
+                    next_value = _num(current_value, default) + _num(amount, 0)
+                    current_map[map_key] = int(next_value) if float(next_value).is_integer() else float(next_value)
+                    return current_map
+
+                def _append_unique(path_or_values: Any, value: Any = None, max_items: Any = None) -> List[Any]:
+                    if isinstance(path_or_values, str):
+                        base_items = _profile_prev(_resolve_profile_path(path_or_values), [])
+                        incoming_values = [value]
+                    else:
+                        base_items = path_or_values
+                        incoming_values = [value]
+                    current = list(base_items) if isinstance(base_items, list) else []
+                    seen = {self._stable_json_token(v) for v in current}
+                    for incoming in incoming_values:
+                        if incoming is None:
+                            continue
+                        token_value = self._stable_json_token(incoming)
+                        if token_value in seen:
+                            continue
+                        seen.add(token_value)
+                        current.append(incoming)
+                    try:
+                        cap = int(max_items) if max_items is not None else 0
+                    except Exception:
+                        cap = 0
+                    if cap > 0 and len(current) > cap:
+                        current = current[-cap:]
+                    return current
+
+                def _rolling_update(
+                    name: Any,
+                    value: Any,
+                    txn_time: Any = None,
+                    windows: Any = None,
+                    retention_days: Any = None,
+                ) -> Dict[str, Any]:
+                    metric_name = str(name or "").strip() or "value"
+                    window_days = self._parse_profile_windows(windows, profile_default_windows)
+                    try:
+                        retention = int(retention_days) if retention_days is not None else profile_retention_days
+                    except Exception:
+                        retention = profile_retention_days
+                    if retention <= 0:
+                        retention = profile_retention_days
+                    max_window = max(window_days) if window_days else 30
+                    retention = max(retention, max_window)
+
+                    rolling_root = working_meta.setdefault("rolling", {})
+                    if not isinstance(rolling_root, dict):
+                        rolling_root = {}
+                        working_meta["rolling"] = rolling_root
+                    raw_stream = rolling_root.get(metric_name)
+                    stream: List[Dict[str, Any]] = []
+                    if isinstance(raw_stream, list):
+                        for item in raw_stream:
+                            if not isinstance(item, dict):
+                                continue
+                            ts = self._parse_profile_event_time(item.get("ts"))
+                            if ts is None:
+                                continue
+                            stream.append({"ts": ts, "value": self._to_number(item.get("value"))})
+
+                    event_dt = self._parse_profile_event_time(txn_time) or current_event_dt
+                    stream.append({"ts": event_dt, "value": self._to_number(value)})
+                    cutoff = event_dt - timedelta(days=retention)
+                    stream = [item for item in stream if isinstance(item.get("ts"), datetime) and item["ts"] >= cutoff]
+                    stream.sort(key=lambda item: item["ts"])
+
+                    rolling_root[metric_name] = [
+                        {
+                            "ts": item["ts"].strftime("%Y-%m-%d %H:%M:%S"),
+                            "value": item.get("value"),
+                        }
+                        for item in stream
+                    ]
+
+                    metrics: Dict[str, Any] = {}
+                    for day in window_days:
+                        threshold = event_dt - timedelta(days=int(day))
+                        window_items = [item for item in stream if item["ts"] >= threshold]
+                        nums = [float(item["value"]) for item in window_items if item.get("value") is not None]
+                        total = float(sum(nums)) if nums else 0.0
+                        metrics[f"d{int(day)}"] = {
+                            "count": len(window_items),
+                            "sum": total,
+                            "avg": (total / len(nums)) if nums else None,
+                            "min": min(nums) if nums else None,
+                            "max": max(nums) if nums else None,
+                            "last": nums[-1] if nums else None,
+                            "start_time": threshold.strftime("%Y-%m-%d %H:%M:%S"),
+                            "end_time": event_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                    return metrics
+
+                def _flatten_profile_values(value: Any) -> List[Any]:
+                    out: List[Any] = []
+
+                    def walk(item: Any) -> None:
+                        if isinstance(item, (list, tuple, set)):
+                            for sub in item:
+                                walk(sub)
+                            return
+                        out.append(item)
+
+                    walk(value)
+                    return out
+
+                def _profile_pick_min(current: Any, incoming: Any) -> Any:
+                    if current is None:
+                        return incoming
+                    if incoming is None:
+                        return current
+                    cur_dt = self._parse_profile_event_time(current)
+                    in_dt = self._parse_profile_event_time(incoming)
+                    if cur_dt is not None and in_dt is not None:
+                        return incoming if in_dt < cur_dt else current
+                    cur_num = self._to_number(current)
+                    in_num = self._to_number(incoming)
+                    if cur_num is not None and in_num is not None:
+                        return incoming if in_num < cur_num else current
+                    try:
+                        return incoming if str(incoming) < str(current) else current
+                    except Exception:
+                        return current
+
+                def _profile_pick_max(current: Any, incoming: Any) -> Any:
+                    if current is None:
+                        return incoming
+                    if incoming is None:
+                        return current
+                    cur_dt = self._parse_profile_event_time(current)
+                    in_dt = self._parse_profile_event_time(incoming)
+                    if cur_dt is not None and in_dt is not None:
+                        return incoming if in_dt > cur_dt else current
+                    cur_num = self._to_number(current)
+                    in_num = self._to_number(incoming)
+                    if cur_num is not None and in_num is not None:
+                        return incoming if in_num > cur_num else current
+                    try:
+                        return incoming if str(incoming) > str(current) else current
+                    except Exception:
+                        return current
+
+                def _profile_metric_kind(agg_name: Any) -> str:
+                    op = str(agg_name or "count").strip().lower()
+                    if op in {"rows", "row_count", "size"}:
+                        return "row_count"
+                    if op in {"count_non_null", "non_null_count"}:
+                        return "count_non_null"
+                    if op in {"distinct_count", "nunique", "unique_count"}:
+                        return "distinct_count"
+                    if op in {"distinct", "unique"}:
+                        return "distinct"
+                    if op in {"value_counts", "count_by_value", "frequency", "freq"}:
+                        return "value_counts"
+                    if op in {"sum", "total"}:
+                        return "sum"
+                    if op in {"avg", "average", "mean"}:
+                        return "mean"
+                    if op in {"min", "minimum"}:
+                        return "min"
+                    if op in {"max", "maximum"}:
+                        return "max"
+                    if op == "first":
+                        return "first"
+                    if op == "last":
+                        return "last"
+                    return "count"
+
+                def _profile_metric_init(kind: str) -> Dict[str, Any]:
+                    if kind in {"count", "count_non_null", "row_count"}:
+                        return {"kind": kind, "count": 0}
+                    if kind == "sum":
+                        return {"kind": kind, "value": 0.0}
+                    if kind == "mean":
+                        return {"kind": kind, "sum": 0.0, "count": 0}
+                    if kind in {"min", "max", "first", "last"}:
+                        return {"kind": kind, "has_value": False, "value": None}
+                    if kind == "distinct_count":
+                        return {"kind": kind, "seen": {}}
+                    if kind == "distinct":
+                        return {"kind": kind, "seen": {}, "values": []}
+                    if kind == "value_counts":
+                        return {"kind": kind, "items": {}, "order": []}
+                    return {"kind": "count", "count": 0}
+
+                def _profile_metric_update(state: Any, kind: str, raw_value: Any) -> Dict[str, Any]:
+                    current_state = state if isinstance(state, dict) else _profile_metric_init(kind)
+                    if str(current_state.get("kind") or "") != kind:
+                        current_state = _profile_metric_init(kind)
+
+                    if kind == "row_count":
+                        current_state["count"] = int(current_state.get("count", 0)) + 1
+                        return current_state
+
+                    values = _flatten_profile_values(raw_value)
+                    if kind == "count":
+                        current_state["count"] = int(current_state.get("count", 0)) + len(values)
+                        return current_state
+
+                    if kind == "count_non_null":
+                        non_null = len(
+                            [v for v in values if v is not None and str(v).strip() != ""]
+                        )
+                        current_state["count"] = int(current_state.get("count", 0)) + non_null
+                        return current_state
+
+                    if kind == "sum":
+                        total = float(current_state.get("value", 0.0))
+                        for value in values:
+                            num = self._to_number(value)
+                            if num is not None:
+                                total += float(num)
+                        current_state["value"] = total
+                        return current_state
+
+                    if kind == "mean":
+                        total = float(current_state.get("sum", 0.0))
+                        count = int(current_state.get("count", 0))
+                        for value in values:
+                            num = self._to_number(value)
+                            if num is None:
+                                continue
+                            total += float(num)
+                            count += 1
+                        current_state["sum"] = total
+                        current_state["count"] = count
+                        return current_state
+
+                    if kind == "min":
+                        cur_val = current_state.get("value")
+                        has_val = bool(current_state.get("has_value", False))
+                        for value in values:
+                            if value is None:
+                                continue
+                            cur_val = value if not has_val else _profile_pick_min(cur_val, value)
+                            has_val = True
+                        current_state["value"] = cur_val
+                        current_state["has_value"] = has_val
+                        return current_state
+
+                    if kind == "max":
+                        cur_val = current_state.get("value")
+                        has_val = bool(current_state.get("has_value", False))
+                        for value in values:
+                            if value is None:
+                                continue
+                            cur_val = value if not has_val else _profile_pick_max(cur_val, value)
+                            has_val = True
+                        current_state["value"] = cur_val
+                        current_state["has_value"] = has_val
+                        return current_state
+
+                    if kind == "first":
+                        if bool(current_state.get("has_value", False)):
+                            return current_state
+                        for value in values:
+                            if value is None:
+                                continue
+                            current_state["value"] = value
+                            current_state["has_value"] = True
+                            break
+                        return current_state
+
+                    if kind == "last":
+                        for value in values:
+                            if value is None:
+                                continue
+                            current_state["value"] = value
+                            current_state["has_value"] = True
+                        return current_state
+
+                    if kind == "distinct_count":
+                        seen = current_state.get("seen")
+                        if not isinstance(seen, dict):
+                            seen = {}
+                            current_state["seen"] = seen
+                        for value in values:
+                            if value is None:
+                                continue
+                            seen[self._stable_json_token(value)] = 1
+                        return current_state
+
+                    if kind == "distinct":
+                        seen = current_state.get("seen")
+                        if not isinstance(seen, dict):
+                            seen = {}
+                            current_state["seen"] = seen
+                        out_values = current_state.get("values")
+                        if not isinstance(out_values, list):
+                            out_values = []
+                            current_state["values"] = out_values
+                        for value in values:
+                            if value is None:
+                                continue
+                            token_value = self._stable_json_token(value)
+                            if token_value in seen:
+                                continue
+                            seen[token_value] = 1
+                            out_values.append(value)
+                        return current_state
+
+                    if kind == "value_counts":
+                        items = current_state.get("items")
+                        if not isinstance(items, dict):
+                            items = {}
+                            current_state["items"] = items
+                        order = current_state.get("order")
+                        if not isinstance(order, list):
+                            order = []
+                            current_state["order"] = order
+                        for value in values:
+                            if value is None:
+                                continue
+                            token_value = self._stable_json_token(value)
+                            bucket = items.get(token_value)
+                            if not isinstance(bucket, dict):
+                                items[token_value] = {"value": value, "count": 1}
+                                order.append(token_value)
+                            else:
+                                bucket["count"] = int(bucket.get("count", 0)) + 1
+                        return current_state
+
+                    current_state["count"] = int(current_state.get("count", 0)) + len(values)
+                    return current_state
+
+                def _profile_metric_finalize(state: Any, kind: str) -> Any:
+                    item = state if isinstance(state, dict) else _profile_metric_init(kind)
+                    if kind in {"count", "count_non_null", "row_count"}:
+                        return int(item.get("count", 0))
+                    if kind == "sum":
+                        total = float(item.get("value", 0.0))
+                        return int(total) if float(total).is_integer() else total
+                    if kind == "mean":
+                        count = int(item.get("count", 0))
+                        if count <= 0:
+                            return None
+                        return float(item.get("sum", 0.0)) / count
+                    if kind in {"min", "max", "first", "last"}:
+                        if not bool(item.get("has_value", False)):
+                            return None
+                        return item.get("value")
+                    if kind == "distinct_count":
+                        seen = item.get("seen")
+                        return len(seen) if isinstance(seen, dict) else 0
+                    if kind == "distinct":
+                        values_out = item.get("values")
+                        return values_out if isinstance(values_out, list) else []
+                    if kind == "value_counts":
+                        items = item.get("items")
+                        order = item.get("order")
+                        if not isinstance(items, dict) or not isinstance(order, list):
+                            return []
+                        return [
+                            {
+                                "value": items[token].get("value"),
+                                "count": int(items[token].get("count", 0)),
+                            }
+                            for token in order
+                            if token in items
+                        ]
+                    return int(item.get("count", 0))
+
+                def _profile_parse_group_metrics(raw_metrics: Any) -> List[Dict[str, Any]]:
+                    raw = raw_metrics
+                    if isinstance(raw, str):
+                        text = raw.strip()
+                        if not text:
+                            return []
+                        try:
+                            raw = json.loads(text)
+                        except Exception:
+                            raw = {}
+
+                    specs: List[Dict[str, Any]] = []
+                    seen_names = set()
+
+                    def add_spec(name: Any, conf: Any) -> None:
+                        metric_name = str(name or "").strip()
+                        if not metric_name:
+                            return
+                        metric_key = metric_name.lower()
+                        if metric_key in seen_names:
+                            return
+                        seen_names.add(metric_key)
+
+                        agg = "count"
+                        metric_value = None
+                        if isinstance(conf, dict):
+                            agg = str(
+                                conf.get("agg")
+                                or conf.get("op")
+                                or conf.get("func")
+                                or conf.get("operation")
+                                or "count"
+                            ).strip().lower()
+                            if "value" in conf:
+                                metric_value = conf.get("value")
+                            else:
+                                value_path = str(
+                                    conf.get("path")
+                                    or conf.get("field")
+                                    or conf.get("column")
+                                    or ""
+                                ).strip()
+                                if value_path:
+                                    metric_value, _ = self._extract_row_value_by_path(row_obj, value_path)
+                        elif isinstance(conf, list):
+                            metric_value = conf[0] if len(conf) > 0 else None
+                            agg = str(conf[1] if len(conf) > 1 else "count").strip().lower()
+                        elif isinstance(conf, str):
+                            text = conf.strip()
+                            if ":" in text:
+                                maybe_path, maybe_agg = [part.strip() for part in text.split(":", 1)]
+                                agg = maybe_agg or "count"
+                                if maybe_path:
+                                    metric_value, _ = self._extract_row_value_by_path(row_obj, maybe_path)
+                            else:
+                                agg = text or "count"
+                        else:
+                            metric_value = conf
+
+                        specs.append(
+                            {
+                                "name": metric_name,
+                                "kind": _profile_metric_kind(agg),
+                                "value": metric_value,
+                            }
+                        )
+
+                    if isinstance(raw, dict):
+                        for metric_name, conf in raw.items():
+                            add_spec(metric_name, conf)
+                    elif isinstance(raw, list):
+                        for idx, conf in enumerate(raw):
+                            add_spec(f"metric_{idx + 1}", conf)
+                    return specs
+
+                def _profile_group_aggregate(
+                    key_path: Any,
+                    metrics: Any,
+                    key_name: Any = "key",
+                    include_null_key: Any = False,
+                ) -> List[Dict[str, Any]]:
+                    key_field = str(key_path or "").strip()
+                    if not key_field:
+                        return []
+
+                    profile_field_name = str(active_profile_field.get("name") or "").strip()
+                    store_key = profile_field_name or key_field
+                    aggregate_root = working_meta.get("group_aggregate")
+                    if not isinstance(aggregate_root, dict):
+                        aggregate_root = {}
+                        working_meta["group_aggregate"] = aggregate_root
+
+                    state = aggregate_root.get(store_key)
+                    if not isinstance(state, dict):
+                        state = {"groups": {}, "order": [], "metric_specs": []}
+                        aggregate_root[store_key] = state
+
+                    metric_specs = _profile_parse_group_metrics(metrics)
+                    if metric_specs:
+                        state["metric_specs"] = metric_specs
+                    else:
+                        metric_specs = state.get("metric_specs") if isinstance(state.get("metric_specs"), list) else []
+
+                    key_value, key_found = self._extract_row_value_by_path(row_obj, key_field)
+                    keep_null_key = bool(include_null_key)
+                    if key_found and (key_value is not None or keep_null_key):
+                        groups = state.get("groups")
+                        if not isinstance(groups, dict):
+                            groups = {}
+                            state["groups"] = groups
+                        order = state.get("order")
+                        if not isinstance(order, list):
+                            order = []
+                            state["order"] = order
+
+                        token_value = self._stable_json_token(key_value)
+                        bucket = groups.get(token_value)
+                        if not isinstance(bucket, dict):
+                            bucket = {"key": key_value, "metrics": {}}
+                            groups[token_value] = bucket
+                            order.append(token_value)
+                        else:
+                            bucket["key"] = key_value
+
+                        bucket_metrics = bucket.get("metrics")
+                        if not isinstance(bucket_metrics, dict):
+                            bucket_metrics = {}
+                            bucket["metrics"] = bucket_metrics
+
+                        for spec in metric_specs:
+                            metric_name = str(spec.get("name") or "").strip()
+                            metric_kind = str(spec.get("kind") or "count").strip().lower()
+                            if not metric_name:
+                                continue
+                            previous_state = bucket_metrics.get(metric_name)
+                            next_state = _profile_metric_update(previous_state, metric_kind, spec.get("value"))
+                            bucket_metrics[metric_name] = next_state
+
+                    out: List[Dict[str, Any]] = []
+                    groups = state.get("groups")
+                    order = state.get("order")
+                    if not isinstance(groups, dict) or not isinstance(order, list):
+                        return []
+
+                    metric_specs_final = state.get("metric_specs")
+                    if not isinstance(metric_specs_final, list):
+                        metric_specs_final = []
+
+                    out_key_name = str(key_name or "key").strip() or "key"
+                    for token in order:
+                        bucket = groups.get(token)
+                        if not isinstance(bucket, dict):
+                            continue
+                        bucket_metrics = bucket.get("metrics")
+                        if not isinstance(bucket_metrics, dict):
+                            bucket_metrics = {}
+                        row_out: Dict[str, Any] = {out_key_name: bucket.get("key")}
+                        for spec in metric_specs_final:
+                            metric_name = str(spec.get("name") or "").strip()
+                            metric_kind = str(spec.get("kind") or "count").strip().lower()
+                            if not metric_name:
+                                continue
+                            metric_state = bucket_metrics.get(metric_name)
+                            row_out[metric_name] = _profile_metric_finalize(metric_state, metric_kind)
+                        out.append(row_out)
+                    return out
+
+                extra_context = {
+                    "prev": _profile_prev,
+                    "profile_prev": _profile_prev,
+                    "profile_get": _profile_prev,
+                    "doc": _profile_prev,
+                    "num": _num,
+                    "safe_div": _safe_div,
+                    "inc": _inc,
+                    "map_inc": _map_inc,
+                    "append_unique": _append_unique,
+                    "appendunique": _append_unique,
+                    "rolling_update": _rolling_update,
+                    "rolling_window_update": _rolling_update,
+                    "profile_group_aggregate": _profile_group_aggregate,
+                    "group_aggregate_profile": _profile_group_aggregate,
+                    "group_aggregate": _profile_group_aggregate,
+                    "group_metrics": _profile_group_aggregate,
+                    "entity_key": pk_value,
+                    "entity_id": pk_value,
+                    "event_time": current_event_time,
+                }
+                eval_context = self._build_expression_context(
+                    row_obj,
+                    custom_values,
+                    dataset_rows=[row_obj],
+                    row_index=row_idx,
+                    extra_context=extra_context,
+                )
+
+                # Keep single-pass in profile mode to avoid side-effect duplication
+                # for helpers like rolling_update().
+                for spec in custom_specs:
+                    name = str(spec.get("name") or "").strip()
+                    if not name:
+                        continue
+                    active_profile_field["name"] = name
+                    mode = str(spec.get("mode") or "value").lower()
+                    active_profile_field["mode"] = mode
+                    expression = str(spec.get("expression") or "")
+                    template = spec.get("json_template")
+                    try:
+                        if mode == "json":
+                            value = self._evaluate_json_template(
+                                template,
+                                row_obj,
+                                custom_values,
+                                dataset_rows=[row_obj],
+                                row_index=row_idx,
+                                context=eval_context,
+                            )
+                        else:
+                            value = self._evaluate_custom_expression(
+                                expression,
+                                row_obj,
+                                custom_values,
+                                dataset_rows=[row_obj],
+                                row_index=row_idx,
+                                context=eval_context,
+                            )
+                    except Exception as exc:
+                        value = None
+                        if warning_count < 5:
+                            logger.warning(
+                                f"Custom profile field '{name}' evaluation failed at row {row_idx + 1}: {exc}"
+                            )
+                        warning_count += 1
+                    finally:
+                        active_profile_field["name"] = ""
+                        active_profile_field["mode"] = "value"
+
+                    safe_value = self._json_safe_value(value)
+                    previous_value = self._get_profile_path_value(working_doc, name, None)
+                    if self._stable_json_token(previous_value) != self._stable_json_token(safe_value):
+                        changed_fields.append(name)
+                    self._set_profile_path_value(working_doc, name, safe_value)
+                    custom_values[name] = safe_value
+                    eval_context[name] = safe_value
+                    if isinstance(name, str) and name.isidentifier():
+                        eval_context[name] = safe_value
+
+                if self._get_profile_path_value(working_doc, primary_key_field, None) is None:
+                    self._set_profile_path_value(working_doc, primary_key_field, self._json_safe_value(pk_value))
+
+                doc_changed = bool(changed_fields)
+                meta_changed = self._stable_json_token(previous_meta) != self._stable_json_token(working_meta)
+                is_new = token not in documents_store
+                if doc_changed or meta_changed or is_new:
+                    documents_store[token] = self._json_safe_value(working_doc)
+                    meta_store[token] = self._json_safe_value(working_meta)
+                    changed_fields_by_token[token] = list(changed_fields)
+                    if token not in changed_token_set:
+                        changed_token_set.add(token)
+                        changed_tokens.append(token)
+
+            emit_tokens: List[str]
+            if profile_emit_mode == "all_entities":
+                emit_tokens = []
+                seen_emit = set()
+                for token in seen_entity_tokens + list(documents_store.keys()):
+                    if token in seen_emit:
+                        continue
+                    seen_emit.add(token)
+                    emit_tokens.append(token)
+            else:
+                emit_tokens = list(changed_tokens)
+
+            for token in emit_tokens:
+                profile_doc = documents_store.get(token)
+                if not isinstance(profile_doc, dict):
+                    continue
+                out_row: Dict[str, Any] = {}
+                if include_source:
+                    source_row = last_source_by_token.get(token)
+                    if isinstance(source_row, dict):
+                        out_row.update(copy.deepcopy(source_row))
+                out_row.update(copy.deepcopy(profile_doc))
+                if primary_key_field and self._get_profile_path_value(out_row, primary_key_field, None) is None:
+                    self._set_profile_path_value(
+                        out_row,
+                        primary_key_field,
+                        self._json_safe_value(entity_value_by_token.get(token)),
+                    )
+                if profile_include_change_fields:
+                    out_row["_profile_changed_fields"] = changed_fields_by_token.get(token, [])
+                result.append(out_row)
+            return result
+
         grouped_rows: List[Dict[str, Any]] = []
         if primary_key_field:
             buckets: Dict[str, Dict[str, Any]] = {}
@@ -3196,10 +4412,20 @@ class ETLEngine:
 
         return result
 
-    def _transform_map(self, data: list, config: dict) -> list:
+    def _transform_map(
+        self,
+        data: list,
+        config: dict,
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> list:
         custom_specs = self._parse_custom_fields_config(config.get("custom_fields"))
         if custom_specs:
-            return self._transform_custom_fields(data, config, custom_specs)
+            return self._transform_custom_fields(
+                data,
+                config,
+                custom_specs,
+                execution_context=execution_context,
+            )
 
         fields = self._parse_selected_fields(config.get("fields", ""))
         if not fields:

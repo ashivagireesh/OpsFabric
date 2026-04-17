@@ -852,6 +852,12 @@ class SourceFieldOptionsRequest(BaseModel):
     config: dict = {}
     max_rows: int = 200
 
+
+class CustomFieldValidationRequest(BaseModel):
+    config: Dict[str, Any] = Field(default_factory=dict)
+    rows: List[Dict[str, Any]] = Field(default_factory=list)
+    max_rows: int = 30
+
 class CredentialCreate(BaseModel):
     name: str
     type: str
@@ -860,6 +866,156 @@ class CredentialCreate(BaseModel):
 class CredentialUpdate(BaseModel):
     name: Optional[str] = None
     data: Optional[dict] = None
+
+
+def _build_pipeline_profile_state_summary(
+    pipeline_id: str,
+    node_id: Optional[str] = None,
+    limit: int = 10,
+) -> Dict[str, Any]:
+    safe_limit = max(1, min(int(limit or 10), 100))
+    runtime_state = etl_engine._load_runtime_state()
+    pipelines_state = runtime_state.get("pipelines") if isinstance(runtime_state, dict) else {}
+    if not isinstance(pipelines_state, dict):
+        pipelines_state = {}
+    pipeline_state = pipelines_state.get(pipeline_id)
+    if not isinstance(pipeline_state, dict):
+        pipeline_state = {}
+    profile_documents = pipeline_state.get("profile_documents")
+    if not isinstance(profile_documents, dict):
+        profile_documents = {}
+
+    nodes: List[Dict[str, Any]] = []
+    total_entities = 0
+    total_meta_entries = 0
+    available_node_ids: List[str] = []
+
+    for nid, node_state in profile_documents.items():
+        if node_id and str(nid) != str(node_id):
+            continue
+        if not isinstance(node_state, dict):
+            continue
+        node_name = str(nid)
+        available_node_ids.append(node_name)
+        documents = node_state.get("documents")
+        if not isinstance(documents, dict):
+            documents = {}
+        meta = node_state.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
+
+        entity_keys = list(documents.keys())
+        entity_count = len(entity_keys)
+        meta_count = len(meta)
+        total_entities += entity_count
+        total_meta_entries += meta_count
+
+        sample_entity_keys = entity_keys[:safe_limit]
+        sample_documents: List[Dict[str, Any]] = []
+        for entity_key in sample_entity_keys:
+            sample_documents.append(
+                {
+                    "entity_key": str(entity_key),
+                    "profile": _json_safe_value(documents.get(entity_key)),
+                }
+            )
+
+        nodes.append(
+            {
+                "node_id": node_name,
+                "entity_count": entity_count,
+                "meta_count": meta_count,
+                "sample_entity_keys": sample_entity_keys,
+                "sample_documents": sample_documents,
+            }
+        )
+
+    return {
+        "pipeline_id": pipeline_id,
+        "node_id": node_id or None,
+        "limit": safe_limit,
+        "total_nodes": len(nodes),
+        "total_entities": total_entities,
+        "total_meta_entries": total_meta_entries,
+        "available_node_ids": available_node_ids,
+        "nodes": nodes,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
+def _clear_pipeline_profile_state(
+    pipeline_id: str,
+    node_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    runtime_state = etl_engine._load_runtime_state()
+    pipelines_state = runtime_state.get("pipelines") if isinstance(runtime_state, dict) else {}
+    if not isinstance(pipelines_state, dict):
+        pipelines_state = {}
+        runtime_state["pipelines"] = pipelines_state
+
+    pipeline_state = pipelines_state.get(pipeline_id)
+    if not isinstance(pipeline_state, dict):
+        return {
+            "pipeline_id": pipeline_id,
+            "node_id": node_id or None,
+            "removed_nodes": 0,
+            "removed_entities": 0,
+            "removed_meta_entries": 0,
+            "remaining_summary": _build_pipeline_profile_state_summary(pipeline_id, node_id=node_id),
+            "cleared_at": datetime.utcnow().isoformat(),
+        }
+
+    profile_documents = pipeline_state.get("profile_documents")
+    if not isinstance(profile_documents, dict):
+        return {
+            "pipeline_id": pipeline_id,
+            "node_id": node_id or None,
+            "removed_nodes": 0,
+            "removed_entities": 0,
+            "removed_meta_entries": 0,
+            "remaining_summary": _build_pipeline_profile_state_summary(pipeline_id, node_id=node_id),
+            "cleared_at": datetime.utcnow().isoformat(),
+        }
+
+    removed_nodes = 0
+    removed_entities = 0
+    removed_meta_entries = 0
+
+    if node_id:
+        node_key = str(node_id)
+        node_state = profile_documents.pop(node_key, None)
+        if isinstance(node_state, dict):
+            removed_nodes = 1
+            docs = node_state.get("documents")
+            if isinstance(docs, dict):
+                removed_entities += len(docs)
+            meta = node_state.get("meta")
+            if isinstance(meta, dict):
+                removed_meta_entries += len(meta)
+    else:
+        for node_state in profile_documents.values():
+            if not isinstance(node_state, dict):
+                continue
+            removed_nodes += 1
+            docs = node_state.get("documents")
+            if isinstance(docs, dict):
+                removed_entities += len(docs)
+            meta = node_state.get("meta")
+            if isinstance(meta, dict):
+                removed_meta_entries += len(meta)
+        pipeline_state.pop("profile_documents", None)
+
+    etl_engine._save_runtime_state(runtime_state)
+
+    return {
+        "pipeline_id": pipeline_id,
+        "node_id": node_id or None,
+        "removed_nodes": removed_nodes,
+        "removed_entities": removed_entities,
+        "removed_meta_entries": removed_meta_entries,
+        "remaining_summary": _build_pipeline_profile_state_summary(pipeline_id, node_id=node_id),
+        "cleared_at": datetime.utcnow().isoformat(),
+    }
 
 
 # ─── PIPELINES ────────────────────────────────────────────────────────────────
@@ -1024,6 +1180,30 @@ async def duplicate_pipeline(pipeline_id: str, db: Session = Depends(get_db)):
     db.add(new_pipeline)
     db.commit()
     return {"id": new_pipeline.id, "name": new_pipeline.name}
+
+
+@app.get("/api/pipelines/{pipeline_id}/profile-state")
+async def get_pipeline_profile_state(
+    pipeline_id: str,
+    node_id: Optional[str] = None,
+    limit: int = 10,
+):
+    return _build_pipeline_profile_state_summary(
+        pipeline_id=pipeline_id,
+        node_id=node_id,
+        limit=limit,
+    )
+
+
+@app.delete("/api/pipelines/{pipeline_id}/profile-state")
+async def clear_pipeline_profile_state(
+    pipeline_id: str,
+    node_id: Optional[str] = None,
+):
+    return _clear_pipeline_profile_state(
+        pipeline_id=pipeline_id,
+        node_id=node_id,
+    )
 
 
 # ─── MLOPS WORKFLOWS ─────────────────────────────────────────────────────────
@@ -8373,6 +8553,132 @@ async def detect_source_field_options(body: SourceFieldOptionsRequest):
         "row_count": len(normalized_rows),
         "preview": normalized_rows[:10],
         "sample_limited": True,
+    }
+
+
+@app.post("/api/custom-fields/validate")
+async def validate_custom_fields(body: CustomFieldValidationRequest):
+    config = body.config if isinstance(body.config, dict) else {}
+    raw_custom_fields = config.get("custom_fields")
+    parsed_specs = etl_engine._parse_custom_fields_config(raw_custom_fields)
+
+    max_rows = max(1, min(int(body.max_rows or 30), 200))
+    input_rows = body.rows if isinstance(body.rows, list) else []
+    normalized_rows: List[Dict[str, Any]] = []
+    for row in input_rows[:max_rows]:
+        if isinstance(row, dict):
+            normalized_rows.append(row)
+    warnings: List[str] = []
+    errors: List[str] = []
+
+    if not normalized_rows:
+        normalized_rows = [{}]
+        warnings.append("No sample rows were provided. Validation ran with a single empty row.")
+
+    raw_list: List[Any] = []
+    if isinstance(raw_custom_fields, list):
+        raw_list = raw_custom_fields
+    elif isinstance(raw_custom_fields, str):
+        text = raw_custom_fields.strip()
+        if text:
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    raw_list = parsed
+                else:
+                    errors.append("custom_fields JSON must be an array.")
+            except Exception as exc:
+                errors.append(f"custom_fields is not valid JSON: {exc}")
+    elif raw_custom_fields is None:
+        raw_list = []
+    else:
+        errors.append("custom_fields must be an array.")
+
+    seen_names: set = set()
+    for idx, item in enumerate(raw_list):
+        if not isinstance(item, dict):
+            errors.append(f"Field #{idx + 1}: item is not an object.")
+            continue
+        enabled = bool(item.get("enabled", True))
+        name = str(item.get("name") or item.get("field") or "").strip()
+        if not name:
+            errors.append(f"Field #{idx + 1}: name is required.")
+            continue
+        key = name.lower()
+        if key in seen_names:
+            errors.append(f"Field '{name}': duplicate field name.")
+        else:
+            seen_names.add(key)
+        if not enabled:
+            warnings.append(f"Field '{name}' is disabled and will be skipped.")
+            continue
+
+        mode = str(item.get("mode") or item.get("kind") or item.get("type") or "value").strip().lower()
+        if mode not in {"value", "json"}:
+            mode = "value"
+        if mode == "value":
+            expression = str(item.get("expression") or item.get("expr") or "").strip()
+            if not expression:
+                errors.append(f"Field '{name}': expression is required for Single Value mode.")
+        else:
+            template_value = item.get("json_template", item.get("template"))
+            if isinstance(template_value, str):
+                text = template_value.strip()
+                if not text:
+                    errors.append(f"Field '{name}': JSON template is required for JSON mode.")
+                else:
+                    try:
+                        json.loads(text)
+                    except Exception as exc:
+                        errors.append(f"Field '{name}': invalid JSON template ({exc}).")
+            elif isinstance(template_value, (dict, list)):
+                pass
+            else:
+                errors.append(f"Field '{name}': JSON template must be object/array or JSON string.")
+
+    if not parsed_specs:
+        errors.append("No enabled custom fields found to validate.")
+
+    if errors:
+        return {
+            "ok": False,
+            "input_rows": len(normalized_rows),
+            "output_rows": 0,
+            "errors": errors,
+            "warnings": warnings,
+            "sample_input": _json_safe_value(normalized_rows[:10]),
+            "sample_output": [],
+        }
+
+    try:
+        result_rows = etl_engine._transform_custom_fields(
+            normalized_rows,
+            config,
+            parsed_specs,
+            execution_context={
+                "node_id": "__custom_field_validation__",
+                "profile_state_by_node": {},
+            },
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "input_rows": len(normalized_rows),
+            "output_rows": 0,
+            "errors": [str(exc)],
+            "warnings": warnings,
+            "sample_input": _json_safe_value(normalized_rows[:10]),
+            "sample_output": [],
+        }
+
+    return {
+        "ok": True,
+        "input_rows": len(normalized_rows),
+        "output_rows": len(result_rows) if isinstance(result_rows, list) else 0,
+        "errors": [],
+        "warnings": warnings,
+        "sample_input": _json_safe_value(normalized_rows[:10]),
+        "sample_output": _json_safe_value((result_rows or [])[:20] if isinstance(result_rows, list) else []),
     }
 
 

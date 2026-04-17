@@ -57,6 +57,7 @@ interface CustomFieldSpec {
   mode: CustomFieldMode
   expression: string
   jsonTemplate: string
+  enabled: boolean
 }
 
 interface OracleColumnMappingSpec {
@@ -76,6 +77,36 @@ interface CustomFieldExampleItem {
   expression?: string
   jsonTemplate?: string
   tags?: string[]
+}
+
+interface ProfileMonitorNodeSummary {
+  node_id: string
+  entity_count: number
+  meta_count: number
+  sample_entity_keys: string[]
+  sample_documents: Array<{ entity_key: string; profile: Record<string, unknown> }>
+}
+
+interface ProfileMonitorResponse {
+  pipeline_id: string
+  node_id?: string | null
+  limit: number
+  total_nodes: number
+  total_entities: number
+  total_meta_entries: number
+  available_node_ids: string[]
+  nodes: ProfileMonitorNodeSummary[]
+  generated_at: string
+}
+
+interface CustomFieldValidationResult {
+  ok: boolean
+  input_rows: number
+  output_rows: number
+  errors: string[]
+  warnings: string[]
+  sample_input: Array<Record<string, unknown>>
+  sample_output: Array<Record<string, unknown>>
 }
 
 const MAX_PATH_DEPTH = 5
@@ -333,6 +364,60 @@ const CUSTOM_FIELD_EXAMPLE_REPOSITORY: CustomFieldExampleItem[] = [
     description: 'Text transforms and boolean flags.',
     tags: ['upper', 'lower', 'trim', 'contains'],
   },
+  {
+    id: 'profile_txn_counter',
+    title: 'Profile: Increment Transaction Count',
+    category: 'Profile Documents',
+    mode: 'value',
+    name: 'txn_count',
+    expression: "=inc('txn_count', 1)",
+    description: 'Stateful increment using previous profile value.',
+    tags: ['profile', 'inc', 'streaming'],
+  },
+  {
+    id: 'profile_amount_totals',
+    title: 'Profile: Total + Avg Amount',
+    category: 'Profile Documents',
+    mode: 'json',
+    name: 'amount_profile',
+    jsonTemplate: `{
+  "total_amount": "=inc('total_amount', field('amount'))",
+  "txn_count": "=inc('txn_count', 1)",
+  "avg_amount": "=safe_div(prev('total_amount',0) + coalesce(field('amount'),0), prev('txn_count',0) + 1, 0)"
+}`,
+    description: 'Incremental total/count and derived average per entity.',
+    tags: ['profile', 'safe_div', 'prev'],
+  },
+  {
+    id: 'profile_txn_type_map',
+    title: 'Profile: Transaction Type Frequency',
+    category: 'Profile Documents',
+    mode: 'value',
+    name: 'txn_types',
+    expression: "=map_inc('txn_types', field('txn_type'), 1)",
+    description: 'Increment map counter by transaction type.',
+    tags: ['profile', 'map_inc', 'object'],
+  },
+  {
+    id: 'profile_customer_group_aggregate',
+    title: 'Profile: Customer Aggregate Array',
+    category: 'Profile Documents',
+    mode: 'value',
+    name: 'customer_profiles',
+    expression: "=group_aggregate('CUSTACCOUNTNUMBER', obj(mintime=obj(path='MIS_TXNDATE',agg='min'), maxtime=obj(path='MIS_TXNDATE',agg='max'), total_transaction_count=obj(path='TRANSACTIONID',agg='count_non_null'), total_service_name=obj(path='SERVICENAME',agg='value_counts')), 'customer')",
+    description: 'In profile mode this keeps incremental state and returns batch-like grouped array output.',
+    tags: ['profile', 'group_aggregate', 'value_counts', 'count_non_null'],
+  },
+  {
+    id: 'profile_rolling_windows',
+    title: 'Profile: 1/7/30 Day Rolling Metrics',
+    category: 'Profile Documents',
+    mode: 'value',
+    name: 'amount_rolling',
+    expression: "=rolling_update('amount', field('amount'), field('txn_time'), array(1,7,30))",
+    description: 'Rolling count/sum/avg/min/max for profile timeline.',
+    tags: ['profile', 'rolling_update', 'windows'],
+  },
 ]
 
 const EXPRESSION_FUNCTION_SNIPPETS: Array<{ label: string; snippet: string }> = [
@@ -370,6 +455,13 @@ const EXPRESSION_FUNCTION_SNIPPETS: Array<{ label: string; snippet: string }> = 
   { label: 'contains(text,needle)', snippet: 'contains(${1:text}, ${2:needle})' },
   { label: 'array(...)', snippet: 'array(${1:value1}, ${2:value2})' },
   { label: 'obj(...)', snippet: "obj(${1:key}=${2:value})" },
+  { label: 'prev(path,default)', snippet: "prev('${1:field_name}', ${2:0})" },
+  { label: 'inc(path,amount)', snippet: "inc('${1:txn_count}', ${2:1})" },
+  { label: 'map_inc(path,key,amount)', snippet: "map_inc('${1:txn_types}', ${2:field('txn_type')}, ${3:1})" },
+  { label: 'profile group_aggregate', snippet: "group_aggregate('${1:key_field}', obj(${2:mintime}=obj(path='${3:MIS_TXNDATE}',agg='min'), ${4:maxtime}=obj(path='${3:MIS_TXNDATE}',agg='max'), ${5:total_transaction_count}=obj(path='${6:TRANSACTIONID}',agg='count_non_null')), '${7:key_name}')" },
+  { label: 'append_unique(path,value)', snippet: "append_unique('${1:agent_ids}', ${2:field('agent_id')})" },
+  { label: 'safe_div(num,den,default)', snippet: 'safe_div(${1:numerator}, ${2:denominator}, ${3:0})' },
+  { label: 'rolling_update(name,value,time,windows)', snippet: "rolling_update('${1:amount}', ${2:field('amount')}, ${3:field('txn_time')}, array(${4:1},${5:7},${6:30}))" },
 ]
 
 const CUSTOM_FIELD_TIPS_TEXT = `Available functions:
@@ -389,6 +481,12 @@ running_sum(), running_mean(), running_min(), running_max(), running_count(), ru
 rolling_sum(values,window), rolling_mean(values,window), rolling_min(), rolling_max(), rolling_count(), rolling_std(),
 rolling(values, window, 'mean'), running_all(values,'sum'), rolling_all(values,window,'mean'), last(values),
 sqrt(), log(), exp(), ceil(), floor(), sin(), cos(), tan()
+
+Profile document helpers:
+prev(path, default), inc(path_or_value, amount, default), map_inc(path_or_map,key,amount,default),
+append_unique(path_or_list,value,max_items), safe_div(num,den,default),
+rolling_update(name,value,txn_time,windows,retention_days),
+group_aggregate(key_path, metrics, key_name) [profile mode keeps incremental state and returns grouped array]
 
 count_if operators:
 eq / ==, != / not, contains / not_contains, like / not_like, in / not_in,
@@ -483,6 +581,7 @@ function createCustomFieldSpec(seed?: Partial<CustomFieldSpec>): CustomFieldSpec
     mode: seed?.mode || 'value',
     expression: seed?.expression || '',
     jsonTemplate: seed?.jsonTemplate || '{\n  "value": "=field(\'id\')"\n}',
+    enabled: seed?.enabled ?? true,
   }
 }
 
@@ -574,6 +673,7 @@ function parseCustomFieldSpecs(value: unknown): CustomFieldSpec[] {
         mode,
         expression: String(rec.expression || rec.expr || ''),
         jsonTemplate: String(rec.jsonTemplate || rec.json_template || rec.template || ''),
+        enabled: parseBoolLike(rec.enabled, true),
       })
     )
   })
@@ -587,7 +687,7 @@ function serializeCustomFieldSpecs(items: CustomFieldSpec[]): Array<Record<strin
       mode: item.mode,
       expression: item.mode === 'value' ? String(item.expression || '').trim() : '',
       json_template: item.mode === 'json' ? String(item.jsonTemplate || '').trim() : '',
-      enabled: true,
+      enabled: Boolean(item.enabled),
     }))
     .filter((item) => item.name)
 }
@@ -821,8 +921,64 @@ function inferUpstreamSources(
   })
 }
 
+function extractPreviewRowsFromNode(node: ETLNode | undefined): Array<Record<string, unknown>> {
+  if (!node?.data) return []
+  const cfg = (node.data.config && typeof node.data.config === 'object'
+    ? node.data.config
+    : {}) as Record<string, unknown>
+
+  const candidateSets = [
+    cfg._preview_rows,
+    node.data.executionSampleOutput,
+    node.data.executionSampleInput,
+  ]
+
+  const out: Array<Record<string, unknown>> = []
+  candidateSets.forEach((candidate) => {
+    if (!Array.isArray(candidate)) return
+    candidate.forEach((row) => {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) return
+      out.push(row as Record<string, unknown>)
+    })
+  })
+  return out
+}
+
+function inferUpstreamPreviewRows(
+  targetNodeId: string,
+  nodes: ETLNode[],
+  edges: Array<{ source: string; target: string }>,
+  maxRows = 30
+): Array<Record<string, unknown>> {
+  const nodesById = new Map(nodes.map((n) => [n.id, n] as const))
+  const incomingByTarget = buildIncomingByTarget(edges)
+  const queue = [...(incomingByTarget.get(targetNodeId) || [])]
+  const visited = new Set<string>()
+  const out: Array<Record<string, unknown>> = []
+
+  while (queue.length > 0 && out.length < maxRows) {
+    const nodeId = String(queue.shift() || '')
+    if (!nodeId || visited.has(nodeId)) continue
+    visited.add(nodeId)
+
+    const node = nodesById.get(nodeId)
+    const rows = extractPreviewRowsFromNode(node)
+    if (rows.length > 0) {
+      out.push(...rows.slice(0, Math.max(0, maxRows - out.length)))
+      if (out.length >= maxRows) break
+    }
+
+    const upstream = incomingByTarget.get(nodeId) || []
+    upstream.forEach((srcId) => {
+      if (!visited.has(srcId)) queue.push(srcId)
+    })
+  }
+
+  return out.slice(0, maxRows)
+}
+
 export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
-  const { nodes, edges, selectedNodeId, updateNodeConfig, updateNodeLabel, removeNode } = useWorkflowStore()
+  const { nodes, edges, selectedNodeId, pipeline, updateNodeConfig, updateNodeLabel, removeNode } = useWorkflowStore()
   const [form] = Form.useForm()
   const [activeTab, setActiveTab] = useState('config')
   const [jsonPathDetectLoading, setJsonPathDetectLoading] = useState(false)
@@ -833,7 +989,24 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [customFieldDraft, setCustomFieldDraft] = useState<CustomFieldSpec[]>([])
   const [customIncludeSourceDraft, setCustomIncludeSourceDraft] = useState(true)
   const [customPrimaryKeyFieldDraft, setCustomPrimaryKeyFieldDraft] = useState('')
+  const [customProfileEnabledDraft, setCustomProfileEnabledDraft] = useState(false)
+  const [customProfileEmitModeDraft, setCustomProfileEmitModeDraft] = useState<'changed_only' | 'all_entities'>('changed_only')
+  const [customProfileRequiredFieldsDraft, setCustomProfileRequiredFieldsDraft] = useState<string[]>([])
+  const [customProfileEventTimeFieldDraft, setCustomProfileEventTimeFieldDraft] = useState('')
+  const [customProfileWindowDaysDraft, setCustomProfileWindowDaysDraft] = useState('1,7,30')
+  const [customProfileRetentionDaysDraft, setCustomProfileRetentionDaysDraft] = useState(45)
+  const [customProfileIncludeChangeFieldsDraft, setCustomProfileIncludeChangeFieldsDraft] = useState(false)
+  const [profileMonitorLoading, setProfileMonitorLoading] = useState(false)
+  const [profileMonitorClearing, setProfileMonitorClearing] = useState(false)
+  const [profileMonitorData, setProfileMonitorData] = useState<ProfileMonitorResponse | null>(null)
+  const [profileMonitorError, setProfileMonitorError] = useState<string | null>(null)
+  const [expandedEditorFieldId, setExpandedEditorFieldId] = useState<string | null>(null)
+  const [expandedEditorMode, setExpandedEditorMode] = useState<CustomFieldMode>('value')
+  const [validationLoading, setValidationLoading] = useState(false)
+  const [validationResult, setValidationResult] = useState<CustomFieldValidationResult | null>(null)
+  const [validationModalOpen, setValidationModalOpen] = useState(false)
   const [activeExpressionFieldId, setActiveExpressionFieldId] = useState<string | null>(null)
+  const [collapsedCustomFieldIds, setCollapsedCustomFieldIds] = useState<string[]>([])
   const [exampleRepoCategory, setExampleRepoCategory] = useState<string>('all')
   const [exampleRepoSearch, setExampleRepoSearch] = useState('')
   const [oracleStudioOpen, setOracleStudioOpen] = useState(false)
@@ -915,6 +1088,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const nodeConfig = (data?.config && typeof data.config === 'object' ? data.config : {}) as Record<string, unknown>
   const configuredCustomFields = parseCustomFieldSpecs(nodeConfig.custom_fields)
   const customFieldConfiguredCount = configuredCustomFields.length
+  const customFieldEnabledConfiguredCount = configuredCustomFields.filter((item) => item.enabled).length
+  const customFieldDraftCount = customFieldDraft.length
+  const customFieldDraftEnabledCount = customFieldDraft.filter((item) => item.enabled).length
+  const customFieldDraftCollapsedCount = collapsedCustomFieldIds.length
   const configuredOracleMappings = parseOracleColumnMappings(nodeConfig.oracle_column_mappings)
   const oracleMappingConfiguredCount = configuredOracleMappings.length
   const oracleOnlyMappedConfigured = parseBoolLike(nodeConfig.oracle_only_mapped_columns, false)
@@ -1029,6 +1206,30 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const configuredPrimaryKeyField = String(
     nodeConfig.custom_primary_key_field || nodeConfig.custom_group_by_field || ''
   ).trim()
+  const configuredProfileEnabled = Boolean(nodeConfig.custom_profile_enabled ?? false)
+  const configuredProfileEmitMode = (
+    String(nodeConfig.custom_profile_emit_mode || 'changed_only').trim().toLowerCase() === 'all_entities'
+      ? 'all_entities'
+      : 'changed_only'
+  ) as 'changed_only' | 'all_entities'
+  const configuredProfileRequiredFields = parseFieldList(nodeConfig.custom_profile_required_fields)
+  const configuredProfileEventTimeField = String(nodeConfig.custom_profile_event_time_field || '').trim()
+  const configuredProfileWindowDays = String(nodeConfig.custom_profile_window_days || '1,7,30').trim() || '1,7,30'
+  const configuredProfileRetentionDays = Number(nodeConfig.custom_profile_retention_days ?? 45)
+  const configuredProfileIncludeChangeFields = Boolean(nodeConfig.custom_profile_include_change_fields ?? false)
+  const activePipelineId = String(pipeline?.id || '').trim()
+  const activeProfileNodeSummary = useMemo(() => {
+    if (!profileMonitorData || !Array.isArray(profileMonitorData.nodes) || !selectedNodeId) return null
+    return (
+      profileMonitorData.nodes.find((item) => String(item.node_id) === String(selectedNodeId))
+      || profileMonitorData.nodes[0]
+      || null
+    )
+  }, [profileMonitorData, selectedNodeId])
+  const expandedEditorField = useMemo(
+    () => customFieldDraft.find((item) => item.id === expandedEditorFieldId) || null,
+    [customFieldDraft, expandedEditorFieldId]
+  )
   const oracleUpstreamFieldOptions = useMemo(
     () => (
       nodeType === 'oracle_destination' && selectedNodeId
@@ -1082,6 +1283,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   useEffect(() => {
     setExpressionCompletionEntries(expressionCompletionEntries)
   }, [expressionCompletionEntries])
+
+  useEffect(() => {
+    if (!customFieldStudioOpen || nodeType !== 'map_transform' || !customProfileEnabledDraft) return
+    if (!selectedNodeId || !activePipelineId) return
+    void refreshProfileMonitor()
+  }, [customFieldStudioOpen, customProfileEnabledDraft, nodeType, selectedNodeId, activePipelineId])
 
   if (!data || !definition) return null
 
@@ -1187,6 +1394,136 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     }
   }
 
+  const refreshProfileMonitor = async () => {
+    if (!activePipelineId || !selectedNodeId) {
+      setProfileMonitorData(null)
+      setProfileMonitorError('Save pipeline first to enable profile monitoring.')
+      return
+    }
+    setProfileMonitorLoading(true)
+    setProfileMonitorError(null)
+    try {
+      const response = await api.getPipelineProfileState(activePipelineId, selectedNodeId, 12)
+      setProfileMonitorData(response as ProfileMonitorResponse)
+      setProfileMonitorError(null)
+    } catch (err: any) {
+      const msg = String(err?.message || 'Failed to load profile state')
+      setProfileMonitorError(msg)
+      notification.error({
+        message: 'Profile monitor failed',
+        description: msg,
+        placement: 'bottomRight',
+      })
+    } finally {
+      setProfileMonitorLoading(false)
+    }
+  }
+
+  const clearProfileMonitor = async () => {
+    if (!activePipelineId || !selectedNodeId) {
+      notification.warning({
+        message: 'Pipeline not ready',
+        description: 'Save pipeline first, then clear profile data.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    setProfileMonitorClearing(true)
+    try {
+      const result = await api.clearPipelineProfileState(activePipelineId, selectedNodeId)
+      const removedEntities = Number((result as any)?.removed_entities || 0)
+      const removedNodes = Number((result as any)?.removed_nodes || 0)
+      notification.success({
+        message: 'Profile data cleared',
+        description: `Removed ${removedEntities} profile document${removedEntities === 1 ? '' : 's'} from ${removedNodes} node${removedNodes === 1 ? '' : 's'}.`,
+        placement: 'bottomRight',
+      })
+      await refreshProfileMonitor()
+    } catch (err: any) {
+      const msg = String(err?.message || 'Failed to clear profile state')
+      notification.error({
+        message: 'Clear profile failed',
+        description: msg,
+        placement: 'bottomRight',
+      })
+    } finally {
+      setProfileMonitorClearing(false)
+    }
+  }
+
+  const openExpandedEditor = (fieldId: string, mode: CustomFieldMode) => {
+    setExpandedEditorFieldId(fieldId)
+    setExpandedEditorMode(mode)
+  }
+
+  const runCustomFieldValidation = async () => {
+    const normalized = serializeCustomFieldSpecs(customFieldDraft)
+    if (normalized.length === 0) {
+      notification.warning({
+        message: 'No custom fields to validate',
+        description: 'Add at least one custom field before running test output validation.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+
+    const primaryKeyField = String(customPrimaryKeyFieldDraft || '').trim()
+    const profileWindowDays = String(customProfileWindowDaysDraft || '').trim() || '1,7,30'
+    const profileRetentionDays = Number.isFinite(customProfileRetentionDaysDraft) && customProfileRetentionDaysDraft > 0
+      ? Math.floor(customProfileRetentionDaysDraft)
+      : 45
+
+    const directPreviewRows = extractPreviewRowsFromNode(node).slice(0, 20)
+    const upstreamPreviewRows = selectedNodeId
+      ? inferUpstreamPreviewRows(selectedNodeId, nodes, edges, 20)
+      : []
+    const sampleRows = [...directPreviewRows, ...upstreamPreviewRows]
+      .filter((row) => row && typeof row === 'object')
+      .slice(0, 30)
+
+    const testConfig: Record<string, unknown> = {
+      ...nodeConfig,
+      custom_fields: normalized,
+      custom_include_source_fields: customIncludeSourceDraft,
+      custom_primary_key_field: primaryKeyField,
+      custom_group_by_field: primaryKeyField,
+      custom_profile_enabled: customProfileEnabledDraft,
+      custom_profile_emit_mode: customProfileEmitModeDraft,
+      custom_profile_required_fields: customProfileRequiredFieldsDraft.join(', '),
+      custom_profile_event_time_field: customProfileEventTimeFieldDraft,
+      custom_profile_window_days: profileWindowDays,
+      custom_profile_retention_days: profileRetentionDays,
+      custom_profile_include_change_fields: customProfileIncludeChangeFieldsDraft,
+    }
+
+    setValidationLoading(true)
+    setValidationResult(null)
+    try {
+      const result = await api.validateCustomFields({
+        config: testConfig,
+        rows: sampleRows,
+        max_rows: 30,
+      })
+      setValidationResult(result as CustomFieldValidationResult)
+      setValidationModalOpen(true)
+      notification.success({
+        message: 'Validation completed',
+        description: `Input ${Number((result as any)?.input_rows || 0)} row(s), output ${Number((result as any)?.output_rows || 0)} row(s).`,
+        placement: 'bottomRight',
+        duration: 2,
+      })
+    } catch (err: any) {
+      const msg = String(err?.message || 'Custom field validation failed')
+      notification.error({
+        message: 'Validation failed',
+        description: msg,
+        placement: 'bottomRight',
+      })
+    } finally {
+      setValidationLoading(false)
+    }
+  }
+
   const openCustomFieldStudio = () => {
     setCustomFieldDraft(
       configuredCustomFields.length > 0
@@ -1195,10 +1532,26 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     )
     setCustomIncludeSourceDraft(Boolean(nodeConfig.custom_include_source_fields ?? true))
     setCustomPrimaryKeyFieldDraft(configuredPrimaryKeyField)
+    setCustomProfileEnabledDraft(configuredProfileEnabled)
+    setCustomProfileEmitModeDraft(configuredProfileEmitMode)
+    setCustomProfileRequiredFieldsDraft(configuredProfileRequiredFields)
+    setCustomProfileEventTimeFieldDraft(configuredProfileEventTimeField)
+    setCustomProfileWindowDaysDraft(configuredProfileWindowDays)
+    setCustomProfileRetentionDaysDraft(
+      Number.isFinite(configuredProfileRetentionDays) && configuredProfileRetentionDays > 0
+        ? Math.floor(configuredProfileRetentionDays)
+        : 45
+    )
+    setCustomProfileIncludeChangeFieldsDraft(configuredProfileIncludeChangeFields)
     setActiveExpressionFieldId(null)
     setExampleRepoCategory('all')
     setExampleRepoSearch('')
     setCustomFieldStudioOpen(true)
+    setProfileMonitorData(null)
+    setProfileMonitorError(null)
+    setValidationResult(null)
+    setValidationModalOpen(false)
+    setCollapsedCustomFieldIds([])
   }
 
   const updateCustomFieldDraft = (id: string, patch: Partial<CustomFieldSpec>) => {
@@ -1213,6 +1566,27 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
   const removeCustomFieldDraft = (id: string) => {
     setCustomFieldDraft((prev) => prev.filter((item) => item.id !== id))
+    setCollapsedCustomFieldIds((prev) => prev.filter((itemId) => itemId !== id))
+  }
+
+  const setAllCustomFieldsEnabled = (enabled: boolean) => {
+    setCustomFieldDraft((prev) => prev.map((item) => ({ ...item, enabled })))
+  }
+
+  const expandAllCustomFields = () => {
+    setCollapsedCustomFieldIds([])
+  }
+
+  const collapseAllCustomFields = () => {
+    setCollapsedCustomFieldIds(customFieldDraft.map((item) => item.id))
+  }
+
+  const toggleCustomFieldCollapsed = (id: string) => {
+    setCollapsedCustomFieldIds((prev) => (
+      prev.includes(id)
+        ? prev.filter((itemId) => itemId !== id)
+        : [...prev, id]
+    ))
   }
 
   const insertIntoActiveExpression = (token: string) => {
@@ -1246,16 +1620,30 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const saveCustomFieldStudio = () => {
     const normalized = serializeCustomFieldSpecs(customFieldDraft)
     const primaryKeyField = String(customPrimaryKeyFieldDraft || '').trim()
+    const profileWindowDays = String(customProfileWindowDaysDraft || '').trim() || '1,7,30'
+    const profileRetentionDays = Number.isFinite(customProfileRetentionDaysDraft) && customProfileRetentionDaysDraft > 0
+      ? Math.floor(customProfileRetentionDaysDraft)
+      : 45
     updateNodeConfig(selectedNodeId!, {
       custom_fields: normalized,
       custom_include_source_fields: customIncludeSourceDraft,
       custom_primary_key_field: primaryKeyField,
       custom_group_by_field: primaryKeyField,
+      custom_profile_enabled: customProfileEnabledDraft,
+      custom_profile_emit_mode: customProfileEmitModeDraft,
+      custom_profile_required_fields: customProfileRequiredFieldsDraft.join(', '),
+      custom_profile_event_time_field: customProfileEventTimeFieldDraft,
+      custom_profile_window_days: profileWindowDays,
+      custom_profile_retention_days: profileRetentionDays,
+      custom_profile_include_change_fields: customProfileIncludeChangeFieldsDraft,
     })
     if (normalized.length > 0) {
       const outputFields = uniqueFieldNames(
         [
-          ...normalized.map((item) => String(item.name || '').trim()).filter(Boolean),
+          ...normalized
+            .filter((item) => Boolean(item.enabled))
+            .map((item) => String(item.name || '').trim())
+            .filter(Boolean),
           ...(primaryKeyField ? [primaryKeyField] : []),
         ]
       )
@@ -1479,7 +1867,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       color: '#22c55e',
                     }}
                   >
-                    {customFieldConfiguredCount} custom
+                    {customFieldEnabledConfiguredCount}/{customFieldConfiguredCount} enabled
                   </Tag>
                 ) : null}
               </Space>
@@ -2072,6 +2460,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             />
             <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Include source fields in output</Text>
             <Button
+              loading={validationLoading}
+              onClick={() => {
+                void runCustomFieldValidation()
+              }}
+              style={{ background: '#0ea5e91a', border: '1px solid #0ea5e940', color: '#0284c7' }}
+            >
+              Test Output Validation
+            </Button>
+            <Button
               onClick={() => addCustomFieldDraft()}
               style={{ background: '#6366f11a', border: '1px solid #6366f140', color: '#6366f1' }}
             >
@@ -2105,7 +2502,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             </Text>
             <br />
             <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
-              When group field is set, expressions run once per group (example: `sum(field('premium'))`).
+              Group mode: expressions run once per group. Profile mode: expressions run per incoming row and update one document per entity.
             </Text>
             <div
               style={{
@@ -2128,6 +2525,154 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 placeholder="Select key field (example: state, agencode)"
                 style={{ width: '100%', marginTop: 6 }}
               />
+            </div>
+            <div
+              style={{
+                marginTop: 10,
+                background: 'var(--app-card-bg)',
+                border: '1px solid var(--app-border-strong)',
+                borderRadius: 8,
+                padding: 10,
+              }}
+            >
+              <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                  Profile Document Mode
+                </Text>
+                <Switch
+                  checked={customProfileEnabledDraft}
+                  onChange={setCustomProfileEnabledDraft}
+                />
+              </Space>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                One JSON profile per entity key with incremental updates.
+              </Text>
+              {customProfileEnabledDraft ? (
+                <Space direction="vertical" size={8} style={{ marginTop: 8, width: '100%' }}>
+                  <Select
+                    value={customProfileEmitModeDraft}
+                    onChange={(value) => setCustomProfileEmitModeDraft(value as 'changed_only' | 'all_entities')}
+                    options={[
+                      { value: 'changed_only', label: 'Emit changed entities only' },
+                      { value: 'all_entities', label: 'Emit all entity profiles' },
+                    ]}
+                    style={{ width: '100%' }}
+                  />
+                  <Select
+                    allowClear
+                    showSearch
+                    value={customProfileEventTimeFieldDraft || undefined}
+                    onChange={(value) => setCustomProfileEventTimeFieldDraft(String(value || ''))}
+                    options={expressionFieldOptions.map((field) => ({ value: field, label: field }))}
+                    placeholder="Event time field (optional)"
+                    style={{ width: '100%' }}
+                  />
+                  <Select
+                    mode="tags"
+                    tokenSeparators={[',']}
+                    value={customProfileRequiredFieldsDraft}
+                    onChange={(values) => setCustomProfileRequiredFieldsDraft(uniqueFieldNames((values || []).map((v) => String(v))))}
+                    options={expressionFieldOptions.map((field) => ({ value: field, label: field }))}
+                    placeholder="Required fields for validation"
+                    style={{ width: '100%' }}
+                  />
+                  <Input
+                    value={customProfileWindowDaysDraft}
+                    onChange={(e) => setCustomProfileWindowDaysDraft(e.target.value)}
+                    placeholder="Rolling windows (days) e.g. 1,7,30"
+                    style={commonInputStyle}
+                  />
+                  <InputNumber
+                    min={1}
+                    value={customProfileRetentionDaysDraft}
+                    onChange={(value) => setCustomProfileRetentionDaysDraft(Number(value || 45))}
+                    placeholder="Retention days"
+                    style={{ width: '100%' }}
+                  />
+                  <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                      Include changed fields metadata
+                    </Text>
+                    <Switch
+                      checked={customProfileIncludeChangeFieldsDraft}
+                      onChange={setCustomProfileIncludeChangeFieldsDraft}
+                    />
+                  </Space>
+                  <Divider style={{ margin: '6px 0', borderColor: 'var(--app-border-strong)' }} />
+                  <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                      Profile Monitoring
+                    </Text>
+                    <Space size={6}>
+                      <Button
+                        size="small"
+                        loading={profileMonitorLoading}
+                        onClick={() => {
+                          void refreshProfileMonitor()
+                        }}
+                      >
+                        Refresh
+                      </Button>
+                      <Button
+                        size="small"
+                        danger
+                        loading={profileMonitorClearing}
+                        onClick={() => {
+                          Modal.confirm({
+                            title: 'Clear Profile Data',
+                            content: 'Clear stored profile documents for this node?',
+                            okText: 'Clear',
+                            okButtonProps: { danger: true },
+                            onOk: async () => {
+                              await clearProfileMonitor()
+                            },
+                          })
+                        }}
+                      >
+                        Clear
+                      </Button>
+                    </Space>
+                  </Space>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Pipeline: {activePipelineId || 'Not saved yet'} | Node: {selectedNodeId || 'N/A'}
+                  </Text>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Profiles: {Number(activeProfileNodeSummary?.entity_count || 0)} | Meta entries: {Number(activeProfileNodeSummary?.meta_count || 0)}
+                  </Text>
+                  {profileMonitorError ? (
+                    <Text style={{ color: '#ef4444', fontSize: 11 }}>
+                      {profileMonitorError}
+                    </Text>
+                  ) : null}
+                  {activeProfileNodeSummary?.sample_entity_keys?.length ? (
+                    <div
+                      style={{
+                        maxHeight: 140,
+                        overflowY: 'auto',
+                        border: '1px solid var(--app-border-strong)',
+                        borderRadius: 8,
+                        padding: 8,
+                        background: 'var(--app-card-bg)',
+                      }}
+                    >
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                        Sample entity keys
+                      </Text>
+                      <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                        {activeProfileNodeSummary.sample_entity_keys.map((key) => (
+                          <Tag key={key} style={{ marginInlineEnd: 0 }}>
+                            {String(key)}
+                          </Tag>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                      No stored profile documents for this node yet.
+                    </Text>
+                  )}
+                </Space>
+              ) : null}
             </div>
 
             <div style={{ marginTop: 10 }}>
@@ -2196,98 +2741,209 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           </div>
 
           <div style={{ flex: 1, padding: 14, overflowY: 'auto' }}>
+            <Space
+              align="center"
+              wrap
+              style={{ justifyContent: 'space-between', width: '100%', marginBottom: 10 }}
+            >
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                {customFieldDraftEnabledCount}/{customFieldDraftCount} enabled
+                {customFieldDraftCount > 0 ? ` • ${customFieldDraftCollapsedCount} collapsed` : ''}
+              </Text>
+              <Space size={6} wrap>
+                <Button
+                  size="small"
+                  disabled={customFieldDraftCount === 0 || customFieldDraftEnabledCount === customFieldDraftCount}
+                  onClick={() => setAllCustomFieldsEnabled(true)}
+                >
+                  Enable All
+                </Button>
+                <Button
+                  size="small"
+                  disabled={customFieldDraftCount === 0 || customFieldDraftEnabledCount === 0}
+                  onClick={() => setAllCustomFieldsEnabled(false)}
+                >
+                  Disable All
+                </Button>
+                <Button
+                  size="small"
+                  disabled={customFieldDraftCount === 0 || customFieldDraftCollapsedCount === 0}
+                  onClick={expandAllCustomFields}
+                >
+                  Expand All
+                </Button>
+                <Button
+                  size="small"
+                  disabled={customFieldDraftCount === 0 || customFieldDraftCollapsedCount === customFieldDraftCount}
+                  onClick={collapseAllCustomFields}
+                >
+                  Collapse All
+                </Button>
+              </Space>
+            </Space>
             {customFieldDraft.length === 0 ? (
               <div style={{ padding: '24px 0' }}>
                 <Text style={{ color: 'var(--app-text-subtle)' }}>No custom fields yet. Click Add Field.</Text>
               </div>
             ) : (
-              customFieldDraft.map((item, idx) => (
-                <div
-                  key={item.id}
-                  style={{
-                    background: 'var(--app-card-bg)',
-                    border: '1px solid var(--app-border-strong)',
-                    borderRadius: 10,
-                    padding: 12,
-                    marginBottom: 12,
-                  }}
-                >
-                  <Space style={{ justifyContent: 'space-between', width: '100%' }}>
-                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Field #{idx + 1}</Text>
-                    <Button
-                      danger
-                      type="text"
-                      icon={<DeleteOutlined />}
-                      onClick={() => removeCustomFieldDraft(item.id)}
-                    >
-                      Remove
-                    </Button>
-                  </Space>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 200px', gap: 10, marginTop: 8 }}>
-                    <Input
-                      value={item.name}
-                      placeholder="Custom field name (e.g. profit_margin)"
-                      onChange={(e) => updateCustomFieldDraft(item.id, { name: e.target.value })}
-                      style={commonInputStyle}
-                    />
-                    <Select
-                      value={item.mode}
-                      options={[
-                        { value: 'value', label: 'Single Value Expression' },
-                        { value: 'json', label: 'JSON Object/Array Template' },
-                      ]}
-                      onChange={(value) => updateCustomFieldDraft(item.id, { mode: value as CustomFieldMode })}
-                    />
-                  </div>
+              customFieldDraft.map((item, idx) => {
+                const isCollapsed = collapsedCustomFieldIds.includes(item.id)
+                const preview = (
+                  item.mode === 'value'
+                    ? String(item.expression || '').trim()
+                    : String(item.jsonTemplate || '').trim().replace(/\s+/g, ' ')
+                )
+                return (
+                  <div
+                    key={item.id}
+                    style={{
+                      background: 'var(--app-card-bg)',
+                      border: '1px solid var(--app-border-strong)',
+                      borderRadius: 10,
+                      padding: 12,
+                      marginBottom: 12,
+                      opacity: item.enabled ? 1 : 0.72,
+                    }}
+                  >
+                    <Space align="center" style={{ justifyContent: 'space-between', width: '100%' }}>
+                      <Space size={8} align="center">
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Field #{idx + 1}</Text>
+                        <Tag
+                          style={{
+                            marginInlineEnd: 0,
+                            background: item.enabled ? '#22c55e1a' : '#64748b1a',
+                            border: item.enabled ? '1px solid #22c55e40' : '1px solid #64748b40',
+                            color: item.enabled ? '#22c55e' : '#94a3b8',
+                          }}
+                        >
+                          {item.enabled ? 'Enabled' : 'Disabled'}
+                        </Tag>
+                        <Tag
+                          style={{
+                            marginInlineEnd: 0,
+                            background: isCollapsed ? '#0ea5e91a' : '#6366f11a',
+                            border: isCollapsed ? '1px solid #0ea5e940' : '1px solid #6366f140',
+                            color: isCollapsed ? '#0284c7' : '#6366f1',
+                          }}
+                        >
+                          {isCollapsed ? 'Collapsed' : 'Expanded'}
+                        </Tag>
+                      </Space>
+                      <Space size={6} align="center" wrap>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Enable</Text>
+                        <Switch
+                          size="small"
+                          checked={item.enabled}
+                          onChange={(value) => updateCustomFieldDraft(item.id, { enabled: value })}
+                        />
+                        <Button
+                          size="small"
+                          onClick={() => toggleCustomFieldCollapsed(item.id)}
+                        >
+                          {isCollapsed ? 'Expand' : 'Collapse'}
+                        </Button>
+                        <Button
+                          size="small"
+                          onClick={() => openExpandedEditor(item.id, item.mode)}
+                        >
+                          Expand Editor
+                        </Button>
+                        <Button
+                          danger
+                          type="text"
+                          icon={<DeleteOutlined />}
+                          onClick={() => removeCustomFieldDraft(item.id)}
+                        >
+                          Remove
+                        </Button>
+                      </Space>
+                    </Space>
+                    {isCollapsed ? (
+                      <div style={{ marginTop: 8 }}>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                          Name: {item.name || '(unnamed)'} | Mode: {item.mode === 'value' ? 'Single Value Expression' : 'JSON Object/Array Template'}
+                        </Text>
+                        <br />
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                          {preview ? preview.slice(0, 180) : 'No expression/template configured yet.'}
+                          {preview.length > 180 ? '...' : ''}
+                        </Text>
+                      </div>
+                    ) : (
+                      <>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 200px', gap: 10, marginTop: 8 }}>
+                          <Input
+                            value={item.name}
+                            placeholder="Custom field name (e.g. profit_margin)"
+                            onChange={(e) => updateCustomFieldDraft(item.id, { name: e.target.value })}
+                            style={commonInputStyle}
+                          />
+                          <Select
+                            value={item.mode}
+                            options={[
+                              { value: 'value', label: 'Single Value Expression' },
+                              { value: 'json', label: 'JSON Object/Array Template' },
+                            ]}
+                            onChange={(value) => updateCustomFieldDraft(item.id, { mode: value as CustomFieldMode })}
+                          />
+                        </div>
 
-                  {item.mode === 'value' ? (
-                    <div style={{ marginTop: 10, border: '1px solid var(--app-border-strong)', borderRadius: 8, overflow: 'hidden' }}>
-                      <Editor
-                        height="120px"
-                        language="etl-expr"
-                        value={item.expression}
-                        beforeMount={(monaco) => ensureExpressionLanguage(monaco)}
-                        onMount={(editor) => {
-                          editor.onDidFocusEditorText(() => {
-                            setActiveExpressionFieldId(item.id)
-                          })
-                        }}
-                        onChange={(value) => updateCustomFieldDraft(item.id, { expression: value || '' })}
-                        theme="vs-dark"
-                        options={{
-                          minimap: { enabled: false },
-                          fontSize: 12,
-                          scrollBeyondLastLine: false,
-                          wordWrap: 'on',
-                          quickSuggestions: true,
-                          suggestOnTriggerCharacters: true,
-                          padding: { top: 8, bottom: 8 },
-                        }}
-                      />
-                    </div>
-                  ) : (
-                    <div style={{ marginTop: 10, border: '1px solid var(--app-border-strong)', borderRadius: 8, overflow: 'hidden' }}>
-                      <Editor
-                        height="200px"
-                        language="json"
-                        value={item.jsonTemplate}
-                        onChange={(value) => updateCustomFieldDraft(item.id, { jsonTemplate: value || '' })}
-                        theme="vs-dark"
-                        options={{
-                          minimap: { enabled: false },
-                          fontSize: 12,
-                          scrollBeyondLastLine: false,
-                          wordWrap: 'on',
-                          padding: { top: 8, bottom: 8 },
-                        }}
-                      />
-                    </div>
-                  )}
-                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, marginTop: 6, display: 'block' }}>
-                    Reference source fields as `field('column_name')` and custom fields by name or `field('custom_name')`.
-                  </Text>
-                </div>
-              ))
+                        {item.mode === 'value' ? (
+                          <div style={{ marginTop: 10, border: '1px solid var(--app-border-strong)', borderRadius: 8, overflow: 'hidden' }}>
+                            <Editor
+                              height="120px"
+                              language="etl-expr"
+                              value={item.expression}
+                              beforeMount={(monaco) => ensureExpressionLanguage(monaco)}
+                              onMount={(editor) => {
+                                editor.onDidFocusEditorText(() => {
+                                  setActiveExpressionFieldId(item.id)
+                                })
+                              }}
+                              onChange={(value) => updateCustomFieldDraft(item.id, { expression: value || '' })}
+                              theme="vs-dark"
+                              options={{
+                                minimap: { enabled: false },
+                                fontSize: 12,
+                                scrollBeyondLastLine: false,
+                                wordWrap: 'on',
+                                quickSuggestions: true,
+                                suggestOnTriggerCharacters: true,
+                                padding: { top: 8, bottom: 8 },
+                              }}
+                            />
+                          </div>
+                        ) : (
+                          <div style={{ marginTop: 10, border: '1px solid var(--app-border-strong)', borderRadius: 8, overflow: 'hidden' }}>
+                            <Editor
+                              height="200px"
+                              language="json"
+                              value={item.jsonTemplate}
+                              onChange={(value) => updateCustomFieldDraft(item.id, { jsonTemplate: value || '' })}
+                              theme="vs-dark"
+                              options={{
+                                minimap: { enabled: false },
+                                fontSize: 12,
+                                scrollBeyondLastLine: false,
+                                wordWrap: 'on',
+                                padding: { top: 8, bottom: 8 },
+                              }}
+                            />
+                          </div>
+                        )}
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, marginTop: 6, display: 'block' }}>
+                          Reference source fields as `field('column_name')` and custom fields by name or `field('custom_name')`.
+                        </Text>
+                        {!item.enabled ? (
+                          <Text style={{ color: '#f59e0b', fontSize: 11, marginTop: 4, display: 'block' }}>
+                            Disabled fields are saved but excluded from execution and validation output.
+                          </Text>
+                        ) : null}
+                      </>
+                    )}
+                  </div>
+                )
+              })
             )}
           </div>
 
@@ -2422,6 +3078,200 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         </div>
       </Modal>
     )}
+    <Modal
+      open={Boolean(expandedEditorField)}
+      onCancel={() => setExpandedEditorFieldId(null)}
+      footer={null}
+      centered
+      width="96vw"
+      styles={{
+        content: {
+          padding: 0,
+          borderRadius: 12,
+          overflow: 'hidden',
+          border: '1px solid var(--app-border-strong)',
+          background: 'var(--app-panel-bg)',
+          height: '96vh',
+          display: 'flex',
+          flexDirection: 'column',
+        },
+        body: {
+          padding: 0,
+          flex: 1,
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+        },
+      }}
+    >
+      <div
+        style={{
+          borderBottom: '1px solid var(--app-border-strong)',
+          background: 'var(--app-card-bg)',
+          padding: '12px 16px',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: 12,
+        }}
+      >
+        <div>
+          <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 16 }}>
+            Expanded Custom Field Editor
+          </Text>
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+            {expandedEditorField ? `Field: ${expandedEditorField.name || '(unnamed)'}` : ''}
+          </Text>
+        </div>
+        <Space>
+          <Tooltip title="Close">
+            <Button
+              shape="circle"
+              icon={<CloseOutlined />}
+              onClick={() => setExpandedEditorFieldId(null)}
+              aria-label="Close expanded editor"
+            />
+          </Tooltip>
+        </Space>
+      </div>
+      <div style={{ flex: 1, minHeight: 0, padding: 10 }}>
+        {expandedEditorField ? (
+          <Editor
+            height="100%"
+            language={expandedEditorMode === 'json' ? 'json' : 'etl-expr'}
+            value={expandedEditorMode === 'json' ? expandedEditorField.jsonTemplate : expandedEditorField.expression}
+            beforeMount={(monaco) => {
+              if (expandedEditorMode === 'value') ensureExpressionLanguage(monaco)
+            }}
+            onChange={(value) => {
+              if (!expandedEditorField) return
+              if (expandedEditorMode === 'json') {
+                updateCustomFieldDraft(expandedEditorField.id, { jsonTemplate: value || '' })
+              } else {
+                updateCustomFieldDraft(expandedEditorField.id, { expression: value || '' })
+              }
+            }}
+            theme="vs-dark"
+            options={{
+              minimap: { enabled: false },
+              fontSize: 14,
+              scrollBeyondLastLine: false,
+              wordWrap: 'on',
+              quickSuggestions: true,
+              suggestOnTriggerCharacters: true,
+              padding: { top: 10, bottom: 10 },
+            }}
+          />
+        ) : null}
+      </div>
+    </Modal>
+    <Modal
+      open={validationModalOpen}
+      onCancel={() => setValidationModalOpen(false)}
+      footer={null}
+      centered
+      width="92vw"
+      styles={{
+        content: {
+          borderRadius: 12,
+          border: '1px solid var(--app-border-strong)',
+          background: 'var(--app-panel-bg)',
+        },
+        body: {
+          maxHeight: '84vh',
+          overflowY: 'auto',
+          padding: 16,
+        },
+      }}
+    >
+      <Space direction="vertical" size={10} style={{ width: '100%' }}>
+        <Space align="center" style={{ justifyContent: 'space-between', width: '100%' }}>
+          <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 16 }}>
+            Custom Field Validation Output
+          </Text>
+          <Tag
+            style={{
+              marginInlineEnd: 0,
+              background: validationResult?.ok ? '#22c55e1a' : '#ef44441a',
+              border: validationResult?.ok ? '1px solid #22c55e40' : '1px solid #ef444440',
+              color: validationResult?.ok ? '#22c55e' : '#ef4444',
+            }}
+          >
+            {validationResult?.ok ? 'VALID' : 'HAS ERRORS'}
+          </Tag>
+        </Space>
+        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+          Input rows: {Number(validationResult?.input_rows || 0)} | Output rows: {Number(validationResult?.output_rows || 0)}
+        </Text>
+        {(validationResult?.errors || []).length > 0 ? (
+          <div
+            style={{
+              border: '1px solid #ef444440',
+              borderRadius: 8,
+              background: '#ef444414',
+              padding: 10,
+            }}
+          >
+            <Text style={{ color: '#ef4444', fontWeight: 600 }}>Errors</Text>
+            {(validationResult?.errors || []).map((err, idx) => (
+              <div key={`val_err_${idx}`} style={{ color: '#fecaca', fontSize: 12, marginTop: 4 }}>
+                {String(err)}
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {(validationResult?.warnings || []).length > 0 ? (
+          <div
+            style={{
+              border: '1px solid #f59e0b40',
+              borderRadius: 8,
+              background: '#f59e0b14',
+              padding: 10,
+            }}
+          >
+            <Text style={{ color: '#f59e0b', fontWeight: 600 }}>Warnings</Text>
+            {(validationResult?.warnings || []).map((warn, idx) => (
+              <div key={`val_warn_${idx}`} style={{ color: '#fde68a', fontSize: 12, marginTop: 4 }}>
+                {String(warn)}
+              </div>
+            ))}
+          </div>
+        ) : null}
+        <div>
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Sample Input</Text>
+          <Input.TextArea
+            readOnly
+            rows={10}
+            value={JSON.stringify(validationResult?.sample_input || [], null, 2)}
+            style={{
+              marginTop: 6,
+              background: 'var(--app-input-bg)',
+              border: '1px solid var(--app-border-strong)',
+              color: 'var(--app-text)',
+              fontFamily: 'monospace',
+              fontSize: 12,
+            }}
+          />
+        </div>
+        <div>
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Sample Output</Text>
+          <Input.TextArea
+            readOnly
+            rows={14}
+            value={JSON.stringify(validationResult?.sample_output || [], null, 2)}
+            style={{
+              marginTop: 6,
+              background: 'var(--app-input-bg)',
+              border: '1px solid var(--app-border-strong)',
+              color: 'var(--app-text)',
+              fontFamily: 'monospace',
+              fontSize: 12,
+            }}
+          />
+        </div>
+      </Space>
+    </Modal>
     {nodeType === 'oracle_destination' && (
       <Modal
         open={oracleStudioOpen}
