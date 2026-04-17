@@ -2422,6 +2422,10 @@ class ETLEngine:
                     return candidate
                 if candidate is None:
                     return current
+                current_dt = _parse_temporal_value(current)
+                candidate_dt = _parse_temporal_value(candidate)
+                if current_dt is not None and candidate_dt is not None:
+                    return candidate if candidate_dt < current_dt else current
                 current_num = self._to_number(current)
                 candidate_num = self._to_number(candidate)
                 if current_num is not None and candidate_num is not None:
@@ -2436,6 +2440,10 @@ class ETLEngine:
                     return candidate
                 if candidate is None:
                     return current
+                current_dt = _parse_temporal_value(current)
+                candidate_dt = _parse_temporal_value(candidate)
+                if current_dt is not None and candidate_dt is not None:
+                    return candidate if candidate_dt > current_dt else current
                 current_num = self._to_number(current)
                 candidate_num = self._to_number(candidate)
                 if current_num is not None and candidate_num is not None:
@@ -2632,7 +2640,29 @@ class ETLEngine:
                         count = int(state.get("count", 0))
                         metric_value = (float(state.get("sum", 0.0)) / count) if count > 0 else None
                     elif kind in {"min", "max", "first", "last"}:
-                        metric_value = state.get("value") if bool(state.get("has_value", False)) else None
+                        raw_metric = state.get("value") if bool(state.get("has_value", False)) else None
+                        if raw_metric is None:
+                            metric_value = None
+                        else:
+                            parsed_metric_dt = _parse_temporal_value(raw_metric)
+                            if parsed_metric_dt is not None:
+                                date_only_hint = False
+                                if isinstance(raw_metric, str):
+                                    raw_text = raw_metric.strip()
+                                    if _looks_date_only_text(raw_text):
+                                        date_only_hint = True
+                                elif isinstance(raw_metric, datetime):
+                                    date_only_hint = (
+                                        raw_metric.hour == 0
+                                        and raw_metric.minute == 0
+                                        and raw_metric.second == 0
+                                        and raw_metric.microsecond == 0
+                                    )
+                                elif isinstance(raw_metric, date):
+                                    date_only_hint = True
+                                metric_value = _format_temporal_output(parsed_metric_dt, date_only_hint)
+                            else:
+                                metric_value = raw_metric
 
                     if metric_value is None and bool(spec.get("has_default")):
                         metric_value = spec.get("default")
