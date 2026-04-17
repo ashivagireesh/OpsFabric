@@ -3082,6 +3082,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       open={Boolean(expandedEditorField)}
       onCancel={() => setExpandedEditorFieldId(null)}
       footer={null}
+      closable={false}
       centered
       width="96vw"
       styles={{
