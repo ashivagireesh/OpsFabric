@@ -1,0 +1,56 @@
+{
+  "pipelines": {
+    "d6cce622-8c7d-46aa-8269-1baf672bf9b0": {
+      "incremental_checkpoints": {},
+      "profile_documents": {
+        "6bd22b49-fc3c-415a-9c3d-208184198817": {
+          "documents": {
+            "\"UBI4000311\"": {
+              "PROFILE_TEST2": {
+                "agentcode": "UBI4000311",
+                "total_transaction_count": 2,
+                "min_txn_time": "2026-26-01 16:18:06",
+                "max_txn_time": "2026-26-02 16:18:06",
+                "service_profiles": [
+                  {
+                    "servicename": "AEPS WITHDRAWAL V2",
+                    "mintime": "2026-01-26 16:18:06",
+                    "maxtime": "2026-02-26 16:18:06",
+                    "total_transaction_count": 2,
+                    "total_distinct_customer": 1,
+                    "min_amount": "4000",
+                    "max_amount": "4000",
+                    "avg_amount": 4000.0
+                  }
+                ],
+                "customer_profiles": [
+                  {
+                    "customer": "342402010032636",
+                    "mintime": "2026-01-26 16:18:06",
+                    "maxtime": "2026-02-26 16:18:06",
+                    "total_transaction_count": 2,
+                    "total_service_name": [
+                      {
+                        "value": "AEPS WITHDRAWAL V2",
+                        "count": 2
+                      }
+                    ]
+                  }
+                ],
+                "distinct_customer_count": 1
+              },
+              "AGENTCODE": "UBI4000311"
+            }
+          },
+          "meta": {
+            "\"UBI4000311\"": {
+              "group_aggregate": {
+                "PROFILE_TEST2||SERVICENAME||servicename": {
+                  "groups": {
+                    "\"AEPS WITHDRAWAL V2\"": {
+                      "key": "AEPS WITHDRAWAL V2",
+                      "metrics": {
+                        "mintime": {
+                          "kind": "min",
+                          "has_value": true,
+                          "value": 

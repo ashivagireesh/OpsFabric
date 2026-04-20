@@ -47,3 +47,4 @@ loguru==0.7.2
 rapidfuzz==3.14.3
 scikit-learn==1.8.0
 h2o==3.46.0.8
+lmdb==1.5.1

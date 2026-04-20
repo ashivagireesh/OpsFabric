@@ -5,6 +5,8 @@ Full ETL operation platform with support for databases, files, APIs, cloud stora
 import uuid
 import json
 import asyncio
+import threading
+import time as _time
 import os as _os
 import html as _html
 import re
@@ -29,6 +31,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy.orm import Session, load_only
 from loguru import logger
+try:
+    import lmdb as _lmdb  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    _lmdb = None
 
 # Load environment from backend/.env and project-root/.env if present.
 _BACKEND_DIR = Path(__file__).resolve().parent
@@ -37,13 +43,15 @@ load_dotenv(_BACKEND_DIR.parent / ".env")
 
 from database import engine, get_db, Base, SessionLocal
 import models
-from etl_engine import ETLEngine
+from etl_engine import ETLEngine, ExecutionAbortedError
 
 
 # ─── STARTUP ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _app_main_loop
+    _app_main_loop = asyncio.get_running_loop()
     Base.metadata.create_all(bind=engine)
     recovered = _recover_stale_running_executions()
     if recovered:
@@ -55,6 +63,7 @@ async def lifespan(app: FastAPI):
     yield
     if scheduler.running:
         scheduler.shutdown(wait=False)
+    _app_main_loop = None
     logger.info("ETL Flow Platform shutting down")
 
 app = FastAPI(
@@ -92,13 +101,13 @@ _H2O_ALLOWED_ALGOS = sorted(set(_H2O_ALGO_CANONICAL.values()))
 
 def _recover_stale_running_executions() -> int:
     """
-    Mark executions that were left in 'running' (typically after backend restart/crash)
+    Mark executions that were left in 'running'/'cancelling' (typically after backend restart/crash)
     as failed so UI polling/history do not stay stuck forever.
     """
     db = SessionLocal()
     try:
         stale_runs = db.query(models.Execution).filter(
-            models.Execution.status == "running"
+            models.Execution.status.in_(["running", "cancelling"])
         ).all()
         if not stale_runs:
             return 0
@@ -177,6 +186,32 @@ class WebSocketManager:
                 pass
 
 ws_manager = WebSocketManager()
+_app_main_loop: Optional[asyncio.AbstractEventLoop] = None
+execution_abort_events: Dict[str, threading.Event] = {}
+execution_workers: Dict[str, threading.Thread] = {}
+_execution_log_flush_state: Dict[str, float] = {}
+_execution_log_flush_lock = threading.Lock()
+_EXECUTION_LOG_FLUSH_INTERVAL_SECONDS = max(
+    0.1,
+    float(str(_os.getenv("EXECUTION_LOG_FLUSH_INTERVAL_SECONDS", "0.8")).strip() or "0.8"),
+)
+
+
+class ThreadSafeWebSocketProxy:
+    async def broadcast(self, execution_id: str, data: dict):
+        loop = _app_main_loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                ws_manager.broadcast(execution_id, data),
+                loop,
+            )
+        except Exception:
+            return
+
+
+threadsafe_ws_manager = ThreadSafeWebSocketProxy()
 
 
 # ─── SCHEDULER ────────────────────────────────────────────────────────────────
@@ -350,11 +385,22 @@ def _extract_execution_runtime_from_nodes(
 
 def _flush_logs(execution, logs: list, db):
     """Persist current logs snapshot to DB so the poll endpoint sees live progress."""
+    execution_id = str(getattr(execution, "id", "") or "").strip()
+    now_monotonic = _time.monotonic()
+    if execution_id:
+        with _execution_log_flush_lock:
+            last_flush = _execution_log_flush_state.get(execution_id, 0.0)
+            if now_monotonic - last_flush < _EXECUTION_LOG_FLUSH_INTERVAL_SECONDS:
+                return
+            _execution_log_flush_state[execution_id] = now_monotonic
     try:
         execution.logs = _json_safe_value(list(logs))
         db.commit()
     except Exception as exc:
         db.rollback()
+        if execution_id:
+            with _execution_log_flush_lock:
+                _execution_log_flush_state.pop(execution_id, None)
         logger.warning(
             f"Execution {getattr(execution, 'id', '<unknown>')} log flush failed: {exc}"
         )
@@ -419,24 +465,63 @@ def _apply_execution_terminal_payload(execution, payload: Dict[str, Any]) -> Non
 
 
 def _persist_execution_terminal_payload(execution_id: str, payload: Dict[str, Any]) -> bool:
-    recovery_db = SessionLocal()
-    try:
-        execution = recovery_db.query(models.Execution).filter(
-            models.Execution.id == execution_id
-        ).first()
-        if execution is None:
-            return False
-        _apply_execution_terminal_payload(execution, payload)
-        recovery_db.commit()
-        return True
-    except Exception as exc:
-        recovery_db.rollback()
-        logger.error(
-            f"Failed to persist terminal state for execution {execution_id}: {exc}"
-        )
-        return False
-    finally:
-        recovery_db.close()
+    max_attempts = max(1, int(str(_os.getenv("EXECUTION_TERMINAL_PERSIST_RETRIES", "3")).strip() or "3"))
+    for attempt in range(1, max_attempts + 1):
+        recovery_db = SessionLocal()
+        try:
+            execution = recovery_db.query(models.Execution).filter(
+                models.Execution.id == execution_id
+            ).first()
+            if execution is None:
+                return False
+            _apply_execution_terminal_payload(execution, payload)
+            recovery_db.commit()
+            return True
+        except Exception as exc:
+            recovery_db.rollback()
+            logger.error(
+                f"Failed to persist terminal state for execution {execution_id} "
+                f"(attempt {attempt}/{max_attempts}): {exc}"
+            )
+            if attempt < max_attempts:
+                _time.sleep(min(0.3 * attempt, 1.0))
+        finally:
+            recovery_db.close()
+    return False
+
+
+def _persist_execution_terminal_status_only(execution_id: str, payload: Dict[str, Any]) -> bool:
+    """
+    Last-resort persistence path for execution terminal state.
+    Writes only lightweight terminal fields so UI does not stay stuck in running mode.
+    """
+    max_attempts = max(1, int(str(_os.getenv("EXECUTION_TERMINAL_STATUS_RETRIES", "4")).strip() or "4"))
+    for attempt in range(1, max_attempts + 1):
+        recovery_db = SessionLocal()
+        try:
+            execution = recovery_db.query(models.Execution).filter(
+                models.Execution.id == execution_id
+            ).first()
+            if execution is None:
+                return False
+            execution.status = payload.get("status", "failed")
+            execution.finished_at = payload.get("finished_at") or datetime.utcnow()
+            execution.error_message = payload.get("error_message")
+            if payload.get("rows_processed") is not None:
+                execution.rows_processed = payload.get("rows_processed")
+            recovery_db.commit()
+            return True
+        except Exception as exc:
+            recovery_db.rollback()
+            logger.error(
+                f"Failed to persist terminal status-only payload for execution {execution_id} "
+                f"(attempt {attempt}/{max_attempts}): {exc}"
+            )
+            if attempt < max_attempts:
+                _time.sleep(min(0.25 * attempt, 1.0))
+        finally:
+            recovery_db.close()
+    return False
 
 
 def _compact_node_result_for_history(value: Any, max_rows: int) -> Any:
@@ -515,7 +600,11 @@ def _compact_execution_node_results_for_history(node_results: Any) -> Any:
     return compact
 
 
-async def _run_pipeline_execution_task(execution_id: str, pipeline_id: str):
+async def _run_pipeline_execution_task(
+    execution_id: str,
+    pipeline_id: str,
+    abort_event: Optional[threading.Event] = None,
+):
     bg_db = SessionLocal()
     bg_exec = None
     terminal_payload: Dict[str, Any] = {
@@ -552,14 +641,18 @@ async def _run_pipeline_execution_task(execution_id: str, pipeline_id: str):
             and str(runtime_config.get("execution_mode", "")).strip().lower() == "streaming"
         ):
             runtime_config["streaming_max_batches"] = 1
+        if abort_event and abort_event.is_set():
+            raise ExecutionAbortedError("Execution aborted before start.")
+
         result = await etl_engine.execute_pipeline(
             pipeline_data,
             execution_id,
             bg_db,
-            ws_manager,
+            threadsafe_ws_manager,
             on_node_done=lambda logs: _flush_logs(bg_exec, logs, bg_db),
             runtime_config=runtime_config,
             pipeline_id=pipeline.id,
+            should_abort=(abort_event.is_set if abort_event else None),
         )
         terminal_payload.update({
             "status": "success",
@@ -570,6 +663,32 @@ async def _run_pipeline_execution_task(execution_id: str, pipeline_id: str):
         })
         logger.info(f"✅ Execution {execution_id} completed — {result['rows_processed']} rows")
 
+    except ExecutionAbortedError as exc:
+        logger.info(f"⏹ Execution {execution_id} cancelled: {exc}")
+        existing_logs = bg_exec.logs if (bg_exec is not None and isinstance(bg_exec.logs, list)) else []
+        cancel_log = {
+            "nodeId": "__system__",
+            "nodeLabel": "System",
+            "timestamp": datetime.utcnow().isoformat(),
+            "status": "error",
+            "message": f"✗ Execution cancelled: {exc}",
+            "rows": 0,
+        }
+        merged_logs = list(existing_logs)
+        merged_logs.append(cancel_log)
+        terminal_payload.update({
+            "status": "cancelled",
+            "error_message": str(exc),
+            "logs": merged_logs,
+        })
+        try:
+            await threadsafe_ws_manager.broadcast(execution_id, {
+                "type": "execution_cancelled",
+                "execution_id": execution_id,
+                "log_entry": cancel_log,
+            })
+        except Exception:
+            pass
     except Exception as exc:
         logger.error(f"❌ Execution {execution_id} failed: {exc}")
         terminal_payload.update({
@@ -594,7 +713,30 @@ async def _run_pipeline_execution_task(execution_id: str, pipeline_id: str):
             bg_db.close()
 
         if not committed:
-            _persist_execution_terminal_payload(execution_id, terminal_payload)
+            persisted = _persist_execution_terminal_payload(execution_id, terminal_payload)
+            if not persisted:
+                _persist_execution_terminal_status_only(execution_id, terminal_payload)
+
+        try:
+            await threadsafe_ws_manager.broadcast(execution_id, {
+                "type": "execution_terminal",
+                "execution_id": execution_id,
+                "status": str(terminal_payload.get("status") or "").strip().lower(),
+                "rows_processed": int(terminal_payload.get("rows_processed") or 0),
+                "error_message": terminal_payload.get("error_message"),
+                "finished_at": (
+                    terminal_payload.get("finished_at").isoformat()
+                    if isinstance(terminal_payload.get("finished_at"), datetime)
+                    else str(terminal_payload.get("finished_at") or "")
+                ),
+            })
+        except Exception:
+            pass
+
+        execution_abort_events.pop(execution_id, None)
+        execution_workers.pop(execution_id, None)
+        with _execution_log_flush_lock:
+            _execution_log_flush_state.pop(execution_id, None)
 
 
 def _start_pipeline_execution(
@@ -613,7 +755,7 @@ def _start_pipeline_execution(
         if skip_if_running:
             running = db.query(models.Execution).filter(
                 models.Execution.pipeline_id == pipeline_id,
-                models.Execution.status == "running",
+                models.Execution.status.in_(["running", "cancelling"]),
             ).first()
             if running:
                 logger.info(
@@ -634,7 +776,30 @@ def _start_pipeline_execution(
         db.close()
 
     if execution_id:
-        asyncio.create_task(_run_pipeline_execution_task(execution_id, pipeline_id))
+        abort_event = threading.Event()
+        execution_abort_events[execution_id] = abort_event
+
+        def _worker_runner() -> None:
+            try:
+                asyncio.run(
+                    _run_pipeline_execution_task(
+                        execution_id,
+                        pipeline_id,
+                        abort_event=abort_event,
+                    )
+                )
+            except Exception as exc:
+                logger.error(
+                    f"Execution worker crashed for {execution_id}: {exc}"
+                )
+
+        worker = threading.Thread(
+            target=_worker_runner,
+            name=f"etl-exec-{execution_id[:8]}",
+            daemon=True,
+        )
+        execution_workers[execution_id] = worker
+        worker.start()
     return execution_id
 
 
@@ -851,12 +1016,38 @@ class SourceFieldOptionsRequest(BaseModel):
     node_type: str
     config: dict = {}
     max_rows: int = 200
+    page: int = 1
+    preview_rows: int = 50
+
+
+class LmdbEnvPathOptionsRequest(BaseModel):
+    base_path: Optional[str] = None
+    max_depth: int = 4
+    limit: int = 500
+
+
+class LmdbDeleteRequest(BaseModel):
+    env_path: str
+    db_name: Optional[str] = None
+    delete_mode: str = "filtered"  # filtered | all
+    key_prefix: str = ""
+    start_key: str = ""
+    end_key: str = ""
+    key_contains: str = ""
+    limit: int = 200000
+
+
+class LmdbSummaryRequest(BaseModel):
+    config: dict = {}
+    summary_scan_limit: int = 0
 
 
 class CustomFieldValidationRequest(BaseModel):
     config: Dict[str, Any] = Field(default_factory=dict)
     rows: List[Dict[str, Any]] = Field(default_factory=list)
     max_rows: int = 30
+    validation_source: str = "lmdb"  # lmdb (rows mode deprecated)
+    lmdb_config: Dict[str, Any] = Field(default_factory=dict)
 
 class CredentialCreate(BaseModel):
     name: str
@@ -872,147 +1063,31 @@ def _build_pipeline_profile_state_summary(
     pipeline_id: str,
     node_id: Optional[str] = None,
     limit: int = 10,
+    primary_key_field: Optional[str] = None,
 ) -> Dict[str, Any]:
-    safe_limit = max(1, min(int(limit or 10), 100))
-    runtime_state = etl_engine._load_runtime_state()
-    pipelines_state = runtime_state.get("pipelines") if isinstance(runtime_state, dict) else {}
-    if not isinstance(pipelines_state, dict):
-        pipelines_state = {}
-    pipeline_state = pipelines_state.get(pipeline_id)
-    if not isinstance(pipeline_state, dict):
-        pipeline_state = {}
-    profile_documents = pipeline_state.get("profile_documents")
-    if not isinstance(profile_documents, dict):
-        profile_documents = {}
-
-    nodes: List[Dict[str, Any]] = []
-    total_entities = 0
-    total_meta_entries = 0
-    available_node_ids: List[str] = []
-
-    for nid, node_state in profile_documents.items():
-        if node_id and str(nid) != str(node_id):
-            continue
-        if not isinstance(node_state, dict):
-            continue
-        node_name = str(nid)
-        available_node_ids.append(node_name)
-        documents = node_state.get("documents")
-        if not isinstance(documents, dict):
-            documents = {}
-        meta = node_state.get("meta")
-        if not isinstance(meta, dict):
-            meta = {}
-
-        entity_keys = list(documents.keys())
-        entity_count = len(entity_keys)
-        meta_count = len(meta)
-        total_entities += entity_count
-        total_meta_entries += meta_count
-
-        sample_entity_keys = entity_keys[:safe_limit]
-        sample_documents: List[Dict[str, Any]] = []
-        for entity_key in sample_entity_keys:
-            sample_documents.append(
-                {
-                    "entity_key": str(entity_key),
-                    "profile": _json_safe_value(documents.get(entity_key)),
-                }
-            )
-
-        nodes.append(
-            {
-                "node_id": node_name,
-                "entity_count": entity_count,
-                "meta_count": meta_count,
-                "sample_entity_keys": sample_entity_keys,
-                "sample_documents": sample_documents,
-            }
-        )
-
-    return {
-        "pipeline_id": pipeline_id,
-        "node_id": node_id or None,
-        "limit": safe_limit,
-        "total_nodes": len(nodes),
-        "total_entities": total_entities,
-        "total_meta_entries": total_meta_entries,
-        "available_node_ids": available_node_ids,
-        "nodes": nodes,
-        "generated_at": datetime.utcnow().isoformat(),
-    }
+    return etl_engine.get_profile_state_summary(
+        pipeline_id=pipeline_id,
+        node_id=node_id,
+        limit=limit,
+        preferred_primary_key_field=primary_key_field,
+    )
 
 
 def _clear_pipeline_profile_state(
     pipeline_id: str,
     node_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    runtime_state = etl_engine._load_runtime_state()
-    pipelines_state = runtime_state.get("pipelines") if isinstance(runtime_state, dict) else {}
-    if not isinstance(pipelines_state, dict):
-        pipelines_state = {}
-        runtime_state["pipelines"] = pipelines_state
-
-    pipeline_state = pipelines_state.get(pipeline_id)
-    if not isinstance(pipeline_state, dict):
-        return {
-            "pipeline_id": pipeline_id,
-            "node_id": node_id or None,
-            "removed_nodes": 0,
-            "removed_entities": 0,
-            "removed_meta_entries": 0,
-            "remaining_summary": _build_pipeline_profile_state_summary(pipeline_id, node_id=node_id),
-            "cleared_at": datetime.utcnow().isoformat(),
-        }
-
-    profile_documents = pipeline_state.get("profile_documents")
-    if not isinstance(profile_documents, dict):
-        return {
-            "pipeline_id": pipeline_id,
-            "node_id": node_id or None,
-            "removed_nodes": 0,
-            "removed_entities": 0,
-            "removed_meta_entries": 0,
-            "remaining_summary": _build_pipeline_profile_state_summary(pipeline_id, node_id=node_id),
-            "cleared_at": datetime.utcnow().isoformat(),
-        }
-
-    removed_nodes = 0
-    removed_entities = 0
-    removed_meta_entries = 0
-
-    if node_id:
-        node_key = str(node_id)
-        node_state = profile_documents.pop(node_key, None)
-        if isinstance(node_state, dict):
-            removed_nodes = 1
-            docs = node_state.get("documents")
-            if isinstance(docs, dict):
-                removed_entities += len(docs)
-            meta = node_state.get("meta")
-            if isinstance(meta, dict):
-                removed_meta_entries += len(meta)
-    else:
-        for node_state in profile_documents.values():
-            if not isinstance(node_state, dict):
-                continue
-            removed_nodes += 1
-            docs = node_state.get("documents")
-            if isinstance(docs, dict):
-                removed_entities += len(docs)
-            meta = node_state.get("meta")
-            if isinstance(meta, dict):
-                removed_meta_entries += len(meta)
-        pipeline_state.pop("profile_documents", None)
-
-    etl_engine._save_runtime_state(runtime_state)
+    removed = etl_engine.clear_profile_state(
+        pipeline_id=pipeline_id,
+        node_id=node_id,
+    )
 
     return {
         "pipeline_id": pipeline_id,
         "node_id": node_id or None,
-        "removed_nodes": removed_nodes,
-        "removed_entities": removed_entities,
-        "removed_meta_entries": removed_meta_entries,
+        "removed_nodes": int(removed.get("removed_nodes") or 0),
+        "removed_entities": int(removed.get("removed_entities") or 0),
+        "removed_meta_entries": int(removed.get("removed_meta_entries") or 0),
         "remaining_summary": _build_pipeline_profile_state_summary(pipeline_id, node_id=node_id),
         "cleared_at": datetime.utcnow().isoformat(),
     }
@@ -1187,11 +1262,13 @@ async def get_pipeline_profile_state(
     pipeline_id: str,
     node_id: Optional[str] = None,
     limit: int = 10,
+    primary_key_field: Optional[str] = None,
 ):
     return _build_pipeline_profile_state_summary(
         pipeline_id=pipeline_id,
         node_id=node_id,
         limit=limit,
+        primary_key_field=primary_key_field,
     )
 
 
@@ -7778,11 +7855,11 @@ async def list_executions(
 
 def _try_finalize_stale_running_execution(execution: models.Execution, db: Session) -> None:
     """
-    Safety net: if an execution row is stuck in `running` but logs are terminal,
+    Safety net: if an execution row is stuck in `running`/`cancelling` but logs are terminal,
     finalize it so frontend polling does not continue forever.
     """
     try:
-        if execution is None or execution.status != "running":
+        if execution is None or str(execution.status or "").strip().lower() not in {"running", "cancelling"}:
             return
         logs = execution.logs if isinstance(execution.logs, list) else []
         if not logs:
@@ -7873,26 +7950,123 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
 async def get_execution(
     execution_id: str,
     include_node_results: bool = False,
+    include_logs: bool = True,
+    log_tail: int = 300,
     db: Session = Depends(get_db),
 ):
-    e = db.query(models.Execution).filter(models.Execution.id == execution_id).first()
+    query = db.query(models.Execution)
+    if not include_node_results and not include_logs:
+        query = query.options(load_only(
+            models.Execution.id,
+            models.Execution.pipeline_id,
+            models.Execution.status,
+            models.Execution.started_at,
+            models.Execution.finished_at,
+            models.Execution.rows_processed,
+            models.Execution.triggered_by,
+            models.Execution.error_message,
+        ))
+    elif not include_node_results and include_logs:
+        query = query.options(load_only(
+            models.Execution.id,
+            models.Execution.pipeline_id,
+            models.Execution.status,
+            models.Execution.started_at,
+            models.Execution.finished_at,
+            models.Execution.rows_processed,
+            models.Execution.triggered_by,
+            models.Execution.error_message,
+            models.Execution.logs,
+        ))
+
+    e = query.filter(models.Execution.id == execution_id).first()
     if not e:
         raise HTTPException(status_code=404, detail="Execution not found")
-    _try_finalize_stale_running_execution(e, db)
-    node_results = e.node_results or {}
+
+    if include_logs:
+        _try_finalize_stale_running_execution(e, db)
+
+    node_results: Dict[str, Any] = {}
+    node_result_keys: List[str] = []
+    if include_node_results:
+        loaded_results = e.node_results or {}
+        if isinstance(loaded_results, dict):
+            node_results = loaded_results
+            node_result_keys = list(loaded_results.keys())
+        else:
+            node_results = {}
+            node_result_keys = []
+
+    logs_payload: List[Any] = []
+    if include_logs:
+        loaded_logs = e.logs or []
+        if isinstance(loaded_logs, list):
+            tail = max(10, min(int(log_tail), 5000))
+            logs_payload = loaded_logs[-tail:] if len(loaded_logs) > tail else loaded_logs
+        else:
+            logs_payload = []
+
     return {
         "id": e.id,
         "pipeline_id": e.pipeline_id,
         "status": e.status,
         "started_at": e.started_at.isoformat() if e.started_at else None,
         "finished_at": e.finished_at.isoformat() if e.finished_at else None,
-        "node_results": node_results if include_node_results else {},
-        "node_result_keys": list(node_results.keys()) if isinstance(node_results, dict) else [],
-        "logs": e.logs or [],
+        "node_results": node_results,
+        "node_result_keys": node_result_keys,
+        "logs": logs_payload,
         "error_message": e.error_message,
         "rows_processed": e.rows_processed,
         "triggered_by": e.triggered_by,
     }
+
+
+@app.post("/api/executions/{execution_id}/abort")
+async def abort_execution(execution_id: str, db: Session = Depends(get_db)):
+    execution = db.query(models.Execution).filter(models.Execution.id == execution_id).first()
+    if not execution:
+        raise HTTPException(status_code=404, detail="Execution not found")
+
+    status = str(execution.status or "").strip().lower()
+    if status == "cancelling":
+        return {
+            "execution_id": execution_id,
+            "status": "cancelling",
+            "aborted": True,
+            "message": "Abort request already in progress.",
+        }
+    if status != "running":
+        return {
+            "execution_id": execution_id,
+            "status": execution.status,
+            "aborted": False,
+            "message": f"Execution is already in terminal state: {execution.status}",
+        }
+
+    abort_event = execution_abort_events.get(execution_id)
+    if abort_event:
+        abort_event.set()
+
+    logs = execution.logs if isinstance(execution.logs, list) else []
+    logs.append({
+        "nodeId": "__system__",
+        "nodeLabel": "System",
+        "timestamp": datetime.utcnow().isoformat(),
+        "status": "running",
+        "message": "⏹ Abort requested. Waiting for current node to stop safely…",
+        "rows": 0,
+    })
+    execution.status = "cancelling"
+    execution.logs = _json_safe_value(logs)
+    db.commit()
+
+    return {
+        "execution_id": execution_id,
+        "status": "cancelling",
+        "aborted": True,
+        "message": "Abort request accepted.",
+    }
+
 
 @app.delete("/api/executions/{execution_id}", status_code=204)
 async def delete_execution(execution_id: str, db: Session = Depends(get_db)):
@@ -8190,6 +8364,78 @@ def _normalize_source_rows(rows: list, max_rows: int) -> list:
     return out
 
 
+def _collect_source_columns(rows: list, max_columns: int = 5000) -> list:
+    columns: list = []
+    seen = set()
+    safe_max = max(1, min(int(max_columns or 5000), 20000))
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        for key in row.keys():
+            name = str(key or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            columns.append(name)
+            if len(columns) >= safe_max:
+                return columns
+    return columns
+
+
+async def _load_lmdb_rows_for_preview(
+    config: dict,
+    max_rows: int,
+    page: int = 1,
+    preview_rows: int = 50,
+) -> Dict[str, Any]:
+    if _lmdb is None:
+        raise HTTPException(400, "LMDB dependency is not installed in backend environment.")
+    try:
+        raw_max_rows = int(max_rows if max_rows is not None else 200)
+    except Exception:
+        raw_max_rows = 200
+    # max_rows <= 0 means unbounded logical scan for preview pagination.
+    safe_max_rows = 2_147_483_647 if raw_max_rows <= 0 else max(1, raw_max_rows)
+    safe_page = max(1, int(page or 1))
+    safe_preview_rows = max(1, min(int(preview_rows or 50), 500))
+    offset = max(0, (safe_page - 1) * safe_preview_rows)
+    if offset >= safe_max_rows:
+        return {
+            "rows": [],
+            "page": safe_page,
+            "preview_rows": safe_preview_rows,
+            "row_count": safe_max_rows,
+            "has_more": False,
+            "sample_limited": True,
+        }
+
+    fetch_limit = min(safe_preview_rows + 1, safe_max_rows - offset)
+    cfg = dict(config or {})
+    cfg["limit"] = fetch_limit
+    cfg["preview_offset"] = offset
+    try:
+        rows = await etl_engine._execute_lmdb(cfg)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"LMDB metadata detection failed: {exc}")
+    has_more = len(rows) > safe_preview_rows
+    page_rows = rows[:safe_preview_rows]
+    if has_more:
+        row_count = max(offset + safe_preview_rows + 1, offset + len(page_rows))
+    else:
+        row_count = offset + len(page_rows)
+    row_count = min(safe_max_rows, row_count)
+    return {
+        "rows": page_rows,
+        "page": safe_page,
+        "preview_rows": safe_preview_rows,
+        "row_count": row_count,
+        "has_more": bool(has_more and row_count < safe_max_rows),
+        "sample_limited": True,
+    }
+
+
 async def _load_tabular_rows_for_source(node_type: str, config: dict, max_rows: int) -> list:
     ntype = (node_type or "").strip().lower()
     cfg = config or {}
@@ -8375,6 +8621,11 @@ async def _load_tabular_rows_for_source(node_type: str, config: dict, max_rows: 
         except Exception as exc:
             raise HTTPException(400, f"Elasticsearch metadata detection failed: {exc}")
 
+    if ntype == "lmdb_source":
+        preview = await _load_lmdb_rows_for_preview(cfg, limit, page=1, preview_rows=limit)
+        rows = preview.get("rows", []) if isinstance(preview, dict) else []
+        return rows if isinstance(rows, list) else []
+
     raise HTTPException(400, f"Unsupported node_type for source field detection: {node_type}")
 
 
@@ -8543,17 +8794,420 @@ async def detect_source_json_field_options(body: JsonFieldOptionsRequest):
 
 @app.post("/api/source/field-options")
 async def detect_source_field_options(body: SourceFieldOptionsRequest):
-    max_rows = max(1, min(int(body.max_rows or 200), 2000))
+    node_type = (body.node_type or "").strip().lower()
+    if node_type == "lmdb_source":
+        try:
+            requested_max_rows = int(body.max_rows if body.max_rows is not None else 1000)
+        except Exception:
+            requested_max_rows = 1000
+        # max_rows <= 0 means no LMDB max-row cap for scan window.
+        max_rows = 2_147_483_647 if requested_max_rows <= 0 else max(1, requested_max_rows)
+    else:
+        max_rows = max(1, min(int(body.max_rows or 200), 2000))
+    if node_type == "lmdb_source":
+        request_page = max(1, int(body.page or 1))
+        request_preview_rows = max(1, min(int(body.preview_rows or 50), 500))
+        preview = await _load_lmdb_rows_for_preview(
+            body.config,
+            max_rows=max_rows,
+            page=request_page,
+            preview_rows=request_preview_rows,
+        )
+        rows = preview.get("rows", []) if isinstance(preview, dict) else []
+        normalized_rows = _normalize_source_rows(rows if isinstance(rows, list) else [], int(preview.get("preview_rows") or 50))
+
+        # Schema union scan across multiple LMDB preview pages so sparse/profile
+        # fields are not missed due to pagination or first-row shape.
+        schema_scan_cap = max(1, min(max_rows, 5000))
+        schema_rows: List[dict] = []
+        schema_page = 1
+        schema_has_more = True
+        while schema_has_more and len(schema_rows) < schema_scan_cap:
+            remaining = schema_scan_cap - len(schema_rows)
+            page_size = max(1, min(500, remaining))
+            schema_preview = await _load_lmdb_rows_for_preview(
+                body.config,
+                max_rows=max_rows,
+                page=schema_page,
+                preview_rows=page_size,
+            )
+            schema_batch = schema_preview.get("rows", []) if isinstance(schema_preview, dict) else []
+            normalized_batch = _normalize_source_rows(
+                schema_batch if isinstance(schema_batch, list) else [],
+                page_size,
+            )
+            if not normalized_batch:
+                break
+            schema_rows.extend(normalized_batch)
+            schema_has_more = bool(schema_preview.get("has_more", False))
+            schema_page += 1
+
+        columns = _collect_source_columns(schema_rows if schema_rows else normalized_rows)
+        return {
+            "node_type": body.node_type,
+            "columns": columns,
+            "row_count": int(preview.get("row_count") or len(normalized_rows)),
+            "preview": normalized_rows,
+            "sample_limited": bool(preview.get("sample_limited", True)),
+            "page": int(preview.get("page") or 1),
+            "preview_rows": int(preview.get("preview_rows") or len(normalized_rows)),
+            "has_more": bool(preview.get("has_more", False)),
+            "schema_rows_scanned": len(schema_rows),
+            "schema_scan_limited": bool(schema_has_more and len(schema_rows) >= schema_scan_cap),
+        }
+
     rows = await _load_tabular_rows_for_source(body.node_type, body.config, max_rows=max_rows)
     normalized_rows = _normalize_source_rows(rows, max_rows)
-    columns = list(normalized_rows[0].keys()) if normalized_rows and isinstance(normalized_rows[0], dict) else []
+    columns = _collect_source_columns(normalized_rows)
+    preview_rows = max(1, min(int(body.preview_rows or 50), 500))
+    preview = normalized_rows[:preview_rows]
     return {
         "node_type": body.node_type,
         "columns": columns,
         "row_count": len(normalized_rows),
-        "preview": normalized_rows[:10],
+        "preview": preview,
         "sample_limited": True,
+        "page": 1,
+        "preview_rows": len(preview),
+        "has_more": len(normalized_rows) > len(preview),
     }
+
+
+def _discover_lmdb_env_paths(
+    roots: List[str],
+    max_depth: int = 4,
+    limit: int = 500,
+) -> Tuple[List[str], int]:
+    discovered: List[str] = []
+    seen_paths = set()
+    scanned_dirs = 0
+
+    safe_max_depth = max(0, min(int(max_depth or 4), 8))
+    safe_limit = max(1, min(int(limit or 500), 5000))
+
+    for root in roots:
+        root_path = str(root or "").strip()
+        if not root_path:
+            continue
+        expanded = _os.path.expandvars(_os.path.expanduser(root_path))
+        expanded = _os.path.abspath(expanded)
+        if not _os.path.isdir(expanded):
+            continue
+        queue: List[Tuple[str, int]] = [(expanded, 0)]
+        local_seen_dirs = set()
+        while queue and len(discovered) < safe_limit:
+            current, depth = queue.pop(0)
+            if current in local_seen_dirs:
+                continue
+            local_seen_dirs.add(current)
+            scanned_dirs += 1
+
+            data_mdb = _os.path.join(current, "data.mdb")
+            if _os.path.isfile(data_mdb):
+                normalized = _os.path.abspath(current)
+                if normalized not in seen_paths:
+                    seen_paths.add(normalized)
+                    discovered.append(normalized)
+                    if len(discovered) >= safe_limit:
+                        break
+
+            if depth >= safe_max_depth:
+                continue
+
+            try:
+                with _os.scandir(current) as it:
+                    for entry in it:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                        name = str(entry.name or "")
+                        if name.startswith(".") or name in {"__pycache__", "node_modules", "venv", ".git"}:
+                            continue
+                        queue.append((entry.path, depth + 1))
+            except Exception:
+                continue
+
+    discovered.sort()
+    return discovered, scanned_dirs
+
+
+@app.post("/api/lmdb/env-path-options")
+async def lmdb_env_path_options(body: LmdbEnvPathOptionsRequest):
+    roots: List[str] = []
+
+    backend_state_root = _os.path.join(_os.path.dirname(__file__), "state")
+    if _os.path.isdir(backend_state_root):
+        roots.append(backend_state_root)
+
+    env_root = str(_os.getenv("LMDB_ROOT", "") or "").strip()
+    if env_root:
+        roots.append(env_root)
+
+    base_path = str(body.base_path or "").strip()
+    if base_path:
+        expanded = _os.path.expandvars(_os.path.expanduser(base_path))
+        if expanded:
+            if expanded.lower().endswith("data.mdb"):
+                expanded = _os.path.dirname(expanded)
+            if _os.path.isdir(expanded):
+                roots.append(expanded)
+            parent = _os.path.dirname(expanded)
+            if parent and _os.path.isdir(parent):
+                roots.append(parent)
+
+    deduped_roots = []
+    seen_root = set()
+    for root in roots:
+        norm = _os.path.abspath(root)
+        if norm in seen_root:
+            continue
+        seen_root.add(norm)
+        deduped_roots.append(norm)
+
+    paths, scanned_dirs = _discover_lmdb_env_paths(
+        deduped_roots,
+        max_depth=body.max_depth,
+        limit=body.limit,
+    )
+
+    return {
+        "roots": deduped_roots,
+        "paths": paths,
+        "count": len(paths),
+        "scanned_dirs": scanned_dirs,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/api/lmdb/summary")
+async def lmdb_summary(body: LmdbSummaryRequest):
+    cfg = dict(body.config or {})
+    scan_limit = max(0, int(body.summary_scan_limit or 0))
+    cfg["summary_scan_limit"] = scan_limit
+    try:
+        return await etl_engine._summarize_lmdb(cfg)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"LMDB summary failed: {exc}")
+
+
+@app.post("/api/lmdb/delete")
+async def delete_lmdb_data(body: LmdbDeleteRequest):
+    if _lmdb is None:
+        raise HTTPException(400, "LMDB dependency is not installed in backend environment.")
+
+    mode = str(body.delete_mode or "filtered").strip().lower()
+    if mode not in {"filtered", "all"}:
+        raise HTTPException(400, "delete_mode must be either 'filtered' or 'all'.")
+
+    try:
+        env_path = etl_engine._resolve_lmdb_env_path(str(body.env_path or ""))
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid LMDB environment path: {exc}")
+
+    db_name = str(body.db_name or "").strip()
+    key_prefix = str(body.key_prefix or "").strip()
+    start_key = str(body.start_key or "").strip()
+    end_key = str(body.end_key or "").strip()
+    key_contains = str(body.key_contains or "").strip()
+    raw_limit = body.limit
+    try:
+        if raw_limit is None or str(raw_limit).strip() == "":
+            parsed_limit = 200000
+        else:
+            parsed_limit = int(raw_limit)
+    except Exception:
+        parsed_limit = 200000
+    # limit <= 0 means unbounded delete in filtered mode.
+    limit: Optional[int] = None if parsed_limit <= 0 else max(1, parsed_limit)
+
+    if mode == "filtered":
+        has_custom_filter = any([key_prefix, start_key, end_key, key_contains])
+        if not has_custom_filter:
+            raise HTTPException(
+                400,
+                "Custom delete requires filter(s): key_prefix, start_key/end_key, or key_contains. "
+                "Use delete_mode='all' to clear the selected DB.",
+            )
+
+    # Full environment reset when user requests "all" without a named DB.
+    # This safely clears default DB and all named DB metadata by recreating
+    # data.mdb/lock.mdb instead of deleting DB records one-by-one.
+    if mode == "all" and not db_name:
+        try:
+            try:
+                # Close cached profile LMDB env if this path is the engine profile store.
+                profile_env_dir = _os.path.abspath(etl_engine._profile_lmdb_dir())  # pylint: disable=protected-access
+                request_env_dir = _os.path.abspath(env_path)
+                if request_env_dir == profile_env_dir:
+                    cached_env = getattr(etl_engine, "_profile_lmdb_env", None)
+                    if cached_env is not None:
+                        try:
+                            cached_env.sync()
+                        except Exception:
+                            pass
+                        try:
+                            cached_env.close()
+                        except Exception:
+                            pass
+                    setattr(etl_engine, "_profile_lmdb_env", None)
+                    setattr(etl_engine, "_profile_lmdb_db_handles", {})
+            except Exception:
+                # Non-fatal: continue reset attempt.
+                pass
+
+            deleted_files: List[str] = []
+            for fname in ("data.mdb", "lock.mdb"):
+                fpath = _os.path.join(env_path, fname)
+                if _os.path.exists(fpath):
+                    _os.remove(fpath)
+                    deleted_files.append(fname)
+
+            # Recreate empty LMDB environment.
+            tmp_env = _lmdb.open(
+                env_path,
+                readonly=False,
+                lock=True,
+                readahead=False,
+                max_dbs=256,
+                subdir=True,
+                create=True,
+            )
+            tmp_env.close()
+
+            return {
+                "status": "ok",
+                "env_path": env_path,
+                "db_name": None,
+                "delete_mode": "all",
+                "deleted_environment": True,
+                "deleted_environment_files": deleted_files,
+                "scanned_keys": 0,
+                "matched_keys": 0,
+                "deleted_keys": 0,
+                "sample_deleted_keys": [],
+            }
+        except Exception as exc:
+            raise HTTPException(400, f"LMDB full reset failed: {exc}")
+
+    env = None
+    try:
+        env = _lmdb.open(
+            env_path,
+            readonly=False,
+            lock=True,
+            readahead=False,
+            max_dbs=256,
+            subdir=True,
+        )
+
+        dbi = None
+        if db_name:
+            try:
+                dbi = env.open_db(db_name.encode("utf-8"), create=False)
+            except Exception as exc:
+                raise HTTPException(400, f"LMDB named DB '{db_name}' not found: {exc}")
+
+        prefix_bytes = key_prefix.encode("utf-8") if key_prefix else None
+        start_bytes = start_key.encode("utf-8") if start_key else None
+        end_bytes = end_key.encode("utf-8") if end_key else None
+
+        keys_to_delete: List[bytes] = []
+        sample_deleted_keys: List[str] = []
+        scanned_count = 0
+        matched_count = 0
+
+        with env.begin(write=False, db=dbi) as rtxn:
+            cursor = rtxn.cursor(db=dbi)
+            if start_bytes is not None:
+                has_item = cursor.set_range(start_bytes)
+            elif prefix_bytes is not None:
+                has_item = cursor.set_range(prefix_bytes)
+            else:
+                has_item = cursor.first()
+
+            while has_item:
+                key_bytes, _ = cursor.item()
+                scanned_count += 1
+
+                if prefix_bytes is not None and not key_bytes.startswith(prefix_bytes):
+                    break
+                if end_bytes is not None and key_bytes > end_bytes:
+                    break
+
+                key_text = key_bytes.decode("utf-8", errors="replace")
+                if key_contains and key_contains not in key_text:
+                    has_item = cursor.next()
+                    continue
+
+                matched_count += 1
+                keys_to_delete.append(bytes(key_bytes))
+                if len(sample_deleted_keys) < 25:
+                    sample_deleted_keys.append(key_text)
+
+                if mode == "filtered" and limit is not None and matched_count >= limit:
+                    break
+                has_item = cursor.next()
+
+        if mode == "filtered" and matched_count == 0:
+            return {
+                "status": "ok",
+                "env_path": env_path,
+                "db_name": db_name or None,
+                "delete_mode": mode,
+                "scanned_keys": scanned_count,
+                "matched_keys": 0,
+                "deleted_keys": 0,
+                "sample_deleted_keys": [],
+            }
+
+        deleted_count = 0
+        incompatible_count = 0
+        incompatible_samples: List[str] = []
+        with env.begin(write=True, db=dbi) as wtxn:
+            if mode == "all" and db_name:
+                # Fast clear for named DB while preserving DB handle.
+                wtxn.drop(dbi, delete=False)
+                deleted_count = matched_count
+            else:
+                for key_bytes in keys_to_delete:
+                    try:
+                        if wtxn.delete(key_bytes, db=dbi):
+                            deleted_count += 1
+                    except Exception as exc:
+                        # Common when trying to delete internal/default DB metadata entries.
+                        if "MDB_INCOMPATIBLE" in str(exc):
+                            incompatible_count += 1
+                            if len(incompatible_samples) < 10:
+                                incompatible_samples.append(
+                                    key_bytes.decode("utf-8", errors="replace")
+                                )
+                            continue
+                        raise
+
+        return {
+            "status": "ok",
+            "env_path": env_path,
+            "db_name": db_name or None,
+            "delete_mode": mode,
+            "limit_applied": limit if mode == "filtered" else None,
+            "scanned_keys": scanned_count,
+            "matched_keys": matched_count,
+            "deleted_keys": deleted_count,
+            "incompatible_keys": incompatible_count,
+            "incompatible_key_samples": incompatible_samples,
+            "sample_deleted_keys": sample_deleted_keys,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"LMDB delete failed: {exc}")
+    finally:
+        if env is not None:
+            try:
+                env.close()
+            except Exception:
+                pass
 
 
 @app.post("/api/custom-fields/validate")
@@ -8563,15 +9217,102 @@ async def validate_custom_fields(body: CustomFieldValidationRequest):
     parsed_specs = etl_engine._parse_custom_fields_config(raw_custom_fields)
 
     max_rows = max(1, min(int(body.max_rows or 30), 200))
-    input_rows = body.rows if isinstance(body.rows, list) else []
     normalized_rows: List[Dict[str, Any]] = []
-    for row in input_rows[:max_rows]:
-        if isinstance(row, dict):
-            normalized_rows.append(row)
     warnings: List[str] = []
     errors: List[str] = []
+    requested_validation_source = str(body.validation_source or "lmdb").strip().lower()
+    if requested_validation_source in {"rows", "sample"}:
+        validation_source = "rows"
+    elif requested_validation_source in {"", "lmdb"}:
+        validation_source = "lmdb"
+    else:
+        validation_source = "lmdb"
+        warnings.append(
+            f"Unknown validation_source '{requested_validation_source}', LMDB mode is used."
+        )
 
-    if not normalized_rows:
+    if validation_source == "lmdb":
+        lmdb_cfg_in = body.lmdb_config if isinstance(body.lmdb_config, dict) else {}
+        lmdb_cfg = {
+            "env_path": str(
+                lmdb_cfg_in.get("env_path")
+                or config.get("custom_validation_lmdb_env_path")
+                or config.get("env_path")
+                or ""
+            ).strip(),
+            "db_name": str(
+                lmdb_cfg_in.get("db_name")
+                or config.get("custom_validation_lmdb_db_name")
+                or ""
+            ).strip(),
+            "key_prefix": str(
+                lmdb_cfg_in.get("key_prefix")
+                or config.get("custom_validation_lmdb_key_prefix")
+                or ""
+            ).strip(),
+            "start_key": str(
+                lmdb_cfg_in.get("start_key")
+                or config.get("custom_validation_lmdb_start_key")
+                or ""
+            ).strip(),
+            "end_key": str(
+                lmdb_cfg_in.get("end_key")
+                or config.get("custom_validation_lmdb_end_key")
+                or ""
+            ).strip(),
+            "key_contains": str(
+                lmdb_cfg_in.get("key_contains")
+                or config.get("custom_validation_lmdb_key_contains")
+                or ""
+            ).strip(),
+            "value_contains": str(
+                lmdb_cfg_in.get("value_contains")
+                or config.get("custom_validation_lmdb_value_contains")
+                or ""
+            ).strip(),
+            "value_format": str(
+                lmdb_cfg_in.get("value_format")
+                or config.get("custom_validation_lmdb_value_format")
+                or "auto"
+            ).strip() or "auto",
+            "flatten_json_values": bool(
+                lmdb_cfg_in.get("flatten_json_values")
+                if "flatten_json_values" in lmdb_cfg_in
+                else config.get("custom_validation_lmdb_flatten_json_values", True)
+            ),
+            "limit": max_rows,
+        }
+        if not lmdb_cfg["env_path"]:
+            input_rows_fallback = body.rows if isinstance(body.rows, list) else []
+            fallback_rows = [row for row in input_rows_fallback if isinstance(row, dict)]
+            if fallback_rows:
+                warnings.append(
+                    "LMDB env_path is missing. Validation automatically used sample rows mode."
+                )
+                validation_source = "rows"
+                normalized_rows.extend(fallback_rows[:max_rows])
+            else:
+                errors.append("LMDB validation requires env_path. Set Custom Validation LMDB Path in Custom Fields Studio.")
+        else:
+            try:
+                lmdb_rows = await _load_lmdb_rows_for_preview(lmdb_cfg, max_rows=max_rows)
+                for row in lmdb_rows[:max_rows]:
+                    if isinstance(row, dict):
+                        normalized_rows.append(row)
+            except HTTPException as exc:
+                errors.append(str(exc.detail))
+            except Exception as exc:
+                errors.append(str(exc))
+            if not normalized_rows and not errors:
+                errors.append("No rows found in LMDB for validation. Adjust db/filter settings.")
+
+    if validation_source == "rows" and not normalized_rows:
+        input_rows = body.rows if isinstance(body.rows, list) else []
+        for row in input_rows[:max_rows]:
+            if isinstance(row, dict):
+                normalized_rows.append(row)
+
+    if not normalized_rows and validation_source == "rows":
         normalized_rows = [{}]
         warnings.append("No sample rows were provided. Validation ran with a single empty row.")
 
@@ -8620,6 +9361,13 @@ async def validate_custom_fields(body: CustomFieldValidationRequest):
             expression = str(item.get("expression") or item.get("expr") or "").strip()
             if not expression:
                 errors.append(f"Field '{name}': expression is required for Single Value mode.")
+            single_output = str(
+                item.get("single_value_output", item.get("value_output", item.get("output_format"))) or ""
+            ).strip().lower()
+            if single_output and single_output not in {"json", "plain_text", "plain", "text", "string", "str"}:
+                warnings.append(
+                    f"Field '{name}': unknown single_value_output '{single_output}', JSON output will be used."
+                )
         else:
             template_value = item.get("json_template", item.get("template"))
             if isinstance(template_value, str):
@@ -8642,6 +9390,7 @@ async def validate_custom_fields(body: CustomFieldValidationRequest):
     if errors:
         return {
             "ok": False,
+            "validation_source": validation_source,
             "input_rows": len(normalized_rows),
             "output_rows": 0,
             "errors": errors,
@@ -8650,6 +9399,7 @@ async def validate_custom_fields(body: CustomFieldValidationRequest):
             "sample_output": [],
         }
 
+    transform_warnings: List[str] = []
     try:
         result_rows = etl_engine._transform_custom_fields(
             normalized_rows,
@@ -8658,24 +9408,41 @@ async def validate_custom_fields(body: CustomFieldValidationRequest):
             execution_context={
                 "node_id": "__custom_field_validation__",
                 "profile_state_by_node": {},
+                "node_warnings": transform_warnings,
             },
         )
     except Exception as exc:
+        if transform_warnings:
+            warnings.extend(transform_warnings[:200])
         return {
             "ok": False,
+            "validation_source": validation_source,
             "input_rows": len(normalized_rows),
             "output_rows": 0,
-            "errors": [str(exc)],
+            "errors": [f"{exc.__class__.__name__}: {exc}"],
             "warnings": warnings,
             "sample_input": _json_safe_value(normalized_rows[:10]),
             "sample_output": [],
         }
 
+    if transform_warnings:
+        warnings.extend(transform_warnings[:200])
+
+    transform_errors: List[str] = []
+    for warn_msg in transform_warnings:
+        text = str(warn_msg or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if "evaluation failed" in lowered or "exception" in lowered or "traceback" in lowered:
+            transform_errors.append(text)
+
     return {
-        "ok": True,
+        "ok": len(transform_errors) == 0,
+        "validation_source": validation_source,
         "input_rows": len(normalized_rows),
         "output_rows": len(result_rows) if isinstance(result_rows, list) else 0,
-        "errors": [],
+        "errors": transform_errors,
         "warnings": warnings,
         "sample_input": _json_safe_value(normalized_rows[:10]),
         "sample_output": _json_safe_value((result_rows or [])[:20] if isinstance(result_rows, list) else []),
@@ -8848,6 +9615,101 @@ async def upload_file(file: UploadFile = File(...)):
         if isinstance(e, HTTPException):
             raise e
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/upload/lmdb-env")
+async def upload_lmdb_env(files: List[UploadFile] = File(...)):
+    """
+    Upload LMDB environment files from browser folder selection.
+    Expects at least data.mdb (lock.mdb optional) and stores in backend uploads/.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded. Select LMDB folder containing data.mdb.")
+
+    max_upload_mb = max(10, min(int(_os.getenv("UPLOAD_MAX_MB", "1024")), 4096))
+    max_upload_bytes = max_upload_mb * 1024 * 1024
+
+    env_id = f"lmdb_{uuid.uuid4().hex[:10]}"
+    env_dir = _os.path.join(_UPLOADS_DIR, env_id)
+    _os.makedirs(env_dir, exist_ok=True)
+
+    total_written = 0
+    uploaded_files: List[Dict[str, Any]] = []
+    has_data_file = False
+
+    try:
+        for file in files:
+            original_name = str(file.filename or "").strip()
+            safe_name = "".join(c if c.isalnum() or c in "._-/" else "_" for c in original_name)
+            base_name = _os.path.basename(safe_name).lower()
+            target_name = base_name
+
+            if base_name == "data.mdb":
+                target_name = "data.mdb"
+                has_data_file = True
+            elif base_name == "lock.mdb":
+                target_name = "lock.mdb"
+            elif base_name.endswith(".mdb") and not has_data_file:
+                # Some browsers may only send one .mdb file without preserved name.
+                target_name = "data.mdb"
+                has_data_file = True
+            else:
+                # Keep any additional files (sub-databases) as-is.
+                target_name = _os.path.basename(base_name) or f"file_{uuid.uuid4().hex[:6]}"
+
+            dest_path = _os.path.join(env_dir, target_name)
+            written = 0
+            with open(dest_path, "wb") as out:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    total_written += len(chunk)
+                    if total_written > max_upload_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"LMDB upload too large. Max upload size is {max_upload_mb} MB.",
+                        )
+                    out.write(chunk)
+
+            uploaded_files.append({
+                "filename": target_name,
+                "bytes": written,
+            })
+            try:
+                await file.close()
+            except Exception:
+                pass
+
+        if not has_data_file:
+            # Final check in case source filename was exactly data.mdb and already written.
+            has_data_file = _os.path.isfile(_os.path.join(env_dir, "data.mdb"))
+
+        if not has_data_file:
+            raise HTTPException(
+                status_code=400,
+                detail="LMDB data.mdb file not found in uploaded folder. Select the LMDB environment directory.",
+            )
+
+        return {
+            "env_path": env_dir,
+            "files": uploaded_files,
+            "total_bytes": total_written,
+        }
+    except Exception:
+        # Cleanup partial upload directory
+        try:
+            if _os.path.isdir(env_dir):
+                for fname in _os.listdir(env_dir):
+                    try:
+                        _os.unlink(_os.path.join(env_dir, fname))
+                    except Exception:
+                        pass
+                _os.rmdir(env_dir)
+        except Exception:
+            pass
+        raise
 
 
 @app.delete("/api/upload")
