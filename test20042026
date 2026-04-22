@@ -1,0 +1,32 @@
+{
+  "customer": "=field('CUSTACCOUNTNUMBER')",
+  "agentcode": "=field('AGENTCODE')",
+
+  "amount_cum": "=inc('PROFILE_TEST2.amount_cum',coalesce(field('AMOUNT'), 0))",
+
+"_txn_ids": "=if_(trim(str(coalesce(field('TRANSACTIONID'), ''))) == '', prev('PROFILE_TEST2._txn_ids', array()), append_unique(prev('PROFILE_TEST2._txn_ids', array()), upper(trim(str(field('TRANSACTIONID'))))))",
+
+
+"amount": "=if_(trim(str(coalesce(field('TRANSACTIONID'), ''))) == '', num(prev('PROFILE_TEST2.amount', 0), 0), if_(count(append_unique(prev('PROFILE_TEST2._txn_ids', array()), upper(trim(str(field('TRANSACTIONID')))))) > count(prev('PROFILE_TEST2._txn_ids', array())), num(prev('PROFILE_TEST2.amount', 0), 0) + num(field('AMOUNT'), 0), num(prev('PROFILE_TEST2.amount', 0), 0)))",
+
+"amount_rolling": "=rolling_update('PROFILE_TEST2.amount_rolling', num(field('AMOUNT'), 0), field('MIS_TXNDATE'), '1,7,30', 45)",
+
+
+ "amount_conition":"=if_(field('AMOUNT') == 100,'YES',if_(field('AMOUNT') > 100,'GREATERTHAN100','LESSTHAN100'))", 
+
+
+  "total_transaction_count1": "=inc('PROFILE_TEST2.total_transaction_count1', if_(field('TRANSACTIONID') == null or trim(str(field('TRANSACTIONID'))) == '', 0, 1))",
+
+
+"total_transaction_count": "=count(if_(trim(str(coalesce(field('TRANSACTIONID'), ''))) == null or trim(str(coalesce(field('TRANSACTIONID'), ''))) == '', prev('PROFILE_TEST2._txn_ids', array()), append_unique(prev('PROFILE_TEST2._txn_ids', array()), trim(str(field('TRANSACTIONID'))))))",
+
+
+  "min_txn_time": "=if_(field('MIS_TXNDATE') == null, prev('PROFILE_TEST2.min_txn_time'), min(array(prev('PROFILE_TEST2.min_txn_time'), field('MIS_TXNDATE'))))",
+  "max_txn_time": "=if_(field('MIS_TXNDATE') == null, prev('PROFILE_TEST2.max_txn_time'), max(array(prev('PROFILE_TEST2.max_txn_time'), field('MIS_TXNDATE'))))",
+
+  "service_profiles": "=group_aggregate('SERVICENAME', obj(mintime=obj(path='MIS_TXNDATE',agg='min'), maxtime=obj(path='MIS_TXNDATE',agg='max'), total_transaction_count=obj(path='TRANSACTIONID',agg='count_non_null'), total_distinct_customer=obj(path='CUSTACCOUNTNUMBER',agg='distinct_count'), min_amount=obj(path='AMOUNT',agg='min'), max_amount=obj(path='AMOUNT',agg='max'), avg_amount=obj(path='AMOUNT',agg='avg')), 'servicename')",
+
+  "customer_profiles": "=group_aggregate('CUSTACCOUNTNUMBER', obj(mintime=obj(path='MIS_TXNDATE',agg='min'), maxtime=obj(path='MIS_TXNDATE',agg='max'), total_transaction_count=obj(path='TRANSACTIONID',agg='count_non_null'), total_service_name=obj(path='SERVICENAME',agg='value_counts')), 'customer')",
+
+  "distinct_customer_count": "=count(prev('PROFILE_TEST2.customer_profiles', array()))"
+}
