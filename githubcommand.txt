@@ -45,3 +45,10 @@ If repo is private on that machine, sign in to GitHub first (PAT/SSH), then clon
 
 Important:
 
+
+
+git add .
+
+git commit -m "message"
+
+git push -u origin main

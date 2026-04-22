@@ -16,6 +16,9 @@ venv/
 .venv/
 backend/venv/
 backend/.venv/
+backend/etl_platform.db.bak_20260418_undo_fix
+backend/etl_platform.db-shm
+backend/etl_platform.db-wal
 backend/etl_platform.db
 
 # Secrets / env
@@ -38,9 +41,19 @@ yarn-error.log*
 # Databases / runtime artifacts
 *.db
 backend/*.db
+backend/*.db.bak*
 backend/outputs/
 backend/uploads/
 backend/FRAMEWORK/
+backend/state/profile_store.lmdb/
+backend/state/profile_store.rocksdb/
+backend/state/*.mdb
+backend/state/*.sst
+backend/state/LOCK
+backend/state/*.log
+stage1/*.csv
+stage1/*.json
+dump.rdb
 
 # Build / caches
 dist/

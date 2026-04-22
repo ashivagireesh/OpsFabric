@@ -1,9 +1,9 @@
-import { memo } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import { Handle, Position } from 'reactflow'
-import { Typography, Tooltip } from 'antd'
+import { Tag, Typography, Tooltip } from 'antd'
 import {
   LoadingOutlined, CheckCircleFilled, CloseCircleFilled,
-  DeleteOutlined, CopyOutlined
+  PauseCircleFilled,
 } from '@ant-design/icons'
 import type { ETLNodeData } from '../../types'
 
@@ -29,13 +29,77 @@ const statusIcon = {
   idle: null,
 }
 
+const statusMeta: Record<string, { text: string; color: string }> = {
+  running: { text: 'Running', color: '#6366f1' },
+  success: { text: 'Success', color: '#22c55e' },
+  error: { text: 'Error', color: '#ef4444' },
+  idle: { text: 'Idle', color: 'var(--app-text-subtle)' },
+}
+
 export const ETLNode = memo(({ id, data, selected }: ETLNodeProps) => {
-  const { definition, label, status = 'idle', executionRows } = data
+  const {
+    definition,
+    label,
+    status = 'idle',
+    executionRows,
+    executionProcessedRows,
+    executionValidatedRows,
+    executionStartedAt,
+    executionDurationMs,
+  } = data
   if (!definition) return null
 
   const { color, bgColor, icon, inputs, outputs, category } = definition
   const ringColor = statusRing[status]
   const isRunning = status === 'running'
+  const statusInfo = statusMeta[status] || statusMeta.idle
+  const [tickNowMs, setTickNowMs] = useState<number>(() => Date.now())
+
+  useEffect(() => {
+    if (!isRunning) return
+    const timer = window.setInterval(() => {
+      setTickNowMs(Date.now())
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [isRunning])
+
+  const executionDurationLabel = useMemo(() => {
+    const formatDuration = (ms: number): string => {
+      if (!Number.isFinite(ms) || ms <= 0) return '0s'
+      const totalSeconds = Math.floor(ms / 1000)
+      const seconds = totalSeconds % 60
+      const minutes = Math.floor(totalSeconds / 60) % 60
+      const hours = Math.floor(totalSeconds / 3600)
+      if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`
+      if (minutes > 0) return `${minutes}m ${seconds}s`
+      return `${seconds}s`
+    }
+
+    if (isRunning) {
+      const startedAt = String(executionStartedAt || '').trim()
+      if (!startedAt) return '0s'
+      const startedMs = Date.parse(startedAt)
+      if (!Number.isFinite(startedMs)) return '0s'
+      return formatDuration(Math.max(0, tickNowMs - Number(startedMs)))
+    }
+
+    if (typeof executionDurationMs === 'number' && Number.isFinite(executionDurationMs)) {
+      return formatDuration(Math.max(0, executionDurationMs))
+    }
+    return undefined
+  }, [executionStartedAt, executionDurationMs, isRunning, tickNowMs])
+  const nodeEnabled = (() => {
+    const raw = (data?.config as Record<string, unknown> | undefined)?.node_enabled
+    if (typeof raw === 'boolean') return raw
+    if (typeof raw === 'number') return raw !== 0
+    if (typeof raw === 'string') {
+      const norm = raw.trim().toLowerCase()
+      if (['false', '0', 'no', 'off', 'disabled', 'disable'].includes(norm)) return false
+      if (['true', '1', 'yes', 'on', 'enabled', 'enable'].includes(norm)) return true
+    }
+    return true
+  })()
+  const isDisabled = !nodeEnabled
 
   return (
     <div
@@ -43,7 +107,7 @@ export const ETLNode = memo(({ id, data, selected }: ETLNodeProps) => {
         minWidth: 180,
         maxWidth: 220,
         background: 'var(--app-card-bg)',
-        border: `1px solid ${selected ? color : 'var(--app-border-strong)'}`,
+        border: `1px solid ${selected ? color : isDisabled ? '#94a3b8' : 'var(--app-border-strong)'}`,
         borderRadius: 12,
         boxShadow: selected
           ? `0 0 0 2px ${color}40, 0 8px 32px rgba(0,0,0,0.4)`
@@ -51,6 +115,8 @@ export const ETLNode = memo(({ id, data, selected }: ETLNodeProps) => {
         transition: 'all 0.2s',
         overflow: 'visible',
         position: 'relative',
+        opacity: isDisabled ? 0.4 : 1,
+        filter: isDisabled ? 'saturate(0.85)' : 'none',
         ...(isRunning ? {
           boxShadow: `0 0 0 2px ${color}80, 0 0 20px ${color}30`,
         } : {}),
@@ -112,15 +178,51 @@ export const ETLNode = memo(({ id, data, selected }: ETLNodeProps) => {
             <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
               {category}
             </Text>
+            {isDisabled && (
+              <div style={{ marginTop: 4 }}>
+                <Tag
+                  style={{
+                    marginInlineEnd: 0,
+                    background: '#64748b1a',
+                    border: '1px solid #64748b40',
+                    color: '#cbd5e1',
+                    borderRadius: 4,
+                    fontSize: 10,
+                    padding: '0 4px',
+                  }}
+                >
+                  Disabled
+                </Tag>
+              </div>
+            )}
+            {(status === 'running' || status === 'error') && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4 }}>
+                <span
+                  style={{
+                    width: 6,
+                    height: 6,
+                    borderRadius: 999,
+                    background: statusInfo.color,
+                    boxShadow: status === 'running' ? `0 0 0 3px ${statusInfo.color}22` : 'none',
+                  }}
+                />
+                <Text style={{ color: statusInfo.color, fontSize: 10, fontWeight: 600 }}>
+                  {statusInfo.text}
+                  {typeof executionRows === 'number' ? ` · ${executionRows.toLocaleString()}` : ''}
+                </Text>
+              </div>
+            )}
           </div>
           {/* Status icon */}
           <div style={{ flexShrink: 0 }}>
-            {statusIcon[status]}
+            {isDisabled
+              ? <PauseCircleFilled style={{ color: '#94a3b8', fontSize: 12 }} />
+              : statusIcon[status]}
           </div>
         </div>
 
         {/* Execution stats */}
-        {executionRows !== undefined && (
+        {(executionRows !== undefined || executionProcessedRows !== undefined || executionValidatedRows !== undefined) && (
           <div style={{
             marginTop: 8,
             padding: '4px 8px',
@@ -129,10 +231,30 @@ export const ETLNode = memo(({ id, data, selected }: ETLNodeProps) => {
             display: 'flex',
             justifyContent: 'space-between',
             alignItems: 'center',
+            gap: 8,
           }}>
-            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Rows out</Text>
-            <Text style={{ color: color, fontWeight: 600, fontSize: 11 }}>
-              {executionRows.toLocaleString()}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Rows out</Text>
+              <Text style={{ color: color, fontWeight: 600, fontSize: 11 }}>
+                {typeof executionRows === 'number' ? executionRows.toLocaleString() : 'N/A'}
+              </Text>
+            </div>
+            {(executionProcessedRows !== undefined || executionValidatedRows !== undefined) && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 2, alignItems: 'flex-end' }}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10 }}>
+                  processed {typeof executionProcessedRows === 'number' ? executionProcessedRows.toLocaleString() : '0'}
+                </Text>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10 }}>
+                  validated {typeof executionValidatedRows === 'number' ? executionValidatedRows.toLocaleString() : '0'}
+                </Text>
+              </div>
+            )}
+          </div>
+        )}
+        {(status !== 'idle' && executionDurationLabel) && (
+          <div style={{ marginTop: 6, display: 'flex', justifyContent: 'flex-end' }}>
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10 }}>
+              time {executionDurationLabel}
             </Text>
           </div>
         )}

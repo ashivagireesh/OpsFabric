@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   Button, Input, Space, Tag, Tooltip, Typography, Dropdown,
@@ -6,9 +6,11 @@ import {
 } from 'antd'
 import {
   ArrowLeftOutlined, SaveOutlined, PlayCircleOutlined,
-  SettingOutlined, LoadingOutlined, CheckCircleFilled,
+  LoadingOutlined, CheckCircleFilled,
   CloseCircleFilled, EllipsisOutlined, ScheduleOutlined,
-  ShareAltOutlined, HistoryOutlined, CodeOutlined
+  StopOutlined,
+  HistoryOutlined, CodeOutlined, CopyOutlined,
+  UndoOutlined, RedoOutlined
 } from '@ant-design/icons'
 import { ReactFlowProvider } from 'reactflow'
 import { useWorkflowStore } from '../store'
@@ -32,6 +34,62 @@ const EXECUTION_MODE_OPTIONS = [
   { value: 'incremental', label: 'Incremental Update' },
   { value: 'streaming', label: 'Streaming Incremental' },
 ]
+
+type CanvasHistorySnapshot = {
+  pipelineId: string | null
+  nodes: any[]
+  edges: any[]
+  key: string
+}
+
+function cloneStructured<T>(value: T): T {
+  try {
+    if (typeof structuredClone === 'function') {
+      return structuredClone(value)
+    }
+  } catch {
+    // fallback below
+  }
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
+function normalizeNodeForHistory(node: any): any {
+  if (!node || typeof node !== 'object') return node
+  const cleaned: any = { ...node }
+  delete cleaned.selected
+  delete cleaned.dragging
+  delete cleaned.resizing
+  delete cleaned.positionAbsolute
+  delete cleaned.zIndex
+  if (cleaned.data && typeof cleaned.data === 'object') {
+    cleaned.data = { ...cleaned.data }
+    delete cleaned.data.status
+    delete cleaned.data.executionRows
+  }
+  return cleaned
+}
+
+function normalizeEdgeForHistory(edge: any): any {
+  if (!edge || typeof edge !== 'object') return edge
+  const cleaned: any = { ...edge }
+  delete cleaned.selected
+  return cleaned
+}
+
+function createCanvasHistorySnapshot(
+  pipelineId: string | null,
+  nodes: any[],
+  edges: any[],
+): CanvasHistorySnapshot {
+  const safeNodes = cloneStructured((Array.isArray(nodes) ? nodes : []).map(normalizeNodeForHistory))
+  const safeEdges = cloneStructured((Array.isArray(edges) ? edges : []).map(normalizeEdgeForHistory))
+  return {
+    pipelineId,
+    nodes: safeNodes,
+    edges: safeEdges,
+    key: JSON.stringify({ pipelineId, nodes: safeNodes, edges: safeEdges }),
+  }
+}
 
 const SCHEDULE_PRESETS = [
   { value: 'every_1_min', label: 'Every 1 minute', cron: '* * * * *' },
@@ -134,10 +192,11 @@ export default function PipelineEditor() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const {
-    nodes,
+    nodes, edges,
     pipeline, loadPipeline, savePipeline, executePipeline,
+    abortExecution, executionAbortRequested, resumeExecutionForPipeline,
     isDirty, isExecuting, selectedNodeId, setSelectedNode,
-    resetCanvas, executionLogs, connectorType, setConnectorType,
+    resetCanvas, executionLogs, connectorType, setConnectorType, duplicateNode,
   } = useWorkflowStore()
 
   const [saving, setSaving] = useState(false)
@@ -146,16 +205,149 @@ export default function PipelineEditor() {
   const [form] = Form.useForm()
   const selectedSchedulePreset = Form.useWatch('schedulePreset', form)
   const selectedExecutionMode = Form.useWatch('executionMode', form)
+  const [canUndo, setCanUndo] = useState(false)
+  const [canRedo, setCanRedo] = useState(false)
+  const [historyReady, setHistoryReady] = useState(false)
+  const historyRef = useRef<CanvasHistorySnapshot[]>([])
+  const historyIndexRef = useRef<number>(-1)
+  const applyingHistoryRef = useRef(false)
+  const activeHistoryPipelineRef = useRef<string | null>(null)
+
+  const updateHistoryFlags = useCallback(() => {
+    const idx = historyIndexRef.current
+    const len = historyRef.current.length
+    setCanUndo(idx > 0)
+    setCanRedo(idx >= 0 && idx < len - 1)
+  }, [])
+
+  const applyHistorySnapshot = useCallback((snapshot: CanvasHistorySnapshot) => {
+    applyingHistoryRef.current = true
+    const nextNodes = cloneStructured(snapshot.nodes)
+    const nextEdges = cloneStructured(snapshot.edges)
+    const currentSelectedNodeId = useWorkflowStore.getState().selectedNodeId
+    const nextSelectedNodeId = nextNodes.some((node: any) => String(node?.id) === String(currentSelectedNodeId))
+      ? currentSelectedNodeId
+      : null
+    useWorkflowStore.setState((state) => ({
+      ...state,
+      nodes: nextNodes,
+      edges: nextEdges,
+      selectedNodeId: nextSelectedNodeId,
+      isDirty: true,
+    }))
+    window.setTimeout(() => {
+      applyingHistoryRef.current = false
+    }, 0)
+  }, [])
+
+  const pushHistorySnapshot = useCallback((snapshot: CanvasHistorySnapshot) => {
+    const current = historyRef.current[historyIndexRef.current]
+    if (current?.key === snapshot.key) {
+      updateHistoryFlags()
+      return
+    }
+    const base = historyRef.current.slice(0, historyIndexRef.current + 1)
+    base.push(snapshot)
+    const maxSnapshots = 120
+    if (base.length > maxSnapshots) {
+      base.splice(0, base.length - maxSnapshots)
+    }
+    historyRef.current = base
+    historyIndexRef.current = base.length - 1
+    updateHistoryFlags()
+  }, [updateHistoryFlags])
+
+  const handleUndo = useCallback(() => {
+    if (isExecuting || !historyReady) return
+    const nextIndex = historyIndexRef.current - 1
+    if (nextIndex < 0) return
+    historyIndexRef.current = nextIndex
+    const snapshot = historyRef.current[nextIndex]
+    const routePipelineId = id ? String(id) : null
+    if (snapshot && (!routePipelineId || snapshot.pipelineId === routePipelineId)) {
+      applyHistorySnapshot(snapshot)
+    }
+    updateHistoryFlags()
+  }, [applyHistorySnapshot, historyReady, id, isExecuting, updateHistoryFlags])
+
+  const handleRedo = useCallback(() => {
+    if (isExecuting || !historyReady) return
+    const nextIndex = historyIndexRef.current + 1
+    if (nextIndex >= historyRef.current.length) return
+    historyIndexRef.current = nextIndex
+    const snapshot = historyRef.current[nextIndex]
+    const routePipelineId = id ? String(id) : null
+    if (snapshot && (!routePipelineId || snapshot.pipelineId === routePipelineId)) {
+      applyHistorySnapshot(snapshot)
+    }
+    updateHistoryFlags()
+  }, [applyHistorySnapshot, historyReady, id, isExecuting, updateHistoryFlags])
 
   useEffect(() => {
+    let cancelled = false
+    setHistoryReady(false)
+    historyRef.current = []
+    historyIndexRef.current = -1
+    activeHistoryPipelineRef.current = null
+    updateHistoryFlags()
+
     if (id) {
-      resetCanvas()
-      loadPipeline(id).then(() => {
-        const state = useWorkflowStore.getState()
-        setPipelineName(state.pipeline?.name || 'Untitled Pipeline')
-      })
+      const routePipelineId = String(id)
+      const currentState = useWorkflowStore.getState()
+      const currentPipelineId = currentState.pipeline?.id ? String(currentState.pipeline.id) : ''
+      const preserveActiveExecutionView =
+        currentState.isExecuting
+        && currentPipelineId === routePipelineId
+        && Boolean(currentState.executionId)
+
+      if (preserveActiveExecutionView) {
+        const loadedName = currentState.pipeline?.name || 'Untitled Pipeline'
+        setPipelineName(loadedName)
+        const initialSnapshot = createCanvasHistorySnapshot(
+          routePipelineId,
+          currentState.nodes || [],
+          currentState.edges || [],
+        )
+        historyRef.current = [initialSnapshot]
+        historyIndexRef.current = 0
+        activeHistoryPipelineRef.current = routePipelineId
+        updateHistoryFlags()
+        setHistoryReady(true)
+        void resumeExecutionForPipeline(routePipelineId)
+      } else {
+        resetCanvas()
+        loadPipeline(id).then(() => {
+          if (cancelled) return
+          const state = useWorkflowStore.getState()
+          const loadedName = state.pipeline?.name || 'Untitled Pipeline'
+          setPipelineName(loadedName)
+          const loadedPipelineId = state.pipeline?.id ? String(state.pipeline.id) : null
+          if (loadedPipelineId && loadedPipelineId === routePipelineId) {
+            const initialSnapshot = createCanvasHistorySnapshot(
+              loadedPipelineId,
+              state.nodes || [],
+              state.edges || [],
+            )
+            historyRef.current = [initialSnapshot]
+            historyIndexRef.current = 0
+            activeHistoryPipelineRef.current = loadedPipelineId
+            updateHistoryFlags()
+            setHistoryReady(true)
+          } else {
+            setHistoryReady(false)
+          }
+          void resumeExecutionForPipeline(routePipelineId)
+        }).catch(() => {
+          if (cancelled) return
+          setHistoryReady(false)
+        })
+      }
     }
-  }, [id])
+
+    return () => {
+      cancelled = true
+    }
+  }, [id, loadPipeline, resetCanvas, resumeExecutionForPipeline, updateHistoryFlags])
 
   useEffect(() => {
     if (pipeline?.name) setPipelineName(pipeline.name)
@@ -185,6 +377,59 @@ export default function PipelineEditor() {
     }
   }, [scheduleModal, selectedSchedulePreset, form])
 
+  useEffect(() => {
+    if (!historyReady || isExecuting || applyingHistoryRef.current) return
+    const routePipelineId = id ? String(id) : null
+    const pipelineId = pipeline?.id ? String(pipeline.id) : null
+    if (!routePipelineId || pipelineId !== routePipelineId) return
+    const snapshot = createCanvasHistorySnapshot(pipelineId, nodes, edges)
+    if (activeHistoryPipelineRef.current !== pipelineId) {
+      activeHistoryPipelineRef.current = pipelineId
+      historyRef.current = [snapshot]
+      historyIndexRef.current = 0
+      updateHistoryFlags()
+      return
+    }
+    pushHistorySnapshot(snapshot)
+  }, [edges, historyReady, id, isExecuting, nodes, pipeline?.id, pushHistorySnapshot, updateHistoryFlags])
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null
+      const tag = String(target?.tagName || '').toUpperCase()
+      const isTyping =
+        !!target?.isContentEditable
+        || tag === 'INPUT'
+        || tag === 'TEXTAREA'
+        || tag === 'SELECT'
+        || !!target?.closest('.monaco-editor')
+      if (isTyping) return
+      const withMod = event.metaKey || event.ctrlKey
+      if (!withMod) return
+      const key = event.key.toLowerCase()
+      if (key === 'z') {
+        event.preventDefault()
+        if (event.shiftKey) {
+          handleRedo()
+        } else {
+          handleUndo()
+        }
+      } else if (key === 'y') {
+        event.preventDefault()
+        handleRedo()
+      } else if (key === 'd') {
+        event.preventDefault()
+        if (!isExecuting && selectedNodeId) {
+          duplicateNode(selectedNodeId)
+        }
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [duplicateNode, handleUndo, handleRedo, isExecuting, selectedNodeId])
+
   // Auto-save on dirty
   useEffect(() => {
     if (!isDirty) return
@@ -207,6 +452,11 @@ export default function PipelineEditor() {
   const handleRun = async () => {
     if (isExecuting) return
     await executePipeline()
+  }
+
+  const handleAbort = async () => {
+    if (!isExecuting) return
+    await abortExecution()
   }
 
   const hasError = executionLogs.some(l => l.status === 'error')
@@ -296,6 +546,30 @@ export default function PipelineEditor() {
                 dropdownStyle={{ background: 'var(--app-card-bg)' }}
               />
             </Tooltip>
+            <Tooltip title="Undo (Ctrl/Cmd + Z)">
+              <Button
+                icon={<UndoOutlined />}
+                onClick={handleUndo}
+                disabled={!canUndo || isExecuting}
+                style={{ background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)', color: 'var(--app-text-muted)' }}
+              />
+            </Tooltip>
+            <Tooltip title="Redo (Ctrl/Cmd + Shift + Z)">
+              <Button
+                icon={<RedoOutlined />}
+                onClick={handleRedo}
+                disabled={!canRedo || isExecuting}
+                style={{ background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)', color: 'var(--app-text-muted)' }}
+              />
+            </Tooltip>
+            <Tooltip title="Duplicate selected node (Ctrl/Cmd + D)">
+              <Button
+                icon={<CopyOutlined />}
+                onClick={() => selectedNodeId && duplicateNode(selectedNodeId)}
+                disabled={!selectedNodeId || isExecuting}
+                style={{ background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)', color: 'var(--app-text-muted)' }}
+              />
+            </Tooltip>
 
             {/* Execution status badge */}
             {hasError && (
@@ -325,19 +599,23 @@ export default function PipelineEditor() {
             </Button>
 
             <Button
-              type="primary"
-              icon={isExecuting ? <LoadingOutlined spin /> : <PlayCircleOutlined />}
-              onClick={handleRun}
-              disabled={isExecuting}
+              type={isExecuting ? 'default' : 'primary'}
+              danger={isExecuting}
+              icon={
+                isExecuting
+                  ? (executionAbortRequested ? <LoadingOutlined spin /> : <StopOutlined />)
+                  : <PlayCircleOutlined />
+              }
+              onClick={isExecuting ? handleAbort : handleRun}
               style={{
                 background: isExecuting
-                  ? 'rgba(99,102,241,0.5)'
+                  ? 'rgba(239,68,68,0.16)'
                   : 'linear-gradient(135deg, #6366f1, #a855f7)',
-                border: 'none',
+                border: isExecuting ? '1px solid rgba(239,68,68,0.45)' : 'none',
                 minWidth: 90,
               }}
             >
-              {isExecuting ? 'Running…' : 'Execute'}
+              {isExecuting ? (executionAbortRequested ? 'Aborting…' : 'Abort') : 'Execute'}
             </Button>
 
             <Dropdown

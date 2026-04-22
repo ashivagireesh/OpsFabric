@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
   Drawer, Form, Input, Select, Switch, InputNumber,
-  Button, Typography, Space, Tabs, Divider, Tag, Tooltip, notification, Modal
+  Button, Typography, Space, Tabs, Divider, Tag, Tooltip, Table, notification, Modal
 } from 'antd'
-import { CloseOutlined, DeleteOutlined, InfoCircleOutlined } from '@ant-design/icons'
+import { CloseOutlined, CopyOutlined, DeleteOutlined, InfoCircleOutlined } from '@ant-design/icons'
 import Editor, { type Monaco } from '@monaco-editor/react'
 import { useWorkflowStore } from '../../store'
 import { SourceFilePicker, DestinationPathPicker } from './FilePicker'
@@ -50,11 +50,19 @@ interface ConfigDrawerProps {
 }
 
 type CustomFieldMode = 'value' | 'json'
+type SingleValueOutputMode = 'plain_text' | 'json'
+type CustomProfileProcessingMode = 'batch' | 'incremental' | 'incremental_batch'
+type CustomProfileComputeStrategy = 'single' | 'parallel_by_profile_key'
+type CustomProfileComputeExecutor = 'thread' | 'process'
+type CustomExpressionEngine = 'auto' | 'python' | 'polars'
+type CustomProfileStorage = 'lmdb' | 'rocksdb' | 'redis' | 'oracle'
+type CustomProfileOracleWriteStrategy = 'single' | 'parallel_key'
 
 interface CustomFieldSpec {
   id: string
   name: string
   mode: CustomFieldMode
+  singleValueOutput: SingleValueOutputMode
   expression: string
   jsonTemplate: string
   enabled: boolean
@@ -65,6 +73,29 @@ interface OracleColumnMappingSpec {
   source: string
   destination: string
   enabled: boolean
+}
+
+interface LmdbStudioDraft {
+  env_path: string
+  db_name: string
+  key_prefix: string
+  start_key: string
+  end_key: string
+  key_contains: string
+  value_contains: string
+  value_format: 'auto' | 'json' | 'text' | 'base64'
+  flatten_json_values: boolean
+  expand_profile_documents: boolean
+  limit: number
+}
+
+interface JsonTagMappingItem {
+  path: string
+  kind: 'string' | 'number' | 'boolean' | 'null' | 'object' | 'array'
+  sample: string
+  fieldExpr: string
+  valuesExpr: string
+  controlTag: string
 }
 
 interface CustomFieldExampleItem {
@@ -101,6 +132,7 @@ interface ProfileMonitorResponse {
 
 interface CustomFieldValidationResult {
   ok: boolean
+  validation_source?: string
   input_rows: number
   output_rows: number
   errors: string[]
@@ -113,6 +145,8 @@ const MAX_PATH_DEPTH = 5
 const MAX_PATH_OPTIONS = 400
 const MAX_ARRAY_INDEX_OPTIONS = 3
 const MAX_OBJECT_KEYS_PER_LEVEL = 40
+const MAX_JSON_TAG_DEPTH = 8
+const MAX_JSON_TAG_MAPPINGS = 320
 
 const CUSTOM_FIELD_EXAMPLE_REPOSITORY: CustomFieldExampleItem[] = [
   {
@@ -579,6 +613,7 @@ function createCustomFieldSpec(seed?: Partial<CustomFieldSpec>): CustomFieldSpec
     id: seed?.id || `cf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     name: seed?.name || '',
     mode: seed?.mode || 'value',
+    singleValueOutput: seed?.singleValueOutput || 'json',
     expression: seed?.expression || '',
     jsonTemplate: seed?.jsonTemplate || '{\n  "value": "=field(\'id\')"\n}',
     enabled: seed?.enabled ?? true,
@@ -594,6 +629,35 @@ function createOracleColumnMappingSpec(seed?: Partial<OracleColumnMappingSpec>):
   }
 }
 
+function createLmdbStudioDraft(seed?: Partial<LmdbStudioDraft>): LmdbStudioDraft {
+  const valueFormatRaw = String(seed?.value_format || 'auto').trim().toLowerCase()
+  const valueFormat: 'auto' | 'json' | 'text' | 'base64' = (
+    valueFormatRaw === 'json'
+      ? 'json'
+      : valueFormatRaw === 'text'
+        ? 'text'
+        : valueFormatRaw === 'base64'
+          ? 'base64'
+          : 'auto'
+  )
+  const rawLimit = Number(seed?.limit ?? 1000)
+  // limit = 0 means no cap (read all matching LMDB records).
+  const limit = Number.isFinite(rawLimit) ? Math.max(0, Math.floor(rawLimit)) : 1000
+  return {
+    env_path: String(seed?.env_path || '').trim(),
+    db_name: String(seed?.db_name || '').trim(),
+    key_prefix: String(seed?.key_prefix || '').trim(),
+    start_key: String(seed?.start_key || '').trim(),
+    end_key: String(seed?.end_key || '').trim(),
+    key_contains: String(seed?.key_contains || '').trim(),
+    value_contains: String(seed?.value_contains || '').trim(),
+    value_format: valueFormat,
+    flatten_json_values: seed?.flatten_json_values ?? true,
+    expand_profile_documents: parseBoolLike(seed?.expand_profile_documents, true),
+    limit,
+  }
+}
+
 function parseBoolLike(value: unknown, defaultValue = false): boolean {
   if (typeof value === 'boolean') return value
   if (typeof value === 'number') return value !== 0
@@ -603,6 +667,171 @@ function parseBoolLike(value: unknown, defaultValue = false): boolean {
     if (['0', 'false', 'no', 'n', 'off'].includes(norm)) return false
   }
   return defaultValue
+}
+
+function normalizeSingleValueOutput(value: unknown): SingleValueOutputMode {
+  const text = String(value || '').trim().toLowerCase()
+  if (['plain_text', 'text', 'plain', 'string', 'str'].includes(text)) return 'plain_text'
+  return 'json'
+}
+
+function toPreviewCellText(value: unknown): string {
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
+function toPreviewJsonText(value: unknown): string {
+  try {
+    return JSON.stringify(value ?? null, null, 2)
+  } catch {
+    return JSON.stringify(String(value ?? ''), null, 2)
+  }
+}
+
+function detectJsonValueKind(value: unknown): JsonTagMappingItem['kind'] {
+  if (value === null || value === undefined) return 'null'
+  if (Array.isArray(value)) return 'array'
+  const t = typeof value
+  if (t === 'string') return 'string'
+  if (t === 'number') return 'number'
+  if (t === 'boolean') return 'boolean'
+  if (t === 'object') return 'object'
+  return 'string'
+}
+
+function toJsonTagSample(value: unknown): string {
+  if (value === null || value === undefined) return 'null'
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed.length > 72 ? `${trimmed.slice(0, 69)}...` : trimmed
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  if (Array.isArray(value)) return `Array(${value.length})`
+  if (typeof value === 'object') {
+    const keys = Object.keys(value as Record<string, unknown>)
+    return `Object(${keys.length})`
+  }
+  return String(value)
+}
+
+function escapeExprPath(path: string): string {
+  return String(path || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+}
+
+function buildJsonTagMapping(path: string, value: unknown): JsonTagMappingItem {
+  const safePath = escapeExprPath(path)
+  return {
+    path,
+    kind: detectJsonValueKind(value),
+    sample: toJsonTagSample(value),
+    fieldExpr: `=field('${safePath}')`,
+    valuesExpr: `=values('${safePath}')`,
+    controlTag: `{{${path}}}`,
+  }
+}
+
+function collectJsonTagMappings(
+  value: unknown,
+  basePath: string,
+  out: JsonTagMappingItem[],
+  seen: Set<string>,
+  depth: number
+): void {
+  if (depth > MAX_JSON_TAG_DEPTH || out.length >= MAX_JSON_TAG_MAPPINGS) return
+
+  if (basePath) {
+    const dedupeKey = `${basePath}|${detectJsonValueKind(value)}`
+    if (!seen.has(dedupeKey)) {
+      seen.add(dedupeKey)
+      out.push(buildJsonTagMapping(basePath, value))
+      if (out.length >= MAX_JSON_TAG_MAPPINGS) return
+    }
+  }
+
+  if (Array.isArray(value)) {
+    if (!basePath) return
+    const wildcardPath = `${basePath}[]`
+    if (!seen.has(`${wildcardPath}|array`)) {
+      seen.add(`${wildcardPath}|array`)
+      out.push(buildJsonTagMapping(wildcardPath, value))
+      if (out.length >= MAX_JSON_TAG_MAPPINGS) return
+    }
+    const sampleItems = value.slice(0, MAX_ARRAY_INDEX_OPTIONS)
+    sampleItems.forEach((item, idx) => {
+      const idxPath = `${basePath}[${idx}]`
+      collectJsonTagMappings(item, idxPath, out, seen, depth + 1)
+    })
+    const exemplar = value.find((item) => item !== null && item !== undefined)
+    if (exemplar !== undefined) {
+      collectJsonTagMappings(exemplar, wildcardPath, out, seen, depth + 1)
+    }
+    return
+  }
+
+  if (value && typeof value === 'object') {
+    Object.entries(value as Record<string, unknown>)
+      .slice(0, MAX_OBJECT_KEYS_PER_LEVEL)
+      .forEach(([key, child]) => {
+        const nextPath = basePath ? `${basePath}.${key}` : key
+        collectJsonTagMappings(child, nextPath, out, seen, depth + 1)
+      })
+  }
+}
+
+function buildJsonTagMappingsFromParsed(value: unknown): JsonTagMappingItem[] {
+  const out: JsonTagMappingItem[] = []
+  const seen = new Set<string>()
+  if (value === null || value === undefined) return out
+  if (Array.isArray(value)) {
+    value.slice(0, MAX_ARRAY_INDEX_OPTIONS).forEach((item, idx) => {
+      collectJsonTagMappings(item, `[${idx}]`, out, seen, 0)
+    })
+    const exemplar = value.find((item) => item !== null && item !== undefined)
+    if (exemplar !== undefined) {
+      collectJsonTagMappings(exemplar, '[]', out, seen, 0)
+    }
+    return out.slice(0, MAX_JSON_TAG_MAPPINGS)
+  }
+  if (value && typeof value === 'object') {
+    Object.entries(value as Record<string, unknown>)
+      .slice(0, MAX_OBJECT_KEYS_PER_LEVEL)
+      .forEach(([key, child]) => {
+        collectJsonTagMappings(child, key, out, seen, 0)
+      })
+    return out.slice(0, MAX_JSON_TAG_MAPPINGS)
+  }
+  collectJsonTagMappings(value, 'value', out, seen, 0)
+  return out.slice(0, MAX_JSON_TAG_MAPPINGS)
+}
+
+function tryParseSortableNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  if (!/^-?\d+(\.\d+)?$/.test(trimmed)) return null
+  const parsed = Number(trimmed)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function applyRocksdbIncrementalTuningDefaults(
+  setFlushRows: (value: number) => void,
+  setFlushInterval: (value: number) => void,
+  setDisableMinRows: (value: number) => void,
+  setEntityLimit: (value: number) => void,
+  setDisableRatio: (value: number) => void,
+): void {
+  setFlushRows(50000)
+  setFlushInterval(10)
+  setDisableMinRows(5000)
+  setEntityLimit(10000)
+  setDisableRatio(0.35)
 }
 
 function parseOracleColumnMappings(value: unknown): OracleColumnMappingSpec[] {
@@ -671,6 +900,9 @@ function parseCustomFieldSpecs(value: unknown): CustomFieldSpec[] {
         id: String(rec.id || ''),
         name: String(rec.name || rec.field || ''),
         mode,
+        singleValueOutput: normalizeSingleValueOutput(
+          rec.singleValueOutput ?? rec.single_value_output ?? rec.value_output ?? rec.output_format
+        ),
         expression: String(rec.expression || rec.expr || ''),
         jsonTemplate: String(rec.jsonTemplate || rec.json_template || rec.template || ''),
         enabled: parseBoolLike(rec.enabled, true),
@@ -683,8 +915,10 @@ function parseCustomFieldSpecs(value: unknown): CustomFieldSpec[] {
 function serializeCustomFieldSpecs(items: CustomFieldSpec[]): Array<Record<string, unknown>> {
   return items
     .map((item) => ({
+      id: String(item.id || '').trim(),
       name: String(item.name || '').trim(),
       mode: item.mode,
+      single_value_output: item.mode === 'value' ? item.singleValueOutput : 'json',
       expression: item.mode === 'value' ? String(item.expression || '').trim() : '',
       json_template: item.mode === 'json' ? String(item.jsonTemplate || '').trim() : '',
       enabled: Boolean(item.enabled),
@@ -706,12 +940,67 @@ function uniqueFieldNames(values: string[]): string[] {
   return out
 }
 
+const INTERNAL_FIELD_ROOT_PREFIXES = ['_lmdb_', '__lmdb_', '_profile_', '_detected_', '_preview_']
+const INTERNAL_FIELD_ROOT_EXACT = new Set([
+  '_lmdb_entity_meta',
+  '_lmdb_profile_source',
+  '_lmdb_value_kind',
+  '__lmdb_preview_row_id',
+  '__lmdb_preview_row_index',
+  '_profile_changed_fields',
+  '_row_count',
+  'lmdb_key',
+  'lmdb_entity_key',
+])
+const LMDB_GLOBAL_ALL_COLUMNS = '__ALL__'
+const LMDB_EMPTY_FILTER_TOKEN = '__LMDB_EMPTY__'
+
+function isInternalSystemField(fieldName: string): boolean {
+  const text = String(fieldName || '').trim()
+  if (!text) return false
+  const rootMatch = text.match(/^[^.[\]]+/)
+  const root = String(rootMatch?.[0] || text).trim()
+  if (!root) return false
+  if (INTERNAL_FIELD_ROOT_EXACT.has(root)) return true
+  return INTERNAL_FIELD_ROOT_PREFIXES.some((prefix) => root.startsWith(prefix))
+}
+
+function filterUserFacingFieldNames(values: string[]): string[] {
+  return uniqueFieldNames(values).filter((name) => !isInternalSystemField(name))
+}
+
 function parseFieldList(value: unknown): string[] {
   if (Array.isArray(value)) {
     return uniqueFieldNames(value.map((v) => String(v)))
   }
   if (typeof value === 'string') {
     return uniqueFieldNames(value.split(/[,\n]/).map((p) => p.trim()))
+  }
+  return []
+}
+
+function parseStringList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    const out: string[] = []
+    const seen = new Set<string>()
+    value.forEach((item) => {
+      const text = String(item || '').trim()
+      if (!text || seen.has(text)) return
+      seen.add(text)
+      out.push(text)
+    })
+    return out
+  }
+  if (typeof value === 'string') {
+    const out: string[] = []
+    const seen = new Set<string>()
+    value.split(/[,\n]/).forEach((item) => {
+      const text = String(item || '').trim()
+      if (!text || seen.has(text)) return
+      seen.add(text)
+      out.push(text)
+    })
+    return out
   }
   return []
 }
@@ -785,7 +1074,7 @@ function extractDirectNodeFields(node: ETLNode | undefined): string[] {
   fields.push(...extractSampleFieldPaths(node.data.executionSampleInput))
   fields.push(...extractSampleFieldPaths(node.data.executionSampleOutput))
 
-  return uniqueFieldNames(fields)
+  return filterUserFacingFieldNames(fields)
 }
 
 function parseRenameMappings(value: unknown): Array<{ from: string; to: string }> {
@@ -870,7 +1159,7 @@ function inferNodeOutputFields(
     result = out.length > 0 ? out : passthroughFields
   }
 
-  result = uniqueFieldNames(result)
+  result = filterUserFacingFieldNames(result)
   memo.set(nodeId, result)
   stack.delete(nodeId)
   return result
@@ -899,7 +1188,7 @@ function inferUpstreamInputFields(targetNodeId: string, nodes: ETLNode[], edges:
       inferNodeOutputFields(srcId, nodesById, incomingByTarget, memo, new Set<string>())
     )
   )
-  return fields
+  return filterUserFacingFieldNames(fields)
 }
 
 function inferUpstreamSources(
@@ -977,8 +1266,107 @@ function inferUpstreamPreviewRows(
   return out.slice(0, maxRows)
 }
 
+function splitPathSegments(path: string): string[] {
+  const text = String(path || '').trim()
+  if (!text) return []
+  const out: string[] = []
+  let current = ''
+  let bracket = false
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    if (!bracket && ch === '.') {
+      if (current.trim()) out.push(current.trim())
+      current = ''
+      continue
+    }
+    if (ch === '[') {
+      if (current.trim()) out.push(current.trim())
+      current = ''
+      bracket = true
+      continue
+    }
+    if (ch === ']') {
+      const token = current.trim()
+      if (token) {
+        const normalized = token.replace(/^['"]|['"]$/g, '').trim()
+        out.push(normalized || '*')
+      } else {
+        out.push('*')
+      }
+      current = ''
+      bracket = false
+      continue
+    }
+    current += ch
+  }
+  if (current.trim()) out.push(current.trim())
+  return out
+}
+
+function readPathValue(row: Record<string, unknown>, path: string): { found: boolean; value: unknown } {
+  const segments = splitPathSegments(path)
+  if (segments.length === 0) return { found: false, value: undefined }
+  let current: unknown = row
+  for (const seg of segments) {
+    if (current === null || current === undefined) return { found: false, value: undefined }
+    if (Array.isArray(current)) {
+      if (seg === '*') {
+        if (current.length === 0) return { found: false, value: undefined }
+        current = current[0]
+        continue
+      }
+      const idx = Number(seg)
+      if (!Number.isInteger(idx) || idx < 0 || idx >= current.length) {
+        return { found: false, value: undefined }
+      }
+      current = current[idx]
+      continue
+    }
+    if (typeof current === 'object') {
+      const obj = current as Record<string, unknown>
+      if (!(seg in obj)) return { found: false, value: undefined }
+      current = obj[seg]
+      continue
+    }
+    return { found: false, value: undefined }
+  }
+  return { found: true, value: current }
+}
+
+function hasMeaningfulValue(value: unknown): boolean {
+  if (value === null || value === undefined) return false
+  if (typeof value === 'string') return value.trim().length > 0
+  if (Array.isArray(value)) return value.length > 0
+  if (typeof value === 'object') return Object.keys(value as Record<string, unknown>).length > 0
+  return true
+}
+
+function filterRowsByPrimaryKey(
+  rows: Array<Record<string, unknown>>,
+  primaryKeyPath: string,
+): Array<Record<string, unknown>> {
+  const path = String(primaryKeyPath || '').trim()
+  if (!path) return rows
+  return rows.filter((row) => {
+    const hit = readPathValue(row, path)
+    if (!hit.found) return false
+    return hasMeaningfulValue(hit.value)
+  })
+}
+
 export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
-  const { nodes, edges, selectedNodeId, pipeline, updateNodeConfig, updateNodeLabel, removeNode } = useWorkflowStore()
+  const {
+    nodes,
+    edges,
+    selectedNodeId,
+    pipeline,
+    isExecuting,
+    updateNodeConfig,
+    updateNodeConfigSilent,
+    updateNodeLabel,
+    removeNode,
+    duplicateNode,
+  } = useWorkflowStore()
   const [form] = Form.useForm()
   const [activeTab, setActiveTab] = useState('config')
   const [jsonPathDetectLoading, setJsonPathDetectLoading] = useState(false)
@@ -988,8 +1376,37 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [customFieldStudioOpen, setCustomFieldStudioOpen] = useState(false)
   const [customFieldDraft, setCustomFieldDraft] = useState<CustomFieldSpec[]>([])
   const [customIncludeSourceDraft, setCustomIncludeSourceDraft] = useState(true)
+  const [customExpressionEngineDraft, setCustomExpressionEngineDraft] = useState<CustomExpressionEngine>('auto')
   const [customPrimaryKeyFieldDraft, setCustomPrimaryKeyFieldDraft] = useState('')
   const [customProfileEnabledDraft, setCustomProfileEnabledDraft] = useState(false)
+  const [customProfileStorageDraft, setCustomProfileStorageDraft] = useState<CustomProfileStorage>('lmdb')
+  const [customProfileOracleHostDraft, setCustomProfileOracleHostDraft] = useState('')
+  const [customProfileOraclePortDraft, setCustomProfileOraclePortDraft] = useState(1521)
+  const [customProfileOracleServiceNameDraft, setCustomProfileOracleServiceNameDraft] = useState('')
+  const [customProfileOracleSidDraft, setCustomProfileOracleSidDraft] = useState('')
+  const [customProfileOracleUserDraft, setCustomProfileOracleUserDraft] = useState('')
+  const [customProfileOraclePasswordDraft, setCustomProfileOraclePasswordDraft] = useState('')
+  const [customProfileOracleDsnDraft, setCustomProfileOracleDsnDraft] = useState('')
+  const [customProfileOracleTableDraft, setCustomProfileOracleTableDraft] = useState('ETL_PROFILE_STATE')
+  const [customProfileOracleWriteStrategyDraft, setCustomProfileOracleWriteStrategyDraft] = useState<CustomProfileOracleWriteStrategy>('parallel_key')
+  const [customProfileOracleParallelWorkersDraft, setCustomProfileOracleParallelWorkersDraft] = useState(4)
+  const [customProfileOracleParallelMinTokensDraft, setCustomProfileOracleParallelMinTokensDraft] = useState(2000)
+  const [customProfileOracleMergeBatchSizeDraft, setCustomProfileOracleMergeBatchSizeDraft] = useState(500)
+  const [customProfileOracleQueueEnabledDraft, setCustomProfileOracleQueueEnabledDraft] = useState(true)
+  const [customProfileOracleQueueWaitOnForceFlushDraft, setCustomProfileOracleQueueWaitOnForceFlushDraft] = useState(false)
+  const [customProfileProcessingModeDraft, setCustomProfileProcessingModeDraft] = useState<CustomProfileProcessingMode>('batch')
+  const [customProfileComputeStrategyDraft, setCustomProfileComputeStrategyDraft] = useState<CustomProfileComputeStrategy>('single')
+  const [customProfileComputeExecutorDraft, setCustomProfileComputeExecutorDraft] = useState<CustomProfileComputeExecutor>('thread')
+  const [customProfileComputeWorkersDraft, setCustomProfileComputeWorkersDraft] = useState(4)
+  const [customProfileComputeMinRowsDraft, setCustomProfileComputeMinRowsDraft] = useState(20000)
+  const [customProfileComputeGlobalPrefetchMaxTokensDraft, setCustomProfileComputeGlobalPrefetchMaxTokensDraft] = useState(40000)
+  const [customProfileBackfillCandidatePrefetchChunkSizeDraft, setCustomProfileBackfillCandidatePrefetchChunkSizeDraft] = useState(500)
+  const [customProfileLivePersistDraft, setCustomProfileLivePersistDraft] = useState(false)
+  const [customProfileFlushEveryRowsDraft, setCustomProfileFlushEveryRowsDraft] = useState(20000)
+  const [customProfileFlushIntervalSecondsDraft, setCustomProfileFlushIntervalSecondsDraft] = useState(2)
+  const [customProfileAppendUniqueDisableMinRowsDraft, setCustomProfileAppendUniqueDisableMinRowsDraft] = useState(5000)
+  const [customProfileAppendUniqueEntityLimitDraft, setCustomProfileAppendUniqueEntityLimitDraft] = useState(10000)
+  const [customProfileAppendUniqueDisableRatioDraft, setCustomProfileAppendUniqueDisableRatioDraft] = useState(0.35)
   const [customProfileEmitModeDraft, setCustomProfileEmitModeDraft] = useState<'changed_only' | 'all_entities'>('changed_only')
   const [customProfileRequiredFieldsDraft, setCustomProfileRequiredFieldsDraft] = useState<string[]>([])
   const [customProfileEventTimeFieldDraft, setCustomProfileEventTimeFieldDraft] = useState('')
@@ -1000,11 +1417,21 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [profileMonitorClearing, setProfileMonitorClearing] = useState(false)
   const [profileMonitorData, setProfileMonitorData] = useState<ProfileMonitorResponse | null>(null)
   const [profileMonitorError, setProfileMonitorError] = useState<string | null>(null)
+  const [profileDataModalOpen, setProfileDataModalOpen] = useState(false)
+  const [selectedProfileEntityKey, setSelectedProfileEntityKey] = useState<string>('')
   const [expandedEditorFieldId, setExpandedEditorFieldId] = useState<string | null>(null)
   const [expandedEditorMode, setExpandedEditorMode] = useState<CustomFieldMode>('value')
   const [validationLoading, setValidationLoading] = useState(false)
   const [validationResult, setValidationResult] = useState<CustomFieldValidationResult | null>(null)
   const [validationModalOpen, setValidationModalOpen] = useState(false)
+  const [validationSourceDraft, setValidationSourceDraft] = useState<'lmdb' | 'rocksdb' | 'sample'>('sample')
+  const [validationLmdbEnvPathDraft, setValidationLmdbEnvPathDraft] = useState('')
+  const [validationLmdbDbNameDraft, setValidationLmdbDbNameDraft] = useState('')
+  const [validationLmdbKeyPrefixDraft, setValidationLmdbKeyPrefixDraft] = useState('')
+  const [validationLmdbStartKeyDraft, setValidationLmdbStartKeyDraft] = useState('')
+  const [validationLmdbEndKeyDraft, setValidationLmdbEndKeyDraft] = useState('')
+  const [validationLmdbKeyContainsDraft, setValidationLmdbKeyContainsDraft] = useState('')
+  const [validationLmdbLimitDraft, setValidationLmdbLimitDraft] = useState(50)
   const [activeExpressionFieldId, setActiveExpressionFieldId] = useState<string | null>(null)
   const [collapsedCustomFieldIds, setCollapsedCustomFieldIds] = useState<string[]>([])
   const [exampleRepoCategory, setExampleRepoCategory] = useState<string>('all')
@@ -1018,6 +1445,38 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [oracleIfExistsDraft, setOracleIfExistsDraft] = useState<'append' | 'replace' | 'fail'>('append')
   const [oracleOperationDraft, setOracleOperationDraft] = useState<'insert' | 'update' | 'upsert'>('insert')
   const [oracleKeyColumnsDraft, setOracleKeyColumnsDraft] = useState<string[]>([])
+  const [lmdbStudioOpen, setLmdbStudioOpen] = useState(false)
+  const [lmdbStudioDraft, setLmdbStudioDraft] = useState<LmdbStudioDraft>(createLmdbStudioDraft())
+  const [lmdbStudioLoading, setLmdbStudioLoading] = useState(false)
+  const [lmdbPathBrowseLoading, setLmdbPathBrowseLoading] = useState(false)
+  const [lmdbDeleteLoading, setLmdbDeleteLoading] = useState(false)
+  const [lmdbStudioError, setLmdbStudioError] = useState<string | null>(null)
+  const [lmdbPathBrowseError, setLmdbPathBrowseError] = useState<string | null>(null)
+  const [lmdbDiscoveredPaths, setLmdbDiscoveredPaths] = useState<string[]>([])
+  const [lmdbStudioPreviewRows, setLmdbStudioPreviewRows] = useState<Array<Record<string, unknown>>>([])
+  const [lmdbStudioColumns, setLmdbStudioColumns] = useState<string[]>([])
+  const [lmdbStudioRowCount, setLmdbStudioRowCount] = useState<number>(0)
+  const [lmdbPreviewView, setLmdbPreviewView] = useState<'table' | 'json' | 'summary'>('table')
+  const [lmdbSummaryRemote, setLmdbSummaryRemote] = useState<Record<string, unknown> | null>(null)
+  const [lmdbSummaryLoading, setLmdbSummaryLoading] = useState<boolean>(false)
+  const [lmdbSummaryError, setLmdbSummaryError] = useState<string | null>(null)
+  const [lmdbPreviewDisplayLimit, setLmdbPreviewDisplayLimit] = useState<number>(200)
+  const [lmdbTablePageSize, setLmdbTablePageSize] = useState<number>(25)
+  const [lmdbTableCurrentPage, setLmdbTableCurrentPage] = useState<number>(1)
+  const [lmdbPreviewHasMore, setLmdbPreviewHasMore] = useState<boolean>(false)
+  const [lmdbVisibleColumns, setLmdbVisibleColumns] = useState<string[]>([])
+  const [lmdbGlobalFilterColumn, setLmdbGlobalFilterColumn] = useState<string>(LMDB_GLOBAL_ALL_COLUMNS)
+  const [lmdbGlobalFilterValues, setLmdbGlobalFilterValues] = useState<string[]>([])
+  const [lmdbColumnFilterValues, setLmdbColumnFilterValues] = useState<Record<string, string[]>>({})
+  const [lmdbJsonEditorOpen, setLmdbJsonEditorOpen] = useState(false)
+  const [lmdbJsonEditorMode, setLmdbJsonEditorMode] = useState<'cell' | 'row'>('cell')
+  const [lmdbJsonEditorTitle, setLmdbJsonEditorTitle] = useState('')
+  const [lmdbJsonEditorText, setLmdbJsonEditorText] = useState('')
+  const [lmdbJsonEditorOriginalText, setLmdbJsonEditorOriginalText] = useState('')
+  const [lmdbJsonEditorRowIndex, setLmdbJsonEditorRowIndex] = useState<number | null>(null)
+  const [lmdbJsonEditorField, setLmdbJsonEditorField] = useState('')
+  const [lmdbJsonEditorError, setLmdbJsonEditorError] = useState<string | null>(null)
+  const [lmdbJsonTagFilter, setLmdbJsonTagFilter] = useState('')
 
   const node = nodes.find(n => n.id === selectedNodeId)
   const data: ETLNodeData | undefined = node?.data
@@ -1036,6 +1495,30 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setSourceFieldDetectError(null)
     setCustomFieldStudioOpen(false)
     setOracleStudioOpen(false)
+    setLmdbStudioOpen(false)
+    setLmdbStudioError(null)
+    setLmdbPathBrowseError(null)
+    setLmdbDiscoveredPaths([])
+    setLmdbPathBrowseLoading(false)
+    setLmdbDeleteLoading(false)
+    setLmdbStudioPreviewRows([])
+    setLmdbStudioColumns([])
+    setLmdbStudioRowCount(0)
+    setLmdbSummaryRemote(null)
+    setLmdbSummaryLoading(false)
+    setLmdbSummaryError(null)
+    setLmdbPreviewView('table')
+    setLmdbPreviewDisplayLimit(200)
+    setLmdbTablePageSize(25)
+    setLmdbTableCurrentPage(1)
+    setLmdbPreviewHasMore(false)
+    setLmdbVisibleColumns([])
+    setLmdbGlobalFilterColumn(LMDB_GLOBAL_ALL_COLUMNS)
+    setLmdbGlobalFilterValues([])
+    setLmdbColumnFilterValues({})
+    setLmdbJsonEditorOpen(false)
+    setLmdbJsonEditorError(null)
+    setLmdbJsonTagFilter('')
   }, [selectedNodeId])
 
   useEffect(() => {
@@ -1074,7 +1557,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     }
 
     if (Object.keys(patch).length > 0) {
-      updateNodeConfig(selectedNodeId, patch)
+      updateNodeConfigSilent(selectedNodeId, patch)
     }
   }, [selectedNodeId, data?.nodeType])
 
@@ -1083,9 +1566,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const isFileSource = FILE_SOURCE_TYPES.includes(nodeType)
   const isFileDest   = FILE_DEST_TYPES.includes(nodeType)
   const isDatabaseSource = DB_SOURCE_TYPES.includes(nodeType)
+  const isRocksdbSource = nodeType === 'rocksdb_source'
+  const isLmdbSource = nodeType === 'lmdb_source' || isRocksdbSource
+  const kvSourceType = isRocksdbSource ? 'rocksdb_source' : 'lmdb_source'
+  const kvSourceLabel = isRocksdbSource ? 'RocksDB' : 'LMDB'
+  const kvSourceLabelUpper = isRocksdbSource ? 'ROCKSDB' : 'LMDB'
+  const kvSourceRootVar = isRocksdbSource ? '${ROCKSDB_ROOT}' : '${LMDB_ROOT}'
+  const kvPathPlaceholder = isRocksdbSource ? '/data/profile_store.rocksdb' : '/data/profile_store.lmdb'
   const fileType     = getFileType(nodeType)
   const isApiJsonNode = nodeType === 'rest_api_source' || nodeType === 'graphql_source'
   const nodeConfig = (data?.config && typeof data.config === 'object' ? data.config : {}) as Record<string, unknown>
+  const nodeEnabled = parseBoolLike(nodeConfig.node_enabled, true)
   const configuredCustomFields = parseCustomFieldSpecs(nodeConfig.custom_fields)
   const customFieldConfiguredCount = configuredCustomFields.length
   const customFieldEnabledConfiguredCount = configuredCustomFields.filter((item) => item.enabled).length
@@ -1115,20 +1606,471 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         : 'insert'
   )
   const oracleConfiguredKeyColumns = parseFieldList(nodeConfig.oracle_key_columns)
+  const lmdbConfigured = useMemo(
+    () => createLmdbStudioDraft({
+      env_path: String(nodeConfig.env_path || nodeConfig.file_path || ''),
+      db_name: String(nodeConfig.db_name || ''),
+      key_prefix: String(nodeConfig.key_prefix || ''),
+      start_key: String(nodeConfig.start_key || ''),
+      end_key: String(nodeConfig.end_key || ''),
+      key_contains: String(nodeConfig.key_contains || ''),
+      value_contains: String(nodeConfig.value_contains || ''),
+      value_format: String(nodeConfig.value_format || 'auto') as 'auto' | 'json' | 'text' | 'base64',
+      flatten_json_values: parseBoolLike(nodeConfig.flatten_json_values, true),
+      expand_profile_documents: parseBoolLike(nodeConfig.expand_profile_documents, true),
+      limit: Number(nodeConfig.limit ?? 1000),
+    }),
+    [nodeConfig]
+  )
+  const lmdbPreviewKeys = useMemo(
+    () => uniqueFieldNames(
+      (lmdbStudioPreviewRows || [])
+        .map((row) => String((row as Record<string, unknown>)?.lmdb_key || '').trim())
+        .filter(Boolean)
+    ),
+    [lmdbStudioPreviewRows]
+  )
+  const lmdbPreviewDisplayRows = useMemo(
+    () => (lmdbStudioPreviewRows || []),
+    [lmdbStudioPreviewRows]
+  )
+  const lmdbAllPreviewColumns = useMemo(
+    () => uniqueFieldNames([
+      ...lmdbStudioColumns,
+      ...lmdbPreviewDisplayRows.flatMap((row) => Object.keys(row || {})),
+    ]).slice(0, 100),
+    [lmdbStudioColumns, lmdbPreviewDisplayRows]
+  )
+  useEffect(() => {
+    if (lmdbAllPreviewColumns.length === 0) {
+      setLmdbVisibleColumns([])
+      return
+    }
+    setLmdbVisibleColumns((prev) => {
+      if (!Array.isArray(prev) || prev.length === 0) return lmdbAllPreviewColumns
+      const kept = prev.filter((name) => lmdbAllPreviewColumns.includes(name))
+      return kept.length > 0 ? kept : lmdbAllPreviewColumns
+    })
+  }, [lmdbAllPreviewColumns])
+  useEffect(() => {
+    setLmdbColumnFilterValues((prev) => {
+      const next: Record<string, string[]> = {}
+      Object.entries(prev || {}).forEach(([name, values]) => {
+        if (!lmdbAllPreviewColumns.includes(name)) return
+        const normalized = uniqueFieldNames((values || []).map((v) => String(v || '').trim()).filter(Boolean))
+        if (normalized.length > 0) next[name] = normalized
+      })
+      return next
+    })
+    if (
+      lmdbGlobalFilterColumn !== LMDB_GLOBAL_ALL_COLUMNS
+      && !lmdbAllPreviewColumns.includes(lmdbGlobalFilterColumn)
+    ) {
+      setLmdbGlobalFilterColumn(LMDB_GLOBAL_ALL_COLUMNS)
+      setLmdbGlobalFilterValues([])
+    }
+  }, [lmdbAllPreviewColumns, lmdbGlobalFilterColumn])
+  useEffect(() => {
+    setLmdbGlobalFilterValues([])
+  }, [lmdbGlobalFilterColumn])
+
+  const lmdbPreviewRowsLimited = useMemo(() => {
+    const safeLimit = Math.max(1, Math.min(
+      Number.isFinite(Number(lmdbPreviewDisplayLimit)) ? Math.floor(Number(lmdbPreviewDisplayLimit)) : 200,
+      2000
+    ))
+    return (lmdbStudioPreviewRows || []).slice(0, safeLimit)
+  }, [lmdbStudioPreviewRows, lmdbPreviewDisplayLimit])
+  const lmdbPreviewTableData = useMemo(
+    () => {
+      const pageOffset = Math.max(0, (Number(lmdbTableCurrentPage || 1) - 1) * Number(lmdbTablePageSize || 25))
+      return (lmdbStudioPreviewRows || []).map((row, idx) => ({
+      ...row,
+      __lmdb_preview_row_id: `lmdb_preview_${pageOffset + idx}`,
+      __lmdb_preview_row_index: pageOffset + idx,
+      }))
+    },
+    [lmdbStudioPreviewRows, lmdbTableCurrentPage, lmdbTablePageSize]
+  )
+  const lmdbGlobalFilterColumnOptions = useMemo(
+    () => ([
+      { value: LMDB_GLOBAL_ALL_COLUMNS, label: 'All Visible Columns' },
+      ...lmdbVisibleColumns.map((name) => ({ value: name, label: name })),
+    ]),
+    [lmdbVisibleColumns]
+  )
+  const lmdbGlobalFilterValueOptions = useMemo(
+    () => {
+      const targetColumns = lmdbGlobalFilterColumn === LMDB_GLOBAL_ALL_COLUMNS
+        ? lmdbVisibleColumns
+        : (lmdbGlobalFilterColumn ? [lmdbGlobalFilterColumn] : [])
+      if (targetColumns.length === 0) return []
+      const values: string[] = []
+      const seen = new Set<string>()
+      for (const row of lmdbPreviewTableData) {
+        for (const name of targetColumns) {
+          const text = toPreviewCellText((row as Record<string, unknown>)?.[name]).trim()
+          const token = text || LMDB_EMPTY_FILTER_TOKEN
+          if (seen.has(token)) continue
+          seen.add(token)
+          values.push(text)
+          if (values.length >= 500) break
+        }
+        if (values.length >= 500) break
+      }
+      return values.map((value) => ({
+        value: value || LMDB_EMPTY_FILTER_TOKEN,
+        label: value || '(blank)',
+      }))
+    },
+    [lmdbPreviewTableData, lmdbVisibleColumns, lmdbGlobalFilterColumn]
+  )
+  const lmdbPreviewTableDataGlobalFiltered = useMemo(
+    () => {
+      const queries = uniqueFieldNames(
+        (lmdbGlobalFilterValues || []).map((value) => String(value || '').trim()).filter(Boolean)
+      )
+      if (queries.length === 0) return lmdbPreviewTableData
+      const targetColumns = lmdbGlobalFilterColumn === LMDB_GLOBAL_ALL_COLUMNS
+        ? lmdbVisibleColumns
+        : (lmdbGlobalFilterColumn ? [lmdbGlobalFilterColumn] : [])
+      if (targetColumns.length === 0) return lmdbPreviewTableData
+      return lmdbPreviewTableData.filter((row) => targetColumns.some((name) => {
+        const text = toPreviewCellText((row as Record<string, unknown>)?.[name]).trim()
+        const textLower = text.toLowerCase()
+        return queries.some((queryRaw) => {
+          if (queryRaw === LMDB_EMPTY_FILTER_TOKEN) return text === ''
+          return textLower.includes(queryRaw.toLowerCase())
+        })
+      }))
+    },
+    [lmdbPreviewTableData, lmdbGlobalFilterColumn, lmdbGlobalFilterValues, lmdbVisibleColumns]
+  )
+  const lmdbSummaryFallback = useMemo(() => {
+    const rows = lmdbPreviewTableDataGlobalFiltered
+    const keyCounts: Record<string, number> = {}
+    const entitySet = new Set<string>()
+    const nodeStatsByKey: Record<string, { processed: number; validated: number; outputRows: number }> = {}
+    let profileRows = 0
+    const toNonNegativeInt = (value: unknown): number => {
+      const parsed = Number(value)
+      if (!Number.isFinite(parsed) || parsed < 0) return 0
+      return Math.floor(parsed)
+    }
+
+    rows.forEach((row) => {
+      const rec = row as Record<string, unknown>
+      const key = String(rec.lmdb_key || '').trim()
+      if (key) {
+        keyCounts[key] = (keyCounts[key] || 0) + 1
+      }
+      const entityKey = String(rec.lmdb_entity_key || '').trim()
+      const profileSource = String(rec._lmdb_profile_source || '').trim().toLowerCase()
+      const isProfileRow = Boolean(entityKey) || profileSource === 'documents' || profileSource === 'document' || profileSource === 'profile'
+      if (isProfileRow) {
+        profileRows += 1
+      }
+      if (entityKey) {
+        entitySet.add(entityKey)
+      }
+
+      const nodeStats = rec._lmdb_node_stats
+      if (nodeStats && typeof nodeStats === 'object' && !Array.isArray(nodeStats)) {
+        const statRec = nodeStats as Record<string, unknown>
+        const statKey = key || entityKey || '__lmdb_default__'
+        const existing = nodeStatsByKey[statKey] || { processed: 0, validated: 0, outputRows: 0 }
+        existing.processed = Math.max(
+          existing.processed,
+          toNonNegativeInt(statRec.custom_fields_incremental_processed_rows),
+        )
+        existing.validated = Math.max(
+          existing.validated,
+          toNonNegativeInt(statRec.custom_fields_incremental_validated_rows),
+        )
+        existing.outputRows = Math.max(
+          existing.outputRows,
+          toNonNegativeInt(statRec.custom_fields_incremental_output_rows),
+        )
+        nodeStatsByKey[statKey] = existing
+      }
+    })
+
+    const incrementalProcessedRows = Object.values(nodeStatsByKey)
+      .reduce((sum, item) => sum + toNonNegativeInt(item.processed), 0)
+    const incrementalValidatedRows = Object.values(nodeStatsByKey)
+      .reduce((sum, item) => sum + toNonNegativeInt(item.validated), 0)
+    const incrementalOutputRows = Object.values(nodeStatsByKey)
+      .reduce((sum, item) => sum + toNonNegativeInt(item.outputRows), 0)
+
+    return {
+      totalRows: Math.max(Number(lmdbStudioRowCount || 0), rows.length),
+      scannedEntries: Math.max(Number(lmdbStudioRowCount || 0), rows.length),
+      detectedColumns: lmdbStudioColumns.length,
+      uniqueKeys: Object.keys(keyCounts).length,
+      profileRows,
+      nonProfileRows: Math.max(0, rows.length - profileRows),
+      uniqueEntities: entitySet.size,
+      profileLikeKeys: Object.keys(keyCounts).filter((key) => key.toLowerCase().includes('profile')).length,
+      txnLatencySamples: 0,
+      txnLatencyAvgMs: null as number | null,
+      txnLatencyMinMs: null as number | null,
+      txnLatencyMaxMs: null as number | null,
+      processingLatencyRps: null as number | null,
+      scanElapsedSeconds: null as number | null,
+      scanCapped: false,
+      scanLimit: 0,
+      customFieldsIncrementalProcessedRows: incrementalProcessedRows,
+      customFieldsIncrementalValidatedRows: incrementalValidatedRows,
+      customFieldsIncrementalOutputRows: incrementalOutputRows,
+    }
+  }, [lmdbPreviewTableDataGlobalFiltered, lmdbStudioRowCount, lmdbStudioColumns])
+  const lmdbSummaryStats = useMemo(() => {
+    const fallback = lmdbSummaryFallback
+    const remote = lmdbSummaryRemote as Record<string, unknown> | null
+    const toNumber = (value: unknown, fallbackValue: number): number => {
+      const parsed = Number(value)
+      return Number.isFinite(parsed) ? parsed : fallbackValue
+    }
+    if (!remote) return fallback
+
+    return {
+      totalRows: toNumber(remote.total_rows, fallback.totalRows),
+      scannedEntries: toNumber(remote.scanned_entries, fallback.totalRows),
+      detectedColumns: fallback.detectedColumns,
+      uniqueKeys: toNumber(remote.unique_keys, fallback.uniqueKeys),
+      profileRows: toNumber(remote.profile_rows, fallback.profileRows),
+      nonProfileRows: toNumber(remote.non_profile_rows, fallback.nonProfileRows),
+      uniqueEntities: toNumber(remote.unique_entities, fallback.uniqueEntities),
+      profileLikeKeys: toNumber(remote.profile_like_keys, fallback.profileLikeKeys),
+      txnLatencySamples: toNumber(remote.txn_latency_samples, fallback.txnLatencySamples),
+      txnLatencyAvgMs: remote.txn_latency_avg_ms === null || remote.txn_latency_avg_ms === undefined
+        ? fallback.txnLatencyAvgMs
+        : toNumber(remote.txn_latency_avg_ms, 0),
+      txnLatencyMinMs: remote.txn_latency_min_ms === null || remote.txn_latency_min_ms === undefined
+        ? fallback.txnLatencyMinMs
+        : toNumber(remote.txn_latency_min_ms, 0),
+      txnLatencyMaxMs: remote.txn_latency_max_ms === null || remote.txn_latency_max_ms === undefined
+        ? fallback.txnLatencyMaxMs
+        : toNumber(remote.txn_latency_max_ms, 0),
+      processingLatencyRps: remote.processing_latency_rps === null || remote.processing_latency_rps === undefined
+        ? (
+          remote.records_processed_per_second === null || remote.records_processed_per_second === undefined
+            ? fallback.processingLatencyRps
+            : toNumber(remote.records_processed_per_second, 0)
+        )
+        : toNumber(remote.processing_latency_rps, 0),
+      scanElapsedSeconds: remote.scan_elapsed_seconds === null || remote.scan_elapsed_seconds === undefined
+        ? fallback.scanElapsedSeconds
+        : toNumber(remote.scan_elapsed_seconds, 0),
+      scanCapped: Boolean(remote.scan_capped),
+      scanLimit: toNumber(remote.scan_limit, fallback.scanLimit),
+      customFieldsIncrementalProcessedRows: toNumber(
+        remote.custom_fields_incremental_processed_rows,
+        fallback.customFieldsIncrementalProcessedRows,
+      ),
+      customFieldsIncrementalValidatedRows: toNumber(
+        remote.custom_fields_incremental_validated_rows,
+        fallback.customFieldsIncrementalValidatedRows,
+      ),
+      customFieldsIncrementalOutputRows: toNumber(
+        remote.custom_fields_incremental_output_rows,
+        fallback.customFieldsIncrementalOutputRows,
+      ),
+    }
+  }, [lmdbSummaryFallback, lmdbSummaryRemote])
+  const lmdbPreviewTableColumns = useMemo(() => {
+    const visibleSet = new Set(lmdbVisibleColumns)
+    const columns: any[] = lmdbAllPreviewColumns
+      .filter((name) => visibleSet.has(name))
+      .map((name) => {
+        const optionValues: string[] = []
+        const seen = new Set<string>()
+        for (const row of lmdbPreviewTableDataGlobalFiltered) {
+          const text = toPreviewCellText((row as Record<string, unknown>)?.[name]).trim()
+          const token = text || LMDB_EMPTY_FILTER_TOKEN
+          if (seen.has(token)) continue
+          seen.add(token)
+          optionValues.push(text)
+          if (optionValues.length >= 300) break
+        }
+        const selectedValues = lmdbColumnFilterValues[name] || []
+        return {
+          title: name,
+          dataIndex: name,
+          key: name,
+          ellipsis: true,
+          filters: optionValues.map((value) => ({
+            text: value || '(blank)',
+            value: value || LMDB_EMPTY_FILTER_TOKEN,
+          })),
+          filterSearch: true,
+          filteredValue: selectedValues.length > 0 ? selectedValues : null,
+          onFilter: (filterValue: string | number | boolean, record: Record<string, unknown>) => {
+            const text = toPreviewCellText(record?.[name]).trim()
+            if (String(filterValue) === LMDB_EMPTY_FILTER_TOKEN) return text === ''
+            return text === String(filterValue)
+          },
+          sorter: (a: Record<string, unknown>, b: Record<string, unknown>) => {
+            const aNum = tryParseSortableNumber(a?.[name])
+            const bNum = tryParseSortableNumber(b?.[name])
+            if (aNum !== null && bNum !== null) return aNum - bNum
+            return toPreviewCellText(a?.[name]).localeCompare(toPreviewCellText(b?.[name]), undefined, {
+              numeric: true,
+              sensitivity: 'base',
+            })
+          },
+          render: (value: unknown, record: Record<string, unknown>) => {
+            const text = toPreviewCellText(value)
+            const short = text.length > 180 ? `${text.slice(0, 177)}...` : text
+            return (
+              <span
+                style={{ fontFamily: 'monospace', fontSize: 12, cursor: 'pointer' }}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  const rowIndexRaw = record?.__lmdb_preview_row_index
+                  const rowIndex = Number.isFinite(Number(rowIndexRaw)) ? Number(rowIndexRaw) : null
+                  openLmdbCellJsonEditor(rowIndex, String(name), value)
+                }}
+              >
+                {short || ' '}
+              </span>
+            )
+          },
+        }
+      })
+
+    columns.push({
+      title: 'Actions',
+      key: '__lmdb_actions',
+      fixed: 'right' as const,
+      width: 110,
+      render: (_: unknown, record: Record<string, unknown>) => {
+        const rowIndexRaw = record?.__lmdb_preview_row_index
+        const rowIndex = Number.isFinite(Number(rowIndexRaw)) ? Number(rowIndexRaw) : null
+        const rowPayload: Record<string, unknown> = {}
+        Object.keys(record || {}).forEach((key) => {
+          if (!key.startsWith('__lmdb_preview_')) {
+            rowPayload[key] = record[key]
+          }
+        })
+        return (
+          <Button
+            size="small"
+            onClick={(event) => {
+              event.stopPropagation()
+              openLmdbRowJsonEditor(rowIndex, rowPayload)
+            }}
+          >
+            Row JSON
+          </Button>
+        )
+      },
+    })
+    return columns
+  }, [lmdbAllPreviewColumns, lmdbVisibleColumns, lmdbPreviewTableDataGlobalFiltered, lmdbColumnFilterValues])
+  const lmdbJsonEditorParsedValue = useMemo(() => {
+    const raw = String(lmdbJsonEditorText || '').trim()
+    if (!raw) return null
+    try {
+      return JSON.parse(raw)
+    } catch {
+      return null
+    }
+  }, [lmdbJsonEditorText])
+  const lmdbJsonEditorHasParseError = useMemo(() => {
+    const raw = String(lmdbJsonEditorText || '').trim()
+    if (!raw) return false
+    try {
+      JSON.parse(raw)
+      return false
+    } catch {
+      return true
+    }
+  }, [lmdbJsonEditorText])
+  const lmdbJsonEditorPathMappings = useMemo(
+    () => buildJsonTagMappingsFromParsed(lmdbJsonEditorParsedValue),
+    [lmdbJsonEditorParsedValue]
+  )
+  const lmdbJsonEditorFilteredPathMappings = useMemo(() => {
+    const query = String(lmdbJsonTagFilter || '').trim().toLowerCase()
+    if (!query) return lmdbJsonEditorPathMappings
+    return lmdbJsonEditorPathMappings.filter((item) => (
+      item.path.toLowerCase().includes(query)
+      || item.kind.toLowerCase().includes(query)
+      || item.sample.toLowerCase().includes(query)
+    ))
+  }, [lmdbJsonEditorPathMappings, lmdbJsonTagFilter])
+  const lmdbEnvPathPresetOptions = useMemo(
+    () => uniqueFieldNames([
+      String(lmdbStudioDraft.env_path || '').trim(),
+      String(lmdbConfigured.env_path || '').trim(),
+      String(validationLmdbEnvPathDraft || '').trim(),
+      ...lmdbDiscoveredPaths,
+      `${kvSourceRootVar}/${isRocksdbSource ? 'profile_store.rocksdb' : 'profile_store.lmdb'}`,
+      `${kvSourceRootVar}/${isRocksdbSource ? 'demo_profiles.rocksdb' : 'demo_profiles.lmdb'}`,
+      isRocksdbSource ? '~/data/profile_store.rocksdb' : '~/data/profile_store.lmdb',
+      isRocksdbSource ? '/data/profile_store.rocksdb' : '/data/profile_store.lmdb',
+    ].filter(Boolean))
+      .map((value) => ({ value, label: value })),
+    [
+      lmdbStudioDraft.env_path,
+      lmdbConfigured.env_path,
+      validationLmdbEnvPathDraft,
+      lmdbDiscoveredPaths,
+      kvSourceRootVar,
+      isRocksdbSource,
+    ]
+  )
+  const lmdbDbNamePresetOptions = useMemo(
+    () => {
+      const values = uniqueFieldNames([
+        String(lmdbStudioDraft.db_name || '').trim(),
+        String(lmdbConfigured.db_name || '').trim(),
+        'profiles',
+        'state',
+        'events',
+      ].filter(Boolean))
+      return [
+        { value: '', label: '(default DB)' },
+        ...values.map((value) => ({ value, label: value })),
+      ]
+    },
+    [lmdbStudioDraft.db_name, lmdbConfigured.db_name]
+  )
+  const lmdbKeyPrefixPresetOptions = useMemo(
+    () => {
+      const prefixes: string[] = []
+      lmdbPreviewKeys.forEach((key) => {
+        const parts = String(key).split(':').filter(Boolean)
+        const maxDepth = Math.min(4, Math.max(0, parts.length - 1))
+        for (let idx = 1; idx <= maxDepth; idx += 1) {
+          prefixes.push(`${parts.slice(0, idx).join(':')}:`)
+        }
+      })
+      const values = uniqueFieldNames([
+        String(lmdbStudioDraft.key_prefix || '').trim(),
+        String(lmdbConfigured.key_prefix || '').trim(),
+        'agent:',
+        'pipeline:',
+        'profile:',
+        'customer:',
+        'workflow:',
+        ...prefixes,
+      ].filter(Boolean))
+      return values.slice(0, 160).map((value) => ({ value, label: value }))
+    },
+    [lmdbStudioDraft.key_prefix, lmdbConfigured.key_prefix, lmdbPreviewKeys]
+  )
+  const lmdbKeyPresetOptions = useMemo(
+    () => lmdbPreviewKeys.slice(0, 300).map((value) => ({ value, label: value })),
+    [lmdbPreviewKeys]
+  )
   const schedulePresetValue = nodeType === 'schedule_trigger'
     ? String(nodeConfig.schedule_preset || detectSchedulePresetFromCron(nodeConfig.cron || DEFAULT_SCHEDULE_CRON))
     : ''
   const scheduleCronValue = nodeType === 'schedule_trigger'
     ? normalizeCronExpr(nodeConfig.cron || DEFAULT_SCHEDULE_CRON)
     : ''
-  const mapInputFieldOptions = uniqueFieldNames([
-    ...parseFieldList(nodeConfig.fields),
-    ...(
-    nodeType === 'map_transform' && selectedNodeId
-      ? inferUpstreamInputFields(selectedNodeId, nodes, edges)
-      : []
-    ),
-  ])
   const upstreamReferenceFields = useMemo(
     () => (
       nodeType === 'map_transform' && selectedNodeId
@@ -1137,8 +2079,56 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     ),
     [nodeType, selectedNodeId, nodes, edges]
   )
-  const expressionFieldOptions = uniqueFieldNames([
+  const configuredMapFields = useMemo(
+    () => parseFieldList(nodeConfig.fields),
+    [nodeConfig.fields]
+  )
+  const draftMapFields = useMemo(
+    () => uniqueFieldNames([
+      ...customFieldDraft.map((item) => String(item.name || '').trim()).filter(Boolean),
+      ...(String(customPrimaryKeyFieldDraft || '').trim() ? [String(customPrimaryKeyFieldDraft || '').trim()] : []),
+    ]),
+    [customFieldDraft, customPrimaryKeyFieldDraft]
+  )
+  const effectiveMapFields = useMemo(() => {
+    if (nodeType !== 'map_transform') return configuredMapFields
+    if (!customFieldStudioOpen) return configuredMapFields
+    // While studio is open, always reflect live draft field/key changes.
+    return draftMapFields.length > 0 ? draftMapFields : configuredMapFields
+  }, [nodeType, customFieldStudioOpen, draftMapFields, configuredMapFields])
+  const mapInputFieldOptions = filterUserFacingFieldNames([
+    ...effectiveMapFields,
     ...upstreamReferenceFields,
+  ])
+  const primaryKeyFieldForFilter = String(
+    customFieldStudioOpen
+      ? customPrimaryKeyFieldDraft
+      : (nodeConfig.custom_primary_key_field || nodeConfig.custom_group_by_field || '')
+  ).trim()
+  const persistedPrimaryKeyField = String(
+    nodeConfig.custom_primary_key_field
+    || nodeConfig.custom_group_by_field
+    || ''
+  ).trim()
+  const primaryKeyFieldOptionPool = filterUserFacingFieldNames([
+    ...upstreamReferenceFields,
+    ...mapInputFieldOptions,
+    ...customFieldDraft.map((item) => String(item.name || '').trim()).filter(Boolean),
+    ...(persistedPrimaryKeyField ? [persistedPrimaryKeyField] : []),
+    ...(primaryKeyFieldForFilter ? [primaryKeyFieldForFilter] : []),
+  ])
+  const primaryKeyScopedUpstreamFields = useMemo(() => {
+    if (nodeType !== 'map_transform' || !selectedNodeId || !primaryKeyFieldForFilter) return []
+    const previewRows = inferUpstreamPreviewRows(selectedNodeId, nodes, edges, 200)
+    if (!previewRows.length) return []
+    const filteredRows = filterRowsByPrimaryKey(previewRows, primaryKeyFieldForFilter)
+    if (!filteredRows.length) return []
+    return filterUserFacingFieldNames(extractSampleFieldPaths(filteredRows))
+  }, [nodeType, selectedNodeId, nodes, edges, primaryKeyFieldForFilter])
+  const referenceFieldOptions = primaryKeyFieldOptionPool
+  const expressionFieldOptions = filterUserFacingFieldNames([
+    ...(primaryKeyScopedUpstreamFields.length > 0 ? primaryKeyScopedUpstreamFields : upstreamReferenceFields),
+    ...(primaryKeyFieldForFilter ? [primaryKeyFieldForFilter] : []),
     ...mapInputFieldOptions,
     ...customFieldDraft.map((item) => String(item.name || '').trim()).filter(Boolean),
   ])
@@ -1206,7 +2196,82 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const configuredPrimaryKeyField = String(
     nodeConfig.custom_primary_key_field || nodeConfig.custom_group_by_field || ''
   ).trim()
+  const configuredExpressionEngine = (
+    () => {
+      const raw = String(nodeConfig.custom_expression_engine || 'auto').trim().toLowerCase()
+      if (raw === 'python') return 'python'
+      if (raw === 'polars') return 'polars'
+      return 'auto'
+    }
+  )() as CustomExpressionEngine
   const configuredProfileEnabled = Boolean(nodeConfig.custom_profile_enabled ?? false)
+  const configuredProfileStorage = (
+    () => {
+      const storage = String(nodeConfig.custom_profile_storage || 'lmdb').trim().toLowerCase()
+      if (storage === 'rocksdb' || storage === 'rocks') return 'rocksdb'
+      if (storage === 'redis' || storage === 'redisdb') return 'redis'
+      if (storage === 'oracle' || storage === 'oracledb' || storage === 'ora') return 'oracle'
+      return 'lmdb'
+    }
+  )() as CustomProfileStorage
+  const configuredProfileProcessingMode = (
+    (() => {
+      const mode = String(nodeConfig.custom_profile_processing_mode || 'batch').trim().toLowerCase()
+      if (mode === 'incremental_batch') return 'incremental_batch'
+      if (mode === 'incremental') return 'incremental'
+      return 'batch'
+    })()
+  ) as CustomProfileProcessingMode
+  const configuredProfileComputeStrategy = (
+    (() => {
+      const raw = String(nodeConfig.custom_profile_compute_strategy || 'single').trim().toLowerCase()
+      if (
+        raw === 'parallel_by_profile_key'
+        || raw === 'parallel_profile_key'
+        || raw === 'profile_key_parallel'
+        || raw === 'parallel_key'
+        || raw === 'parallel'
+      ) {
+        return 'parallel_by_profile_key'
+      }
+      return 'single'
+    })()
+  ) as CustomProfileComputeStrategy
+  const configuredProfileComputeExecutor = (
+    (() => {
+      const raw = String(nodeConfig.custom_profile_compute_executor || 'thread').trim().toLowerCase()
+      if (
+        raw === 'process'
+        || raw === 'processes'
+        || raw === 'multiprocess'
+        || raw === 'multi_process'
+        || raw === 'mp'
+      ) {
+        return 'process'
+      }
+      return 'thread'
+    })()
+  ) as CustomProfileComputeExecutor
+  const configuredProfileComputeWorkersRaw = Number(nodeConfig.custom_profile_compute_workers ?? 4)
+  const configuredProfileComputeWorkers = Number.isFinite(configuredProfileComputeWorkersRaw)
+    ? Math.max(2, Math.min(Math.floor(configuredProfileComputeWorkersRaw), 16))
+    : 4
+  const configuredProfileComputeMinRowsRaw = Number(nodeConfig.custom_profile_compute_min_rows ?? 20000)
+  const configuredProfileComputeMinRows = Number.isFinite(configuredProfileComputeMinRowsRaw)
+    ? Math.max(1000, Math.min(Math.floor(configuredProfileComputeMinRowsRaw), 5000000))
+    : 20000
+  const configuredProfileComputeGlobalPrefetchMaxTokensRaw = Number(
+    nodeConfig.custom_profile_compute_global_prefetch_max_tokens ?? 40000
+  )
+  const configuredProfileComputeGlobalPrefetchMaxTokens = Number.isFinite(configuredProfileComputeGlobalPrefetchMaxTokensRaw)
+    ? Math.max(1000, Math.min(Math.floor(configuredProfileComputeGlobalPrefetchMaxTokensRaw), 2000000))
+    : 40000
+  const configuredProfileBackfillCandidatePrefetchChunkSizeRaw = Number(
+    nodeConfig.custom_profile_backfill_candidate_prefetch_chunk_size ?? 500
+  )
+  const configuredProfileBackfillCandidatePrefetchChunkSize = Number.isFinite(configuredProfileBackfillCandidatePrefetchChunkSizeRaw)
+    ? Math.max(50, Math.min(Math.floor(configuredProfileBackfillCandidatePrefetchChunkSizeRaw), 900))
+    : 500
   const configuredProfileEmitMode = (
     String(nodeConfig.custom_profile_emit_mode || 'changed_only').trim().toLowerCase() === 'all_entities'
       ? 'all_entities'
@@ -1217,15 +2282,118 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const configuredProfileWindowDays = String(nodeConfig.custom_profile_window_days || '1,7,30').trim() || '1,7,30'
   const configuredProfileRetentionDays = Number(nodeConfig.custom_profile_retention_days ?? 45)
   const configuredProfileIncludeChangeFields = Boolean(nodeConfig.custom_profile_include_change_fields ?? false)
+  const configuredProfileOracleHost = String(nodeConfig.custom_profile_oracle_host || '').trim()
+  const configuredProfileOraclePortRaw = Number(nodeConfig.custom_profile_oracle_port ?? 1521)
+  const configuredProfileOraclePort = Number.isFinite(configuredProfileOraclePortRaw) && configuredProfileOraclePortRaw > 0
+    ? Math.floor(configuredProfileOraclePortRaw)
+    : 1521
+  const configuredProfileOracleServiceName = String(nodeConfig.custom_profile_oracle_service_name || '').trim()
+  const configuredProfileOracleSid = String(nodeConfig.custom_profile_oracle_sid || '').trim()
+  const configuredProfileOracleUser = String(nodeConfig.custom_profile_oracle_user || '').trim()
+  const configuredProfileOraclePassword = String(nodeConfig.custom_profile_oracle_password || '').trim()
+  const configuredProfileOracleDsn = String(nodeConfig.custom_profile_oracle_dsn || '').trim()
+  const configuredProfileOracleTable = String(nodeConfig.custom_profile_oracle_table || 'ETL_PROFILE_STATE').trim() || 'ETL_PROFILE_STATE'
+  const configuredProfileOracleWriteStrategy = (
+    (() => {
+      const raw = String(nodeConfig.custom_profile_oracle_write_strategy || 'parallel_key').trim().toLowerCase()
+      if (raw === 'parallel' || raw === 'parallel_key' || raw === 'parallel_key_partitioned' || raw === 'key_partitioned') {
+        return 'parallel_key'
+      }
+      return 'single'
+    })()
+  ) as CustomProfileOracleWriteStrategy
+  const configuredProfileOracleParallelWorkersRaw = Number(nodeConfig.custom_profile_oracle_parallel_workers ?? 4)
+  const configuredProfileOracleParallelWorkers = Number.isFinite(configuredProfileOracleParallelWorkersRaw)
+    ? Math.max(2, Math.min(Math.floor(configuredProfileOracleParallelWorkersRaw), 16))
+    : 4
+  const configuredProfileOracleParallelMinTokensRaw = Number(nodeConfig.custom_profile_oracle_parallel_min_tokens ?? 2000)
+  const configuredProfileOracleParallelMinTokens = Number.isFinite(configuredProfileOracleParallelMinTokensRaw)
+    ? Math.max(1, Math.min(Math.floor(configuredProfileOracleParallelMinTokensRaw), 1000000))
+    : 2000
+  const configuredProfileOracleMergeBatchSizeRaw = Number(nodeConfig.custom_profile_oracle_merge_batch_size ?? 500)
+  const configuredProfileOracleMergeBatchSize = Number.isFinite(configuredProfileOracleMergeBatchSizeRaw)
+    ? Math.max(50, Math.min(Math.floor(configuredProfileOracleMergeBatchSizeRaw), 2000))
+    : 500
+  const configuredProfileOracleQueueEnabled = Boolean(nodeConfig.custom_profile_oracle_queue_enabled ?? true)
+  const configuredProfileOracleQueueWaitOnForceFlush = Boolean(nodeConfig.custom_profile_oracle_queue_wait_on_force_flush ?? false)
+  const configuredProfileLivePersist = Boolean(nodeConfig.custom_profile_live_persist ?? false)
+  const hasConfiguredProfileFlushEveryRows = Object.prototype.hasOwnProperty.call(nodeConfig, 'custom_profile_flush_every_rows')
+  const hasConfiguredProfileFlushIntervalSeconds = Object.prototype.hasOwnProperty.call(nodeConfig, 'custom_profile_flush_interval_seconds')
+  const configuredProfileFlushEveryRows = Number(
+    nodeConfig.custom_profile_flush_every_rows
+    ?? (
+      configuredProfileStorage === 'rocksdb' && configuredProfileProcessingMode === 'incremental'
+        ? 50000
+        : 20000
+    )
+  )
+  const configuredProfileFlushIntervalSeconds = Number(
+    nodeConfig.custom_profile_flush_interval_seconds
+    ?? (
+      configuredProfileStorage === 'rocksdb' && configuredProfileProcessingMode === 'incremental'
+        ? 10
+        : 2
+    )
+  )
+  const configuredProfileAppendUniqueDisableMinRows = Number(nodeConfig.custom_profile_append_unique_cache_disable_min_rows ?? 5000)
+  const configuredProfileAppendUniqueEntityLimit = Number(nodeConfig.custom_profile_append_unique_cache_entity_limit ?? 10000)
+  const configuredProfileAppendUniqueDisableRatio = Number(nodeConfig.custom_profile_append_unique_cache_disable_ratio ?? 0.35)
+  const configuredValidationLmdbEnvPath = String(
+    nodeConfig.custom_validation_rocksdb_env_path
+    || nodeConfig.custom_validation_lmdb_env_path
+    || nodeConfig.env_path
+    || ''
+  ).trim()
+  const configuredValidationLmdbDbName = String(nodeConfig.custom_validation_lmdb_db_name || '').trim()
+  const configuredValidationLmdbKeyPrefix = String(nodeConfig.custom_validation_lmdb_key_prefix || '').trim()
+  const configuredValidationLmdbStartKey = String(nodeConfig.custom_validation_lmdb_start_key || '').trim()
+  const configuredValidationLmdbEndKey = String(nodeConfig.custom_validation_lmdb_end_key || '').trim()
+  const configuredValidationLmdbKeyContains = String(nodeConfig.custom_validation_lmdb_key_contains || '').trim()
+  const configuredValidationLmdbLimit = Number(nodeConfig.custom_validation_lmdb_limit ?? 50)
   const activePipelineId = String(pipeline?.id || '').trim()
+  const profileMonitorPreferredKeyField = String(
+    customFieldStudioOpen
+      ? customPrimaryKeyFieldDraft
+      : (nodeConfig.custom_primary_key_field || nodeConfig.custom_group_by_field || '')
+  ).trim()
   const activeProfileNodeSummary = useMemo(() => {
-    if (!profileMonitorData || !Array.isArray(profileMonitorData.nodes) || !selectedNodeId) return null
+    if (!profileMonitorData || !Array.isArray(profileMonitorData.nodes) || profileMonitorData.nodes.length === 0) return null
+    const nodesList = profileMonitorData.nodes
+    const selectedNode = selectedNodeId
+      ? nodesList.find((item) => String(item.node_id) === String(selectedNodeId))
+      : null
+    const hasPreferredKeyInNode = (nodeSummary: any): boolean => {
+      if (!nodeSummary || !profileMonitorPreferredKeyField) return false
+      const docs = Array.isArray(nodeSummary.sample_documents) ? nodeSummary.sample_documents : []
+      return docs.some((doc: any) => {
+        const profile = doc?.profile
+        if (!profile || typeof profile !== 'object' || Array.isArray(profile)) return false
+        const hit = readPathValue(profile as Record<string, unknown>, profileMonitorPreferredKeyField)
+        return hit.found && hasMeaningfulValue(hit.value)
+      })
+    }
+
+    if (selectedNode && (!profileMonitorPreferredKeyField || hasPreferredKeyInNode(selectedNode))) {
+      return selectedNode
+    }
+    if (profileMonitorPreferredKeyField) {
+      const preferredNode = nodesList.find((item) => hasPreferredKeyInNode(item))
+      if (preferredNode) return preferredNode
+    }
+    return selectedNode || nodesList[0] || null
+  }, [profileMonitorData, selectedNodeId, profileMonitorPreferredKeyField])
+  const activeProfileDocuments = useMemo(
+    () => (activeProfileNodeSummary?.sample_documents || []),
+    [activeProfileNodeSummary]
+  )
+  const selectedProfileDocument = useMemo(() => {
+    if (!activeProfileDocuments.length) return null
     return (
-      profileMonitorData.nodes.find((item) => String(item.node_id) === String(selectedNodeId))
-      || profileMonitorData.nodes[0]
+      activeProfileDocuments.find((doc) => String(doc.entity_key) === String(selectedProfileEntityKey))
+      || activeProfileDocuments[0]
       || null
     )
-  }, [profileMonitorData, selectedNodeId])
+  }, [activeProfileDocuments, selectedProfileEntityKey])
   const expandedEditorField = useMemo(
     () => customFieldDraft.find((item) => item.id === expandedEditorFieldId) || null,
     [customFieldDraft, expandedEditorFieldId]
@@ -1290,6 +2458,75 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     void refreshProfileMonitor()
   }, [customFieldStudioOpen, customProfileEnabledDraft, nodeType, selectedNodeId, activePipelineId])
 
+  useEffect(() => {
+    if (!activeProfileDocuments.length) {
+      if (selectedProfileEntityKey) setSelectedProfileEntityKey('')
+      return
+    }
+    const hasSelected = activeProfileDocuments.some(
+      (doc) => String(doc.entity_key) === String(selectedProfileEntityKey)
+    )
+    if (!hasSelected) {
+      setSelectedProfileEntityKey(String(activeProfileDocuments[0]?.entity_key || ''))
+    }
+  }, [activeProfileDocuments, selectedProfileEntityKey])
+
+  useEffect(() => {
+    // When primary key changes, force re-selection so monitor follows new key samples.
+    setSelectedProfileEntityKey('')
+  }, [customPrimaryKeyFieldDraft])
+
+  useEffect(() => {
+    if (!lmdbStudioOpen || !isLmdbSource || lmdbPreviewView !== 'summary' || !isExecuting) {
+      return
+    }
+    const envPath = String(lmdbStudioDraft.env_path || '').trim()
+    if (!envPath) return
+
+    let cancelled = false
+    let timer: number | null = null
+
+    const tick = async () => {
+      if (cancelled) return
+      const globalFilterValues = uniqueFieldNames(
+        (lmdbGlobalFilterValues || []).map((value) => String(value || '').trim()).filter(Boolean),
+      )
+      const columnFilters: Record<string, string[]> = {}
+      Object.entries(lmdbColumnFilterValues || {}).forEach(([name, values]) => {
+        const col = String(name || '').trim()
+        if (!col || !Array.isArray(values)) return
+        const normalized = uniqueFieldNames(values.map((v) => String(v || '').trim()).filter(Boolean))
+        if (normalized.length > 0) columnFilters[col] = normalized
+      })
+      const requestConfig: Record<string, unknown> = {
+        ...lmdbDraftToConfig(lmdbStudioDraft),
+        global_filter_column: String(lmdbGlobalFilterColumn || LMDB_GLOBAL_ALL_COLUMNS),
+        global_filter_values: globalFilterValues,
+      }
+      if (Object.keys(columnFilters).length > 0) {
+        requestConfig.column_filters = columnFilters
+      }
+      await fetchLmdbSummary(requestConfig)
+      if (cancelled) return
+      timer = window.setTimeout(tick, 1200)
+    }
+
+    void tick()
+    return () => {
+      cancelled = true
+      if (timer !== null) window.clearTimeout(timer)
+    }
+  }, [
+    isExecuting,
+    lmdbStudioOpen,
+    lmdbPreviewView,
+    lmdbStudioDraft,
+    lmdbGlobalFilterColumn,
+    lmdbGlobalFilterValues,
+    lmdbColumnFilterValues,
+    nodeType,
+  ])
+
   if (!data || !definition) return null
 
   const handleFieldChange = (name: string, value: unknown) => {
@@ -1303,6 +2540,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const handleDelete = () => {
     removeNode(selectedNodeId!)
     onClose()
+  }
+
+  const handleDuplicate = () => {
+    if (!selectedNodeId) return
+    duplicateNode(selectedNodeId)
   }
 
   const detectJsonPathOptions = async () => {
@@ -1321,11 +2563,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       if (typeof response?.row_count === 'number') patch._row_count = response.row_count
       if (detectedColumns.length > 0) patch._detected_columns = detectedColumns.join(', ')
       if (Array.isArray(response?.preview) && response.preview.length > 0) patch._preview_rows = response.preview
+      updateNodeConfigSilent(selectedNodeId, patch)
       if (suggestedPath && !String(nodeConfig.json_path || '').trim()) {
-        patch.json_path = suggestedPath
+        updateNodeConfig(selectedNodeId, { json_path: suggestedPath })
       }
-
-      updateNodeConfig(selectedNodeId, patch)
       if (detectedPaths.length > 0) {
         notification.success({
           message: 'JSON fields detected',
@@ -1355,7 +2596,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setSourceFieldDetectError(null)
     setSourceFieldDetectLoading(true)
     try {
-      const response = await api.detectSourceFieldOptions(nodeType, nodeConfig, 300)
+      const detectMaxRows = isLmdbSource ? 5000 : 300
+      const response = await api.detectSourceFieldOptions(nodeType, nodeConfig, detectMaxRows)
       const detectedColumns = Array.isArray(response?.columns) ? response.columns : []
       const patch: Record<string, unknown> = {}
       if (detectedColumns.length > 0) {
@@ -1368,7 +2610,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         patch._preview_rows = response.preview
       }
       if (Object.keys(patch).length > 0) {
-        updateNodeConfig(selectedNodeId, patch)
+        updateNodeConfigSilent(selectedNodeId, patch)
       }
       if (detectedColumns.length > 0) {
         notification.success({
@@ -1400,10 +2642,22 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       setProfileMonitorError('Save pipeline first to enable profile monitoring.')
       return
     }
+    const preferredPrimaryKeyField = String(
+      customFieldStudioOpen
+        ? customPrimaryKeyFieldDraft
+        : (nodeConfig.custom_primary_key_field || nodeConfig.custom_group_by_field || '')
+    ).trim()
+    const monitorNodeId = preferredPrimaryKeyField ? undefined : selectedNodeId
+    const monitorLimit = preferredPrimaryKeyField ? 24 : 12
     setProfileMonitorLoading(true)
     setProfileMonitorError(null)
     try {
-      const response = await api.getPipelineProfileState(activePipelineId, selectedNodeId, 12)
+      const response = await api.getPipelineProfileState(
+        activePipelineId,
+        monitorNodeId,
+        monitorLimit,
+        preferredPrimaryKeyField || undefined,
+      )
       setProfileMonitorData(response as ProfileMonitorResponse)
       setProfileMonitorError(null)
     } catch (err: any) {
@@ -1451,6 +2705,20 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     }
   }
 
+  const openProfileDataViewer = () => {
+    if (!activeProfileDocuments.length) {
+      notification.info({
+        message: 'No profile data available',
+        description: 'Run pipeline and refresh Profile Monitoring to load stored profile documents.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    const defaultKey = String(activeProfileDocuments[0]?.entity_key || '')
+    setSelectedProfileEntityKey((prev) => (prev ? prev : defaultKey))
+    setProfileDataModalOpen(true)
+  }
+
   const openExpandedEditor = (fieldId: string, mode: CustomFieldMode) => {
     setExpandedEditorFieldId(fieldId)
     setExpandedEditorMode(mode)
@@ -1472,28 +2740,102 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const profileRetentionDays = Number.isFinite(customProfileRetentionDaysDraft) && customProfileRetentionDaysDraft > 0
       ? Math.floor(customProfileRetentionDaysDraft)
       : 45
-
-    const directPreviewRows = extractPreviewRowsFromNode(node).slice(0, 20)
+    const requestedValidationSource: 'lmdb' | 'rocksdb' | 'rows' = (
+      validationSourceDraft === 'sample'
+        ? 'rows'
+        : validationSourceDraft === 'rocksdb'
+          ? 'rocksdb'
+          : 'lmdb'
+    )
+    const validationLimit = Math.max(1, Math.min(Number(validationLmdbLimitDraft || 30) || 30, 200))
+    const lmdbEnvPath = String(validationLmdbEnvPathDraft || '').trim()
+    const selectedNode = nodes.find((item) => item.id === selectedNodeId)
+    const selectedPreviewRows = extractPreviewRowsFromNode(selectedNode)
     const upstreamPreviewRows = selectedNodeId
-      ? inferUpstreamPreviewRows(selectedNodeId, nodes, edges, 20)
+      ? inferUpstreamPreviewRows(selectedNodeId, nodes, edges, validationLimit)
       : []
-    const sampleRows = [...directPreviewRows, ...upstreamPreviewRows]
-      .filter((row) => row && typeof row === 'object')
-      .slice(0, 30)
+    const sampleRowsRaw = [...selectedPreviewRows, ...upstreamPreviewRows]
+    const sampleRows = sampleRowsRaw
+      .filter((row): row is Record<string, unknown> => !!row && typeof row === 'object' && !Array.isArray(row))
+      .slice(0, validationLimit)
+    const validationSource: 'lmdb' | 'rocksdb' | 'rows' = (
+      requestedValidationSource !== 'rows' && !lmdbEnvPath
+        ? 'rows'
+        : requestedValidationSource
+    )
+    const appendUniqueCacheModeDraft = (
+      customProfileStorageDraft === 'rocksdb' && customProfileProcessingModeDraft === 'incremental'
+        ? 'persistent'
+        : 'auto'
+    )
+    if (requestedValidationSource !== 'rows' && !lmdbEnvPath) {
+      notification.warning({
+        message: `${requestedValidationSource === 'rocksdb' ? 'RocksDB' : 'LMDB'} path missing, using sample rows`,
+        description: 'Validation switched to Sample Rows mode because validation DB path is empty.',
+        placement: 'bottomRight',
+      })
+    }
+    if (validationSource === 'rows' && sampleRows.length === 0) {
+      notification.error({
+        message: 'No sample rows available',
+        description: 'Run source detect/preview or execute upstream nodes to generate sample rows for validation.',
+        placement: 'bottomRight',
+      })
+      return
+    }
 
     const testConfig: Record<string, unknown> = {
       ...nodeConfig,
       custom_fields: normalized,
       custom_include_source_fields: customIncludeSourceDraft,
+      custom_expression_engine: customExpressionEngineDraft,
       custom_primary_key_field: primaryKeyField,
       custom_group_by_field: primaryKeyField,
       custom_profile_enabled: customProfileEnabledDraft,
+      custom_profile_storage: customProfileStorageDraft,
+      custom_profile_oracle_host: String(customProfileOracleHostDraft || '').trim(),
+      custom_profile_oracle_port: customProfileOraclePortDraft,
+      custom_profile_oracle_service_name: String(customProfileOracleServiceNameDraft || '').trim(),
+      custom_profile_oracle_sid: String(customProfileOracleSidDraft || '').trim(),
+      custom_profile_oracle_user: String(customProfileOracleUserDraft || '').trim(),
+      custom_profile_oracle_password: String(customProfileOraclePasswordDraft || '').trim(),
+      custom_profile_oracle_dsn: String(customProfileOracleDsnDraft || '').trim(),
+      custom_profile_oracle_table: String(customProfileOracleTableDraft || '').trim() || 'ETL_PROFILE_STATE',
+      custom_profile_oracle_write_strategy: customProfileOracleWriteStrategyDraft,
+      custom_profile_oracle_parallel_workers: customProfileOracleParallelWorkersDraft,
+      custom_profile_oracle_parallel_min_tokens: customProfileOracleParallelMinTokensDraft,
+      custom_profile_oracle_merge_batch_size: customProfileOracleMergeBatchSizeDraft,
+      custom_profile_oracle_queue_enabled: customProfileOracleQueueEnabledDraft,
+      custom_profile_oracle_queue_wait_on_force_flush: customProfileOracleQueueWaitOnForceFlushDraft,
+      custom_profile_processing_mode: customProfileProcessingModeDraft,
+      custom_profile_compute_strategy: customProfileComputeStrategyDraft,
+      custom_profile_compute_executor: customProfileComputeExecutorDraft,
+      custom_profile_compute_workers: customProfileComputeWorkersDraft,
+      custom_profile_compute_min_rows: customProfileComputeMinRowsDraft,
+      custom_profile_compute_global_prefetch_max_tokens: customProfileComputeGlobalPrefetchMaxTokensDraft,
+      custom_profile_backfill_candidate_prefetch_chunk_size: customProfileBackfillCandidatePrefetchChunkSizeDraft,
       custom_profile_emit_mode: customProfileEmitModeDraft,
       custom_profile_required_fields: customProfileRequiredFieldsDraft.join(', '),
       custom_profile_event_time_field: customProfileEventTimeFieldDraft,
       custom_profile_window_days: profileWindowDays,
       custom_profile_retention_days: profileRetentionDays,
       custom_profile_include_change_fields: customProfileIncludeChangeFieldsDraft,
+      custom_profile_live_persist: customProfileLivePersistDraft,
+      custom_profile_flush_every_rows: customProfileFlushEveryRowsDraft,
+      custom_profile_flush_interval_seconds: customProfileFlushIntervalSecondsDraft,
+      custom_profile_append_unique_cache_mode: appendUniqueCacheModeDraft,
+      custom_profile_append_unique_cache_disable_min_rows: customProfileAppendUniqueDisableMinRowsDraft,
+      custom_profile_append_unique_cache_entity_limit: customProfileAppendUniqueEntityLimitDraft,
+      custom_profile_append_unique_cache_disable_ratio: customProfileAppendUniqueDisableRatioDraft,
+      custom_validation_source: validationSource,
+      custom_validation_lmdb_env_path: validationLmdbEnvPathDraft,
+      custom_validation_lmdb_db_name: validationLmdbDbNameDraft,
+      custom_validation_lmdb_key_prefix: validationLmdbKeyPrefixDraft,
+      custom_validation_lmdb_start_key: validationLmdbStartKeyDraft,
+      custom_validation_lmdb_end_key: validationLmdbEndKeyDraft,
+      custom_validation_lmdb_key_contains: validationLmdbKeyContainsDraft,
+      custom_validation_lmdb_limit: validationLimit,
+      custom_validation_rocksdb_env_path: validationLmdbEnvPathDraft,
     }
 
     setValidationLoading(true)
@@ -1501,22 +2843,88 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     try {
       const result = await api.validateCustomFields({
         config: testConfig,
-        rows: sampleRows,
-        max_rows: 30,
+        rows: validationSource === 'rows' ? sampleRows : [],
+        max_rows: validationLimit,
+        validation_source: validationSource,
+        lmdb_config: {
+          env_path: lmdbEnvPath,
+          db_name: String(validationLmdbDbNameDraft || '').trim(),
+          key_prefix: String(validationLmdbKeyPrefixDraft || '').trim(),
+          start_key: String(validationLmdbStartKeyDraft || '').trim(),
+          end_key: String(validationLmdbEndKeyDraft || '').trim(),
+          key_contains: String(validationLmdbKeyContainsDraft || '').trim(),
+          limit: validationLimit,
+        },
+        rocksdb_config: {
+          env_path: lmdbEnvPath,
+          key_prefix: String(validationLmdbKeyPrefixDraft || '').trim(),
+          start_key: String(validationLmdbStartKeyDraft || '').trim(),
+          end_key: String(validationLmdbEndKeyDraft || '').trim(),
+          key_contains: String(validationLmdbKeyContainsDraft || '').trim(),
+          limit: validationLimit,
+        },
       })
       setValidationResult(result as CustomFieldValidationResult)
       setValidationModalOpen(true)
-      notification.success({
-        message: 'Validation completed',
-        description: `Input ${Number((result as any)?.input_rows || 0)} row(s), output ${Number((result as any)?.output_rows || 0)} row(s).`,
-        placement: 'bottomRight',
-        duration: 2,
-      })
+      const resultOk = Boolean((result as any)?.ok)
+      const resultWarnings = Array.isArray((result as any)?.warnings)
+        ? ((result as any).warnings as unknown[]).map((item) => String(item))
+        : []
+      const responseSource = String((result as any)?.validation_source || validationSource).toUpperCase()
+      const baseDesc = `${responseSource} | Input ${Number((result as any)?.input_rows || 0)} row(s), output ${Number((result as any)?.output_rows || 0)} row(s).`
+      if (resultOk) {
+        if (resultWarnings.length > 0) {
+          notification.warning({
+            message: 'Validation completed with warnings',
+            description: `${baseDesc} ${resultWarnings[0]}`,
+            placement: 'bottomRight',
+          })
+        } else {
+          notification.success({
+            message: 'Validation completed',
+            description: baseDesc,
+            placement: 'bottomRight',
+            duration: 2,
+          })
+        }
+      } else {
+        const firstError = Array.isArray((result as any)?.errors) && (result as any).errors.length > 0
+          ? String((result as any).errors[0])
+          : 'Validation returned errors.'
+        notification.error({
+          message: 'Validation completed with errors',
+          description: `${baseDesc} ${firstError}`,
+          placement: 'bottomRight',
+        })
+      }
     } catch (err: any) {
-      const msg = String(err?.message || 'Custom field validation failed')
+      const responseData = err?.response?.data
+      const responseErrors = Array.isArray(responseData?.errors)
+        ? responseData.errors.map((item: unknown) => String(item))
+        : []
+      const responseWarnings = Array.isArray(responseData?.warnings)
+        ? responseData.warnings.map((item: unknown) => String(item))
+        : []
+      const fallbackMsg = String(
+        responseData?.detail
+        || responseData?.message
+        || err?.message
+        || 'Custom field validation failed',
+      )
+      setValidationResult({
+        ok: false,
+        validation_source: String(responseData?.validation_source || validationSource),
+        input_rows: Number(responseData?.input_rows || 0),
+        output_rows: Number(responseData?.output_rows || 0),
+        errors: responseErrors.length > 0 ? responseErrors : [fallbackMsg],
+        warnings: responseWarnings,
+        sample_input: Array.isArray(responseData?.sample_input) ? responseData.sample_input : [],
+        sample_output: Array.isArray(responseData?.sample_output) ? responseData.sample_output : [],
+      })
+      setValidationModalOpen(true)
       notification.error({
         message: 'Validation failed',
-        description: msg,
+        description: fallbackMsg,
         placement: 'bottomRight',
       })
     } finally {
@@ -1525,14 +2933,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   }
 
   const openCustomFieldStudio = () => {
-    setCustomFieldDraft(
+    const initialDraft = (
       configuredCustomFields.length > 0
         ? configuredCustomFields.map((item) => createCustomFieldSpec(item))
         : [createCustomFieldSpec()]
     )
+    setCustomFieldDraft(initialDraft)
     setCustomIncludeSourceDraft(Boolean(nodeConfig.custom_include_source_fields ?? true))
+    setCustomExpressionEngineDraft(configuredExpressionEngine)
     setCustomPrimaryKeyFieldDraft(configuredPrimaryKeyField)
     setCustomProfileEnabledDraft(configuredProfileEnabled)
+    setCustomProfileStorageDraft(configuredProfileStorage)
+    setCustomProfileProcessingModeDraft(configuredProfileProcessingMode)
     setCustomProfileEmitModeDraft(configuredProfileEmitMode)
     setCustomProfileRequiredFieldsDraft(configuredProfileRequiredFields)
     setCustomProfileEventTimeFieldDraft(configuredProfileEventTimeField)
@@ -1543,6 +2955,81 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         : 45
     )
     setCustomProfileIncludeChangeFieldsDraft(configuredProfileIncludeChangeFields)
+    setCustomProfileOracleHostDraft(configuredProfileOracleHost)
+    setCustomProfileOraclePortDraft(configuredProfileOraclePort)
+    setCustomProfileOracleServiceNameDraft(configuredProfileOracleServiceName)
+    setCustomProfileOracleSidDraft(configuredProfileOracleSid)
+    setCustomProfileOracleUserDraft(configuredProfileOracleUser)
+    setCustomProfileOraclePasswordDraft(configuredProfileOraclePassword)
+    setCustomProfileOracleDsnDraft(configuredProfileOracleDsn)
+    setCustomProfileOracleTableDraft(configuredProfileOracleTable)
+    setCustomProfileOracleWriteStrategyDraft(configuredProfileOracleWriteStrategy)
+    setCustomProfileOracleParallelWorkersDraft(configuredProfileOracleParallelWorkers)
+    setCustomProfileOracleParallelMinTokensDraft(configuredProfileOracleParallelMinTokens)
+    setCustomProfileOracleMergeBatchSizeDraft(configuredProfileOracleMergeBatchSize)
+    setCustomProfileOracleQueueEnabledDraft(configuredProfileOracleQueueEnabled)
+    setCustomProfileOracleQueueWaitOnForceFlushDraft(configuredProfileOracleQueueWaitOnForceFlush)
+    setCustomProfileComputeStrategyDraft(configuredProfileComputeStrategy)
+    setCustomProfileComputeExecutorDraft(configuredProfileComputeExecutor)
+    setCustomProfileComputeWorkersDraft(configuredProfileComputeWorkers)
+    setCustomProfileComputeMinRowsDraft(configuredProfileComputeMinRows)
+    setCustomProfileComputeGlobalPrefetchMaxTokensDraft(configuredProfileComputeGlobalPrefetchMaxTokens)
+    setCustomProfileBackfillCandidatePrefetchChunkSizeDraft(configuredProfileBackfillCandidatePrefetchChunkSize)
+    setCustomProfileLivePersistDraft(
+      configuredProfileProcessingMode === 'incremental_batch'
+        ? true
+        : configuredProfileLivePersist
+    )
+    setCustomProfileFlushEveryRowsDraft(
+      configuredProfileProcessingMode === 'incremental_batch'
+        ? Math.max(100, Math.min(Number(configuredProfileFlushEveryRows) || 20000, 50000))
+        : (configuredProfileStorage === 'rocksdb' && configuredProfileProcessingMode === 'incremental' && !hasConfiguredProfileFlushEveryRows)
+          ? 50000
+        : Math.max(1, Math.floor(Number(configuredProfileFlushEveryRows) || 20000))
+    )
+    setCustomProfileFlushIntervalSecondsDraft(
+      configuredProfileProcessingMode === 'incremental_batch'
+        ? Math.max(0.5, Math.min(Number(configuredProfileFlushIntervalSeconds) || 2, 10))
+        : (configuredProfileStorage === 'rocksdb' && configuredProfileProcessingMode === 'incremental' && !hasConfiguredProfileFlushIntervalSeconds)
+          ? 10
+        : Math.max(0.1, Number(configuredProfileFlushIntervalSeconds) || 2)
+    )
+    setCustomProfileAppendUniqueDisableMinRowsDraft(
+      Number.isFinite(configuredProfileAppendUniqueDisableMinRows) && configuredProfileAppendUniqueDisableMinRows > 0
+        ? Math.max(1000, Math.floor(configuredProfileAppendUniqueDisableMinRows))
+        : 5000
+    )
+    setCustomProfileAppendUniqueEntityLimitDraft(
+      Number.isFinite(configuredProfileAppendUniqueEntityLimit) && configuredProfileAppendUniqueEntityLimit > 0
+        ? Math.max(1000, Math.floor(configuredProfileAppendUniqueEntityLimit))
+        : 10000
+    )
+    setCustomProfileAppendUniqueDisableRatioDraft(
+      Number.isFinite(configuredProfileAppendUniqueDisableRatio)
+        ? Math.max(0.01, Math.min(Number(configuredProfileAppendUniqueDisableRatio), 1))
+        : 0.35
+    )
+    const configuredValidationSource = String(nodeConfig.custom_validation_source || '')
+      .trim()
+      .toLowerCase()
+    setValidationSourceDraft(
+      configuredValidationSource === 'rocksdb'
+        ? 'rocksdb'
+        : configuredValidationSource === 'lmdb'
+          ? 'lmdb'
+          : 'sample'
+    )
+    setValidationLmdbEnvPathDraft(configuredValidationLmdbEnvPath)
+    setValidationLmdbDbNameDraft(configuredValidationLmdbDbName)
+    setValidationLmdbKeyPrefixDraft(configuredValidationLmdbKeyPrefix)
+    setValidationLmdbStartKeyDraft(configuredValidationLmdbStartKey)
+    setValidationLmdbEndKeyDraft(configuredValidationLmdbEndKey)
+    setValidationLmdbKeyContainsDraft(configuredValidationLmdbKeyContains)
+    setValidationLmdbLimitDraft(
+      Number.isFinite(configuredValidationLmdbLimit) && configuredValidationLmdbLimit > 0
+        ? Math.min(200, Math.floor(configuredValidationLmdbLimit))
+        : 50
+    )
     setActiveExpressionFieldId(null)
     setExampleRepoCategory('all')
     setExampleRepoSearch('')
@@ -1551,7 +3038,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setProfileMonitorError(null)
     setValidationResult(null)
     setValidationModalOpen(false)
-    setCollapsedCustomFieldIds([])
+    const collapsedIds = parseStringList(nodeConfig.custom_collapsed_field_ids)
+    const draftIdSet = new Set(initialDraft.map((item) => String(item.id || '').trim()).filter(Boolean))
+    setCollapsedCustomFieldIds(collapsedIds.filter((id) => draftIdSet.has(id)))
   }
 
   const updateCustomFieldDraft = (id: string, patch: Partial<CustomFieldSpec>) => {
@@ -1619,23 +3108,73 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
   const saveCustomFieldStudio = () => {
     const normalized = serializeCustomFieldSpecs(customFieldDraft)
+    const normalizedIds = normalized
+      .map((item) => String(item.id || '').trim())
+      .filter(Boolean)
+    const collapsedIds = collapsedCustomFieldIds.filter((id) => normalizedIds.includes(id))
     const primaryKeyField = String(customPrimaryKeyFieldDraft || '').trim()
     const profileWindowDays = String(customProfileWindowDaysDraft || '').trim() || '1,7,30'
     const profileRetentionDays = Number.isFinite(customProfileRetentionDaysDraft) && customProfileRetentionDaysDraft > 0
       ? Math.floor(customProfileRetentionDaysDraft)
       : 45
+    const validationLimit = Math.max(1, Math.min(Number(validationLmdbLimitDraft || 50) || 50, 200))
+    const appendUniqueCacheModeDraft = (
+      customProfileStorageDraft === 'rocksdb' && customProfileProcessingModeDraft === 'incremental'
+        ? 'persistent'
+        : 'auto'
+    )
     updateNodeConfig(selectedNodeId!, {
       custom_fields: normalized,
       custom_include_source_fields: customIncludeSourceDraft,
+      custom_expression_engine: customExpressionEngineDraft,
       custom_primary_key_field: primaryKeyField,
       custom_group_by_field: primaryKeyField,
       custom_profile_enabled: customProfileEnabledDraft,
+      custom_profile_storage: customProfileStorageDraft,
+      custom_profile_oracle_host: String(customProfileOracleHostDraft || '').trim(),
+      custom_profile_oracle_port: customProfileOraclePortDraft,
+      custom_profile_oracle_service_name: String(customProfileOracleServiceNameDraft || '').trim(),
+      custom_profile_oracle_sid: String(customProfileOracleSidDraft || '').trim(),
+      custom_profile_oracle_user: String(customProfileOracleUserDraft || '').trim(),
+      custom_profile_oracle_password: String(customProfileOraclePasswordDraft || '').trim(),
+      custom_profile_oracle_dsn: String(customProfileOracleDsnDraft || '').trim(),
+      custom_profile_oracle_table: String(customProfileOracleTableDraft || '').trim() || 'ETL_PROFILE_STATE',
+      custom_profile_oracle_write_strategy: customProfileOracleWriteStrategyDraft,
+      custom_profile_oracle_parallel_workers: customProfileOracleParallelWorkersDraft,
+      custom_profile_oracle_parallel_min_tokens: customProfileOracleParallelMinTokensDraft,
+      custom_profile_oracle_merge_batch_size: customProfileOracleMergeBatchSizeDraft,
+      custom_profile_oracle_queue_enabled: customProfileOracleQueueEnabledDraft,
+      custom_profile_oracle_queue_wait_on_force_flush: customProfileOracleQueueWaitOnForceFlushDraft,
+      custom_profile_processing_mode: customProfileProcessingModeDraft,
+      custom_profile_compute_strategy: customProfileComputeStrategyDraft,
+      custom_profile_compute_executor: customProfileComputeExecutorDraft,
+      custom_profile_compute_workers: customProfileComputeWorkersDraft,
+      custom_profile_compute_min_rows: customProfileComputeMinRowsDraft,
+      custom_profile_compute_global_prefetch_max_tokens: customProfileComputeGlobalPrefetchMaxTokensDraft,
+      custom_profile_backfill_candidate_prefetch_chunk_size: customProfileBackfillCandidatePrefetchChunkSizeDraft,
       custom_profile_emit_mode: customProfileEmitModeDraft,
       custom_profile_required_fields: customProfileRequiredFieldsDraft.join(', '),
       custom_profile_event_time_field: customProfileEventTimeFieldDraft,
       custom_profile_window_days: profileWindowDays,
       custom_profile_retention_days: profileRetentionDays,
       custom_profile_include_change_fields: customProfileIncludeChangeFieldsDraft,
+      custom_profile_live_persist: customProfileLivePersistDraft,
+      custom_profile_flush_every_rows: customProfileFlushEveryRowsDraft,
+      custom_profile_flush_interval_seconds: customProfileFlushIntervalSecondsDraft,
+      custom_profile_append_unique_cache_mode: appendUniqueCacheModeDraft,
+      custom_profile_append_unique_cache_disable_min_rows: customProfileAppendUniqueDisableMinRowsDraft,
+      custom_profile_append_unique_cache_entity_limit: customProfileAppendUniqueEntityLimitDraft,
+      custom_profile_append_unique_cache_disable_ratio: customProfileAppendUniqueDisableRatioDraft,
+      custom_validation_source: validationSourceDraft,
+      custom_validation_lmdb_env_path: String(validationLmdbEnvPathDraft || '').trim(),
+      custom_validation_lmdb_db_name: String(validationLmdbDbNameDraft || '').trim(),
+      custom_validation_lmdb_key_prefix: String(validationLmdbKeyPrefixDraft || '').trim(),
+      custom_validation_lmdb_start_key: String(validationLmdbStartKeyDraft || '').trim(),
+      custom_validation_lmdb_end_key: String(validationLmdbEndKeyDraft || '').trim(),
+      custom_validation_lmdb_key_contains: String(validationLmdbKeyContainsDraft || '').trim(),
+      custom_validation_lmdb_limit: validationLimit,
+      custom_validation_rocksdb_env_path: String(validationLmdbEnvPathDraft || '').trim(),
+      custom_collapsed_field_ids: collapsedIds,
     })
     if (normalized.length > 0) {
       const outputFields = uniqueFieldNames(
@@ -1739,6 +3278,510 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     })
   }
 
+  const lmdbDraftToConfig = (draft: LmdbStudioDraft): Record<string, unknown> => ({
+    env_path: String(draft.env_path || '').trim(),
+    db_name: String(draft.db_name || '').trim(),
+    key_prefix: String(draft.key_prefix || '').trim(),
+    start_key: String(draft.start_key || '').trim(),
+    end_key: String(draft.end_key || '').trim(),
+    key_contains: String(draft.key_contains || '').trim(),
+    value_contains: String(draft.value_contains || '').trim(),
+    value_format: draft.value_format || 'auto',
+    flatten_json_values: Boolean(draft.flatten_json_values),
+    expand_profile_documents: Boolean(draft.expand_profile_documents),
+    limit: Math.max(0, Number.isFinite(Number(draft.limit)) ? Math.floor(Number(draft.limit)) : 1000),
+  })
+
+  const loadLmdbEnvPathOptions = async (
+    basePathOverride?: string,
+    sourceOverride?: 'lmdb' | 'rocksdb',
+  ) => {
+    setLmdbPathBrowseLoading(true)
+    setLmdbPathBrowseError(null)
+    try {
+      const sourceType = sourceOverride || (isRocksdbSource ? 'rocksdb' : 'lmdb')
+      const sourceLabel = sourceType === 'rocksdb' ? 'RocksDB' : 'LMDB'
+      const response = sourceType === 'rocksdb'
+        ? await api.detectRocksdbEnvPathOptions({
+          base_path: String(basePathOverride || lmdbStudioDraft.env_path || lmdbConfigured.env_path || '').trim(),
+          max_depth: 5,
+          limit: 800,
+        })
+        : await api.detectLmdbEnvPathOptions({
+        base_path: String(basePathOverride || lmdbStudioDraft.env_path || lmdbConfigured.env_path || '').trim(),
+        max_depth: 5,
+        limit: 800,
+      })
+      const paths = Array.isArray(response?.paths)
+        ? response.paths.map((item: unknown) => String(item || '').trim()).filter(Boolean)
+        : []
+      setLmdbDiscoveredPaths(uniqueFieldNames(paths))
+      if (paths.length === 0) {
+        notification.info({
+          message: `No ${sourceLabel} paths found`,
+          description: sourceType === 'rocksdb'
+            ? 'No folders with RocksDB CURRENT file were discovered in browse roots.'
+            : 'No folders with data.mdb were discovered in browse roots.',
+          placement: 'bottomRight',
+          duration: 2.5,
+        })
+      } else {
+        notification.success({
+          message: `${sourceLabel} paths loaded`,
+          description: `${paths.length} path(s) discovered.`,
+          placement: 'bottomRight',
+          duration: 2,
+        })
+      }
+    } catch (err: any) {
+      const sourceLabel = sourceOverride === 'rocksdb' ? 'RocksDB' : kvSourceLabel
+      const msg = String(err?.message || `Failed to fetch ${sourceLabel} path options`)
+      setLmdbPathBrowseError(msg)
+      notification.error({
+        message: `${sourceLabel} browser failed`,
+        description: msg,
+        placement: 'bottomRight',
+      })
+    } finally {
+      setLmdbPathBrowseLoading(false)
+    }
+  }
+
+  const openLmdbStudio = () => {
+    const draft = createLmdbStudioDraft(lmdbConfigured)
+    setLmdbStudioDraft(draft)
+    setLmdbStudioError(null)
+    setLmdbPathBrowseError(null)
+    setLmdbPreviewView('table')
+    setLmdbPreviewDisplayLimit(200)
+    setLmdbTablePageSize(25)
+    setLmdbVisibleColumns([])
+    setLmdbJsonEditorOpen(false)
+    setLmdbJsonEditorError(null)
+    setLmdbJsonTagFilter('')
+    setLmdbStudioPreviewRows([])
+    setLmdbStudioColumns([])
+    setLmdbStudioRowCount(0)
+    setLmdbSummaryRemote(null)
+    setLmdbSummaryLoading(false)
+    setLmdbSummaryError(null)
+    setLmdbStudioOpen(true)
+    setLmdbTableCurrentPage(1)
+    setLmdbPreviewHasMore(false)
+    setLmdbGlobalFilterColumn(LMDB_GLOBAL_ALL_COLUMNS)
+    setLmdbGlobalFilterValues([])
+    setLmdbColumnFilterValues({})
+  }
+
+  const fetchLmdbSummary = async (requestConfig: Record<string, unknown>) => {
+    setLmdbSummaryLoading(true)
+    setLmdbSummaryError(null)
+    try {
+      const summaryResponse = isRocksdbSource
+        ? await api.getRocksdbSummary(requestConfig, 0)
+        : await api.getLmdbSummary(requestConfig, 0)
+      if (summaryResponse && typeof summaryResponse === 'object') {
+        setLmdbSummaryRemote(summaryResponse as Record<string, unknown>)
+      }
+    } catch (summaryErr: any) {
+      const summaryMsg = String(summaryErr?.message || `Failed to fetch ${kvSourceLabel} summary`)
+      setLmdbSummaryRemote(null)
+      setLmdbSummaryError(summaryMsg)
+    } finally {
+      setLmdbSummaryLoading(false)
+    }
+  }
+
+  const runLmdbPreview = async (options?: {
+    draftOverride?: LmdbStudioDraft
+    page?: number
+    pageSize?: number
+    quiet?: boolean
+    globalFilterColumnOverride?: string
+    globalFilterValuesOverride?: string[]
+    columnFiltersOverride?: Record<string, string[]>
+  }) => {
+    const draft = options?.draftOverride || lmdbStudioDraft
+    const page = Math.max(1, Math.floor(Number(options?.page ?? lmdbTableCurrentPage ?? 1)))
+    const pageSize = Math.max(5, Math.min(Number.isFinite(Number(options?.pageSize))
+      ? Math.floor(Number(options?.pageSize))
+      : Number(lmdbTablePageSize || 25), 500))
+    const quiet = Boolean(options?.quiet)
+    const globalFilterColumn = String(
+      options?.globalFilterColumnOverride ?? lmdbGlobalFilterColumn ?? LMDB_GLOBAL_ALL_COLUMNS
+    )
+    const globalFilterValues = uniqueFieldNames(
+      (options?.globalFilterValuesOverride ?? lmdbGlobalFilterValues ?? [])
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+    )
+    const columnFiltersRaw = options?.columnFiltersOverride ?? lmdbColumnFilterValues
+    const columnFilters: Record<string, string[]> = {}
+    Object.entries(columnFiltersRaw || {}).forEach(([name, values]) => {
+      const col = String(name || '').trim()
+      if (!col || !Array.isArray(values)) return
+      const normalized = uniqueFieldNames(values.map((v) => String(v || '').trim()).filter(Boolean))
+      if (normalized.length > 0) columnFilters[col] = normalized
+    })
+    const envPath = String(draft.env_path || '').trim()
+    const shouldRefreshSummary = Boolean(
+      options?.draftOverride
+      || options?.globalFilterColumnOverride !== undefined
+      || options?.globalFilterValuesOverride !== undefined
+      || options?.columnFiltersOverride !== undefined
+      || page === 1
+      || !lmdbSummaryRemote
+    )
+    if (!envPath) {
+      const msg = `${kvSourceLabel} environment path is required.`
+      setLmdbStudioError(msg)
+      notification.error({ message: `${kvSourceLabel} query failed`, description: msg, placement: 'bottomRight' })
+      return
+    }
+    setLmdbStudioError(null)
+    setLmdbStudioLoading(true)
+    try {
+      const configuredLimit = Number.isFinite(Number(draft.limit)) ? Math.floor(Number(draft.limit)) : 1000
+      const previewFetchLimit = configuredLimit <= 0 ? 2_147_483_647 : Math.max(1, configuredLimit)
+      const lmdbSchemaScanRows = Math.max(previewFetchLimit, 5000)
+      const requestConfig: Record<string, unknown> = {
+        ...lmdbDraftToConfig(draft),
+        global_filter_column: globalFilterColumn,
+        global_filter_values: globalFilterValues,
+      }
+      if (Object.keys(columnFilters).length > 0) {
+        requestConfig.column_filters = columnFilters
+      }
+      const response = await api.detectSourceFieldOptions(kvSourceType, requestConfig, lmdbSchemaScanRows, {
+        page,
+        previewRows: pageSize,
+        includeSchemaScan: false,
+        schemaScanLimit: 250,
+        previewCompact: true,
+        previewMaxCellChars: 2000,
+        previewMaxCollectionItems: 64,
+      })
+      const previewRows = Array.isArray(response?.preview) ? response.preview : []
+      const columns = Array.isArray(response?.columns) ? response.columns.map((v: unknown) => String(v)) : []
+      const hasMore = Boolean(response?.has_more)
+      const rowCountRaw = Number(response?.row_count || 0)
+      const pageBase = Math.max(0, (page - 1) * pageSize)
+      const fallbackRowCount = pageBase + previewRows.length + (hasMore ? 1 : 0)
+      const rowCount = Number.isFinite(rowCountRaw) && rowCountRaw > 0 ? rowCountRaw : fallbackRowCount
+
+      setLmdbStudioPreviewRows(previewRows)
+      setLmdbStudioColumns((prev) => uniqueFieldNames([...(prev || []), ...columns]))
+      setLmdbStudioRowCount(Number.isFinite(rowCount) ? rowCount : previewRows.length)
+      setLmdbTableCurrentPage(page)
+      setLmdbTablePageSize(pageSize)
+      setLmdbPreviewHasMore(hasMore)
+
+      if (shouldRefreshSummary) {
+        await fetchLmdbSummary(requestConfig)
+      }
+
+      if (selectedNodeId) {
+        const patch: Record<string, unknown> = {
+          ...lmdbDraftToConfig(draft),
+          _detected_columns: columns.join(', '),
+          _row_count: Number.isFinite(rowCount) ? rowCount : previewRows.length,
+          _preview_page: page,
+          _preview_page_size: pageSize,
+          _preview_has_more: hasMore,
+        }
+        if (previewRows.length > 0) patch._preview_rows = previewRows
+        updateNodeConfigSilent(selectedNodeId, patch)
+      }
+      if (!quiet) {
+        notification.success({
+          message: `${kvSourceLabel} query completed`,
+          description: `Page ${page} loaded with ${previewRows.length.toLocaleString()} row(s).`,
+          placement: 'bottomRight',
+          duration: 2,
+        })
+      }
+    } catch (err: any) {
+      const msg = String(err?.message || `Failed to query ${kvSourceLabel} source`)
+      setLmdbStudioError(msg)
+      notification.error({
+        message: `${kvSourceLabel} query failed`,
+        description: msg,
+        placement: 'bottomRight',
+      })
+    } finally {
+      setLmdbStudioLoading(false)
+    }
+  }
+
+  const saveLmdbJsonEditor = () => {
+    const rowIndex = lmdbJsonEditorRowIndex
+    if (rowIndex === null || rowIndex < 0) {
+      setLmdbJsonEditorError('Row index is not selected.')
+      return
+    }
+
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(String(lmdbJsonEditorText || '').trim() || 'null')
+    } catch {
+      setLmdbJsonEditorError('Invalid JSON. Correct JSON syntax and retry.')
+      return
+    }
+
+    if (lmdbJsonEditorMode === 'row' && (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed))) {
+      setLmdbJsonEditorError('Row JSON must be an object.')
+      return
+    }
+
+    setLmdbStudioPreviewRows((prev) => {
+      if (!Array.isArray(prev) || rowIndex >= prev.length) return prev
+      const next = [...prev]
+      if (lmdbJsonEditorMode === 'row') {
+        next[rowIndex] = parsed as Record<string, unknown>
+      } else {
+        const fieldName = String(lmdbJsonEditorField || '').trim()
+        if (!fieldName) return prev
+        const currentRow = next[rowIndex]
+        const baseRow = (currentRow && typeof currentRow === 'object' && !Array.isArray(currentRow))
+          ? { ...(currentRow as Record<string, unknown>) }
+          : {}
+        baseRow[fieldName] = parsed
+        next[rowIndex] = baseRow
+      }
+      return next
+    })
+
+    setLmdbJsonEditorError(null)
+    setLmdbJsonEditorOpen(false)
+    setLmdbJsonTagFilter('')
+    notification.success({
+      message: 'Preview JSON updated',
+      description: lmdbJsonEditorMode === 'row'
+        ? 'Row JSON was updated in preview.'
+        : `Cell JSON for "${lmdbJsonEditorField}" was updated in preview.`,
+      placement: 'bottomRight',
+      duration: 1.8,
+    })
+  }
+
+  function openLmdbCellJsonEditor(
+    rowIndex: number | null,
+    fieldName: string,
+    value: unknown,
+  ) {
+    const text = toPreviewJsonText(value)
+    setLmdbJsonEditorMode('cell')
+    setLmdbJsonEditorField(String(fieldName || ''))
+    setLmdbJsonEditorRowIndex(rowIndex)
+    setLmdbJsonEditorTitle(`Edit Cell JSON — ${fieldName}`)
+    setLmdbJsonEditorText(text)
+    setLmdbJsonEditorOriginalText(text)
+    setLmdbJsonEditorError(null)
+    setLmdbJsonTagFilter('')
+    setLmdbJsonEditorOpen(true)
+  }
+
+  function openLmdbRowJsonEditor(
+    rowIndex: number | null,
+    rowPayload: Record<string, unknown>,
+  ) {
+    const text = toPreviewJsonText(rowPayload)
+    setLmdbJsonEditorMode('row')
+    setLmdbJsonEditorField('')
+    setLmdbJsonEditorRowIndex(rowIndex)
+    setLmdbJsonEditorTitle('Edit Full Row JSON')
+    setLmdbJsonEditorText(text)
+    setLmdbJsonEditorOriginalText(text)
+    setLmdbJsonEditorError(null)
+    setLmdbJsonTagFilter('')
+    setLmdbJsonEditorOpen(true)
+  }
+
+  function formatLmdbJsonEditor() {
+    try {
+      const parsed = JSON.parse(String(lmdbJsonEditorText || '').trim() || 'null')
+      setLmdbJsonEditorText(JSON.stringify(parsed, null, 2))
+      setLmdbJsonEditorError(null)
+    } catch {
+      setLmdbJsonEditorError('Invalid JSON. Unable to format.')
+    }
+  }
+
+  function minifyLmdbJsonEditor() {
+    try {
+      const parsed = JSON.parse(String(lmdbJsonEditorText || '').trim() || 'null')
+      setLmdbJsonEditorText(JSON.stringify(parsed))
+      setLmdbJsonEditorError(null)
+    } catch {
+      setLmdbJsonEditorError('Invalid JSON. Unable to minify.')
+    }
+  }
+
+  function resetLmdbJsonEditor() {
+    setLmdbJsonEditorText(lmdbJsonEditorOriginalText)
+    setLmdbJsonEditorError(null)
+  }
+
+  async function copyLmdbJsonSnippet(snippet: string, label: string) {
+    const text = String(snippet || '')
+    if (!text) return
+    let copied = false
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text)
+        copied = true
+      }
+    } catch {
+      copied = false
+    }
+    if (!copied) {
+      try {
+        if (typeof document !== 'undefined') {
+          const el = document.createElement('textarea')
+          el.value = text
+          el.style.position = 'fixed'
+          el.style.left = '-9999px'
+          document.body.appendChild(el)
+          el.focus()
+          el.select()
+          copied = document.execCommand('copy')
+          document.body.removeChild(el)
+        }
+      } catch {
+        copied = false
+      }
+    }
+    if (copied) {
+      notification.success({
+        message: 'Copied',
+        description: `${label} copied to clipboard.`,
+        placement: 'bottomRight',
+        duration: 1.5,
+      })
+    } else {
+      notification.error({
+        message: 'Copy failed',
+        description: 'Clipboard is unavailable in this browser context.',
+        placement: 'bottomRight',
+      })
+    }
+  }
+
+  const deleteLmdbData = async (mode: 'filtered' | 'all') => {
+    const draft = lmdbStudioDraft
+    const envPath = String(draft.env_path || '').trim()
+    if (!envPath) {
+      const msg = `${kvSourceLabel} environment path is required.`
+      setLmdbStudioError(msg)
+      notification.error({ message: `${kvSourceLabel} delete failed`, description: msg, placement: 'bottomRight' })
+      return
+    }
+    if (mode === 'filtered') {
+      const hasCustomFilter = Boolean(
+        String(draft.key_prefix || '').trim()
+        || String(draft.start_key || '').trim()
+        || String(draft.end_key || '').trim()
+        || String(draft.key_contains || '').trim()
+      )
+      if (!hasCustomFilter) {
+        const msg = 'Set at least one filter (prefix/start/end/key contains) for custom delete.'
+        setLmdbStudioError(msg)
+        notification.error({ message: `${kvSourceLabel} delete failed`, description: msg, placement: 'bottomRight' })
+        return
+      }
+    }
+
+    setLmdbDeleteLoading(true)
+    setLmdbStudioError(null)
+    try {
+      const response = isRocksdbSource
+        ? await api.deleteRocksdbData({
+          env_path: envPath,
+          delete_mode: mode,
+          key_prefix: String(draft.key_prefix || '').trim(),
+          start_key: String(draft.start_key || '').trim(),
+          end_key: String(draft.end_key || '').trim(),
+          key_contains: String(draft.key_contains || '').trim(),
+          limit: Math.max(0, Number.isFinite(Number(draft.limit)) ? Math.floor(Number(draft.limit)) : 1000),
+        })
+        : await api.deleteLmdbData({
+        env_path: envPath,
+        db_name: String(draft.db_name || '').trim(),
+        delete_mode: mode,
+        key_prefix: String(draft.key_prefix || '').trim(),
+        start_key: String(draft.start_key || '').trim(),
+        end_key: String(draft.end_key || '').trim(),
+        key_contains: String(draft.key_contains || '').trim(),
+        limit: Math.max(0, Number.isFinite(Number(draft.limit)) ? Math.floor(Number(draft.limit)) : 1000),
+      })
+
+      const deleted = Number(response?.deleted_keys || 0)
+      const matched = Number(response?.matched_keys || 0)
+      notification.success({
+        message: mode === 'all' ? `${kvSourceLabel} cleared` : `${kvSourceLabel} filtered delete completed`,
+        description: `${deleted.toLocaleString()} key(s) deleted${mode === 'filtered' ? ` (matched: ${matched.toLocaleString()})` : ''}.`,
+        placement: 'bottomRight',
+        duration: 3,
+      })
+
+      await runLmdbPreview({
+        draftOverride: draft,
+        page: 1,
+      })
+    } catch (err: any) {
+      const msg = String(err?.message || `Failed to delete ${kvSourceLabel} data`)
+      setLmdbStudioError(msg)
+      notification.error({
+        message: `${kvSourceLabel} delete failed`,
+        description: msg,
+        placement: 'bottomRight',
+      })
+    } finally {
+      setLmdbDeleteLoading(false)
+    }
+  }
+
+  const confirmDeleteLmdbData = (mode: 'filtered' | 'all') => {
+    const title = mode === 'all'
+      ? `Delete All ${kvSourceLabel} Data?`
+      : `Delete Filtered ${kvSourceLabel} Data?`
+    const content = mode === 'all'
+      ? `This will delete all keys from the selected ${kvSourceLabel} database. This cannot be undone.`
+      : 'This will delete keys matching current filters (prefix/range/contains). This cannot be undone.'
+    Modal.confirm({
+      title,
+      content,
+      centered: true,
+      okText: mode === 'all' ? 'Delete All' : 'Delete Matching',
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        await deleteLmdbData(mode)
+      },
+    })
+  }
+
+  const saveLmdbStudio = () => {
+    const envPath = String(lmdbStudioDraft.env_path || '').trim()
+    if (!envPath) {
+      notification.error({
+        message: `${kvSourceLabel} path is required`,
+        description: `Set ${kvSourceLabel} path directly from backend filesystem.`,
+        placement: 'bottomRight',
+      })
+      return
+    }
+    if (selectedNodeId) {
+      updateNodeConfig(selectedNodeId, lmdbDraftToConfig(lmdbStudioDraft))
+    }
+    setLmdbStudioOpen(false)
+    notification.success({
+      message: `${kvSourceLabel} source config saved`,
+      description: `${kvSourceLabel} source node is ready for execution.`,
+      placement: 'bottomRight',
+      duration: 2,
+    })
+  }
+
   const commonInputStyle = {
     background: 'var(--app-input-bg)',
     border: '1px solid var(--app-border-strong)',
@@ -1750,12 +3793,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
     // ── File source picker ────────────────────────────────────────────
     if (field.name === 'file_path' && isFileSource) {
+      const pickerNodeId = selectedNodeId
       return (
         <SourceFilePicker
+          key={`source-file-picker-${pickerNodeId || 'none'}`}
+          nodeId={pickerNodeId || undefined}
           value={val as string}
           fileType={fileType as any}
           placeholder={`Click to browse ${fileType.toUpperCase()} file…`}
           onChange={(path, fileInfo) => {
+            if (!pickerNodeId) return
             const patch: Record<string, unknown> = { file_path: path }
             if (fileInfo) {
               // Auto-populate columns hint if available
@@ -1779,7 +3826,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 }
               }
             }
-            updateNodeConfig(selectedNodeId!, patch)
+            updateNodeConfig(pickerNodeId, patch)
           }}
         />
       )
@@ -1787,19 +3834,85 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
     // ── File destination path picker ──────────────────────────────────
     if (field.name === 'file_path' && isFileDest) {
+      const pickerNodeId = selectedNodeId
       return (
         <DestinationPathPicker
+          key={`destination-file-picker-${pickerNodeId || 'none'}`}
           value={val as string}
           fileType={fileType as any}
           placeholder={`/output/result.${fileType}`}
-          nodeId={selectedNodeId!}
-          onChange={(path) => handleFieldChange('file_path', path)}
+          nodeId={pickerNodeId || undefined}
+          onChange={(path) => {
+            if (!pickerNodeId) return
+            updateNodeConfig(pickerNodeId, { file_path: path })
+          }}
         />
       )
     }
 
     switch (field.type) {
       case 'text':
+        if (isLmdbSource && field.name === 'env_path') {
+          return (
+            <Space direction="vertical" size={8} style={{ width: '100%' }}>
+              <Space.Compact style={{ width: '100%' }}>
+                <Input
+                  placeholder={field.placeholder || kvPathPlaceholder}
+                  value={String(val || '')}
+                  onChange={(e) => handleFieldChange(field.name, e.target.value)}
+                  style={{ ...commonInputStyle, width: '100%' }}
+                />
+                <Button
+                  size="small"
+                  loading={lmdbPathBrowseLoading}
+                  onClick={() => { void loadLmdbEnvPathOptions(String(val || '')) }}
+                >
+                  Browse
+                </Button>
+              </Space.Compact>
+              <Select
+                size="small"
+                showSearch
+                allowClear
+                placeholder={`Select discovered ${kvSourceLabel} path`}
+                options={lmdbEnvPathPresetOptions}
+                onChange={(path) => {
+                  if (typeof path !== 'string' || !path) return
+                  handleFieldChange(field.name, path)
+                }}
+                style={{ width: '100%' }}
+              />
+              <Space size={8} wrap>
+                <Button
+                  size="small"
+                  onClick={openLmdbStudio}
+                  style={{
+                    background: '#14b8a61a',
+                    border: '1px solid #14b8a640',
+                    color: '#14b8a6',
+                  }}
+                >
+                  Open {kvSourceLabel} Studio
+                </Button>
+                <Button
+                  size="small"
+                  loading={sourceFieldDetectLoading}
+                  onClick={() => { void detectSourceFieldOptions() }}
+                >
+                  Detect Fields
+                </Button>
+              </Space>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                Direct backend path only. Supports absolute path, `~`, and env vars.
+              </Text>
+              {lmdbPathBrowseError ? (
+                <Text style={{ color: '#ef4444', fontSize: 11 }}>
+                  {lmdbPathBrowseError}
+                </Text>
+              ) : null}
+            </Space>
+          )
+        }
         if (nodeType === 'join_transform' && (field.name === 'left_key' || field.name === 'right_key')) {
           const options = (field.name === 'left_key' ? joinLeftFieldOptions : joinRightFieldOptions)
             .map((name) => ({ value: name, label: name }))
@@ -2139,6 +4252,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           </div>
         </Space>
         <Space>
+          <Tooltip title="Duplicate node">
+            <Button type="text" icon={<CopyOutlined />} size="small" style={{ color: 'var(--app-text-muted)' }} onClick={handleDuplicate} />
+          </Tooltip>
           <Tooltip title="Delete node">
             <Button type="text" icon={<DeleteOutlined />} size="small" style={{ color: '#ef4444' }} onClick={handleDelete} />
           </Tooltip>
@@ -2171,6 +4287,35 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 style={commonInputStyle}
               />
             </Form.Item>
+
+            <div
+              style={{
+                border: '1px solid var(--app-border-strong)',
+                borderRadius: 8,
+                background: 'var(--app-shell-bg)',
+                padding: '8px 10px',
+                marginBottom: 12,
+              }}
+            >
+              <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                <div>
+                  <Text style={{ color: 'var(--app-text)', fontSize: 12, fontWeight: 600 }}>
+                    Node Enabled
+                  </Text>
+                  <br />
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Disabled nodes are skipped during execution and pass upstream rows through.
+                  </Text>
+                </div>
+                <Switch
+                  checked={nodeEnabled}
+                  onChange={(checked) => {
+                    if (!selectedNodeId) return
+                    updateNodeConfig(selectedNodeId, { node_enabled: checked })
+                  }}
+                />
+              </Space>
+            </div>
 
             {visibleFields.length > 0 ? (
               <Divider style={{ borderColor: 'var(--app-border)', margin: '4px 0 14px' }}>
@@ -2212,6 +4357,51 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       {sourceFieldDetectError}
                     </Text>
                   )}
+                </Space>
+              </div>
+            ) : null}
+
+            {isLmdbSource ? (
+              <div style={{
+                background: '#14b8a60f',
+                border: '1px solid #14b8a640',
+                borderRadius: 8,
+                padding: '8px 10px',
+                marginBottom: 12,
+              }}>
+                <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                  <Text style={{ color: '#14b8a6', fontSize: 11, fontWeight: 700, whiteSpace: 'nowrap' }}>
+                    {kvSourceLabel} Source Studio
+                  </Text>
+                  <Space size={6} wrap>
+                    <Button
+                      size="small"
+                      onClick={openLmdbStudio}
+                      style={{
+                        background: '#14b8a61a',
+                        border: '1px solid #14b8a640',
+                        color: '#14b8a6',
+                      }}
+                    >
+                      Open Full Screen
+                    </Button>
+                  </Space>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Set {kvSourceLabel} backend path, apply filters, and preview query output.
+                  </Text>
+                  <Space size={6} wrap>
+                    <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9' }}>
+                      decode: {lmdbConfigured.value_format}
+                    </Tag>
+                    <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b' }}>
+                      limit: {Number(lmdbConfigured.limit || 0) || 0}
+                    </Tag>
+                    {lmdbConfigured.key_prefix ? (
+                      <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e' }}>
+                        prefix filter
+                      </Tag>
+                    ) : null}
+                  </Space>
                 </Space>
               </div>
             ) : null}
@@ -2282,7 +4472,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             ) : null}
 
             {/* Auto-detected schema hint for sources */}
-            {(isFileSource || isDatabaseSource) && !!nodeConfig._detected_columns ? (
+            {(isFileSource || isDatabaseSource || isLmdbSource) && !!nodeConfig._detected_columns ? (
               <div style={{
                 background: '#22c55e0a', border: '1px solid #22c55e20',
                 borderRadius: 8, padding: '8px 12px', marginBottom: 12,
@@ -2521,10 +4711,36 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 showSearch
                 value={customPrimaryKeyFieldDraft || undefined}
                 onChange={(value) => setCustomPrimaryKeyFieldDraft(String(value || ''))}
-                options={expressionFieldOptions.map((field) => ({ value: field, label: field }))}
+                options={referenceFieldOptions.map((field) => ({ value: field, label: field }))}
                 placeholder="Select key field (example: state, agencode)"
                 style={{ width: '100%', marginTop: 6 }}
               />
+            </div>
+            <div
+              style={{
+                marginTop: 10,
+                background: 'var(--app-card-bg)',
+                border: '1px solid var(--app-border-strong)',
+                borderRadius: 8,
+                padding: 10,
+              }}
+            >
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                Expression Engine
+              </Text>
+              <Select
+                value={customExpressionEngineDraft}
+                onChange={(value) => setCustomExpressionEngineDraft(value as CustomExpressionEngine)}
+                options={[
+                  { value: 'auto', label: 'Auto' },
+                  { value: 'python', label: 'Python' },
+                  { value: 'polars', label: 'Polars' },
+                ]}
+                style={{ width: '100%', marginTop: 6 }}
+              />
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                Auto selects the safest engine. Polars is best for batch/stateless expressions.
+              </Text>
             </div>
             <div
               style={{
@@ -2549,6 +4765,407 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               </Text>
               {customProfileEnabledDraft ? (
                 <Space direction="vertical" size={8} style={{ marginTop: 8, width: '100%' }}>
+                  <Select
+                    value={customProfileStorageDraft}
+                    onChange={(value) => {
+                      const nextStorage = value as CustomProfileStorage
+                      setCustomProfileStorageDraft(nextStorage)
+                      if (nextStorage === 'rocksdb' && customProfileProcessingModeDraft === 'incremental') {
+                        applyRocksdbIncrementalTuningDefaults(
+                          setCustomProfileFlushEveryRowsDraft,
+                          setCustomProfileFlushIntervalSecondsDraft,
+                          setCustomProfileAppendUniqueDisableMinRowsDraft,
+                          setCustomProfileAppendUniqueEntityLimitDraft,
+                          setCustomProfileAppendUniqueDisableRatioDraft,
+                        )
+                      }
+                    }}
+                    options={[
+                      { value: 'lmdb', label: 'LMDB' },
+                      { value: 'rocksdb', label: 'RocksDB' },
+                      { value: 'redis', label: 'Redis' },
+                      { value: 'oracle', label: 'Oracle' },
+                    ]}
+                    style={{ width: '100%' }}
+                  />
+                  <Select
+                    value={customProfileProcessingModeDraft}
+                    onChange={(value) => {
+                      const nextMode = value as CustomProfileProcessingMode
+                      setCustomProfileProcessingModeDraft(nextMode)
+                      if (nextMode === 'incremental_batch') {
+                        setCustomProfileLivePersistDraft(true)
+                        setCustomProfileFlushEveryRowsDraft((prev) => {
+                          const safe = Number.isFinite(prev) ? prev : 20000
+                          return Math.max(100, Math.min(Math.floor(safe || 20000), 50000))
+                        })
+                        setCustomProfileFlushIntervalSecondsDraft((prev) => {
+                          const safe = Number.isFinite(prev) ? prev : 2
+                          return Math.max(0.5, Math.min(Number(safe || 2), 10))
+                        })
+                      } else if (nextMode === 'incremental' && customProfileStorageDraft === 'rocksdb') {
+                        applyRocksdbIncrementalTuningDefaults(
+                          setCustomProfileFlushEveryRowsDraft,
+                          setCustomProfileFlushIntervalSecondsDraft,
+                          setCustomProfileAppendUniqueDisableMinRowsDraft,
+                          setCustomProfileAppendUniqueEntityLimitDraft,
+                          setCustomProfileAppendUniqueDisableRatioDraft,
+                        )
+                      }
+                    }}
+                    options={[
+                      { value: 'batch', label: 'Batch' },
+                      { value: 'incremental', label: 'Incremental' },
+                      { value: 'incremental_batch', label: 'Incremental Batch' },
+                    ]}
+                    style={{ width: '100%' }}
+                  />
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Batch: existing behavior. Incremental: high-speed row-wise updates. Incremental Batch: row-wise updates with chunked live persist for safer recovery.
+                  </Text>
+                  <div
+                    style={{
+                      border: '1px solid var(--app-border-strong)',
+                      borderRadius: 8,
+                      padding: 8,
+                      background: 'var(--app-bg-elevated)',
+                    }}
+                  >
+                    <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                        Compute Strategy
+                      </Text>
+                      <Select
+                        value={customProfileComputeStrategyDraft}
+                        onChange={(value) => setCustomProfileComputeStrategyDraft(value as CustomProfileComputeStrategy)}
+                        options={[
+                          { value: 'single', label: 'Single Compute' },
+                          { value: 'parallel_by_profile_key', label: 'Parallel by Profile Key' },
+                        ]}
+                        style={{ width: '100%' }}
+                      />
+                      {customProfileComputeStrategyDraft === 'parallel_by_profile_key' ? (
+                        <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                              Compute Executor
+                            </Text>
+                            <Select
+                              value={customProfileComputeExecutorDraft}
+                              onChange={(value) => setCustomProfileComputeExecutorDraft(value as CustomProfileComputeExecutor)}
+                              options={[
+                                { value: 'thread', label: 'Multi Thread' },
+                                { value: 'process', label: 'Multi Process' },
+                              ]}
+                              style={{ width: '100%', marginTop: 4 }}
+                            />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                              Compute Workers (2-16)
+                            </Text>
+                            <InputNumber
+                              min={2}
+                              max={16}
+                              value={customProfileComputeWorkersDraft}
+                              onChange={(value) => {
+                                const num = Number(value || 4)
+                                setCustomProfileComputeWorkersDraft(Math.max(2, Math.min(Math.floor(num), 16)))
+                              }}
+                              style={{ width: '100%', marginTop: 4 }}
+                            />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                              Parallel Min Rows (1000-5000000)
+                            </Text>
+                            <InputNumber
+                              min={1000}
+                              max={5000000}
+                              value={customProfileComputeMinRowsDraft}
+                              onChange={(value) => {
+                                const num = Number(value || 20000)
+                                setCustomProfileComputeMinRowsDraft(Math.max(1000, Math.min(Math.floor(num), 5000000)))
+                              }}
+                              style={{ width: '100%', marginTop: 4 }}
+                            />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                              Global Prefetch Max Tokens (1000-2000000)
+                            </Text>
+                            <InputNumber
+                              min={1000}
+                              max={2000000}
+                              value={customProfileComputeGlobalPrefetchMaxTokensDraft}
+                              onChange={(value) => {
+                                const num = Number(value || 40000)
+                                setCustomProfileComputeGlobalPrefetchMaxTokensDraft(Math.max(1000, Math.min(Math.floor(num), 2000000)))
+                              }}
+                              style={{ width: '100%', marginTop: 4 }}
+                            />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                              Prefetch Chunk Size (50-900)
+                            </Text>
+                            <InputNumber
+                              min={50}
+                              max={900}
+                              value={customProfileBackfillCandidatePrefetchChunkSizeDraft}
+                              onChange={(value) => {
+                                const num = Number(value || 500)
+                                setCustomProfileBackfillCandidatePrefetchChunkSizeDraft(Math.max(50, Math.min(Math.floor(num), 900)))
+                              }}
+                              style={{ width: '100%', marginTop: 4 }}
+                            />
+                          </div>
+                        </Space>
+                      ) : null}
+                    </Space>
+                  </div>
+                  {customProfileProcessingModeDraft !== 'batch' ? (
+                    <div
+                      style={{
+                        border: '1px solid var(--app-border-strong)',
+                        borderRadius: 8,
+                        padding: 8,
+                        background: 'var(--app-bg-elevated)',
+                      }}
+                    >
+                      <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                        {customProfileProcessingModeDraft === 'incremental_batch' ? (
+                          <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                              Live Persist
+                            </Text>
+                            <Switch
+                              checked={customProfileLivePersistDraft}
+                              onChange={setCustomProfileLivePersistDraft}
+                            />
+                          </Space>
+                        ) : null}
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                            Flush Every Rows (100-50000)
+                          </Text>
+                          <InputNumber
+                            min={100}
+                            max={50000}
+                            value={customProfileFlushEveryRowsDraft}
+                            onChange={(value) => {
+                              const num = Number(value || 20000)
+                              setCustomProfileFlushEveryRowsDraft(Math.max(100, Math.min(Math.floor(num), 50000)))
+                            }}
+                            style={{ width: '100%', marginTop: 4 }}
+                          />
+                        </div>
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                            Flush Interval Seconds (0.5-10.0)
+                          </Text>
+                          <InputNumber
+                            min={0.5}
+                            max={10}
+                            step={0.1}
+                            value={customProfileFlushIntervalSecondsDraft}
+                            onChange={(value) => {
+                              const num = Number(value || 2)
+                              setCustomProfileFlushIntervalSecondsDraft(Math.max(0.5, Math.min(num, 10)))
+                            }}
+                            style={{ width: '100%', marginTop: 4 }}
+                          />
+                        </div>
+                        {customProfileStorageDraft === 'rocksdb' && customProfileProcessingModeDraft === 'incremental' ? (
+                          <>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                              RocksDB Incremental Tuning
+                            </Text>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                                Append Unique Disable Min Rows
+                              </Text>
+                              <InputNumber
+                                min={1000}
+                                max={10000000}
+                                value={customProfileAppendUniqueDisableMinRowsDraft}
+                                onChange={(value) => {
+                                  const num = Number(value || 5000)
+                                  setCustomProfileAppendUniqueDisableMinRowsDraft(Math.max(1000, Math.floor(num)))
+                                }}
+                                style={{ width: '100%', marginTop: 4 }}
+                              />
+                            </div>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                                Append Unique Entity Limit
+                              </Text>
+                              <InputNumber
+                                min={1000}
+                                max={10000000}
+                                value={customProfileAppendUniqueEntityLimitDraft}
+                                onChange={(value) => {
+                                  const num = Number(value || 10000)
+                                  setCustomProfileAppendUniqueEntityLimitDraft(Math.max(1000, Math.floor(num)))
+                                }}
+                                style={{ width: '100%', marginTop: 4 }}
+                              />
+                            </div>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                                Append Unique Disable Ratio (0-1)
+                              </Text>
+                              <InputNumber
+                                min={0.01}
+                                max={1}
+                                step={0.01}
+                                value={customProfileAppendUniqueDisableRatioDraft}
+                                onChange={(value) => {
+                                  const num = Number(value || 0.35)
+                                  setCustomProfileAppendUniqueDisableRatioDraft(Math.max(0.01, Math.min(num, 1)))
+                                }}
+                                style={{ width: '100%', marginTop: 4 }}
+                              />
+                            </div>
+                          </>
+                        ) : null}
+                      </Space>
+                    </div>
+                  ) : null}
+                  {customProfileStorageDraft === 'oracle' ? (
+                    <div
+                      style={{
+                        border: '1px solid var(--app-border-strong)',
+                        borderRadius: 8,
+                        padding: 8,
+                        background: 'var(--app-bg-elevated)',
+                      }}
+                    >
+                      <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                          Oracle Profile Store
+                        </Text>
+                        <Input
+                          value={customProfileOracleHostDraft}
+                          onChange={(e) => setCustomProfileOracleHostDraft(e.target.value)}
+                          placeholder="Host (optional if DSN is set)"
+                          style={commonInputStyle}
+                        />
+                        <InputNumber
+                          min={1}
+                          max={65535}
+                          value={customProfileOraclePortDraft}
+                          onChange={(value) => {
+                            const num = Number(value || 1521)
+                            setCustomProfileOraclePortDraft(Math.max(1, Math.min(Math.floor(num), 65535)))
+                          }}
+                          style={{ width: '100%' }}
+                          placeholder="Port"
+                        />
+                        <Input
+                          value={customProfileOracleServiceNameDraft}
+                          onChange={(e) => setCustomProfileOracleServiceNameDraft(e.target.value)}
+                          placeholder="Service Name (optional)"
+                          style={commonInputStyle}
+                        />
+                        <Input
+                          value={customProfileOracleSidDraft}
+                          onChange={(e) => setCustomProfileOracleSidDraft(e.target.value)}
+                          placeholder="SID (optional)"
+                          style={commonInputStyle}
+                        />
+                        <Input
+                          value={customProfileOracleDsnDraft}
+                          onChange={(e) => setCustomProfileOracleDsnDraft(e.target.value)}
+                          placeholder="DSN (optional, overrides host/port/service/sid)"
+                          style={commonInputStyle}
+                        />
+                        <Input
+                          value={customProfileOracleUserDraft}
+                          onChange={(e) => setCustomProfileOracleUserDraft(e.target.value)}
+                          placeholder="Oracle User"
+                          style={commonInputStyle}
+                        />
+                        <Input.Password
+                          value={customProfileOraclePasswordDraft}
+                          onChange={(e) => setCustomProfileOraclePasswordDraft(e.target.value)}
+                          placeholder="Oracle Password"
+                          style={commonInputStyle}
+                        />
+                        <Input
+                          value={customProfileOracleTableDraft}
+                          onChange={(e) => setCustomProfileOracleTableDraft(e.target.value)}
+                          placeholder="Profile Table (default ETL_PROFILE_STATE)"
+                          style={commonInputStyle}
+                        />
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                            Async Queue Persist
+                          </Text>
+                          <Switch
+                            checked={customProfileOracleQueueEnabledDraft}
+                            onChange={setCustomProfileOracleQueueEnabledDraft}
+                          />
+                        </div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                            Wait On Force Flush
+                          </Text>
+                          <Switch
+                            checked={customProfileOracleQueueWaitOnForceFlushDraft}
+                            onChange={setCustomProfileOracleQueueWaitOnForceFlushDraft}
+                            disabled={!customProfileOracleQueueEnabledDraft}
+                          />
+                        </div>
+                        <Select
+                          value={customProfileOracleWriteStrategyDraft}
+                          onChange={(value) => setCustomProfileOracleWriteStrategyDraft(value as CustomProfileOracleWriteStrategy)}
+                          options={[
+                            { value: 'single', label: 'Single Session (Current)' },
+                            { value: 'parallel_key', label: 'Parallel by Profile Key' },
+                          ]}
+                          style={{ width: '100%' }}
+                        />
+                        {customProfileOracleWriteStrategyDraft === 'parallel_key' ? (
+                          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                            <InputNumber
+                              min={2}
+                              max={16}
+                              value={customProfileOracleParallelWorkersDraft}
+                              onChange={(value) => {
+                                const num = Number(value || 4)
+                                setCustomProfileOracleParallelWorkersDraft(Math.max(2, Math.min(Math.floor(num), 16)))
+                              }}
+                              style={{ width: '100%' }}
+                              placeholder="Parallel Workers (2-16)"
+                            />
+                            <InputNumber
+                              min={1}
+                              max={1000000}
+                              value={customProfileOracleParallelMinTokensDraft}
+                              onChange={(value) => {
+                                const num = Number(value || 2000)
+                                setCustomProfileOracleParallelMinTokensDraft(Math.max(1, Math.min(Math.floor(num), 1000000)))
+                              }}
+                              style={{ width: '100%' }}
+                              placeholder="Parallel Min Tokens (1-1000000)"
+                            />
+                            <InputNumber
+                              min={50}
+                              max={2000}
+                              value={customProfileOracleMergeBatchSizeDraft}
+                              onChange={(value) => {
+                                const num = Number(value || 500)
+                                setCustomProfileOracleMergeBatchSizeDraft(Math.max(50, Math.min(Math.floor(num), 2000)))
+                              }}
+                              style={{ width: '100%' }}
+                              placeholder="Oracle Merge Batch Size (50-2000)"
+                            />
+                          </Space>
+                        ) : null}
+                      </Space>
+                    </div>
+                  ) : null}
                   <Select
                     value={customProfileEmitModeDraft}
                     onChange={(value) => setCustomProfileEmitModeDraft(value as 'changed_only' | 'all_entities')}
@@ -2615,6 +5232,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       </Button>
                       <Button
                         size="small"
+                        disabled={!activeProfileDocuments.length}
+                        onClick={openProfileDataViewer}
+                      >
+                        View
+                      </Button>
+                      <Button
+                        size="small"
                         danger
                         loading={profileMonitorClearing}
                         onClick={() => {
@@ -2673,6 +5297,118 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   )}
                 </Space>
               ) : null}
+            </div>
+
+            <div
+              style={{
+                marginTop: 10,
+                background: 'var(--app-card-bg)',
+                border: '1px solid var(--app-border-strong)',
+                borderRadius: 8,
+                padding: 10,
+              }}
+            >
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                Validation Source
+              </Text>
+              <Select
+                value={validationSourceDraft}
+                onChange={(value) => setValidationSourceDraft(value as 'lmdb' | 'rocksdb' | 'sample')}
+                options={[
+                  { value: 'lmdb', label: 'LMDB (fast validation)' },
+                  { value: 'rocksdb', label: 'RocksDB (fast validation)' },
+                  { value: 'sample', label: 'Sample Rows (from preview/upstream)' },
+                ]}
+                style={{ width: '100%', marginTop: 6 }}
+              />
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                LMDB/RocksDB mode uses profile store rows. Sample mode uses current node/upstream preview rows.
+              </Text>
+              <Space direction="vertical" size={8} style={{ marginTop: 8, width: '100%' }}>
+                <Space.Compact style={{ width: '100%' }}>
+                  <Input
+                    value={validationLmdbEnvPathDraft}
+                    onChange={(e) => setValidationLmdbEnvPathDraft(e.target.value)}
+                    placeholder={validationSourceDraft === 'rocksdb' ? '/path/to/profile_store.rocksdb' : '/path/to/profile_store.lmdb'}
+                    style={{ ...commonInputStyle, width: '100%' }}
+                  />
+                  <Button
+                    loading={lmdbPathBrowseLoading}
+                    onClick={() => {
+                      void loadLmdbEnvPathOptions(
+                        String(validationLmdbEnvPathDraft || ''),
+                        validationSourceDraft === 'rocksdb' ? 'rocksdb' : 'lmdb',
+                      )
+                    }}
+                  >
+                    Browse
+                  </Button>
+                </Space.Compact>
+                <Select
+                  showSearch
+                  allowClear
+                  placeholder="Select discovered profile DB path"
+                  options={lmdbEnvPathPresetOptions}
+                  value={validationLmdbEnvPathDraft || undefined}
+                  onChange={(value) => setValidationLmdbEnvPathDraft(String(value || ''))}
+                  style={{ width: '100%' }}
+                />
+                {validationSourceDraft === 'lmdb' ? (
+                  <Select
+                    showSearch
+                    allowClear
+                    placeholder="DB name (optional)"
+                    options={lmdbDbNamePresetOptions}
+                    value={validationLmdbDbNameDraft || undefined}
+                    onChange={(value) => setValidationLmdbDbNameDraft(String(value || ''))}
+                    style={{ width: '100%' }}
+                  />
+                ) : null}
+                <Input
+                  value={validationLmdbKeyPrefixDraft}
+                  onChange={(e) => setValidationLmdbKeyPrefixDraft(e.target.value)}
+                  placeholder="Key prefix filter (optional)"
+                  style={commonInputStyle}
+                />
+                <Space.Compact style={{ width: '100%' }}>
+                  <Input
+                    value={validationLmdbStartKeyDraft}
+                    onChange={(e) => setValidationLmdbStartKeyDraft(e.target.value)}
+                    placeholder="Start key (optional)"
+                    style={{ ...commonInputStyle, width: '100%' }}
+                  />
+                  <Input
+                    value={validationLmdbEndKeyDraft}
+                    onChange={(e) => setValidationLmdbEndKeyDraft(e.target.value)}
+                    placeholder="End key (optional)"
+                    style={{ ...commonInputStyle, width: '100%' }}
+                  />
+                </Space.Compact>
+                <Space.Compact style={{ width: '100%' }}>
+                  <Input
+                    value={validationLmdbKeyContainsDraft}
+                    onChange={(e) => setValidationLmdbKeyContainsDraft(e.target.value)}
+                    placeholder="Key contains (optional)"
+                    style={{ ...commonInputStyle, width: '100%' }}
+                  />
+                  <InputNumber
+                    min={1}
+                    max={200}
+                    value={validationLmdbLimitDraft}
+                    onChange={(value) => setValidationLmdbLimitDraft(Number(value || 50))}
+                    placeholder="Rows"
+                    style={{ width: 110 }}
+                  />
+                </Space.Compact>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                  Validation row sample limit: {Math.max(1, Math.min(Number(validationLmdbLimitDraft || 50) || 50, 200))}
+                </Text>
+                {lmdbPathBrowseError ? (
+                  <Text style={{ color: '#ef4444', fontSize: 11 }}>
+                    {lmdbPathBrowseError}
+                  </Text>
+                ) : null}
+              </Space>
             </div>
 
             <div style={{ marginTop: 10 }}>
@@ -2862,6 +5598,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       <div style={{ marginTop: 8 }}>
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
                           Name: {item.name || '(unnamed)'} | Mode: {item.mode === 'value' ? 'Single Value Expression' : 'JSON Object/Array Template'}
+                          {item.mode === 'value' ? ` | Output: ${item.singleValueOutput === 'plain_text' ? 'Plain Text' : 'JSON'}` : ''}
                         </Text>
                         <br />
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
@@ -2871,7 +5608,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       </div>
                     ) : (
                       <>
-                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 200px', gap: 10, marginTop: 8 }}>
+                        <div
+                          style={{
+                            display: 'grid',
+                            gridTemplateColumns: item.mode === 'value' ? '1fr 200px 220px' : '1fr 200px',
+                            gap: 10,
+                            marginTop: 8,
+                          }}
+                        >
                           <Input
                             value={item.name}
                             placeholder="Custom field name (e.g. profit_margin)"
@@ -2886,6 +5630,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                             ]}
                             onChange={(value) => updateCustomFieldDraft(item.id, { mode: value as CustomFieldMode })}
                           />
+                          {item.mode === 'value' ? (
+                            <Select
+                              value={item.singleValueOutput}
+                              options={[
+                                { value: 'json', label: 'Output: JSON' },
+                                { value: 'plain_text', label: 'Output: Plain Text' },
+                              ]}
+                              onChange={(value) => updateCustomFieldDraft(item.id, { singleValueOutput: value as SingleValueOutputMode })}
+                            />
+                          ) : null}
                         </div>
 
                         {item.mode === 'value' ? (
@@ -3079,6 +5833,72 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       </Modal>
     )}
     <Modal
+      open={profileDataModalOpen}
+      onCancel={() => setProfileDataModalOpen(false)}
+      footer={null}
+      centered
+      width="90vw"
+      styles={{
+        content: {
+          borderRadius: 12,
+          border: '1px solid var(--app-border-strong)',
+          background: 'var(--app-panel-bg)',
+        },
+        body: {
+          maxHeight: '84vh',
+          overflowY: 'auto',
+          padding: 16,
+        },
+      }}
+    >
+      <Space direction="vertical" size={10} style={{ width: '100%' }}>
+        <Space align="center" style={{ justifyContent: 'space-between', width: '100%' }}>
+          <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 16 }}>
+            Stored Profile Data
+          </Text>
+          <Space size={6}>
+            <Button
+              size="small"
+              loading={profileMonitorLoading}
+              onClick={() => {
+                void refreshProfileMonitor()
+              }}
+            >
+              Refresh
+            </Button>
+            <Button size="small" onClick={() => setProfileDataModalOpen(false)}>Close</Button>
+          </Space>
+        </Space>
+        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+          Node: {activeProfileNodeSummary?.node_id || selectedNodeId || 'N/A'} | Showing {activeProfileDocuments.length} sample profile document(s).
+        </Text>
+        <Select
+          showSearch
+          value={selectedProfileDocument ? String(selectedProfileDocument.entity_key) : undefined}
+          onChange={(value) => setSelectedProfileEntityKey(String(value || ''))}
+          options={activeProfileDocuments.map((doc) => ({
+            value: String(doc.entity_key),
+            label: String(doc.entity_key),
+          }))}
+          placeholder="Select entity key"
+          style={{ width: '100%' }}
+          optionFilterProp="label"
+        />
+        <Input.TextArea
+          readOnly
+          rows={28}
+          value={JSON.stringify(selectedProfileDocument?.profile || {}, null, 2)}
+          style={{
+            background: 'var(--app-input-bg)',
+            border: '1px solid var(--app-border-strong)',
+            color: 'var(--app-text)',
+            fontFamily: 'monospace',
+            fontSize: 12,
+          }}
+        />
+      </Space>
+    </Modal>
+    <Modal
       open={Boolean(expandedEditorField)}
       onCancel={() => setExpandedEditorFieldId(null)}
       footer={null}
@@ -3138,32 +5958,50 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       </div>
       <div style={{ flex: 1, minHeight: 0, padding: 10 }}>
         {expandedEditorField ? (
-          <Editor
-            height="100%"
-            language={expandedEditorMode === 'json' ? 'json' : 'etl-expr'}
-            value={expandedEditorMode === 'json' ? expandedEditorField.jsonTemplate : expandedEditorField.expression}
-            beforeMount={(monaco) => {
-              if (expandedEditorMode === 'value') ensureExpressionLanguage(monaco)
-            }}
-            onChange={(value) => {
-              if (!expandedEditorField) return
-              if (expandedEditorMode === 'json') {
-                updateCustomFieldDraft(expandedEditorField.id, { jsonTemplate: value || '' })
-              } else {
-                updateCustomFieldDraft(expandedEditorField.id, { expression: value || '' })
-              }
-            }}
-            theme="vs-dark"
-            options={{
-              minimap: { enabled: false },
-              fontSize: 14,
-              scrollBeyondLastLine: false,
-              wordWrap: 'on',
-              quickSuggestions: true,
-              suggestOnTriggerCharacters: true,
-              padding: { top: 10, bottom: 10 },
-            }}
-          />
+          <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {expandedEditorMode === 'value' ? (
+              <Space size={8} align="center" wrap style={{ flex: '0 0 auto' }}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Single Value Output</Text>
+                <Select
+                  value={expandedEditorField.singleValueOutput}
+                  options={[
+                    { value: 'json', label: 'JSON' },
+                    { value: 'plain_text', label: 'Plain Text' },
+                  ]}
+                  onChange={(value) => updateCustomFieldDraft(expandedEditorField.id, { singleValueOutput: value as SingleValueOutputMode })}
+                  style={{ width: 180 }}
+                />
+              </Space>
+            ) : null}
+            <div style={{ flex: 1, minHeight: 0 }}>
+              <Editor
+                height="100%"
+                language={expandedEditorMode === 'json' ? 'json' : 'etl-expr'}
+                value={expandedEditorMode === 'json' ? expandedEditorField.jsonTemplate : expandedEditorField.expression}
+                beforeMount={(monaco) => {
+                  if (expandedEditorMode === 'value') ensureExpressionLanguage(monaco)
+                }}
+                onChange={(value) => {
+                  if (!expandedEditorField) return
+                  if (expandedEditorMode === 'json') {
+                    updateCustomFieldDraft(expandedEditorField.id, { jsonTemplate: value || '' })
+                  } else {
+                    updateCustomFieldDraft(expandedEditorField.id, { expression: value || '' })
+                  }
+                }}
+                theme="vs-dark"
+                options={{
+                  minimap: { enabled: false },
+                  fontSize: 14,
+                  scrollBeyondLastLine: false,
+                  wordWrap: 'on',
+                  quickSuggestions: true,
+                  suggestOnTriggerCharacters: true,
+                  padding: { top: 10, bottom: 10 },
+                }}
+              />
+            </div>
+          </div>
         ) : null}
       </div>
     </Modal>
@@ -3191,19 +6029,29 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 16 }}>
             Custom Field Validation Output
           </Text>
+          {(() => {
+            const hasErrors = !validationResult?.ok || (validationResult?.errors || []).length > 0
+            const hasWarnings = !hasErrors && (validationResult?.warnings || []).length > 0
+            const bg = hasErrors ? '#ef44441a' : (hasWarnings ? '#f59e0b14' : '#22c55e1a')
+            const border = hasErrors ? '1px solid #ef444440' : (hasWarnings ? '1px solid #f59e0b40' : '1px solid #22c55e40')
+            const color = hasErrors ? '#ef4444' : (hasWarnings ? '#f59e0b' : '#22c55e')
+            const text = hasErrors ? 'HAS ERRORS' : (hasWarnings ? 'HAS WARNINGS' : 'VALID')
+            return (
           <Tag
             style={{
               marginInlineEnd: 0,
-              background: validationResult?.ok ? '#22c55e1a' : '#ef44441a',
-              border: validationResult?.ok ? '1px solid #22c55e40' : '1px solid #ef444440',
-              color: validationResult?.ok ? '#22c55e' : '#ef4444',
+              background: bg,
+              border,
+              color,
             }}
           >
-            {validationResult?.ok ? 'VALID' : 'HAS ERRORS'}
+            {text}
           </Tag>
+            )
+          })()}
         </Space>
         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
-          Input rows: {Number(validationResult?.input_rows || 0)} | Output rows: {Number(validationResult?.output_rows || 0)}
+          Source: {String(validationResult?.validation_source || 'lmdb').toUpperCase()} | Input rows: {Number(validationResult?.input_rows || 0)} | Output rows: {Number(validationResult?.output_rows || 0)}
         </Text>
         {(validationResult?.errors || []).length > 0 ? (
           <div
@@ -3273,6 +6121,949 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         </div>
       </Space>
     </Modal>
+    {isLmdbSource && (
+      <Modal
+        open={lmdbStudioOpen}
+        onCancel={() => setLmdbStudioOpen(false)}
+        footer={null}
+        closable={false}
+        maskClosable
+        centered
+        width="96vw"
+        styles={{
+          content: {
+            padding: 0,
+            borderRadius: 12,
+            overflow: 'hidden',
+            border: '1px solid var(--app-border-strong)',
+            background: 'var(--app-panel-bg)',
+            height: '96vh',
+            display: 'flex',
+            flexDirection: 'column',
+          },
+          body: {
+            padding: 0,
+            flex: 1,
+            minHeight: 0,
+            display: 'flex',
+            flexDirection: 'column',
+          },
+        }}
+      >
+        <div
+          style={{
+            borderBottom: '1px solid var(--app-border-strong)',
+            background: 'var(--app-card-bg)',
+            padding: '12px 16px',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: 12,
+          }}
+        >
+          <div>
+            <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 16 }}>
+              {kvSourceLabel} Source Studio
+            </Text>
+            <br />
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+              Browse {kvSourceLabel} environment, set key filters, and query live source preview.
+            </Text>
+          </div>
+          <Space>
+            <Button
+              onClick={() => { void runLmdbPreview({ page: 1, pageSize: lmdbTablePageSize }) }}
+              loading={lmdbStudioLoading}
+              style={{ background: '#14b8a61a', border: '1px solid #14b8a640', color: '#14b8a6' }}
+            >
+              Query Preview
+            </Button>
+            <Button
+              danger
+              loading={lmdbDeleteLoading}
+              disabled={lmdbStudioLoading}
+              onClick={() => confirmDeleteLmdbData('filtered')}
+            >
+              Delete Matching
+            </Button>
+            <Button
+              danger
+              loading={lmdbDeleteLoading}
+              disabled={lmdbStudioLoading}
+              onClick={() => confirmDeleteLmdbData('all')}
+            >
+              Delete All
+            </Button>
+            <Button onClick={() => setLmdbStudioOpen(false)}>Close</Button>
+            <Button
+              type="primary"
+              onClick={saveLmdbStudio}
+              style={{ background: 'linear-gradient(135deg, #14b8a6, #0f766e)', border: 'none' }}
+            >
+              Save {kvSourceLabel} Config
+            </Button>
+          </Space>
+        </div>
+
+        <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+          <div
+            style={{
+              width: '30%',
+              minWidth: 320,
+              borderRight: '1px solid var(--app-border-strong)',
+              padding: 12,
+              overflowY: 'auto',
+            }}
+          >
+            <Space direction="vertical" size={4} style={{ width: '100%' }}>
+              <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Query Configuration</Text>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                Set environment and key/value filters.
+              </Text>
+            </Space>
+
+            <div style={{ marginTop: 8, display: 'grid', gap: 8 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: isRocksdbSource ? '1fr' : '1fr 1fr', gap: 8 }}>
+                <div>
+                  <Space size={6} style={{ width: '100%', justifyContent: 'space-between' }}>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Prelist Env Path</Text>
+                    <Button
+                      size="small"
+                      loading={lmdbPathBrowseLoading}
+                      onClick={() => { void loadLmdbEnvPathOptions(String(lmdbStudioDraft.env_path || '')) }}
+                    >
+                      Browse
+                    </Button>
+                  </Space>
+                  <Select
+                    size="small"
+                    showSearch
+                    allowClear
+                    placeholder="Select env path preset"
+                    options={lmdbEnvPathPresetOptions}
+                    onChange={(value) => {
+                      if (typeof value !== 'string' || !value) return
+                      setLmdbStudioDraft((prev) => ({ ...prev, env_path: value }))
+                    }}
+                    style={{ width: '100%', marginTop: 4 }}
+                  />
+                </div>
+                {!isRocksdbSource ? (
+                  <div>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Prelist DB Name</Text>
+                    <Select
+                      size="small"
+                      showSearch
+                      allowClear
+                      placeholder="Select DB preset"
+                      options={lmdbDbNamePresetOptions}
+                      onChange={(value) => {
+                        setLmdbStudioDraft((prev) => ({ ...prev, db_name: String(value ?? '') }))
+                      }}
+                      style={{ width: '100%', marginTop: 4 }}
+                    />
+                  </div>
+                ) : null}
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                <div>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Prelist Key Prefix</Text>
+                  <Select
+                    size="small"
+                    showSearch
+                    allowClear
+                    placeholder="Select prefix preset"
+                    options={lmdbKeyPrefixPresetOptions}
+                    onChange={(value) => {
+                      if (typeof value !== 'string' || !value) return
+                      setLmdbStudioDraft((prev) => ({ ...prev, key_prefix: value }))
+                    }}
+                    style={{ width: '100%', marginTop: 4 }}
+                  />
+                </div>
+                <div>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Prelist Start Key</Text>
+                  <Select
+                    size="small"
+                    showSearch
+                    allowClear
+                    placeholder="Select start key"
+                    options={lmdbKeyPresetOptions}
+                    onChange={(value) => {
+                      if (typeof value !== 'string' || !value) return
+                      setLmdbStudioDraft((prev) => ({ ...prev, start_key: value }))
+                    }}
+                    style={{ width: '100%', marginTop: 4 }}
+                  />
+                </div>
+              </div>
+
+              <div>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Prelist End Key</Text>
+                <Select
+                  size="small"
+                  showSearch
+                  allowClear
+                  placeholder="Select end key"
+                  options={lmdbKeyPresetOptions}
+                  onChange={(value) => {
+                    if (typeof value !== 'string' || !value) return
+                    setLmdbStudioDraft((prev) => ({ ...prev, end_key: value }))
+                  }}
+                  style={{ width: '100%', marginTop: 4 }}
+                />
+              </div>
+
+              <div>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{kvSourceLabel} Environment Path</Text>
+                <Input
+                  size="small"
+                  value={lmdbStudioDraft.env_path}
+                  placeholder={kvPathPlaceholder}
+                  onChange={(e) => setLmdbStudioDraft((prev) => ({ ...prev, env_path: e.target.value }))}
+                  style={{ ...commonInputStyle, marginTop: 4 }}
+                />
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: isRocksdbSource ? '1fr' : '1fr 1fr', gap: 8 }}>
+                {!isRocksdbSource ? (
+                  <div>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Named DB</Text>
+                    <Input
+                      size="small"
+                      value={lmdbStudioDraft.db_name}
+                      placeholder="profiles"
+                      onChange={(e) => setLmdbStudioDraft((prev) => ({ ...prev, db_name: e.target.value }))}
+                      style={{ ...commonInputStyle, marginTop: 4 }}
+                    />
+                  </div>
+                ) : null}
+                <div>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Key Prefix</Text>
+                  <Input
+                    size="small"
+                    value={lmdbStudioDraft.key_prefix}
+                    placeholder="pipeline:abc:"
+                    onChange={(e) => setLmdbStudioDraft((prev) => ({ ...prev, key_prefix: e.target.value }))}
+                    style={{ ...commonInputStyle, marginTop: 4 }}
+                  />
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                <div>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Start Key</Text>
+                  <Input
+                    size="small"
+                    value={lmdbStudioDraft.start_key}
+                    onChange={(e) => setLmdbStudioDraft((prev) => ({ ...prev, start_key: e.target.value }))}
+                    style={{ ...commonInputStyle, marginTop: 4 }}
+                  />
+                </div>
+                <div>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>End Key</Text>
+                  <Input
+                    size="small"
+                    value={lmdbStudioDraft.end_key}
+                    onChange={(e) => setLmdbStudioDraft((prev) => ({ ...prev, end_key: e.target.value }))}
+                    style={{ ...commonInputStyle, marginTop: 4 }}
+                  />
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                <div>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Key Contains</Text>
+                  <Input
+                    size="small"
+                    value={lmdbStudioDraft.key_contains}
+                    onChange={(e) => setLmdbStudioDraft((prev) => ({ ...prev, key_contains: e.target.value }))}
+                    style={{ ...commonInputStyle, marginTop: 4 }}
+                  />
+                </div>
+                <div>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Value Contains</Text>
+                  <Input
+                    size="small"
+                    value={lmdbStudioDraft.value_contains}
+                    onChange={(e) => setLmdbStudioDraft((prev) => ({ ...prev, value_contains: e.target.value }))}
+                    style={{ ...commonInputStyle, marginTop: 4 }}
+                  />
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, alignItems: 'end' }}>
+                <div>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Decode</Text>
+                  <Select
+                    size="small"
+                    value={lmdbStudioDraft.value_format}
+                    onChange={(value) => setLmdbStudioDraft((prev) => ({
+                      ...prev,
+                      value_format: value as 'auto' | 'json' | 'text' | 'base64',
+                    }))}
+                    options={[
+                      { value: 'auto', label: 'Auto' },
+                      { value: 'json', label: 'JSON' },
+                      { value: 'text', label: 'Text' },
+                      { value: 'base64', label: 'Base64' },
+                    ]}
+                    style={{ width: '100%', marginTop: 4 }}
+                  />
+                </div>
+                <div>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Limit</Text>
+                  <InputNumber
+                    size="small"
+                    value={lmdbStudioDraft.limit}
+                    min={0}
+                    onChange={(value) => setLmdbStudioDraft((prev) => ({
+                      ...prev,
+                      limit: Math.max(0, Number.isFinite(Number(value)) ? Math.floor(Number(value)) : 0),
+                    }))}
+                    style={{ width: '100%', marginTop: 4 }}
+                  />
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10 }}>
+                    0 = No limit (read all matching records)
+                  </Text>
+                </div>
+              </div>
+
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  background: 'var(--app-shell-bg)',
+                  border: '1px solid var(--app-border)',
+                  borderRadius: 6,
+                  padding: '6px 8px',
+                }}
+              >
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Flatten JSON object values</Text>
+                <Switch
+                  size="small"
+                  checked={lmdbStudioDraft.flatten_json_values}
+                  onChange={(checked) => setLmdbStudioDraft((prev) => ({ ...prev, flatten_json_values: checked }))}
+                />
+              </div>
+
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  background: 'var(--app-shell-bg)',
+                  border: '1px solid var(--app-border)',
+                  borderRadius: 6,
+                  padding: '6px 8px',
+                }}
+              >
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                  Expand profile documents (one row per profile)
+                </Text>
+                <Switch
+                  size="small"
+                  checked={lmdbStudioDraft.expand_profile_documents}
+                  onChange={(checked) => setLmdbStudioDraft((prev) => ({ ...prev, expand_profile_documents: checked }))}
+                />
+              </div>
+            </div>
+
+            {lmdbPathBrowseError ? (
+              <div
+                style={{
+                  marginTop: 8,
+                  background: '#ef44441a',
+                  border: '1px solid #ef444440',
+                  borderRadius: 8,
+                  padding: '6px 8px',
+                }}
+              >
+                <Text style={{ color: '#fca5a5', fontSize: 12 }}>{lmdbPathBrowseError}</Text>
+              </div>
+            ) : null}
+
+            {lmdbStudioError ? (
+              <div
+                style={{
+                  marginTop: 8,
+                  background: '#ef44441a',
+                  border: '1px solid #ef444440',
+                  borderRadius: 8,
+                  padding: '6px 8px',
+                }}
+              >
+                <Text style={{ color: '#fca5a5', fontSize: 12 }}>{lmdbStudioError}</Text>
+              </div>
+            ) : null}
+          </div>
+
+          <div style={{ flex: 1, padding: 14, overflowY: 'auto' }}>
+            <Space style={{ justifyContent: 'space-between', width: '100%', marginBottom: 8 }}>
+              <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Preview Result</Text>
+              <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a630', color: '#14b8a6' }}>
+                {Number(lmdbStudioRowCount || lmdbStudioPreviewRows.length).toLocaleString()}
+                {lmdbPreviewHasMore ? '+' : ''} rows
+              </Tag>
+            </Space>
+
+            {lmdbStudioColumns.length > 0 ? (
+              <div style={{ marginBottom: 10 }}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Detected Columns</Text>
+                <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {lmdbStudioColumns.map((name) => (
+                    <Tag
+                      key={`lmdb_col_${name}`}
+                      style={{ background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)', color: 'var(--app-text)' }}
+                    >
+                      {name}
+                    </Tag>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
+            <div>
+              <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Preview Rows</Text>
+              <Tabs
+                activeKey={lmdbPreviewView}
+                onChange={(key) => setLmdbPreviewView(key as 'table' | 'json' | 'summary')}
+                size="small"
+                style={{ marginTop: 6 }}
+                items={[
+                  {
+                    key: 'summary',
+                    label: 'Summary',
+                    children: (
+                      <div style={{ display: 'grid', gap: 12 }}>
+                        <div
+                          style={{
+                            border: '1px solid var(--app-border-strong)',
+                            borderRadius: 8,
+                            background: 'var(--app-card-bg)',
+                            padding: 10,
+                          }}
+                        >
+                          <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                            <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Complete Data Highlights</Text>
+                            {lmdbSummaryLoading ? (
+                              <Tag style={{ margin: 0, background: '#2563eb14', border: '1px solid #2563eb3a', color: '#93c5fd' }}>
+                                Refreshing
+                              </Tag>
+                            ) : null}
+                          </Space>
+                          {lmdbSummaryError ? (
+                            <div
+                              style={{
+                                marginTop: 8,
+                                background: '#f59e0b14',
+                                border: '1px solid #f59e0b40',
+                                borderRadius: 6,
+                                padding: '6px 8px',
+                              }}
+                            >
+                              <Text style={{ color: '#fcd34d', fontSize: 11 }}>
+                                Summary fallback in use: {lmdbSummaryError}
+                              </Text>
+                            </div>
+                          ) : null}
+                          <div
+                            style={{
+                              marginTop: 8,
+                              display: 'grid',
+                              gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+                              gap: 8,
+                            }}
+                          >
+                            <div style={{ padding: 8, border: '1px solid var(--app-border)', borderRadius: 6, background: 'var(--app-shell-bg)' }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Records Processed (Complete)</Text>
+                              <br />
+                              <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>
+                                {Number(lmdbSummaryStats.totalRows || 0).toLocaleString()}
+                              </Text>
+                            </div>
+                            <div style={{ padding: 8, border: '1px solid var(--app-border)', borderRadius: 6, background: 'var(--app-shell-bg)' }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Custom Fields Incremental (Live)</Text>
+                              <br />
+                              <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>
+                                {Number(lmdbSummaryStats.customFieldsIncrementalProcessedRows || 0).toLocaleString()}
+                                {' '}processed
+                              </Text>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10, display: 'block' }}>
+                                {Number(lmdbSummaryStats.customFieldsIncrementalValidatedRows || 0).toLocaleString()} validated
+                                {' · '}
+                                {Number(lmdbSummaryStats.customFieldsIncrementalOutputRows || 0).toLocaleString()} output
+                              </Text>
+                            </div>
+                            <div style={{ padding: 8, border: '1px solid var(--app-border)', borderRadius: 6, background: 'var(--app-shell-bg)' }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Entries Scanned</Text>
+                              <br />
+                              <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>
+                                {Number(lmdbSummaryStats.scannedEntries || 0).toLocaleString()}
+                              </Text>
+                            </div>
+                            <div style={{ padding: 8, border: '1px solid var(--app-border)', borderRadius: 6, background: 'var(--app-shell-bg)' }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Detected Columns</Text>
+                              <br />
+                              <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>{Number(lmdbSummaryStats.detectedColumns || 0).toLocaleString()}</Text>
+                            </div>
+                            <div style={{ padding: 8, border: '1px solid var(--app-border)', borderRadius: 6, background: 'var(--app-shell-bg)' }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Unique {kvSourceLabelUpper} Keys (Complete)</Text>
+                              <br />
+                              <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>{Number(lmdbSummaryStats.uniqueKeys || 0).toLocaleString()}</Text>
+                            </div>
+                            <div style={{ padding: 8, border: '1px solid var(--app-border)', borderRadius: 6, background: 'var(--app-shell-bg)' }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Distinct Entities (Complete)</Text>
+                              <br />
+                              <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>{Number(lmdbSummaryStats.uniqueEntities || 0).toLocaleString()}</Text>
+                            </div>
+                            <div style={{ padding: 8, border: '1px solid var(--app-border)', borderRadius: 6, background: 'var(--app-shell-bg)' }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Profile Rows (Complete)</Text>
+                              <br />
+                              <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>{Number(lmdbSummaryStats.profileRows || 0).toLocaleString()}</Text>
+                            </div>
+                            <div style={{ padding: 8, border: '1px solid var(--app-border)', borderRadius: 6, background: 'var(--app-shell-bg)' }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Non-Profile Rows (Complete)</Text>
+                              <br />
+                              <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>{Number(lmdbSummaryStats.nonProfileRows || 0).toLocaleString()}</Text>
+                            </div>
+                            <div style={{ padding: 8, border: '1px solid var(--app-border)', borderRadius: 6, background: 'var(--app-shell-bg)' }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Profile-like Keys (Complete)</Text>
+                              <br />
+                              <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>{Number(lmdbSummaryStats.profileLikeKeys || 0).toLocaleString()}</Text>
+                            </div>
+                            <div style={{ padding: 8, border: '1px solid var(--app-border)', borderRadius: 6, background: 'var(--app-shell-bg)' }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Processing Latency (records/sec)</Text>
+                              <br />
+                              <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>
+                                {lmdbSummaryStats.processingLatencyRps !== null
+                                  ? Number(lmdbSummaryStats.processingLatencyRps).toLocaleString(undefined, { maximumFractionDigits: 2 })
+                                  : 'N/A'}
+                              </Text>
+                              {lmdbSummaryStats.scanElapsedSeconds !== null ? (
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10, display: 'block' }}>
+                                  scan time: {Number(lmdbSummaryStats.scanElapsedSeconds).toLocaleString(undefined, { maximumFractionDigits: 2 })}s
+                                </Text>
+                              ) : null}
+                            </div>
+                          </div>
+                          {lmdbSummaryStats.scanCapped ? (
+                            <Text style={{ color: '#fbbf24', fontSize: 11, marginTop: 8, display: 'block' }}>
+                              Summary scan is capped at {Number(lmdbSummaryStats.scanLimit || 0).toLocaleString()} matched rows.
+                            </Text>
+                          ) : null}
+                        </div>
+                      </div>
+                    ),
+                  },
+                  {
+                    key: 'table',
+                    label: 'Data Table',
+                    children: (
+                      <div>
+                        <div
+                          style={{
+                            marginBottom: 10,
+                            padding: '8px 10px',
+                            border: '1px solid var(--app-border)',
+                            borderRadius: 8,
+                            background: 'var(--app-shell-bg)',
+                            display: 'flex',
+                            flexWrap: 'wrap',
+                            gap: 10,
+                            alignItems: 'center',
+                          }}
+                        >
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Columns</Text>
+                          <Select
+                            mode="multiple"
+                            size="small"
+                            value={lmdbVisibleColumns}
+                            options={lmdbAllPreviewColumns.map((name) => ({ value: name, label: name }))}
+                            onChange={(values) => {
+                              const normalized = uniqueFieldNames(
+                                (values || []).map((item) => String(item || '').trim()).filter(Boolean)
+                              )
+                              setLmdbVisibleColumns(normalized)
+                            }}
+                            maxTagCount={6}
+                            allowClear
+                            style={{ minWidth: 360, flex: '1 1 360px' }}
+                            placeholder="Select columns to show/hide"
+                          />
+                          <Button
+                            size="small"
+                            onClick={() => setLmdbVisibleColumns(lmdbAllPreviewColumns)}
+                          >
+                            Show All
+                          </Button>
+                          <Divider type="vertical" style={{ borderColor: 'var(--app-border-strong)' }} />
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Global Filter</Text>
+                          <Select
+                            size="small"
+                            value={lmdbGlobalFilterColumn}
+                            onChange={(value) => {
+                              const nextColumn = String(value || LMDB_GLOBAL_ALL_COLUMNS)
+                              setLmdbGlobalFilterColumn(nextColumn)
+                              setLmdbGlobalFilterValues([])
+                              void runLmdbPreview({
+                                page: 1,
+                                pageSize: lmdbTablePageSize,
+                                quiet: true,
+                                globalFilterColumnOverride: nextColumn,
+                                globalFilterValuesOverride: [],
+                              })
+                            }}
+                            options={lmdbGlobalFilterColumnOptions}
+                            style={{ width: 190 }}
+                          />
+                          <Select
+                            size="small"
+                            mode="tags"
+                            showSearch
+                            allowClear
+                            maxTagCount="responsive"
+                            value={lmdbGlobalFilterValues}
+                            onChange={(values) => {
+                              const nextValues = uniqueFieldNames(
+                                (values || []).map((v) => String(v || '').trim()).filter(Boolean)
+                              )
+                              setLmdbGlobalFilterValues(nextValues)
+                              void runLmdbPreview({
+                                page: 1,
+                                pageSize: lmdbTablePageSize,
+                                quiet: true,
+                                globalFilterColumnOverride: lmdbGlobalFilterColumn,
+                                globalFilterValuesOverride: nextValues,
+                              })
+                            }}
+                            options={lmdbGlobalFilterValueOptions}
+                            placeholder="Type/select multiple values"
+                            optionFilterProp="label"
+                            style={{ minWidth: 220, flex: '1 1 220px' }}
+                          />
+                          <Button
+                            size="small"
+                            onClick={() => {
+                              setLmdbGlobalFilterColumn(LMDB_GLOBAL_ALL_COLUMNS)
+                              setLmdbGlobalFilterValues([])
+                              setLmdbColumnFilterValues({})
+                              void runLmdbPreview({
+                                page: 1,
+                                pageSize: lmdbTablePageSize,
+                                quiet: true,
+                                globalFilterColumnOverride: LMDB_GLOBAL_ALL_COLUMNS,
+                                globalFilterValuesOverride: [],
+                                columnFiltersOverride: {},
+                              })
+                            }}
+                          >
+                            Clear Filters
+                          </Button>
+                          <Divider type="vertical" style={{ borderColor: 'var(--app-border-strong)' }} />
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Display Rows</Text>
+                          <InputNumber
+                            size="small"
+                            min={1}
+                            max={2000}
+                            value={lmdbPreviewDisplayLimit}
+                            onChange={(value) => setLmdbPreviewDisplayLimit(Math.max(1, Math.min(Number(value || 1), 2000)))}
+                            style={{ width: 110 }}
+                          />
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Page Size</Text>
+                          <Select
+                            size="small"
+                            value={String(lmdbTablePageSize)}
+                            onChange={(value) => {
+                              const nextSize = Math.max(5, Math.min(Number(value || 25), 500))
+                              setLmdbTablePageSize(nextSize)
+                              setLmdbTableCurrentPage(1)
+                              void runLmdbPreview({
+                                page: 1,
+                                pageSize: nextSize,
+                                quiet: true,
+                              })
+                            }}
+                            options={['10', '25', '50', '100', '200'].map((value) => ({ value, label: value }))}
+                            style={{ width: 90 }}
+                          />
+                        </div>
+                        <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, overflow: 'hidden' }}>
+                          <Table
+                            size="small"
+                            scroll={{ x: 'max-content', y: 560 }}
+                            columns={lmdbPreviewTableColumns}
+                            dataSource={lmdbPreviewTableDataGlobalFiltered}
+                            rowKey="__lmdb_preview_row_id"
+                            onRow={(record) => ({
+                              onClick: () => {
+                                const rowIndexRaw = (record as Record<string, unknown>)?.__lmdb_preview_row_index
+                                const rowIndex = Number.isFinite(Number(rowIndexRaw)) ? Number(rowIndexRaw) : null
+                                const rowPayload: Record<string, unknown> = {}
+                                Object.keys(record || {}).forEach((key) => {
+                                  if (!String(key).startsWith('__lmdb_preview_')) {
+                                    rowPayload[key] = (record as Record<string, unknown>)[key]
+                                  }
+                                })
+                                openLmdbRowJsonEditor(rowIndex, rowPayload)
+                              },
+                            })}
+                            pagination={{
+                              current: lmdbTableCurrentPage,
+                              total: lmdbPreviewHasMore
+                                ? Math.max(
+                                  Number(lmdbStudioRowCount || 0),
+                                  (Math.max(1, Number(lmdbTableCurrentPage || 1)) * Math.max(1, Number(lmdbTablePageSize || 25))) + 1
+                                )
+                                : Math.max(Number(lmdbStudioRowCount || 0), lmdbPreviewTableDataGlobalFiltered.length),
+                              pageSize: lmdbTablePageSize,
+                              showSizeChanger: true,
+                              pageSizeOptions: ['10', '25', '50', '100', '200'],
+                            }}
+                            onChange={(pagination, filters, _sorter, extra) => {
+                              const normalizedFilters: Record<string, string[]> = {}
+                              Object.entries(filters || {}).forEach(([name, values]) => {
+                                if (!Array.isArray(values)) return
+                                const normalized = uniqueFieldNames(values.map((v) => String(v || '')).filter(Boolean))
+                                if (normalized.length > 0) normalizedFilters[name] = normalized
+                              })
+                              setLmdbColumnFilterValues(normalizedFilters)
+                              if (extra?.action === 'filter') {
+                                void runLmdbPreview({
+                                  page: 1,
+                                  pageSize: lmdbTablePageSize,
+                                  quiet: true,
+                                  columnFiltersOverride: normalizedFilters,
+                                })
+                                return
+                              }
+                              if (extra?.action !== 'paginate') return
+                              const safePageSize = Math.max(5, Math.min(Number((pagination as any)?.pageSize || lmdbTablePageSize || 25), 500))
+                              const sizeChanged = safePageSize !== lmdbTablePageSize
+                              const targetPage = sizeChanged ? 1 : Math.max(1, Number((pagination as any)?.current || 1))
+                              setLmdbTablePageSize(safePageSize)
+                              setLmdbTableCurrentPage(targetPage)
+                              void runLmdbPreview({
+                                page: targetPage,
+                                pageSize: safePageSize,
+                                quiet: true,
+                                columnFiltersOverride: normalizedFilters,
+                              })
+                            }}
+                          />
+                        </div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                          Tip: use Global Filter + column header filters. Click any cell for cell JSON, or click row background / Row JSON for full row JSON.
+                        </Text>
+                      </div>
+                    ),
+                  },
+                  {
+                    key: 'json',
+                    label: 'JSON',
+                    children: (
+                      <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, overflow: 'hidden' }}>
+                        <Editor
+                          language="json"
+                          value={JSON.stringify(lmdbPreviewRowsLimited, null, 2)}
+                          theme="vs-dark"
+                          height="560px"
+                          options={{
+                            readOnly: true,
+                            minimap: { enabled: false },
+                            fontSize: 12,
+                            scrollBeyondLastLine: false,
+                            wordWrap: 'off',
+                            lineNumbers: 'on',
+                            renderLineHighlight: 'line',
+                            automaticLayout: true,
+                          }}
+                        />
+                      </div>
+                    ),
+                  },
+                ]}
+              />
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                Server pagination enabled. Page {lmdbTableCurrentPage} shows {lmdbPreviewTableDataGlobalFiltered.length.toLocaleString()} filtered row(s) with incremental fetch.
+              </Text>
+            </div>
+          </div>
+        </div>
+      </Modal>
+    )}
+    {isLmdbSource && (
+      <Modal
+        open={lmdbJsonEditorOpen}
+        onCancel={() => {
+          setLmdbJsonEditorOpen(false)
+          setLmdbJsonEditorError(null)
+          setLmdbJsonTagFilter('')
+        }}
+        onOk={saveLmdbJsonEditor}
+        okText="Apply"
+        width="96vw"
+        centered
+        title={lmdbJsonEditorTitle || (lmdbJsonEditorMode === 'row' ? 'Edit Full Row JSON' : 'Edit Cell JSON')}
+        styles={{
+          content: {
+            borderRadius: 12,
+            overflow: 'hidden',
+            background: 'var(--app-panel-bg)',
+            border: '1px solid var(--app-border-strong)',
+            height: '96vh',
+            display: 'flex',
+            flexDirection: 'column',
+          },
+          header: {
+            background: 'var(--app-card-bg)',
+            borderBottom: '1px solid var(--app-border-strong)',
+          },
+          body: {
+            background: 'var(--app-panel-bg)',
+            flex: 1,
+            minHeight: 0,
+            overflow: 'hidden',
+          },
+        }}
+      >
+        <Space direction="vertical" size={8} style={{ width: '100%', height: '100%', display: 'flex' }}>
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+            Mode: {lmdbJsonEditorMode === 'row' ? 'Full Row JSON' : `Cell JSON (${lmdbJsonEditorField || '-'})`}
+            {lmdbJsonEditorRowIndex !== null ? ` | Row #${lmdbJsonEditorRowIndex + 1}` : ''}
+          </Text>
+          <Space wrap size={8}>
+            <Button size="small" onClick={formatLmdbJsonEditor}>Format</Button>
+            <Button size="small" onClick={minifyLmdbJsonEditor}>Minify</Button>
+            <Button size="small" onClick={resetLmdbJsonEditor}>Reset</Button>
+          </Space>
+          <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, overflow: 'hidden' }}>
+            <Editor
+              language="json"
+              value={lmdbJsonEditorText}
+              onChange={(value) => {
+                setLmdbJsonEditorText(value || '')
+                if (lmdbJsonEditorError) setLmdbJsonEditorError(null)
+              }}
+              theme="vs-dark"
+              height="46vh"
+              options={{
+                minimap: { enabled: false },
+                fontSize: 12,
+                scrollBeyondLastLine: false,
+                wordWrap: 'off',
+                lineNumbers: 'on',
+                renderLineHighlight: 'line',
+                automaticLayout: true,
+              }}
+            />
+          </div>
+          <div
+            style={{
+              border: '1px solid var(--app-border-strong)',
+              borderRadius: 8,
+              background: 'var(--app-card-bg)',
+              padding: 10,
+            }}
+          >
+            <Space style={{ justifyContent: 'space-between', width: '100%' }} align="start" wrap>
+              <div>
+                <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>JSON Control Tags & Mappings</Text>
+                <br />
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                  Color-coded paths with ready mapping snippets for `field()`, `values()`, and control tags.
+                </Text>
+              </div>
+              <Tag style={{ marginInlineEnd: 0 }}>
+                {lmdbJsonEditorFilteredPathMappings.length.toLocaleString()} tags
+              </Tag>
+            </Space>
+            <Input
+              size="small"
+              value={lmdbJsonTagFilter}
+              onChange={(e) => setLmdbJsonTagFilter(e.target.value)}
+              placeholder="Filter by path / type / sample value"
+              style={{ marginTop: 8 }}
+            />
+            <div
+              style={{
+                marginTop: 8,
+                maxHeight: '30vh',
+                overflowY: 'auto',
+                display: 'grid',
+                gap: 6,
+              }}
+            >
+              {lmdbJsonEditorFilteredPathMappings.length === 0 ? (
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                  {lmdbJsonEditorHasParseError
+                    ? 'JSON syntax is invalid. Fix editor JSON to populate mappings.'
+                    : 'No JSON mappings detected. Ensure editor content is a JSON object/array.'}
+                </Text>
+              ) : (
+                lmdbJsonEditorFilteredPathMappings.map((item) => (
+                  <div
+                    key={`${item.path}_${item.kind}`}
+                    style={{
+                      border: '1px solid var(--app-border-strong)',
+                      borderRadius: 8,
+                      padding: '6px 8px',
+                      background: 'var(--app-shell-bg)',
+                      display: 'grid',
+                      gap: 6,
+                    }}
+                  >
+                    <Space size={6} wrap>
+                      <Tag
+                        color={
+                          item.kind === 'string'
+                            ? 'blue'
+                            : item.kind === 'number'
+                              ? 'geekblue'
+                              : item.kind === 'boolean'
+                                ? 'green'
+                                : item.kind === 'object'
+                                  ? 'purple'
+                                  : item.kind === 'array'
+                                    ? 'gold'
+                                    : 'default'
+                        }
+                      >
+                        {item.kind}
+                      </Tag>
+                      <Tag style={{ marginInlineEnd: 0 }}>{item.path}</Tag>
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                        sample: {item.sample}
+                      </Text>
+                    </Space>
+                    <Space size={6} wrap>
+                      <Button size="small" onClick={() => { void copyLmdbJsonSnippet(item.fieldExpr, 'field() mapping') }}>
+                        Copy `field()`
+                      </Button>
+                      <Button size="small" onClick={() => { void copyLmdbJsonSnippet(item.valuesExpr, 'values() mapping') }}>
+                        Copy `values()`
+                      </Button>
+                      <Button size="small" onClick={() => { void copyLmdbJsonSnippet(item.controlTag, 'control tag') }}>
+                        Copy tag
+                      </Button>
+                    </Space>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+          {lmdbJsonEditorError ? (
+            <Text style={{ color: '#fca5a5', fontSize: 12 }}>{lmdbJsonEditorError}</Text>
+          ) : (
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+              Apply updates preview data only. Save {kvSourceLabel} Config to persist source settings.
+            </Text>
+          )}
+        </Space>
+      </Modal>
+    )}
     {nodeType === 'oracle_destination' && (
       <Modal
         open={oracleStudioOpen}

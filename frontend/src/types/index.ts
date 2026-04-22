@@ -38,6 +38,11 @@ export interface ETLNodeData {
   config: Record<string, unknown>
   status?: 'idle' | 'running' | 'success' | 'error'
   executionRows?: number
+  executionProcessedRows?: number
+  executionValidatedRows?: number
+  executionStartedAt?: string
+  executionFinishedAt?: string
+  executionDurationMs?: number
   executionSampleInput?: Record<string, unknown>[]
   executionSampleOutput?: Record<string, unknown>[]
   executionError?: string

@@ -261,10 +261,18 @@ const api = {
     }
   },
 
-  getPipelineProfileState: async (pipelineId: string, nodeId?: string, limit = 10) => {
+  getPipelineProfileState: async (
+    pipelineId: string,
+    nodeId?: string,
+    limit = 10,
+    primaryKeyField?: string,
+  ) => {
     try {
       const params: Record<string, unknown> = { limit }
       if (nodeId) params.node_id = nodeId
+      if (primaryKeyField && String(primaryKeyField).trim()) {
+        params.primary_key_field = String(primaryKeyField).trim()
+      }
       const r = await http.get(`/api/pipelines/${pipelineId}/profile-state`, { params })
       return r.data
     } catch {
@@ -293,8 +301,16 @@ const api = {
     try {
       const r = await http.post(`/api/pipelines/${id}/execute`)
       return r.data
-    } catch {
-      // Signal to caller that backend is offline
+    } catch (err: any) {
+      const status = Number(err?.response?.status || 0)
+      if (status > 0) {
+        const detail = err?.response?.data?.detail
+        const message = typeof detail === 'string' && detail.trim()
+          ? detail.trim()
+          : `Failed to start execution (HTTP ${status})`
+        throw new Error(message)
+      }
+      // Signal to caller that backend is likely offline/unreachable.
       return { execution_id: `local_exec_${Date.now()}`, status: 'running', offline: true }
     }
   },
@@ -315,13 +331,40 @@ const api = {
     }
   },
 
-  detectSourceFieldOptions: async (nodeType: string, config: Record<string, unknown>, maxRows = 200) => {
+  detectSourceFieldOptions: async (
+    nodeType: string,
+    config: Record<string, unknown>,
+    maxRows = 200,
+    options?: {
+      page?: number
+      previewRows?: number
+      includeSchemaScan?: boolean
+      schemaScanLimit?: number
+      previewCompact?: boolean
+      previewMaxCellChars?: number
+      previewMaxCollectionItems?: number
+      timeoutMs?: number
+    },
+  ) => {
     try {
-      const r = await http.post('/api/source/field-options', {
+      const payload = {
         node_type: nodeType,
         config,
         max_rows: maxRows,
-      })
+        page: Math.max(1, Number(options?.page || 1)),
+        preview_rows: Math.max(1, Number(options?.previewRows || 50)),
+        include_schema_scan: options?.includeSchemaScan ?? true,
+        schema_scan_limit: Math.max(1, Number(options?.schemaScanLimit || 5000)),
+        preview_compact: options?.previewCompact ?? true,
+        preview_max_cell_chars: Math.max(200, Number(options?.previewMaxCellChars || 2000)),
+        preview_max_collection_items: Math.max(8, Number(options?.previewMaxCollectionItems || 64)),
+      }
+      const timeoutMs = Number(options?.timeoutMs || 0)
+      const r = await http.post(
+        '/api/source/field-options',
+        payload,
+        timeoutMs > 0 ? { timeout: Math.max(1000, timeoutMs) } : undefined,
+      )
       return r.data
     } catch (err: any) {
       const detail = err?.response?.data?.detail
@@ -332,10 +375,161 @@ const api = {
     }
   },
 
+  uploadLmdbEnv: async (files: File[]) => {
+    if (!Array.isArray(files) || files.length === 0) {
+      throw new Error('Select LMDB folder first.')
+    }
+    const form = new FormData()
+    files.forEach((file) => {
+      form.append('files', file)
+    })
+    try {
+      const r = await http.post('/api/upload/lmdb-env', form, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 10 * 60 * 1000,
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+      })
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to upload LMDB environment')
+      throw new Error(message)
+    }
+  },
+
+  deleteLmdbData: async (payload: {
+    env_path: string
+    db_name?: string
+    delete_mode?: 'filtered' | 'all'
+    key_prefix?: string
+    start_key?: string
+    end_key?: string
+    key_contains?: string
+    limit?: number
+  }) => {
+    try {
+      const r = await http.post('/api/lmdb/delete', payload)
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to delete LMDB data')
+      throw new Error(message)
+    }
+  },
+
+  deleteRocksdbData: async (payload: {
+    env_path: string
+    delete_mode?: 'filtered' | 'all'
+    key_prefix?: string
+    start_key?: string
+    end_key?: string
+    key_contains?: string
+    limit?: number
+  }) => {
+    try {
+      const r = await http.post('/api/rocksdb/delete', payload)
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to delete RocksDB data')
+      throw new Error(message)
+    }
+  },
+
+  detectLmdbEnvPathOptions: async (payload?: {
+    base_path?: string
+    max_depth?: number
+    limit?: number
+  }) => {
+    try {
+      const r = await http.post('/api/lmdb/env-path-options', {
+        base_path: payload?.base_path || '',
+        max_depth: payload?.max_depth ?? 4,
+        limit: payload?.limit ?? 500,
+      })
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to fetch LMDB path options')
+      throw new Error(message)
+    }
+  },
+
+  detectRocksdbEnvPathOptions: async (payload?: {
+    base_path?: string
+    max_depth?: number
+    limit?: number
+  }) => {
+    try {
+      const r = await http.post('/api/rocksdb/env-path-options', {
+        base_path: payload?.base_path || '',
+        max_depth: payload?.max_depth ?? 4,
+        limit: payload?.limit ?? 500,
+      })
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to fetch RocksDB path options')
+      throw new Error(message)
+    }
+  },
+
+  getLmdbSummary: async (
+    config: Record<string, unknown>,
+    summaryScanLimit = 0,
+  ) => {
+    try {
+      const r = await http.post('/api/lmdb/summary', {
+        config,
+        summary_scan_limit: Math.max(0, Number(summaryScanLimit || 0)),
+      })
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to fetch LMDB summary')
+      throw new Error(message)
+    }
+  },
+
+  getRocksdbSummary: async (
+    config: Record<string, unknown>,
+    summaryScanLimit = 0,
+  ) => {
+    try {
+      const r = await http.post('/api/rocksdb/summary', {
+        config,
+        summary_scan_limit: Math.max(0, Number(summaryScanLimit || 0)),
+      })
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to fetch RocksDB summary')
+      throw new Error(message)
+    }
+  },
+
   validateCustomFields: async (payload: {
     config: Record<string, unknown>
     rows: Array<Record<string, unknown>>
     max_rows?: number
+    validation_source?: 'rows' | 'lmdb' | 'rocksdb'
+    lmdb_config?: Record<string, unknown>
+    rocksdb_config?: Record<string, unknown>
   }) => {
     const r = await http.post('/api/custom-fields/validate', payload)
     return r.data
@@ -670,19 +864,65 @@ const api = {
     return r.data
   }, pipelineId ? mockExecutions.filter(e => e.pipeline_id === pipelineId) : mockExecutions),
 
-  getExecution: async (id: string) => {
+  getExecution: async (
+    id: string,
+    options?: {
+      includeLogs?: boolean
+      logTail?: number
+    },
+  ) => {
     try {
       const r = await http.get(`/api/executions/${id}`, {
-        params: { include_node_results: false },
+        params: {
+          include_node_results: false,
+          include_logs: options?.includeLogs ?? true,
+          log_tail: options?.logTail ?? 300,
+        },
       })
       return r.data
-    } catch {
+    } catch (error) {
+      if (!isOfflineError(error)) throw error
       return mockExecutions.find(e => e.id === id) || { id, status: 'success', logs: [], rows_processed: 0 }
+    }
+  },
+
+  abortExecution: async (id: string) => {
+    try {
+      const r = await http.post(`/api/executions/${id}/abort`)
+      return r.data
+    } catch (error) {
+      if (!isOfflineError(error)) throw error
+      return { execution_id: id, status: 'cancelled', aborted: true, offline: true }
     }
   },
 
   deleteExecution: async (id: string) => {
     try { await http.delete(`/api/executions/${id}`) } catch { /* offline */ }
+  },
+
+  getSqliteUsage: () => safeGet(async () => {
+    const r = await http.get('/api/settings/sqlite/usage')
+    return r.data
+  }, {
+    sqlite_enabled: false,
+    db_path: null,
+    db_exists: false,
+    db_size_bytes: 0,
+    db_size_mb: 0,
+    execution_total: 0,
+    execution_running: 0,
+    execution_terminal: 0,
+    mlops_runs_total: 0,
+    mlops_runs_running: 0,
+    business_runs_total: 0,
+    business_runs_running: 0,
+    audit_logs_total: 0,
+    generated_at: new Date().toISOString(),
+  }),
+
+  cleanupSqliteData: async (payload: Record<string, unknown>) => {
+    const r = await http.post('/api/settings/sqlite/cleanup', payload)
+    return r.data
   },
 
   // ── Credentials ────────────────────────────────────────────────────────────

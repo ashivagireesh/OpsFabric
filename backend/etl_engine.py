@@ -5,14 +5,16 @@ Supports: Databases, Files, APIs, Cloud Storage, Message Queues
 import asyncio
 import ast
 import base64
-import copy
 import json
 import math
 import os
+import queue as _queue
 import re
+import threading
 import tempfile
 import time as pytime
 import uuid
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
@@ -21,10 +23,163 @@ try:
     import lmdb  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
     lmdb = None
+try:
+    import rocksdict as _rocksdict  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    _rocksdict = None
+try:
+    import redis as _redis  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    _redis = None
+try:
+    import polars as _pl  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    _pl = None
 
 
 class ExecutionAbortedError(Exception):
     """Raised when an execution is aborted by user request."""
+
+
+def _run_custom_profile_partition_process_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Process-worker entry for profile-key partition execution.
+
+    This is kept at module scope so it is picklable by ProcessPoolExecutor.
+    """
+    partition_idx = int(payload.get("partition_idx") or 0)
+    try:
+        engine = ETLEngine()
+        partition_rows = payload.get("partition_rows")
+        if not isinstance(partition_rows, list):
+            partition_rows = []
+        config = payload.get("config")
+        if not isinstance(config, dict):
+            config = {}
+        custom_specs = payload.get("custom_specs")
+        if not isinstance(custom_specs, list):
+            custom_specs = []
+        node_id = str(payload.get("node_id") or "map_transform")
+        pipeline_id = str(payload.get("pipeline_id") or "").strip()
+        profile_storage = engine._normalize_profile_storage(
+            payload.get("profile_storage", "lmdb")
+        )
+        profile_oracle_cfg = payload.get("profile_oracle_cfg") if isinstance(payload.get("profile_oracle_cfg"), dict) else None
+        partition_tokens_raw = payload.get("partition_tokens")
+        partition_tokens = [
+            str(token).strip()
+            for token in (partition_tokens_raw or [])
+            if str(token or "").strip()
+        ]
+        try:
+            prefetch_chunk_size = int(payload.get("prefetch_chunk_size") or 500)
+        except Exception:
+            prefetch_chunk_size = 500
+        prefetch_chunk_size = max(50, min(prefetch_chunk_size, 900))
+
+        local_documents: Dict[str, Dict[str, Any]] = {}
+        local_meta: Dict[str, Dict[str, Any]] = {}
+
+        prefetched_docs = payload.get("prefetched_docs")
+        if isinstance(prefetched_docs, dict):
+            for token, value in prefetched_docs.items():
+                token_text = str(token or "").strip()
+                if not token_text or not isinstance(value, dict):
+                    continue
+                local_documents[token_text] = value
+        prefetched_meta = payload.get("prefetched_meta")
+        if isinstance(prefetched_meta, dict):
+            for token, value in prefetched_meta.items():
+                token_text = str(token or "").strip()
+                if not token_text or not isinstance(value, dict):
+                    continue
+                local_meta[token_text] = value
+
+        if pipeline_id and partition_tokens and not local_documents and not local_meta:
+            try:
+                docs, meta, _existing = engine._load_profile_state_for_entity_tokens(
+                    pipeline_id,
+                    node_id,
+                    partition_tokens,
+                    storage=profile_storage,
+                    profile_cfg=profile_oracle_cfg,
+                    oracle_session=None,
+                    chunk_size=prefetch_chunk_size,
+                )
+                if isinstance(docs, dict):
+                    local_documents = docs
+                if isinstance(meta, dict):
+                    local_meta = meta
+            except Exception as prefetch_exc:
+                return {
+                    "ok": False,
+                    "partition_idx": partition_idx,
+                    "error": f"partition prefetch failed: {prefetch_exc}",
+                }
+
+        local_profile_state = {
+            node_id: {
+                "documents": local_documents,
+                "meta": local_meta,
+                "stats": {},
+            }
+        }
+        local_node_warnings: List[str] = []
+        local_execution_context: Dict[str, Any] = {
+            "execution_id": payload.get("execution_id"),
+            "pipeline_id": "",
+            "node_id": node_id,
+            "node_label": payload.get("node_label"),
+            "mode": payload.get("mode"),
+            "stream_iteration": payload.get("stream_iteration"),
+            "runtime": payload.get("runtime"),
+            "pipeline_state": {},
+            "profile_state_by_node": local_profile_state,
+            "node_warnings": local_node_warnings,
+            "emit_node_progress": None,
+            "node_progress_every": int(payload.get("node_progress_every") or 2000),
+            "profile_oracle_cfg": profile_oracle_cfg,
+            "profile_oracle_session": None,
+        }
+        local_rows = engine._transform_custom_fields(
+            partition_rows,
+            config,
+            custom_specs,
+            execution_context=local_execution_context,
+        )
+        local_node_state = local_profile_state.get(node_id)
+        if not isinstance(local_node_state, dict):
+            local_node_state = {"documents": {}, "meta": {}, "stats": {}}
+        local_stats = local_node_state.get("stats") if isinstance(local_node_state.get("stats"), dict) else {}
+        try:
+            local_processed = int(local_stats.get("custom_fields_incremental_processed_rows") or 0)
+        except Exception:
+            local_processed = len(partition_rows)
+        try:
+            local_validated = int(local_stats.get("custom_fields_incremental_validated_rows") or 0)
+        except Exception:
+            local_validated = 0
+        try:
+            local_flush_count = int(local_stats.get("custom_fields_incremental_flush_count") or 0)
+        except Exception:
+            local_flush_count = 0
+        return {
+            "ok": True,
+            "partition_idx": partition_idx,
+            "rows": local_rows if isinstance(local_rows, list) else [],
+            "node_state": local_node_state,
+            "warnings": local_node_warnings,
+            "processed": local_processed,
+            "validated": local_validated,
+            "output_rows": len(local_rows) if isinstance(local_rows, list) else 0,
+            "flush_count": local_flush_count,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "partition_idx": partition_idx,
+            "error": str(exc or "unknown process worker error"),
+        }
 
 
 class ETLEngine:
@@ -34,10 +189,22 @@ class ETLEngine:
         self._expr_ast_cache: Dict[str, ast.AST] = {}
         self._json_template_cache: Dict[str, Any] = {}
         self._path_variants_cache: Dict[str, List[str]] = {}
+        self._profile_path_tokens_cache: Dict[str, List[Any]] = {}
         self._profile_event_time_cache: Dict[Any, Optional[datetime]] = {}
         self._profile_fractional_seconds_re = re.compile(r"\.(\d{1,9})")
         self._profile_lmdb_env = None
         self._profile_lmdb_enabled = lmdb is not None
+        self._profile_rocksdb = None
+        self._profile_rocksdb_path: Optional[str] = None
+        self._profile_rocksdb_enabled = _rocksdict is not None
+        self._profile_rocksdb_write_options = None
+        self._profile_rocksdb_write_options_initialized = False
+        self._profile_redis_enabled = _redis is not None
+        self._profile_redis_client = None
+        self._profile_redis_url_cached: Optional[str] = None
+        self._oracle_full_scan_block_until: Dict[str, float] = {}
+        self._oracle_profile_write_queue_lock = threading.Lock()
+        self._oracle_profile_write_queues: Dict[str, Dict[str, Any]] = {}
 
     def _uploads_dir(self) -> str:
         return os.path.join(os.path.dirname(__file__), "uploads")
@@ -150,6 +317,157 @@ class ETLEngine:
 
         return expanded
 
+    def _resolve_rocksdb_env_path(self, raw_path: str, create: bool = False) -> str:
+        """
+        Resolve RocksDB path.
+
+        RocksDB uses a directory that contains files like CURRENT/MANIFEST.
+        """
+        path_text = str(raw_path or "").strip()
+        if not path_text:
+            raise RuntimeError("RocksDB path is empty. Select RocksDB folder path.")
+
+        expanded = os.path.expandvars(os.path.expanduser(path_text))
+        if expanded.startswith("local://"):
+            original_name = expanded.replace("local://", "", 1).strip().strip("/")
+            recovered = self._find_uploaded_file(original_name)
+            if recovered:
+                expanded = recovered
+            else:
+                raise RuntimeError(
+                    f"RocksDB path '{original_name}' was not uploaded to the server. "
+                    "Re-open RocksDB source node and browse the RocksDB folder again."
+                )
+
+        if os.path.isfile(expanded):
+            expanded = os.path.dirname(expanded)
+
+        if create:
+            os.makedirs(expanded, exist_ok=True)
+        elif not os.path.isdir(expanded):
+            raise RuntimeError(f"RocksDB directory not found: {expanded}")
+
+        return expanded
+
+    def _normalize_path_for_compare(self, path: str) -> str:
+        try:
+            return os.path.realpath(os.path.abspath(str(path or "")))
+        except Exception:
+            return str(path or "")
+
+    def _open_rocksdb_store(self, db_path: str):
+        if _rocksdict is None:
+            raise RuntimeError("RocksDB dependency is not installed. Install with: pip install rocksdict")
+        # Keep constructor simple and robust across rocksdict versions.
+        return _rocksdict.Rdict(db_path)
+
+    def _get_profile_rocksdb_write_options(self):
+        """
+        Build and cache RocksDB write options for profile-store writes.
+
+        Tunables (env):
+        - PROFILE_ROCKSDB_DISABLE_WAL: default false (safer)
+        - PROFILE_ROCKSDB_WRITE_SYNC: default false
+        - PROFILE_ROCKSDB_WRITE_NO_SLOWDOWN: default false
+        - PROFILE_ROCKSDB_WRITE_LOW_PRI: default false
+        """
+        if _rocksdict is None:
+            return None
+        if self._profile_rocksdb_write_options_initialized:
+            return self._profile_rocksdb_write_options
+        self._profile_rocksdb_write_options_initialized = True
+        try:
+            write_opt = _rocksdict.WriteOptions()
+            write_opt.disable_wal = self._parse_bool_like(
+                os.getenv("PROFILE_ROCKSDB_DISABLE_WAL", "false"),
+                False,
+            )
+            write_opt.sync = self._parse_bool_like(
+                os.getenv("PROFILE_ROCKSDB_WRITE_SYNC", "false"),
+                False,
+            )
+            write_opt.no_slowdown = self._parse_bool_like(
+                os.getenv("PROFILE_ROCKSDB_WRITE_NO_SLOWDOWN", "false"),
+                False,
+            )
+            write_opt.low_pri = self._parse_bool_like(
+                os.getenv("PROFILE_ROCKSDB_WRITE_LOW_PRI", "false"),
+                False,
+            )
+            write_opt.memtable_insert_hint_per_batch = self._parse_bool_like(
+                os.getenv("PROFILE_ROCKSDB_MEMTABLE_HINT_PER_BATCH", "true"),
+                True,
+            )
+            self._profile_rocksdb_write_options = write_opt
+        except Exception as exc:
+            logger.warning(f"Failed to initialize RocksDB write options; using defaults: {exc}")
+            self._profile_rocksdb_write_options = None
+        return self._profile_rocksdb_write_options
+
+    def _acquire_rocksdb_store(self, db_path: str) -> Tuple[Any, bool]:
+        """
+        Borrow a RocksDB handle for read/write operations.
+        Returns: (store, should_close_after_use)
+
+        When the requested path is the same as the always-open profile store path,
+        reuse that handle to avoid same-process lock conflicts.
+        """
+        requested_path = self._normalize_path_for_compare(db_path)
+        if (
+            self._profile_rocksdb is not None
+            and self._profile_rocksdb_path
+            and requested_path == self._profile_rocksdb_path
+        ):
+            return self._profile_rocksdb, False
+
+        try:
+            return self._open_rocksdb_store(db_path), True
+        except Exception as exc:
+            text = str(exc or "").lower()
+            if (
+                self._profile_rocksdb is not None
+                and self._profile_rocksdb_path
+                and requested_path == self._profile_rocksdb_path
+                and (
+                    "lock hold by current process" in text
+                    or "no locks available" in text
+                    or "lock" in text
+                )
+            ):
+                return self._profile_rocksdb, False
+            raise
+
+    def _close_rocksdb_store(self, store: Any) -> None:
+        try:
+            close_fn = getattr(store, "close", None)
+            if callable(close_fn):
+                close_fn()
+        except Exception:
+            pass
+
+    def _rocksdb_iter_items(self, store: Any):
+        # rocksdict exposes .items(); fallback to iterator protocols.
+        if hasattr(store, "items"):
+            return store.items()
+        if hasattr(store, "iter"):
+            return store.iter()
+        raise RuntimeError("RocksDB iterator is unavailable for this backend.")
+
+    def _rocksdb_key_to_text(self, key: Any) -> str:
+        if isinstance(key, (bytes, bytearray)):
+            return bytes(key).decode("utf-8", errors="replace")
+        return str(key)
+
+    def _rocksdb_value_to_bytes(self, value: Any) -> bytes:
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value)
+        if isinstance(value, str):
+            return value.encode("utf-8")
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
+        except Exception:
+            return str(value).encode("utf-8", errors="replace")
+
     def _decode_lmdb_value(self, value: bytes, value_format: str) -> Tuple[Any, str]:
         fmt = str(value_format or "auto").strip().lower() or "auto"
         if fmt == "base64":
@@ -195,13 +513,53 @@ class ETLEngine:
         """
         Expand profile-state style payloads stored as:
           {"documents": {entity_key: profile_obj, ...}, "meta": {...}}
+        and incremental entity payloads stored as:
+          {"document": {...}, "meta": {...}}
         into one output row per entity.
         """
         if not isinstance(decoded_value, dict):
             return []
 
+        def _extract_entity_from_store_key(raw_key: str) -> Optional[str]:
+            text = str(raw_key or "")
+            marker = "::@e::"
+            if marker not in text:
+                return None
+            tail = text.split(marker, 1)[1]
+            _node_id, sep, entity_token = tail.partition("::")
+            if not sep:
+                return None
+            entity = str(entity_token or "").strip()
+            return entity or None
+
         documents = decoded_value.get("documents")
         if not isinstance(documents, dict) or not documents:
+            # Incremental per-entity profile record:
+            # key: <pipeline>::@e::<node_id>::<entity_token>
+            # val: {"document": {...}, "meta": {...}}
+            if "document" in decoded_value:
+                profile_value = decoded_value.get("document")
+                row: Dict[str, Any] = {}
+                if isinstance(profile_value, dict):
+                    row.update(profile_value)
+                else:
+                    row["profile"] = profile_value
+
+                row["lmdb_key"] = str(lmdb_key)
+                entity_key = _extract_entity_from_store_key(str(lmdb_key))
+                if entity_key:
+                    row["lmdb_entity_key"] = entity_key
+                row["_lmdb_profile_source"] = "document"
+
+                entity_meta = decoded_value.get("meta")
+                if isinstance(entity_meta, dict) and entity_meta:
+                    row["_lmdb_entity_meta"] = entity_meta
+                node_stats = decoded_value.get("stats")
+                if isinstance(node_stats, dict):
+                    row["_lmdb_node_stats"] = node_stats
+                if include_value_kind:
+                    row["_lmdb_value_kind"] = value_kind
+                return [self._json_safe_value(row)]
             return []
 
         meta = decoded_value.get("meta")
@@ -293,6 +651,18 @@ class ETLEngine:
         os.makedirs(state_dir, exist_ok=True)
         return os.path.join(state_dir, "profile_store.lmdb")
 
+    def _profile_rocksdb_dir(self) -> str:
+        state_dir = os.path.join(os.path.dirname(__file__), "state")
+        os.makedirs(state_dir, exist_ok=True)
+        return os.path.join(state_dir, "profile_store.rocksdb")
+
+    def _profile_redis_url(self) -> str:
+        return str(
+            os.getenv("PROFILE_REDIS_URL")
+            or os.getenv("REDIS_URL")
+            or "redis://127.0.0.1:6379/0"
+        ).strip()
+
     def _get_profile_lmdb_env(self):
         if not self._profile_lmdb_enabled or lmdb is None:
             return None
@@ -319,11 +689,571 @@ class ETLEngine:
             return None
         return self._profile_lmdb_env
 
+    def _get_profile_rocksdb_store(self):
+        if not self._profile_rocksdb_enabled or _rocksdict is None:
+            return None
+        if self._profile_rocksdb is not None:
+            return self._profile_rocksdb
+        rocks_dir = self._profile_rocksdb_dir()
+        try:
+            rocks_dir = self._resolve_rocksdb_env_path(rocks_dir, create=True)
+            self._profile_rocksdb = self._open_rocksdb_store(rocks_dir)
+            self._profile_rocksdb_path = self._normalize_path_for_compare(rocks_dir)
+        except Exception as exc:
+            logger.warning(f"RocksDB profile store init failed: {exc}")
+            self._profile_rocksdb_enabled = False
+            self._profile_rocksdb = None
+            self._profile_rocksdb_path = None
+            return None
+        return self._profile_rocksdb
+
+    def _get_profile_redis_client(self):
+        if not self._profile_redis_enabled or _redis is None:
+            return None
+        redis_url = self._profile_redis_url()
+        if (
+            self._profile_redis_client is not None
+            and self._profile_redis_url_cached
+            and redis_url == self._profile_redis_url_cached
+        ):
+            return self._profile_redis_client
+        try:
+            client = _redis.Redis.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_connect_timeout=3,
+                socket_timeout=5,
+                health_check_interval=30,
+            )
+            client.ping()
+            self._profile_redis_client = client
+            self._profile_redis_url_cached = redis_url
+            return self._profile_redis_client
+        except Exception as exc:
+            logger.warning(f"Redis profile store init failed: {exc}")
+            self._profile_redis_client = None
+            self._profile_redis_url_cached = None
+            return None
+
     def _profile_lmdb_prefix(self, pipeline_id: str) -> bytes:
         return f"{str(pipeline_id)}::".encode("utf-8")
 
     def _profile_lmdb_key(self, pipeline_id: str, node_id: str) -> bytes:
         return f"{str(pipeline_id)}::{str(node_id)}".encode("utf-8")
+
+    def _profile_lmdb_entity_key(self, pipeline_id: str, node_id: str, entity_token: str) -> bytes:
+        return f"{str(pipeline_id)}::@e::{str(node_id)}::{str(entity_token)}".encode("utf-8")
+
+    def _profile_lmdb_entity_prefix(self, pipeline_id: str, node_id: str) -> bytes:
+        return f"{str(pipeline_id)}::@e::{str(node_id)}::".encode("utf-8")
+
+    def _profile_lmdb_stats_key(self, pipeline_id: str, node_id: str) -> bytes:
+        return f"{str(pipeline_id)}::@s::{str(node_id)}".encode("utf-8")
+
+    def _profile_rocks_key_text(self, pipeline_id: str, suffix: str) -> str:
+        return f"{str(pipeline_id)}::{suffix}"
+
+    def _profile_rocks_prefix(self, pipeline_id: str) -> str:
+        return f"{str(pipeline_id)}::"
+
+    def _profile_rocks_snapshot_key(self, pipeline_id: str, node_id: str) -> str:
+        return self._profile_rocks_key_text(pipeline_id, str(node_id))
+
+    def _profile_rocks_entity_key(self, pipeline_id: str, node_id: str, entity_token: str) -> str:
+        return self._profile_rocks_key_text(pipeline_id, f"@e::{str(node_id)}::{str(entity_token)}")
+
+    def _profile_rocks_entity_prefix(self, pipeline_id: str, node_id: str) -> str:
+        return self._profile_rocks_key_text(pipeline_id, f"@e::{str(node_id)}::")
+
+    def _profile_rocks_stats_key(self, pipeline_id: str, node_id: str) -> str:
+        return self._profile_rocks_key_text(pipeline_id, f"@s::{str(node_id)}")
+
+    def _profile_redis_key_text(self, pipeline_id: str, suffix: str) -> str:
+        return f"{str(pipeline_id)}::{suffix}"
+
+    def _profile_redis_prefix(self, pipeline_id: str) -> str:
+        return f"{str(pipeline_id)}::"
+
+    def _profile_redis_snapshot_key(self, pipeline_id: str, node_id: str) -> str:
+        return self._profile_redis_key_text(pipeline_id, str(node_id))
+
+    def _profile_redis_entity_key(self, pipeline_id: str, node_id: str, entity_token: str) -> str:
+        return self._profile_redis_key_text(pipeline_id, f"@e::{str(node_id)}::{str(entity_token)}")
+
+    def _profile_redis_entity_prefix(self, pipeline_id: str, node_id: str) -> str:
+        return self._profile_redis_key_text(pipeline_id, f"@e::{str(node_id)}::")
+
+    def _profile_redis_stats_key(self, pipeline_id: str, node_id: str) -> str:
+        return self._profile_redis_key_text(pipeline_id, f"@s::{str(node_id)}")
+
+    def _sanitize_oracle_identifier(self, value: str, default: str = "ETL_PROFILE_STATE") -> str:
+        text = str(value or "").strip()
+        if not text:
+            return default
+        parts = [p.strip() for p in text.split(".") if p.strip()]
+        if not parts:
+            return default
+        safe_parts: List[str] = []
+        for part in parts:
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_$#]*$", part):
+                return default
+            safe_parts.append(part.upper())
+        return ".".join(safe_parts) if safe_parts else default
+
+    def _resolve_profile_oracle_config(self, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        cfg = config if isinstance(config, dict) else {}
+
+        def _pick(key: str, env_key: str, default: Any = "") -> Any:
+            value = cfg.get(key)
+            if value is None or str(value).strip() == "":
+                value = os.getenv(env_key, default)
+            return value
+
+        try:
+            port_value = int(_pick("custom_profile_oracle_port", "PROFILE_ORACLE_PORT", 1521))
+        except Exception:
+            port_value = 1521
+
+        table_name_raw = str(
+            _pick("custom_profile_oracle_table", "PROFILE_ORACLE_TABLE", "ETL_PROFILE_STATE")
+        ).strip()
+        table_name = self._sanitize_oracle_identifier(table_name_raw, "ETL_PROFILE_STATE")
+        write_strategy = self._normalize_oracle_profile_write_strategy(
+            _pick("custom_profile_oracle_write_strategy", "PROFILE_ORACLE_WRITE_STRATEGY", "parallel_key")
+        )
+        try:
+            parallel_workers = int(
+                _pick("custom_profile_oracle_parallel_workers", "PROFILE_ORACLE_PARALLEL_WORKERS", 4)
+            )
+        except Exception:
+            parallel_workers = 4
+        parallel_workers = max(2, min(parallel_workers, 16))
+        try:
+            parallel_min_tokens = int(
+                _pick("custom_profile_oracle_parallel_min_tokens", "PROFILE_ORACLE_PARALLEL_MIN_TOKENS", 2000)
+            )
+        except Exception:
+            parallel_min_tokens = 2000
+        parallel_min_tokens = max(1, min(parallel_min_tokens, 1_000_000))
+        try:
+            merge_batch_size = int(
+                _pick("custom_profile_oracle_merge_batch_size", "PROFILE_ORACLE_MERGE_BATCH_SIZE", 500)
+            )
+        except Exception:
+            merge_batch_size = 500
+        merge_batch_size = max(50, min(merge_batch_size, 2000))
+        parallel_force = self._parse_bool_like(
+            _pick("custom_profile_oracle_parallel_force", "PROFILE_ORACLE_PARALLEL_FORCE", "true"),
+            True,
+        )
+
+        out = {
+            "host": str(_pick("custom_profile_oracle_host", "PROFILE_ORACLE_HOST", "localhost")).strip() or "localhost",
+            "port": port_value,
+            "service_name": str(_pick("custom_profile_oracle_service_name", "PROFILE_ORACLE_SERVICE_NAME", "")).strip(),
+            "sid": str(_pick("custom_profile_oracle_sid", "PROFILE_ORACLE_SID", "")).strip(),
+            "user": str(_pick("custom_profile_oracle_user", "PROFILE_ORACLE_USER", "")).strip(),
+            "password": str(_pick("custom_profile_oracle_password", "PROFILE_ORACLE_PASSWORD", "")).strip(),
+            "dsn": str(_pick("custom_profile_oracle_dsn", "PROFILE_ORACLE_DSN", "")).strip(),
+            "table": table_name,
+            "write_strategy": write_strategy,
+            "parallel_workers": parallel_workers,
+            "parallel_min_tokens": parallel_min_tokens,
+            "merge_batch_size": merge_batch_size,
+            "parallel_force": bool(parallel_force),
+        }
+        return out
+
+    def _oracle_profile_stats_token(self) -> str:
+        return "__NODE_STATS__"
+
+    def _profile_oracle_connect(self, profile_cfg: Optional[Dict[str, Any]] = None):
+        try:
+            import oracledb
+        except Exception as exc:
+            raise RuntimeError("Oracle profile storage requires python-oracledb.") from exc
+
+        cfg = self._resolve_profile_oracle_config(profile_cfg)
+        if not cfg.get("user") or not cfg.get("password"):
+            raise RuntimeError(
+                "Oracle profile storage requires user/password. "
+                "Set custom_profile_oracle_user/custom_profile_oracle_password or PROFILE_ORACLE_USER/PROFILE_ORACLE_PASSWORD."
+            )
+        dsn = str(cfg.get("dsn") or "").strip() or self._build_oracle_dsn(cfg)
+        conn = oracledb.connect(
+            user=cfg.get("user", ""),
+            password=cfg.get("password", ""),
+            dsn=dsn,
+        )
+        return conn, cfg
+
+    def _open_oracle_profile_session(
+        self,
+        profile_cfg: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        conn = None
+        try:
+            conn, cfg = self._profile_oracle_connect(profile_cfg)
+            table_sql = self._sanitize_oracle_identifier(
+                str(cfg.get("table") or "ETL_PROFILE_STATE"),
+                "ETL_PROFILE_STATE",
+            )
+            self._ensure_profile_oracle_table(conn, table_sql)
+            column_specs = self._oracle_profile_table_column_specs(conn, table_sql)
+            return {
+                "conn": conn,
+                "cfg": cfg,
+                "table_sql": table_sql,
+                "column_specs": column_specs,
+                "profile_cfg": profile_cfg if isinstance(profile_cfg, dict) else {},
+            }
+        except Exception:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            raise
+
+    def _close_oracle_profile_session(
+        self,
+        session: Optional[Dict[str, Any]],
+        *,
+        commit: bool = False,
+        rollback_on_error: bool = False,
+    ) -> None:
+        if not isinstance(session, dict):
+            return
+        conn = session.get("conn")
+        if conn is None:
+            return
+        if commit:
+            try:
+                conn.commit()
+            except Exception:
+                if rollback_on_error:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                raise
+        elif rollback_on_error:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def _ensure_profile_oracle_table(self, conn: Any, table_name: str) -> None:
+        table_sql = self._sanitize_oracle_identifier(table_name, "ETL_PROFILE_STATE")
+        base_name = table_sql.split(".")[-1]
+        pk_name = self._sanitize_oracle_identifier(f"{base_name[:24]}_PK", "ETL_PROFILE_PK")
+        create_table_plsql = f"""
+BEGIN
+  EXECUTE IMMEDIATE '
+    CREATE TABLE {table_sql} (
+      PIPELINE_ID   VARCHAR2(128) NOT NULL,
+      NODE_ID       VARCHAR2(128) NOT NULL,
+      ENTITY_TOKEN  VARCHAR2(512) NOT NULL,
+      DOCUMENT_JSON CLOB,
+      META_JSON     CLOB,
+      STATS_JSON    CLOB,
+      UPDATED_AT    TIMESTAMP DEFAULT SYSTIMESTAMP,
+      CONSTRAINT {pk_name} PRIMARY KEY (PIPELINE_ID, NODE_ID, ENTITY_TOKEN)
+    )';
+EXCEPTION
+  WHEN OTHERS THEN
+    IF SQLCODE != -955 THEN
+      RAISE;
+    END IF;
+END;"""
+        cursor = conn.cursor()
+        try:
+            cursor.execute(create_table_plsql)
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+    def _oracle_profile_table_column_specs(self, conn: Any, table_sql: str) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        cursor = conn.cursor()
+        try:
+            owner: Optional[str] = None
+            table_name = table_sql
+            if "." in table_sql:
+                parts = table_sql.split(".", 1)
+                owner = str(parts[0] or "").strip().upper() or None
+                table_name = str(parts[1] or "").strip().upper() or table_name
+            else:
+                table_name = str(table_sql or "").strip().upper()
+            if owner:
+                cursor.execute(
+                    """
+                    SELECT COLUMN_NAME, DATA_TYPE, DATA_LENGTH, CHAR_LENGTH
+                    FROM ALL_TAB_COLUMNS
+                    WHERE OWNER = :owner AND TABLE_NAME = :table_name
+                    """,
+                    {"owner": owner, "table_name": table_name},
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT COLUMN_NAME, DATA_TYPE, DATA_LENGTH, CHAR_LENGTH
+                    FROM USER_TAB_COLUMNS
+                    WHERE TABLE_NAME = :table_name
+                    """,
+                    {"table_name": table_name},
+                )
+            for row in cursor.fetchall() or []:
+                col_name = str((row[0] if len(row) > 0 else "") or "").strip().upper()
+                if not col_name:
+                    continue
+                out[col_name] = {
+                    "data_type": str((row[1] if len(row) > 1 else "") or "").strip().upper(),
+                    "data_length": int(row[2] or 0) if len(row) > 2 else 0,
+                    "char_length": int(row[3] or 0) if len(row) > 3 else 0,
+                }
+        except Exception:
+            return {}
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        return out
+
+    def _oracle_lob_to_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if hasattr(value, "read") and callable(getattr(value, "read", None)):
+            try:
+                return str(value.read() or "")
+            except Exception:
+                pass
+        return str(value)
+
+    def _oracle_json_to_dict(self, text: Any) -> Dict[str, Any]:
+        raw = self._oracle_lob_to_text(text).strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    def _oracle_prepare_json_bind_payload(
+        self,
+        payload: Dict[str, Any],
+        column_specs: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        if not isinstance(column_specs, dict) or not column_specs:
+            return dict(payload)
+        out = dict(payload)
+        for bind_key, col_name in (
+            ("document_json", "DOCUMENT_JSON"),
+            ("meta_json", "META_JSON"),
+            ("stats_json", "STATS_JSON"),
+        ):
+            value = out.get(bind_key)
+            if value is None:
+                continue
+            spec = column_specs.get(col_name) if isinstance(column_specs, dict) else None
+            if not isinstance(spec, dict):
+                continue
+            data_type = str(spec.get("data_type") or "").strip().upper()
+            text_value = str(value)
+            if data_type in {"VARCHAR2", "NVARCHAR2", "CHAR", "NCHAR"}:
+                max_len = int(spec.get("char_length") or spec.get("data_length") or 0)
+                if max_len > 0 and len(text_value) > max_len:
+                    out[bind_key] = text_value[:max_len]
+                else:
+                    out[bind_key] = text_value
+            elif data_type == "LONG":
+                out[bind_key] = text_value
+            else:
+                out[bind_key] = text_value
+        return out
+
+    def _oracle_profile_upsert_row(
+        self,
+        cursor: Any,
+        table_sql: str,
+        payload: Dict[str, Any],
+        column_specs: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> None:
+        safe_payload = self._oracle_prepare_json_bind_payload(payload, column_specs)
+        update_sql = (
+            f"UPDATE {table_sql} "
+            "SET DOCUMENT_JSON = :document_json, "
+            "    META_JSON = :meta_json, "
+            "    STATS_JSON = :stats_json, "
+            "    UPDATED_AT = SYSTIMESTAMP "
+            "WHERE PIPELINE_ID = :pipeline_id "
+            "  AND NODE_ID = :node_id "
+            "  AND ENTITY_TOKEN = :entity_token"
+        )
+        cursor.execute(update_sql, safe_payload)
+        if int(getattr(cursor, "rowcount", 0) or 0) > 0:
+            return
+        insert_sql = (
+            f"INSERT INTO {table_sql} "
+            "(PIPELINE_ID, NODE_ID, ENTITY_TOKEN, DOCUMENT_JSON, META_JSON, STATS_JSON, UPDATED_AT) "
+            "VALUES (:pipeline_id, :node_id, :entity_token, :document_json, :meta_json, :stats_json, SYSTIMESTAMP)"
+        )
+        cursor.execute(insert_sql, safe_payload)
+
+    def _oracle_profile_upsert_many(
+        self,
+        cursor: Any,
+        table_sql: str,
+        payloads: List[Dict[str, Any]],
+        *,
+        chunk_size: int = 500,
+        column_specs: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> None:
+        rows = [
+            self._oracle_prepare_json_bind_payload(row, column_specs)
+            for row in (payloads or [])
+            if isinstance(row, dict)
+        ]
+        if not rows:
+            return
+        safe_chunk = max(1, min(int(chunk_size or 500), 2000))
+        merge_sql_clob = (
+            f"MERGE INTO {table_sql} t "
+            "USING ("
+            "  SELECT :pipeline_id AS PIPELINE_ID, "
+            "         :node_id AS NODE_ID, "
+            "         :entity_token AS ENTITY_TOKEN, "
+            "         CAST(:document_json AS CLOB) AS DOCUMENT_JSON, "
+            "         CAST(:meta_json AS CLOB) AS META_JSON, "
+            "         CAST(:stats_json AS CLOB) AS STATS_JSON "
+            "  FROM dual"
+            ") s "
+            "ON (t.PIPELINE_ID = s.PIPELINE_ID "
+            "    AND t.NODE_ID = s.NODE_ID "
+            "    AND t.ENTITY_TOKEN = s.ENTITY_TOKEN) "
+            "WHEN MATCHED THEN UPDATE SET "
+            "  t.DOCUMENT_JSON = s.DOCUMENT_JSON, "
+            "  t.META_JSON = s.META_JSON, "
+            "  t.STATS_JSON = s.STATS_JSON, "
+            "  t.UPDATED_AT = SYSTIMESTAMP "
+            "WHEN NOT MATCHED THEN INSERT "
+            "  (PIPELINE_ID, NODE_ID, ENTITY_TOKEN, DOCUMENT_JSON, META_JSON, STATS_JSON, UPDATED_AT) "
+            "VALUES "
+            "  (s.PIPELINE_ID, s.NODE_ID, s.ENTITY_TOKEN, s.DOCUMENT_JSON, s.META_JSON, s.STATS_JSON, SYSTIMESTAMP)"
+        )
+        merge_sql_plain = (
+            f"MERGE INTO {table_sql} t "
+            "USING ("
+            "  SELECT :pipeline_id AS PIPELINE_ID, "
+            "         :node_id AS NODE_ID, "
+            "         :entity_token AS ENTITY_TOKEN, "
+            "         :document_json AS DOCUMENT_JSON, "
+            "         :meta_json AS META_JSON, "
+            "         :stats_json AS STATS_JSON "
+            "  FROM dual"
+            ") s "
+            "ON (t.PIPELINE_ID = s.PIPELINE_ID "
+            "    AND t.NODE_ID = s.NODE_ID "
+            "    AND t.ENTITY_TOKEN = s.ENTITY_TOKEN) "
+            "WHEN MATCHED THEN UPDATE SET "
+            "  t.DOCUMENT_JSON = s.DOCUMENT_JSON, "
+            "  t.META_JSON = s.META_JSON, "
+            "  t.STATS_JSON = s.STATS_JSON, "
+            "  t.UPDATED_AT = SYSTIMESTAMP "
+            "WHEN NOT MATCHED THEN INSERT "
+            "  (PIPELINE_ID, NODE_ID, ENTITY_TOKEN, DOCUMENT_JSON, META_JSON, STATS_JSON, UPDATED_AT) "
+            "VALUES "
+            "  (s.PIPELINE_ID, s.NODE_ID, s.ENTITY_TOKEN, s.DOCUMENT_JSON, s.META_JSON, s.STATS_JSON, SYSTIMESTAMP)"
+        )
+        # Use CLOB-typed merge only when we can positively confirm all JSON columns
+        # are CLOB/NCLOB. Unknown column metadata defaults to plain binds so legacy
+        # LONG/VARCHAR schemas do not fail with ORA-00932.
+        use_clob_merge = False
+        if isinstance(column_specs, dict) and column_specs:
+            use_clob_merge = True
+            for col_name in ("DOCUMENT_JSON", "META_JSON", "STATS_JSON"):
+                spec = column_specs.get(col_name)
+                if not isinstance(spec, dict):
+                    use_clob_merge = False
+                    break
+                data_type = str(spec.get("data_type") or "").strip().upper()
+                if data_type not in {"CLOB", "NCLOB"}:
+                    use_clob_merge = False
+                    break
+        try:
+            if use_clob_merge:
+                import oracledb  # type: ignore
+                cursor.setinputsizes(
+                    pipeline_id=oracledb.DB_TYPE_VARCHAR,
+                    node_id=oracledb.DB_TYPE_VARCHAR,
+                    entity_token=oracledb.DB_TYPE_VARCHAR,
+                    document_json=oracledb.DB_TYPE_CLOB,
+                    meta_json=oracledb.DB_TYPE_CLOB,
+                    stats_json=oracledb.DB_TYPE_CLOB,
+                )
+        except Exception:
+            pass
+        for start_idx in range(0, len(rows), safe_chunk):
+            chunk_rows = rows[start_idx:start_idx + safe_chunk]
+            try:
+                cursor.executemany(merge_sql_clob if use_clob_merge else merge_sql_plain, chunk_rows)
+            except Exception as exc:
+                err_text = str(exc or "")
+                if "ORA-00932" in err_text and use_clob_merge:
+                    fallback_cursor = None
+                    try:
+                        conn_obj = getattr(cursor, "connection", None)
+                        if conn_obj is not None:
+                            fallback_cursor = conn_obj.cursor()
+                            fallback_cursor.executemany(merge_sql_plain, chunk_rows)
+                        else:
+                            cursor.executemany(merge_sql_plain, chunk_rows)
+                        continue
+                    except Exception as fallback_exc:
+                        err_text = str(fallback_exc or "")
+                    finally:
+                        if fallback_cursor is not None:
+                            try:
+                                fallback_cursor.close()
+                            except Exception:
+                                pass
+                if "ORA-01461" in err_text or "ORA-01460" in err_text or "ORA-00932" in err_text:
+                    row_cursor = None
+                    row_cursor_ref = cursor
+                    try:
+                        conn_obj = getattr(cursor, "connection", None)
+                        if conn_obj is not None:
+                            row_cursor = conn_obj.cursor()
+                            row_cursor_ref = row_cursor
+                    except Exception:
+                        row_cursor = None
+                        row_cursor_ref = cursor
+                    try:
+                        for payload in chunk_rows:
+                            self._oracle_profile_upsert_row(
+                                row_cursor_ref,
+                                table_sql,
+                                payload,
+                                column_specs=column_specs,
+                            )
+                    finally:
+                        if row_cursor is not None:
+                            try:
+                                row_cursor.close()
+                            except Exception:
+                                pass
+                    continue
+                raise
 
     def _node_profile_counts(self, node_state: Any) -> Tuple[int, int]:
         if not isinstance(node_state, dict):
@@ -334,6 +1264,297 @@ class ETLEngine:
             len(docs) if isinstance(docs, dict) else 0,
             len(meta) if isinstance(meta, dict) else 0,
         )
+
+    def _normalize_profile_storage(self, raw_storage: Any) -> str:
+        text = str(raw_storage or "lmdb").strip().lower()
+        if text in {"rocksdb", "rocks"}:
+            return "rocksdb"
+        if text in {"redis", "redisdb"}:
+            return "redis"
+        if text in {"oracle", "oracledb", "ora"}:
+            return "oracle"
+        return "lmdb"
+
+    def _normalize_oracle_profile_write_strategy(self, raw_strategy: Any) -> str:
+        text = str(raw_strategy or "parallel_key").strip().lower()
+        if text in {
+            "parallel",
+            "parallel_key",
+            "parallel_key_partitioned",
+            "key_partitioned",
+            "profile_key_parallel",
+        }:
+            return "parallel_key"
+        return "single"
+
+    def _normalize_profile_compute_strategy(self, raw_strategy: Any) -> str:
+        text = str(raw_strategy or "single").strip().lower()
+        if text in {
+            "parallel_by_profile_key",
+            "parallel_profile_key",
+            "profile_key_parallel",
+            "parallel_key",
+            "parallel",
+        }:
+            return "parallel_by_profile_key"
+        return "single"
+
+    def _normalize_profile_compute_executor(self, raw_executor: Any) -> str:
+        text = str(raw_executor or "thread").strip().lower()
+        if text in {
+            "process",
+            "processes",
+            "multiprocess",
+            "multi_process",
+            "mp",
+        }:
+            return "process"
+        return "thread"
+
+    def _normalize_profile_processing_mode(self, raw_mode: Any) -> str:
+        text = str(raw_mode or "batch").strip().lower()
+        if text in {"incremental", "inc"}:
+            return "incremental"
+        if text in {"incremental_batch", "inc_batch", "incremental-batch"}:
+            return "incremental_batch"
+        return "batch"
+
+    def _oracle_profile_queue_key(self, pipeline_id: str, node_id: str) -> str:
+        return f"{str(pipeline_id)}::{str(node_id)}"
+
+    def _ensure_oracle_profile_queue_runtime_state(self) -> None:
+        if not hasattr(self, "_oracle_profile_write_queue_lock"):
+            self._oracle_profile_write_queue_lock = threading.Lock()
+        if not hasattr(self, "_oracle_profile_write_queues") or not isinstance(
+            getattr(self, "_oracle_profile_write_queues", None),
+            dict,
+        ):
+            self._oracle_profile_write_queues = {}
+
+    def _oracle_profile_write_queue_worker(self, queue_key: str) -> None:
+        self._ensure_oracle_profile_queue_runtime_state()
+        while True:
+            with self._oracle_profile_write_queue_lock:
+                state = self._oracle_profile_write_queues.get(queue_key)
+            if not isinstance(state, dict):
+                return
+            queue_obj = state.get("queue")
+            stop_event = state.get("stop_event")
+            if not isinstance(queue_obj, _queue.Queue):
+                return
+            if isinstance(stop_event, threading.Event) and stop_event.is_set() and queue_obj.empty():
+                break
+
+            try:
+                item = queue_obj.get(timeout=0.2)
+            except _queue.Empty:
+                continue
+
+            success = False
+            error_text = ""
+            started_at = pytime.monotonic()
+            try:
+                if not isinstance(item, dict):
+                    raise RuntimeError("invalid oracle queue payload")
+                success = bool(
+                    self._save_profile_state_single_node_by_storage(
+                        str(item.get("pipeline_id") or ""),
+                        str(item.get("node_id") or ""),
+                        item.get("node_state") if isinstance(item.get("node_state"), dict) else {},
+                        changed_tokens=(
+                            item.get("changed_tokens")
+                            if isinstance(item.get("changed_tokens"), list)
+                            else None
+                        ),
+                        storage="oracle",
+                        profile_cfg=(
+                            item.get("profile_cfg")
+                            if isinstance(item.get("profile_cfg"), dict)
+                            else None
+                        ),
+                        oracle_session=None,
+                        oracle_auto_commit=bool(item.get("oracle_auto_commit", True)),
+                    )
+                )
+                if not success:
+                    error_text = "oracle queue persist failed"
+            except Exception as exc:
+                success = False
+                error_text = str(exc or "oracle queue persist exception")
+            finally:
+                latency_ms = int(max(0.0, (pytime.monotonic() - started_at) * 1000.0))
+                with self._oracle_profile_write_queue_lock:
+                    current = self._oracle_profile_write_queues.get(queue_key)
+                    if isinstance(current, dict):
+                        stats = current.get("stats") if isinstance(current.get("stats"), dict) else {}
+                        if not isinstance(current.get("stats"), dict):
+                            current["stats"] = stats
+                        stats["processed_batches"] = int(stats.get("processed_batches") or 0) + 1
+                        if success:
+                            stats["last_error"] = ""
+                        else:
+                            stats["failed_batches"] = int(stats.get("failed_batches") or 0) + 1
+                            stats["last_error"] = str(error_text or "oracle queue persist failed")
+                        stats["inflight_batches"] = max(0, int(stats.get("inflight_batches") or 0) - 1)
+                        stats["last_latency_ms"] = latency_ms
+                        stats["last_finished_at"] = datetime.utcnow().isoformat()
+                try:
+                    queue_obj.task_done()
+                except Exception:
+                    pass
+
+        with self._oracle_profile_write_queue_lock:
+            current = self._oracle_profile_write_queues.get(queue_key)
+            if isinstance(current, dict):
+                current["worker_alive"] = False
+
+    def _ensure_oracle_profile_write_queue(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        profile_cfg: Optional[Dict[str, Any]],
+        maxsize: int,
+    ) -> Dict[str, Any]:
+        self._ensure_oracle_profile_queue_runtime_state()
+        queue_key = self._oracle_profile_queue_key(pipeline_id, node_id)
+        with self._oracle_profile_write_queue_lock:
+            existing = self._oracle_profile_write_queues.get(queue_key)
+            if isinstance(existing, dict):
+                if isinstance(profile_cfg, dict):
+                    existing["profile_cfg"] = profile_cfg
+                existing["last_touched_at"] = datetime.utcnow().isoformat()
+                return existing
+
+            safe_maxsize = max(8, min(int(maxsize or 256), 4096))
+            q: _queue.Queue = _queue.Queue(maxsize=safe_maxsize)
+            stop_event = threading.Event()
+            state: Dict[str, Any] = {
+                "pipeline_id": str(pipeline_id),
+                "node_id": str(node_id),
+                "profile_cfg": profile_cfg if isinstance(profile_cfg, dict) else {},
+                "queue": q,
+                "stop_event": stop_event,
+                "worker_thread": None,
+                "worker_alive": True,
+                "created_at": datetime.utcnow().isoformat(),
+                "last_touched_at": datetime.utcnow().isoformat(),
+                "stats": {
+                    "enqueued_batches": 0,
+                    "processed_batches": 0,
+                    "failed_batches": 0,
+                    "inflight_batches": 0,
+                    "last_latency_ms": 0,
+                    "last_error": "",
+                    "last_enqueue_at": "",
+                    "last_finished_at": "",
+                },
+            }
+            worker = threading.Thread(
+                target=self._oracle_profile_write_queue_worker,
+                args=(queue_key,),
+                daemon=True,
+                name=f"oracle-profile-q-{str(node_id)[:8]}",
+            )
+            state["worker_thread"] = worker
+            self._oracle_profile_write_queues[queue_key] = state
+        worker.start()
+        return state
+
+    def _enqueue_oracle_profile_write(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        node_state: Dict[str, Any],
+        changed_tokens: List[str],
+        profile_cfg: Optional[Dict[str, Any]],
+        queue_maxsize: int,
+        enqueue_timeout_seconds: float = 0.2,
+        oracle_auto_commit: bool = True,
+    ) -> Tuple[bool, str]:
+        self._ensure_oracle_profile_queue_runtime_state()
+        if not changed_tokens:
+            return True, ""
+        state = self._ensure_oracle_profile_write_queue(
+            pipeline_id,
+            node_id,
+            profile_cfg=profile_cfg,
+            maxsize=queue_maxsize,
+        )
+        queue_obj = state.get("queue")
+        if not isinstance(queue_obj, _queue.Queue):
+            return False, "oracle_queue_not_initialized"
+
+        timeout_s = max(0.01, min(float(enqueue_timeout_seconds or 0.2), 5.0))
+        payload = {
+            "pipeline_id": str(pipeline_id),
+            "node_id": str(node_id),
+            "node_state": node_state if isinstance(node_state, dict) else {},
+            "changed_tokens": list(changed_tokens),
+            "profile_cfg": profile_cfg if isinstance(profile_cfg, dict) else {},
+            "oracle_auto_commit": bool(oracle_auto_commit),
+        }
+        try:
+            queue_obj.put(payload, timeout=timeout_s)
+        except _queue.Full:
+            return False, "oracle_queue_full"
+        except Exception as exc:
+            return False, str(exc or "oracle_queue_enqueue_failed")
+
+        queue_key = self._oracle_profile_queue_key(pipeline_id, node_id)
+        with self._oracle_profile_write_queue_lock:
+            current = self._oracle_profile_write_queues.get(queue_key)
+            if isinstance(current, dict):
+                stats = current.get("stats") if isinstance(current.get("stats"), dict) else {}
+                if not isinstance(current.get("stats"), dict):
+                    current["stats"] = stats
+                stats["enqueued_batches"] = int(stats.get("enqueued_batches") or 0) + 1
+                stats["inflight_batches"] = int(stats.get("inflight_batches") or 0) + 1
+                stats["last_enqueue_at"] = datetime.utcnow().isoformat()
+                current["last_touched_at"] = datetime.utcnow().isoformat()
+        return True, ""
+
+    def _get_oracle_profile_write_queue_stats(
+        self,
+        pipeline_id: str,
+        node_id: str,
+    ) -> Dict[str, Any]:
+        self._ensure_oracle_profile_queue_runtime_state()
+        queue_key = self._oracle_profile_queue_key(pipeline_id, node_id)
+        with self._oracle_profile_write_queue_lock:
+            state = self._oracle_profile_write_queues.get(queue_key)
+            if not isinstance(state, dict):
+                return {
+                    "enabled": False,
+                    "queue_depth": 0,
+                    "inflight_batches": 0,
+                    "enqueued_batches": 0,
+                    "processed_batches": 0,
+                    "failed_batches": 0,
+                    "last_error": "",
+                    "last_latency_ms": 0,
+                    "worker_alive": False,
+                    "pending_batches": 0,
+                }
+            queue_obj = state.get("queue")
+            stats = state.get("stats") if isinstance(state.get("stats"), dict) else {}
+            queue_depth = int(queue_obj.qsize()) if isinstance(queue_obj, _queue.Queue) else 0
+            pending_batches = (
+                max(0, int(getattr(queue_obj, "unfinished_tasks", 0) or 0))
+                if isinstance(queue_obj, _queue.Queue)
+                else 0
+            )
+            return {
+                "enabled": True,
+                "queue_depth": int(queue_depth),
+                "inflight_batches": int(stats.get("inflight_batches") or 0),
+                "enqueued_batches": int(stats.get("enqueued_batches") or 0),
+                "processed_batches": int(stats.get("processed_batches") or 0),
+                "failed_batches": int(stats.get("failed_batches") or 0),
+                "last_error": str(stats.get("last_error") or ""),
+                "last_latency_ms": int(stats.get("last_latency_ms") or 0),
+                "worker_alive": bool(state.get("worker_alive", False)),
+                "pending_batches": int(pending_batches),
+            }
 
     def _load_runtime_profile_state_by_node(self, pipeline_id: str) -> Dict[str, Any]:
         runtime_state = self._load_runtime_state()
@@ -365,7 +1586,10 @@ class ETLEngine:
         if env is None:
             return {}
         prefix = self._profile_lmdb_prefix(str(pipeline_id))
-        out: Dict[str, Any] = {}
+        snapshot_state: Dict[str, Dict[str, Any]] = {}
+        delta_docs: Dict[str, Dict[str, Any]] = {}
+        delta_meta: Dict[str, Dict[str, Any]] = {}
+        delta_stats: Dict[str, Dict[str, Any]] = {}
         try:
             with env.begin(write=False) as txn:
                 cursor = txn.cursor()
@@ -373,8 +1597,8 @@ class ETLEngine:
                     for key_bytes, value_bytes in cursor:
                         if not key_bytes.startswith(prefix):
                             break
-                        node_id = key_bytes[len(prefix):].decode("utf-8", errors="ignore")
-                        if not node_id:
+                        suffix = key_bytes[len(prefix):].decode("utf-8", errors="ignore")
+                        if not suffix:
                             continue
                         try:
                             payload = json.loads(value_bytes.decode("utf-8"))
@@ -382,10 +1606,47 @@ class ETLEngine:
                             continue
                         if not isinstance(payload, dict):
                             continue
+
+                        if suffix.startswith("@e::"):
+                            # Per-entity incremental writes.
+                            # Key format: <pipeline>::@e::<node_id>::<entity_token>
+                            parts = suffix.split("::", 2)
+                            if len(parts) < 3:
+                                continue
+                            node_id = str(parts[1] or "").strip()
+                            entity_token = str(parts[2] or "").strip()
+                            if not node_id or not entity_token:
+                                continue
+                            if "document" in payload:
+                                doc_value = payload.get("document")
+                                if isinstance(doc_value, dict):
+                                    node_docs = delta_docs.setdefault(node_id, {})
+                                    node_docs[entity_token] = doc_value
+                            if "meta" in payload:
+                                meta_value = payload.get("meta")
+                                if isinstance(meta_value, dict):
+                                    node_meta = delta_meta.setdefault(node_id, {})
+                                    node_meta[entity_token] = meta_value
+                            continue
+
+                        if suffix.startswith("@s::"):
+                            # Node stats from incremental writes.
+                            # Key format: <pipeline>::@s::<node_id>
+                            parts = suffix.split("::", 1)
+                            if len(parts) < 2:
+                                continue
+                            node_id = str(parts[1] or "").strip()
+                            if not node_id:
+                                continue
+                            delta_stats[node_id] = payload if isinstance(payload, dict) else {}
+                            continue
+
+                        # Legacy/full snapshot format.
+                        node_id = suffix
                         docs = payload.get("documents")
                         meta = payload.get("meta")
                         stats = payload.get("stats")
-                        out[str(node_id)] = {
+                        snapshot_state[str(node_id)] = {
                             "documents": docs if isinstance(docs, dict) else {},
                             "meta": meta if isinstance(meta, dict) else {},
                             "stats": stats if isinstance(stats, dict) else {},
@@ -393,7 +1654,140 @@ class ETLEngine:
         except Exception as exc:
             logger.warning(f"Failed to read LMDB profile state for pipeline {pipeline_id}: {exc}")
             return {}
+
+        out: Dict[str, Any] = {}
+        for node_id, node_payload in snapshot_state.items():
+            node_dict = node_payload if isinstance(node_payload, dict) else {}
+            out[str(node_id)] = {
+                "documents": dict(node_dict.get("documents") or {}) if isinstance(node_dict.get("documents"), dict) else {},
+                "meta": dict(node_dict.get("meta") or {}) if isinstance(node_dict.get("meta"), dict) else {},
+                "stats": dict(node_dict.get("stats") or {}) if isinstance(node_dict.get("stats"), dict) else {},
+            }
+
+        all_delta_nodes = set(delta_docs.keys()) | set(delta_meta.keys()) | set(delta_stats.keys())
+        for node_id in all_delta_nodes:
+            node_out = out.get(node_id)
+            if not isinstance(node_out, dict):
+                node_out = {"documents": {}, "meta": {}, "stats": {}}
+                out[node_id] = node_out
+            docs_out = node_out.get("documents")
+            if not isinstance(docs_out, dict):
+                docs_out = {}
+                node_out["documents"] = docs_out
+            meta_out = node_out.get("meta")
+            if not isinstance(meta_out, dict):
+                meta_out = {}
+                node_out["meta"] = meta_out
+
+            for entity_token, doc_value in (delta_docs.get(node_id) or {}).items():
+                if isinstance(doc_value, dict):
+                    docs_out[str(entity_token)] = doc_value
+            for entity_token, meta_value in (delta_meta.get(node_id) or {}).items():
+                if isinstance(meta_value, dict):
+                    meta_out[str(entity_token)] = meta_value
+
+            stats_value = delta_stats.get(node_id)
+            if isinstance(stats_value, dict):
+                node_out["stats"] = stats_value
+
         return out
+
+    def _load_lmdb_profile_state_single_entity(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        entity_token: str,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        env = self._get_profile_lmdb_env()
+        if env is None:
+            return {}, {}
+        token = str(entity_token or "").strip()
+        if not token:
+            return {}, {}
+        key_bytes = self._profile_lmdb_entity_key(str(pipeline_id), str(node_id), token)
+        try:
+            with env.begin(write=False) as txn:
+                raw_value = txn.get(key_bytes)
+                if raw_value is not None:
+                    try:
+                        payload = json.loads(raw_value.decode("utf-8"))
+                    except Exception:
+                        payload = {}
+                    if isinstance(payload, dict):
+                        doc = payload.get("document")
+                        meta = payload.get("meta")
+                        return (
+                            doc if isinstance(doc, dict) else {},
+                            meta if isinstance(meta, dict) else {},
+                        )
+        except Exception as exc:
+            logger.debug(
+                f"Failed LMDB single-entity profile read for pipeline={pipeline_id}, "
+                f"node={node_id}, token={token}: {exc}"
+            )
+        return {}, {}
+
+    def _load_lmdb_profile_existing_entity_tokens(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        max_tokens: int = 300000,
+    ) -> Optional[set]:
+        env = self._get_profile_lmdb_env()
+        if env is None:
+            return None
+        prefix = self._profile_lmdb_entity_prefix(str(pipeline_id), str(node_id))
+        if not prefix:
+            return None
+        out: set = set()
+        try:
+            with env.begin(write=False) as txn:
+                cursor = txn.cursor()
+                if cursor.set_range(prefix):
+                    for key_bytes, _ in cursor:
+                        if not key_bytes.startswith(prefix):
+                            break
+                        token_bytes = key_bytes[len(prefix):]
+                        if not token_bytes:
+                            continue
+                        try:
+                            token = token_bytes.decode("utf-8", errors="replace")
+                        except Exception:
+                            token = str(token_bytes)
+                        if token:
+                            out.add(token)
+                        if len(out) > max_tokens:
+                            return None
+            return out
+        except Exception as exc:
+            logger.debug(
+                f"Failed to build LMDB entity-token index for pipeline={pipeline_id}, "
+                f"node={node_id}: {exc}"
+            )
+            return None
+
+    def _has_lmdb_profile_state_for_node(self, pipeline_id: str, node_id: str) -> bool:
+        env = self._get_profile_lmdb_env()
+        if env is None:
+            return False
+        try:
+            stats_key = self._profile_lmdb_stats_key(str(pipeline_id), str(node_id))
+            entity_prefix = self._profile_lmdb_entity_prefix(str(pipeline_id), str(node_id))
+            snapshot_key = self._profile_lmdb_key(str(pipeline_id), str(node_id))
+            with env.begin(write=False) as txn:
+                if txn.get(stats_key) is not None:
+                    return True
+                if txn.get(snapshot_key) is not None:
+                    return True
+                cursor = txn.cursor()
+                if cursor.set_range(entity_prefix):
+                    for key_bytes, _ in cursor:
+                        if not key_bytes.startswith(entity_prefix):
+                            break
+                        return True
+            return False
+        except Exception:
+            return False
 
     def _save_profile_state_by_node(self, pipeline_id: str, profile_state_by_node: Dict[str, Any]) -> bool:
         env = self._get_profile_lmdb_env()
@@ -442,26 +1836,60 @@ class ETLEngine:
             logger.warning(f"Failed to persist LMDB profile state for pipeline {pipeline_id}: {exc}")
             return False
 
-    def _save_profile_state_single_node(self, pipeline_id: str, node_id: str, node_state: Dict[str, Any]) -> bool:
+    def _save_profile_state_single_node(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        node_state: Dict[str, Any],
+        changed_tokens: Optional[List[str]] = None,
+    ) -> bool:
         env = self._get_profile_lmdb_env()
         if env is None:
             return False
-        safe_node_state = self._json_safe_value(node_state if isinstance(node_state, dict) else {})
-        docs = safe_node_state.get("documents") if isinstance(safe_node_state, dict) else {}
-        meta = safe_node_state.get("meta") if isinstance(safe_node_state, dict) else {}
-        stats = safe_node_state.get("stats") if isinstance(safe_node_state, dict) else {}
-        payload = {
-            "documents": docs if isinstance(docs, dict) else {},
-            "meta": meta if isinstance(meta, dict) else {},
-            "stats": stats if isinstance(stats, dict) else {},
-        }
-        key_bytes = self._profile_lmdb_key(str(pipeline_id), str(node_id))
+        node_dict = node_state if isinstance(node_state, dict) else {}
+        docs = node_dict.get("documents") if isinstance(node_dict.get("documents"), dict) else {}
+        meta = node_dict.get("meta") if isinstance(node_dict.get("meta"), dict) else {}
+        stats = node_dict.get("stats") if isinstance(node_dict.get("stats"), dict) else {}
+        changed = [
+            str(token).strip()
+            for token in (changed_tokens or [])
+            if str(token).strip()
+        ]
         try:
             with env.begin(write=True) as txn:
-                txn.put(
-                    key_bytes,
-                    json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                )
+                if changed:
+                    # Incremental fast path: write only touched entities + node stats.
+                    for token in changed:
+                        doc_value = docs.get(token)
+                        meta_value = meta.get(token)
+                        payload = {
+                            "document": self._json_safe_value(doc_value if isinstance(doc_value, dict) else {}),
+                            "meta": self._json_safe_value(meta_value if isinstance(meta_value, dict) else {}),
+                        }
+                        txn.put(
+                            self._profile_lmdb_entity_key(str(pipeline_id), str(node_id), token),
+                            json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                        )
+                    txn.put(
+                        self._profile_lmdb_stats_key(str(pipeline_id), str(node_id)),
+                        json.dumps(self._json_safe_value(stats), ensure_ascii=False).encode("utf-8"),
+                    )
+                else:
+                    # Snapshot fallback path.
+                    safe_node_state = self._json_safe_value(node_dict)
+                    docs_safe = safe_node_state.get("documents") if isinstance(safe_node_state, dict) else {}
+                    meta_safe = safe_node_state.get("meta") if isinstance(safe_node_state, dict) else {}
+                    stats_safe = safe_node_state.get("stats") if isinstance(safe_node_state, dict) else {}
+                    payload = {
+                        "documents": docs_safe if isinstance(docs_safe, dict) else {},
+                        "meta": meta_safe if isinstance(meta_safe, dict) else {},
+                        "stats": stats_safe if isinstance(stats_safe, dict) else {},
+                    }
+                    key_bytes = self._profile_lmdb_key(str(pipeline_id), str(node_id))
+                    txn.put(
+                        key_bytes,
+                        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                    )
             return True
         except Exception as exc:
             logger.warning(
@@ -495,40 +1923,54 @@ class ETLEngine:
         if env is None:
             return 0, 0, 0
 
-        removed_nodes = 0
-        removed_entities = 0
-        removed_meta_entries = 0
+        current_state = self._load_lmdb_profile_state_by_node(str(pipeline_id))
+        if node_id:
+            node_state = current_state.get(str(node_id))
+            if isinstance(node_state, dict):
+                docs_count, meta_count = self._node_profile_counts(node_state)
+                removed_nodes = 1
+                removed_entities = docs_count
+                removed_meta_entries = meta_count
+            else:
+                removed_nodes = 0
+                removed_entities = 0
+                removed_meta_entries = 0
+        else:
+            removed_nodes = len(current_state)
+            removed_entities = 0
+            removed_meta_entries = 0
+            for node_state in current_state.values():
+                docs_count, meta_count = self._node_profile_counts(node_state)
+                removed_entities += docs_count
+                removed_meta_entries += meta_count
+
         prefix = self._profile_lmdb_prefix(str(pipeline_id))
         try:
             with env.begin(write=True) as txn:
                 keys_to_delete: List[bytes] = []
                 if node_id:
-                    key_bytes = self._profile_lmdb_key(str(pipeline_id), str(node_id))
-                    raw_value = txn.get(key_bytes)
-                    if raw_value is not None:
-                        try:
-                            payload = json.loads(raw_value.decode("utf-8"))
-                        except Exception:
-                            payload = {}
-                        docs_count, meta_count = self._node_profile_counts(payload)
-                        removed_nodes = 1
-                        removed_entities = docs_count
-                        removed_meta_entries = meta_count
+                    node_key = str(node_id)
+                    key_bytes = self._profile_lmdb_key(str(pipeline_id), node_key)
+                    if txn.get(key_bytes) is not None:
                         keys_to_delete.append(key_bytes)
+
+                    stats_key = self._profile_lmdb_stats_key(str(pipeline_id), node_key)
+                    if txn.get(stats_key) is not None:
+                        keys_to_delete.append(stats_key)
+
+                    entity_prefix = self._profile_lmdb_entity_prefix(str(pipeline_id), node_key)
+                    cursor = txn.cursor()
+                    if cursor.set_range(entity_prefix):
+                        for entity_key_bytes, _ in cursor:
+                            if not entity_key_bytes.startswith(entity_prefix):
+                                break
+                            keys_to_delete.append(bytes(entity_key_bytes))
                 else:
                     cursor = txn.cursor()
                     if cursor.set_range(prefix):
-                        for key_bytes, value_bytes in cursor:
+                        for key_bytes, _ in cursor:
                             if not key_bytes.startswith(prefix):
                                 break
-                            try:
-                                payload = json.loads(value_bytes.decode("utf-8"))
-                            except Exception:
-                                payload = {}
-                            docs_count, meta_count = self._node_profile_counts(payload)
-                            removed_nodes += 1
-                            removed_entities += docs_count
-                            removed_meta_entries += meta_count
                             keys_to_delete.append(bytes(key_bytes))
 
                 for key_bytes in keys_to_delete:
@@ -538,11 +1980,1831 @@ class ETLEngine:
             return 0, 0, 0
         return removed_nodes, removed_entities, removed_meta_entries
 
-    def _load_profile_state_by_node(self, pipeline_id: str) -> Dict[str, Any]:
+    def _load_redis_profile_state_by_node(self, pipeline_id: str) -> Dict[str, Any]:
+        client = self._get_profile_redis_client()
+        if client is None:
+            return {}
+        prefix = self._profile_redis_prefix(str(pipeline_id))
+        snapshot_state: Dict[str, Dict[str, Any]] = {}
+        delta_docs: Dict[str, Dict[str, Any]] = {}
+        delta_meta: Dict[str, Dict[str, Any]] = {}
+        delta_stats: Dict[str, Dict[str, Any]] = {}
+        try:
+            scan_pattern = f"{prefix}*"
+            cursor = 0
+            while True:
+                cursor, keys = client.scan(cursor=cursor, match=scan_pattern, count=2000)
+                if keys:
+                    values = client.mget(keys)
+                    for key_text, raw_value in zip(keys, values):
+                        if not isinstance(key_text, str) or not key_text.startswith(prefix):
+                            continue
+                        if raw_value is None:
+                            continue
+                        suffix = key_text[len(prefix):]
+                        if not suffix:
+                            continue
+                        try:
+                            payload = json.loads(str(raw_value))
+                        except Exception:
+                            continue
+                        if not isinstance(payload, dict):
+                            continue
+
+                        if suffix.startswith("@e::"):
+                            parts = suffix.split("::", 2)
+                            if len(parts) < 3:
+                                continue
+                            node_id = str(parts[1] or "").strip()
+                            entity_token = str(parts[2] or "").strip()
+                            if not node_id or not entity_token:
+                                continue
+                            if "document" in payload and isinstance(payload.get("document"), dict):
+                                delta_docs.setdefault(node_id, {})[entity_token] = payload.get("document")
+                            if "meta" in payload and isinstance(payload.get("meta"), dict):
+                                delta_meta.setdefault(node_id, {})[entity_token] = payload.get("meta")
+                            continue
+
+                        if suffix.startswith("@s::"):
+                            parts = suffix.split("::", 1)
+                            if len(parts) < 2:
+                                continue
+                            node_id = str(parts[1] or "").strip()
+                            if not node_id:
+                                continue
+                            delta_stats[node_id] = payload if isinstance(payload, dict) else {}
+                            continue
+
+                        node_id = suffix
+                        docs = payload.get("documents")
+                        meta = payload.get("meta")
+                        stats = payload.get("stats")
+                        snapshot_state[str(node_id)] = {
+                            "documents": docs if isinstance(docs, dict) else {},
+                            "meta": meta if isinstance(meta, dict) else {},
+                            "stats": stats if isinstance(stats, dict) else {},
+                        }
+                if cursor == 0:
+                    break
+        except Exception as exc:
+            logger.warning(f"Failed to read Redis profile state for pipeline {pipeline_id}: {exc}")
+            return {}
+
+        out: Dict[str, Any] = {}
+        for node_id, node_payload in snapshot_state.items():
+            node_dict = node_payload if isinstance(node_payload, dict) else {}
+            out[str(node_id)] = {
+                "documents": dict(node_dict.get("documents") or {}) if isinstance(node_dict.get("documents"), dict) else {},
+                "meta": dict(node_dict.get("meta") or {}) if isinstance(node_dict.get("meta"), dict) else {},
+                "stats": dict(node_dict.get("stats") or {}) if isinstance(node_dict.get("stats"), dict) else {},
+            }
+
+        all_delta_nodes = set(delta_docs.keys()) | set(delta_meta.keys()) | set(delta_stats.keys())
+        for node_id in all_delta_nodes:
+            node_out = out.get(node_id)
+            if not isinstance(node_out, dict):
+                node_out = {"documents": {}, "meta": {}, "stats": {}}
+                out[node_id] = node_out
+            docs_out = node_out.get("documents")
+            if not isinstance(docs_out, dict):
+                docs_out = {}
+                node_out["documents"] = docs_out
+            meta_out = node_out.get("meta")
+            if not isinstance(meta_out, dict):
+                meta_out = {}
+                node_out["meta"] = meta_out
+
+            for entity_token, doc_value in (delta_docs.get(node_id) or {}).items():
+                if isinstance(doc_value, dict):
+                    docs_out[str(entity_token)] = doc_value
+            for entity_token, meta_value in (delta_meta.get(node_id) or {}).items():
+                if isinstance(meta_value, dict):
+                    meta_out[str(entity_token)] = meta_value
+            stats_value = delta_stats.get(node_id)
+            if isinstance(stats_value, dict):
+                node_out["stats"] = stats_value
+
+        return out
+
+    def _load_redis_profile_state_single_entity(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        entity_token: str,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        client = self._get_profile_redis_client()
+        if client is None:
+            return {}, {}
+        token = str(entity_token or "").strip()
+        if not token:
+            return {}, {}
+        key_text = self._profile_redis_entity_key(str(pipeline_id), str(node_id), token)
+        try:
+            raw_value = client.get(key_text)
+            if raw_value is None:
+                return {}, {}
+            payload = json.loads(str(raw_value))
+            if not isinstance(payload, dict):
+                return {}, {}
+            doc = payload.get("document")
+            meta = payload.get("meta")
+            return (
+                doc if isinstance(doc, dict) else {},
+                meta if isinstance(meta, dict) else {},
+            )
+        except Exception as exc:
+            logger.debug(
+                f"Failed Redis single-entity profile read for pipeline={pipeline_id}, "
+                f"node={node_id}, token={token}: {exc}"
+            )
+        return {}, {}
+
+    def _has_redis_profile_state_for_node(self, pipeline_id: str, node_id: str) -> bool:
+        client = self._get_profile_redis_client()
+        if client is None:
+            return False
+        stats_key = self._profile_redis_stats_key(str(pipeline_id), str(node_id))
+        snapshot_key = self._profile_redis_snapshot_key(str(pipeline_id), str(node_id))
+        entity_prefix = self._profile_redis_entity_prefix(str(pipeline_id), str(node_id))
+        try:
+            if client.exists(stats_key):
+                return True
+            if client.exists(snapshot_key):
+                return True
+            for _ in client.scan_iter(match=f"{entity_prefix}*", count=1):
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _save_redis_profile_state_single_node(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        node_state: Dict[str, Any],
+        changed_tokens: Optional[List[str]] = None,
+    ) -> bool:
+        client = self._get_profile_redis_client()
+        if client is None:
+            return False
+        node_dict = node_state if isinstance(node_state, dict) else {}
+        docs = node_dict.get("documents") if isinstance(node_dict.get("documents"), dict) else {}
+        meta = node_dict.get("meta") if isinstance(node_dict.get("meta"), dict) else {}
+        stats = node_dict.get("stats") if isinstance(node_dict.get("stats"), dict) else {}
+        changed = [
+            str(token).strip()
+            for token in (changed_tokens or [])
+            if str(token).strip()
+        ]
+        try:
+            pipe = client.pipeline(transaction=False)
+            if changed:
+                for token in changed:
+                    doc_value = docs.get(token)
+                    meta_value = meta.get(token)
+                    payload = {
+                        "document": self._json_safe_value(doc_value if isinstance(doc_value, dict) else {}),
+                        "meta": self._json_safe_value(meta_value if isinstance(meta_value, dict) else {}),
+                    }
+                    pipe.set(
+                        self._profile_redis_entity_key(str(pipeline_id), str(node_id), token),
+                        json.dumps(payload, ensure_ascii=False),
+                    )
+                pipe.set(
+                    self._profile_redis_stats_key(str(pipeline_id), str(node_id)),
+                    json.dumps(self._json_safe_value(stats), ensure_ascii=False),
+                )
+            else:
+                safe_node_state = self._json_safe_value(node_dict)
+                docs_safe = safe_node_state.get("documents") if isinstance(safe_node_state, dict) else {}
+                meta_safe = safe_node_state.get("meta") if isinstance(safe_node_state, dict) else {}
+                stats_safe = safe_node_state.get("stats") if isinstance(safe_node_state, dict) else {}
+                payload = {
+                    "documents": docs_safe if isinstance(docs_safe, dict) else {},
+                    "meta": meta_safe if isinstance(meta_safe, dict) else {},
+                    "stats": stats_safe if isinstance(stats_safe, dict) else {},
+                }
+                pipe.set(
+                    self._profile_redis_snapshot_key(str(pipeline_id), str(node_id)),
+                    json.dumps(payload, ensure_ascii=False),
+                )
+            pipe.execute()
+            return True
+        except Exception as exc:
+            logger.warning(
+                f"Failed to persist Redis profile state for pipeline {pipeline_id}, node {node_id}: {exc}"
+            )
+            return False
+
+    def _clear_redis_profile_state_by_node(
+        self,
+        pipeline_id: str,
+        node_id: Optional[str] = None,
+    ) -> Tuple[int, int, int]:
+        client = self._get_profile_redis_client()
+        if client is None:
+            return 0, 0, 0
+
+        current_state = self._load_redis_profile_state_by_node(str(pipeline_id))
+        if node_id:
+            node_state = current_state.get(str(node_id))
+            if isinstance(node_state, dict):
+                docs_count, meta_count = self._node_profile_counts(node_state)
+                removed_nodes = 1
+                removed_entities = docs_count
+                removed_meta_entries = meta_count
+            else:
+                removed_nodes = 0
+                removed_entities = 0
+                removed_meta_entries = 0
+        else:
+            removed_nodes = len(current_state)
+            removed_entities = 0
+            removed_meta_entries = 0
+            for node_state in current_state.values():
+                docs_count, meta_count = self._node_profile_counts(node_state)
+                removed_entities += docs_count
+                removed_meta_entries += meta_count
+
+        try:
+            keys_to_delete: List[str] = []
+            if node_id:
+                node_key = str(node_id)
+                keys_to_delete.append(self._profile_redis_snapshot_key(str(pipeline_id), node_key))
+                keys_to_delete.append(self._profile_redis_stats_key(str(pipeline_id), node_key))
+                entity_prefix = self._profile_redis_entity_prefix(str(pipeline_id), node_key)
+                keys_to_delete.extend(list(client.scan_iter(match=f"{entity_prefix}*", count=2000)))
+            else:
+                prefix = self._profile_redis_prefix(str(pipeline_id))
+                keys_to_delete.extend(list(client.scan_iter(match=f"{prefix}*", count=2000)))
+            if keys_to_delete:
+                client.delete(*keys_to_delete)
+        except Exception as exc:
+            logger.warning(f"Failed to clear Redis profile state for pipeline {pipeline_id}: {exc}")
+            return 0, 0, 0
+        return removed_nodes, removed_entities, removed_meta_entries
+
+    def _load_oracle_profile_state_by_node(
+        self,
+        pipeline_id: str,
+        profile_cfg: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        resolved_cfg = self._resolve_profile_oracle_config(profile_cfg)
+        if not resolved_cfg.get("user") or not resolved_cfg.get("password"):
+            # Oracle profile store is optional; skip silently unless explicitly configured.
+            return {}
+        scan_key = json.dumps(
+            {
+                "pipeline_id": str(pipeline_id),
+                "host": resolved_cfg.get("host"),
+                "port": resolved_cfg.get("port"),
+                "service_name": resolved_cfg.get("service_name"),
+                "sid": resolved_cfg.get("sid"),
+                "user": resolved_cfg.get("user"),
+                "dsn": resolved_cfg.get("dsn"),
+                "table": resolved_cfg.get("table"),
+            },
+            sort_keys=True,
+            default=str,
+        )
+        try:
+            blocked_until = float(self._oracle_full_scan_block_until.get(scan_key, 0.0) or 0.0)
+        except Exception:
+            blocked_until = 0.0
+        if blocked_until > pytime.monotonic():
+            return {}
+        conn = None
+        cursor = None
+        try:
+            conn, cfg = self._profile_oracle_connect(profile_cfg)
+            table_sql = self._sanitize_oracle_identifier(str(cfg.get("table") or "ETL_PROFILE_STATE"), "ETL_PROFILE_STATE")
+            self._ensure_profile_oracle_table(conn, table_sql)
+            cursor = conn.cursor()
+            query_sql = (
+                f"SELECT NODE_ID, ENTITY_TOKEN, DOCUMENT_JSON, META_JSON, STATS_JSON "
+                f"FROM {table_sql} "
+                "WHERE PIPELINE_ID = :pipeline_id"
+            )
+            cursor.execute(query_sql, {"pipeline_id": str(pipeline_id)})
+            out: Dict[str, Any] = {}
+            stats_token = self._oracle_profile_stats_token()
+            for row in cursor:
+                node_id = str(row[0] or "").strip()
+                entity_token = str(row[1] or "").strip()
+                if not node_id or not entity_token:
+                    continue
+                node_state = out.get(node_id)
+                if not isinstance(node_state, dict):
+                    node_state = {"documents": {}, "meta": {}, "stats": {}}
+                    out[node_id] = node_state
+                documents = node_state.get("documents")
+                if not isinstance(documents, dict):
+                    documents = {}
+                    node_state["documents"] = documents
+                meta = node_state.get("meta")
+                if not isinstance(meta, dict):
+                    meta = {}
+                    node_state["meta"] = meta
+                stats = node_state.get("stats")
+                if not isinstance(stats, dict):
+                    stats = {}
+                    node_state["stats"] = stats
+
+                if entity_token == stats_token:
+                    parsed_stats = self._oracle_json_to_dict(row[4])
+                    if isinstance(parsed_stats, dict):
+                        node_state["stats"] = parsed_stats
+                    continue
+
+                parsed_doc = self._oracle_json_to_dict(row[2])
+                parsed_meta = self._oracle_json_to_dict(row[3])
+                documents[entity_token] = parsed_doc if isinstance(parsed_doc, dict) else {}
+                meta[entity_token] = parsed_meta if isinstance(parsed_meta, dict) else {}
+            return out
+        except Exception as exc:
+            err_text = str(exc or "")
+            if "ORA-01555" in err_text or "ORA-22924" in err_text:
+                try:
+                    cooldown_seconds = int(
+                        os.getenv("ORACLE_PROFILE_FULL_SCAN_COOLDOWN_SECONDS", "300")
+                    )
+                except Exception:
+                    cooldown_seconds = 300
+                cooldown_seconds = max(30, min(cooldown_seconds, 3600))
+                self._oracle_full_scan_block_until[scan_key] = (
+                    pytime.monotonic() + float(cooldown_seconds)
+                )
+            logger.warning(f"Failed to read Oracle profile state for pipeline {pipeline_id}: {exc}")
+            return {}
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _load_oracle_profile_state_for_node(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        profile_cfg: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Load Oracle profile state for one node only.
+        This avoids full pipeline-wide snapshot scans on large profile tables.
+        """
+        resolved_cfg = self._resolve_profile_oracle_config(profile_cfg)
+        if not resolved_cfg.get("user") or not resolved_cfg.get("password"):
+            return {"documents": {}, "meta": {}, "stats": {}}
+        node_key = str(node_id or "").strip()
+        if not node_key:
+            return {"documents": {}, "meta": {}, "stats": {}}
+        conn = None
+        cursor = None
+        try:
+            conn, cfg = self._profile_oracle_connect(profile_cfg)
+            table_sql = self._sanitize_oracle_identifier(
+                str(cfg.get("table") or "ETL_PROFILE_STATE"),
+                "ETL_PROFILE_STATE",
+            )
+            self._ensure_profile_oracle_table(conn, table_sql)
+            cursor = conn.cursor()
+            query_sql = (
+                f"SELECT ENTITY_TOKEN, DOCUMENT_JSON, META_JSON, STATS_JSON "
+                f"FROM {table_sql} "
+                "WHERE PIPELINE_ID = :pipeline_id "
+                "  AND NODE_ID = :node_id"
+            )
+            cursor.execute(
+                query_sql,
+                {"pipeline_id": str(pipeline_id), "node_id": node_key},
+            )
+            node_state: Dict[str, Any] = {"documents": {}, "meta": {}, "stats": {}}
+            documents = node_state["documents"]
+            meta = node_state["meta"]
+            stats_token = self._oracle_profile_stats_token()
+            for row in cursor:
+                entity_token = str((row[0] if isinstance(row, (list, tuple)) and len(row) > 0 else "") or "").strip()
+                if not entity_token:
+                    continue
+                if entity_token == stats_token:
+                    parsed_stats = self._oracle_json_to_dict(row[3] if isinstance(row, (list, tuple)) and len(row) > 3 else None)
+                    if isinstance(parsed_stats, dict):
+                        node_state["stats"] = parsed_stats
+                    continue
+                parsed_doc = self._oracle_json_to_dict(row[1] if isinstance(row, (list, tuple)) and len(row) > 1 else None)
+                parsed_meta = self._oracle_json_to_dict(row[2] if isinstance(row, (list, tuple)) and len(row) > 2 else None)
+                documents[entity_token] = parsed_doc if isinstance(parsed_doc, dict) else {}
+                meta[entity_token] = parsed_meta if isinstance(parsed_meta, dict) else {}
+            return node_state
+        except Exception as exc:
+            logger.warning(
+                f"Failed to read Oracle profile state for pipeline {pipeline_id}, node {node_key}: {exc}"
+            )
+            return {"documents": {}, "meta": {}, "stats": {}}
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _load_oracle_profile_state_single_entity(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        entity_token: str,
+        profile_cfg: Optional[Dict[str, Any]] = None,
+        oracle_session: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        token = str(entity_token or "").strip()
+        if not token:
+            return {}, {}
+        conn = None
+        cursor = None
+        own_session = False
+        active_session: Optional[Dict[str, Any]] = None
+        try:
+            if isinstance(oracle_session, dict) and oracle_session.get("conn") is not None:
+                active_session = oracle_session
+            else:
+                active_session = self._open_oracle_profile_session(profile_cfg)
+                own_session = True
+            conn = active_session.get("conn")
+            table_sql = str(active_session.get("table_sql") or "ETL_PROFILE_STATE")
+            cursor = conn.cursor()
+            query_sql = (
+                f"SELECT DOCUMENT_JSON, META_JSON "
+                f"FROM {table_sql} "
+                "WHERE PIPELINE_ID = :pipeline_id "
+                "  AND NODE_ID = :node_id "
+                "  AND ENTITY_TOKEN = :entity_token"
+            )
+            cursor.execute(
+                query_sql,
+                {
+                    "pipeline_id": str(pipeline_id),
+                    "node_id": str(node_id),
+                    "entity_token": token,
+                },
+            )
+            row = cursor.fetchone()
+            if not row:
+                return {}, {}
+            doc = self._oracle_json_to_dict(row[0])
+            meta = self._oracle_json_to_dict(row[1])
+            return (
+                doc if isinstance(doc, dict) else {},
+                meta if isinstance(meta, dict) else {},
+            )
+        except Exception as exc:
+            logger.debug(
+                f"Failed Oracle single-entity profile read for pipeline={pipeline_id}, "
+                f"node={node_id}, token={token}: {exc}"
+            )
+            return {}, {}
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if own_session:
+                try:
+                    self._close_oracle_profile_session(active_session, commit=False)
+                except Exception:
+                    pass
+
+    def _load_oracle_profile_node_summary(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        limit: int = 10,
+        profile_cfg: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Lightweight Oracle profile summary for one node.
+        Avoids full pipeline snapshot scans (which can hit ORA-01555 on large tables).
+        """
+        safe_limit = max(1, min(int(limit or 10), 100))
+        resolved_cfg = self._resolve_profile_oracle_config(profile_cfg)
+        if not resolved_cfg.get("user") or not resolved_cfg.get("password"):
+            return {
+                "entity_count": 0,
+                "meta_count": 0,
+                "sample_entity_keys": [],
+                "sample_documents": [],
+            }
+        conn = None
+        cursor = None
+        try:
+            conn, cfg = self._profile_oracle_connect(profile_cfg)
+            table_sql = self._sanitize_oracle_identifier(
+                str(cfg.get("table") or "ETL_PROFILE_STATE"),
+                "ETL_PROFILE_STATE",
+            )
+            self._ensure_profile_oracle_table(conn, table_sql)
+            cursor = conn.cursor()
+            stats_token = self._oracle_profile_stats_token()
+
+            # Exact entity count for this node (stats row excluded).
+            cursor.execute(
+                (
+                    f"SELECT COUNT(1) "
+                    f"FROM {table_sql} "
+                    "WHERE PIPELINE_ID = :pipeline_id "
+                    "  AND NODE_ID = :node_id "
+                    "  AND ENTITY_TOKEN <> :stats_token"
+                ),
+                {
+                    "pipeline_id": str(pipeline_id),
+                    "node_id": str(node_id),
+                    "stats_token": stats_token,
+                },
+            )
+            row = cursor.fetchone()
+            entity_count = int((row[0] if isinstance(row, (list, tuple)) else row) or 0)
+
+            # Small sample only.
+            cursor.execute(
+                (
+                    "SELECT ENTITY_TOKEN, DOCUMENT_JSON "
+                    "FROM ( "
+                    f"  SELECT ENTITY_TOKEN, DOCUMENT_JSON "
+                    f"  FROM {table_sql} "
+                    "  WHERE PIPELINE_ID = :pipeline_id "
+                    "    AND NODE_ID = :node_id "
+                    "    AND ENTITY_TOKEN <> :stats_token "
+                    "  ORDER BY ENTITY_TOKEN "
+                    ") "
+                    "WHERE ROWNUM <= :row_limit"
+                ),
+                {
+                    "pipeline_id": str(pipeline_id),
+                    "node_id": str(node_id),
+                    "stats_token": stats_token,
+                    "row_limit": int(safe_limit),
+                },
+            )
+            sample_entity_keys: List[str] = []
+            sample_documents: List[Dict[str, Any]] = []
+            for sample_row in cursor.fetchall() or []:
+                token = str((sample_row[0] if len(sample_row) > 0 else "") or "").strip()
+                if not token:
+                    continue
+                sample_entity_keys.append(token)
+                parsed_doc = self._oracle_json_to_dict(sample_row[1] if len(sample_row) > 1 else None)
+                sample_documents.append(
+                    {
+                        "entity_key": token,
+                        "profile": self._json_safe_value(parsed_doc if isinstance(parsed_doc, dict) else {}),
+                    }
+                )
+
+            return {
+                "entity_count": int(entity_count),
+                # Oracle profile rows are one row per entity (+stats row), so meta_count follows entity_count.
+                "meta_count": int(entity_count),
+                "sample_entity_keys": sample_entity_keys,
+                "sample_documents": sample_documents,
+            }
+        except Exception as exc:
+            logger.warning(
+                f"Failed to read Oracle profile summary for pipeline {pipeline_id}, node {node_id}: {exc}"
+            )
+            return {
+                "entity_count": 0,
+                "meta_count": 0,
+                "sample_entity_keys": [],
+                "sample_documents": [],
+            }
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _load_oracle_profile_existing_entity_tokens(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        profile_cfg: Optional[Dict[str, Any]] = None,
+        oracle_session: Optional[Dict[str, Any]] = None,
+        max_tokens: int = 300000,
+    ) -> Optional[set]:
+        conn = None
+        cursor = None
+        own_session = False
+        active_session: Optional[Dict[str, Any]] = None
+        out: set = set()
+        try:
+            if isinstance(oracle_session, dict) and oracle_session.get("conn") is not None:
+                active_session = oracle_session
+            else:
+                active_session = self._open_oracle_profile_session(profile_cfg)
+                own_session = True
+            conn = active_session.get("conn")
+            table_sql = str(active_session.get("table_sql") or "ETL_PROFILE_STATE")
+            cursor = conn.cursor()
+            query_sql = (
+                f"SELECT ENTITY_TOKEN "
+                f"FROM {table_sql} "
+                "WHERE PIPELINE_ID = :pipeline_id "
+                "  AND NODE_ID = :node_id "
+                "  AND ENTITY_TOKEN <> :stats_token"
+            )
+            cursor.execute(
+                query_sql,
+                {
+                    "pipeline_id": str(pipeline_id),
+                    "node_id": str(node_id),
+                    "stats_token": self._oracle_profile_stats_token(),
+                },
+            )
+            for row in cursor:
+                token = str((row[0] if isinstance(row, (list, tuple)) else row) or "").strip()
+                if not token:
+                    continue
+                out.add(token)
+                if len(out) > max_tokens:
+                    return None
+            return out
+        except Exception as exc:
+            logger.debug(
+                f"Failed Oracle entity-token backfill index for pipeline={pipeline_id}, "
+                f"node={node_id}: {exc}"
+            )
+            return None
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if own_session:
+                try:
+                    self._close_oracle_profile_session(active_session, commit=False)
+                except Exception:
+                    pass
+
+    def _load_oracle_profile_state_for_entity_tokens(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        entity_tokens: Any,
+        profile_cfg: Optional[Dict[str, Any]] = None,
+        oracle_session: Optional[Dict[str, Any]] = None,
+        chunk_size: int = 500,
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], set]:
+        docs: Dict[str, Dict[str, Any]] = {}
+        meta: Dict[str, Dict[str, Any]] = {}
+        existing_tokens: set = set()
+        normalized_tokens: List[str] = []
+        seen_tokens: set = set()
+        stats_token = self._oracle_profile_stats_token()
+
+        for raw in entity_tokens or []:
+            token_text = str(raw or "").strip()
+            if not token_text or token_text == stats_token or token_text in seen_tokens:
+                continue
+            seen_tokens.add(token_text)
+            normalized_tokens.append(token_text)
+
+        if not normalized_tokens:
+            return docs, meta, existing_tokens
+
+        conn = None
+        cursor = None
+        own_session = False
+        active_session: Optional[Dict[str, Any]] = None
+        try:
+            if isinstance(oracle_session, dict) and oracle_session.get("conn") is not None:
+                active_session = oracle_session
+            else:
+                active_session = self._open_oracle_profile_session(profile_cfg)
+                own_session = True
+            conn = active_session.get("conn")
+            table_sql = str(active_session.get("table_sql") or "ETL_PROFILE_STATE")
+            cursor = conn.cursor()
+
+            safe_chunk = max(1, min(int(chunk_size or 500), 900))
+            for start_idx in range(0, len(normalized_tokens), safe_chunk):
+                token_chunk = normalized_tokens[start_idx:start_idx + safe_chunk]
+                if not token_chunk:
+                    continue
+                bind_names = [f"token_{idx}" for idx in range(len(token_chunk))]
+                in_clause = ", ".join(f":{bind_name}" for bind_name in bind_names)
+                query_sql = (
+                    f"SELECT ENTITY_TOKEN, DOCUMENT_JSON, META_JSON "
+                    f"FROM {table_sql} "
+                    "WHERE PIPELINE_ID = :pipeline_id "
+                    "  AND NODE_ID = :node_id "
+                    f"  AND ENTITY_TOKEN IN ({in_clause})"
+                )
+                bind_params: Dict[str, Any] = {
+                    "pipeline_id": str(pipeline_id),
+                    "node_id": str(node_id),
+                }
+                for bind_name, token_value in zip(bind_names, token_chunk):
+                    bind_params[bind_name] = token_value
+                cursor.execute(query_sql, bind_params)
+                for row in cursor:
+                    token_value = str(
+                        (row[0] if isinstance(row, (list, tuple)) and len(row) > 0 else "") or ""
+                    ).strip()
+                    if not token_value:
+                        continue
+                    existing_tokens.add(token_value)
+                    parsed_doc = self._oracle_json_to_dict(
+                        row[1] if isinstance(row, (list, tuple)) and len(row) > 1 else None
+                    )
+                    parsed_meta = self._oracle_json_to_dict(
+                        row[2] if isinstance(row, (list, tuple)) and len(row) > 2 else None
+                    )
+                    docs[token_value] = parsed_doc if isinstance(parsed_doc, dict) else {}
+                    meta[token_value] = parsed_meta if isinstance(parsed_meta, dict) else {}
+            return docs, meta, existing_tokens
+        except Exception as exc:
+            logger.debug(
+                f"Failed Oracle candidate profile prefetch for pipeline={pipeline_id}, "
+                f"node={node_id}: {exc}"
+            )
+            return {}, {}, set()
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if own_session:
+                try:
+                    self._close_oracle_profile_session(active_session, commit=False)
+                except Exception:
+                    pass
+
+    def _normalize_profile_entity_tokens(self, entity_tokens: Any) -> List[str]:
+        normalized_tokens: List[str] = []
+        seen_tokens: set = set()
+        for raw in entity_tokens or []:
+            token_text = str(raw or "").strip()
+            if not token_text or token_text in seen_tokens:
+                continue
+            seen_tokens.add(token_text)
+            normalized_tokens.append(token_text)
+        return normalized_tokens
+
+    def _load_lmdb_profile_state_for_entity_tokens(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        entity_tokens: Any,
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], set]:
+        docs: Dict[str, Dict[str, Any]] = {}
+        meta: Dict[str, Dict[str, Any]] = {}
+        existing_tokens: set = set()
+        normalized_tokens = self._normalize_profile_entity_tokens(entity_tokens)
+        if not normalized_tokens:
+            return docs, meta, existing_tokens
+        env = self._get_profile_lmdb_env()
+        if env is None:
+            return docs, meta, existing_tokens
+        try:
+            with env.begin(write=False) as txn:
+                for token in normalized_tokens:
+                    raw_value = txn.get(
+                        self._profile_lmdb_entity_key(str(pipeline_id), str(node_id), token)
+                    )
+                    if raw_value is None:
+                        continue
+                    try:
+                        payload = json.loads(raw_value.decode("utf-8"))
+                    except Exception:
+                        payload = {}
+                    if not isinstance(payload, dict):
+                        continue
+                    existing_tokens.add(token)
+                    doc = payload.get("document")
+                    meta_value = payload.get("meta")
+                    docs[token] = doc if isinstance(doc, dict) else {}
+                    meta[token] = meta_value if isinstance(meta_value, dict) else {}
+        except Exception as exc:
+            logger.debug(
+                f"Failed LMDB candidate profile prefetch for pipeline={pipeline_id}, "
+                f"node={node_id}: {exc}"
+            )
+            return {}, {}, set()
+        return docs, meta, existing_tokens
+
+    def _load_rocks_profile_state_for_entity_tokens(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        entity_tokens: Any,
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], set]:
+        docs: Dict[str, Dict[str, Any]] = {}
+        meta: Dict[str, Dict[str, Any]] = {}
+        existing_tokens: set = set()
+        normalized_tokens = self._normalize_profile_entity_tokens(entity_tokens)
+        if not normalized_tokens:
+            return docs, meta, existing_tokens
+        store = self._get_profile_rocksdb_store()
+        if store is None:
+            return docs, meta, existing_tokens
+        try:
+            for token in normalized_tokens:
+                key_text = self._profile_rocks_entity_key(str(pipeline_id), str(node_id), token)
+                raw_value = store.get(key_text)
+                if raw_value is None:
+                    continue
+                try:
+                    payload = json.loads(
+                        self._rocksdb_value_to_bytes(raw_value).decode("utf-8", errors="replace")
+                    )
+                except Exception:
+                    payload = {}
+                if not isinstance(payload, dict):
+                    continue
+                existing_tokens.add(token)
+                doc = payload.get("document")
+                meta_value = payload.get("meta")
+                docs[token] = doc if isinstance(doc, dict) else {}
+                meta[token] = meta_value if isinstance(meta_value, dict) else {}
+        except Exception as exc:
+            logger.debug(
+                f"Failed RocksDB candidate profile prefetch for pipeline={pipeline_id}, "
+                f"node={node_id}: {exc}"
+            )
+            return {}, {}, set()
+        return docs, meta, existing_tokens
+
+    def _load_redis_profile_state_for_entity_tokens(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        entity_tokens: Any,
+        chunk_size: int = 500,
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], set]:
+        docs: Dict[str, Dict[str, Any]] = {}
+        meta: Dict[str, Dict[str, Any]] = {}
+        existing_tokens: set = set()
+        normalized_tokens = self._normalize_profile_entity_tokens(entity_tokens)
+        if not normalized_tokens:
+            return docs, meta, existing_tokens
+        client = self._get_profile_redis_client()
+        if client is None:
+            return docs, meta, existing_tokens
+        safe_chunk = max(1, min(int(chunk_size or 500), 2000))
+        try:
+            for start_idx in range(0, len(normalized_tokens), safe_chunk):
+                token_chunk = normalized_tokens[start_idx:start_idx + safe_chunk]
+                keys = [
+                    self._profile_redis_entity_key(str(pipeline_id), str(node_id), token)
+                    for token in token_chunk
+                ]
+                values = client.mget(keys)
+                for token, raw_value in zip(token_chunk, values):
+                    if raw_value is None:
+                        continue
+                    try:
+                        payload = json.loads(str(raw_value))
+                    except Exception:
+                        payload = {}
+                    if not isinstance(payload, dict):
+                        continue
+                    existing_tokens.add(token)
+                    doc = payload.get("document")
+                    meta_value = payload.get("meta")
+                    docs[token] = doc if isinstance(doc, dict) else {}
+                    meta[token] = meta_value if isinstance(meta_value, dict) else {}
+        except Exception as exc:
+            logger.debug(
+                f"Failed Redis candidate profile prefetch for pipeline={pipeline_id}, "
+                f"node={node_id}: {exc}"
+            )
+            return {}, {}, set()
+        return docs, meta, existing_tokens
+
+    def _load_profile_state_for_entity_tokens(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        entity_tokens: Any,
+        storage: str = "lmdb",
+        profile_cfg: Optional[Dict[str, Any]] = None,
+        oracle_session: Optional[Dict[str, Any]] = None,
+        chunk_size: int = 500,
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], set]:
+        normalized = self._normalize_profile_storage(storage)
+        if normalized == "oracle":
+            return self._load_oracle_profile_state_for_entity_tokens(
+                pipeline_id,
+                node_id,
+                entity_tokens,
+                profile_cfg=profile_cfg,
+                oracle_session=oracle_session,
+                chunk_size=chunk_size,
+            )
+        if normalized == "rocksdb":
+            return self._load_rocks_profile_state_for_entity_tokens(
+                pipeline_id,
+                node_id,
+                entity_tokens,
+            )
+        if normalized == "redis":
+            return self._load_redis_profile_state_for_entity_tokens(
+                pipeline_id,
+                node_id,
+                entity_tokens,
+                chunk_size=chunk_size,
+            )
+        return self._load_lmdb_profile_state_for_entity_tokens(
+            pipeline_id,
+            node_id,
+            entity_tokens,
+        )
+
+    def _has_oracle_profile_state_for_node(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        profile_cfg: Optional[Dict[str, Any]] = None,
+        oracle_session: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        conn = None
+        cursor = None
+        own_session = False
+        active_session: Optional[Dict[str, Any]] = None
+        try:
+            if isinstance(oracle_session, dict) and oracle_session.get("conn") is not None:
+                active_session = oracle_session
+            else:
+                active_session = self._open_oracle_profile_session(profile_cfg)
+                own_session = True
+            conn = active_session.get("conn")
+            table_sql = str(active_session.get("table_sql") or "ETL_PROFILE_STATE")
+            cursor = conn.cursor()
+            query_sql = (
+                f"SELECT 1 FROM {table_sql} "
+                "WHERE PIPELINE_ID = :pipeline_id "
+                "  AND NODE_ID = :node_id "
+                "  AND ROWNUM = 1"
+            )
+            cursor.execute(query_sql, {"pipeline_id": str(pipeline_id), "node_id": str(node_id)})
+            return cursor.fetchone() is not None
+        except Exception:
+            return False
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if own_session:
+                try:
+                    self._close_oracle_profile_session(active_session, commit=False)
+                except Exception:
+                    pass
+
+    def _save_oracle_profile_state_single_node(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        node_state: Dict[str, Any],
+        changed_tokens: Optional[List[str]] = None,
+        profile_cfg: Optional[Dict[str, Any]] = None,
+        oracle_session: Optional[Dict[str, Any]] = None,
+        auto_commit: bool = True,
+    ) -> bool:
+        parallel_table_sql: Optional[str] = None
+        parallel_column_specs: Optional[Dict[str, Dict[str, Any]]] = None
+
+        def _save_changed_token_batch(batch_tokens: List[str]) -> Tuple[bool, str]:
+            batch_conn = None
+            batch_cursor = None
+            try:
+                batch_conn, batch_cfg = self._profile_oracle_connect(effective_profile_cfg)
+                batch_table_sql = (
+                    str(parallel_table_sql).strip()
+                    if str(parallel_table_sql or "").strip()
+                    else self._sanitize_oracle_identifier(
+                        str(batch_cfg.get("table") or "ETL_PROFILE_STATE"),
+                        "ETL_PROFILE_STATE",
+                    )
+                )
+                batch_column_specs = (
+                    parallel_column_specs
+                    if isinstance(parallel_column_specs, dict) and parallel_column_specs
+                    else self._oracle_profile_table_column_specs(batch_conn, batch_table_sql)
+                )
+                batch_cursor = batch_conn.cursor()
+                batch_payloads: List[Dict[str, Any]] = []
+                for token in batch_tokens:
+                    token_text = str(token or "").strip()
+                    if not token_text:
+                        continue
+                    doc_value = docs.get(token_text)
+                    meta_value = meta.get(token_text)
+                    batch_payloads.append({
+                        "pipeline_id": str(pipeline_id),
+                        "node_id": str(node_id),
+                        "entity_token": token_text,
+                        "document_json": json.dumps(
+                            self._json_safe_value(doc_value if isinstance(doc_value, dict) else {}),
+                            ensure_ascii=False,
+                        ),
+                        "meta_json": json.dumps(
+                            self._json_safe_value(meta_value if isinstance(meta_value, dict) else {}),
+                            ensure_ascii=False,
+                        ),
+                        "stats_json": None,
+                    })
+                self._oracle_profile_upsert_many(
+                    batch_cursor,
+                    batch_table_sql,
+                    batch_payloads,
+                    chunk_size=oracle_merge_batch_size,
+                    column_specs=batch_column_specs,
+                )
+                if batch_conn is not None:
+                    batch_conn.commit()
+                return True, ""
+            except Exception as exc:
+                err_text = str(exc or "")
+                logger.warning(
+                    f"Failed Oracle parallel profile token batch persist for pipeline {pipeline_id}, "
+                    f"node {node_id}: {err_text}"
+                )
+                if batch_conn is not None:
+                    try:
+                        batch_conn.rollback()
+                    except Exception:
+                        pass
+                return False, err_text
+            finally:
+                if batch_cursor is not None:
+                    try:
+                        batch_cursor.close()
+                    except Exception:
+                        pass
+                if batch_conn is not None:
+                    try:
+                        batch_conn.close()
+                    except Exception:
+                        pass
+
+        def _save_stats_row() -> bool:
+            stats_session: Optional[Dict[str, Any]] = None
+            stats_conn = None
+            stats_cursor = None
+            try:
+                stats_session = self._open_oracle_profile_session(effective_profile_cfg)
+                stats_conn = stats_session.get("conn")
+                stats_table_sql = str(stats_session.get("table_sql") or "ETL_PROFILE_STATE")
+                stats_column_specs = (
+                    stats_session.get("column_specs")
+                    if isinstance(stats_session.get("column_specs"), dict)
+                    else None
+                )
+                stats_cursor = stats_conn.cursor()
+                stats_payload = {
+                    "pipeline_id": str(pipeline_id),
+                    "node_id": str(node_id),
+                    "entity_token": stats_token,
+                    "document_json": None,
+                    "meta_json": None,
+                    "stats_json": json.dumps(self._json_safe_value(stats), ensure_ascii=False),
+                }
+                self._oracle_profile_upsert_many(
+                    stats_cursor,
+                    stats_table_sql,
+                    [stats_payload],
+                    chunk_size=1,
+                    column_specs=stats_column_specs,
+                )
+                if stats_conn is not None:
+                    stats_conn.commit()
+                return True
+            except Exception as exc:
+                logger.warning(
+                    f"Failed Oracle parallel profile stats persist for pipeline {pipeline_id}, "
+                    f"node {node_id}: {exc}"
+                )
+                if stats_conn is not None:
+                    try:
+                        stats_conn.rollback()
+                    except Exception:
+                        pass
+                return False
+            finally:
+                if stats_cursor is not None:
+                    try:
+                        stats_cursor.close()
+                    except Exception:
+                        pass
+                if stats_session is not None:
+                    try:
+                        self._close_oracle_profile_session(
+                            stats_session,
+                            commit=False,
+                            rollback_on_error=False,
+                        )
+                    except Exception:
+                        pass
+
+        node_dict = node_state if isinstance(node_state, dict) else {}
+        docs = node_dict.get("documents") if isinstance(node_dict.get("documents"), dict) else {}
+        meta = node_dict.get("meta") if isinstance(node_dict.get("meta"), dict) else {}
+        stats = node_dict.get("stats") if isinstance(node_dict.get("stats"), dict) else {}
+        stats_token = self._oracle_profile_stats_token()
+        changed: List[str] = []
+        changed_seen: set = set()
+        for token in (changed_tokens or []):
+            token_text = str(token or "").strip()
+            if not token_text or token_text in changed_seen:
+                continue
+            changed_seen.add(token_text)
+            changed.append(token_text)
+
+        effective_profile_cfg: Optional[Dict[str, Any]] = None
+        if isinstance(profile_cfg, dict):
+            effective_profile_cfg = profile_cfg
+        elif isinstance(oracle_session, dict):
+            session_profile_cfg = oracle_session.get("profile_cfg")
+            if isinstance(session_profile_cfg, dict):
+                effective_profile_cfg = session_profile_cfg
+        resolved_cfg = self._resolve_profile_oracle_config(effective_profile_cfg)
+        oracle_write_strategy = self._normalize_oracle_profile_write_strategy(
+            resolved_cfg.get("write_strategy")
+        )
+        oracle_parallel_workers = max(
+            2,
+            min(
+                int(resolved_cfg.get("parallel_workers") or 4),
+                16,
+            ),
+        )
+        oracle_parallel_min_tokens = max(
+            1,
+            min(
+                int(resolved_cfg.get("parallel_min_tokens") or 2000),
+                1_000_000,
+            ),
+        )
+        oracle_parallel_force = bool(resolved_cfg.get("parallel_force", False))
+        oracle_merge_batch_size = max(
+            50,
+            min(
+                int(resolved_cfg.get("merge_batch_size") or 500),
+                2000,
+            ),
+        )
+        parallel_worker_target = min(
+            oracle_parallel_workers,
+            max(1, int(math.ceil(float(len(changed) or 0) / float(max(1, oracle_merge_batch_size)))))
+        )
+        use_parallel_changed_persist = (
+            bool(changed)
+            and oracle_write_strategy == "parallel_key"
+            and auto_commit
+            and (oracle_parallel_force or len(changed) >= oracle_parallel_min_tokens)
+            and parallel_worker_target >= 2
+        )
+        if use_parallel_changed_persist:
+            bootstrap_session: Optional[Dict[str, Any]] = None
+            try:
+                if isinstance(oracle_session, dict) and oracle_session.get("conn") is not None:
+                    bootstrap_conn = oracle_session.get("conn")
+                    bootstrap_table_sql = str(oracle_session.get("table_sql") or "ETL_PROFILE_STATE")
+                    self._ensure_profile_oracle_table(bootstrap_conn, bootstrap_table_sql)
+                    bootstrap_specs = (
+                        oracle_session.get("column_specs")
+                        if isinstance(oracle_session.get("column_specs"), dict)
+                        else self._oracle_profile_table_column_specs(bootstrap_conn, bootstrap_table_sql)
+                    )
+                    parallel_table_sql = str(bootstrap_table_sql or "ETL_PROFILE_STATE")
+                    parallel_column_specs = bootstrap_specs if isinstance(bootstrap_specs, dict) else {}
+                else:
+                    bootstrap_session = self._open_oracle_profile_session(effective_profile_cfg)
+                    parallel_table_sql = str(bootstrap_session.get("table_sql") or "ETL_PROFILE_STATE")
+                    bootstrap_specs = (
+                        bootstrap_session.get("column_specs")
+                        if isinstance(bootstrap_session.get("column_specs"), dict)
+                        else None
+                    )
+                    parallel_column_specs = bootstrap_specs if isinstance(bootstrap_specs, dict) else {}
+            except Exception as bootstrap_exc:
+                logger.warning(
+                    f"Failed to prepare Oracle parallel profile persist context for pipeline {pipeline_id}, "
+                    f"node {node_id}: {bootstrap_exc}"
+                )
+                use_parallel_changed_persist = False
+            finally:
+                if bootstrap_session is not None:
+                    try:
+                        self._close_oracle_profile_session(
+                            bootstrap_session,
+                            commit=False,
+                            rollback_on_error=False,
+                        )
+                    except Exception:
+                        pass
+        if use_parallel_changed_persist:
+            partitions: List[List[str]] = [[] for _ in range(min(parallel_worker_target, len(changed)))]
+            for token in changed:
+                idx = abs(hash(token)) % len(partitions)
+                partitions[idx].append(token)
+            batches = [batch for batch in partitions if batch]
+            if not batches:
+                batches = [changed]
+            max_workers = max(1, min(len(batches), parallel_worker_target))
+            parallel_ok = True
+            failed_batches: List[Tuple[List[str], str]] = []
+            fallback_logged = False
+            try:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {
+                        executor.submit(_save_changed_token_batch, batch): batch
+                        for batch in batches
+                    }
+                    for future in as_completed(futures):
+                        batch = futures.get(future) or []
+                        ok, err_text = future.result()
+                        if not bool(ok):
+                            failed_batches.append((batch, str(err_text or "")))
+            except Exception as exc:
+                logger.warning(
+                    f"Failed Oracle parallel profile persist execution for pipeline {pipeline_id}, "
+                    f"node {node_id}: {exc}"
+                )
+                parallel_ok = False
+            if failed_batches:
+                retry_failures: List[Tuple[List[str], str]] = []
+                for batch, prev_err in failed_batches:
+                    ok, retry_err = _save_changed_token_batch(batch)
+                    if not bool(ok):
+                        retry_failures.append((batch, str(retry_err or prev_err or "")))
+                if retry_failures:
+                    parallel_ok = False
+                    sample_errors = "; ".join(
+                        [
+                            f"batch={len(batch):,} err={err[:180]}"
+                            for batch, err in retry_failures[:3]
+                        ]
+                    )
+                    if len(retry_failures) > 3:
+                        sample_errors = f"{sample_errors}; ..."
+                    logger.warning(
+                        f"Falling back to single-session Oracle profile persist for pipeline {pipeline_id}, "
+                        f"node {node_id} after parallel persist failure. "
+                        f"failed_batches={len(retry_failures)}; {sample_errors}"
+                    )
+                    fallback_logged = True
+                else:
+                    parallel_ok = True
+            if not parallel_ok:
+                if not fallback_logged:
+                    logger.warning(
+                        f"Falling back to single-session Oracle profile persist for pipeline {pipeline_id}, "
+                        f"node {node_id} after parallel persist failure."
+                    )
+            else:
+                return _save_stats_row()
+
+        conn = None
+        cursor = None
+        own_session = False
+        active_session: Optional[Dict[str, Any]] = None
+        try:
+            if isinstance(oracle_session, dict) and oracle_session.get("conn") is not None:
+                active_session = oracle_session
+            else:
+                active_session = self._open_oracle_profile_session(profile_cfg)
+                own_session = True
+            conn = active_session.get("conn")
+            table_sql = str(active_session.get("table_sql") or "ETL_PROFILE_STATE")
+            active_column_specs = (
+                active_session.get("column_specs")
+                if isinstance(active_session.get("column_specs"), dict)
+                else None
+            )
+            cursor = conn.cursor()
+
+            if changed:
+                changed_payloads: List[Dict[str, Any]] = []
+                for token in changed:
+                    doc_value = docs.get(token)
+                    meta_value = meta.get(token)
+                    changed_payloads.append({
+                        "pipeline_id": str(pipeline_id),
+                        "node_id": str(node_id),
+                        "entity_token": token,
+                        "document_json": json.dumps(self._json_safe_value(doc_value if isinstance(doc_value, dict) else {}), ensure_ascii=False),
+                        "meta_json": json.dumps(self._json_safe_value(meta_value if isinstance(meta_value, dict) else {}), ensure_ascii=False),
+                        "stats_json": None,
+                    })
+                stats_payload = {
+                    "pipeline_id": str(pipeline_id),
+                    "node_id": str(node_id),
+                    "entity_token": stats_token,
+                    "document_json": None,
+                    "meta_json": None,
+                    "stats_json": json.dumps(self._json_safe_value(stats), ensure_ascii=False),
+                }
+                changed_payloads.append(stats_payload)
+                self._oracle_profile_upsert_many(
+                    cursor,
+                    table_sql,
+                    changed_payloads,
+                    chunk_size=oracle_merge_batch_size,
+                    column_specs=active_column_specs,
+                )
+            else:
+                delete_sql = (
+                    f"DELETE FROM {table_sql} "
+                    "WHERE PIPELINE_ID = :pipeline_id "
+                    "  AND NODE_ID = :node_id"
+                )
+                cursor.execute(delete_sql, {"pipeline_id": str(pipeline_id), "node_id": str(node_id)})
+                snapshot_payloads: List[Dict[str, Any]] = []
+                for token, doc_value in docs.items():
+                    token_text = str(token or "").strip()
+                    if not token_text:
+                        continue
+                    meta_value = meta.get(token_text)
+                    snapshot_payloads.append({
+                        "pipeline_id": str(pipeline_id),
+                        "node_id": str(node_id),
+                        "entity_token": token_text,
+                        "document_json": json.dumps(self._json_safe_value(doc_value if isinstance(doc_value, dict) else {}), ensure_ascii=False),
+                        "meta_json": json.dumps(self._json_safe_value(meta_value if isinstance(meta_value, dict) else {}), ensure_ascii=False),
+                        "stats_json": None,
+                    })
+                stats_payload = {
+                    "pipeline_id": str(pipeline_id),
+                    "node_id": str(node_id),
+                    "entity_token": stats_token,
+                    "document_json": None,
+                    "meta_json": None,
+                    "stats_json": json.dumps(self._json_safe_value(stats), ensure_ascii=False),
+                }
+                snapshot_payloads.append(stats_payload)
+                self._oracle_profile_upsert_many(
+                    cursor,
+                    table_sql,
+                    snapshot_payloads,
+                    chunk_size=oracle_merge_batch_size,
+                    column_specs=active_column_specs,
+                )
+
+            if auto_commit and conn is not None:
+                conn.commit()
+            return True
+        except Exception as exc:
+            logger.warning(
+                f"Failed to persist Oracle profile state for pipeline {pipeline_id}, node {node_id}: {exc}"
+            )
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            return False
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if own_session:
+                try:
+                    self._close_oracle_profile_session(
+                        active_session,
+                        commit=False,
+                        rollback_on_error=False,
+                    )
+                except Exception:
+                    pass
+
+    def _clear_oracle_profile_state_by_node(
+        self,
+        pipeline_id: str,
+        node_id: Optional[str] = None,
+        profile_cfg: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[int, int, int]:
+        resolved_cfg = self._resolve_profile_oracle_config(profile_cfg)
+        if not resolved_cfg.get("user") or not resolved_cfg.get("password"):
+            return 0, 0, 0
+        current_state = self._load_oracle_profile_state_by_node(str(pipeline_id), profile_cfg=profile_cfg)
+        if node_id:
+            node_state = current_state.get(str(node_id))
+            if isinstance(node_state, dict):
+                docs_count, meta_count = self._node_profile_counts(node_state)
+                removed_nodes = 1
+                removed_entities = docs_count
+                removed_meta_entries = meta_count
+            else:
+                removed_nodes = 0
+                removed_entities = 0
+                removed_meta_entries = 0
+        else:
+            removed_nodes = len(current_state)
+            removed_entities = 0
+            removed_meta_entries = 0
+            for node_state in current_state.values():
+                docs_count, meta_count = self._node_profile_counts(node_state)
+                removed_entities += docs_count
+                removed_meta_entries += meta_count
+
+        conn = None
+        cursor = None
+        try:
+            conn, cfg = self._profile_oracle_connect(profile_cfg)
+            table_sql = self._sanitize_oracle_identifier(str(cfg.get("table") or "ETL_PROFILE_STATE"), "ETL_PROFILE_STATE")
+            self._ensure_profile_oracle_table(conn, table_sql)
+            cursor = conn.cursor()
+            if node_id:
+                delete_sql = (
+                    f"DELETE FROM {table_sql} "
+                    "WHERE PIPELINE_ID = :pipeline_id "
+                    "  AND NODE_ID = :node_id"
+                )
+                cursor.execute(delete_sql, {"pipeline_id": str(pipeline_id), "node_id": str(node_id)})
+            else:
+                delete_sql = f"DELETE FROM {table_sql} WHERE PIPELINE_ID = :pipeline_id"
+                cursor.execute(delete_sql, {"pipeline_id": str(pipeline_id)})
+            conn.commit()
+            return removed_nodes, removed_entities, removed_meta_entries
+        except Exception as exc:
+            logger.warning(f"Failed to clear Oracle profile state for pipeline {pipeline_id}: {exc}")
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            return 0, 0, 0
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _load_rocks_profile_state_by_node(self, pipeline_id: str) -> Dict[str, Any]:
+        store = self._get_profile_rocksdb_store()
+        if store is None:
+            return {}
+        prefix = self._profile_rocks_prefix(str(pipeline_id))
+        snapshot_state: Dict[str, Dict[str, Any]] = {}
+        delta_docs: Dict[str, Dict[str, Any]] = {}
+        delta_meta: Dict[str, Dict[str, Any]] = {}
+        delta_stats: Dict[str, Dict[str, Any]] = {}
+        try:
+            for raw_key, raw_value in self._rocksdb_iter_items(store):
+                key_text = self._rocksdb_key_to_text(raw_key)
+                if not key_text.startswith(prefix):
+                    continue
+                suffix = key_text[len(prefix):]
+                if not suffix:
+                    continue
+                try:
+                    value_text = self._rocksdb_value_to_bytes(raw_value).decode("utf-8", errors="replace")
+                    payload = json.loads(value_text)
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+
+                if suffix.startswith("@e::"):
+                    parts = suffix.split("::", 2)
+                    if len(parts) < 3:
+                        continue
+                    node_id = str(parts[1] or "").strip()
+                    entity_token = str(parts[2] or "").strip()
+                    if not node_id or not entity_token:
+                        continue
+                    if "document" in payload and isinstance(payload.get("document"), dict):
+                        delta_docs.setdefault(node_id, {})[entity_token] = payload.get("document")
+                    if "meta" in payload and isinstance(payload.get("meta"), dict):
+                        delta_meta.setdefault(node_id, {})[entity_token] = payload.get("meta")
+                    continue
+
+                if suffix.startswith("@s::"):
+                    parts = suffix.split("::", 1)
+                    if len(parts) < 2:
+                        continue
+                    node_id = str(parts[1] or "").strip()
+                    if not node_id:
+                        continue
+                    delta_stats[node_id] = payload if isinstance(payload, dict) else {}
+                    continue
+
+                node_id = suffix
+                docs = payload.get("documents")
+                meta = payload.get("meta")
+                stats = payload.get("stats")
+                snapshot_state[str(node_id)] = {
+                    "documents": docs if isinstance(docs, dict) else {},
+                    "meta": meta if isinstance(meta, dict) else {},
+                    "stats": stats if isinstance(stats, dict) else {},
+                }
+        except Exception as exc:
+            logger.warning(f"Failed to read RocksDB profile state for pipeline {pipeline_id}: {exc}")
+            return {}
+
+        out: Dict[str, Any] = {}
+        for node_id, node_payload in snapshot_state.items():
+            node_dict = node_payload if isinstance(node_payload, dict) else {}
+            out[str(node_id)] = {
+                "documents": dict(node_dict.get("documents") or {}) if isinstance(node_dict.get("documents"), dict) else {},
+                "meta": dict(node_dict.get("meta") or {}) if isinstance(node_dict.get("meta"), dict) else {},
+                "stats": dict(node_dict.get("stats") or {}) if isinstance(node_dict.get("stats"), dict) else {},
+            }
+
+        all_delta_nodes = set(delta_docs.keys()) | set(delta_meta.keys()) | set(delta_stats.keys())
+        for node_id in all_delta_nodes:
+            node_out = out.get(node_id)
+            if not isinstance(node_out, dict):
+                node_out = {"documents": {}, "meta": {}, "stats": {}}
+                out[node_id] = node_out
+            docs_out = node_out.get("documents")
+            if not isinstance(docs_out, dict):
+                docs_out = {}
+                node_out["documents"] = docs_out
+            meta_out = node_out.get("meta")
+            if not isinstance(meta_out, dict):
+                meta_out = {}
+                node_out["meta"] = meta_out
+
+            for entity_token, doc_value in (delta_docs.get(node_id) or {}).items():
+                if isinstance(doc_value, dict):
+                    docs_out[str(entity_token)] = doc_value
+            for entity_token, meta_value in (delta_meta.get(node_id) or {}).items():
+                if isinstance(meta_value, dict):
+                    meta_out[str(entity_token)] = meta_value
+
+            stats_value = delta_stats.get(node_id)
+            if isinstance(stats_value, dict):
+                node_out["stats"] = stats_value
+
+        return out
+
+    def _load_rocks_profile_state_single_entity(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        entity_token: str,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        store = self._get_profile_rocksdb_store()
+        if store is None:
+            return {}, {}
+        token = str(entity_token or "").strip()
+        if not token:
+            return {}, {}
+        key_text = self._profile_rocks_entity_key(str(pipeline_id), str(node_id), token)
+        try:
+            raw_value = store.get(key_text)
+            if raw_value is None:
+                return {}, {}
+            payload_text = self._rocksdb_value_to_bytes(raw_value).decode("utf-8", errors="replace")
+            payload = json.loads(payload_text)
+            if not isinstance(payload, dict):
+                return {}, {}
+            doc = payload.get("document")
+            meta = payload.get("meta")
+            return (
+                doc if isinstance(doc, dict) else {},
+                meta if isinstance(meta, dict) else {},
+            )
+        except Exception as exc:
+            logger.debug(
+                f"Failed RocksDB single-entity profile read for pipeline={pipeline_id}, "
+                f"node={node_id}, token={token}: {exc}"
+            )
+        return {}, {}
+
+    def _has_rocks_profile_state_for_node(self, pipeline_id: str, node_id: str) -> bool:
+        store = self._get_profile_rocksdb_store()
+        if store is None:
+            return False
+        stats_key = self._profile_rocks_stats_key(str(pipeline_id), str(node_id))
+        snapshot_key = self._profile_rocks_snapshot_key(str(pipeline_id), str(node_id))
+        entity_prefix = self._profile_rocks_entity_prefix(str(pipeline_id), str(node_id))
+        try:
+            if store.get(stats_key) is not None:
+                return True
+            if store.get(snapshot_key) is not None:
+                return True
+            for raw_key, _ in self._rocksdb_iter_items(store):
+                key_text = self._rocksdb_key_to_text(raw_key)
+                if key_text.startswith(entity_prefix):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _save_rocks_profile_state_single_node(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        node_state: Dict[str, Any],
+        changed_tokens: Optional[List[str]] = None,
+    ) -> bool:
+        store = self._get_profile_rocksdb_store()
+        if store is None:
+            return False
+        node_dict = node_state if isinstance(node_state, dict) else {}
+        docs = node_dict.get("documents") if isinstance(node_dict.get("documents"), dict) else {}
+        meta = node_dict.get("meta") if isinstance(node_dict.get("meta"), dict) else {}
+        stats = node_dict.get("stats") if isinstance(node_dict.get("stats"), dict) else {}
+        changed = [
+            str(token).strip()
+            for token in (changed_tokens or [])
+            if str(token).strip()
+        ]
+        # Keep only first occurrence for stable batched writes.
+        if changed:
+            seen_changed = set()
+            changed = [token for token in changed if not (token in seen_changed or seen_changed.add(token))]
+        write_opt = self._get_profile_rocksdb_write_options()
+        try:
+            if changed:
+                # Fast path: commit changed entities + stats as one RocksDB WriteBatch.
+                batch_written = False
+                try:
+                    batch = _rocksdict.WriteBatch()
+                    for token in changed:
+                        doc_value = docs.get(token)
+                        meta_value = meta.get(token)
+                        payload = {
+                            "document": self._json_safe_value(doc_value if isinstance(doc_value, dict) else {}),
+                            "meta": self._json_safe_value(meta_value if isinstance(meta_value, dict) else {}),
+                        }
+                        batch.put(
+                            self._profile_rocks_entity_key(str(pipeline_id), str(node_id), token),
+                            json.dumps(payload, ensure_ascii=False),
+                        )
+                    batch.put(
+                        self._profile_rocks_stats_key(str(pipeline_id), str(node_id)),
+                        json.dumps(self._json_safe_value(stats), ensure_ascii=False),
+                    )
+                    if not batch.is_empty():
+                        store.write(batch, write_opt)
+                    batch_written = True
+                except Exception:
+                    batch_written = False
+                if not batch_written:
+                    # Fallback for compatibility with older rocksdict/engines.
+                    for token in changed:
+                        doc_value = docs.get(token)
+                        meta_value = meta.get(token)
+                        payload = {
+                            "document": self._json_safe_value(doc_value if isinstance(doc_value, dict) else {}),
+                            "meta": self._json_safe_value(meta_value if isinstance(meta_value, dict) else {}),
+                        }
+                        store.put(
+                            self._profile_rocks_entity_key(str(pipeline_id), str(node_id), token),
+                            json.dumps(payload, ensure_ascii=False),
+                            write_opt,
+                        )
+                    store.put(
+                        self._profile_rocks_stats_key(str(pipeline_id), str(node_id)),
+                        json.dumps(self._json_safe_value(stats), ensure_ascii=False),
+                        write_opt,
+                    )
+            else:
+                safe_node_state = self._json_safe_value(node_dict)
+                docs_safe = safe_node_state.get("documents") if isinstance(safe_node_state, dict) else {}
+                meta_safe = safe_node_state.get("meta") if isinstance(safe_node_state, dict) else {}
+                stats_safe = safe_node_state.get("stats") if isinstance(safe_node_state, dict) else {}
+                payload = {
+                    "documents": docs_safe if isinstance(docs_safe, dict) else {},
+                    "meta": meta_safe if isinstance(meta_safe, dict) else {},
+                    "stats": stats_safe if isinstance(stats_safe, dict) else {},
+                }
+                snapshot_key = self._profile_rocks_snapshot_key(str(pipeline_id), str(node_id))
+                payload_text = json.dumps(payload, ensure_ascii=False)
+                try:
+                    batch = _rocksdict.WriteBatch()
+                    batch.put(snapshot_key, payload_text)
+                    store.write(batch, write_opt)
+                except Exception:
+                    store.put(snapshot_key, payload_text, write_opt)
+            return True
+        except Exception as exc:
+            logger.warning(
+                f"Failed to persist RocksDB profile state for pipeline {pipeline_id}, node {node_id}: {exc}"
+            )
+            return False
+
+    def _clear_rocks_profile_state_by_node(
+        self,
+        pipeline_id: str,
+        node_id: Optional[str] = None,
+    ) -> Tuple[int, int, int]:
+        store = self._get_profile_rocksdb_store()
+        if store is None:
+            return 0, 0, 0
+
+        current_state = self._load_rocks_profile_state_by_node(str(pipeline_id))
+        if node_id:
+            node_state = current_state.get(str(node_id))
+            if isinstance(node_state, dict):
+                docs_count, meta_count = self._node_profile_counts(node_state)
+                removed_nodes = 1
+                removed_entities = docs_count
+                removed_meta_entries = meta_count
+            else:
+                removed_nodes = 0
+                removed_entities = 0
+                removed_meta_entries = 0
+        else:
+            removed_nodes = len(current_state)
+            removed_entities = 0
+            removed_meta_entries = 0
+            for node_state in current_state.values():
+                docs_count, meta_count = self._node_profile_counts(node_state)
+                removed_entities += docs_count
+                removed_meta_entries += meta_count
+
+        prefix = self._profile_rocks_prefix(str(pipeline_id))
+        keys_to_delete: List[str] = []
+        try:
+            if node_id:
+                node_key = str(node_id)
+                keys_to_delete.append(self._profile_rocks_snapshot_key(str(pipeline_id), node_key))
+                keys_to_delete.append(self._profile_rocks_stats_key(str(pipeline_id), node_key))
+                entity_prefix = self._profile_rocks_entity_prefix(str(pipeline_id), node_key)
+                for raw_key, _ in self._rocksdb_iter_items(store):
+                    key_text = self._rocksdb_key_to_text(raw_key)
+                    if key_text.startswith(entity_prefix):
+                        keys_to_delete.append(key_text)
+            else:
+                for raw_key, _ in self._rocksdb_iter_items(store):
+                    key_text = self._rocksdb_key_to_text(raw_key)
+                    if key_text.startswith(prefix):
+                        keys_to_delete.append(key_text)
+
+            for key_text in keys_to_delete:
+                try:
+                    del store[key_text]
+                except Exception:
+                    continue
+        except Exception as exc:
+            logger.warning(f"Failed to clear RocksDB profile state for pipeline {pipeline_id}: {exc}")
+            return 0, 0, 0
+        return removed_nodes, removed_entities, removed_meta_entries
+
+    def _load_profile_state_by_node(
+        self,
+        pipeline_id: str,
+        include_oracle: bool = True,
+    ) -> Dict[str, Any]:
         pipeline_key = str(pipeline_id)
+        combined_state: Dict[str, Any] = {}
+
         lmdb_state = self._load_lmdb_profile_state_by_node(pipeline_key)
-        if lmdb_state:
-            return lmdb_state
+        if isinstance(lmdb_state, dict) and lmdb_state:
+            combined_state.update(lmdb_state)
+
+        rocks_state = self._load_rocks_profile_state_by_node(pipeline_key)
+        if isinstance(rocks_state, dict) and rocks_state:
+            # If same node exists in both stores, RocksDB wins.
+            combined_state.update(rocks_state)
+
+        redis_state = self._load_redis_profile_state_by_node(pipeline_key)
+        if isinstance(redis_state, dict) and redis_state:
+            # If same node exists across stores, Redis wins.
+            combined_state.update(redis_state)
+
+        if include_oracle:
+            oracle_state = self._load_oracle_profile_state_by_node(pipeline_key)
+            if isinstance(oracle_state, dict) and oracle_state:
+                # If same node exists across stores, Oracle wins.
+                combined_state.update(oracle_state)
+
+        if combined_state:
+            return combined_state
 
         runtime_state = self._load_runtime_profile_state_by_node(pipeline_key)
         # One-time migration of legacy JSON runtime profile state into LMDB.
@@ -560,16 +3822,109 @@ class ETLEngine:
             )
         return {}
 
+    def _has_profile_state_for_node(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        storage: str = "lmdb",
+        profile_cfg: Optional[Dict[str, Any]] = None,
+        oracle_session: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        normalized = self._normalize_profile_storage(storage)
+        if normalized == "rocksdb":
+            return self._has_rocks_profile_state_for_node(pipeline_id, node_id)
+        if normalized == "redis":
+            return self._has_redis_profile_state_for_node(pipeline_id, node_id)
+        if normalized == "oracle":
+            return self._has_oracle_profile_state_for_node(
+                pipeline_id,
+                node_id,
+                profile_cfg=profile_cfg,
+                oracle_session=oracle_session,
+            )
+        return self._has_lmdb_profile_state_for_node(pipeline_id, node_id)
+
+    def _load_profile_state_single_entity(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        entity_token: str,
+        storage: str = "lmdb",
+        profile_cfg: Optional[Dict[str, Any]] = None,
+        oracle_session: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        normalized = self._normalize_profile_storage(storage)
+        if normalized == "rocksdb":
+            return self._load_rocks_profile_state_single_entity(pipeline_id, node_id, entity_token)
+        if normalized == "redis":
+            return self._load_redis_profile_state_single_entity(pipeline_id, node_id, entity_token)
+        if normalized == "oracle":
+            return self._load_oracle_profile_state_single_entity(
+                pipeline_id,
+                node_id,
+                entity_token,
+                profile_cfg=profile_cfg,
+                oracle_session=oracle_session,
+            )
+        return self._load_lmdb_profile_state_single_entity(pipeline_id, node_id, entity_token)
+
+    def _save_profile_state_single_node_by_storage(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        node_state: Dict[str, Any],
+        changed_tokens: Optional[List[str]] = None,
+        storage: str = "lmdb",
+        profile_cfg: Optional[Dict[str, Any]] = None,
+        oracle_session: Optional[Dict[str, Any]] = None,
+        oracle_auto_commit: bool = True,
+    ) -> bool:
+        normalized = self._normalize_profile_storage(storage)
+        if normalized == "rocksdb":
+            return self._save_rocks_profile_state_single_node(
+                pipeline_id,
+                node_id,
+                node_state,
+                changed_tokens=changed_tokens,
+            )
+        if normalized == "redis":
+            return self._save_redis_profile_state_single_node(
+                pipeline_id,
+                node_id,
+                node_state,
+                changed_tokens=changed_tokens,
+            )
+        if normalized == "oracle":
+            return self._save_oracle_profile_state_single_node(
+                pipeline_id,
+                node_id,
+                node_state,
+                changed_tokens=changed_tokens,
+                profile_cfg=profile_cfg,
+                oracle_session=oracle_session,
+                auto_commit=oracle_auto_commit,
+            )
+        return self._save_profile_state_single_node(
+            pipeline_id,
+            node_id,
+            node_state,
+            changed_tokens=changed_tokens,
+        )
+
     def get_profile_state_summary(
         self,
         pipeline_id: str,
         node_id: Optional[str] = None,
         limit: int = 10,
         preferred_primary_key_field: Optional[str] = None,
+        include_oracle: bool = True,
     ) -> Dict[str, Any]:
         safe_limit = max(1, min(int(limit or 10), 100))
         preferred_key_field = str(preferred_primary_key_field or "").strip()
-        profile_documents = self._load_profile_state_by_node(str(pipeline_id))
+        profile_documents = self._load_profile_state_by_node(
+            str(pipeline_id),
+            include_oracle=bool(include_oracle),
+        )
 
         nodes: List[Dict[str, Any]] = []
         total_entities = 0
@@ -644,7 +3999,7 @@ class ETLEngine:
             "pipeline_id": str(pipeline_id),
             "node_id": node_id or None,
             "limit": safe_limit,
-            "storage": "lmdb",
+            "storage": "mixed",
             "total_nodes": len(nodes),
             "total_entities": total_entities,
             "total_meta_entries": total_meta_entries,
@@ -657,6 +4012,7 @@ class ETLEngine:
         self,
         pipeline_id: str,
         node_id: Optional[str] = None,
+        profile_cfg: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, int]:
         pipeline_key = str(pipeline_id)
         current_state = self._load_profile_state_by_node(pipeline_key)
@@ -675,6 +4031,14 @@ class ETLEngine:
 
         # Clear both LMDB and legacy JSON runtime storage.
         self._clear_lmdb_profile_state_by_node(pipeline_key, node_id=node_id)
+        self._clear_rocks_profile_state_by_node(pipeline_key, node_id=node_id)
+        self._clear_redis_profile_state_by_node(pipeline_key, node_id=node_id)
+        if profile_cfg is not None:
+            self._clear_oracle_profile_state_by_node(
+                pipeline_key,
+                node_id=node_id,
+                profile_cfg=profile_cfg,
+            )
         self._clear_runtime_profile_state_by_node(pipeline_key, node_id=node_id)
 
         return {
@@ -1150,19 +4514,109 @@ class ETLEngine:
         runtime = self._normalize_runtime_config(runtime_config)
         mode = runtime["mode"]
         profile_mode_requested = False
+        profile_requires_full_snapshot = False
+        profile_node_storage_by_id: Dict[str, str] = {}
+        profile_node_processing_mode_by_id: Dict[str, str] = {}
+        profile_node_oracle_cfg_by_id: Dict[str, Dict[str, Any]] = {}
+        profile_storage_types_requested: set = set()
         for node in pipeline.get("nodes", []):
+            if not self._is_node_enabled(node if isinstance(node, dict) else {}):
+                continue
+            node_id = str(node.get("id") or "").strip() if isinstance(node, dict) else ""
+            if not node_id:
+                continue
             node_data = node.get("data") if isinstance(node, dict) else {}
             node_config = node_data.get("config") if isinstance(node_data, dict) else {}
             if not isinstance(node_config, dict):
                 continue
             if bool(node_config.get("custom_profile_enabled", False)):
                 profile_mode_requested = True
-                break
-        if profile_mode_requested and self._get_profile_lmdb_env() is None:
-            raise RuntimeError(
-                "LMDB profile store is required for custom profile mode. "
-                "Install/enable LMDB and restart backend."
-            )
+                storage_type = self._normalize_profile_storage(
+                    node_config.get("custom_profile_storage", "lmdb")
+                )
+                profile_node_storage_by_id[node_id] = storage_type
+                profile_storage_types_requested.add(storage_type)
+                processing_mode = str(
+                    node_config.get("custom_profile_processing_mode") or "batch"
+                ).strip().lower()
+                if processing_mode not in {"incremental", "incremental_batch"}:
+                    processing_mode = "batch"
+                profile_node_processing_mode_by_id[node_id] = processing_mode
+                if storage_type == "oracle":
+                    profile_node_oracle_cfg_by_id[node_id] = {
+                        "custom_profile_oracle_host": node_config.get("custom_profile_oracle_host"),
+                        "custom_profile_oracle_port": node_config.get("custom_profile_oracle_port"),
+                        "custom_profile_oracle_service_name": node_config.get("custom_profile_oracle_service_name"),
+                        "custom_profile_oracle_sid": node_config.get("custom_profile_oracle_sid"),
+                        "custom_profile_oracle_user": node_config.get("custom_profile_oracle_user"),
+                        "custom_profile_oracle_password": node_config.get("custom_profile_oracle_password"),
+                        "custom_profile_oracle_dsn": node_config.get("custom_profile_oracle_dsn"),
+                        "custom_profile_oracle_table": node_config.get("custom_profile_oracle_table"),
+                        "custom_profile_oracle_write_strategy": node_config.get("custom_profile_oracle_write_strategy"),
+                        "custom_profile_oracle_parallel_workers": node_config.get("custom_profile_oracle_parallel_workers"),
+                        "custom_profile_oracle_parallel_min_tokens": node_config.get("custom_profile_oracle_parallel_min_tokens"),
+                        "custom_profile_oracle_merge_batch_size": node_config.get("custom_profile_oracle_merge_batch_size"),
+                        "custom_profile_oracle_parallel_force": node_config.get("custom_profile_oracle_parallel_force"),
+                    }
+                if processing_mode not in {"incremental", "incremental_batch"}:
+                    profile_requires_full_snapshot = True
+        profile_lazy_incremental_mode = bool(
+            profile_mode_requested and not profile_requires_full_snapshot
+        )
+        if profile_mode_requested:
+            if "lmdb" in profile_storage_types_requested and self._get_profile_lmdb_env() is None:
+                raise RuntimeError(
+                    "LMDB profile store is required for custom profile mode. "
+                    "Install/enable LMDB and restart backend."
+                )
+            if "rocksdb" in profile_storage_types_requested and self._get_profile_rocksdb_store() is None:
+                raise RuntimeError(
+                    "RocksDB profile store is required for custom profile mode. "
+                    "Install/enable RocksDB (rocksdict) and restart backend."
+                )
+            if "redis" in profile_storage_types_requested and self._get_profile_redis_client() is None:
+                raise RuntimeError(
+                    "Redis profile store is required for custom profile mode. "
+                    "Set PROFILE_REDIS_URL/REDIS_URL and ensure Redis is reachable."
+                )
+            if "oracle" in profile_storage_types_requested:
+                oracle_checked_signatures: set = set()
+                for node_id, raw_cfg in profile_node_oracle_cfg_by_id.items():
+                    resolved_cfg = self._resolve_profile_oracle_config(raw_cfg)
+                    cfg_signature = json.dumps(
+                        {
+                            "host": resolved_cfg.get("host"),
+                            "port": resolved_cfg.get("port"),
+                            "service_name": resolved_cfg.get("service_name"),
+                            "sid": resolved_cfg.get("sid"),
+                            "user": resolved_cfg.get("user"),
+                            "dsn": resolved_cfg.get("dsn"),
+                            "table": resolved_cfg.get("table"),
+                        },
+                        sort_keys=True,
+                    )
+                    if cfg_signature in oracle_checked_signatures:
+                        continue
+                    conn = None
+                    try:
+                        conn, cfg = self._profile_oracle_connect(raw_cfg)
+                        table_sql = self._sanitize_oracle_identifier(
+                            str(cfg.get("table") or "ETL_PROFILE_STATE"),
+                            "ETL_PROFILE_STATE",
+                        )
+                        self._ensure_profile_oracle_table(conn, table_sql)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Oracle profile store is required for custom profile mode. "
+                            f"Node `{node_id}` Oracle profile connection failed: {exc}"
+                        ) from exc
+                    finally:
+                        if conn is not None:
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                    oracle_checked_signatures.add(cfg_signature)
 
         # Build adjacency list
         adj: Dict[str, List[str]] = {nid: [] for nid in nodes}
@@ -1191,9 +4645,62 @@ class ETLEngine:
         profile_state_by_node: Dict[str, Any] = {}
         if pipeline_id:
             pipeline_state = pipelines_state.setdefault(pipeline_id, {})
-            loaded_profile_state = self._load_profile_state_by_node(pipeline_id)
-            if isinstance(loaded_profile_state, dict):
-                profile_state_by_node = loaded_profile_state
+            if profile_mode_requested and not profile_lazy_incremental_mode:
+                lmdb_loaded = self._load_lmdb_profile_state_by_node(pipeline_id)
+                rocks_loaded = self._load_rocks_profile_state_by_node(pipeline_id)
+                redis_loaded = self._load_redis_profile_state_by_node(pipeline_id)
+                oracle_loaded_by_signature: Dict[str, Dict[str, Any]] = {}
+                merged_state: Dict[str, Any] = {}
+                for nid, storage in profile_node_storage_by_id.items():
+                    processing_mode = str(
+                        profile_node_processing_mode_by_id.get(str(nid)) or "batch"
+                    ).strip().lower()
+                    if (
+                        storage == "oracle"
+                        and processing_mode in {"incremental", "incremental_batch"}
+                    ):
+                        # Oracle incremental nodes do per-entity backfill and live flush.
+                        # Skip eager full-state preload to avoid unnecessary full snapshot scans.
+                        continue
+                    if storage == "rocksdb":
+                        state_payload = rocks_loaded.get(nid) if isinstance(rocks_loaded, dict) else None
+                    elif storage == "redis":
+                        state_payload = redis_loaded.get(nid) if isinstance(redis_loaded, dict) else None
+                    elif storage == "oracle":
+                        node_oracle_cfg = profile_node_oracle_cfg_by_id.get(nid)
+                        resolved_cfg = self._resolve_profile_oracle_config(node_oracle_cfg)
+                        cfg_signature = json.dumps(
+                            {
+                                "host": resolved_cfg.get("host"),
+                                "port": resolved_cfg.get("port"),
+                                "service_name": resolved_cfg.get("service_name"),
+                                "sid": resolved_cfg.get("sid"),
+                                "user": resolved_cfg.get("user"),
+                                "dsn": resolved_cfg.get("dsn"),
+                                "table": resolved_cfg.get("table"),
+                            },
+                            sort_keys=True,
+                        )
+                        oracle_loaded = oracle_loaded_by_signature.get(cfg_signature)
+                        if not isinstance(oracle_loaded, dict):
+                            oracle_loaded = {}
+                            oracle_loaded_by_signature[cfg_signature] = oracle_loaded
+                        state_payload = oracle_loaded.get(nid)
+                        if not isinstance(state_payload, dict):
+                            state_payload = self._load_oracle_profile_state_for_node(
+                                pipeline_id,
+                                str(nid),
+                                profile_cfg=node_oracle_cfg,
+                            )
+                            oracle_loaded[nid] = (
+                                state_payload if isinstance(state_payload, dict) else {}
+                            )
+                    else:
+                        state_payload = lmdb_loaded.get(nid) if isinstance(lmdb_loaded, dict) else None
+                    if isinstance(state_payload, dict):
+                        merged_state[nid] = state_payload
+                if merged_state:
+                    profile_state_by_node = merged_state
         incremental_checkpoints = pipeline_state.setdefault("incremental_checkpoints", {})
 
         results: Dict[str, Any] = {}
@@ -1340,8 +4847,57 @@ class ETLEngine:
                         except Exception:
                             pass
 
+                node_execution_context_base: Dict[str, Any] = {
+                    "execution_id": execution_id,
+                    "pipeline_id": pipeline_id,
+                    "node_id": nid,
+                    "node_label": label,
+                    "mode": mode,
+                    "stream_iteration": stream_idx,
+                    "runtime": runtime,
+                    "pipeline_state": pipeline_state,
+                    "profile_state_by_node": profile_state_by_node,
+                    "node_warnings": None,  # injected below
+                    "emit_node_progress": _emit_live_node_progress,
+                    "node_progress_every": progress_every,
+                    "should_abort": should_abort,
+                    "raise_if_aborted": _raise_if_aborted,
+                }
+                node_profile_oracle_cfg: Optional[Dict[str, Any]] = None
+                node_profile_oracle_session: Optional[Dict[str, Any]] = None
+                if (
+                    node_type == "map_transform"
+                    and bool(config.get("custom_profile_enabled", False))
+                    and self._normalize_profile_storage(
+                        config.get("custom_profile_storage", "lmdb")
+                    ) == "oracle"
+                ):
+                    node_profile_oracle_cfg = {
+                        "custom_profile_oracle_host": config.get("custom_profile_oracle_host"),
+                        "custom_profile_oracle_port": config.get("custom_profile_oracle_port"),
+                        "custom_profile_oracle_service_name": config.get("custom_profile_oracle_service_name"),
+                        "custom_profile_oracle_sid": config.get("custom_profile_oracle_sid"),
+                        "custom_profile_oracle_user": config.get("custom_profile_oracle_user"),
+                        "custom_profile_oracle_password": config.get("custom_profile_oracle_password"),
+                        "custom_profile_oracle_dsn": config.get("custom_profile_oracle_dsn"),
+                        "custom_profile_oracle_table": config.get("custom_profile_oracle_table"),
+                        "custom_profile_oracle_write_strategy": config.get("custom_profile_oracle_write_strategy"),
+                        "custom_profile_oracle_parallel_workers": config.get("custom_profile_oracle_parallel_workers"),
+                        "custom_profile_oracle_parallel_min_tokens": config.get("custom_profile_oracle_parallel_min_tokens"),
+                        "custom_profile_oracle_merge_batch_size": config.get("custom_profile_oracle_merge_batch_size"),
+                        "custom_profile_oracle_parallel_force": config.get("custom_profile_oracle_parallel_force"),
+                    }
+                    if pipeline_id:
+                        node_profile_oracle_session = self._open_oracle_profile_session(
+                            node_profile_oracle_cfg
+                        )
+                    node_execution_context_base["profile_oracle_cfg"] = node_profile_oracle_cfg
+                    node_execution_context_base["profile_oracle_session"] = node_profile_oracle_session
+
                 try:
                     node_warnings: List[str] = []
+                    node_execution_context_base["node_warnings"] = node_warnings
+                    node_execution_succeeded = False
 
                     chunk_batches = 1
                     if (
@@ -1362,22 +4918,7 @@ class ETLEngine:
                                 chunk,
                                 incoming_by_source={},
                                 incoming_order=[],
-                                execution_context={
-                                    "execution_id": execution_id,
-                                    "pipeline_id": pipeline_id,
-                                    "node_id": nid,
-                                    "node_label": label,
-                                    "mode": mode,
-                                    "stream_iteration": stream_idx,
-                                    "runtime": runtime,
-                                    "pipeline_state": pipeline_state,
-                                    "profile_state_by_node": profile_state_by_node,
-                                    "node_warnings": node_warnings,
-                                    "emit_node_progress": _emit_live_node_progress,
-                                    "node_progress_every": progress_every,
-                                    "should_abort": should_abort,
-                                    "raise_if_aborted": _raise_if_aborted,
-                                },
+                                execution_context=dict(node_execution_context_base),
                             )
                             if isinstance(chunk_output, list):
                                 output.extend(chunk_output)
@@ -1424,22 +4965,7 @@ class ETLEngine:
                             upstream_data,
                             incoming_by_source=incoming_by_source,
                             incoming_order=incoming_order,
-                            execution_context={
-                                "execution_id": execution_id,
-                                "pipeline_id": pipeline_id,
-                                "node_id": nid,
-                                "node_label": label,
-                                "mode": mode,
-                                "stream_iteration": stream_idx,
-                                "runtime": runtime,
-                                "pipeline_state": pipeline_state,
-                                "profile_state_by_node": profile_state_by_node,
-                                "node_warnings": node_warnings,
-                                "emit_node_progress": _emit_live_node_progress,
-                                "node_progress_every": progress_every,
-                                "should_abort": should_abort,
-                                "raise_if_aborted": _raise_if_aborted,
-                            },
+                            execution_context=dict(node_execution_context_base),
                         )
                         _raise_if_aborted()
 
@@ -1512,6 +5038,7 @@ class ETLEngine:
                             incremental_note = f" | incremental field={runtime['incremental_field']} kept={len(filtered):,} dropped={dropped:,}"
 
                     pass_results[nid] = output
+                    emitted_row_count = len(output) if isinstance(output, list) else 0
                     row_count = len(output) if isinstance(output, list) else 0
                     if (
                         isinstance(output, list)
@@ -1520,10 +5047,41 @@ class ETLEngine:
                         and isinstance(output[0].get("rows"), (int, float))
                     ):
                         row_count = int(output[0].get("rows") or 0)
+                    profile_processed_hint = 0
+                    profile_validated_hint = 0
+                    if (
+                        row_count <= 0
+                        and node_type == "map_transform"
+                        and bool(config.get("custom_profile_enabled", False))
+                        and isinstance(profile_state_by_node, dict)
+                    ):
+                        node_profile_state = profile_state_by_node.get(nid)
+                        if isinstance(node_profile_state, dict):
+                            node_stats = node_profile_state.get("stats")
+                            if isinstance(node_stats, dict):
+                                try:
+                                    profile_processed_hint = int(
+                                        node_stats.get("custom_fields_incremental_processed_rows") or 0
+                                    )
+                                except Exception:
+                                    profile_processed_hint = 0
+                                try:
+                                    profile_validated_hint = int(
+                                        node_stats.get("custom_fields_incremental_validated_rows") or 0
+                                    )
+                                except Exception:
+                                    profile_validated_hint = 0
+                        hint = profile_validated_hint or profile_processed_hint
+                        if hint > 0:
+                            row_count = hint
                     total_rows += row_count
                     pass_rows += row_count
                     log_entry["status"] = "success"
                     log_entry["rows"] = row_count
+                    # Remove transient live counters from the final success payload.
+                    log_entry.pop("processed_rows", None)
+                    log_entry.pop("validated_rows", None)
+                    log_entry.pop("incremental_counter", None)
 
                     batch_note = f" | batches={chunk_batches}" if chunk_batches > 1 else ""
                     warning_note = ""
@@ -1553,6 +5111,17 @@ class ETLEngine:
                         file_path = output[0]["path"]
                         log_entry["message"] = f"✓ {label} — written: {file_path} ({row_count:,} rows){batch_note}{incremental_note}{warning_note}"
                         log_entry["output_path"] = file_path
+                    elif (
+                        node_type == "map_transform"
+                        and bool(config.get("custom_profile_enabled", False))
+                        and emitted_row_count == 0
+                        and row_count > 0
+                    ):
+                        log_entry["message"] = (
+                            f"✓ {label} — processed {row_count:,} rows "
+                            f"(profile emit output={emitted_row_count:,})"
+                            f"{batch_note}{incremental_note}{warning_note}"
+                        )
                     else:
                         log_entry["message"] = f"✓ {label} — {row_count:,} rows{batch_note}{incremental_note}{warning_note}"
 
@@ -1565,6 +5134,7 @@ class ETLEngine:
                         })
                     if on_node_done:
                         on_node_done(logs)
+                    node_execution_succeeded = True
 
                 except Exception as e:
                     log_entry["status"] = "error"
@@ -1581,6 +5151,22 @@ class ETLEngine:
                     if on_node_done:
                         on_node_done(logs)
                     raise
+                finally:
+                    if isinstance(node_profile_oracle_session, dict):
+                        try:
+                            self._close_oracle_profile_session(
+                                node_profile_oracle_session,
+                                commit=bool(node_execution_succeeded),
+                                rollback_on_error=not bool(node_execution_succeeded),
+                            )
+                        except Exception as close_exc:
+                            if node_execution_succeeded:
+                                raise RuntimeError(
+                                    f"Oracle profile session finalize failed for node `{label}`: {close_exc}"
+                                ) from close_exc
+                            logger.warning(
+                                f"Oracle profile session close failed for node {nid}: {close_exc}"
+                            )
 
             results = pass_results
             if mode == "streaming":
@@ -1591,13 +5177,78 @@ class ETLEngine:
                     await asyncio.sleep(runtime["streaming_interval_seconds"])
 
         if pipeline_id:
-            # Strict profile persistence: LMDB only.
-            if profile_state_by_node:
-                saved_to_lmdb = self._save_profile_state_by_node(pipeline_id, profile_state_by_node)
-                if not saved_to_lmdb:
+            if profile_state_by_node and not profile_lazy_incremental_mode:
+                all_saved = True
+                failed_nodes: List[str] = []
+                for nid, node_state in profile_state_by_node.items():
+                    storage = profile_node_storage_by_id.get(str(nid), "lmdb")
+                    processing_mode = str(
+                        profile_node_processing_mode_by_id.get(str(nid)) or "batch"
+                    ).strip().lower()
+                    if (
+                        storage == "oracle"
+                        and processing_mode in {"incremental", "incremental_batch"}
+                    ):
+                        # Oracle incremental mode already persists at flush boundaries and force-flush.
+                        # Skip redundant full-node snapshot rewrite at pipeline end.
+                        continue
+                    profile_cfg = (
+                        profile_node_oracle_cfg_by_id.get(str(nid))
+                        if storage == "oracle"
+                        else None
+                    )
+                    saved = self._save_profile_state_single_node_by_storage(
+                        pipeline_id,
+                        str(nid),
+                        node_state if isinstance(node_state, dict) else {},
+                        changed_tokens=None,
+                        storage=storage,
+                        profile_cfg=profile_cfg,
+                    )
+                    if not saved:
+                        all_saved = False
+                        failed_nodes.append(f"{nid}({storage})")
+                if not all_saved:
                     raise RuntimeError(
-                        "Failed to persist profile state to LMDB. "
-                        "Runtime JSON fallback is disabled for profiling."
+                        "Failed to persist profile state to selected profile storage(s): "
+                        + ", ".join(failed_nodes)
+                    )
+            elif profile_state_by_node and profile_lazy_incremental_mode:
+                # Incremental modes persist during node execution. As a safety net for
+                # non-Oracle stores, verify target state exists and do one fallback
+                # persist from in-memory profile_state if needed.
+                fallback_failed_nodes: List[str] = []
+                for nid, node_state in profile_state_by_node.items():
+                    node_key = str(nid)
+                    storage = profile_node_storage_by_id.get(node_key, "lmdb")
+                    processing_mode = str(
+                        profile_node_processing_mode_by_id.get(node_key) or "batch"
+                    ).strip().lower()
+                    if processing_mode not in {"incremental", "incremental_batch"}:
+                        continue
+                    if storage == "oracle":
+                        # Oracle has dedicated incremental flush/queue semantics.
+                        continue
+                    has_state = self._has_profile_state_for_node(
+                        pipeline_id,
+                        node_key,
+                        storage=storage,
+                    )
+                    if has_state:
+                        continue
+                    saved = self._save_profile_state_single_node_by_storage(
+                        pipeline_id,
+                        node_key,
+                        node_state if isinstance(node_state, dict) else {},
+                        changed_tokens=None,
+                        storage=storage,
+                    )
+                    if not saved:
+                        fallback_failed_nodes.append(f"{node_key}({storage})")
+                if fallback_failed_nodes:
+                    raise RuntimeError(
+                        "Failed to persist incremental profile state to selected profile storage(s): "
+                        + ", ".join(fallback_failed_nodes)
                     )
             pipeline_state.pop("profile_documents", None)
             self._clear_runtime_profile_state_by_node(pipeline_id)
@@ -1615,7 +5266,13 @@ class ETLEngine:
         execution_context: Optional[Dict[str, Any]] = None,
     ) -> list:
         """Dispatch to the correct connector/transform handler."""
-        await asyncio.sleep(0.3)  # Simulate async I/O
+        # Optional debug delay only (disabled by default in production paths).
+        try:
+            simulated_delay_ms = int(os.getenv("ETL_NODE_SIMULATED_DELAY_MS", "0"))
+        except Exception:
+            simulated_delay_ms = 0
+        if simulated_delay_ms > 0:
+            await asyncio.sleep(float(simulated_delay_ms) / 1000.0)
 
         # ─── TRIGGERS ──────────────────────────────────────────
         if node_type in ("manual_trigger", "schedule_trigger", "webhook_trigger"):
@@ -1646,6 +5303,8 @@ class ETLEngine:
             return await self._execute_parquet(config)
         elif node_type == "lmdb_source":
             return await self._execute_lmdb(config, execution_context=execution_context)
+        elif node_type == "rocksdb_source":
+            return await self._execute_rocksdb(config, execution_context=execution_context)
         elif node_type == "rest_api_source":
             return await self._execute_rest_api(config)
         elif node_type == "graphql_source":
@@ -1848,9 +5507,21 @@ class ETLEngine:
             import oracledb
 
             dsn = self._build_oracle_dsn(config)
+            oracle_user_raw = config.get("user")
+            oracle_password_raw = config.get("password")
+            oracle_user = (
+                str(oracle_user_raw).strip()
+                if oracle_user_raw is not None
+                else ""
+            )
+            oracle_password = (
+                str(oracle_password_raw)
+                if oracle_password_raw is not None
+                else ""
+            )
             conn = oracledb.connect(
-                user=config.get("user", ""),
-                password=config.get("password", ""),
+                user=oracle_user,
+                password=oracle_password,
                 dsn=dsn,
             )
             cursor = conn.cursor()
@@ -2215,6 +5886,18 @@ class ETLEngine:
         except Exception:
             preview_offset = 0
         preview_offset = max(0, preview_offset)
+        preview_compact = bool(config.get("preview_compact", False))
+        try:
+            preview_max_cell_chars = int(config.get("preview_max_cell_chars", 2000) or 2000)
+        except Exception:
+            preview_max_cell_chars = 2000
+        preview_max_cell_chars = max(200, min(preview_max_cell_chars, 20000))
+        try:
+            preview_max_collection_items = int(config.get("preview_max_collection_items", 64) or 64)
+        except Exception:
+            preview_max_collection_items = 64
+        preview_max_collection_items = max(8, min(preview_max_collection_items, 500))
+        preview_max_depth = 6
 
         try:
             max_dbs = int(config.get("max_dbs", 16) or 16)
@@ -2270,6 +5953,42 @@ class ETLEngine:
                         continue
                     return False
             return True
+
+        def _compact_preview_value(value: Any, depth: int = 0) -> Any:
+            safe = self._json_safe_value(value)
+            if not preview_compact:
+                return safe
+            if isinstance(safe, str):
+                if len(safe) > preview_max_cell_chars:
+                    return safe[:preview_max_cell_chars] + "..."
+                return safe
+            if isinstance(safe, dict):
+                if depth >= preview_max_depth:
+                    return f"{{... {len(safe)} keys ...}}"
+                out: Dict[str, Any] = {}
+                total = len(safe)
+                for idx, (k, v) in enumerate(safe.items()):
+                    if idx >= preview_max_collection_items:
+                        out["__truncated_items__"] = max(0, total - preview_max_collection_items)
+                        break
+                    out[str(k)] = _compact_preview_value(v, depth + 1)
+                return out
+            if isinstance(safe, list):
+                if depth >= preview_max_depth:
+                    return f"[... {len(safe)} items ...]"
+                out = [_compact_preview_value(v, depth + 1) for v in safe[:preview_max_collection_items]]
+                if len(safe) > preview_max_collection_items:
+                    out.append({"__truncated_items__": len(safe) - preview_max_collection_items})
+                return out
+            return safe
+
+        def _prepare_output_row(row: Dict[str, Any]) -> Dict[str, Any]:
+            if not preview_compact:
+                return self._json_safe_value(row)
+            out: Dict[str, Any] = {}
+            for key, value in row.items():
+                out[str(key)] = _compact_preview_value(value, 0)
+            return out
 
         try:
             _raise_if_aborted()
@@ -2343,7 +6062,7 @@ class ETLEngine:
                                     continue
                                 if limit > 0 and len(rows) >= limit:
                                     break
-                                rows.append(expanded_row)
+                                rows.append(_prepare_output_row(expanded_row))
                                 matched_rows += 1
                             if limit > 0 and len(rows) >= limit:
                                 break
@@ -2367,7 +6086,7 @@ class ETLEngine:
                         matched_rows += 1
                         has_item = cursor.next()
                         continue
-                    rows.append(row)
+                    rows.append(_prepare_output_row(row))
                     matched_rows += 1
                     has_item = cursor.next()
 
@@ -2381,6 +6100,301 @@ class ETLEngine:
                     env.close()
                 except Exception:
                     pass
+
+        return rows
+
+    async def _execute_rocksdb(
+        self,
+        config: dict,
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> list:
+        if _rocksdict is None:
+            raise RuntimeError("RocksDB dependency is not installed. Install with: pip install rocksdict")
+
+        should_abort_cb = None
+        raise_if_aborted_cb = None
+        if isinstance(execution_context, dict):
+            if callable(execution_context.get("should_abort")):
+                should_abort_cb = execution_context.get("should_abort")
+            if callable(execution_context.get("raise_if_aborted")):
+                raise_if_aborted_cb = execution_context.get("raise_if_aborted")
+
+        def _raise_if_aborted() -> None:
+            if callable(raise_if_aborted_cb):
+                raise_if_aborted_cb()
+                return
+            if callable(should_abort_cb):
+                try:
+                    if bool(should_abort_cb()):
+                        raise ExecutionAbortedError("Execution aborted during RocksDB source read.")
+                except ExecutionAbortedError:
+                    raise
+                except Exception:
+                    pass
+
+        raw_path = (
+            config.get("env_path")
+            or config.get("file_path")
+            or config.get("path")
+            or ""
+        )
+        db_path = self._resolve_rocksdb_env_path(str(raw_path))
+
+        value_format = str(config.get("value_format", "auto") or "auto").strip().lower() or "auto"
+        flatten_json_values = bool(config.get("flatten_json_values", True))
+        expand_profile_documents = bool(config.get("expand_profile_documents", True))
+        include_value_kind = bool(config.get("include_value_kind", True))
+        key_contains = str(config.get("key_contains", "") or "").strip()
+        value_contains = str(config.get("value_contains", "") or "").strip().lower()
+        key_prefix = str(config.get("key_prefix", "") or "").strip()
+        start_key = str(config.get("start_key", "") or "").strip()
+        end_key = str(config.get("end_key", "") or "").strip()
+        global_filter_column = str(config.get("global_filter_column", "") or "").strip()
+        raw_global_filter_values = config.get("global_filter_values", None)
+        if raw_global_filter_values is None:
+            fallback_value = str(config.get("global_filter_value", "") or "").strip()
+            raw_global_filter_values = [fallback_value] if fallback_value else []
+        if isinstance(raw_global_filter_values, str):
+            try:
+                parsed = json.loads(raw_global_filter_values)
+                if isinstance(parsed, list):
+                    raw_global_filter_values = parsed
+                else:
+                    raw_global_filter_values = [raw_global_filter_values]
+            except Exception:
+                raw_global_filter_values = [raw_global_filter_values]
+        elif not isinstance(raw_global_filter_values, (list, tuple, set)):
+            raw_global_filter_values = [raw_global_filter_values]
+        global_filter_values: List[str] = []
+        global_filter_seen = set()
+        for item in list(raw_global_filter_values):
+            text = str(item if item is not None else "").strip()
+            if not text or text in global_filter_seen:
+                continue
+            global_filter_seen.add(text)
+            global_filter_values.append(text)
+        raw_column_filters = config.get("column_filters", {})
+        if isinstance(raw_column_filters, str):
+            try:
+                raw_column_filters = json.loads(raw_column_filters)
+            except Exception:
+                raw_column_filters = {}
+        if not isinstance(raw_column_filters, dict):
+            raw_column_filters = {}
+        column_filters: Dict[str, set] = {}
+        for raw_name, raw_values in raw_column_filters.items():
+            col_name = str(raw_name or "").strip()
+            if not col_name:
+                continue
+            if isinstance(raw_values, (list, tuple, set)):
+                values_iter = list(raw_values)
+            else:
+                values_iter = [raw_values]
+            normalized_values = []
+            for item in values_iter:
+                text = str(item if item is not None else "").strip()
+                if text:
+                    normalized_values.append(text)
+            if normalized_values:
+                column_filters[col_name] = set(normalized_values)
+
+        raw_limit = config.get("limit", 1000)
+        try:
+            if raw_limit is None or str(raw_limit).strip() == "":
+                limit = 1000
+            else:
+                limit = int(raw_limit)
+        except Exception:
+            limit = 1000
+        if limit < 0:
+            limit = 0
+        try:
+            preview_offset = int(config.get("preview_offset", 0) or 0)
+        except Exception:
+            preview_offset = 0
+        preview_offset = max(0, preview_offset)
+        preview_compact = bool(config.get("preview_compact", False))
+        try:
+            preview_max_cell_chars = int(config.get("preview_max_cell_chars", 2000) or 2000)
+        except Exception:
+            preview_max_cell_chars = 2000
+        preview_max_cell_chars = max(200, min(preview_max_cell_chars, 20000))
+        try:
+            preview_max_collection_items = int(config.get("preview_max_collection_items", 64) or 64)
+        except Exception:
+            preview_max_collection_items = 64
+        preview_max_collection_items = max(8, min(preview_max_collection_items, 500))
+        preview_max_depth = 6
+
+        rows: List[Dict[str, Any]] = []
+        matched_rows = 0
+        store = None
+        store_should_close = False
+        prefix_bytes = key_prefix.encode("utf-8") if key_prefix else None
+        start_bytes = start_key.encode("utf-8") if start_key else None
+        end_bytes = end_key.encode("utf-8") if end_key else None
+
+        def _to_cell_text(value: Any) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, str):
+                return value
+            if isinstance(value, (int, float, bool)):
+                return str(value)
+            try:
+                return json.dumps(value, ensure_ascii=False, default=str)
+            except Exception:
+                return str(value)
+
+        def _row_matches_filters(row: Dict[str, Any]) -> bool:
+            if global_filter_values:
+                if global_filter_column and global_filter_column != "__ALL__":
+                    targets = [global_filter_column]
+                else:
+                    targets = list(row.keys())
+                matched = False
+                for name in targets:
+                    text = _to_cell_text(row.get(name)).strip()
+                    text_lower = text.lower()
+                    for query in global_filter_values:
+                        if query == "__LMDB_EMPTY__":
+                            if text == "":
+                                matched = True
+                                break
+                        elif query.lower() in text_lower:
+                            matched = True
+                            break
+                    if matched:
+                        break
+                if not matched:
+                    return False
+
+            if column_filters:
+                for name, allowed_values in column_filters.items():
+                    text = _to_cell_text(row.get(name)).strip()
+                    if "__LMDB_EMPTY__" in allowed_values and text == "":
+                        continue
+                    if text in allowed_values:
+                        continue
+                    return False
+            return True
+
+        def _compact_preview_value(value: Any, depth: int = 0) -> Any:
+            safe = self._json_safe_value(value)
+            if not preview_compact:
+                return safe
+            if isinstance(safe, str):
+                if len(safe) > preview_max_cell_chars:
+                    return safe[:preview_max_cell_chars] + "..."
+                return safe
+            if isinstance(safe, dict):
+                if depth >= preview_max_depth:
+                    return f"{{... {len(safe)} keys ...}}"
+                out: Dict[str, Any] = {}
+                total = len(safe)
+                for idx, (k, v) in enumerate(safe.items()):
+                    if idx >= preview_max_collection_items:
+                        out["__truncated_items__"] = max(0, total - preview_max_collection_items)
+                        break
+                    out[str(k)] = _compact_preview_value(v, depth + 1)
+                return out
+            if isinstance(safe, list):
+                if depth >= preview_max_depth:
+                    return f"[... {len(safe)} items ...]"
+                out = [_compact_preview_value(v, depth + 1) for v in safe[:preview_max_collection_items]]
+                if len(safe) > preview_max_collection_items:
+                    out.append({"__truncated_items__": len(safe) - preview_max_collection_items})
+                return out
+            return safe
+
+        def _prepare_output_row(row: Dict[str, Any]) -> Dict[str, Any]:
+            if not preview_compact:
+                return self._json_safe_value(row)
+            out: Dict[str, Any] = {}
+            for key, value in row.items():
+                out[str(key)] = _compact_preview_value(value, 0)
+            return out
+
+        try:
+            _raise_if_aborted()
+            store, store_should_close = self._acquire_rocksdb_store(db_path)
+
+            for raw_key, raw_value in self._rocksdb_iter_items(store):
+                _raise_if_aborted()
+                if limit > 0 and len(rows) >= limit:
+                    break
+
+                key_text = self._rocksdb_key_to_text(raw_key)
+                key_bytes = key_text.encode("utf-8", errors="replace")
+
+                if prefix_bytes is not None and not key_bytes.startswith(prefix_bytes):
+                    continue
+                if start_bytes is not None and key_bytes < start_bytes:
+                    continue
+                if end_bytes is not None and key_bytes > end_bytes:
+                    continue
+                if key_contains and key_contains not in key_text:
+                    continue
+
+                value_bytes = self._rocksdb_value_to_bytes(raw_value)
+                decoded_value, value_kind = self._decode_lmdb_value(value_bytes, value_format)
+                if value_contains:
+                    try:
+                        if isinstance(decoded_value, str):
+                            haystack = decoded_value
+                        else:
+                            haystack = json.dumps(decoded_value, ensure_ascii=False)
+                    except Exception:
+                        haystack = str(decoded_value)
+                    if value_contains not in haystack.lower():
+                        continue
+
+                if flatten_json_values and expand_profile_documents:
+                    expanded_rows = self._expand_lmdb_profile_documents(
+                        key_text,
+                        decoded_value,
+                        include_value_kind=include_value_kind,
+                        value_kind=value_kind,
+                    )
+                    if expanded_rows:
+                        for expanded_row in expanded_rows:
+                            _raise_if_aborted()
+                            if not _row_matches_filters(expanded_row):
+                                continue
+                            if matched_rows < preview_offset:
+                                matched_rows += 1
+                                continue
+                            if limit > 0 and len(rows) >= limit:
+                                break
+                            rows.append(_prepare_output_row(expanded_row))
+                            matched_rows += 1
+                        continue
+
+                if flatten_json_values and isinstance(decoded_value, dict):
+                    row: Dict[str, Any] = {"lmdb_key": key_text, **decoded_value}
+                    if include_value_kind:
+                        row["_lmdb_value_kind"] = value_kind
+                else:
+                    row = {"lmdb_key": key_text, "lmdb_value": decoded_value}
+                    if include_value_kind:
+                        row["_lmdb_value_kind"] = value_kind
+
+                if not _row_matches_filters(row):
+                    continue
+
+                if matched_rows < preview_offset:
+                    matched_rows += 1
+                    continue
+                rows.append(_prepare_output_row(row))
+                matched_rows += 1
+
+        except ExecutionAbortedError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read RocksDB source: {exc}")
+        finally:
+            if store is not None and store_should_close:
+                self._close_rocksdb_store(store)
 
         return rows
 
@@ -2718,7 +6732,7 @@ class ETLEngine:
 
             entity_key = str(row.get("lmdb_entity_key") or "").strip()
             profile_source = str(row.get("_lmdb_profile_source") or "").strip().lower()
-            is_profile_row = bool(entity_key) or profile_source == "documents" or profile_source == "profile"
+            is_profile_row = bool(entity_key) or profile_source in {"documents", "document", "profile"}
             if is_profile_row:
                 profile_rows += 1
             else:
@@ -2854,6 +6868,487 @@ class ETLEngine:
                     env.close()
                 except Exception:
                     pass
+
+        scan_elapsed_seconds = max(0.0, (datetime.utcnow() - scan_started_at).total_seconds())
+        processing_latency_rps = (
+            (matched_rows / scan_elapsed_seconds)
+            if scan_elapsed_seconds > 0 and matched_rows >= 0
+            else None
+        )
+        custom_fields_incremental_processed_rows = sum(
+            int((stats or {}).get("processed") or 0)
+            for stats in node_incremental_stats_by_key.values()
+            if isinstance(stats, dict)
+        )
+        custom_fields_incremental_validated_rows = sum(
+            int((stats or {}).get("validated") or 0)
+            for stats in node_incremental_stats_by_key.values()
+            if isinstance(stats, dict)
+        )
+        custom_fields_incremental_output_rows = sum(
+            int((stats or {}).get("output_rows") or 0)
+            for stats in node_incremental_stats_by_key.values()
+            if isinstance(stats, dict)
+        )
+
+        return {
+            "total_rows": matched_rows,
+            "profile_rows": profile_rows,
+            "non_profile_rows": non_profile_rows,
+            "unique_keys": len(unique_keys),
+            "unique_entities": len(unique_entities),
+            "profile_like_keys": len(profile_like_keys),
+            "txn_latency_samples": txn_latency_samples,
+            "txn_latency_avg_ms": (txn_latency_sum_ms / txn_latency_samples) if txn_latency_samples > 0 else None,
+            "txn_latency_min_ms": txn_latency_min_ms,
+            "txn_latency_max_ms": txn_latency_max_ms,
+            "processing_latency_rps": processing_latency_rps,
+            "records_processed_per_second": processing_latency_rps,
+            "scan_elapsed_seconds": scan_elapsed_seconds,
+            "scan_capped": scan_capped,
+            "scan_limit": summary_scan_limit,
+            "scanned_entries": scanned_entries,
+            "custom_fields_incremental_processed_rows": custom_fields_incremental_processed_rows,
+            "custom_fields_incremental_validated_rows": custom_fields_incremental_validated_rows,
+            "custom_fields_incremental_output_rows": custom_fields_incremental_output_rows,
+            "generated_at": datetime.utcnow().isoformat(),
+        }
+
+    async def _summarize_rocksdb(self, config: dict) -> Dict[str, Any]:
+        if _rocksdict is None:
+            raise RuntimeError("RocksDB dependency is not installed. Install with: pip install rocksdict")
+
+        raw_path = (
+            config.get("env_path")
+            or config.get("file_path")
+            or config.get("path")
+            or ""
+        )
+        db_path = self._resolve_rocksdb_env_path(str(raw_path))
+
+        value_format = str(config.get("value_format", "auto") or "auto").strip().lower() or "auto"
+        flatten_json_values = bool(config.get("flatten_json_values", True))
+        expand_profile_documents = bool(config.get("expand_profile_documents", True))
+        include_value_kind = bool(config.get("include_value_kind", True))
+        key_contains = str(config.get("key_contains", "") or "").strip()
+        value_contains = str(config.get("value_contains", "") or "").strip().lower()
+        key_prefix = str(config.get("key_prefix", "") or "").strip()
+        start_key = str(config.get("start_key", "") or "").strip()
+        end_key = str(config.get("end_key", "") or "").strip()
+        global_filter_column = str(config.get("global_filter_column", "") or "").strip()
+        raw_global_filter_values = config.get("global_filter_values", None)
+        if raw_global_filter_values is None:
+            fallback_value = str(config.get("global_filter_value", "") or "").strip()
+            raw_global_filter_values = [fallback_value] if fallback_value else []
+        if isinstance(raw_global_filter_values, str):
+            try:
+                parsed = json.loads(raw_global_filter_values)
+                if isinstance(parsed, list):
+                    raw_global_filter_values = parsed
+                else:
+                    raw_global_filter_values = [raw_global_filter_values]
+            except Exception:
+                raw_global_filter_values = [raw_global_filter_values]
+        elif not isinstance(raw_global_filter_values, (list, tuple, set)):
+            raw_global_filter_values = [raw_global_filter_values]
+        global_filter_values: List[str] = []
+        global_filter_seen = set()
+        for item in list(raw_global_filter_values):
+            text = str(item if item is not None else "").strip()
+            if not text or text in global_filter_seen:
+                continue
+            global_filter_seen.add(text)
+            global_filter_values.append(text)
+
+        raw_column_filters = config.get("column_filters", {})
+        if isinstance(raw_column_filters, str):
+            try:
+                raw_column_filters = json.loads(raw_column_filters)
+            except Exception:
+                raw_column_filters = {}
+        if not isinstance(raw_column_filters, dict):
+            raw_column_filters = {}
+        column_filters: Dict[str, set] = {}
+        for raw_name, raw_values in raw_column_filters.items():
+            col_name = str(raw_name or "").strip()
+            if not col_name:
+                continue
+            if isinstance(raw_values, (list, tuple, set)):
+                values_iter = list(raw_values)
+            else:
+                values_iter = [raw_values]
+            normalized_values = []
+            for item in values_iter:
+                text = str(item if item is not None else "").strip()
+                if text:
+                    normalized_values.append(text)
+            if normalized_values:
+                column_filters[col_name] = set(normalized_values)
+
+        try:
+            summary_scan_limit = int(config.get("summary_scan_limit", 0) or 0)
+        except Exception:
+            summary_scan_limit = 0
+        summary_scan_limit = max(0, summary_scan_limit)
+
+        store = None
+        store_should_close = False
+        scan_started_at = datetime.utcnow()
+        scan_capped = False
+        scanned_entries = 0
+        matched_rows = 0
+        profile_rows = 0
+        non_profile_rows = 0
+        unique_keys: set = set()
+        unique_entities: set = set()
+        profile_like_keys: set = set()
+        txn_latency_samples = 0
+        txn_latency_sum_ms = 0.0
+        txn_latency_min_ms: Optional[float] = None
+        txn_latency_max_ms: Optional[float] = None
+        node_incremental_stats_by_key: Dict[str, Dict[str, int]] = {}
+
+        prefix_bytes = key_prefix.encode("utf-8") if key_prefix else None
+        start_bytes = start_key.encode("utf-8") if start_key else None
+        end_bytes = end_key.encode("utf-8") if end_key else None
+
+        def _to_cell_text(value: Any) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, str):
+                return value
+            if isinstance(value, (int, float, bool)):
+                return str(value)
+            try:
+                return json.dumps(value, ensure_ascii=False, default=str)
+            except Exception:
+                return str(value)
+
+        def _row_matches_filters(row: Dict[str, Any]) -> bool:
+            if global_filter_values:
+                if global_filter_column and global_filter_column != "__ALL__":
+                    targets = [global_filter_column]
+                else:
+                    targets = list(row.keys())
+                matched = False
+                for name in targets:
+                    text = _to_cell_text(row.get(name)).strip()
+                    text_lower = text.lower()
+                    for query in global_filter_values:
+                        if query == "__LMDB_EMPTY__":
+                            if text == "":
+                                matched = True
+                                break
+                        elif query.lower() in text_lower:
+                            matched = True
+                            break
+                    if matched:
+                        break
+                if not matched:
+                    return False
+
+            if column_filters:
+                for name, allowed_values in column_filters.items():
+                    text = _to_cell_text(row.get(name)).strip()
+                    if "__LMDB_EMPTY__" in allowed_values and text == "":
+                        continue
+                    if text in allowed_values:
+                        continue
+                    return False
+            return True
+
+        latency_ms_fields = (
+            "latency_ms",
+            "processing_latency_ms",
+            "transaction_latency_ms",
+            "txn_latency_ms",
+            "response_time_ms",
+            "duration_ms",
+            "elapsed_ms",
+            "processing_time_ms",
+            "latency",
+            "duration",
+            "response_time",
+            "processing_time",
+        )
+        latency_seconds_fields = (
+            "latency_seconds",
+            "duration_seconds",
+            "elapsed_seconds",
+            "response_time_seconds",
+            "processing_time_seconds",
+        )
+        latency_time_pairs = (
+            ("request_time", "response_time"),
+            ("start_time", "end_time"),
+            ("start_ts", "end_ts"),
+            ("txn_start_time", "txn_end_time"),
+            ("transaction_start_time", "transaction_end_time"),
+            ("mintime", "maxtime"),
+            ("min_txndate", "max_txndate"),
+        )
+
+        def _to_float(value: Any) -> Optional[float]:
+            if value is None or isinstance(value, bool):
+                return None
+            if isinstance(value, (int, float)):
+                if math.isfinite(float(value)):
+                    return float(value)
+                return None
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return None
+                text = text.replace(",", "")
+                try:
+                    parsed = float(text)
+                    if math.isfinite(parsed):
+                        return parsed
+                except Exception:
+                    return None
+            return None
+
+        def _to_non_negative_int(value: Any) -> Optional[int]:
+            parsed = _to_float(value)
+            if parsed is None:
+                return None
+            try:
+                as_int = int(parsed)
+            except Exception:
+                return None
+            if as_int < 0:
+                return None
+            return as_int
+
+        def _extract_transaction_latency_ms(row: Dict[str, Any]) -> Optional[float]:
+            normalized: Dict[str, Any] = {}
+            for raw_key, raw_value in row.items():
+                key = str(raw_key or "").strip().lower()
+                if not key:
+                    continue
+                normalized[key] = raw_value
+
+            def _collect_nested_named_values(
+                value: Any,
+                wanted_keys: set,
+                out: Dict[str, List[Any]],
+                depth: int,
+                budget: List[int],
+            ) -> None:
+                if budget[0] <= 0 or depth > 6:
+                    return
+                if isinstance(value, dict):
+                    for raw_name, raw_child in value.items():
+                        if budget[0] <= 0:
+                            break
+                        budget[0] -= 1
+                        name = str(raw_name or "").strip().lower()
+                        if name in wanted_keys and not isinstance(raw_child, (dict, list)):
+                            bucket = out.get(name)
+                            if bucket is None:
+                                out[name] = [raw_child]
+                            elif len(bucket) < 32:
+                                bucket.append(raw_child)
+                        if isinstance(raw_child, (dict, list)):
+                            _collect_nested_named_values(raw_child, wanted_keys, out, depth + 1, budget)
+                    return
+                if isinstance(value, list):
+                    for item in value:
+                        if budget[0] <= 0:
+                            break
+                        budget[0] -= 1
+                        if isinstance(item, (dict, list)):
+                            _collect_nested_named_values(item, wanted_keys, out, depth + 1, budget)
+
+            def _get_value_candidates(name: str, nested_map: Dict[str, List[Any]]) -> List[Any]:
+                candidates: List[Any] = []
+                if name in normalized:
+                    candidates.append(normalized.get(name))
+                nested_values = nested_map.get(name) or []
+                if nested_values:
+                    candidates.extend(nested_values)
+                return candidates
+
+            wanted_keys = set(latency_ms_fields) | set(latency_seconds_fields)
+            for start_field, end_field in latency_time_pairs:
+                wanted_keys.add(start_field)
+                wanted_keys.add(end_field)
+            nested_candidates: Dict[str, List[Any]] = {}
+
+            def _ensure_nested_candidates() -> Dict[str, List[Any]]:
+                nonlocal nested_candidates
+                if nested_candidates:
+                    return nested_candidates
+                budget = [800]
+                _collect_nested_named_values(row, wanted_keys, nested_candidates, 0, budget)
+                return nested_candidates
+
+            for field_name in latency_ms_fields:
+                candidates = [normalized.get(field_name)] if field_name in normalized else []
+                if not candidates:
+                    candidates = _ensure_nested_candidates().get(field_name, [])
+                for candidate in candidates:
+                    parsed = _to_float(candidate)
+                    if parsed is not None and parsed >= 0:
+                        return parsed
+
+            for field_name in latency_seconds_fields:
+                candidates = [normalized.get(field_name)] if field_name in normalized else []
+                if not candidates:
+                    candidates = _ensure_nested_candidates().get(field_name, [])
+                for candidate in candidates:
+                    parsed = _to_float(candidate)
+                    if parsed is not None and parsed >= 0:
+                        return parsed * 1000.0
+
+            nested_map = _ensure_nested_candidates()
+            for start_field, end_field in latency_time_pairs:
+                start_candidates = _get_value_candidates(start_field, nested_map)
+                end_candidates = _get_value_candidates(end_field, nested_map)
+                if not start_candidates or not end_candidates:
+                    continue
+
+                pair_len = min(len(start_candidates), len(end_candidates), 16)
+                for idx in range(pair_len):
+                    start_dt = self._parse_profile_event_time(start_candidates[idx])
+                    end_dt = self._parse_profile_event_time(end_candidates[idx])
+                    if start_dt is None or end_dt is None:
+                        continue
+                    delta_ms = (end_dt - start_dt).total_seconds() * 1000.0
+                    if math.isfinite(delta_ms) and delta_ms >= 0:
+                        return delta_ms
+
+                for start_value in start_candidates[:8]:
+                    start_dt = self._parse_profile_event_time(start_value)
+                    if start_dt is None:
+                        continue
+                    for end_value in end_candidates[:8]:
+                        end_dt = self._parse_profile_event_time(end_value)
+                        if end_dt is None:
+                            continue
+                        delta_ms = (end_dt - start_dt).total_seconds() * 1000.0
+                        if math.isfinite(delta_ms) and delta_ms >= 0:
+                            return delta_ms
+            return None
+
+        def _track_row(row: Dict[str, Any]) -> None:
+            nonlocal matched_rows, profile_rows, non_profile_rows
+            nonlocal txn_latency_samples, txn_latency_sum_ms, txn_latency_min_ms, txn_latency_max_ms
+            matched_rows += 1
+
+            key_text = str(row.get("lmdb_key") or "").strip()
+            if key_text:
+                unique_keys.add(key_text)
+                if "profile" in key_text.lower():
+                    profile_like_keys.add(key_text)
+
+            entity_key = str(row.get("lmdb_entity_key") or "").strip()
+            profile_source = str(row.get("_lmdb_profile_source") or "").strip().lower()
+            is_profile_row = bool(entity_key) or profile_source in {"documents", "document", "profile"}
+            if is_profile_row:
+                profile_rows += 1
+            else:
+                non_profile_rows += 1
+            if entity_key:
+                unique_entities.add(entity_key)
+
+            latency_ms = _extract_transaction_latency_ms(row)
+            if latency_ms is not None:
+                txn_latency_samples += 1
+                txn_latency_sum_ms += latency_ms
+                if txn_latency_min_ms is None or latency_ms < txn_latency_min_ms:
+                    txn_latency_min_ms = latency_ms
+                if txn_latency_max_ms is None or latency_ms > txn_latency_max_ms:
+                    txn_latency_max_ms = latency_ms
+
+            node_stats = row.get("_lmdb_node_stats")
+            if isinstance(node_stats, dict):
+                processed = _to_non_negative_int(node_stats.get("custom_fields_incremental_processed_rows"))
+                validated = _to_non_negative_int(node_stats.get("custom_fields_incremental_validated_rows"))
+                output_rows = _to_non_negative_int(node_stats.get("custom_fields_incremental_output_rows"))
+                if processed is not None or validated is not None or output_rows is not None:
+                    stats_key = key_text or str(row.get("lmdb_entity_key") or "") or "__rocksdb_default__"
+                    existing = node_incremental_stats_by_key.get(stats_key)
+                    if not isinstance(existing, dict):
+                        existing = {"processed": 0, "validated": 0, "output_rows": 0}
+                    if processed is not None:
+                        existing["processed"] = max(int(existing.get("processed") or 0), int(processed))
+                    if validated is not None:
+                        existing["validated"] = max(int(existing.get("validated") or 0), int(validated))
+                    if output_rows is not None:
+                        existing["output_rows"] = max(int(existing.get("output_rows") or 0), int(output_rows))
+                    node_incremental_stats_by_key[stats_key] = existing
+
+        try:
+            store, store_should_close = self._acquire_rocksdb_store(db_path)
+            for raw_key, raw_value in self._rocksdb_iter_items(store):
+                scanned_entries += 1
+                key_text = self._rocksdb_key_to_text(raw_key)
+                key_bytes = key_text.encode("utf-8", errors="replace")
+
+                if prefix_bytes is not None and not key_bytes.startswith(prefix_bytes):
+                    continue
+                if start_bytes is not None and key_bytes < start_bytes:
+                    continue
+                if end_bytes is not None and key_bytes > end_bytes:
+                    continue
+                if key_contains and key_contains not in key_text:
+                    continue
+
+                value_bytes = self._rocksdb_value_to_bytes(raw_value)
+                decoded_value, value_kind = self._decode_lmdb_value(value_bytes, value_format)
+                if value_contains:
+                    try:
+                        if isinstance(decoded_value, str):
+                            haystack = decoded_value
+                        else:
+                            haystack = json.dumps(decoded_value, ensure_ascii=False)
+                    except Exception:
+                        haystack = str(decoded_value)
+                    if value_contains not in haystack.lower():
+                        continue
+
+                if flatten_json_values and expand_profile_documents:
+                    expanded_rows = self._expand_lmdb_profile_documents(
+                        key_text,
+                        decoded_value,
+                        include_value_kind=include_value_kind,
+                        value_kind=value_kind,
+                    )
+                    if expanded_rows:
+                        for expanded_row in expanded_rows:
+                            if not _row_matches_filters(expanded_row):
+                                continue
+                            _track_row(expanded_row)
+                            if summary_scan_limit > 0 and matched_rows >= summary_scan_limit:
+                                scan_capped = True
+                                break
+                        if scan_capped:
+                            break
+                        continue
+
+                if flatten_json_values and isinstance(decoded_value, dict):
+                    row: Dict[str, Any] = {"lmdb_key": key_text, **decoded_value}
+                    if include_value_kind:
+                        row["_lmdb_value_kind"] = value_kind
+                else:
+                    row = {"lmdb_key": key_text, "lmdb_value": decoded_value}
+                    if include_value_kind:
+                        row["_lmdb_value_kind"] = value_kind
+
+                if not _row_matches_filters(row):
+                    continue
+
+                _track_row(row)
+                if summary_scan_limit > 0 and matched_rows >= summary_scan_limit:
+                    scan_capped = True
+                    break
+
+        except Exception as exc:
+            raise RuntimeError(f"Failed to summarize RocksDB source: {exc}")
+        finally:
+            if store is not None and store_should_close:
+                self._close_rocksdb_store(store)
 
         scan_elapsed_seconds = max(0.0, (datetime.utcnow() - scan_started_at).total_seconds())
         processing_latency_rps = (
@@ -3112,23 +7607,27 @@ class ETLEngine:
         if not isinstance(row, dict):
             return None, False
 
-        # Case/space-insensitive lookup map for robust field resolution
+        # Direct key hit first.
+        if path in row:
+            return row.get(path), True
+
+        # Fast variant direct-hit path for common flattened schemas.
+        for variant in variants:
+            if variant in row:
+                return row.get(variant), True
+
+        # Build case-insensitive lookup only when exact direct lookup misses.
         row_key_lookup: Dict[str, Any] = {}
         for rk in row.keys():
             key_norm = str(rk or "").strip().lower()
             if key_norm and key_norm not in row_key_lookup:
                 row_key_lookup[key_norm] = rk
 
-        # Direct key hit first.
-        if path in row:
-            return row.get(path), True
         direct_norm = path.strip().lower()
         if direct_norm in row_key_lookup:
             return row.get(row_key_lookup[direct_norm]), True
 
         for variant in variants:
-            if variant in row:
-                return row.get(variant), True
             variant_norm = str(variant or "").strip().lower()
             if variant_norm in row_key_lookup:
                 return row.get(row_key_lookup[variant_norm]), True
@@ -3261,6 +7760,24 @@ class ETLEngine:
             return None
 
     def _stable_json_token(self, value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "b:1" if value else "b:0"
+        if isinstance(value, int):
+            return f"i:{value}"
+        if isinstance(value, float):
+            if math.isnan(value):
+                return "f:nan"
+            return f"f:{value:.17g}"
+        if isinstance(value, str):
+            return f"s:{value}"
+        if isinstance(value, datetime):
+            return f"dt:{value.isoformat()}"
+        if isinstance(value, date):
+            return f"d:{value.isoformat()}"
+        if isinstance(value, time):
+            return f"t:{value.isoformat()}"
         try:
             return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
         except Exception:
@@ -3306,6 +7823,9 @@ class ETLEngine:
         text = str(path or "").strip()
         if not text:
             return []
+        cached = self._profile_path_tokens_cache.get(text)
+        if cached is not None:
+            return cached
         out: List[Any] = []
         for part in text.split("."):
             token = part.strip()
@@ -3323,6 +7843,9 @@ class ETLEngine:
                         out.append(int(idx))
                     except Exception:
                         out.append(idx)
+        if len(self._profile_path_tokens_cache) > 8192:
+            self._profile_path_tokens_cache.clear()
+        self._profile_path_tokens_cache[text] = out
         return out
 
     def _get_profile_path_value(self, data: Any, path: Any, default: Any = None) -> Any:
@@ -3602,82 +8125,9 @@ class ETLEngine:
             return False
 
         def _parse_temporal_value(value: Any) -> Optional[datetime]:
-            import re as _re
-
-            if value is None:
-                return None
-            to_py = getattr(value, "to_pydatetime", None)
-            if callable(to_py):
-                try:
-                    value = to_py()
-                except Exception:
-                    pass
-            if isinstance(value, datetime):
-                return value
-            if isinstance(value, date):
-                return datetime.combine(value, time.min)
-            if isinstance(value, str):
-                text = " ".join(value.strip().split())
-                if not text:
-                    return None
-                # Normalize fractional seconds: keep up to microseconds for strptime/fromisoformat.
-                normalized = _re.sub(
-                    r"\.(\d{1,9})",
-                    lambda m: "." + m.group(1)[:6].ljust(6, "0"),
-                    text,
-                    count=1,
-                )
-
-                candidates = [normalized]
-                if normalized.endswith("Z"):
-                    candidates.append(normalized[:-1] + "+00:00")
-
-                parse_formats = (
-                    # Date only
-                    "%Y-%m-%d",
-                    "%Y%m%d",
-                    "%d-%m-%Y",
-                    "%d-%m-%y",
-                    "%d/%m/%Y",
-                    "%d/%m/%y",
-                    "%m/%d/%Y",
-                    "%m/%d/%y",
-                    # 24h datetime
-                    "%Y-%m-%d %H:%M:%S",
-                    "%Y-%m-%d %H:%M:%S.%f",
-                    "%Y-%d-%m %H:%M:%S",
-                    "%Y-%d-%m %H:%M:%S.%f",
-                    "%d-%m-%Y %H:%M:%S",
-                    "%d-%m-%Y %H:%M:%S.%f",
-                    "%d-%m-%y %H:%M:%S",
-                    "%d-%m-%y %H:%M:%S.%f",
-                    "%d/%m/%Y %H:%M:%S",
-                    "%d/%m/%Y %H:%M:%S.%f",
-                    "%d/%m/%y %H:%M:%S",
-                    "%d/%m/%y %H:%M:%S.%f",
-                    # 12h datetime with AM/PM
-                    "%d-%m-%Y %I:%M:%S %p",
-                    "%d-%m-%Y %I:%M:%S.%f %p",
-                    "%d-%m-%y %I:%M:%S %p",
-                    "%d-%m-%y %I:%M:%S.%f %p",
-                    "%d/%m/%Y %I:%M:%S %p",
-                    "%d/%m/%Y %I:%M:%S.%f %p",
-                    "%d/%m/%y %I:%M:%S %p",
-                    "%d/%m/%y %I:%M:%S.%f %p",
-                )
-
-                for candidate_text in candidates:
-                    for fmt in parse_formats:
-                        try:
-                            return datetime.strptime(candidate_text, fmt)
-                        except Exception:
-                            continue
-                    try:
-                        return datetime.fromisoformat(candidate_text)
-                    except Exception:
-                        continue
-                return None
-            return None
+            # Reuse global parser with cache so repeated temporal tokens in
+            # expressions (for example min/max over datetime fields) stay fast.
+            return self._parse_profile_event_time(value)
 
         def _format_temporal_output(value: Any, date_only_hint: bool = False) -> Any:
             to_py = getattr(value, "to_pydatetime", None)
@@ -3820,6 +8270,18 @@ class ETLEngine:
             flat = [v for v in _flatten_sequence(seq) if v is not None]
             if not flat:
                 return None
+            if len(flat) == 1:
+                single = flat[0]
+                single_dt = _parse_temporal_value(single)
+                if single_dt is not None:
+                    return _format_temporal_output(
+                        single_dt,
+                        _looks_date_only_text(single) if isinstance(single, str) else False,
+                    )
+                single_num = self._to_number(single)
+                if single_num is not None:
+                    return single_num
+                return single
             temporal_values, temporal_date_only = _temporal_sequence(flat)
             if len(temporal_values) == len(flat) and temporal_values:
                 return _format_temporal_output(min(temporal_values), temporal_date_only)
@@ -3836,6 +8298,18 @@ class ETLEngine:
             flat = [v for v in _flatten_sequence(seq) if v is not None]
             if not flat:
                 return None
+            if len(flat) == 1:
+                single = flat[0]
+                single_dt = _parse_temporal_value(single)
+                if single_dt is not None:
+                    return _format_temporal_output(
+                        single_dt,
+                        _looks_date_only_text(single) if isinstance(single, str) else False,
+                    )
+                single_num = self._to_number(single)
+                if single_num is not None:
+                    return single_num
+                return single
             temporal_values, temporal_date_only = _temporal_sequence(flat)
             if len(temporal_values) == len(flat) and temporal_values:
                 return _format_temporal_output(max(temporal_values), temporal_date_only)
@@ -3850,6 +8324,13 @@ class ETLEngine:
         def _count(values: Any = None) -> int:
             if values is None:
                 return int(group_size)
+            # Hot path for profile/incremental expressions:
+            # count(append_unique(...)) is common and should stay O(1)
+            # as collections grow.
+            if isinstance(values, dict):
+                return len(values)
+            if isinstance(values, (list, tuple, set)):
+                return len(values)
             return len(_flatten_sequence(values))
 
         def _distinct(values: Any) -> List[Any]:
@@ -5196,6 +9677,7 @@ class ETLEngine:
             branch = node.body if cond else node.orelse
             return self._eval_expression_ast(branch, context, depth + 1)
         if isinstance(node, ast.Call):
+            fn_name = ""
             if isinstance(node.func, ast.Name):
                 fn_name = node.func.id
                 fn = context.get(fn_name)
@@ -5204,6 +9686,8 @@ class ETLEngine:
             else:
                 raise RuntimeError("Only named function calls are allowed")
             if not callable(fn):
+                if fn_name:
+                    raise RuntimeError(f"Function not allowed: {fn_name}")
                 raise RuntimeError("Function not allowed")
             args = [self._eval_expression_ast(arg, context, depth + 1) for arg in node.args]
             kwargs = {
@@ -5376,8 +9860,10 @@ class ETLEngine:
         ).strip()
         profile_enabled = bool(config.get("custom_profile_enabled", False))
         profile_processing_mode = str(config.get("custom_profile_processing_mode") or "batch").strip().lower()
-        if profile_processing_mode not in {"batch", "incremental"}:
+        if profile_processing_mode not in {"batch", "incremental", "incremental_batch"}:
             profile_processing_mode = "batch"
+        is_profile_incremental_mode = profile_processing_mode in {"incremental", "incremental_batch"}
+        is_profile_incremental_batch_mode = profile_processing_mode == "incremental_batch"
         profile_emit_mode = str(config.get("custom_profile_emit_mode") or "changed_only").strip().lower()
         if profile_emit_mode not in {"changed_only", "all_entities"}:
             profile_emit_mode = "changed_only"
@@ -5391,6 +9877,10 @@ class ETLEngine:
         if profile_retention_days <= 0:
             profile_retention_days = 45
         profile_include_change_fields = bool(config.get("custom_profile_include_change_fields", False))
+        expression_engine_requested = str(config.get("custom_expression_engine") or "auto").strip().lower()
+        if expression_engine_requested not in {"auto", "python", "polars"}:
+            expression_engine_requested = "auto"
+        expression_engine_active = "python"
 
         result: list = []
         warning_count = 0
@@ -5421,9 +9911,11 @@ class ETLEngine:
         except Exception:
             node_progress_every = 2000
         node_progress_every = max(1, min(node_progress_every, 50000))
-        if profile_processing_mode == "incremental":
-            # Keep live progress visibly ticking in UI for incremental mode.
-            node_progress_every = min(node_progress_every, 25)
+        if is_profile_incremental_mode:
+            # Time-driven progress emits are enough for live UX.
+            # Keep row-driven checks coarse for throughput.
+            node_progress_every = max(500, min(node_progress_every, 5000))
+        abort_check_every = 500 if is_profile_incremental_mode else 25
 
         def _raise_if_aborted() -> None:
             if callable(raise_if_aborted_cb):
@@ -5449,6 +9941,23 @@ class ETLEngine:
                 logger.warning(text)
             warning_count += 1
 
+        if expression_engine_requested == "polars":
+            if _pl is None:
+                _record_custom_field_warning(
+                    "Polars expression engine was selected but Polars is not installed. "
+                    "Falling back to Python engine."
+                )
+            elif profile_enabled:
+                _record_custom_field_warning(
+                    "Polars expression engine was selected, but profile/document incremental mode "
+                    "currently runs on Python engine for full function compatibility."
+                )
+            else:
+                _record_custom_field_warning(
+                    "Polars expression engine was selected. Compatibility path is active; "
+                    "Python evaluator is used for full expression-function support."
+                )
+
         base_rows: List[Dict[str, Any]] = [
             row if isinstance(row, dict) else {"value": row}
             for row in data
@@ -5464,6 +9973,35 @@ class ETLEngine:
         if profile_enabled:
             node_id = str((execution_context or {}).get("node_id") or "map_transform")
             pipeline_id_for_profile = str((execution_context or {}).get("pipeline_id") or "").strip()
+            profile_storage = self._normalize_profile_storage(
+                config.get("custom_profile_storage", "lmdb")
+            )
+            profile_oracle_cfg: Optional[Dict[str, Any]] = None
+            profile_oracle_session: Optional[Dict[str, Any]] = None
+            if profile_storage == "oracle":
+                context_oracle_cfg = (
+                    (execution_context or {}).get("profile_oracle_cfg")
+                    if isinstance((execution_context or {}).get("profile_oracle_cfg"), dict)
+                    else None
+                )
+                profile_oracle_cfg = context_oracle_cfg or {
+                    "custom_profile_oracle_host": config.get("custom_profile_oracle_host"),
+                    "custom_profile_oracle_port": config.get("custom_profile_oracle_port"),
+                    "custom_profile_oracle_service_name": config.get("custom_profile_oracle_service_name"),
+                    "custom_profile_oracle_sid": config.get("custom_profile_oracle_sid"),
+                    "custom_profile_oracle_user": config.get("custom_profile_oracle_user"),
+                    "custom_profile_oracle_password": config.get("custom_profile_oracle_password"),
+                    "custom_profile_oracle_dsn": config.get("custom_profile_oracle_dsn"),
+                    "custom_profile_oracle_table": config.get("custom_profile_oracle_table"),
+                    "custom_profile_oracle_write_strategy": config.get("custom_profile_oracle_write_strategy"),
+                    "custom_profile_oracle_parallel_workers": config.get("custom_profile_oracle_parallel_workers"),
+                    "custom_profile_oracle_parallel_min_tokens": config.get("custom_profile_oracle_parallel_min_tokens"),
+                    "custom_profile_oracle_merge_batch_size": config.get("custom_profile_oracle_merge_batch_size"),
+                    "custom_profile_oracle_parallel_force": config.get("custom_profile_oracle_parallel_force"),
+                }
+                context_oracle_session = (execution_context or {}).get("profile_oracle_session")
+                if isinstance(context_oracle_session, dict):
+                    profile_oracle_session = context_oracle_session
             profile_state_by_node = (
                 (execution_context or {}).get("profile_state_by_node")
                 if isinstance((execution_context or {}).get("profile_state_by_node"), dict)
@@ -5478,6 +10016,77 @@ class ETLEngine:
                 node_profile_store = existing_node_state
             else:
                 node_profile_store = {}
+            profile_backfill_enabled = False
+            profile_backfill_missing_tokens: set = set()
+            profile_backfill_existing_tokens: Optional[set] = None
+            profile_backfill_existing_tokens_complete = False
+            oracle_backfill_preloaded_tokens = 0
+            oracle_prefetched_docs: Dict[str, Dict[str, Any]] = {}
+            oracle_prefetched_meta: Dict[str, Dict[str, Any]] = {}
+            oracle_backfill_candidate_prefetch = False
+            if pipeline_id_for_profile and is_profile_incremental_mode:
+                profile_backfill_enabled = self._has_profile_state_for_node(
+                    pipeline_id_for_profile,
+                    node_id,
+                    storage=profile_storage,
+                    profile_cfg=profile_oracle_cfg,
+                    oracle_session=profile_oracle_session,
+                )
+                if profile_backfill_enabled and profile_storage == "lmdb":
+                    try:
+                        max_index_tokens = int(
+                            config.get("custom_profile_backfill_index_max_tokens")
+                            or os.getenv("PROFILE_BACKFILL_INDEX_MAX_TOKENS", "300000")
+                        )
+                    except Exception:
+                        max_index_tokens = 300000
+                    max_index_tokens = max(10000, min(max_index_tokens, 2_000_000))
+                    profile_backfill_existing_tokens = self._load_lmdb_profile_existing_entity_tokens(
+                        pipeline_id_for_profile,
+                        node_id,
+                        max_tokens=max_index_tokens,
+                    )
+                    if isinstance(profile_backfill_existing_tokens, set):
+                        profile_backfill_existing_tokens_complete = True
+                elif profile_backfill_enabled and profile_storage == "oracle":
+                    candidate_tokens: List[str] = []
+                    candidate_seen: set = set()
+                    for profile_row in base_rows:
+                        row_obj = profile_row if isinstance(profile_row, dict) else {"value": profile_row}
+                        pk_candidate, pk_found = self._extract_row_value_by_path(row_obj, primary_key_field)
+                        if not pk_found or pk_candidate is None or str(pk_candidate).strip() == "":
+                            continue
+                        candidate_token = self._stable_json_token(pk_candidate)
+                        if not candidate_token or candidate_token in candidate_seen:
+                            continue
+                        candidate_seen.add(candidate_token)
+                        candidate_tokens.append(candidate_token)
+
+                    if candidate_tokens:
+                        try:
+                            prefetch_chunk_size = int(
+                                config.get("custom_profile_backfill_candidate_prefetch_chunk_size")
+                                or os.getenv("PROFILE_BACKFILL_CANDIDATE_PREFETCH_CHUNK_SIZE", "500")
+                            )
+                        except Exception:
+                            prefetch_chunk_size = 500
+                        prefetch_chunk_size = max(50, min(prefetch_chunk_size, 900))
+                        (
+                            oracle_prefetched_docs,
+                            oracle_prefetched_meta,
+                            oracle_existing_tokens,
+                        ) = self._load_oracle_profile_state_for_entity_tokens(
+                            pipeline_id_for_profile,
+                            node_id,
+                            candidate_tokens,
+                            profile_cfg=profile_oracle_cfg,
+                            oracle_session=profile_oracle_session,
+                            chunk_size=prefetch_chunk_size,
+                        )
+                        profile_backfill_existing_tokens = oracle_existing_tokens
+                        profile_backfill_existing_tokens_complete = True
+                        oracle_backfill_preloaded_tokens = len(oracle_existing_tokens)
+                        oracle_backfill_candidate_prefetch = True
 
             documents_store = node_profile_store.get("documents")
             if not isinstance(documents_store, dict):
@@ -5489,37 +10098,353 @@ class ETLEngine:
                 meta_store = {}
                 node_profile_store["meta"] = meta_store
 
+            if oracle_prefetched_docs:
+                documents_store.update(oracle_prefetched_docs)
+            if oracle_prefetched_meta:
+                meta_store.update(oracle_prefetched_meta)
+
+            # Oracle incremental optimization:
+            # when existing token cardinality is manageable, preload node profile
+            # state once and avoid per-entity backfill reads during row processing.
+            if (
+                profile_backfill_enabled
+                and profile_storage == "oracle"
+                and pipeline_id_for_profile
+                and is_profile_incremental_mode
+                and isinstance(profile_backfill_existing_tokens, set)
+                and not oracle_backfill_candidate_prefetch
+            ):
+                try:
+                    preload_max_tokens = int(
+                        config.get("custom_profile_backfill_preload_max_tokens")
+                        or os.getenv("PROFILE_BACKFILL_PRELOAD_MAX_TOKENS_ORACLE")
+                        or os.getenv("PROFILE_BACKFILL_PRELOAD_MAX_TOKENS", "300000")
+                    )
+                except Exception:
+                    preload_max_tokens = 300000
+                preload_max_tokens = max(0, min(preload_max_tokens, 2_000_000))
+                if (
+                    preload_max_tokens > 0
+                    and len(profile_backfill_existing_tokens) > 0
+                    and len(profile_backfill_existing_tokens) <= preload_max_tokens
+                ):
+                    preloaded_state = self._load_oracle_profile_state_for_node(
+                        pipeline_id_for_profile,
+                        node_id,
+                        profile_cfg=profile_oracle_cfg,
+                    )
+                    preloaded_docs = (
+                        preloaded_state.get("documents")
+                        if isinstance(preloaded_state, dict)
+                        else None
+                    )
+                    preloaded_meta = (
+                        preloaded_state.get("meta")
+                        if isinstance(preloaded_state, dict)
+                        else None
+                    )
+                    if isinstance(preloaded_docs, dict) and preloaded_docs:
+                        documents_store.update(preloaded_docs)
+                        oracle_backfill_preloaded_tokens = len(preloaded_docs)
+                    if isinstance(preloaded_meta, dict) and preloaded_meta:
+                        meta_store.update(preloaded_meta)
+
             changed_tokens: List[str] = []
             changed_token_set: set = set()
             changed_fields_by_token: Dict[str, List[str]] = {}
             seen_entity_tokens: List[str] = []
             seen_entity_set: set = set()
+            seen_entity_count = 0
             entity_value_by_token: Dict[str, Any] = {}
             last_source_by_token: Dict[str, Dict[str, Any]] = {}
             live_persist_warning_emitted = False
+            append_unique_state_by_token: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            append_unique_cache_mode = str(
+                config.get("custom_profile_append_unique_cache_mode") or "auto"
+            ).strip().lower()
+            if append_unique_cache_mode not in {"auto", "persistent", "row_local"}:
+                append_unique_cache_mode = "auto"
+            # Incremental profile throughput:
+            # keep append_unique cache persistent by default for incremental_batch,
+            # and for external profile stores in incremental mode. Auto row-local
+            # switching can degrade heavily once profile cardinality grows.
+            if append_unique_cache_mode == "auto":
+                if profile_processing_mode == "incremental_batch":
+                    append_unique_cache_mode = "persistent"
+                elif (
+                    profile_processing_mode == "incremental"
+                    and profile_storage in {"rocksdb", "oracle", "redis"}
+                ):
+                    append_unique_cache_mode = "persistent"
+            append_unique_persistent_cache_enabled = append_unique_cache_mode != "row_local"
+            append_unique_cache_prune_warning_emitted = False
+            append_unique_cache_row_local_warning_emitted = False
+            append_unique_token_last_seen: Dict[str, int] = {}
+            append_unique_disable_min_rows_cfg = config.get(
+                "custom_profile_append_unique_cache_disable_min_rows",
+                None,
+            )
+            append_unique_cache_disable_min_rows = max(
+                1000,
+                int(
+                    append_unique_disable_min_rows_cfg
+                    if append_unique_disable_min_rows_cfg is not None
+                    and str(append_unique_disable_min_rows_cfg).strip() != ""
+                    else os.getenv(
+                        "PROFILE_APPEND_UNIQUE_CACHE_DISABLE_MIN_ROWS",
+                        "20000",
+                    )
+                ),
+            )
+            append_unique_entity_limit_cfg = config.get(
+                "custom_profile_append_unique_cache_entity_limit",
+                None,
+            )
+            append_unique_cache_entity_limit = max(
+                1000,
+                int(
+                    append_unique_entity_limit_cfg
+                    if append_unique_entity_limit_cfg is not None
+                    and str(append_unique_entity_limit_cfg).strip() != ""
+                    else os.getenv(
+                        "PROFILE_APPEND_UNIQUE_CACHE_ENTITY_LIMIT",
+                        "40000",
+                    )
+                ),
+            )
+            append_unique_disable_ratio_cfg = config.get(
+                "custom_profile_append_unique_cache_disable_ratio",
+                None,
+            )
+            try:
+                append_unique_cache_disable_ratio = float(
+                    append_unique_disable_ratio_cfg
+                    if append_unique_disable_ratio_cfg is not None
+                    and str(append_unique_disable_ratio_cfg).strip() != ""
+                    else os.getenv(
+                        "PROFILE_APPEND_UNIQUE_CACHE_DISABLE_RATIO",
+                        "0.65",
+                    )
+                )
+            except Exception:
+                append_unique_cache_disable_ratio = 0.65
+            append_unique_cache_disable_ratio = max(0.0, min(append_unique_cache_disable_ratio, 1.0))
             stats_store = node_profile_store.get("stats")
             if not isinstance(stats_store, dict):
                 stats_store = {}
                 node_profile_store["stats"] = stats_store
+            stats_store["custom_fields_expression_engine_requested"] = expression_engine_requested
+            stats_store["custom_fields_expression_engine_active"] = expression_engine_active
+            stats_store["custom_fields_append_unique_cache_mode"] = (
+                "persistent" if append_unique_persistent_cache_enabled else "row_local"
+            )
+            stats_store["custom_fields_backfill_index_enabled"] = isinstance(
+                profile_backfill_existing_tokens,
+                set,
+            )
+            stats_store["custom_fields_backfill_index_tokens"] = (
+                len(profile_backfill_existing_tokens)
+                if isinstance(profile_backfill_existing_tokens, set)
+                else 0
+            )
+            stats_store["custom_fields_oracle_backfill_preloaded_tokens"] = int(
+                oracle_backfill_preloaded_tokens
+            )
             total_input_rows = len(base_rows)
+            emit_incremental_rows = bool(total_input_rows <= 5000)
+            emit_incremental_rows_cfg = config.get("custom_profile_emit_incremental_rows")
+            if emit_incremental_rows_cfg is not None:
+                emit_incremental_rows = bool(emit_incremental_rows_cfg)
             incremental_processed_rows = 0
             incremental_validated_rows = 0
+            incremental_pending_flush_updates = 0
+            incremental_pending_tokens: set = set()
+            incremental_flush_count = 0
             last_progress_emit_at = 0.0
+            last_profile_flush_at = pytime.monotonic()
+            if is_profile_incremental_batch_mode:
+                # "Incremental Batch" mode: chunked durability (faster than per-row).
+                default_flush_every_rows = 20000
+                default_flush_interval_seconds = 2.0
+            else:
+                default_flush_every_rows = 200 if total_input_rows <= 5000 else 2000
+                default_flush_interval_seconds = 1.0 if total_input_rows <= 5000 else 3.0
+            flush_every_rows_cfg = config.get("custom_profile_flush_every_rows", None)
+            try:
+                if flush_every_rows_cfg is not None and str(flush_every_rows_cfg).strip() != "":
+                    incremental_flush_every_rows = int(flush_every_rows_cfg)
+                else:
+                    incremental_flush_every_rows = int(
+                        os.getenv("PROFILE_INCREMENTAL_FLUSH_EVERY_ROWS", default_flush_every_rows)
+                    )
+            except Exception:
+                incremental_flush_every_rows = default_flush_every_rows
+            if is_profile_incremental_batch_mode:
+                incremental_flush_every_rows = max(100, min(incremental_flush_every_rows, 20000))
+            else:
+                incremental_flush_every_rows = max(1, min(incremental_flush_every_rows, 100000))
+            flush_interval_seconds_cfg = config.get("custom_profile_flush_interval_seconds", None)
+            try:
+                if flush_interval_seconds_cfg is not None and str(flush_interval_seconds_cfg).strip() != "":
+                    incremental_flush_interval_seconds = float(flush_interval_seconds_cfg)
+                else:
+                    incremental_flush_interval_seconds = float(
+                        os.getenv("PROFILE_INCREMENTAL_FLUSH_INTERVAL_SECONDS", default_flush_interval_seconds)
+                    )
+            except Exception:
+                incremental_flush_interval_seconds = default_flush_interval_seconds
+            if is_profile_incremental_batch_mode:
+                incremental_flush_interval_seconds = max(0.5, min(incremental_flush_interval_seconds, 10.0))
+                live_persist_enabled = bool(config.get("custom_profile_live_persist", True))
+            else:
+                incremental_flush_interval_seconds = max(0.1, min(incremental_flush_interval_seconds, 30.0))
+                live_persist_enabled = bool(total_input_rows <= 10000)
+            # Oracle profile mode must be visible during runtime (fields created/updated live).
+            # Keep a single session per node, but commit on each configured flush boundary.
+            oracle_live_commit_enabled = bool(profile_storage == "oracle")
+            if is_profile_incremental_mode and oracle_live_commit_enabled:
+                live_persist_enabled = True
 
-            def _emit_profile_progress(force: bool = False) -> None:
-                nonlocal incremental_processed_rows, incremental_validated_rows, last_progress_emit_at
+            def _flush_incremental_profile_state(force: bool = False) -> None:
+                nonlocal incremental_pending_flush_updates, incremental_pending_tokens
+                nonlocal incremental_flush_count, last_profile_flush_at
+                nonlocal live_persist_warning_emitted
+                if not is_profile_incremental_mode:
+                    return
+                if not (
+                    pipeline_id_for_profile
+                    and isinstance(profile_state_by_node, dict)
+                ):
+                    return
+                if incremental_pending_flush_updates <= 0 and not force:
+                    return
+                if not force and not live_persist_enabled:
+                    return
+                now = pytime.monotonic()
+                due_rows = incremental_pending_flush_updates >= incremental_flush_every_rows
+                due_time = (now - last_profile_flush_at) >= incremental_flush_interval_seconds
+                if not force and not due_rows and not due_time:
+                    return
+
                 _raise_if_aborted()
+                node_state_for_flush = profile_state_by_node.get(node_id)
+                if not isinstance(node_state_for_flush, dict):
+                    return
+                oracle_auto_commit_for_flush = (
+                    oracle_live_commit_enabled
+                    or not isinstance(profile_oracle_session, dict)
+                )
+                if profile_storage == "oracle":
+                    resolved_oracle_cfg = self._resolve_profile_oracle_config(profile_oracle_cfg)
+                    oracle_strategy = self._normalize_oracle_profile_write_strategy(
+                        resolved_oracle_cfg.get("write_strategy")
+                    )
+                    try:
+                        oracle_min_tokens = int(resolved_oracle_cfg.get("parallel_min_tokens") or 2000)
+                    except Exception:
+                        oracle_min_tokens = 2000
+                    oracle_min_tokens = max(1, min(oracle_min_tokens, 1_000_000))
+                    oracle_parallel_force = bool(resolved_oracle_cfg.get("parallel_force", False))
+                    pending_token_count = len(incremental_pending_tokens)
+                    oracle_parallel_eligible = bool(
+                        oracle_strategy == "parallel_key"
+                        and oracle_auto_commit_for_flush
+                        and (
+                            oracle_parallel_force
+                            or pending_token_count >= oracle_min_tokens
+                        )
+                    )
+                    try:
+                        oracle_merge_batch = int(resolved_oracle_cfg.get("merge_batch_size") or 500)
+                    except Exception:
+                        oracle_merge_batch = 500
+                    oracle_merge_batch = max(50, min(oracle_merge_batch, 2000))
+                    try:
+                        oracle_workers_cfg = int(resolved_oracle_cfg.get("parallel_workers") or 4)
+                    except Exception:
+                        oracle_workers_cfg = 4
+                    oracle_workers_cfg = max(2, min(oracle_workers_cfg, 16))
+                    oracle_workers_effective = min(
+                        oracle_workers_cfg,
+                        max(1, int(math.ceil(float(pending_token_count) / float(max(1, oracle_merge_batch)))))
+                    )
+                    oracle_parallel_eligible = bool(
+                        oracle_parallel_eligible and oracle_workers_effective >= 2
+                    )
+                    stats_store["custom_fields_oracle_parallel_strategy"] = oracle_strategy
+                    stats_store["custom_fields_oracle_parallel_min_tokens"] = int(oracle_min_tokens)
+                    stats_store["custom_fields_oracle_parallel_pending_tokens"] = int(pending_token_count)
+                    stats_store["custom_fields_oracle_parallel_workers_configured"] = int(oracle_workers_cfg)
+                    stats_store["custom_fields_oracle_parallel_workers_effective"] = int(oracle_workers_effective)
+                    stats_store["custom_fields_oracle_merge_batch_size"] = int(oracle_merge_batch)
+                    stats_store["custom_fields_oracle_parallel_force"] = bool(oracle_parallel_force)
+                    stats_store["custom_fields_oracle_parallel_last_flush_eligible"] = bool(oracle_parallel_eligible)
+                flushed = self._save_profile_state_single_node_by_storage(
+                    pipeline_id_for_profile,
+                    node_id,
+                    node_state_for_flush,
+                    changed_tokens=list(incremental_pending_tokens),
+                    storage=profile_storage,
+                    profile_cfg=profile_oracle_cfg,
+                    oracle_session=profile_oracle_session,
+                    oracle_auto_commit=oracle_auto_commit_for_flush,
+                )
+                # Oracle fallback: if shared-session flush failed, retry once
+                # using a fresh independent session/transaction so profile docs
+                # can still be persisted during runtime.
+                if not flushed and profile_storage == "oracle":
+                    flushed = self._save_profile_state_single_node_by_storage(
+                        pipeline_id_for_profile,
+                        node_id,
+                        node_state_for_flush,
+                        changed_tokens=list(incremental_pending_tokens),
+                        storage=profile_storage,
+                        profile_cfg=profile_oracle_cfg,
+                        oracle_session=None,
+                        oracle_auto_commit=True,
+                    )
+                if flushed:
+                    incremental_pending_flush_updates = 0
+                    incremental_pending_tokens.clear()
+                    incremental_flush_count += 1
+                    last_profile_flush_at = now
+                    stats_store["custom_fields_incremental_last_flush_at"] = datetime.utcnow().isoformat()
+                elif not live_persist_warning_emitted:
+                    live_persist_warning_emitted = True
+                    _record_custom_field_warning(
+                        "Incremental profile live persist failed; final profile-store save will be attempted at pipeline end."
+                    )
+                if force and not flushed and profile_storage == "oracle":
+                    raise RuntimeError(
+                        "Oracle profile incremental flush failed. JSON profile document was not persisted. "
+                        "Check Oracle profile config/table privileges and node warnings."
+                    )
+
+            def _emit_profile_progress(
+                force: bool = False,
+                emit_progress_event: bool = True,
+            ) -> None:
+                nonlocal incremental_processed_rows, incremental_validated_rows, last_progress_emit_at
                 now = pytime.monotonic()
                 should_emit_by_rows = (incremental_processed_rows % node_progress_every == 0)
-                should_emit_by_time = (now - last_progress_emit_at) >= 0.5
+                should_emit_by_time = (now - last_progress_emit_at) >= 2.0
                 if not force and not should_emit_by_rows and not should_emit_by_time:
                     return
+                _raise_if_aborted()
                 last_progress_emit_at = now
                 stats_store["custom_fields_incremental_processed_rows"] = int(incremental_processed_rows)
                 stats_store["custom_fields_incremental_validated_rows"] = int(incremental_validated_rows)
                 stats_store["custom_fields_incremental_output_rows"] = int(len(result))
+                stats_store["custom_fields_incremental_pending_flush_updates"] = int(incremental_pending_flush_updates)
+                stats_store["custom_fields_incremental_flush_count"] = int(incremental_flush_count)
                 stats_store["custom_fields_incremental_last_updated_at"] = datetime.utcnow().isoformat()
-                if emit_node_progress and profile_processing_mode == "incremental":
+                stats_store["custom_fields_append_unique_cache_entries"] = int(
+                    len(append_unique_state_by_token)
+                ) if append_unique_persistent_cache_enabled else 0
+                stats_store["custom_fields_append_unique_cache_mode"] = (
+                    "persistent" if append_unique_persistent_cache_enabled else "row_local"
+                )
+                if emit_node_progress and is_profile_incremental_mode and emit_progress_event:
                     progress_pct = (
                         100.0
                         if total_input_rows <= 0
@@ -5541,11 +10466,24 @@ class ETLEngine:
                         pass
 
             for row_idx, base_row in enumerate(base_rows):
-                if row_idx == 0 or row_idx % 25 == 0:
+                if row_idx == 0 or row_idx % abort_check_every == 0:
                     _raise_if_aborted()
                 incremental_processed_rows += 1
                 row_obj = base_row if isinstance(base_row, dict) else {"value": base_row}
-                pk_value, pk_found = self._extract_row_value_by_path(row_obj, primary_key_field)
+                row_extract_cache: Dict[str, Tuple[Any, bool]] = {}
+
+                def _row_extract(path: Any) -> Tuple[Any, bool]:
+                    path_key = str(path or "").strip()
+                    if not path_key:
+                        return None, False
+                    cached = row_extract_cache.get(path_key)
+                    if cached is not None:
+                        return cached
+                    resolved = self._extract_row_value_by_path(row_obj, path_key)
+                    row_extract_cache[path_key] = resolved
+                    return resolved
+
+                pk_value, pk_found = _row_extract(primary_key_field)
                 if not pk_found or pk_value is None or str(pk_value).strip() == "":
                     _record_custom_field_warning(
                         f"Custom profile row {row_idx + 1} skipped: missing entity key field '{primary_key_field}'."
@@ -5555,7 +10493,7 @@ class ETLEngine:
 
                 missing_required: List[str] = []
                 for required_field in profile_required_fields:
-                    req_value, req_found = self._extract_row_value_by_path(row_obj, required_field)
+                    req_value, req_found = _row_extract(required_field)
                     if not req_found or req_value is None or str(req_value).strip() == "":
                         missing_required.append(required_field)
                 if missing_required:
@@ -5570,14 +10508,117 @@ class ETLEngine:
                 if token not in seen_entity_set:
                     seen_entity_set.add(token)
                     seen_entity_tokens.append(token)
+                    seen_entity_count += 1
                 entity_value_by_token[token] = pk_value
-                last_source_by_token[token] = row_obj
+                if include_source:
+                    last_source_by_token[token] = row_obj
+
+                if (
+                    append_unique_persistent_cache_enabled
+                    and append_unique_cache_mode == "auto"
+                    and incremental_processed_rows >= append_unique_cache_disable_min_rows
+                    and incremental_processed_rows % 1000 == 0
+                ):
+                    distinct_ratio = (
+                        float(seen_entity_count) / float(incremental_processed_rows)
+                        if incremental_processed_rows > 0
+                        else 0.0
+                    )
+                    avg_rows_per_entity = (
+                        float(incremental_processed_rows) / float(max(1, seen_entity_count))
+                    )
+                    # High-cardinality + low-reuse streams (for example PK=CUSTACCOUNTNUMBER)
+                    # perform better with row-local append_unique state.
+                    if (
+                        distinct_ratio >= append_unique_cache_disable_ratio
+                        and avg_rows_per_entity <= 1.35
+                        and seen_entity_count >= append_unique_cache_entity_limit
+                    ):
+                        append_unique_persistent_cache_enabled = False
+                        append_unique_state_by_token.clear()
+                        append_unique_token_last_seen.clear()
+                        stats_store["custom_fields_append_unique_cache_mode"] = "row_local"
+                        stats_store["custom_fields_append_unique_cache_switched_at_row"] = int(incremental_processed_rows)
+                        stats_store["custom_fields_append_unique_cache_switched_reason"] = (
+                            f"high-cardinality low-reuse stream "
+                            f"(distinct_ratio={distinct_ratio:.3f}, avg_rows_per_entity={avg_rows_per_entity:.3f})"
+                        )
+                        if not append_unique_cache_row_local_warning_emitted:
+                            append_unique_cache_row_local_warning_emitted = True
+                            _record_custom_field_warning(
+                                "Custom profile optimization: switched append_unique cache to row-local mode "
+                                "for high-cardinality low-reuse stream."
+                            )
+                    elif len(append_unique_state_by_token) > append_unique_cache_entity_limit:
+                        prune_fraction = max(0.05, min(0.5, append_unique_cache_disable_ratio))
+                        prune_target = max(
+                            256,
+                            min(
+                                int(max(1, append_unique_cache_entity_limit) * prune_fraction),
+                                max(512, append_unique_cache_entity_limit // 2),
+                            ),
+                        )
+                        removed = 0
+                        for stale_token, _ in sorted(
+                            append_unique_token_last_seen.items(),
+                            key=lambda item: item[1],
+                        ):
+                            if stale_token == token:
+                                continue
+                            if stale_token in append_unique_state_by_token:
+                                append_unique_state_by_token.pop(stale_token, None)
+                                append_unique_token_last_seen.pop(stale_token, None)
+                                removed += 1
+                            if (
+                                removed >= prune_target
+                                or len(append_unique_state_by_token) <= append_unique_cache_entity_limit
+                            ):
+                                break
+                        if removed > 0:
+                            stats_store["custom_fields_append_unique_cache_pruned_at_row"] = int(incremental_processed_rows)
+                            stats_store["custom_fields_append_unique_cache_pruned_entries"] = int(removed)
+                            stats_store["custom_fields_append_unique_cache_entries"] = int(len(append_unique_state_by_token))
+                            if not append_unique_cache_prune_warning_emitted:
+                                append_unique_cache_prune_warning_emitted = True
+                                _record_custom_field_warning(
+                                    "Custom profile optimization: append_unique cache is high-cardinality; "
+                                    "applying LRU pruning to keep throughput stable."
+                                )
 
                 previous_doc = documents_store.get(token)
+                previous_meta = meta_store.get(token)
+                if (
+                    profile_backfill_enabled
+                    and token not in profile_backfill_missing_tokens
+                    and (not isinstance(previous_doc, dict) or not isinstance(previous_meta, dict))
+                    and (pipeline_id_for_profile and is_profile_incremental_mode)
+                ):
+                    if (
+                        isinstance(profile_backfill_existing_tokens, set)
+                        and profile_backfill_existing_tokens_complete
+                        and token not in profile_backfill_existing_tokens
+                    ):
+                        profile_backfill_missing_tokens.add(token)
+                    else:
+                        loaded_doc, loaded_meta = self._load_profile_state_single_entity(
+                            pipeline_id_for_profile,
+                            node_id,
+                            token,
+                            storage=profile_storage,
+                            profile_cfg=profile_oracle_cfg,
+                            oracle_session=profile_oracle_session,
+                        )
+                        if isinstance(loaded_doc, dict) and loaded_doc:
+                            previous_doc = loaded_doc
+                            documents_store[token] = loaded_doc
+                        if isinstance(loaded_meta, dict) and loaded_meta:
+                            previous_meta = loaded_meta
+                            meta_store[token] = loaded_meta
+                        if not loaded_doc and not loaded_meta:
+                            profile_backfill_missing_tokens.add(token)
                 is_new = not isinstance(previous_doc, dict)
                 if not isinstance(previous_doc, dict):
                     previous_doc = {}
-                previous_meta = meta_store.get(token)
                 if not isinstance(previous_meta, dict):
                     previous_meta = {}
 
@@ -5589,11 +10630,16 @@ class ETLEngine:
                 custom_values: Dict[str, Any] = {}
                 changed_fields: List[str] = []
                 profile_meta_touched = False
-                append_unique_cache: Dict[str, Dict[str, Any]] = {}
+                append_unique_cache: Dict[str, Dict[str, Any]]
+                if append_unique_persistent_cache_enabled:
+                    append_unique_cache = append_unique_state_by_token.setdefault(token, {})
+                    append_unique_token_last_seen[token] = incremental_processed_rows
+                else:
+                    append_unique_cache = {}
 
                 event_time_value = None
                 if profile_event_time_field:
-                    event_time_value, _ = self._extract_row_value_by_path(row_obj, profile_event_time_field)
+                    event_time_value, _ = _row_extract(profile_event_time_field)
                 if event_time_value is None:
                     for fallback_time_field in (
                         "txn_time",
@@ -5604,7 +10650,7 @@ class ETLEngine:
                         "SERVERTIME",
                         "TXNDATE",
                     ):
-                        fallback_value, found = self._extract_row_value_by_path(row_obj, fallback_time_field)
+                        fallback_value, found = _row_extract(fallback_time_field)
                         if found and fallback_value is not None and str(fallback_value).strip() != "":
                             event_time_value = fallback_value
                             break
@@ -5612,6 +10658,8 @@ class ETLEngine:
                 current_event_time = current_event_dt.strftime("%Y-%m-%d %H:%M:%S")
                 active_profile_field: Dict[str, str] = {"name": "", "mode": "value"}
                 _missing = object()
+                profile_prev_cache: Dict[str, Any] = {}
+                profile_object_path_index: Dict[int, str] = {}
 
                 def _resolve_profile_path(path: Any) -> str:
                     path_text = str(path or "").strip()
@@ -5639,16 +10687,50 @@ class ETLEngine:
 
                 def _profile_prev(path: Any = None, default: Any = None) -> Any:
                     if path is None or str(path).strip() == "":
-                        return copy.deepcopy(working_doc)
+                        cache_key = "__doc__"
+                        if cache_key in profile_prev_cache:
+                            cached_doc = profile_prev_cache.get(cache_key)
+                            return dict(cached_doc) if isinstance(cached_doc, dict) else cached_doc
+                        doc_value = dict(working_doc)
+                        profile_prev_cache[cache_key] = doc_value
+                        return dict(doc_value)
+
                     path_text = _resolve_profile_path(path)
+                    if path_text in profile_prev_cache:
+                        cached_value = profile_prev_cache.get(path_text)
+                        if isinstance(cached_value, dict):
+                            profile_object_path_index[id(cached_value)] = path_text
+                            return cached_value
+                        if isinstance(cached_value, list):
+                            profile_object_path_index[id(cached_value)] = path_text
+                            return cached_value
+                        return cached_value if cached_value is not None else default
+
                     if path_text in custom_values:
                         value = custom_values.get(path_text)
                     else:
                         value = self._get_profile_path_value(working_doc, path_text, None)
                     if value is None:
                         return default
-                    if isinstance(value, (dict, list)):
-                        return copy.deepcopy(_resolve_profile_dynamic_value(value, working_meta))
+
+                    if isinstance(value, dict):
+                        resolved = _resolve_profile_dynamic_value(value, working_meta)
+                        if isinstance(resolved, dict):
+                            profile_prev_cache[path_text] = resolved
+                            profile_object_path_index[id(resolved)] = path_text
+                            return resolved
+                        profile_prev_cache[path_text] = resolved
+                        return resolved
+                    if isinstance(value, list):
+                        resolved = _resolve_profile_dynamic_value(value, working_meta)
+                        if isinstance(resolved, list):
+                            profile_prev_cache[path_text] = resolved
+                            profile_object_path_index[id(resolved)] = path_text
+                            return resolved
+                        profile_prev_cache[path_text] = resolved
+                        return resolved
+
+                    profile_prev_cache[path_text] = value
                     return value
 
                 def _num(value: Any, default: Any = 0) -> float:
@@ -5677,10 +10759,13 @@ class ETLEngine:
 
                 def _map_inc(path_or_map: Any, key: Any, amount: Any = 1, default: Any = 0) -> Dict[str, Any]:
                     if isinstance(path_or_map, str):
-                        base_map = _profile_prev(_resolve_profile_path(path_or_map), {})
+                        resolved_path = _resolve_profile_path(path_or_map)
+                        base_map = self._get_profile_path_value(working_doc, resolved_path, _missing)
+                        if base_map is _missing or not isinstance(base_map, dict):
+                            base_map = {}
                     else:
                         base_map = path_or_map
-                    current_map = dict(base_map) if isinstance(base_map, dict) else {}
+                    current_map = base_map if isinstance(base_map, dict) else {}
                     map_key = str(key) if key is not None else "null"
                     current_value = current_map.get(map_key, default)
                     next_value = _num(current_value, default) + _num(amount, 0)
@@ -5720,8 +10805,14 @@ class ETLEngine:
                             current_cached = cached_items_state.get("current")
                             seen_cached = cached_items_state.get("seen")
                             if isinstance(current_cached, list) and isinstance(seen_cached, set):
-                                current = current_cached
-                                seen = seen_cached
+                                base_items_current = self._get_profile_path_value(working_doc, resolved_path, _missing)
+                                if base_items_current is _missing:
+                                    base_items_current = current_cached
+                                if isinstance(base_items_current, list) and base_items_current is current_cached:
+                                    current = current_cached
+                                    seen = seen_cached
+                                else:
+                                    cached_items_state = None
                             else:
                                 cached_items_state = None
                         if not isinstance(cached_items_state, dict):
@@ -5751,8 +10842,29 @@ class ETLEngine:
                         else:
                             base_items = path_or_values
                             incoming_values = [value]
-                        current = list(base_items) if isinstance(base_items, list) else []
-                        seen = {_candidate_token(v) for v in current}
+                        source_path = (
+                            profile_object_path_index.get(id(base_items), "")
+                            if isinstance(base_items, list)
+                            else ""
+                        )
+                        if source_path:
+                            resolved_path = _resolve_profile_path(source_path)
+                            cached_items_state = append_unique_cache.get(resolved_path)
+                            if isinstance(cached_items_state, dict):
+                                current_cached = cached_items_state.get("current")
+                                seen_cached = cached_items_state.get("seen")
+                                if isinstance(current_cached, list) and isinstance(seen_cached, set):
+                                    current = current_cached
+                                    seen = seen_cached
+                                else:
+                                    cached_items_state = None
+                            if not isinstance(cached_items_state, dict):
+                                current = list(base_items) if isinstance(base_items, list) else []
+                                seen = {_candidate_token(v) for v in current}
+                                append_unique_cache[resolved_path] = {"current": current, "seen": seen}
+                        else:
+                            current = list(base_items) if isinstance(base_items, list) else []
+                            seen = {_candidate_token(v) for v in current}
                     flattened_incoming = _flatten_profile_values(incoming_values)
                     for incoming in flattened_incoming:
                         if incoming is None:
@@ -5768,6 +10880,10 @@ class ETLEngine:
                         cap = 0
                     if cap > 0 and len(current) > cap:
                         current = current[-cap:]
+                        seen = {_candidate_token(v) for v in current}
+                        if isinstance(path_or_values, str):
+                            resolved_path = _resolve_profile_path(path_or_values)
+                            append_unique_cache[resolved_path] = {"current": current, "seen": seen}
                     return current
 
                 def _rolling_update(
@@ -6198,7 +11314,7 @@ class ETLEngine:
                         if mode == "path":
                             value_path = str(metric_def.get("path") or "").strip()
                             if value_path:
-                                metric_value, _ = self._extract_row_value_by_path(row_obj, value_path)
+                                metric_value, _ = _row_extract(value_path)
                             else:
                                 metric_value = None
                         out_specs.append(
@@ -6247,6 +11363,8 @@ class ETLEngine:
                             "output_key_name": output_key_name,
                             "dirty": True,
                             "cached_rows": [],
+                            "row_index": {},
+                            "cache_signature": "",
                         }
                         aggregate_root[store_key] = state
                     else:
@@ -6270,7 +11388,25 @@ class ETLEngine:
                     else:
                         metric_specs = state.get("metric_specs") if isinstance(state.get("metric_specs"), list) else []
 
-                    key_value, key_found = self._extract_row_value_by_path(row_obj, key_field)
+                    metric_specs_final = state.get("metric_specs")
+                    if not isinstance(metric_specs_final, list):
+                        metric_specs_final = []
+                    cache_signature = json.dumps(
+                        {
+                            "output_key_name": output_key_name,
+                            "metric_specs": metric_specs_final,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    )
+                    if str(state.get("cache_signature") or "") != cache_signature:
+                        state["cache_signature"] = cache_signature
+                        state["dirty"] = True
+                        state["cached_rows"] = []
+                        state["row_index"] = {}
+
+                    key_value, key_found = _row_extract(key_field)
                     keep_null_key = bool(include_null_key)
                     if key_found and (key_value is not None or keep_null_key):
                         groups = state.get("groups")
@@ -6304,7 +11440,34 @@ class ETLEngine:
                             previous_state = bucket_metrics.get(metric_name)
                             next_state = _profile_metric_update(previous_state, metric_kind, spec.get("value"))
                             bucket_metrics[metric_name] = next_state
-                        state["dirty"] = True
+
+                        # Incremental cache update: keep materialized output rows in sync
+                        # per touched group instead of rebuilding all groups each row.
+                        cached_rows = state.get("cached_rows")
+                        if not isinstance(cached_rows, list):
+                            cached_rows = []
+                            state["cached_rows"] = cached_rows
+                        row_index = state.get("row_index")
+                        if not isinstance(row_index, dict):
+                            row_index = {}
+                            state["row_index"] = row_index
+
+                        index_value = row_index.get(token_value)
+                        if not isinstance(index_value, int) or index_value < 0 or index_value >= len(cached_rows):
+                            index_value = len(cached_rows)
+                            row_index[token_value] = index_value
+                            cached_rows.append({})
+
+                        row_out: Dict[str, Any] = {output_key_name: bucket.get("key")}
+                        for spec in metric_specs_final:
+                            metric_name = str(spec.get("name") or "").strip()
+                            metric_kind = str(spec.get("kind") or "count").strip().lower()
+                            if not metric_name:
+                                continue
+                            metric_state = bucket_metrics.get(metric_name)
+                            row_out[metric_name] = _profile_metric_finalize(metric_state, metric_kind)
+                        cached_rows[index_value] = row_out
+                        state["dirty"] = False
                         profile_meta_touched = True
                     # Return a lazy placeholder and materialize aggregate arrays only
                     # when emitting/persisting profile docs (not for every row update).
@@ -6335,6 +11498,7 @@ class ETLEngine:
                     output_key = str(state.get("output_key_name") or "key").strip() or "key"
 
                     out: List[Dict[str, Any]] = []
+                    row_index: Dict[str, int] = {}
                     for token in order:
                         bucket = groups.get(token)
                         if not isinstance(bucket, dict):
@@ -6350,9 +11514,11 @@ class ETLEngine:
                                 continue
                             metric_state = bucket_metrics.get(metric_name)
                             row_out[metric_name] = _profile_metric_finalize(metric_state, metric_kind)
+                        row_index[token] = len(out)
                         out.append(row_out)
 
                     state["cached_rows"] = out
+                    state["row_index"] = row_index
                     state["dirty"] = False
                     return out
 
@@ -6494,54 +11660,99 @@ class ETLEngine:
                         changed_token_set.add(token)
                         changed_tokens.append(token)
 
-                if profile_processing_mode == "incremental" and (doc_changed or meta_changed or is_new):
-                    profile_doc_for_emit = documents_store.get(token)
-                    if not isinstance(profile_doc_for_emit, dict):
-                        profile_doc_for_emit = working_doc
-                    profile_meta_for_emit = meta_store.get(token)
-                    if not isinstance(profile_meta_for_emit, dict):
-                        profile_meta_for_emit = working_meta
-                    resolved_profile_doc = _resolve_profile_dynamic_value(
-                        profile_doc_for_emit,
-                        profile_meta_for_emit,
-                    )
-                    if isinstance(resolved_profile_doc, dict):
-                        # Keep materialized profile in state for persisted profile docs.
-                        documents_store[token] = resolved_profile_doc
-                        out_row: Dict[str, Any] = {}
-                        if include_source and isinstance(row_obj, dict):
-                            out_row.update(row_obj)
-                        out_row.update(resolved_profile_doc)
-                        if primary_key_field and self._get_profile_path_value(out_row, primary_key_field, None) is None:
-                            self._set_profile_path_value(
-                                out_row,
-                                primary_key_field,
-                                self._json_safe_value(pk_value),
-                            )
-                        if profile_include_change_fields:
-                            out_row["_profile_changed_fields"] = list(changed_fields)
-                        result.append(self._json_safe_value(out_row))
-                        if (
-                            pipeline_id_for_profile
-                            and isinstance(profile_state_by_node, dict)
-                        ):
-                            _raise_if_aborted()
-                            node_state_for_flush = profile_state_by_node.get(node_id)
-                            if isinstance(node_state_for_flush, dict):
-                                flushed = self._save_profile_state_single_node(
-                                    pipeline_id_for_profile,
-                                    node_id,
-                                    node_state_for_flush,
+                if is_profile_incremental_mode and (doc_changed or meta_changed or is_new):
+                    incremental_pending_flush_updates += 1
+                    incremental_pending_tokens.add(token)
+                    if emit_incremental_rows:
+                        profile_doc_for_emit = documents_store.get(token)
+                        if not isinstance(profile_doc_for_emit, dict):
+                            profile_doc_for_emit = working_doc
+                        profile_meta_for_emit = meta_store.get(token)
+                        if not isinstance(profile_meta_for_emit, dict):
+                            profile_meta_for_emit = working_meta
+                        resolved_profile_doc = _resolve_profile_dynamic_value(
+                            profile_doc_for_emit,
+                            profile_meta_for_emit,
+                        )
+                        if isinstance(resolved_profile_doc, dict):
+                            # Keep per-row state raw for speed on large incremental runs.
+                            # Materialized docs are persisted once at the end (or during
+                            # live persist when explicitly enabled).
+                            if live_persist_enabled:
+                                documents_store[token] = resolved_profile_doc
+                            out_row: Dict[str, Any] = {}
+                            if include_source and isinstance(row_obj, dict):
+                                out_row.update(row_obj)
+                            out_row.update(resolved_profile_doc)
+                            if primary_key_field and self._get_profile_path_value(out_row, primary_key_field, None) is None:
+                                self._set_profile_path_value(
+                                    out_row,
+                                    primary_key_field,
+                                    self._json_safe_value(pk_value),
                                 )
-                                if not flushed and not live_persist_warning_emitted:
-                                    live_persist_warning_emitted = True
-                                    _record_custom_field_warning(
-                                        "Incremental profile live persist failed; final LMDB save will be attempted at pipeline end."
-                                    )
+                            if profile_include_change_fields:
+                                out_row["_profile_changed_fields"] = list(changed_fields)
+                            result.append(self._json_safe_value(out_row))
+                    _flush_incremental_profile_state(force=False)
                 _emit_profile_progress()
 
-            if profile_processing_mode == "incremental":
-                _emit_profile_progress(force=True)
+            if is_profile_incremental_mode:
+                # Materialize lazy aggregate placeholders once per entity before the
+                # terminal flush so persisted LMDB docs stay directly consumable.
+                for token, profile_doc in list(documents_store.items()):
+                    if not isinstance(profile_doc, dict):
+                        continue
+                    profile_meta = meta_store.get(token)
+                    if not isinstance(profile_meta, dict):
+                        profile_meta = {}
+                    resolved_profile_doc = _resolve_profile_dynamic_value(profile_doc, profile_meta)
+                    if isinstance(resolved_profile_doc, dict):
+                        documents_store[token] = resolved_profile_doc
+                _flush_incremental_profile_state(force=True)
+                # Keep final stats updated but avoid emitting an extra terminal
+                # "running/progress counter" message once processing is complete.
+                _emit_profile_progress(force=True, emit_progress_event=False)
+                if emit_incremental_rows:
+                    return result
+
+                emit_tokens: List[str]
+                if profile_emit_mode == "all_entities":
+                    emit_tokens = []
+                    seen_emit = set()
+                    for token in seen_entity_tokens + list(documents_store.keys()):
+                        if token in seen_emit:
+                            continue
+                        seen_emit.add(token)
+                        emit_tokens.append(token)
+                else:
+                    emit_tokens = list(changed_tokens)
+
+                for token in emit_tokens:
+                    _raise_if_aborted()
+                    profile_doc = documents_store.get(token)
+                    if not isinstance(profile_doc, dict):
+                        continue
+                    profile_meta = meta_store.get(token)
+                    if not isinstance(profile_meta, dict):
+                        profile_meta = {}
+                    resolved_profile_doc = _resolve_profile_dynamic_value(profile_doc, profile_meta)
+                    if not isinstance(resolved_profile_doc, dict):
+                        continue
+                    out_row: Dict[str, Any] = {}
+                    if include_source:
+                        source_row = last_source_by_token.get(token)
+                        if isinstance(source_row, dict):
+                            out_row.update(source_row)
+                    out_row.update(resolved_profile_doc)
+                    if primary_key_field and self._get_profile_path_value(out_row, primary_key_field, None) is None:
+                        self._set_profile_path_value(
+                            out_row,
+                            primary_key_field,
+                            self._json_safe_value(entity_value_by_token.get(token)),
+                        )
+                    if profile_include_change_fields:
+                        out_row["_profile_changed_fields"] = changed_fields_by_token.get(token, [])
+                    result.append(self._json_safe_value(out_row))
                 return result
 
             emit_tokens: List[str]
@@ -6689,6 +11900,646 @@ class ETLEngine:
 
         return result
 
+    def _transform_custom_fields_parallel_by_profile_key(
+        self,
+        data: list,
+        config: dict,
+        custom_specs: List[dict],
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> list:
+        profile_enabled = bool(config.get("custom_profile_enabled", False))
+        if not profile_enabled or not custom_specs:
+            return self._transform_custom_fields(
+                data,
+                config,
+                custom_specs,
+                execution_context=execution_context,
+            )
+        profile_processing_mode = self._normalize_profile_processing_mode(
+            config.get("custom_profile_processing_mode", "batch")
+        )
+        is_profile_incremental_mode = profile_processing_mode in {"incremental", "incremental_batch"}
+
+        profile_storage = self._normalize_profile_storage(
+            config.get("custom_profile_storage", "lmdb")
+        )
+
+        primary_key_field = str(
+            config.get("custom_primary_key_field")
+            or config.get("custom_group_by_field")
+            or ""
+        ).strip()
+        if not primary_key_field:
+            return self._transform_custom_fields(
+                data,
+                config,
+                custom_specs,
+                execution_context=execution_context,
+            )
+
+        try:
+            min_rows = int(
+                config.get("custom_profile_compute_min_rows")
+                or os.getenv("PROFILE_COMPUTE_MIN_ROWS", "20000")
+            )
+        except Exception:
+            min_rows = 20000
+        min_rows = max(1000, min(min_rows, 5_000_000))
+        if len(data or []) < min_rows:
+            return self._transform_custom_fields(
+                data,
+                config,
+                custom_specs,
+                execution_context=execution_context,
+            )
+
+        oracle_queue_enabled_cfg = config.get("custom_profile_oracle_queue_enabled", None)
+        if oracle_queue_enabled_cfg is None or str(oracle_queue_enabled_cfg).strip() == "":
+            oracle_queue_enabled_cfg = os.getenv("PROFILE_ORACLE_QUEUE_ENABLED", "1")
+        oracle_queue_enabled = bool(
+            is_profile_incremental_mode
+            and self._parse_bool_like(oracle_queue_enabled_cfg, True)
+        )
+        try:
+            oracle_queue_maxsize = int(
+                config.get("custom_profile_oracle_queue_maxsize")
+                or os.getenv("PROFILE_ORACLE_QUEUE_MAXSIZE", "256")
+            )
+        except Exception:
+            oracle_queue_maxsize = 256
+        oracle_queue_maxsize = max(8, min(oracle_queue_maxsize, 4096))
+        try:
+            oracle_queue_enqueue_timeout_seconds = float(
+                config.get("custom_profile_oracle_queue_enqueue_timeout_seconds")
+                or os.getenv("PROFILE_ORACLE_QUEUE_ENQUEUE_TIMEOUT_SECONDS", "0.2")
+            )
+        except Exception:
+            oracle_queue_enqueue_timeout_seconds = 0.2
+        oracle_queue_enqueue_timeout_seconds = max(
+            0.01,
+            min(oracle_queue_enqueue_timeout_seconds, 5.0),
+        )
+
+        default_workers = min(8, max(2, int(os.cpu_count() or 4)))
+        try:
+            workers = int(
+                config.get("custom_profile_compute_workers")
+                or os.getenv("PROFILE_COMPUTE_WORKERS", str(default_workers))
+            )
+        except Exception:
+            workers = default_workers
+        workers = max(2, min(workers, 16))
+        compute_executor = self._normalize_profile_compute_executor(
+            config.get("custom_profile_compute_executor", "thread")
+        )
+        if compute_executor == "process":
+            workers = max(2, min(workers, max(2, int(os.cpu_count() or 2))))
+        # For very large runs, keep a minimum worker floor even if config was set low.
+        # This avoids "parallel" mode behaving almost like single-thread execution.
+        if len(data or []) >= 200_000 and workers < 4:
+            workers = min(8, max(4, default_workers))
+
+        partitions: List[List[Dict[str, Any]]] = [[] for _ in range(workers)]
+        partition_tokens: List[set] = [set() for _ in range(workers)]
+        fallback_rows: List[Dict[str, Any]] = []
+        for raw_row in (data or []):
+            row_obj = raw_row if isinstance(raw_row, dict) else {"value": raw_row}
+            pk_value, pk_found = self._extract_row_value_by_path(row_obj, primary_key_field)
+            if not pk_found or pk_value is None or str(pk_value).strip() == "":
+                fallback_rows.append(row_obj)
+                continue
+            token = self._stable_json_token(pk_value)
+            partition_index = abs(hash(token)) % workers
+            partitions[partition_index].append(row_obj)
+            partition_tokens[partition_index].add(token)
+        if fallback_rows:
+            partitions[0].extend(fallback_rows)
+
+        active_partitions: List[Tuple[int, List[Dict[str, Any]], set]] = []
+        for idx, rows in enumerate(partitions):
+            if rows:
+                active_partitions.append((idx, rows, partition_tokens[idx]))
+        if len(active_partitions) <= 1:
+            return self._transform_custom_fields(
+                data,
+                config,
+                custom_specs,
+                execution_context=execution_context,
+            )
+
+        node_id = str((execution_context or {}).get("node_id") or "map_transform")
+        pipeline_id = str((execution_context or {}).get("pipeline_id") or "").strip()
+        context_oracle_cfg = (
+            (execution_context or {}).get("profile_oracle_cfg")
+            if isinstance((execution_context or {}).get("profile_oracle_cfg"), dict)
+            else None
+        )
+        profile_oracle_cfg = context_oracle_cfg or {
+            "custom_profile_oracle_host": config.get("custom_profile_oracle_host"),
+            "custom_profile_oracle_port": config.get("custom_profile_oracle_port"),
+            "custom_profile_oracle_service_name": config.get("custom_profile_oracle_service_name"),
+            "custom_profile_oracle_sid": config.get("custom_profile_oracle_sid"),
+            "custom_profile_oracle_user": config.get("custom_profile_oracle_user"),
+            "custom_profile_oracle_password": config.get("custom_profile_oracle_password"),
+            "custom_profile_oracle_dsn": config.get("custom_profile_oracle_dsn"),
+            "custom_profile_oracle_table": config.get("custom_profile_oracle_table"),
+            "custom_profile_oracle_write_strategy": config.get("custom_profile_oracle_write_strategy"),
+            "custom_profile_oracle_parallel_workers": config.get("custom_profile_oracle_parallel_workers"),
+            "custom_profile_oracle_parallel_min_tokens": config.get("custom_profile_oracle_parallel_min_tokens"),
+            "custom_profile_oracle_merge_batch_size": config.get("custom_profile_oracle_merge_batch_size"),
+            "custom_profile_oracle_parallel_force": config.get("custom_profile_oracle_parallel_force"),
+        }
+        context_oracle_session = (
+            (execution_context or {}).get("profile_oracle_session")
+            if isinstance((execution_context or {}).get("profile_oracle_session"), dict)
+            else None
+        )
+        emit_node_progress = (
+            (execution_context or {}).get("emit_node_progress")
+            if isinstance(execution_context, dict) and callable((execution_context or {}).get("emit_node_progress"))
+            else None
+        )
+        should_abort_cb = (
+            (execution_context or {}).get("should_abort")
+            if isinstance(execution_context, dict) and callable((execution_context or {}).get("should_abort"))
+            else None
+        )
+        raise_if_aborted_cb = (
+            (execution_context or {}).get("raise_if_aborted")
+            if isinstance(execution_context, dict) and callable((execution_context or {}).get("raise_if_aborted"))
+            else None
+        )
+
+        def _raise_if_aborted() -> None:
+            if callable(raise_if_aborted_cb):
+                raise_if_aborted_cb()
+                return
+            if callable(should_abort_cb):
+                try:
+                    if bool(should_abort_cb()):
+                        raise ExecutionAbortedError("Execution aborted by user.")
+                except ExecutionAbortedError:
+                    raise
+                except Exception:
+                    pass
+
+        all_candidate_tokens: List[str] = []
+        seen_candidate_tokens: set = set()
+        for _, _, tokens in active_partitions:
+            for token in tokens:
+                if token in seen_candidate_tokens:
+                    continue
+                seen_candidate_tokens.add(token)
+                all_candidate_tokens.append(token)
+
+        prefetched_docs: Dict[str, Dict[str, Any]] = {}
+        prefetched_meta: Dict[str, Dict[str, Any]] = {}
+        try:
+            prefetch_chunk_size = int(
+                config.get("custom_profile_backfill_candidate_prefetch_chunk_size")
+                or os.getenv("PROFILE_BACKFILL_CANDIDATE_PREFETCH_CHUNK_SIZE", "500")
+            )
+        except Exception:
+            prefetch_chunk_size = 500
+        prefetch_chunk_size = max(50, min(prefetch_chunk_size, 900))
+        try:
+            compute_global_prefetch_max_tokens = int(
+                config.get("custom_profile_compute_global_prefetch_max_tokens")
+                or os.getenv("PROFILE_COMPUTE_GLOBAL_PREFETCH_MAX_TOKENS", "40000")
+            )
+        except Exception:
+            compute_global_prefetch_max_tokens = 40000
+        compute_global_prefetch_max_tokens = max(1000, min(compute_global_prefetch_max_tokens, 2_000_000))
+        use_global_prefetch = bool(
+            pipeline_id
+            and all_candidate_tokens
+            and len(all_candidate_tokens) <= compute_global_prefetch_max_tokens
+        )
+
+        if use_global_prefetch:
+            if emit_node_progress:
+                try:
+                    emit_node_progress({
+                        "processed_rows": 0,
+                        "validated_rows": 0,
+                        "output_rows": 0,
+                        "message": (
+                            f"⟳ Running {str((execution_context or {}).get('node_label') or 'Custom Fields')}… "
+                            f"loading profile baseline for {len(all_candidate_tokens):,} keys"
+                        ),
+                    })
+                except Exception:
+                    pass
+            try:
+                docs, meta, _existing = self._load_profile_state_for_entity_tokens(
+                    pipeline_id,
+                    node_id,
+                    all_candidate_tokens,
+                    storage=profile_storage,
+                    profile_cfg=profile_oracle_cfg,
+                    oracle_session=context_oracle_session,
+                    chunk_size=prefetch_chunk_size,
+                )
+                if isinstance(docs, dict):
+                    prefetched_docs = docs
+                if isinstance(meta, dict):
+                    prefetched_meta = meta
+            except Exception as exc:
+                logger.warning(
+                    f"Parallel profile compute baseline prefetch failed for pipeline {pipeline_id}, "
+                    f"node {node_id}: {exc}"
+                )
+
+        partition_config = dict(config or {})
+        partition_config["custom_profile_compute_strategy"] = "single"
+
+        processed_rows_total = 0
+        validated_rows_total = 0
+        output_rows_total = 0
+        flush_count_total = 0
+        merged_documents: Dict[str, Dict[str, Any]] = {}
+        merged_meta: Dict[str, Dict[str, Any]] = {}
+        merged_rows: List[Any] = []
+        merged_warnings: List[str] = []
+        partition_progress_lock = threading.Lock()
+        partition_live_progress: Dict[int, Dict[str, int]] = {}
+
+        def _run_partition(partition_info: Tuple[int, List[Dict[str, Any]], set]) -> Dict[str, Any]:
+            partition_idx, partition_rows, partition_token_set = partition_info
+            local_documents: Dict[str, Any] = {}
+            local_meta: Dict[str, Any] = {}
+            if use_global_prefetch:
+                for token in partition_token_set:
+                    doc_value = prefetched_docs.get(token)
+                    if isinstance(doc_value, dict):
+                        # Token ownership is partitioned by stable hash, so direct reuse
+                        # avoids expensive deep-copy overhead.
+                        local_documents[token] = doc_value
+                    meta_value = prefetched_meta.get(token)
+                    if isinstance(meta_value, dict):
+                        local_meta[token] = meta_value
+            elif pipeline_id and partition_token_set:
+                try:
+                    partition_docs, partition_meta, _existing = self._load_profile_state_for_entity_tokens(
+                        pipeline_id,
+                        node_id,
+                        list(partition_token_set),
+                        storage=profile_storage,
+                        profile_cfg=profile_oracle_cfg,
+                        oracle_session=None,
+                        chunk_size=prefetch_chunk_size,
+                    )
+                    if isinstance(partition_docs, dict):
+                        local_documents = partition_docs
+                    if isinstance(partition_meta, dict):
+                        local_meta = partition_meta
+                except Exception as exc:
+                    logger.warning(
+                        f"Parallel profile compute partition prefetch failed for pipeline {pipeline_id}, "
+                        f"node {node_id}, partition {partition_idx}: {exc}"
+                    )
+            local_profile_state = {
+                node_id: {
+                    "documents": local_documents,
+                    "meta": local_meta,
+                    "stats": {},
+                }
+            }
+            local_node_warnings: List[str] = []
+
+            def _emit_partition_progress(progress_payload: Dict[str, Any]) -> None:
+                if not emit_node_progress:
+                    return
+                processed_now = int(progress_payload.get("processed_rows") or 0)
+                validated_now = int(progress_payload.get("validated_rows") or 0)
+                output_now = int(progress_payload.get("output_rows") or 0)
+                with partition_progress_lock:
+                    partition_live_progress[partition_idx] = {
+                        "processed": processed_now,
+                        "validated": validated_now,
+                        "output_rows": output_now,
+                    }
+                    agg_processed = sum(int(v.get("processed") or 0) for v in partition_live_progress.values())
+                    agg_validated = sum(int(v.get("validated") or 0) for v in partition_live_progress.values())
+                    agg_output = sum(int(v.get("output_rows") or 0) for v in partition_live_progress.values())
+                try:
+                    emit_node_progress({
+                        "processed_rows": agg_processed,
+                        "validated_rows": agg_validated,
+                        "output_rows": agg_output,
+                        "message": (
+                            f"⟳ Running {str((execution_context or {}).get('node_label') or 'Custom Fields')}… "
+                            f"parallel incremental {agg_processed:,}/{len(data):,} processed"
+                        ),
+                    })
+                except Exception:
+                    pass
+
+            local_execution_context: Dict[str, Any] = {
+                "execution_id": (execution_context or {}).get("execution_id"),
+                "pipeline_id": "",
+                "node_id": node_id,
+                "node_label": (execution_context or {}).get("node_label"),
+                "mode": (execution_context or {}).get("mode"),
+                "stream_iteration": (execution_context or {}).get("stream_iteration"),
+                "runtime": (execution_context or {}).get("runtime"),
+                "pipeline_state": {},
+                "profile_state_by_node": local_profile_state,
+                "node_warnings": local_node_warnings,
+                "emit_node_progress": _emit_partition_progress,
+                "node_progress_every": int((execution_context or {}).get("node_progress_every") or 2000),
+                "should_abort": should_abort_cb,
+                "raise_if_aborted": raise_if_aborted_cb,
+                "profile_oracle_cfg": profile_oracle_cfg,
+                "profile_oracle_session": None,
+            }
+            local_rows = self._transform_custom_fields(
+                partition_rows,
+                partition_config,
+                custom_specs,
+                execution_context=local_execution_context,
+            )
+            local_node_state = local_profile_state.get(node_id)
+            if not isinstance(local_node_state, dict):
+                local_node_state = {"documents": {}, "meta": {}, "stats": {}}
+            local_stats = local_node_state.get("stats") if isinstance(local_node_state.get("stats"), dict) else {}
+            try:
+                local_processed = int(local_stats.get("custom_fields_incremental_processed_rows") or 0)
+            except Exception:
+                local_processed = len(partition_rows)
+            try:
+                local_validated = int(local_stats.get("custom_fields_incremental_validated_rows") or 0)
+            except Exception:
+                local_validated = 0
+            try:
+                local_flush_count = int(local_stats.get("custom_fields_incremental_flush_count") or 0)
+            except Exception:
+                local_flush_count = 0
+            return {
+                "partition_idx": partition_idx,
+                "rows": local_rows if isinstance(local_rows, list) else [],
+                "node_state": local_node_state,
+                "warnings": local_node_warnings,
+                "processed": local_processed,
+                "validated": local_validated,
+                "output_rows": len(local_rows) if isinstance(local_rows, list) else 0,
+                "flush_count": local_flush_count,
+            }
+
+        max_workers = max(2, min(workers, len(active_partitions)))
+        partition_results: List[Dict[str, Any]] = []
+        try:
+            if compute_executor == "process":
+                process_jobs: List[Dict[str, Any]] = []
+                for partition_idx, partition_rows, partition_token_set in active_partitions:
+                    partition_prefetched_docs: Dict[str, Dict[str, Any]] = {}
+                    partition_prefetched_meta: Dict[str, Dict[str, Any]] = {}
+                    if use_global_prefetch:
+                        for token in partition_token_set:
+                            doc_value = prefetched_docs.get(token)
+                            if isinstance(doc_value, dict):
+                                partition_prefetched_docs[token] = doc_value
+                            meta_value = prefetched_meta.get(token)
+                            if isinstance(meta_value, dict):
+                                partition_prefetched_meta[token] = meta_value
+                    process_jobs.append({
+                        "partition_idx": partition_idx,
+                        "partition_rows": partition_rows,
+                        "partition_tokens": list(partition_token_set),
+                        "config": partition_config,
+                        "custom_specs": custom_specs,
+                        "node_id": node_id,
+                        "pipeline_id": pipeline_id,
+                        "profile_storage": profile_storage,
+                        "profile_oracle_cfg": profile_oracle_cfg,
+                        "prefetched_docs": partition_prefetched_docs,
+                        "prefetched_meta": partition_prefetched_meta,
+                        "prefetch_chunk_size": prefetch_chunk_size,
+                        "execution_id": (execution_context or {}).get("execution_id"),
+                        "node_label": (execution_context or {}).get("node_label"),
+                        "mode": (execution_context or {}).get("mode"),
+                        "stream_iteration": (execution_context or {}).get("stream_iteration"),
+                        "runtime": (execution_context or {}).get("runtime"),
+                        "node_progress_every": int((execution_context or {}).get("node_progress_every") or 2000),
+                    })
+                with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                    futures = [
+                        executor.submit(_run_custom_profile_partition_process_worker, job)
+                        for job in process_jobs
+                    ]
+                    for future in as_completed(futures):
+                        _raise_if_aborted()
+                        partition_result = future.result()
+                        if not isinstance(partition_result, dict):
+                            raise RuntimeError("Parallel profile process partition returned invalid result")
+                        if not bool(partition_result.get("ok")):
+                            raise RuntimeError(
+                                f"Parallel profile process partition failed: "
+                                f"{partition_result.get('error')}"
+                            )
+                        partition_results.append(partition_result)
+                        processed_rows_total += int(partition_result.get("processed") or 0)
+                        validated_rows_total += int(partition_result.get("validated") or 0)
+                        output_rows_total += int(partition_result.get("output_rows") or 0)
+                        flush_count_total += int(partition_result.get("flush_count") or 0)
+                        if emit_node_progress:
+                            try:
+                                emit_node_progress({
+                                    "processed_rows": int(processed_rows_total),
+                                    "validated_rows": int(validated_rows_total),
+                                    "output_rows": int(output_rows_total),
+                                    "message": (
+                                        f"⟳ Running {str((execution_context or {}).get('node_label') or 'Custom Fields')}… "
+                                        f"parallel incremental {processed_rows_total:,}/{len(data):,} processed"
+                                    ),
+                                })
+                            except Exception:
+                                pass
+            else:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = [
+                        executor.submit(_run_partition, partition)
+                        for partition in active_partitions
+                    ]
+                    for future in as_completed(futures):
+                        _raise_if_aborted()
+                        partition_result = future.result()
+                        partition_results.append(partition_result)
+                        processed_rows_total += int(partition_result.get("processed") or 0)
+                        validated_rows_total += int(partition_result.get("validated") or 0)
+                        output_rows_total += int(partition_result.get("output_rows") or 0)
+                        flush_count_total += int(partition_result.get("flush_count") or 0)
+                        if emit_node_progress:
+                            try:
+                                emit_node_progress({
+                                    "processed_rows": int(processed_rows_total),
+                                    "validated_rows": int(validated_rows_total),
+                                    "output_rows": int(output_rows_total),
+                                    "message": (
+                                        f"⟳ Running {str((execution_context or {}).get('node_label') or 'Custom Fields')}… "
+                                        f"parallel incremental {processed_rows_total:,}/{len(data):,} processed"
+                                    ),
+                                })
+                            except Exception:
+                                pass
+        except ExecutionAbortedError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                f"Parallel profile compute failed for pipeline {pipeline_id}, node {node_id}; "
+                f"falling back to single compute strategy: {exc}"
+            )
+            return self._transform_custom_fields(
+                data,
+                config,
+                custom_specs,
+                execution_context=execution_context,
+            )
+
+        partition_results.sort(key=lambda item: int(item.get("partition_idx") or 0))
+        for partition_result in partition_results:
+            local_node_state = partition_result.get("node_state")
+            if isinstance(local_node_state, dict):
+                local_docs = local_node_state.get("documents")
+                if isinstance(local_docs, dict):
+                    merged_documents.update(local_docs)
+                local_meta = local_node_state.get("meta")
+                if isinstance(local_meta, dict):
+                    merged_meta.update(local_meta)
+            local_rows = partition_result.get("rows")
+            if isinstance(local_rows, list) and local_rows:
+                merged_rows.extend(local_rows)
+            local_warnings = partition_result.get("warnings")
+            if isinstance(local_warnings, list) and local_warnings:
+                merged_warnings.extend([str(w) for w in local_warnings if str(w).strip()])
+
+        profile_state_by_node = (
+            (execution_context or {}).get("profile_state_by_node")
+            if isinstance((execution_context or {}).get("profile_state_by_node"), dict)
+            else None
+        )
+        if isinstance(profile_state_by_node, dict):
+            stats_out = {
+                "custom_fields_expression_engine_requested": str(
+                    config.get("custom_expression_engine") or "auto"
+                ).strip().lower(),
+                "custom_fields_expression_engine_active": "python",
+                "custom_fields_incremental_processed_rows": int(processed_rows_total),
+                "custom_fields_incremental_validated_rows": int(validated_rows_total),
+                "custom_fields_incremental_output_rows": int(len(merged_rows)),
+                "custom_fields_incremental_flush_count": int(flush_count_total),
+                "custom_fields_incremental_last_updated_at": datetime.utcnow().isoformat(),
+                "custom_fields_compute_strategy": "parallel_by_profile_key",
+                "custom_fields_compute_executor": str(compute_executor),
+                "custom_fields_profile_storage": str(profile_storage),
+                "custom_fields_compute_workers": int(max_workers),
+                "custom_fields_compute_partitions": int(len(active_partitions)),
+            }
+            profile_state_by_node[node_id] = {
+                "documents": merged_documents,
+                "meta": merged_meta,
+                "stats": stats_out,
+            }
+
+        if isinstance((execution_context or {}).get("node_warnings"), list):
+            warn_target = (execution_context or {}).get("node_warnings")
+            warn_seen = set(str(item) for item in warn_target if str(item).strip())
+            for warning in merged_warnings:
+                if warning in warn_seen:
+                    continue
+                warn_seen.add(warning)
+                if len(warn_target) >= 200:
+                    break
+                warn_target.append(warning)
+
+        if pipeline_id and (merged_documents or merged_meta):
+            changed_tokens = list(
+                {
+                    str(token).strip()
+                    for token in list(merged_documents.keys()) + list(merged_meta.keys())
+                    if str(token).strip()
+                }
+            )
+            node_state_payload = {
+                "documents": merged_documents,
+                "meta": merged_meta,
+                "stats": (
+                    profile_state_by_node.get(node_id, {}).get("stats", {})
+                    if isinstance(profile_state_by_node, dict)
+                    else {}
+                ),
+            }
+            persisted = False
+            if profile_storage == "oracle" and oracle_queue_enabled and changed_tokens:
+                enqueued, enqueue_error = self._enqueue_oracle_profile_write(
+                    pipeline_id,
+                    node_id,
+                    node_state_payload,
+                    changed_tokens=changed_tokens,
+                    profile_cfg=profile_oracle_cfg,
+                    queue_maxsize=oracle_queue_maxsize,
+                    enqueue_timeout_seconds=oracle_queue_enqueue_timeout_seconds,
+                    oracle_auto_commit=True,
+                )
+                if enqueued:
+                    persisted = True
+                    queue_stats = self._get_oracle_profile_write_queue_stats(
+                        pipeline_id,
+                        node_id,
+                    )
+                    if isinstance(profile_state_by_node, dict):
+                        node_stats = profile_state_by_node.get(node_id, {}).get("stats")
+                        if isinstance(node_stats, dict):
+                            node_stats["custom_fields_oracle_queue_enabled"] = True
+                            node_stats["custom_fields_oracle_queue_depth"] = int(
+                                queue_stats.get("queue_depth") or 0
+                            )
+                            node_stats["custom_fields_oracle_queue_pending_batches"] = int(
+                                queue_stats.get("pending_batches") or 0
+                            )
+                            node_stats["custom_fields_oracle_queue_inflight_batches"] = int(
+                                queue_stats.get("inflight_batches") or 0
+                            )
+                            node_stats["custom_fields_oracle_queue_enqueued_batches"] = int(
+                                queue_stats.get("enqueued_batches") or 0
+                            )
+                            node_stats["custom_fields_oracle_queue_processed_batches"] = int(
+                                queue_stats.get("processed_batches") or 0
+                            )
+                            node_stats["custom_fields_oracle_queue_failed_batches"] = int(
+                                queue_stats.get("failed_batches") or 0
+                            )
+                            node_stats["custom_fields_oracle_queue_worker_alive"] = bool(
+                                queue_stats.get("worker_alive", False)
+                            )
+                            node_stats["custom_fields_oracle_queue_last_error"] = str(
+                                queue_stats.get("last_error") or ""
+                            )
+                else:
+                    logger.warning(
+                        f"Parallel profile enqueue failed for pipeline {pipeline_id}, node {node_id}: "
+                        f"{enqueue_error or 'unknown queue error'}. Falling back to sync persist."
+                    )
+
+            if not persisted:
+                persisted = self._save_profile_state_single_node_by_storage(
+                    pipeline_id,
+                    node_id,
+                    node_state_payload,
+                    changed_tokens=changed_tokens,
+                    storage=profile_storage,
+                    profile_cfg=profile_oracle_cfg,
+                    oracle_session=None,
+                    oracle_auto_commit=True,
+                )
+            if not persisted:
+                raise RuntimeError(
+                    f"Parallel profile compute persist failed for pipeline {pipeline_id}, "
+                    f"node {node_id}, storage={profile_storage}."
+                )
+
+        return merged_rows
+
     def _transform_map(
         self,
         data: list,
@@ -6706,6 +12557,19 @@ class ETLEngine:
                 node_warnings.append(warn_msg)
             logger.warning(warn_msg)
         if custom_specs:
+            compute_strategy = self._normalize_profile_compute_strategy(
+                config.get("custom_profile_compute_strategy", "single")
+            )
+            if (
+                bool(config.get("custom_profile_enabled", False))
+                and compute_strategy == "parallel_by_profile_key"
+            ):
+                return self._transform_custom_fields_parallel_by_profile_key(
+                    data,
+                    config,
+                    custom_specs,
+                    execution_context=execution_context,
+                )
             return self._transform_custom_fields(
                 data,
                 config,
@@ -7194,14 +13058,25 @@ class ETLEngine:
             raise RuntimeError(f"MySQL write failed: {e}")
 
     def _build_oracle_dsn(self, config: dict) -> str:
-        dsn = str(config.get("dsn", "")).strip()
+        dsn_raw = config.get("dsn")
+        dsn = str(dsn_raw).strip() if dsn_raw is not None else ""
         if dsn:
             return dsn
 
-        host = str(config.get("host", "localhost")).strip() or "localhost"
-        port = int(config.get("port", 1521))
-        service_name = str(config.get("service_name", "") or config.get("database", "")).strip()
-        sid = str(config.get("sid", "")).strip()
+        host_raw = config.get("host")
+        host = str(host_raw).strip() if host_raw is not None else ""
+        host = host or "localhost"
+        port_raw = config.get("port", 1521)
+        try:
+            port = int(str(port_raw).strip())
+        except Exception:
+            port = 1521
+        service_raw = config.get("service_name")
+        if service_raw is None or str(service_raw).strip() == "":
+            service_raw = config.get("database")
+        service_name = str(service_raw).strip() if service_raw is not None else ""
+        sid_raw = config.get("sid")
+        sid = str(sid_raw).strip() if sid_raw is not None else ""
 
         if service_name:
             return f"{host}:{port}/{service_name}"
@@ -7210,17 +13085,30 @@ class ETLEngine:
         return f"{host}:{port}/ORCLCDB"
 
     def _build_sqlalchemy_oracle_url(self, config: dict) -> str:
-        user = quote_plus(str(config.get("user", "")))
-        password = quote_plus(str(config.get("password", "")))
+        user_raw = config.get("user")
+        password_raw = config.get("password")
+        user = quote_plus(str(user_raw).strip() if user_raw is not None else "")
+        password = quote_plus(str(password_raw) if password_raw is not None else "")
 
-        dsn = str(config.get("dsn", "")).strip()
+        dsn_raw = config.get("dsn")
+        dsn = str(dsn_raw).strip() if dsn_raw is not None else ""
         if dsn:
             return f"oracle+oracledb://{user}:{password}@{dsn}"
 
-        host = str(config.get("host", "localhost")).strip() or "localhost"
-        port = int(config.get("port", 1521))
-        service_name = str(config.get("service_name", "") or config.get("database", "")).strip()
-        sid = str(config.get("sid", "")).strip()
+        host_raw = config.get("host")
+        host = str(host_raw).strip() if host_raw is not None else ""
+        host = host or "localhost"
+        port_raw = config.get("port", 1521)
+        try:
+            port = int(str(port_raw).strip())
+        except Exception:
+            port = 1521
+        service_raw = config.get("service_name")
+        if service_raw is None or str(service_raw).strip() == "":
+            service_raw = config.get("database")
+        service_name = str(service_raw).strip() if service_raw is not None else ""
+        sid_raw = config.get("sid")
+        sid = str(sid_raw).strip() if sid_raw is not None else ""
 
         if service_name:
             return (

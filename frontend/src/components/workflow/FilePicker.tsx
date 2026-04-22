@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Button, Space, Typography, Tag, Table, Spin, Alert, Input, Tooltip, Progress } from 'antd'
 import {
   FolderOpenOutlined, FileTextOutlined, CheckCircleFilled,
@@ -38,6 +38,7 @@ interface FileInfo {
 }
 
 interface FilePickerProps {
+  nodeId?: string
   value?: string
   onChange?: (path: string, file?: FileInfo) => void
   accept?: string
@@ -46,14 +47,45 @@ interface FilePickerProps {
   fileType?: keyof typeof ACCEPTED_TYPES
 }
 
+function basenameFromPath(rawPath: string): string {
+  const cleaned = String(rawPath || '')
+    .replace(/^local:\/\//, '')
+    .replace(/^__local__:\/\//, '')
+  const token = cleaned.split(/[\\/]/).pop() || cleaned
+  const decoded = decodeURIComponent(token)
+  return decoded.trim() || 'selected_file'
+}
+
 // ─── Source file picker ───────────────────────────────────────────────────────
-export function SourceFilePicker({ value, onChange, fileType = 'all', placeholder }: FilePickerProps) {
+export function SourceFilePicker({ nodeId, value, onChange, fileType = 'all', placeholder }: FilePickerProps) {
   const inputRef = useRef<HTMLInputElement>(null)
   const [uploading, setUploading] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(0)
   const [fileInfo, setFileInfo] = useState<FileInfo | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [backendAvailable, setBackendAvailable] = useState<boolean | null>(null)
+
+  useEffect(() => {
+    setError(null)
+    setUploadProgress(0)
+    setBackendAvailable(null)
+    const currentPath = String(value || '').trim()
+    if (!currentPath) {
+      setFileInfo(null)
+      return
+    }
+    setFileInfo((prev) => {
+      if (prev && String(prev.serverPath || '') === currentPath) return prev
+      return {
+        name: basenameFromPath(currentPath),
+        size: 0,
+        rows: 0,
+        columns: [],
+        preview: [],
+        serverPath: currentPath,
+      }
+    })
+  }, [nodeId, value])
 
   const parseLocalCSV = (file: File): Promise<{ rows: number; columns: string[]; preview: Record<string, unknown>[] }> =>
     new Promise((resolve) => {
@@ -308,10 +340,41 @@ export function DestinationPathPicker({ value, onChange, placeholder, fileType =
 
   const ext = fileType === 'excel' ? '.xlsx' : fileType === 'json' ? '.json' : '.csv'
 
+  useEffect(() => {
+    if (!nodeId) {
+      setPickedFolder(null)
+      setPickedFilename(null)
+      return
+    }
+    const existingHandle = destDirHandles.get(nodeId)
+    const existingFilename = destFilenames.get(nodeId)
+    if (existingHandle && existingFilename) {
+      setPickedFolder(existingHandle.name)
+      setPickedFilename(existingFilename)
+      return
+    }
+    const raw = String(value || '').trim()
+    if (raw.startsWith('__local__://')) {
+      const relative = raw.replace('__local__://', '')
+      const parts = relative.split('/').filter(Boolean)
+      if (parts.length >= 2) {
+        const filename = parts.pop() || null
+        const folder = parts.join('/') || null
+        setPickedFolder(folder)
+        setPickedFilename(filename)
+        return
+      }
+    }
+    setPickedFolder(null)
+    setPickedFilename(null)
+  }, [nodeId, value])
+
   const handleFolderPick = async () => {
     try {
       const dirHandle: FileSystemDirectoryHandle = await (window as any).showDirectoryPicker({ mode: 'readwrite' })
-      const fileName = `output_${new Date().toISOString().slice(0, 16).replace('T', '_').replace(/:/g, '-')}${ext}`
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      const nodeSuffix = nodeId ? nodeId.slice(0, 8) : Math.random().toString(36).slice(2, 8)
+      const fileName = `output_${stamp}_${nodeSuffix}${ext}`
 
       // Store the handle for post-execution write
       if (nodeId) {

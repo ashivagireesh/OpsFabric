@@ -5,7 +5,7 @@ import {
   DashboardOutlined, ApiOutlined, HistoryOutlined, KeyOutlined,
   SettingOutlined, MenuFoldOutlined, MenuUnfoldOutlined, ThunderboltOutlined,
   RocketOutlined, GithubOutlined, BarChartOutlined, TeamOutlined, ExperimentOutlined,
-  MessageOutlined, CodeOutlined, BranchesOutlined, CommentOutlined,
+  MessageOutlined, CodeOutlined, BranchesOutlined, CommentOutlined, BookOutlined,
 } from '@ant-design/icons'
 import { useThemeStore } from '../store/themeStore'
 
@@ -23,6 +23,7 @@ const menuItems = [
   { key: '/python-analytics', icon: <CodeOutlined />, label: 'Python Analytics' },
   { key: '/nlp-chat', icon: <MessageOutlined />, label: 'NLP Chat Studio' },
   { key: '/workflow-chat', icon: <CommentOutlined />, label: 'Workflow Chat' },
+  { key: '/reference', icon: <BookOutlined />, label: 'Reference' },
   { type: 'divider' as const },
   { key: '/admin', icon: <TeamOutlined />, label: 'Admin' },
   { key: '/settings', icon: <SettingOutlined />, label: 'Settings' },

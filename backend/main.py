@@ -14,6 +14,7 @@ import math
 import base64
 import smtplib
 import ssl
+import sqlite3 as _sqlite3
 from datetime import datetime, timedelta, date, time
 from decimal import Decimal
 from pathlib import Path
@@ -35,13 +36,17 @@ try:
     import lmdb as _lmdb  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
     _lmdb = None
+try:
+    import rocksdict as _rocksdict  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    _rocksdict = None
 
 # Load environment from backend/.env and project-root/.env if present.
 _BACKEND_DIR = Path(__file__).resolve().parent
 load_dotenv(_BACKEND_DIR / ".env")
 load_dotenv(_BACKEND_DIR.parent / ".env")
 
-from database import engine, get_db, Base, SessionLocal
+from database import engine, get_db, Base, SessionLocal, DATABASE_URL
 import models
 from etl_engine import ETLEngine, ExecutionAbortedError
 
@@ -56,6 +61,7 @@ async def lifespan(app: FastAPI):
     recovered = _recover_stale_running_executions()
     if recovered:
         logger.warning(f"Recovered {recovered} stale running execution(s) on startup")
+    _run_execution_history_maintenance(context="startup")
     if not scheduler.running:
         scheduler.start()
     _reload_all_pipeline_schedule_jobs()
@@ -189,11 +195,12 @@ ws_manager = WebSocketManager()
 _app_main_loop: Optional[asyncio.AbstractEventLoop] = None
 execution_abort_events: Dict[str, threading.Event] = {}
 execution_workers: Dict[str, threading.Thread] = {}
+_execution_start_lock = threading.Lock()
 _execution_log_flush_state: Dict[str, float] = {}
 _execution_log_flush_lock = threading.Lock()
 _EXECUTION_LOG_FLUSH_INTERVAL_SECONDS = max(
     0.1,
-    float(str(_os.getenv("EXECUTION_LOG_FLUSH_INTERVAL_SECONDS", "0.8")).strip() or "0.8"),
+    float(str(_os.getenv("EXECUTION_LOG_FLUSH_INTERVAL_SECONDS", "5.0")).strip() or "5.0"),
 )
 
 
@@ -229,8 +236,305 @@ EXECUTION_MODE_OPTIONS = {"batch", "incremental", "streaming"}
 DEFAULT_EXECUTION_MODE = "batch"
 
 
+def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
+    try:
+        parsed = int(str(_os.getenv(name, str(default))).strip() or str(default))
+    except Exception:
+        parsed = int(default)
+    return max(min_value, min(parsed, max_value))
+
+
+def _env_float(name: str, default: float, min_value: float, max_value: float) -> float:
+    try:
+        parsed = float(str(_os.getenv(name, str(default))).strip() or str(default))
+    except Exception:
+        parsed = float(default)
+    return max(min_value, min(parsed, max_value))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = str(_os.getenv(name, "1" if default else "0")).strip().lower()
+    if raw in {"1", "true", "yes", "on", "y"}:
+        return True
+    if raw in {"0", "false", "no", "off", "n"}:
+        return False
+    return bool(default)
+
+
+_EXECUTION_HISTORY_MAX_ROWS = _env_int("EXECUTION_HISTORY_MAX_ROWS", 2000, 10, 50000)
+_EXECUTION_HISTORY_MAX_LOG_ENTRIES = _env_int("EXECUTION_HISTORY_MAX_LOG_ENTRIES", 500, 20, 10000)
+_EXECUTION_HISTORY_LOG_MESSAGE_MAX_CHARS = _env_int("EXECUTION_HISTORY_LOG_MESSAGE_MAX_CHARS", 800, 120, 10000)
+_EXECUTION_HISTORY_SUMMARY_ONLY_ROWS_THRESHOLD = _env_int("EXECUTION_HISTORY_SUMMARY_ONLY_ROWS_THRESHOLD", 80000, 0, 100_000_000)
+_EXECUTION_HISTORY_SUMMARY_ONLY_SIZE_MB = _env_int("EXECUTION_HISTORY_SUMMARY_ONLY_SIZE_MB", 8, 1, 512)
+_EXECUTION_HISTORY_SUMMARY_ONLY_SIZE_BYTES = _EXECUTION_HISTORY_SUMMARY_ONLY_SIZE_MB * 1024 * 1024
+_EXECUTION_HISTORY_SUMMARY_SAMPLE_ROWS = _env_int("EXECUTION_HISTORY_SUMMARY_SAMPLE_ROWS", 20, 1, 500)
+
+_EXECUTION_HISTORY_AUTO_PRUNE_ENABLED = _env_bool("EXECUTION_HISTORY_AUTO_PRUNE_ENABLED", True)
+_EXECUTION_HISTORY_RETENTION_DAYS = _env_int("EXECUTION_HISTORY_RETENTION_DAYS", 14, 0, 3650)
+_EXECUTION_HISTORY_MAX_RECORDS = _env_int("EXECUTION_HISTORY_MAX_RECORDS", 300, 20, 50000)
+_EXECUTION_HISTORY_PRUNE_DELETE_LIMIT = _env_int("EXECUTION_HISTORY_PRUNE_DELETE_LIMIT", 150, 10, 5000)
+
+
 def _schedule_job_id(pipeline_id: str) -> str:
     return f"{SCHEDULE_JOB_PREFIX}{pipeline_id}"
+
+
+def _coerce_bool(value: Any, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on", "y"}:
+            return True
+        if text in {"0", "false", "no", "off", "n"}:
+            return False
+    return bool(default)
+
+
+def _is_pipeline_node_enabled(node: Any) -> bool:
+    if not isinstance(node, dict):
+        return True
+    data = node.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    cfg = data.get("config")
+    if not isinstance(cfg, dict):
+        cfg = {}
+    if "node_enabled" in cfg:
+        return _coerce_bool(cfg.get("node_enabled"), True)
+    if "enabled" in data:
+        return _coerce_bool(data.get("enabled"), True)
+    if "enabled" in node:
+        return _coerce_bool(node.get("enabled"), True)
+    return True
+
+
+def _collect_pipeline_lmdb_resources(nodes: Any) -> Dict[str, str]:
+    resources: Dict[str, str] = {}
+    profile_env = _os.path.abspath(etl_engine._profile_lmdb_dir())  # pylint: disable=protected-access
+    profile_rocks_env = _os.path.abspath(etl_engine._profile_rocksdb_dir())  # pylint: disable=protected-access
+    profile_redis_url = str(etl_engine._profile_redis_url())  # pylint: disable=protected-access
+
+    def _normalize_profile_storage(value: Any) -> str:
+        text = str(value or "lmdb").strip().lower()
+        if text in {"rocksdb", "rocks"}:
+            return "rocksdb"
+        if text in {"redis", "redisdb"}:
+            return "redis"
+        if text in {"oracle", "oracledb", "ora"}:
+            return "oracle"
+        return "lmdb"
+
+    def _mask_redis_url(url: str) -> str:
+        text = str(url or "").strip()
+        if "@" not in text or "://" not in text:
+            return text
+        try:
+            scheme, rest = text.split("://", 1)
+            creds, host = rest.split("@", 1)
+            if ":" in creds:
+                user, _ = creds.split(":", 1)
+                return f"{scheme}://{user}:***@{host}"
+            return f"{scheme}://***@{host}"
+        except Exception:
+            return text
+
+    def _add_resource(engine: str, env_path: str, db_name: str = "") -> None:
+        normalized_engine = str(engine or "").strip().lower() or "lmdb"
+        if normalized_engine == "redis":
+            redis_url = str(env_path or "").strip()
+            if not redis_url:
+                return
+            key = f"redis::{redis_url}"
+            resources[key] = f"redis:{_mask_redis_url(redis_url)}"
+            return
+        if normalized_engine == "oracle":
+            oracle_target = str(env_path or "").strip()
+            if not oracle_target:
+                return
+            table_name = str(db_name or "").strip() or "ETL_PROFILE_STATE"
+            table_name = table_name.upper()
+            key = f"oracle::{oracle_target}::{table_name}"
+            resources[key] = f"oracle:{oracle_target} (table={table_name})"
+            return
+        env_abs = _os.path.abspath(str(env_path or "").strip())
+        if not env_abs:
+            return
+        env_key = f"{normalized_engine}_env::{env_abs}"
+        if env_key not in resources:
+            resources[env_key] = f"{normalized_engine}:{env_abs}"
+        if normalized_engine == "lmdb":
+            db_text = str(db_name or "").strip() or "__default__"
+            db_key = f"lmdb_db::{env_abs}::{db_text}"
+            resources[db_key] = f"lmdb:{env_abs} (db={db_text})"
+        else:
+            db_key = f"rocksdb::{env_abs}"
+            resources[db_key] = f"rocksdb:{env_abs}"
+
+    if not isinstance(nodes, list):
+        return resources
+
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if not _is_pipeline_node_enabled(node):
+            continue
+        data = node.get("data")
+        if not isinstance(data, dict):
+            data = {}
+        cfg = data.get("config")
+        if not isinstance(cfg, dict):
+            cfg = {}
+        node_type = str(data.get("nodeType") or node.get("type") or "").strip().lower()
+
+        if bool(cfg.get("custom_profile_enabled")):
+            storage = _normalize_profile_storage(cfg.get("custom_profile_storage", "lmdb"))
+            if storage == "rocksdb":
+                _add_resource("rocksdb", profile_rocks_env)
+            elif storage == "redis":
+                _add_resource("redis", profile_redis_url)
+            elif storage == "oracle":
+                try:
+                    oracle_cfg = etl_engine._resolve_profile_oracle_config(cfg)  # pylint: disable=protected-access
+                    dsn = str(oracle_cfg.get("dsn") or "").strip() or etl_engine._build_oracle_dsn(oracle_cfg)  # pylint: disable=protected-access
+                    user = str(oracle_cfg.get("user") or "").strip() or "unknown_user"
+                    table_name = str(oracle_cfg.get("table") or "ETL_PROFILE_STATE").strip() or "ETL_PROFILE_STATE"
+                    _add_resource("oracle", f"{user}@{dsn}", table_name)
+                except Exception:
+                    _add_resource("oracle", "unknown", str(cfg.get("custom_profile_oracle_table") or "ETL_PROFILE_STATE"))
+            else:
+                _add_resource(
+                    "lmdb",
+                    profile_env,
+                    str(cfg.get("custom_profile_lmdb_db_name") or "").strip(),
+                )
+
+        if node_type in {"lmdb_source", "lmdb_destination"}:
+            raw_env_path = str(cfg.get("env_path") or "").strip()
+            if raw_env_path:
+                try:
+                    env_path = etl_engine._resolve_lmdb_env_path(raw_env_path)  # pylint: disable=protected-access
+                except Exception:
+                    env_path = _os.path.abspath(raw_env_path)
+            else:
+                env_path = profile_env
+            _add_resource("lmdb", env_path, str(cfg.get("db_name") or "").strip())
+        elif node_type == "rocksdb_source":
+            raw_env_path = str(cfg.get("env_path") or "").strip()
+            if raw_env_path:
+                try:
+                    env_path = etl_engine._resolve_rocksdb_env_path(raw_env_path)  # pylint: disable=protected-access
+                except Exception:
+                    env_path = _os.path.abspath(raw_env_path)
+            else:
+                env_path = profile_rocks_env
+            _add_resource("rocksdb", env_path)
+        elif node_type in {"redis_source", "redis_destination"}:
+            host = str(cfg.get("host") or "localhost").strip() or "localhost"
+            port = str(cfg.get("port") or "6379").strip() or "6379"
+            db_name = str(cfg.get("db") or cfg.get("database") or "0").strip() or "0"
+            _add_resource("redis", f"redis://{host}:{port}/{db_name}")
+
+    return resources
+
+
+def _collect_pipeline_oracle_profile_configs(
+    nodes: Any,
+    node_id: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(nodes, list):
+        return out
+
+    target_node = str(node_id or "").strip()
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if not _is_pipeline_node_enabled(node):
+            continue
+        nid = str(node.get("id") or "").strip()
+        if not nid:
+            continue
+        if target_node and nid != target_node:
+            continue
+        data = node.get("data")
+        if not isinstance(data, dict):
+            continue
+        cfg = data.get("config")
+        if not isinstance(cfg, dict):
+            continue
+        if not bool(cfg.get("custom_profile_enabled", False)):
+            continue
+        storage = str(cfg.get("custom_profile_storage", "lmdb")).strip().lower()
+        if storage not in {"oracle", "oracledb", "ora"}:
+            continue
+        out[nid] = {
+            "custom_profile_oracle_host": cfg.get("custom_profile_oracle_host"),
+            "custom_profile_oracle_port": cfg.get("custom_profile_oracle_port"),
+            "custom_profile_oracle_service_name": cfg.get("custom_profile_oracle_service_name"),
+            "custom_profile_oracle_sid": cfg.get("custom_profile_oracle_sid"),
+            "custom_profile_oracle_user": cfg.get("custom_profile_oracle_user"),
+            "custom_profile_oracle_password": cfg.get("custom_profile_oracle_password"),
+            "custom_profile_oracle_dsn": cfg.get("custom_profile_oracle_dsn"),
+            "custom_profile_oracle_table": cfg.get("custom_profile_oracle_table"),
+            "custom_profile_oracle_write_strategy": cfg.get("custom_profile_oracle_write_strategy"),
+            "custom_profile_oracle_parallel_workers": cfg.get("custom_profile_oracle_parallel_workers"),
+            "custom_profile_oracle_parallel_min_tokens": cfg.get("custom_profile_oracle_parallel_min_tokens"),
+            "custom_profile_oracle_merge_batch_size": cfg.get("custom_profile_oracle_merge_batch_size"),
+            "custom_profile_oracle_parallel_force": cfg.get("custom_profile_oracle_parallel_force"),
+        }
+    return out
+
+
+def _find_running_lmdb_conflict(
+    db: Session,
+    pipeline_id: str,
+    pipeline_nodes: Any,
+) -> Optional[Dict[str, Any]]:
+    target_resources = _collect_pipeline_lmdb_resources(pipeline_nodes)
+    if not target_resources:
+        return None
+
+    running_execs = db.query(models.Execution).filter(
+        models.Execution.status.in_(["running", "cancelling"]),
+    ).all()
+    if not running_execs:
+        return None
+
+    running_pipeline_ids = list({str(run.pipeline_id) for run in running_execs if getattr(run, "pipeline_id", None)})
+    if not running_pipeline_ids:
+        return None
+
+    pipelines = db.query(models.Pipeline).filter(
+        models.Pipeline.id.in_(running_pipeline_ids)
+    ).all()
+    pipeline_by_id: Dict[str, models.Pipeline] = {str(p.id): p for p in pipelines}
+
+    for run in running_execs:
+        other_pipeline_id = str(getattr(run, "pipeline_id", "") or "").strip()
+        if not other_pipeline_id:
+            continue
+        other_pipeline = pipeline_by_id.get(other_pipeline_id)
+        if other_pipeline is None:
+            continue
+        other_resources = _collect_pipeline_lmdb_resources(other_pipeline.nodes or [])
+        if not other_resources:
+            continue
+        overlap_keys = set(target_resources.keys()) & set(other_resources.keys())
+        if not overlap_keys:
+            continue
+        overlap_key = sorted(overlap_keys)[0]
+        return {
+            "execution_id": str(run.id),
+            "pipeline_id": other_pipeline_id,
+            "pipeline_name": str(getattr(other_pipeline, "name", "") or "Unknown"),
+            "resource": target_resources.get(overlap_key) or other_resources.get(overlap_key) or overlap_key,
+            "requested_pipeline_id": str(pipeline_id),
+        }
+
+    return None
 
 
 def _normalize_cron_expr(cron_expr: Optional[str]) -> str:
@@ -393,11 +697,25 @@ def _flush_logs(execution, logs: list, db):
             if now_monotonic - last_flush < _EXECUTION_LOG_FLUSH_INTERVAL_SECONDS:
                 return
             _execution_log_flush_state[execution_id] = now_monotonic
+    compact_logs = _compact_execution_logs_for_history(logs)
+    # Keep worker-session object in sync, but flush logs through a short-lived
+    # session so heavy pipeline compute is less impacted by SQLite commits.
     try:
-        execution.logs = _json_safe_value(list(logs))
-        db.commit()
+        execution.logs = compact_logs
+    except Exception:
+        pass
+    try:
+        flush_db = SessionLocal()
+        try:
+            row = flush_db.query(models.Execution).filter(
+                models.Execution.id == execution_id
+            ).first()
+            if row is not None:
+                row.logs = compact_logs
+                flush_db.commit()
+        finally:
+            flush_db.close()
     except Exception as exc:
-        db.rollback()
         if execution_id:
             with _execution_log_flush_lock:
                 _execution_log_flush_state.pop(execution_id, None)
@@ -459,7 +777,12 @@ def _apply_execution_terminal_payload(execution, payload: Dict[str, Any]) -> Non
     if payload.get("node_results") is not None:
         execution.node_results = _json_safe_value(payload["node_results"])
     if payload.get("logs") is not None:
-        execution.logs = _json_safe_value(payload["logs"])
+        execution.logs = _compact_execution_logs_for_history(
+            _normalize_terminal_execution_logs(
+                payload["logs"],
+                payload.get("status"),
+            )
+        )
     if payload.get("rows_processed") is not None:
         execution.rows_processed = payload["rows_processed"]
 
@@ -509,6 +832,13 @@ def _persist_execution_terminal_status_only(execution_id: str, payload: Dict[str
             execution.error_message = payload.get("error_message")
             if payload.get("rows_processed") is not None:
                 execution.rows_processed = payload.get("rows_processed")
+            if isinstance(execution.logs, list) and execution.logs:
+                execution.logs = _compact_execution_logs_for_history(
+                    _normalize_terminal_execution_logs(
+                        execution.logs,
+                        execution.status,
+                    )
+                )
             recovery_db.commit()
             return True
         except Exception as exc:
@@ -589,15 +919,298 @@ def _compact_node_result_for_history(value: Any, max_rows: int) -> Any:
     return value
 
 
-def _compact_execution_node_results_for_history(node_results: Any) -> Any:
+def _compact_execution_logs_for_history(logs: Any) -> Any:
+    if not isinstance(logs, list):
+        return _json_safe_value(logs)
+
+    if _EXECUTION_HISTORY_MAX_LOG_ENTRIES <= 0:
+        return []
+
+    trimmed = logs[-_EXECUTION_HISTORY_MAX_LOG_ENTRIES:] if len(logs) > _EXECUTION_HISTORY_MAX_LOG_ENTRIES else list(logs)
+    compact_logs: List[Any] = []
+    for item in trimmed:
+        if isinstance(item, dict):
+            entry = dict(item)
+            message = str(entry.get("message") or "")
+            if len(message) > _EXECUTION_HISTORY_LOG_MESSAGE_MAX_CHARS:
+                entry["message"] = message[:_EXECUTION_HISTORY_LOG_MESSAGE_MAX_CHARS] + "..."
+            warnings = entry.get("warnings")
+            if isinstance(warnings, list) and len(warnings) > 8:
+                entry["warnings"] = warnings[:8]
+                entry["warning_count"] = int(entry.get("warning_count") or len(warnings))
+            output_sample = entry.get("output_sample")
+            if isinstance(output_sample, list) and len(output_sample) > 5:
+                entry["output_sample"] = output_sample[:5]
+                entry["output_sample_truncated"] = True
+            compact_logs.append(_json_safe_value(entry))
+            continue
+        text = str(item)
+        if len(text) > _EXECUTION_HISTORY_LOG_MESSAGE_MAX_CHARS:
+            text = text[:_EXECUTION_HISTORY_LOG_MESSAGE_MAX_CHARS] + "..."
+        compact_logs.append(text)
+    return compact_logs
+
+
+def _normalize_terminal_execution_logs(logs: Any, execution_status: Any) -> Any:
+    """
+    Normalize stale `running` log entries when execution is already terminal.
+    This prevents UI from showing false node errors from late progress snapshots.
+    """
+    if not isinstance(logs, list):
+        return logs
+
+    status_norm = str(execution_status or "").strip().lower()
+    if status_norm not in {"success", "failed", "cancelled"}:
+        return logs
+
+    normalized: List[Any] = []
+    for item in logs:
+        if not isinstance(item, dict):
+            normalized.append(item)
+            continue
+
+        entry = dict(item)
+        entry_status = str(entry.get("status") or "").strip().lower()
+        if entry_status != "running":
+            normalized.append(entry)
+            continue
+
+        node_label = str(entry.get("nodeLabel") or "Node").strip() or "Node"
+        rows_value = entry.get("rows")
+        rows_suffix = ""
+        if isinstance(rows_value, (int, float)):
+            rows_suffix = f" — {int(rows_value):,} rows"
+
+        msg = str(entry.get("message") or "").strip()
+        if status_norm == "success":
+            entry["status"] = "success"
+            if not msg or msg.startswith("⟳ Running "):
+                entry["message"] = f"✓ {node_label}{rows_suffix}"
+        else:
+            entry["status"] = "error"
+            if not msg or msg.startswith("⟳ Running "):
+                if status_norm == "cancelled":
+                    entry["message"] = f"✗ {node_label} cancelled"
+                else:
+                    entry["message"] = f"✗ {node_label} failed"
+
+        normalized.append(entry)
+
+    return normalized
+
+
+def _estimate_json_bytes(value: Any) -> int:
+    try:
+        text = json.dumps(_json_safe_value(value), ensure_ascii=False, default=str)
+        return len(text.encode("utf-8"))
+    except Exception:
+        return 0
+
+
+def _summarize_node_result_for_history(value: Any, max_sample_rows: int) -> Any:
+    sample_cap = max(1, min(int(max_sample_rows or 20), 500))
+
+    if isinstance(value, list):
+        total_rows = len(value)
+        if total_rows <= sample_cap:
+            return _json_safe_value(value)
+
+        sample: List[Any] = []
+        for item in value[:sample_cap]:
+            if isinstance(item, dict):
+                if _looks_like_pipeline_metadata_row(item):
+                    meta = {k: item.get(k) for k in ("status", "rows", "destination", "note", "path", "table", "collection", "index", "bucket", "key")}
+                    sample.append(_json_safe_value(meta))
+                else:
+                    sample.append(_json_safe_value(item))
+            else:
+                sample.append(_json_safe_value(item))
+        return {
+            "kind": "summary_only_rows",
+            "rows": total_rows,
+            "sample_rows": len(sample),
+            "sample": sample,
+            "note": "Execution history stored in summary-only mode for performance.",
+        }
+
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {"kind": "summary_only_object"}
+        keys = list(value.keys())
+        out["keys"] = [str(k) for k in keys[:100]]
+        out["keys_count"] = len(keys)
+        if "rows" in value:
+            try:
+                out["rows"] = int(value.get("rows") or 0)
+            except Exception:
+                out["rows"] = value.get("rows")
+        if "path" in value:
+            out["path"] = value.get("path")
+        nested_data = value.get("data")
+        if isinstance(nested_data, list):
+            out["rows"] = max(int(out.get("rows") or 0), len(nested_data))
+            sample_data = nested_data[:sample_cap]
+            out["sample_rows"] = len(sample_data)
+            out["sample"] = _json_safe_value(sample_data)
+        return out
+
+    return _json_safe_value(value)
+
+
+def _compact_execution_node_results_for_history(
+    node_results: Any,
+    rows_processed: Optional[int] = None,
+) -> Any:
     if not isinstance(node_results, dict):
         return node_results
 
-    max_rows = max(50, min(int(_os.getenv("EXECUTION_HISTORY_MAX_ROWS", "2000")), 50000))
+    rows_value = 0
+    try:
+        rows_value = int(rows_processed or 0)
+    except Exception:
+        rows_value = 0
+
+    if _EXECUTION_HISTORY_SUMMARY_ONLY_ROWS_THRESHOLD > 0 and rows_value >= _EXECUTION_HISTORY_SUMMARY_ONLY_ROWS_THRESHOLD:
+        summary_fast: Dict[str, Any] = {}
+        for node_id, value in node_results.items():
+            summary_fast[node_id] = _summarize_node_result_for_history(
+                value,
+                _EXECUTION_HISTORY_SUMMARY_SAMPLE_ROWS,
+            )
+        summary_fast["__history_meta__"] = {
+            "mode": "summary_only",
+            "reason": f"rows_processed>={_EXECUTION_HISTORY_SUMMARY_ONLY_ROWS_THRESHOLD}",
+            "rows_processed": rows_value,
+            "generated_at": datetime.utcnow().isoformat(),
+            "sample_rows_per_node": _EXECUTION_HISTORY_SUMMARY_SAMPLE_ROWS,
+        }
+        return summary_fast
+
+    max_rows = max(10, _EXECUTION_HISTORY_MAX_ROWS)
     compact: Dict[str, Any] = {}
     for node_id, value in node_results.items():
         compact[node_id] = _compact_node_result_for_history(value, max_rows)
-    return compact
+
+    summary_only = False
+    summary_reason = ""
+    if _EXECUTION_HISTORY_SUMMARY_ONLY_SIZE_BYTES > 0:
+        estimated_size = _estimate_json_bytes(compact)
+        if estimated_size >= _EXECUTION_HISTORY_SUMMARY_ONLY_SIZE_BYTES:
+            summary_only = True
+            summary_reason = f"node_results_size>={_EXECUTION_HISTORY_SUMMARY_ONLY_SIZE_MB}MB"
+
+    if not summary_only:
+        return compact
+
+    summary: Dict[str, Any] = {}
+    for node_id, value in compact.items():
+        summary[node_id] = _summarize_node_result_for_history(
+            value,
+            _EXECUTION_HISTORY_SUMMARY_SAMPLE_ROWS,
+        )
+    summary["__history_meta__"] = {
+        "mode": "summary_only",
+        "reason": summary_reason or "summary_only_policy",
+        "rows_processed": rows_value,
+        "generated_at": datetime.utcnow().isoformat(),
+        "sample_rows_per_node": _EXECUTION_HISTORY_SUMMARY_SAMPLE_ROWS,
+    }
+    return summary
+
+
+def _prune_execution_history(db: Session, force: bool = False) -> Dict[str, Any]:
+    if not _EXECUTION_HISTORY_AUTO_PRUNE_ENABLED and not force:
+        return {
+            "enabled": False,
+            "deleted": 0,
+            "deleted_ids": [],
+            "retention_days": _EXECUTION_HISTORY_RETENTION_DAYS,
+            "max_records": _EXECUTION_HISTORY_MAX_RECORDS,
+        }
+
+    terminal_statuses = ("success", "failed", "cancelled")
+    candidate_ids: set = set()
+    delete_limit = max(10, _EXECUTION_HISTORY_PRUNE_DELETE_LIMIT)
+
+    if _EXECUTION_HISTORY_RETENTION_DAYS > 0:
+        cutoff = datetime.utcnow() - timedelta(days=_EXECUTION_HISTORY_RETENTION_DAYS)
+        older_rows = db.query(models.Execution.id).filter(
+            models.Execution.status.in_(terminal_statuses),
+            models.Execution.started_at < cutoff,
+        ).order_by(models.Execution.started_at.asc()).limit(delete_limit * 4).all()
+        for item in older_rows:
+            if item and item[0]:
+                candidate_ids.add(str(item[0]))
+
+    if _EXECUTION_HISTORY_MAX_RECORDS > 0:
+        overflow_rows = db.query(models.Execution.id).filter(
+            models.Execution.status.in_(terminal_statuses),
+        ).order_by(models.Execution.started_at.desc()).offset(
+            _EXECUTION_HISTORY_MAX_RECORDS
+        ).limit(delete_limit * 4).all()
+        for item in overflow_rows:
+            if item and item[0]:
+                candidate_ids.add(str(item[0]))
+
+    if not candidate_ids:
+        return {
+            "enabled": True,
+            "deleted": 0,
+            "deleted_ids": [],
+            "retention_days": _EXECUTION_HISTORY_RETENTION_DAYS,
+            "max_records": _EXECUTION_HISTORY_MAX_RECORDS,
+        }
+
+    ordered_candidates = db.query(models.Execution.id).filter(
+        models.Execution.id.in_(list(candidate_ids)),
+        models.Execution.status.in_(terminal_statuses),
+    ).order_by(models.Execution.started_at.asc()).limit(delete_limit).all()
+    ids_to_delete = [str(item[0]) for item in ordered_candidates if item and item[0]]
+
+    if not ids_to_delete:
+        return {
+            "enabled": True,
+            "deleted": 0,
+            "deleted_ids": [],
+            "retention_days": _EXECUTION_HISTORY_RETENTION_DAYS,
+            "max_records": _EXECUTION_HISTORY_MAX_RECORDS,
+        }
+
+    deleted = db.query(models.Execution).filter(
+        models.Execution.id.in_(ids_to_delete),
+        models.Execution.status.in_(terminal_statuses),
+    ).delete(synchronize_session=False)
+
+    return {
+        "enabled": True,
+        "deleted": int(deleted or 0),
+        "deleted_ids": ids_to_delete,
+        "retention_days": _EXECUTION_HISTORY_RETENTION_DAYS,
+        "max_records": _EXECUTION_HISTORY_MAX_RECORDS,
+    }
+
+
+def _run_execution_history_maintenance(context: str = "auto", force: bool = False) -> Dict[str, Any]:
+    db = SessionLocal()
+    try:
+        summary = _prune_execution_history(db, force=force)
+        db.commit()
+        deleted = int(summary.get("deleted") or 0)
+        if deleted > 0:
+            logger.info(
+                f"Execution history maintenance ({context}) deleted {deleted} old execution row(s)."
+            )
+        return summary
+    except Exception as exc:
+        db.rollback()
+        logger.warning(f"Execution history maintenance failed ({context}): {exc}")
+        return {
+            "enabled": _EXECUTION_HISTORY_AUTO_PRUNE_ENABLED,
+            "deleted": 0,
+            "deleted_ids": [],
+            "error": str(exc),
+        }
+    finally:
+        db.close()
 
 
 async def _run_pipeline_execution_task(
@@ -654,14 +1267,18 @@ async def _run_pipeline_execution_task(
             pipeline_id=pipeline.id,
             should_abort=(abort_event.is_set if abort_event else None),
         )
+        rows_processed = int(result.get("rows_processed") or 0)
         terminal_payload.update({
             "status": "success",
             "error_message": None,
-            "node_results": _compact_execution_node_results_for_history(result["node_results"]),
-            "logs": result["logs"],
-            "rows_processed": result["rows_processed"],
+            "node_results": _compact_execution_node_results_for_history(
+                result.get("node_results"),
+                rows_processed=rows_processed,
+            ),
+            "logs": _compact_execution_logs_for_history(result.get("logs")),
+            "rows_processed": rows_processed,
         })
-        logger.info(f"✅ Execution {execution_id} completed — {result['rows_processed']} rows")
+        logger.info(f"✅ Execution {execution_id} completed — {rows_processed} rows")
 
     except ExecutionAbortedError as exc:
         logger.info(f"⏹ Execution {execution_id} cancelled: {exc}")
@@ -737,6 +1354,7 @@ async def _run_pipeline_execution_task(
         execution_workers.pop(execution_id, None)
         with _execution_log_flush_lock:
             _execution_log_flush_state.pop(execution_id, None)
+        _run_execution_history_maintenance(context=f"execution:{execution_id}")
 
 
 def _start_pipeline_execution(
@@ -747,31 +1365,51 @@ def _start_pipeline_execution(
     db = SessionLocal()
     execution_id: Optional[str] = None
     try:
-        pipeline = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
-        if not pipeline:
-            logger.warning(f"Skipping execution: pipeline {pipeline_id} not found")
-            return None
-
-        if skip_if_running:
-            running = db.query(models.Execution).filter(
-                models.Execution.pipeline_id == pipeline_id,
-                models.Execution.status.in_(["running", "cancelling"]),
-            ).first()
-            if running:
-                logger.info(
-                    f"Skipping scheduled run for pipeline {pipeline_id} — execution {running.id} is still running"
-                )
+        with _execution_start_lock:
+            pipeline = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
+            if not pipeline:
+                logger.warning(f"Skipping execution: pipeline {pipeline_id} not found")
                 return None
 
-        execution_id = str(uuid.uuid4())
-        execution = models.Execution(
-            id=execution_id,
-            pipeline_id=pipeline_id,
-            status="running",
-            triggered_by=triggered_by,
-        )
-        db.add(execution)
-        db.commit()
+            if skip_if_running:
+                running = db.query(models.Execution).filter(
+                    models.Execution.pipeline_id == pipeline_id,
+                    models.Execution.status.in_(["running", "cancelling"]),
+                ).first()
+                if running:
+                    logger.info(
+                        f"Skipping scheduled run for pipeline {pipeline_id} — execution {running.id} is still running"
+                    )
+                    return None
+
+            lmdb_conflict = _find_running_lmdb_conflict(
+                db,
+                pipeline_id=pipeline_id,
+                pipeline_nodes=pipeline.nodes or [],
+            )
+            if lmdb_conflict:
+                conflict_msg = (
+                    "Profile/KV resource is already in use by another running pipeline execution. "
+                    f"Execution `{lmdb_conflict.get('execution_id')}` "
+                    f"(pipeline: `{lmdb_conflict.get('pipeline_name')}`) holds `{lmdb_conflict.get('resource')}`. "
+                    "Only one pipeline can process a given LMDB/RocksDB/Redis/Oracle profile resource at a time."
+                )
+                if skip_if_running:
+                    logger.info(
+                        f"Skipping scheduled run for pipeline {pipeline_id} — {conflict_msg}"
+                    )
+                    return None
+                raise RuntimeError(conflict_msg)
+
+            execution_id = str(uuid.uuid4())
+            execution = models.Execution(
+                id=execution_id,
+                pipeline_id=pipeline_id,
+                status="running",
+                triggered_by=triggered_by,
+            )
+            db.add(execution)
+            db.commit()
     finally:
         db.close()
 
@@ -804,11 +1442,15 @@ def _start_pipeline_execution(
 
 
 async def _run_scheduled_pipeline(pipeline_id: str):
-    execution_id = _start_pipeline_execution(
-        pipeline_id=pipeline_id,
-        triggered_by="schedule",
-        skip_if_running=True,
-    )
+    try:
+        execution_id = _start_pipeline_execution(
+            pipeline_id=pipeline_id,
+            triggered_by="schedule",
+            skip_if_running=True,
+        )
+    except Exception as exc:
+        logger.info(f"Skipping scheduled run for pipeline {pipeline_id}: {exc}")
+        return
     if execution_id:
         logger.info(f"⏰ Scheduled pipeline {pipeline_id} started execution {execution_id}")
 
@@ -1018,6 +1660,11 @@ class SourceFieldOptionsRequest(BaseModel):
     max_rows: int = 200
     page: int = 1
     preview_rows: int = 50
+    include_schema_scan: bool = True
+    schema_scan_limit: int = 5000
+    preview_compact: bool = True
+    preview_max_cell_chars: int = 2000
+    preview_max_collection_items: int = 64
 
 
 class LmdbEnvPathOptionsRequest(BaseModel):
@@ -1042,12 +1689,34 @@ class LmdbSummaryRequest(BaseModel):
     summary_scan_limit: int = 0
 
 
+class RocksdbEnvPathOptionsRequest(BaseModel):
+    base_path: Optional[str] = None
+    max_depth: int = 4
+    limit: int = 500
+
+
+class RocksdbDeleteRequest(BaseModel):
+    env_path: str
+    delete_mode: str = "filtered"  # filtered | all
+    key_prefix: str = ""
+    start_key: str = ""
+    end_key: str = ""
+    key_contains: str = ""
+    limit: int = 200000
+
+
+class RocksdbSummaryRequest(BaseModel):
+    config: dict = {}
+    summary_scan_limit: int = 0
+
+
 class CustomFieldValidationRequest(BaseModel):
     config: Dict[str, Any] = Field(default_factory=dict)
     rows: List[Dict[str, Any]] = Field(default_factory=list)
     max_rows: int = 30
-    validation_source: str = "lmdb"  # lmdb (rows mode deprecated)
+    validation_source: str = "lmdb"  # lmdb|rocksdb (rows mode deprecated)
     lmdb_config: Dict[str, Any] = Field(default_factory=dict)
+    rocksdb_config: Dict[str, Any] = Field(default_factory=dict)
 
 class CredentialCreate(BaseModel):
     name: str
@@ -1059,28 +1728,151 @@ class CredentialUpdate(BaseModel):
     data: Optional[dict] = None
 
 
+class SQLiteCleanupRequest(BaseModel):
+    clear_execution_runtime_payloads: bool = True
+    clear_mlops_run_payloads: bool = True
+    clear_business_run_payloads: bool = True
+    clear_audit_logs: bool = False
+    vacuum: bool = True
+
+
 def _build_pipeline_profile_state_summary(
     pipeline_id: str,
     node_id: Optional[str] = None,
     limit: int = 10,
     primary_key_field: Optional[str] = None,
+    pipeline_nodes: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    return etl_engine.get_profile_state_summary(
+    summary = etl_engine.get_profile_state_summary(
         pipeline_id=pipeline_id,
         node_id=node_id,
         limit=limit,
         preferred_primary_key_field=primary_key_field,
+        include_oracle=False,
     )
+    oracle_cfg_by_node = _collect_pipeline_oracle_profile_configs(
+        pipeline_nodes,
+        node_id=node_id,
+    )
+    if not oracle_cfg_by_node:
+        return summary
+
+    safe_limit = max(1, min(int(limit or 10), 100))
+    oracle_summary_cache: Dict[str, Dict[str, Any]] = {}
+    summary_nodes = summary.get("nodes")
+    summary_nodes_list = summary_nodes if isinstance(summary_nodes, list) else []
+    nodes_by_id: Dict[str, Dict[str, Any]] = {}
+    node_order: List[str] = []
+    for item in summary_nodes_list:
+        if not isinstance(item, dict):
+            continue
+        node_name = str(item.get("node_id") or "").strip()
+        if not node_name:
+            continue
+        nodes_by_id[node_name] = item
+        if node_name not in node_order:
+            node_order.append(node_name)
+
+    for profile_node_id, profile_cfg in oracle_cfg_by_node.items():
+        resolved_cfg = etl_engine._resolve_profile_oracle_config(profile_cfg)  # pylint: disable=protected-access
+        signature = json.dumps(
+            {
+                "host": resolved_cfg.get("host"),
+                "port": resolved_cfg.get("port"),
+                "service_name": resolved_cfg.get("service_name"),
+                "sid": resolved_cfg.get("sid"),
+                "user": resolved_cfg.get("user"),
+                "dsn": resolved_cfg.get("dsn"),
+                "table": resolved_cfg.get("table"),
+            },
+            sort_keys=True,
+        )
+        cache_key = f"{signature}::{profile_node_id}::{safe_limit}"
+        node_summary = oracle_summary_cache.get(cache_key)
+        if not isinstance(node_summary, dict):
+            node_summary = etl_engine._load_oracle_profile_node_summary(  # pylint: disable=protected-access
+                str(pipeline_id),
+                str(profile_node_id),
+                limit=safe_limit,
+                profile_cfg=profile_cfg,
+            )
+            oracle_summary_cache[cache_key] = node_summary if isinstance(node_summary, dict) else {}
+        if not isinstance(node_summary, dict):
+            continue
+
+        sample_entity_keys = node_summary.get("sample_entity_keys")
+        sample_documents = node_summary.get("sample_documents")
+        if not isinstance(sample_entity_keys, list):
+            sample_entity_keys = []
+        if not isinstance(sample_documents, list):
+            sample_documents = []
+        nodes_by_id[profile_node_id] = {
+            "node_id": profile_node_id,
+            "entity_count": int(node_summary.get("entity_count") or 0),
+            "meta_count": int(node_summary.get("meta_count") or 0),
+            "sample_entity_keys": sample_entity_keys,
+            "sample_documents": sample_documents,
+        }
+        if profile_node_id not in node_order:
+            node_order.append(profile_node_id)
+
+    merged_nodes = [nodes_by_id[nid] for nid in node_order if nid in nodes_by_id]
+    summary["nodes"] = merged_nodes
+    summary["available_node_ids"] = [str(item.get("node_id")) for item in merged_nodes if isinstance(item, dict)]
+    summary["total_nodes"] = len(merged_nodes)
+    summary["total_entities"] = sum(
+        int(item.get("entity_count") or 0)
+        for item in merged_nodes
+        if isinstance(item, dict)
+    )
+    summary["total_meta_entries"] = sum(
+        int(item.get("meta_count") or 0)
+        for item in merged_nodes
+        if isinstance(item, dict)
+    )
+    summary["storage"] = "mixed"
+    return summary
 
 
 def _clear_pipeline_profile_state(
     pipeline_id: str,
     node_id: Optional[str] = None,
+    pipeline_nodes: Optional[Any] = None,
 ) -> Dict[str, Any]:
     removed = etl_engine.clear_profile_state(
         pipeline_id=pipeline_id,
         node_id=node_id,
     )
+    oracle_cfg_by_node = _collect_pipeline_oracle_profile_configs(
+        pipeline_nodes,
+        node_id=node_id,
+    )
+    seen_oracle_signatures: set = set()
+    for _, profile_cfg in oracle_cfg_by_node.items():
+        resolved_cfg = etl_engine._resolve_profile_oracle_config(profile_cfg)  # pylint: disable=protected-access
+        signature = json.dumps(
+            {
+                "host": resolved_cfg.get("host"),
+                "port": resolved_cfg.get("port"),
+                "service_name": resolved_cfg.get("service_name"),
+                "sid": resolved_cfg.get("sid"),
+                "user": resolved_cfg.get("user"),
+                "dsn": resolved_cfg.get("dsn"),
+                "table": resolved_cfg.get("table"),
+            },
+            sort_keys=True,
+        )
+        if signature in seen_oracle_signatures:
+            continue
+        seen_oracle_signatures.add(signature)
+        extra_removed = etl_engine.clear_profile_state(
+            pipeline_id=pipeline_id,
+            node_id=node_id,
+            profile_cfg=profile_cfg,
+        )
+        removed["removed_nodes"] = int(removed.get("removed_nodes") or 0) + int(extra_removed.get("removed_nodes") or 0)
+        removed["removed_entities"] = int(removed.get("removed_entities") or 0) + int(extra_removed.get("removed_entities") or 0)
+        removed["removed_meta_entries"] = int(removed.get("removed_meta_entries") or 0) + int(extra_removed.get("removed_meta_entries") or 0)
 
     return {
         "pipeline_id": pipeline_id,
@@ -1088,7 +1880,11 @@ def _clear_pipeline_profile_state(
         "removed_nodes": int(removed.get("removed_nodes") or 0),
         "removed_entities": int(removed.get("removed_entities") or 0),
         "removed_meta_entries": int(removed.get("removed_meta_entries") or 0),
-        "remaining_summary": _build_pipeline_profile_state_summary(pipeline_id, node_id=node_id),
+        "remaining_summary": _build_pipeline_profile_state_summary(
+            pipeline_id,
+            node_id=node_id,
+            pipeline_nodes=pipeline_nodes,
+        ),
         "cleared_at": datetime.utcnow().isoformat(),
     }
 
@@ -1263,12 +2059,16 @@ async def get_pipeline_profile_state(
     node_id: Optional[str] = None,
     limit: int = 10,
     primary_key_field: Optional[str] = None,
+    db: Session = Depends(get_db),
 ):
+    pipeline = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
+    pipeline_nodes = pipeline.nodes if pipeline and isinstance(pipeline.nodes, list) else []
     return _build_pipeline_profile_state_summary(
         pipeline_id=pipeline_id,
         node_id=node_id,
         limit=limit,
         primary_key_field=primary_key_field,
+        pipeline_nodes=pipeline_nodes,
     )
 
 
@@ -1276,10 +2076,14 @@ async def get_pipeline_profile_state(
 async def clear_pipeline_profile_state(
     pipeline_id: str,
     node_id: Optional[str] = None,
+    db: Session = Depends(get_db),
 ):
+    pipeline = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
+    pipeline_nodes = pipeline.nodes if pipeline and isinstance(pipeline.nodes, list) else []
     return _clear_pipeline_profile_state(
         pipeline_id=pipeline_id,
         node_id=node_id,
+        pipeline_nodes=pipeline_nodes,
     )
 
 
@@ -7796,11 +8600,16 @@ async def execute_pipeline(pipeline_id: str, db: Session = Depends(get_db)):
     p = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Pipeline not found")
-    execution_id = _start_pipeline_execution(
-        pipeline_id=pipeline_id,
-        triggered_by="manual",
-        skip_if_running=False,
-    )
+    try:
+        execution_id = _start_pipeline_execution(
+            pipeline_id=pipeline_id,
+            triggered_by="manual",
+            skip_if_running=False,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to start execution: {exc}")
     if not execution_id:
         raise HTTPException(status_code=500, detail="Failed to start execution")
     return {"execution_id": execution_id, "status": "running"}
@@ -7908,7 +8717,28 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
             for entry in logs
             if isinstance(entry, dict)
         )
-        if has_running_log:
+        worker = execution_workers.get(str(execution.id or ""))
+        worker_alive = bool(worker and worker.is_alive())
+        if has_running_log and worker_alive:
+            return
+        if has_running_log and not worker_alive:
+            stale_message = "Execution auto-finalized as failed: worker thread is not active."
+            execution.status = "failed"
+            execution.finished_at = execution.finished_at or datetime.utcnow()
+            if not execution.error_message:
+                execution.error_message = stale_message
+            stale_log = {
+                "nodeId": "__system__",
+                "nodeLabel": "System",
+                "timestamp": datetime.utcnow().isoformat(),
+                "status": "error",
+                "message": f"✗ {stale_message}",
+                "rows": 0,
+            }
+            merged_logs = logs if isinstance(logs, list) else []
+            merged_logs.append(stale_log)
+            execution.logs = merged_logs
+            db.commit()
             return
 
         has_error = any(
@@ -7983,7 +8813,7 @@ async def get_execution(
     if not e:
         raise HTTPException(status_code=404, detail="Execution not found")
 
-    if include_logs:
+    if include_logs and str(e.status or "").strip().lower() in {"running", "cancelling"}:
         _try_finalize_stale_running_execution(e, db)
 
     node_results: Dict[str, Any] = {}
@@ -8003,6 +8833,10 @@ async def get_execution(
         if isinstance(loaded_logs, list):
             tail = max(10, min(int(log_tail), 5000))
             logs_payload = loaded_logs[-tail:] if len(loaded_logs) > tail else loaded_logs
+            logs_payload = _normalize_terminal_execution_logs(
+                logs_payload,
+                e.status,
+            )
         else:
             logs_payload = []
 
@@ -8074,6 +8908,193 @@ async def delete_execution(execution_id: str, db: Session = Depends(get_db)):
     if e:
         db.delete(e)
         db.commit()
+
+
+@app.post("/api/executions/cleanup")
+async def cleanup_execution_history(force: bool = True):
+    """
+    Manually trigger execution-history maintenance:
+    - delete old terminal executions based on retention/count policy
+    """
+    return _run_execution_history_maintenance(context="manual", force=force)
+
+
+def _resolve_sqlite_db_file_path() -> Optional[Path]:
+    db_url = str(DATABASE_URL or "").strip()
+    if not db_url.lower().startswith("sqlite:"):
+        return None
+    raw = ""
+    if db_url.startswith("sqlite:///"):
+        raw = db_url[len("sqlite:///"):]
+    elif db_url.startswith("sqlite://"):
+        raw = db_url[len("sqlite://"):]
+    raw = raw.split("?", 1)[0].split("#", 1)[0].strip()
+    if not raw or raw == ":memory:":
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        path = (_BACKEND_DIR / raw).resolve()
+    return path
+
+
+def _collect_sqlite_runtime_usage(db: Session) -> Dict[str, Any]:
+    sqlite_path = _resolve_sqlite_db_file_path()
+    size_bytes = 0
+    if sqlite_path and sqlite_path.exists():
+        try:
+            size_bytes = int(sqlite_path.stat().st_size)
+        except Exception:
+            size_bytes = 0
+
+    execution_total = db.query(models.Execution).count()
+    execution_running = db.query(models.Execution).filter(
+        models.Execution.status.in_(["pending", "running", "cancelling"])
+    ).count()
+    execution_terminal = db.query(models.Execution).filter(
+        models.Execution.status.in_(["success", "failed", "cancelled"])
+    ).count()
+    mlops_runs_total = db.query(models.MLOpsRun).count()
+    mlops_runs_running = db.query(models.MLOpsRun).filter(
+        models.MLOpsRun.status.in_(["pending", "running", "cancelling"])
+    ).count()
+    business_runs_total = db.query(models.BusinessRun).count()
+    business_runs_running = db.query(models.BusinessRun).filter(
+        models.BusinessRun.status.in_(["pending", "running", "cancelling"])
+    ).count()
+    audit_logs_total = db.query(models.AuditLog).count()
+
+    return {
+        "sqlite_enabled": sqlite_path is not None,
+        "db_path": str(sqlite_path) if sqlite_path else None,
+        "db_exists": bool(sqlite_path and sqlite_path.exists()),
+        "db_size_bytes": int(size_bytes),
+        "db_size_mb": round(float(size_bytes) / (1024.0 * 1024.0), 3),
+        "execution_total": int(execution_total),
+        "execution_running": int(execution_running),
+        "execution_terminal": int(execution_terminal),
+        "mlops_runs_total": int(mlops_runs_total),
+        "mlops_runs_running": int(mlops_runs_running),
+        "business_runs_total": int(business_runs_total),
+        "business_runs_running": int(business_runs_running),
+        "audit_logs_total": int(audit_logs_total),
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
+@app.get("/api/settings/sqlite/usage")
+async def get_sqlite_usage(db: Session = Depends(get_db)):
+    return _collect_sqlite_runtime_usage(db)
+
+
+@app.post("/api/settings/sqlite/cleanup")
+async def cleanup_sqlite_runtime_data(
+    body: SQLiteCleanupRequest,
+    db: Session = Depends(get_db),
+):
+    sqlite_path = _resolve_sqlite_db_file_path()
+    if sqlite_path is None:
+        raise HTTPException(status_code=400, detail="SQLite database is not configured.")
+
+    before = _collect_sqlite_runtime_usage(db)
+    updated: Dict[str, int] = {
+        "executions": 0,
+        "mlops_runs": 0,
+        "business_runs": 0,
+        "audit_logs": 0,
+    }
+    warnings: List[str] = []
+
+    try:
+        terminal_statuses = ["success", "failed", "cancelled"]
+
+        if body.clear_execution_runtime_payloads:
+            updated["executions"] = int(
+                db.query(models.Execution).filter(
+                    models.Execution.status.in_(terminal_statuses)
+                ).update(
+                    {
+                        models.Execution.logs: [],
+                        models.Execution.node_results: {},
+                        models.Execution.rows_processed: 0,
+                    },
+                    synchronize_session=False,
+                )
+                or 0
+            )
+
+        if body.clear_mlops_run_payloads:
+            updated["mlops_runs"] = int(
+                db.query(models.MLOpsRun).filter(
+                    models.MLOpsRun.status.in_(terminal_statuses)
+                ).update(
+                    {
+                        models.MLOpsRun.logs: [],
+                        models.MLOpsRun.metrics: {},
+                        models.MLOpsRun.artifact_rows: 0,
+                    },
+                    synchronize_session=False,
+                )
+                or 0
+            )
+
+        if body.clear_business_run_payloads:
+            updated["business_runs"] = int(
+                db.query(models.BusinessRun).filter(
+                    models.BusinessRun.status.in_(terminal_statuses)
+                ).update(
+                    {
+                        models.BusinessRun.logs: [],
+                        models.BusinessRun.node_outputs: {},
+                        models.BusinessRun.metrics: {},
+                    },
+                    synchronize_session=False,
+                )
+                or 0
+            )
+
+        if body.clear_audit_logs:
+            updated["audit_logs"] = int(
+                db.query(models.AuditLog).delete(synchronize_session=False) or 0
+            )
+
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"SQLite cleanup failed: {exc}")
+
+    vacuum_result = {
+        "attempted": bool(body.vacuum),
+        "ok": False,
+        "error": "",
+    }
+    if body.vacuum:
+        try:
+            if not sqlite_path.exists():
+                raise RuntimeError("SQLite database file not found.")
+            conn = _sqlite3.connect(str(sqlite_path))
+            try:
+                conn.execute("PRAGMA busy_timeout=30000;")
+                conn.execute("VACUUM;")
+                conn.commit()
+            finally:
+                conn.close()
+            vacuum_result["ok"] = True
+        except Exception as exc:
+            vacuum_result["ok"] = False
+            vacuum_result["error"] = str(exc)
+            warnings.append(
+                "VACUUM did not complete (database may be busy). Retry when pipelines are idle."
+            )
+
+    after = _collect_sqlite_runtime_usage(db)
+    return {
+        "message": "SQLite runtime cleanup completed.",
+        "before": before,
+        "after": after,
+        "updated": updated,
+        "vacuum": vacuum_result,
+        "warnings": warnings,
+    }
 
 
 # ─── CREDENTIALS ──────────────────────────────────────────────────────────────
@@ -8436,6 +9457,59 @@ async def _load_lmdb_rows_for_preview(
     }
 
 
+async def _load_rocksdb_rows_for_preview(
+    config: dict,
+    max_rows: int,
+    page: int = 1,
+    preview_rows: int = 50,
+) -> Dict[str, Any]:
+    if _rocksdict is None:
+        raise HTTPException(400, "RocksDB dependency is not installed in backend environment.")
+    try:
+        raw_max_rows = int(max_rows if max_rows is not None else 200)
+    except Exception:
+        raw_max_rows = 200
+    safe_max_rows = 2_147_483_647 if raw_max_rows <= 0 else max(1, raw_max_rows)
+    safe_page = max(1, int(page or 1))
+    safe_preview_rows = max(1, min(int(preview_rows or 50), 500))
+    offset = max(0, (safe_page - 1) * safe_preview_rows)
+    if offset >= safe_max_rows:
+        return {
+            "rows": [],
+            "page": safe_page,
+            "preview_rows": safe_preview_rows,
+            "row_count": safe_max_rows,
+            "has_more": False,
+            "sample_limited": True,
+        }
+
+    fetch_limit = min(safe_preview_rows + 1, safe_max_rows - offset)
+    cfg = dict(config or {})
+    cfg["limit"] = fetch_limit
+    cfg["preview_offset"] = offset
+    try:
+        rows = await etl_engine._execute_rocksdb(cfg)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"RocksDB metadata detection failed: {exc}")
+    has_more = len(rows) > safe_preview_rows
+    page_rows = rows[:safe_preview_rows]
+    if has_more:
+        row_count = max(offset + safe_preview_rows + 1, offset + len(page_rows))
+    else:
+        row_count = offset + len(page_rows)
+    row_count = min(safe_max_rows, row_count)
+    return {
+        "rows": page_rows,
+        "page": safe_page,
+        "preview_rows": safe_preview_rows,
+        "row_count": row_count,
+        "has_more": bool(has_more and row_count < safe_max_rows),
+        "sample_limited": True,
+    }
+
+
 async def _load_tabular_rows_for_source(node_type: str, config: dict, max_rows: int) -> list:
     ntype = (node_type or "").strip().lower()
     cfg = config or {}
@@ -8512,9 +9586,21 @@ async def _load_tabular_rows_for_source(node_type: str, config: dict, max_rows: 
         conn = None
         try:
             dsn = etl_engine._build_oracle_dsn(cfg)
+            oracle_user_raw = cfg.get("user")
+            oracle_password_raw = cfg.get("password")
+            oracle_user = (
+                str(oracle_user_raw).strip()
+                if oracle_user_raw is not None
+                else ""
+            )
+            oracle_password = (
+                str(oracle_password_raw)
+                if oracle_password_raw is not None
+                else ""
+            )
             conn = oracledb.connect(
-                user=cfg.get("user", ""),
-                password=cfg.get("password", ""),
+                user=oracle_user,
+                password=oracle_password,
                 dsn=dsn,
             )
             query = _strip_sql_terminator(cfg.get("query", ""))
@@ -8623,6 +9709,11 @@ async def _load_tabular_rows_for_source(node_type: str, config: dict, max_rows: 
 
     if ntype == "lmdb_source":
         preview = await _load_lmdb_rows_for_preview(cfg, limit, page=1, preview_rows=limit)
+        rows = preview.get("rows", []) if isinstance(preview, dict) else []
+        return rows if isinstance(rows, list) else []
+
+    if ntype == "rocksdb_source":
+        preview = await _load_rocksdb_rows_for_preview(cfg, limit, page=1, preview_rows=limit)
         rows = preview.get("rows", []) if isinstance(preview, dict) else []
         return rows if isinstance(rows, list) else []
 
@@ -8795,7 +9886,7 @@ async def detect_source_json_field_options(body: JsonFieldOptionsRequest):
 @app.post("/api/source/field-options")
 async def detect_source_field_options(body: SourceFieldOptionsRequest):
     node_type = (body.node_type or "").strip().lower()
-    if node_type == "lmdb_source":
+    if node_type in {"lmdb_source", "rocksdb_source"}:
         try:
             requested_max_rows = int(body.max_rows if body.max_rows is not None else 1000)
         except Exception:
@@ -8804,43 +9895,68 @@ async def detect_source_field_options(body: SourceFieldOptionsRequest):
         max_rows = 2_147_483_647 if requested_max_rows <= 0 else max(1, requested_max_rows)
     else:
         max_rows = max(1, min(int(body.max_rows or 200), 2000))
-    if node_type == "lmdb_source":
+    if node_type in {"lmdb_source", "rocksdb_source"}:
         request_page = max(1, int(body.page or 1))
         request_preview_rows = max(1, min(int(body.preview_rows or 50), 500))
-        preview = await _load_lmdb_rows_for_preview(
-            body.config,
-            max_rows=max_rows,
-            page=request_page,
-            preview_rows=request_preview_rows,
-        )
+        include_schema_scan = bool(body.include_schema_scan)
+        schema_scan_limit = max(1, min(int(body.schema_scan_limit or 5000), 20000))
+        preview_config = dict(body.config or {})
+        if bool(body.preview_compact):
+            preview_config["preview_compact"] = True
+            preview_config["preview_max_cell_chars"] = max(200, min(int(body.preview_max_cell_chars or 2000), 20000))
+            preview_config["preview_max_collection_items"] = max(8, min(int(body.preview_max_collection_items or 64), 500))
+        if node_type == "rocksdb_source":
+            preview = await _load_rocksdb_rows_for_preview(
+                preview_config,
+                max_rows=max_rows,
+                page=request_page,
+                preview_rows=request_preview_rows,
+            )
+        else:
+            preview = await _load_lmdb_rows_for_preview(
+                preview_config,
+                max_rows=max_rows,
+                page=request_page,
+                preview_rows=request_preview_rows,
+            )
         rows = preview.get("rows", []) if isinstance(preview, dict) else []
         normalized_rows = _normalize_source_rows(rows if isinstance(rows, list) else [], int(preview.get("preview_rows") or 50))
 
         # Schema union scan across multiple LMDB preview pages so sparse/profile
         # fields are not missed due to pagination or first-row shape.
-        schema_scan_cap = max(1, min(max_rows, 5000))
         schema_rows: List[dict] = []
-        schema_page = 1
-        schema_has_more = True
-        while schema_has_more and len(schema_rows) < schema_scan_cap:
-            remaining = schema_scan_cap - len(schema_rows)
-            page_size = max(1, min(500, remaining))
-            schema_preview = await _load_lmdb_rows_for_preview(
-                body.config,
-                max_rows=max_rows,
-                page=schema_page,
-                preview_rows=page_size,
-            )
-            schema_batch = schema_preview.get("rows", []) if isinstance(schema_preview, dict) else []
-            normalized_batch = _normalize_source_rows(
-                schema_batch if isinstance(schema_batch, list) else [],
-                page_size,
-            )
-            if not normalized_batch:
-                break
-            schema_rows.extend(normalized_batch)
-            schema_has_more = bool(schema_preview.get("has_more", False))
-            schema_page += 1
+        schema_has_more = False
+        if include_schema_scan:
+            schema_scan_cap = max(1, min(max_rows, schema_scan_limit))
+            schema_page = 1
+            schema_has_more = True
+            while schema_has_more and len(schema_rows) < schema_scan_cap:
+                remaining = schema_scan_cap - len(schema_rows)
+                page_size = max(1, min(500, remaining))
+                if node_type == "rocksdb_source":
+                    schema_preview = await _load_rocksdb_rows_for_preview(
+                        preview_config,
+                        max_rows=max_rows,
+                        page=schema_page,
+                        preview_rows=page_size,
+                    )
+                else:
+                    schema_preview = await _load_lmdb_rows_for_preview(
+                        preview_config,
+                        max_rows=max_rows,
+                        page=schema_page,
+                        preview_rows=page_size,
+                    )
+                schema_batch = schema_preview.get("rows", []) if isinstance(schema_preview, dict) else []
+                normalized_batch = _normalize_source_rows(
+                    schema_batch if isinstance(schema_batch, list) else [],
+                    page_size,
+                )
+                if not normalized_batch:
+                    break
+                schema_rows.extend(normalized_batch)
+                schema_has_more = bool(schema_preview.get("has_more", False))
+                schema_page += 1
 
         columns = _collect_source_columns(schema_rows if schema_rows else normalized_rows)
         return {
@@ -8852,8 +9968,9 @@ async def detect_source_field_options(body: SourceFieldOptionsRequest):
             "page": int(preview.get("page") or 1),
             "preview_rows": int(preview.get("preview_rows") or len(normalized_rows)),
             "has_more": bool(preview.get("has_more", False)),
+            "include_schema_scan": include_schema_scan,
             "schema_rows_scanned": len(schema_rows),
-            "schema_scan_limited": bool(schema_has_more and len(schema_rows) >= schema_scan_cap),
+            "schema_scan_limited": bool(include_schema_scan and schema_has_more),
         }
 
     rows = await _load_tabular_rows_for_source(body.node_type, body.config, max_rows=max_rows)
@@ -8930,6 +10047,63 @@ def _discover_lmdb_env_paths(
     return discovered, scanned_dirs
 
 
+def _discover_rocksdb_env_paths(
+    roots: List[str],
+    max_depth: int = 4,
+    limit: int = 500,
+) -> Tuple[List[str], int]:
+    discovered: List[str] = []
+    seen_paths = set()
+    scanned_dirs = 0
+
+    safe_max_depth = max(0, min(int(max_depth or 4), 8))
+    safe_limit = max(1, min(int(limit or 500), 5000))
+
+    for root in roots:
+        root_path = str(root or "").strip()
+        if not root_path:
+            continue
+        expanded = _os.path.expandvars(_os.path.expanduser(root_path))
+        expanded = _os.path.abspath(expanded)
+        if not _os.path.isdir(expanded):
+            continue
+        queue: List[Tuple[str, int]] = [(expanded, 0)]
+        local_seen_dirs = set()
+        while queue and len(discovered) < safe_limit:
+            current, depth = queue.pop(0)
+            if current in local_seen_dirs:
+                continue
+            local_seen_dirs.add(current)
+            scanned_dirs += 1
+
+            current_file = _os.path.join(current, "CURRENT")
+            if _os.path.isfile(current_file):
+                normalized = _os.path.abspath(current)
+                if normalized not in seen_paths:
+                    seen_paths.add(normalized)
+                    discovered.append(normalized)
+                    if len(discovered) >= safe_limit:
+                        break
+
+            if depth >= safe_max_depth:
+                continue
+
+            try:
+                with _os.scandir(current) as it:
+                    for entry in it:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                        name = str(entry.name or "")
+                        if name.startswith(".") or name in {"__pycache__", "node_modules", "venv", ".git"}:
+                            continue
+                        queue.append((entry.path, depth + 1))
+            except Exception:
+                continue
+
+    discovered.sort()
+    return discovered, scanned_dirs
+
+
 @app.post("/api/lmdb/env-path-options")
 async def lmdb_env_path_options(body: LmdbEnvPathOptionsRequest):
     roots: List[str] = []
@@ -8978,6 +10152,52 @@ async def lmdb_env_path_options(body: LmdbEnvPathOptionsRequest):
     }
 
 
+@app.post("/api/rocksdb/env-path-options")
+async def rocksdb_env_path_options(body: RocksdbEnvPathOptionsRequest):
+    roots: List[str] = []
+
+    backend_state_root = _os.path.join(_os.path.dirname(__file__), "state")
+    if _os.path.isdir(backend_state_root):
+        roots.append(backend_state_root)
+
+    env_root = str(_os.getenv("ROCKSDB_ROOT", "") or "").strip()
+    if env_root:
+        roots.append(env_root)
+
+    base_path = str(body.base_path or "").strip()
+    if base_path:
+        expanded = _os.path.expandvars(_os.path.expanduser(base_path))
+        if expanded:
+            if _os.path.isdir(expanded):
+                roots.append(expanded)
+            parent = _os.path.dirname(expanded)
+            if parent and _os.path.isdir(parent):
+                roots.append(parent)
+
+    deduped_roots = []
+    seen_root = set()
+    for root in roots:
+        norm = _os.path.abspath(root)
+        if norm in seen_root:
+            continue
+        seen_root.add(norm)
+        deduped_roots.append(norm)
+
+    paths, scanned_dirs = _discover_rocksdb_env_paths(
+        deduped_roots,
+        max_depth=body.max_depth,
+        limit=body.limit,
+    )
+
+    return {
+        "roots": deduped_roots,
+        "paths": paths,
+        "count": len(paths),
+        "scanned_dirs": scanned_dirs,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
 @app.post("/api/lmdb/summary")
 async def lmdb_summary(body: LmdbSummaryRequest):
     cfg = dict(body.config or {})
@@ -8989,6 +10209,19 @@ async def lmdb_summary(body: LmdbSummaryRequest):
         raise
     except Exception as exc:
         raise HTTPException(400, f"LMDB summary failed: {exc}")
+
+
+@app.post("/api/rocksdb/summary")
+async def rocksdb_summary(body: RocksdbSummaryRequest):
+    cfg = dict(body.config or {})
+    scan_limit = max(0, int(body.summary_scan_limit or 0))
+    cfg["summary_scan_limit"] = scan_limit
+    try:
+        return await etl_engine._summarize_rocksdb(cfg)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"RocksDB summary failed: {exc}")
 
 
 @app.post("/api/lmdb/delete")
@@ -9210,6 +10443,116 @@ async def delete_lmdb_data(body: LmdbDeleteRequest):
                 pass
 
 
+@app.post("/api/rocksdb/delete")
+async def delete_rocksdb_data(body: RocksdbDeleteRequest):
+    if _rocksdict is None:
+        raise HTTPException(400, "RocksDB dependency is not installed in backend environment.")
+
+    mode = str(body.delete_mode or "filtered").strip().lower()
+    if mode not in {"filtered", "all"}:
+        raise HTTPException(400, "delete_mode must be either 'filtered' or 'all'.")
+
+    try:
+        db_path = etl_engine._resolve_rocksdb_env_path(str(body.env_path or ""))
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid RocksDB path: {exc}")
+
+    key_prefix = str(body.key_prefix or "").strip()
+    start_key = str(body.start_key or "").strip()
+    end_key = str(body.end_key or "").strip()
+    key_contains = str(body.key_contains or "").strip()
+    raw_limit = body.limit
+    try:
+        if raw_limit is None or str(raw_limit).strip() == "":
+            parsed_limit = 200000
+        else:
+            parsed_limit = int(raw_limit)
+    except Exception:
+        parsed_limit = 200000
+    limit: Optional[int] = None if parsed_limit <= 0 else max(1, parsed_limit)
+
+    if mode == "filtered":
+        has_custom_filter = any([key_prefix, start_key, end_key, key_contains])
+        if not has_custom_filter:
+            raise HTTPException(
+                400,
+                "Custom delete requires filter(s): key_prefix, start_key/end_key, or key_contains. "
+                "Use delete_mode='all' to clear the selected DB.",
+            )
+
+    store = None
+    store_should_close = False
+    try:
+        store, store_should_close = etl_engine._acquire_rocksdb_store(db_path)  # pylint: disable=protected-access
+        prefix_bytes = key_prefix.encode("utf-8") if key_prefix else None
+        start_bytes = start_key.encode("utf-8") if start_key else None
+        end_bytes = end_key.encode("utf-8") if end_key else None
+
+        keys_to_delete: List[str] = []
+        sample_deleted_keys: List[str] = []
+        scanned_count = 0
+        matched_count = 0
+
+        for raw_key, _ in etl_engine._rocksdb_iter_items(store):  # pylint: disable=protected-access
+            key_text = etl_engine._rocksdb_key_to_text(raw_key)  # pylint: disable=protected-access
+            key_bytes = key_text.encode("utf-8", errors="replace")
+            scanned_count += 1
+
+            if prefix_bytes is not None and not key_bytes.startswith(prefix_bytes):
+                continue
+            if start_bytes is not None and key_bytes < start_bytes:
+                continue
+            if end_bytes is not None and key_bytes > end_bytes:
+                continue
+            if key_contains and key_contains not in key_text:
+                continue
+
+            matched_count += 1
+            keys_to_delete.append(key_text)
+            if len(sample_deleted_keys) < 25:
+                sample_deleted_keys.append(key_text)
+
+            if mode == "filtered" and limit is not None and matched_count >= limit:
+                break
+
+        if mode == "filtered" and matched_count == 0:
+            return {
+                "status": "ok",
+                "env_path": db_path,
+                "delete_mode": mode,
+                "scanned_keys": scanned_count,
+                "matched_keys": 0,
+                "deleted_keys": 0,
+                "sample_deleted_keys": [],
+            }
+
+        deleted_count = 0
+        for key_text in keys_to_delete:
+            try:
+                del store[key_text]
+                deleted_count += 1
+            except Exception:
+                continue
+
+        return {
+            "status": "ok",
+            "env_path": db_path,
+            "delete_mode": mode,
+            "limit_applied": limit if mode == "filtered" else None,
+            "scanned_keys": scanned_count,
+            "matched_keys": matched_count,
+            "deleted_keys": deleted_count,
+            "sample_deleted_keys": sample_deleted_keys,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"RocksDB delete failed: {exc}")
+    finally:
+        if store is not None and store_should_close:
+            etl_engine._close_rocksdb_store(store)  # pylint: disable=protected-access
+
+
 @app.post("/api/custom-fields/validate")
 async def validate_custom_fields(body: CustomFieldValidationRequest):
     config = body.config if isinstance(body.config, dict) else {}
@@ -9223,6 +10566,8 @@ async def validate_custom_fields(body: CustomFieldValidationRequest):
     requested_validation_source = str(body.validation_source or "lmdb").strip().lower()
     if requested_validation_source in {"rows", "sample"}:
         validation_source = "rows"
+    elif requested_validation_source in {"rocks", "rocksdb"}:
+        validation_source = "rocksdb"
     elif requested_validation_source in {"", "lmdb"}:
         validation_source = "lmdb"
     else:
@@ -9231,53 +10576,55 @@ async def validate_custom_fields(body: CustomFieldValidationRequest):
             f"Unknown validation_source '{requested_validation_source}', LMDB mode is used."
         )
 
-    if validation_source == "lmdb":
+    if validation_source in {"lmdb", "rocksdb"}:
+        is_rocks_validation = validation_source == "rocksdb"
         lmdb_cfg_in = body.lmdb_config if isinstance(body.lmdb_config, dict) else {}
+        rocks_cfg_in = body.rocksdb_config if isinstance(body.rocksdb_config, dict) else {}
         lmdb_cfg = {
             "env_path": str(
-                lmdb_cfg_in.get("env_path")
-                or config.get("custom_validation_lmdb_env_path")
+                (rocks_cfg_in.get("env_path") if is_rocks_validation else lmdb_cfg_in.get("env_path"))
+                or (config.get("custom_validation_rocksdb_env_path") if is_rocks_validation else config.get("custom_validation_lmdb_env_path"))
                 or config.get("env_path")
                 or ""
             ).strip(),
             "db_name": str(
-                lmdb_cfg_in.get("db_name")
+                (rocks_cfg_in.get("db_name") if is_rocks_validation else lmdb_cfg_in.get("db_name"))
                 or config.get("custom_validation_lmdb_db_name")
                 or ""
             ).strip(),
             "key_prefix": str(
-                lmdb_cfg_in.get("key_prefix")
+                (rocks_cfg_in.get("key_prefix") if is_rocks_validation else lmdb_cfg_in.get("key_prefix"))
                 or config.get("custom_validation_lmdb_key_prefix")
                 or ""
             ).strip(),
             "start_key": str(
-                lmdb_cfg_in.get("start_key")
+                (rocks_cfg_in.get("start_key") if is_rocks_validation else lmdb_cfg_in.get("start_key"))
                 or config.get("custom_validation_lmdb_start_key")
                 or ""
             ).strip(),
             "end_key": str(
-                lmdb_cfg_in.get("end_key")
+                (rocks_cfg_in.get("end_key") if is_rocks_validation else lmdb_cfg_in.get("end_key"))
                 or config.get("custom_validation_lmdb_end_key")
                 or ""
             ).strip(),
             "key_contains": str(
-                lmdb_cfg_in.get("key_contains")
+                (rocks_cfg_in.get("key_contains") if is_rocks_validation else lmdb_cfg_in.get("key_contains"))
                 or config.get("custom_validation_lmdb_key_contains")
                 or ""
             ).strip(),
             "value_contains": str(
-                lmdb_cfg_in.get("value_contains")
+                (rocks_cfg_in.get("value_contains") if is_rocks_validation else lmdb_cfg_in.get("value_contains"))
                 or config.get("custom_validation_lmdb_value_contains")
                 or ""
             ).strip(),
             "value_format": str(
-                lmdb_cfg_in.get("value_format")
+                (rocks_cfg_in.get("value_format") if is_rocks_validation else lmdb_cfg_in.get("value_format"))
                 or config.get("custom_validation_lmdb_value_format")
                 or "auto"
             ).strip() or "auto",
             "flatten_json_values": bool(
-                lmdb_cfg_in.get("flatten_json_values")
-                if "flatten_json_values" in lmdb_cfg_in
+                (rocks_cfg_in.get("flatten_json_values") if is_rocks_validation else lmdb_cfg_in.get("flatten_json_values"))
+                if ("flatten_json_values" in rocks_cfg_in if is_rocks_validation else "flatten_json_values" in lmdb_cfg_in)
                 else config.get("custom_validation_lmdb_flatten_json_values", True)
             ),
             "limit": max_rows,
@@ -9287,15 +10634,22 @@ async def validate_custom_fields(body: CustomFieldValidationRequest):
             fallback_rows = [row for row in input_rows_fallback if isinstance(row, dict)]
             if fallback_rows:
                 warnings.append(
-                    "LMDB env_path is missing. Validation automatically used sample rows mode."
+                    f"{'RocksDB' if is_rocks_validation else 'LMDB'} env_path is missing. Validation automatically used sample rows mode."
                 )
                 validation_source = "rows"
                 normalized_rows.extend(fallback_rows[:max_rows])
             else:
-                errors.append("LMDB validation requires env_path. Set Custom Validation LMDB Path in Custom Fields Studio.")
+                errors.append(
+                    "RocksDB validation requires env_path. Set Custom Validation RocksDB Path in Custom Fields Studio."
+                    if is_rocks_validation
+                    else "LMDB validation requires env_path. Set Custom Validation LMDB Path in Custom Fields Studio."
+                )
         else:
             try:
-                lmdb_rows = await _load_lmdb_rows_for_preview(lmdb_cfg, max_rows=max_rows)
+                if is_rocks_validation:
+                    lmdb_rows = await _load_rocksdb_rows_for_preview(lmdb_cfg, max_rows=max_rows)
+                else:
+                    lmdb_rows = await _load_lmdb_rows_for_preview(lmdb_cfg, max_rows=max_rows)
                 for row in lmdb_rows[:max_rows]:
                     if isinstance(row, dict):
                         normalized_rows.append(row)
@@ -9304,7 +10658,11 @@ async def validate_custom_fields(body: CustomFieldValidationRequest):
             except Exception as exc:
                 errors.append(str(exc))
             if not normalized_rows and not errors:
-                errors.append("No rows found in LMDB for validation. Adjust db/filter settings.")
+                errors.append(
+                    "No rows found in RocksDB for validation. Adjust key/path/filter settings."
+                    if is_rocks_validation
+                    else "No rows found in LMDB for validation. Adjust db/filter settings."
+                )
 
     if validation_source == "rows" and not normalized_rows:
         input_rows = body.rows if isinstance(body.rows, list) else []

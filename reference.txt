@@ -46,3 +46,29 @@ uvicorn main:app --host 0.0.0.0 --port 8001 --reload
 
 to reduce size
 sqlite3 "backend/etl_platform.db" "VACUUM;"
+
+
+
+cd /Users/gireesha/Documents/FRAMEWORK/backend
+source venv/bin/activate
+export OLLAMA_BASE_URL=http://127.0.0.1:11434
+export PROFILE_REDIS_URL=redis://127.0.0.1:6379/0
+export OLLAMA_BUSINESS_MODEL_CLOUD=gpt-oss:20b-cloud
+export OLLAMA_REQUEST_TIMEOUT=300
+export OLLAMA_KEEP_ALIVE=30m
+
+pids=($(lsof -tiTCP:8001 -sTCP:LISTEN))
+[ ${#pids[@]} -gt 0 ] && kill -9 ${pids[@]}
+
+uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+
+
+to reduce size
+sqlite3 "backend/etl_platform.db" "VACUUM;"
+
+
+cd /Users/gireesha/Documents/FRAMEWORK/backend
+source venv/bin/activate
+pids=$(lsof -tiTCP:8001 -sTCP:LISTEN)
+[ -n "$pids" ] && kill -9 $pids
+uvicorn main:app --host 0.0.0.0 --port 8001 --reload

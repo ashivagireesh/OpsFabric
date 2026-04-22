@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState } from 'react'
+import { useRef, useEffect, useState, useMemo } from 'react'
 import { Typography, Space, Tag, Button, Alert } from 'antd'
 import {
   CloseOutlined, LoadingOutlined, CheckCircleFilled, CloseCircleFilled,
@@ -12,7 +12,15 @@ import { destDirHandles, destFilenames } from './FilePicker'
 const { Text } = Typography
 
 export default function ExecutionPanel() {
-  const { executionLogs, isExecuting, setShowLogs, showLogs, nodes } = useWorkflowStore()
+  const {
+    executionLogs,
+    isExecuting,
+    executionAbortRequested,
+    abortExecution,
+    setShowLogs,
+    showLogs,
+    nodes,
+  } = useWorkflowStore()
   const bottomRef = useRef<HTMLDivElement>(null)
   const [localWriteStatus, setLocalWriteStatus] = useState<Record<string, 'writing' | 'done' | 'error'>>({})
 
@@ -25,18 +33,32 @@ export default function ExecutionPanel() {
   const isSuccess      = !isExecuting && executionLogs.length > 0 && !hasError
   const totalRows      = executionLogs.reduce((s, l) => s + (l.rows || 0), 0)
 
-  // Collect output file paths from destination logs
-  const outputFiles: string[] = []
-  if (isSuccess) {
-    executionLogs.forEach((l: any) => {
-      if (l.output_path) {
-        if (!outputFiles.includes(l.output_path)) outputFiles.push(l.output_path)
-      } else {
-        const match = l.message?.match(/written:\s+(.+?)\s+\(/)
-        if (match && !outputFiles.includes(match[1])) outputFiles.push(match[1])
+  const nodeOutputPathById = useMemo<Record<string, string>>(() => {
+    if (!isSuccess) return {}
+    const mapping: Record<string, string> = {}
+    executionLogs.forEach((log: any) => {
+      if (!log?.nodeId) return
+      if (typeof log.output_path === 'string' && log.output_path.trim()) {
+        mapping[String(log.nodeId)] = String(log.output_path)
+        return
+      }
+      const match = String(log.message || '').match(/written:\s+(.+?)\s+\(/)
+      if (match?.[1]) {
+        mapping[String(log.nodeId)] = String(match[1])
       }
     })
-  }
+    return mapping
+  }, [isSuccess, executionLogs])
+
+  // Collect output file paths from destination logs
+  const outputFiles = useMemo<string[]>(() => {
+    if (!isSuccess) return []
+    const files: string[] = []
+    Object.values(nodeOutputPathById).forEach((path) => {
+      if (!files.includes(path)) files.push(path)
+    })
+    return files
+  }, [isSuccess, nodeOutputPathById])
 
   // Auto-write to picked local folder when execution completes
   useEffect(() => {
@@ -46,7 +68,7 @@ export default function ExecutionPanel() {
       const dirHandle = destDirHandles.get(node.id)
       const filename  = destFilenames.get(node.id)
       if (!dirHandle || !filename) return
-      const serverPath = outputFiles.find(p => p.endsWith(filename))
+      const serverPath = nodeOutputPathById[node.id] || outputFiles.find(p => p.endsWith(filename))
       if (!serverPath) return
 
       setLocalWriteStatus(s => ({ ...s, [node.id]: 'writing' }))
@@ -65,7 +87,7 @@ export default function ExecutionPanel() {
         setLocalWriteStatus(s => ({ ...s, [node.id]: 'error' }))
       }
     })
-  }, [isSuccess]) // eslint-disable-line
+  }, [isSuccess, outputFiles, nodes, nodeOutputPathById])
 
   if (!showLogs) return null
 
@@ -103,7 +125,7 @@ export default function ExecutionPanel() {
                 : null}
 
           <Text style={{ color: 'var(--app-text-muted)', fontSize: 12, fontWeight: 600, whiteSpace: 'nowrap', flexShrink: 0 }}>
-            {isExecuting ? 'Executing Pipeline…' : 'Execution Output'}
+            {isExecuting ? (executionAbortRequested ? 'Aborting Pipeline…' : 'Executing Pipeline…') : 'Execution Output'}
           </Text>
 
           {isSuccess && (
@@ -118,13 +140,25 @@ export default function ExecutionPanel() {
           )}
         </Space>
 
-        <Button
-          type="text"
-          icon={<CloseOutlined />}
-          size="small"
-          style={{ color: 'var(--app-text-dim)', flexShrink: 0 }}
-          onClick={() => setShowLogs(false)}
-        />
+        <Space size={6}>
+          {isExecuting ? (
+            <Button
+              size="small"
+              danger
+              loading={executionAbortRequested}
+              onClick={() => { void abortExecution() }}
+            >
+              {executionAbortRequested ? 'Aborting…' : 'Abort'}
+            </Button>
+          ) : null}
+          <Button
+            type="text"
+            icon={<CloseOutlined />}
+            size="small"
+            style={{ color: 'var(--app-text-dim)', flexShrink: 0 }}
+            onClick={() => setShowLogs(false)}
+          />
+        </Space>
       </div>
 
       {/* ── Output files bar (shown only when files were written) ────────────── */}
@@ -142,8 +176,9 @@ export default function ExecutionPanel() {
           <Text style={{ color: 'var(--app-text-dim)', fontSize: 11, flexShrink: 0 }}>Output:</Text>
           {outputFiles.map((path, i) => {
             const filename = path.split('/').pop() || 'output'
-            const nodeWithHandle = nodes.find(n =>
-              destDirHandles.has(n.id) && destFilenames.get(n.id) === filename
+            const nodeWithHandle = (
+              nodes.find((n) => nodeOutputPathById[n.id] === path && destDirHandles.has(n.id))
+              || nodes.find((n) => destDirHandles.has(n.id) && destFilenames.get(n.id) === filename)
             )
             const folderName  = nodeWithHandle ? destDirHandles.get(nodeWithHandle.id)?.name : null
             const writeStatus = nodeWithHandle ? localWriteStatus[nodeWithHandle.id] : undefined

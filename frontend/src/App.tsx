@@ -9,6 +9,7 @@ import CredentialManager from './pages/CredentialManager'
 import Settings from './pages/Settings'
 import NLPChatStudio from './pages/NLPChatStudio'
 import WorkflowChatStudio from './pages/WorkflowChatStudio'
+import PipelineReference from './pages/PipelineReference'
 import DashboardGallery from './pages/viz/DashboardGallery'
 import DashboardEditor from './pages/viz/DashboardEditor'
 import DashboardViewer from './pages/viz/DashboardViewer'
@@ -61,6 +62,7 @@ export default function App() {
           <Route path="/python-analytics" element={<PythonAnalyticsStudio />} />
           <Route path="/nlp-chat" element={<NLPChatStudio />} />
           <Route path="/workflow-chat" element={<WorkflowChatStudio />} />
+          <Route path="/reference" element={<PipelineReference />} />
           <Route path="/dashboards/:id" element={<DashboardViewer />} />
           <Route path="/admin" element={<AdminPanel />} />
         </Route>

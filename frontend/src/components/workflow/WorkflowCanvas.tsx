@@ -1,4 +1,4 @@
-import { useCallback, useRef } from 'react'
+import { useCallback, useMemo, useRef } from 'react'
 import ReactFlow, {
   Background, Controls, MiniMap,
   BackgroundVariant, NodeTypes, Panel,
@@ -9,18 +9,115 @@ import { useWorkflowStore } from '../../store'
 import { getNodeDef } from '../../constants/nodeTypes'
 import { v4 as uuidv4 } from 'uuid'
 import type { ETLNodeData } from '../../types'
+import type { Connection, Edge, HandleType } from 'reactflow'
 
 const nodeTypes: NodeTypes = { etlNode: ETLNode as React.ComponentType<any> }
 
 export default function WorkflowCanvas() {
   const {
     nodes, edges,
-    onNodesChange, onEdgesChange, onConnect,
+    onNodesChange, onEdgesChange, onConnect, onReconnect,
     setSelectedNode, connectorType,
   } = useWorkflowStore()
 
   const { screenToFlowPosition } = useReactFlow()
   const canvasRef = useRef<HTMLDivElement>(null)
+  const reconnectStateRef = useRef<{ edge: Edge | null; success: boolean }>({ edge: null, success: false })
+
+  const nodeRuntimeById = useMemo(() => {
+    const map = new Map<string, ETLNodeData>()
+    for (const node of nodes) {
+      map.set(node.id, node.data as ETLNodeData)
+    }
+    return map
+  }, [nodes])
+
+  const runtimeEdges = useMemo(() => {
+    const edgeLabelPadding: [number, number] = [6, 3]
+
+    return edges.map((edge) => {
+      const source = nodeRuntimeById.get(edge.source)
+      const target = nodeRuntimeById.get(edge.target)
+      const sourceStatus = source?.status || 'idle'
+      const targetStatus = target?.status || 'idle'
+      const isRunningEdge = sourceStatus === 'running' || targetStatus === 'running'
+      const isErrorEdge = sourceStatus === 'error' || targetStatus === 'error'
+      const isSelectedEdge = !!edge.selected
+
+      const flowStatus =
+        isErrorEdge
+          ? 'error'
+          : isRunningEdge
+            ? 'running'
+            : sourceStatus === 'success'
+              ? 'success'
+              : 'idle'
+
+      const strokeColor =
+        flowStatus === 'error'
+          ? '#ef4444'
+          : flowStatus === 'success'
+            ? '#22c55e'
+            : '#64748b'
+
+      const selectedStroke =
+        flowStatus === 'error'
+          ? '#fb7185'
+          : flowStatus === 'running'
+            ? '#a78bfa'
+            : '#38bdf8'
+
+      let label = ''
+      if (isRunningEdge) {
+        const runningRows =
+          targetStatus === 'running' && typeof target?.executionRows === 'number'
+            ? target.executionRows
+            : sourceStatus === 'running' && typeof source?.executionRows === 'number'
+              ? source.executionRows
+              : undefined
+        label = typeof runningRows === 'number'
+          ? `${runningRows.toLocaleString()} processing`
+          : 'Running...'
+      } else if (isErrorEdge) {
+        label = 'Error'
+      }
+
+      return {
+        ...edge,
+        animated: isRunningEdge,
+        reconnectable: true,
+        updatable: true,
+        interactionWidth: typeof edge.interactionWidth === 'number' ? edge.interactionWidth : 44,
+        style: {
+          ...(edge.style || {}),
+          stroke: isSelectedEdge
+            ? selectedStroke
+            : (isRunningEdge || isErrorEdge ? strokeColor : '#334155'),
+          strokeWidth: isSelectedEdge ? 3.4 : isRunningEdge ? 2.6 : isErrorEdge ? 2.2 : 1.6,
+          opacity: isSelectedEdge || isRunningEdge || isErrorEdge ? 1 : 0.6,
+          filter: isSelectedEdge ? `drop-shadow(0 0 6px ${selectedStroke}88)` : undefined,
+        },
+        label,
+        labelShowBg: !!label,
+        labelBgPadding: label ? edgeLabelPadding : undefined,
+        labelBgBorderRadius: label ? 8 : undefined,
+        labelBgStyle: label
+          ? {
+            fill: 'var(--app-card-bg)',
+            stroke: `${strokeColor}55`,
+            strokeWidth: 1,
+          }
+          : undefined,
+        labelStyle: label
+          ? {
+            fill: strokeColor,
+            fontSize: 10,
+            fontWeight: 700,
+          }
+          : undefined,
+      }
+    })
+  }, [edges, nodeRuntimeById])
 
   const onDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault()
@@ -62,24 +159,63 @@ export default function WorkflowCanvas() {
     setSelectedNode(null)
   }, [setSelectedNode])
 
+  const handleReconnect = useCallback((oldEdge: Edge, connection: Connection) => {
+    reconnectStateRef.current.success = true
+    onReconnect(oldEdge, connection)
+  }, [onReconnect])
+
+  const handleReconnectStart = useCallback((_: React.MouseEvent, edge: Edge, __: HandleType) => {
+    reconnectStateRef.current = { edge, success: false }
+  }, [])
+
+  const handleReconnectEnd = useCallback((_: MouseEvent | TouchEvent, edge: Edge, __: HandleType) => {
+    const tracked = reconnectStateRef.current
+    if (!tracked.success) {
+      const fallbackEdge = tracked.edge || edge
+      if (fallbackEdge?.id) {
+        useWorkflowStore.setState((state) => {
+          const exists = state.edges.some((e) => e.id === fallbackEdge.id)
+          if (exists) return {}
+          return {
+            edges: [...state.edges, { ...fallbackEdge, reconnectable: true, updatable: true, interactionWidth: 44 } as any],
+            isDirty: true,
+          }
+        })
+      }
+    }
+    reconnectStateRef.current = { edge: null, success: false }
+  }, [])
+
   return (
     <div ref={canvasRef} style={{ flex: 1, height: '100%' }}>
       <ReactFlow
         nodes={nodes}
-        edges={edges}
+        edges={runtimeEdges}
         nodeTypes={nodeTypes}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
+        onReconnect={handleReconnect}
+        onEdgeUpdate={handleReconnect}
+        onReconnectStart={handleReconnectStart}
+        onReconnectEnd={handleReconnectEnd}
+        onEdgeUpdateStart={handleReconnectStart}
+        onEdgeUpdateEnd={handleReconnectEnd}
         onNodeClick={onNodeClick}
         onPaneClick={onPaneClick}
         onDrop={onDrop}
         onDragOver={onDragOver}
+        edgesUpdatable
+        reconnectRadius={18}
+        edgeUpdaterRadius={18}
         fitView
         fitViewOptions={{ padding: 0.2 }}
         defaultEdgeOptions={{
           type: connectorType,
           animated: true,
+          reconnectable: true,
+          updatable: true,
+          interactionWidth: 44,
           style: { stroke: '#6366f1', strokeWidth: 2 },
         }}
         connectionLineStyle={{ stroke: '#6366f1', strokeWidth: 2 }}

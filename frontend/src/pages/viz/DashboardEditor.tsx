@@ -2118,6 +2118,11 @@ export default function DashboardEditor() {
   // These must be before any early return to satisfy rules-of-hooks
   const layout: LayoutItem[] = activeDashboard?.layout ?? []
   const widgets: Widget[] = activeDashboard?.widgets ?? []
+  const isLightDashboardTheme = (activeDashboard?.theme ?? 'dark') === 'light'
+  const rulerLineColor = isLightDashboardTheme ? '#dbe4f0' : '#252535'
+  const guideLabelBg = isLightDashboardTheme ? '#ffffffd9' : '#0f172acc'
+  const guideLabelBorder = isLightDashboardTheme ? '#cbd5e1' : '#6366f155'
+  const guideLabelText = isLightDashboardTheme ? '#334155' : '#cbd5e1'
   const analyticsSourceMissing =
     (analyticsConfig.source_type === 'pipeline' && !analyticsConfig.pipeline_id) ||
     (analyticsConfig.source_type === 'file' && !(analyticsConfig.file_path || '').trim()) ||
@@ -2383,11 +2388,11 @@ export default function DashboardEditor() {
           {/* Horizontal ruler row */}
           <div style={{ display: 'flex', flexShrink: 0, zIndex: 2 }}>
             {/* Corner */}
-            <div style={{ width: 20, height: 18, background: 'var(--app-panel-2)', borderRight: '1px solid #252535', borderBottom: '1px solid #252535', flexShrink: 0 }} />
+            <div style={{ width: 20, height: 18, background: 'var(--app-panel-2)', borderRight: `1px solid ${rulerLineColor}`, borderBottom: `1px solid ${rulerLineColor}`, flexShrink: 0 }} />
             {/* H ruler */}
             <div style={{
-              flex: 1, height: 18, background: 'var(--app-panel-2)', borderBottom: '1px solid #252535',
-              backgroundImage: 'repeating-linear-gradient(90deg, #252535 0, #252535 1px, transparent 1px, transparent 24px)',
+              flex: 1, height: 18, background: 'var(--app-panel-2)', borderBottom: `1px solid ${rulerLineColor}`,
+              backgroundImage: `repeating-linear-gradient(90deg, ${rulerLineColor} 0, ${rulerLineColor} 1px, transparent 1px, transparent 24px)`,
               position: 'relative', overflow: 'hidden',
             }}>
               {[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20].map(i => (
@@ -2402,8 +2407,8 @@ export default function DashboardEditor() {
           <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
             {/* V ruler */}
             <div style={{
-              width: 20, flexShrink: 0, background: 'var(--app-panel-2)', borderRight: '1px solid #252535',
-              backgroundImage: 'repeating-linear-gradient(180deg, #252535 0, #252535 1px, transparent 1px, transparent 24px)',
+              width: 20, flexShrink: 0, background: 'var(--app-panel-2)', borderRight: `1px solid ${rulerLineColor}`,
+              backgroundImage: `repeating-linear-gradient(180deg, ${rulerLineColor} 0, ${rulerLineColor} 1px, transparent 1px, transparent 24px)`,
               position: 'relative', overflow: 'hidden',
             }}>
               {[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20].map(i => (
@@ -2445,10 +2450,10 @@ export default function DashboardEditor() {
                 position: 'absolute',
                 left: Math.max(4, rulerGuide.x + 8),
                 top: Math.max(4, rulerGuide.y + 8),
-                background: '#0f172acc',
-                border: '1px solid #6366f155',
+                background: guideLabelBg,
+                border: `1px solid ${guideLabelBorder}`,
                 borderRadius: 4,
-                color: '#cbd5e1',
+                color: guideLabelText,
                 fontSize: 10,
                 lineHeight: 1,
                 padding: '4px 6px',

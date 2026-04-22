@@ -344,15 +344,20 @@ const WidgetCell = memo(function WidgetCell({
 
 interface FilterBarProps {
   filters: any[]
+  theme?: string
 }
 
-function GlobalFilterBar({ filters }: FilterBarProps) {
+function GlobalFilterBar({ filters, theme = 'dark' }: FilterBarProps) {
   if (!filters || filters.length === 0) return null
+  const isLight = theme === 'light'
+  const barBg = isLight ? '#f8fafc' : '#0a0a12'
+  const barBorder = isLight ? '#dbe4f0' : 'var(--app-border)'
+  const labelColor = isLight ? '#475569' : 'var(--app-text-dim)'
 
   return (
     <div style={{
-      background: '#0a0a12',
-      borderBottom: '1px solid var(--app-border)',
+      background: barBg,
+      borderBottom: `1px solid ${barBorder}`,
       padding: '8px 24px',
       display: 'flex',
       alignItems: 'center',
@@ -361,8 +366,8 @@ function GlobalFilterBar({ filters }: FilterBarProps) {
       minHeight: 44,
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
-        <FilterOutlined style={{ color: 'var(--app-text-dim)', fontSize: 13 }} />
-        <Text style={{ color: 'var(--app-text-dim)', fontSize: 12, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+        <FilterOutlined style={{ color: labelColor, fontSize: 13 }} />
+        <Text style={{ color: labelColor, fontSize: 12, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase' }}>
           Filters
         </Text>
       </div>
@@ -401,13 +406,21 @@ interface DrillPathBarProps {
   path: DashboardDrillStep[]
   onStepUp: () => void
   onReset: () => void
+  theme?: string
 }
 
-function DrillPathBar({ mode, onModeChange, path, onStepUp, onReset }: DrillPathBarProps) {
+function DrillPathBar({ mode, onModeChange, path, onStepUp, onReset, theme = 'dark' }: DrillPathBarProps) {
+  const isLight = theme === 'light'
+  const barBg = isLight ? '#f8fafc' : '#0b1020'
+  const barBorder = isLight ? '#dbe4f0' : '#1e293b'
+  const titleColor = isLight ? '#1d4ed8' : '#93c5fd'
+  const tagBg = isLight ? '#1d4ed815' : '#1d4ed820'
+  const tagBorder = isLight ? '#93c5fd80' : '#3b82f655'
+  const actionColor = isLight ? '#475569' : '#cbd5e1'
   return (
     <div style={{
-      background: '#0b1020',
-      borderBottom: '1px solid #1e293b',
+      background: barBg,
+      borderBottom: `1px solid ${barBorder}`,
       padding: '8px 24px',
       display: 'flex',
       alignItems: 'center',
@@ -415,7 +428,7 @@ function DrillPathBar({ mode, onModeChange, path, onStepUp, onReset }: DrillPath
       flexWrap: 'wrap',
       minHeight: 44,
     }}>
-      <Text style={{ color: '#93c5fd', fontSize: 12, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+      <Text style={{ color: titleColor, fontSize: 12, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
         Drill Path
       </Text>
       <Segmented
@@ -431,9 +444,9 @@ function DrillPathBar({ mode, onModeChange, path, onStepUp, onReset }: DrillPath
         <Tag
           key={`${step.field}_${idx}`}
           style={{
-            background: '#1d4ed820',
-            border: '1px solid #3b82f655',
-            color: '#93c5fd',
+            background: tagBg,
+            border: `1px solid ${tagBorder}`,
+            color: titleColor,
             borderRadius: 16,
             margin: 0,
             fontSize: 12,
@@ -442,10 +455,10 @@ function DrillPathBar({ mode, onModeChange, path, onStepUp, onReset }: DrillPath
           {step.field}: {String(step.value)}
         </Tag>
       ))}
-      <Button size="small" onClick={onStepUp} disabled={!path.length} style={{ borderColor: 'var(--app-text-faint)', color: '#cbd5e1', background: 'transparent' }}>
+      <Button size="small" onClick={onStepUp} disabled={!path.length} style={{ borderColor: 'var(--app-text-faint)', color: actionColor, background: 'transparent' }}>
         Up
       </Button>
-      <Button size="small" onClick={onReset} disabled={!path.length} style={{ borderColor: 'var(--app-text-faint)', color: '#cbd5e1', background: 'transparent' }}>
+      <Button size="small" onClick={onReset} disabled={!path.length} style={{ borderColor: 'var(--app-text-faint)', color: actionColor, background: 'transparent' }}>
         Reset
       </Button>
     </div>
@@ -505,15 +518,17 @@ interface TopBarProps {
   onSnapshot: () => void
   snapshotLoading?: boolean
   onBack: () => void
+  theme?: string
 }
 
-function TopBar({ name, updatedAt, onEdit, onShare, onSnapshot, snapshotLoading = false, onBack }: TopBarProps) {
+function TopBar({ name, updatedAt, onEdit, onShare, onSnapshot, snapshotLoading = false, onBack, theme = 'dark' }: TopBarProps) {
   const updatedAgo = updatedAt ? dayjs(updatedAt).fromNow() : null
+  const isLight = theme === 'light'
 
   return (
     <div style={{
-      background: '#0a0a12',
-      borderBottom: '1px solid var(--app-border)',
+      background: isLight ? '#f8fafc' : '#0a0a12',
+      borderBottom: `1px solid ${isLight ? '#dbe4f0' : 'var(--app-border)'}`,
       padding: '0 20px',
       height: 56,
       display: 'flex',
@@ -863,17 +878,19 @@ export default function DashboardViewer() {
         onSnapshot={handleCaptureSnapshot}
         snapshotLoading={snapshotSaving}
         onBack={handleBack}
+        theme={dashboardTheme}
       />
 
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
         {/* ── Global filter bar ── */}
-        <GlobalFilterBar filters={dashboard.global_filters ?? []} />
+        <GlobalFilterBar filters={dashboard.global_filters ?? []} theme={dashboardTheme} />
         <DrillPathBar
           mode={dashboardDrillMode}
           onModeChange={setDashboardDrillMode}
           path={dashboardDrillPath}
           onStepUp={handleDrillStepUp}
           onReset={handleDrillReset}
+          theme={dashboardTheme}
         />
 
         {/* ── Main canvas ── */}

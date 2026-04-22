@@ -216,7 +216,7 @@ function NodeCard({ node, onDragStart, onClick }: {
           {node.icon}
         </div>
         <div style={{ minWidth: 0 }}>
-          <Text style={{ color: '#d1d5db', fontSize: 12, fontWeight: 500, display: 'block' }}>
+          <Text style={{ color: 'var(--app-text)', fontSize: 12, fontWeight: 500, display: 'block' }}>
             {node.label}
           </Text>
         </div>
