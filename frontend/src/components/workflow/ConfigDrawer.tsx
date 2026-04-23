@@ -70,6 +70,11 @@ interface CustomFieldSpec {
   enabled: boolean
 }
 
+type CustomFieldBeautifyBackup = {
+  expression: string
+  jsonTemplate: string
+}
+
 interface OracleColumnMappingSpec {
   id: string
   source: string
@@ -576,6 +581,58 @@ const CUSTOM_EDITOR_FONT_FAMILY_OPTIONS: Array<{ value: CustomEditorFontPreset; 
   { value: 'fira_code', label: 'Fira Code' },
   { value: 'consolas', label: 'Consolas' },
 ]
+const CUSTOM_EDITOR_PREFS_STORAGE_KEY = 'opsfabric.custom_editor_prefs.v1'
+
+type CustomEditorPrefs = {
+  colorProfile: CustomEditorColorProfile
+  fontPreset: CustomEditorFontPreset
+  fontSize: number
+  lineHeight: number
+  wordWrap: boolean
+  ligatures: boolean
+}
+
+const DEFAULT_CUSTOM_EDITOR_PREFS: CustomEditorPrefs = {
+  colorProfile: 'high_contrast',
+  fontPreset: 'jetbrains_mono',
+  fontSize: 13,
+  lineHeight: 22,
+  wordWrap: true,
+  ligatures: false,
+}
+
+function loadCustomEditorPrefs(): CustomEditorPrefs {
+  if (typeof window === 'undefined' || !window.localStorage) {
+    return { ...DEFAULT_CUSTOM_EDITOR_PREFS }
+  }
+  try {
+    const raw = window.localStorage.getItem(CUSTOM_EDITOR_PREFS_STORAGE_KEY)
+    if (!raw) return { ...DEFAULT_CUSTOM_EDITOR_PREFS }
+    const parsed = JSON.parse(raw) as Partial<CustomEditorPrefs>
+    const colorProfile = parsed?.colorProfile
+    const fontPreset = parsed?.fontPreset
+    const allowedColorProfiles = new Set<CustomEditorColorProfile>(['high_contrast', 'soft', 'js_like'])
+    const allowedFontPresets = new Set<CustomEditorFontPreset>(['jetbrains_mono', 'fira_code', 'consolas'])
+    return {
+      colorProfile: allowedColorProfiles.has(colorProfile as CustomEditorColorProfile)
+        ? (colorProfile as CustomEditorColorProfile)
+        : DEFAULT_CUSTOM_EDITOR_PREFS.colorProfile,
+      fontPreset: allowedFontPresets.has(fontPreset as CustomEditorFontPreset)
+        ? (fontPreset as CustomEditorFontPreset)
+        : DEFAULT_CUSTOM_EDITOR_PREFS.fontPreset,
+      fontSize: Number.isFinite(Number(parsed?.fontSize))
+        ? Math.max(11, Math.min(20, Math.floor(Number(parsed?.fontSize))))
+        : DEFAULT_CUSTOM_EDITOR_PREFS.fontSize,
+      lineHeight: Number.isFinite(Number(parsed?.lineHeight))
+        ? Math.max(18, Math.min(28, Math.floor(Number(parsed?.lineHeight))))
+        : DEFAULT_CUSTOM_EDITOR_PREFS.lineHeight,
+      wordWrap: typeof parsed?.wordWrap === 'boolean' ? parsed.wordWrap : DEFAULT_CUSTOM_EDITOR_PREFS.wordWrap,
+      ligatures: typeof parsed?.ligatures === 'boolean' ? parsed.ligatures : DEFAULT_CUSTOM_EDITOR_PREFS.ligatures,
+    }
+  } catch {
+    return { ...DEFAULT_CUSTOM_EDITOR_PREFS }
+  }
+}
 
 function resolveEditorFontFamily(preset: CustomEditorFontPreset): string {
   if (preset === 'fira_code') return '"Fira Code", Menlo, Monaco, Consolas, "Courier New", monospace'
@@ -587,9 +644,113 @@ let exprLanguageRegistered = false
 let jsonTemplateLanguageRegistered = false
 let customEditorThemeRegistered = false
 let exprCompletionEntries: ExpressionCompletionEntry[] = []
+const EXPR_ALLOWED_AGG_VALUES = new Set([
+  'sum',
+  'mean',
+  'avg',
+  'min',
+  'max',
+  'count',
+  'count_non_null',
+  'distinct',
+  'distinct_count',
+  'value_counts',
+  'first',
+  'last',
+  'row_count',
+  'std',
+  'variance',
+])
+const EXPR_ALLOWED_CONDITION_OPERATORS = new Set([
+  'eq',
+  '==',
+  '!=',
+  'not',
+  'contains',
+  'not_contains',
+  'like',
+  'not_like',
+  'in',
+  'not_in',
+  'startswith',
+  'not_startswith',
+  'endswith',
+  'not_endswith',
+  'regex',
+  'not_regex',
+])
+
+const DEFAULT_EXPRESSION_FUNCTION_NAMES = new Set(
+  [
+    ...EXPRESSION_FUNCTION_SNIPPETS.map((item) => item.snippet),
+    ...EXPRESSION_FUNCTION_SNIPPETS.map((item) => item.label),
+    // Extra runtime helpers that may be available even if not listed in snippets.
+    'num(value,default)',
+    'str(value)',
+    'length(value)',
+    'abs(value)',
+    'sqrt(value)',
+    'log(value)',
+    'exp(value)',
+    'ceil(value)',
+    'floor(value)',
+    'sin(value)',
+    'cos(value)',
+    'tan(value)',
+    'agg(value,agg_name)',
+  ]
+    .map((text) => {
+      const m = String(text || '').match(/\b([A-Za-z_]\w*)\s*\(/)
+      return m ? m[1].toLowerCase() : ''
+    })
+    .filter(Boolean)
+)
+
+type ExpressionValidationContext = {
+  allowedFunctionNames: Set<string>
+  allowedFieldNames: Set<string>
+  allowedFieldNamesLower: Set<string>
+}
+
+let exprValidationContext: ExpressionValidationContext = {
+  allowedFunctionNames: new Set(DEFAULT_EXPRESSION_FUNCTION_NAMES),
+  allowedFieldNames: new Set(),
+  allowedFieldNamesLower: new Set(),
+}
+
+function buildExpressionValidationContext(entries: ExpressionCompletionEntry[]): ExpressionValidationContext {
+  const allowedFunctionNames = new Set(DEFAULT_EXPRESSION_FUNCTION_NAMES)
+  const allowedFieldNames = new Set<string>()
+  const allowedFieldNamesLower = new Set<string>()
+  ;(entries || []).forEach((entry) => {
+    if (!entry) return
+    if (entry.kind === 'function') {
+      const candidates = [entry.insertText, entry.label]
+      candidates.forEach((candidate) => {
+        const m = String(candidate || '').match(/\b([A-Za-z_]\w*)\s*\(/)
+        if (m?.[1]) {
+          allowedFunctionNames.add(String(m[1]).toLowerCase())
+        }
+      })
+      return
+    }
+    if (entry.kind === 'field') {
+      const fieldName = String(entry.label || '').trim()
+      if (!fieldName) return
+      allowedFieldNames.add(fieldName)
+      allowedFieldNamesLower.add(fieldName.toLowerCase())
+    }
+  })
+  return { allowedFunctionNames, allowedFieldNames, allowedFieldNamesLower }
+}
+
+function getExpressionValidationContext(): ExpressionValidationContext {
+  return exprValidationContext
+}
 
 function setExpressionCompletionEntries(entries: ExpressionCompletionEntry[]): void {
   exprCompletionEntries = entries
+  exprValidationContext = buildExpressionValidationContext(entries)
 }
 
 function ensureCustomEditorTheme(monaco: Monaco): void {
@@ -886,15 +1047,580 @@ function extractExpressionStringRanges(text: string): Array<{ value: string; sta
   return out
 }
 
+function findNextNonWhitespaceChar(source: string, start: number): string {
+  for (let i = start; i < source.length; i += 1) {
+    const ch = source[i]
+    if (!/\s/.test(ch)) return ch
+  }
+  return ''
+}
+
+function isMatchingCloseChar(openChar: string, closeChar: string): boolean {
+  return (
+    (openChar === '(' && closeChar === ')')
+    || (openChar === '[' && closeChar === ']')
+    || (openChar === '{' && closeChar === '}')
+  )
+}
+
+function getLastNonWhitespaceChar(source: string): string {
+  for (let i = source.length - 1; i >= 0; i -= 1) {
+    const ch = source[i]
+    if (!/\s/.test(ch)) return ch
+  }
+  return ''
+}
+
+function trimTrailingSpaces(source: string): string {
+  return source.replace(/[ \t]+$/g, '')
+}
+
+function beautifyExpressionText(rawExpression: string): string {
+  const source = String(rawExpression || '').trim()
+  if (!source) return ''
+  const hasEqualsPrefix = source.startsWith('=')
+  const body = hasEqualsPrefix ? source.slice(1).trim() : source
+  if (!body) return hasEqualsPrefix ? '=' : ''
+
+  let out = ''
+  let quote: '"' | "'" | null = null
+  let escaped = false
+  let pendingSpace = false
+  let depth = 0
+  const indentUnit = '  '
+  const operatorPattern = /[+\-*/%<>=!&|?:]/
+
+  const append = (value: string) => {
+    out += value
+  }
+  const ensureSpace = () => {
+    const last = out.slice(-1)
+    if (out && last !== '\n' && last !== ' ') append(' ')
+  }
+  const newlineWithIndent = (indentDepth: number) => {
+    out = trimTrailingSpaces(out)
+    if (!out.endsWith('\n')) append('\n')
+    append(indentUnit.repeat(Math.max(0, indentDepth)))
+  }
+  const flushPendingSpace = () => {
+    if (!pendingSpace) return
+    ensureSpace()
+    pendingSpace = false
+  }
+
+  for (let i = 0; i < body.length; i += 1) {
+    const ch = body[i]
+    if (quote) {
+      append(ch)
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        continue
+      }
+      if (ch === quote) {
+        quote = null
+      }
+      continue
+    }
+
+    if (ch === '"' || ch === "'") {
+      flushPendingSpace()
+      quote = ch
+      append(ch)
+      continue
+    }
+
+    if (/\s/.test(ch)) {
+      pendingSpace = true
+      continue
+    }
+
+    if (ch === '(' || ch === '[' || ch === '{') {
+      flushPendingSpace()
+      out = trimTrailingSpaces(out)
+      append(ch)
+      depth += 1
+      const next = findNextNonWhitespaceChar(body, i + 1)
+      if (next && !isMatchingCloseChar(ch, next)) {
+        newlineWithIndent(depth)
+      }
+      pendingSpace = false
+      continue
+    }
+
+    if (ch === ')' || ch === ']' || ch === '}') {
+      pendingSpace = false
+      depth = Math.max(0, depth - 1)
+      out = trimTrailingSpaces(out)
+      const lastNonWs = getLastNonWhitespaceChar(out)
+      const expectedOpen = ch === ')' ? '(' : ch === ']' ? '[' : '{'
+      if (lastNonWs === expectedOpen) {
+        out = out.replace(/\n[ \t]*$/g, '')
+      } else {
+        newlineWithIndent(depth)
+      }
+      append(ch)
+      const next = findNextNonWhitespaceChar(body, i + 1)
+      if (next && ![',', ')', ']', '}'].includes(next)) {
+        append(' ')
+      }
+      continue
+    }
+
+    if (ch === ',') {
+      append(',')
+      newlineWithIndent(depth)
+      pendingSpace = false
+      continue
+    }
+
+    if (operatorPattern.test(ch)) {
+      flushPendingSpace()
+      out = trimTrailingSpaces(out)
+      const next = body[i + 1] || ''
+      if (ch === '-' && /[0-9.]/.test(next) && /[\s(,[{:=+\-*/%<>=!&|?:]/.test(body[i - 1] || '')) {
+        append(ch)
+        continue
+      }
+      ensureSpace()
+      append(ch)
+      let j = i + 1
+      while (j < body.length && operatorPattern.test(body[j])) {
+        append(body[j])
+        i = j
+        j += 1
+      }
+      append(' ')
+      pendingSpace = false
+      continue
+    }
+
+    flushPendingSpace()
+    append(ch)
+  }
+
+  let formatted = out
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+  if (!formatted) formatted = body
+  return hasEqualsPrefix ? `=${formatted}` : formatted
+}
+
+function beautifyJsonTemplateText(raw: string): string {
+  const source = String(raw || '').trim()
+  if (!source) return '{\n}'
+  const parsed = JSON.parse(source)
+  return JSON.stringify(parsed, null, 2)
+}
+
+type ExpressionFunctionCallRef = {
+  name: string
+  nameStart: number
+  openParenOffset: number
+  closeParenOffset: number
+  argsSource: string
+}
+
+type ParsedArgSegment = {
+  text: string
+  startOffset: number
+  endOffset: number
+}
+
+function decodeSingleQuotedLiteral(raw: string): string {
+  return String(raw || '')
+    .replace(/\\\\/g, '\\')
+    .replace(/\\'/g, "'")
+}
+
+function buildQuoteMask(source: string): boolean[] {
+  const mask = Array(source.length).fill(false)
+  let quote: '"' | "'" | null = null
+  let escaped = false
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i]
+    if (quote) {
+      mask[i] = true
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        continue
+      }
+      if (ch === quote) {
+        quote = null
+      }
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      mask[i] = true
+    }
+  }
+  return mask
+}
+
+function findMatchingParenOffset(source: string, openOffset: number): number {
+  let depth = 0
+  let quote: '"' | "'" | null = null
+  let escaped = false
+  for (let i = openOffset; i < source.length; i += 1) {
+    const ch = source[i]
+    if (quote) {
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        continue
+      }
+      if (ch === quote) {
+        quote = null
+      }
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      continue
+    }
+    if (ch === '(') {
+      depth += 1
+      continue
+    }
+    if (ch === ')') {
+      depth -= 1
+      if (depth === 0) return i
+    }
+  }
+  return -1
+}
+
+function collectExpressionFunctionCalls(source: string): ExpressionFunctionCallRef[] {
+  const refs: ExpressionFunctionCallRef[] = []
+  if (!source) return refs
+  const quoteMask = buildQuoteMask(source)
+  const matcher = /\b([A-Za-z_]\w*)\s*\(/g
+  let match = matcher.exec(source)
+  while (match) {
+    const name = String(match[1] || '')
+    const nameStart = Number(match.index || 0)
+    if (!quoteMask[nameStart]) {
+      const openParenOffset = source.indexOf('(', nameStart + name.length)
+      if (openParenOffset >= 0 && !quoteMask[openParenOffset]) {
+        const closeParenOffset = findMatchingParenOffset(source, openParenOffset)
+        if (closeParenOffset > openParenOffset) {
+          refs.push({
+            name,
+            nameStart,
+            openParenOffset,
+            closeParenOffset,
+            argsSource: source.slice(openParenOffset + 1, closeParenOffset),
+          })
+        }
+      }
+    }
+    match = matcher.exec(source)
+  }
+  return refs
+}
+
+function splitTopLevelArgsWithOffsets(argsSource: string): ParsedArgSegment[] {
+  const segments: ParsedArgSegment[] = []
+  let start = 0
+  let depthRound = 0
+  let depthSquare = 0
+  let depthCurly = 0
+  let quote: '"' | "'" | null = null
+  let escaped = false
+
+  for (let i = 0; i < argsSource.length; i += 1) {
+    const ch = argsSource[i]
+    if (quote) {
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        continue
+      }
+      if (ch === quote) {
+        quote = null
+      }
+      continue
+    }
+
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      continue
+    }
+    if (ch === '(') depthRound += 1
+    else if (ch === ')') depthRound = Math.max(0, depthRound - 1)
+    else if (ch === '[') depthSquare += 1
+    else if (ch === ']') depthSquare = Math.max(0, depthSquare - 1)
+    else if (ch === '{') depthCurly += 1
+    else if (ch === '}') depthCurly = Math.max(0, depthCurly - 1)
+    else if (ch === ',' && depthRound === 0 && depthSquare === 0 && depthCurly === 0) {
+      segments.push({
+        text: argsSource.slice(start, i),
+        startOffset: start,
+        endOffset: i,
+      })
+      start = i + 1
+    }
+  }
+
+  segments.push({
+    text: argsSource.slice(start),
+    startOffset: start,
+    endOffset: argsSource.length,
+  })
+  return segments
+}
+
+function extractSingleQuotedLiteralFromSegment(segment: ParsedArgSegment): { value: string; startOffset: number; endOffset: number } | null {
+  const text = segment.text
+  if (!text) return null
+  const firstQuote = text.indexOf("'")
+  if (firstQuote < 0 || text.slice(0, firstQuote).trim()) return null
+  let escaped = false
+  for (let i = firstQuote + 1; i < text.length; i += 1) {
+    const ch = text[i]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (ch === '\\') {
+      escaped = true
+      continue
+    }
+    if (ch === "'") {
+      if (text.slice(i + 1).trim()) return null
+      const raw = text.slice(firstQuote + 1, i)
+      return {
+        value: decodeSingleQuotedLiteral(raw),
+        startOffset: segment.startOffset + firstQuote + 1,
+        endOffset: segment.startOffset + i,
+      }
+    }
+  }
+  return null
+}
+
+function isAllowedFieldName(fieldName: string, validationContext: ExpressionValidationContext): boolean {
+  if (!fieldName) return true
+  if (!validationContext.allowedFieldNames.size && !validationContext.allowedFieldNamesLower.size) return true
+  if (validationContext.allowedFieldNames.has(fieldName)) return true
+  return validationContext.allowedFieldNamesLower.has(fieldName.toLowerCase())
+}
+
+function validateExpressionSemantics(
+  source: string,
+  baseOffset: number,
+  validationContext: ExpressionValidationContext
+): ExpressionValidationIssue[] {
+  const issues: ExpressionValidationIssue[] = []
+  const seen = new Set<string>()
+  const functionRefs = collectExpressionFunctionCalls(source)
+  const conditionFunctions = new Set([
+    'count_if',
+    'sum_if',
+    'mean_if',
+    'min_if',
+    'max_if',
+    'distinct_if',
+    'distinct_count_if',
+    'count_non_null_if',
+  ])
+
+  const addIssue = (issue: ExpressionValidationIssue) => {
+    const key = `${issue.startOffset}:${issue.endOffset}:${issue.message}`
+    if (seen.has(key)) return
+    seen.add(key)
+    issues.push(issue)
+  }
+
+  const markUnknownField = (fieldName: string, startOffset: number, endOffset: number, contextLabel: string) => {
+    if (isAllowedFieldName(fieldName, validationContext)) return
+    addIssue({
+      startOffset: baseOffset + startOffset,
+      endOffset: baseOffset + Math.max(startOffset + 1, endOffset),
+      message: `Field "${fieldName}" is not available (${contextLabel})`,
+      severity: 'error',
+    })
+  }
+
+  functionRefs.forEach((ref) => {
+    const fnNameLower = ref.name.toLowerCase()
+    if (!validationContext.allowedFunctionNames.has(fnNameLower)) {
+      addIssue({
+        startOffset: baseOffset + ref.nameStart,
+        endOffset: baseOffset + ref.nameStart + ref.name.length,
+        message: `Function "${ref.name}" is not available`,
+        severity: 'error',
+      })
+    }
+
+    const args = splitTopLevelArgsWithOffsets(ref.argsSource)
+    const fieldArgIndexes: number[] = []
+    if (fnNameLower === 'field' || fnNameLower === 'values' || fnNameLower === 'prev') {
+      fieldArgIndexes.push(0)
+    } else if (fnNameLower === 'group_aggregate') {
+      fieldArgIndexes.push(0)
+    } else if (conditionFunctions.has(fnNameLower)) {
+      fieldArgIndexes.push(0, 1)
+    } else if (fnNameLower === 'agg_if') {
+      fieldArgIndexes.push(0, 1)
+    }
+
+    fieldArgIndexes.forEach((argIdx) => {
+      const segment = args[argIdx]
+      if (!segment) return
+      const literal = extractSingleQuotedLiteralFromSegment(segment)
+      if (!literal) return
+      if (fnNameLower === 'prev' && literal.value.includes('.')) {
+        return
+      }
+      markUnknownField(
+        literal.value,
+        ref.openParenOffset + 1 + literal.startOffset,
+        ref.openParenOffset + 1 + literal.endOffset,
+        `${ref.name}()`
+      )
+    })
+
+    if (conditionFunctions.has(fnNameLower)) {
+      const opArg = args[3]
+      const opLiteral = opArg ? extractSingleQuotedLiteralFromSegment(opArg) : null
+      if (opLiteral) {
+        const opLower = opLiteral.value.trim().toLowerCase()
+        if (opLower && !EXPR_ALLOWED_CONDITION_OPERATORS.has(opLower)) {
+          addIssue({
+            startOffset: baseOffset + ref.openParenOffset + 1 + opLiteral.startOffset,
+            endOffset: baseOffset + ref.openParenOffset + 1 + opLiteral.endOffset,
+            message: `Operator "${opLiteral.value}" is not supported`,
+            severity: 'error',
+          })
+        }
+      }
+    }
+    if (fnNameLower === 'agg_if') {
+      const aggArg = args[3]
+      const aggLiteral = aggArg ? extractSingleQuotedLiteralFromSegment(aggArg) : null
+      if (aggLiteral) {
+        const aggLower = aggLiteral.value.trim().toLowerCase()
+        if (aggLower && !EXPR_ALLOWED_AGG_VALUES.has(aggLower)) {
+          addIssue({
+            startOffset: baseOffset + ref.openParenOffset + 1 + aggLiteral.startOffset,
+            endOffset: baseOffset + ref.openParenOffset + 1 + aggLiteral.endOffset,
+            message: `Aggregate "${aggLiteral.value}" is not supported`,
+            severity: 'error',
+          })
+        }
+      }
+      const opArg = args[4]
+      const opLiteral = opArg ? extractSingleQuotedLiteralFromSegment(opArg) : null
+      if (opLiteral) {
+        const opLower = opLiteral.value.trim().toLowerCase()
+        if (opLower && !EXPR_ALLOWED_CONDITION_OPERATORS.has(opLower)) {
+          addIssue({
+            startOffset: baseOffset + ref.openParenOffset + 1 + opLiteral.startOffset,
+            endOffset: baseOffset + ref.openParenOffset + 1 + opLiteral.endOffset,
+            message: `Operator "${opLiteral.value}" is not supported`,
+            severity: 'error',
+          })
+        }
+      }
+    }
+    if (fnNameLower === 'agg' || fnNameLower === 'running_all') {
+      const aggArg = args[1]
+      const aggLiteral = aggArg ? extractSingleQuotedLiteralFromSegment(aggArg) : null
+      if (aggLiteral) {
+        const aggLower = aggLiteral.value.trim().toLowerCase()
+        if (aggLower && !EXPR_ALLOWED_AGG_VALUES.has(aggLower)) {
+          addIssue({
+            startOffset: baseOffset + ref.openParenOffset + 1 + aggLiteral.startOffset,
+            endOffset: baseOffset + ref.openParenOffset + 1 + aggLiteral.endOffset,
+            message: `Aggregate "${aggLiteral.value}" is not supported`,
+            severity: 'error',
+          })
+        }
+      }
+    }
+    if (fnNameLower === 'rolling' || fnNameLower === 'rolling_all') {
+      const aggArg = args[2]
+      const aggLiteral = aggArg ? extractSingleQuotedLiteralFromSegment(aggArg) : null
+      if (aggLiteral) {
+        const aggLower = aggLiteral.value.trim().toLowerCase()
+        if (aggLower && !EXPR_ALLOWED_AGG_VALUES.has(aggLower)) {
+          addIssue({
+            startOffset: baseOffset + ref.openParenOffset + 1 + aggLiteral.startOffset,
+            endOffset: baseOffset + ref.openParenOffset + 1 + aggLiteral.endOffset,
+            message: `Aggregate "${aggLiteral.value}" is not supported`,
+            severity: 'error',
+          })
+        }
+      }
+    }
+  })
+
+  if (validationContext.allowedFieldNames.size || validationContext.allowedFieldNamesLower.size) {
+    const pathMatcher = /\bpath\s*=\s*'((?:[^'\\]|\\.)*)'/g
+    let pathMatch = pathMatcher.exec(source)
+    while (pathMatch) {
+      const raw = String(pathMatch[1] || '')
+      const full = String(pathMatch[0] || '')
+      const quoteOffset = full.indexOf("'")
+      if (quoteOffset >= 0) {
+        markUnknownField(
+          decodeSingleQuotedLiteral(raw),
+          pathMatch.index + quoteOffset + 1,
+          pathMatch.index + quoteOffset + 1 + raw.length,
+          'obj(path=...)'
+        )
+      }
+      pathMatch = pathMatcher.exec(source)
+    }
+  }
+
+  const aggMatcher = /\bagg\s*=\s*'((?:[^'\\]|\\.)*)'/g
+  let aggMatch = aggMatcher.exec(source)
+  while (aggMatch) {
+    const raw = decodeSingleQuotedLiteral(String(aggMatch[1] || ''))
+    const full = String(aggMatch[0] || '')
+    const quoteOffset = full.indexOf("'")
+    const aggLower = raw.trim().toLowerCase()
+    if (aggLower && !EXPR_ALLOWED_AGG_VALUES.has(aggLower) && quoteOffset >= 0) {
+      addIssue({
+        startOffset: baseOffset + aggMatch.index + quoteOffset + 1,
+        endOffset: baseOffset + aggMatch.index + quoteOffset + 1 + String(aggMatch[1] || '').length,
+        message: `Aggregate "${raw}" is not supported`,
+        severity: 'error',
+      })
+    }
+    aggMatch = aggMatcher.exec(source)
+  }
+
+  return issues
+}
+
 function validateExpressionSyntax(
   expression: string,
   baseOffset = 0,
-  options?: { requireEqualsPrefix?: boolean }
+  options?: { requireEqualsPrefix?: boolean; validationContext?: ExpressionValidationContext }
 ): ExpressionValidationIssue[] {
   const issues: ExpressionValidationIssue[] = []
   const source = String(expression || '')
   const trimmed = source.trim()
   const requireEqualsPrefix = options?.requireEqualsPrefix ?? true
+  const validationContext = options?.validationContext || getExpressionValidationContext()
 
   if (!trimmed) return issues
   if (requireEqualsPrefix && !trimmed.startsWith('=')) {
@@ -980,6 +1706,8 @@ function validateExpressionSyntax(
     })
   }
 
+  issues.push(...validateExpressionSemantics(source, baseOffset, validationContext))
+
   return issues
 }
 
@@ -1053,6 +1781,12 @@ function createCustomFieldSpec(seed?: Partial<CustomFieldSpec>): CustomFieldSpec
     jsonTemplate: seed?.jsonTemplate || '{\n  "value": "=field(\'id\')"\n}',
     enabled: seed?.enabled ?? true,
   }
+}
+
+function cloneCustomFieldSpecs(items: CustomFieldSpec[]): CustomFieldSpec[] {
+  return (items || []).map((item) => ({
+    ...item,
+  }))
 }
 
 function createOracleColumnMappingSpec(seed?: Partial<OracleColumnMappingSpec>): OracleColumnMappingSpec {
@@ -1810,6 +2544,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [sourceFieldDetectError, setSourceFieldDetectError] = useState<string | null>(null)
   const [customFieldStudioOpen, setCustomFieldStudioOpen] = useState(false)
   const [customFieldDraft, setCustomFieldDraft] = useState<CustomFieldSpec[]>([])
+  const [customFieldBeautifyUndoById, setCustomFieldBeautifyUndoById] = useState<Record<string, CustomFieldBeautifyBackup>>({})
+  const [customFieldBeautifyUndoAllSnapshot, setCustomFieldBeautifyUndoAllSnapshot] = useState<CustomFieldSpec[] | null>(null)
   const [customIncludeSourceDraft, setCustomIncludeSourceDraft] = useState(true)
   const [customExpressionEngineDraft, setCustomExpressionEngineDraft] = useState<CustomExpressionEngine>('auto')
   const [customPrimaryKeyFieldDraft, setCustomPrimaryKeyFieldDraft] = useState('')
@@ -1868,12 +2604,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [validationLmdbKeyContainsDraft, setValidationLmdbKeyContainsDraft] = useState('')
   const [validationLmdbLimitDraft, setValidationLmdbLimitDraft] = useState(50)
   const [activeExpressionFieldId, setActiveExpressionFieldId] = useState<string | null>(null)
-  const [customEditorColorProfile, setCustomEditorColorProfile] = useState<CustomEditorColorProfile>('high_contrast')
-  const [customEditorFontPreset, setCustomEditorFontPreset] = useState<CustomEditorFontPreset>('jetbrains_mono')
-  const [customEditorFontSize, setCustomEditorFontSize] = useState(13)
-  const [customEditorLineHeight, setCustomEditorLineHeight] = useState(22)
-  const [customEditorWordWrap, setCustomEditorWordWrap] = useState(true)
-  const [customEditorLigatures, setCustomEditorLigatures] = useState(false)
+  const [customEditorColorProfile, setCustomEditorColorProfile] = useState<CustomEditorColorProfile>(() => loadCustomEditorPrefs().colorProfile)
+  const [customEditorFontPreset, setCustomEditorFontPreset] = useState<CustomEditorFontPreset>(() => loadCustomEditorPrefs().fontPreset)
+  const [customEditorFontSize, setCustomEditorFontSize] = useState(() => loadCustomEditorPrefs().fontSize)
+  const [customEditorLineHeight, setCustomEditorLineHeight] = useState(() => loadCustomEditorPrefs().lineHeight)
+  const [customEditorWordWrap, setCustomEditorWordWrap] = useState(() => loadCustomEditorPrefs().wordWrap)
+  const [customEditorLigatures, setCustomEditorLigatures] = useState(() => loadCustomEditorPrefs().ligatures)
   const [collapsedCustomFieldIds, setCollapsedCustomFieldIds] = useState<string[]>([])
   const [exampleRepoCategory, setExampleRepoCategory] = useState<string>('all')
   const [exampleRepoSearch, setExampleRepoSearch] = useState('')
@@ -1921,6 +2657,30 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
   const customEditorThemeId = CUSTOM_EDITOR_THEME_IDS[customEditorColorProfile]
   const customEditorFontFamily = resolveEditorFontFamily(customEditorFontPreset)
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.localStorage) return
+    try {
+      const prefs: CustomEditorPrefs = {
+        colorProfile: customEditorColorProfile,
+        fontPreset: customEditorFontPreset,
+        fontSize: customEditorFontSize,
+        lineHeight: customEditorLineHeight,
+        wordWrap: customEditorWordWrap,
+        ligatures: customEditorLigatures,
+      }
+      window.localStorage.setItem(CUSTOM_EDITOR_PREFS_STORAGE_KEY, JSON.stringify(prefs))
+    } catch {
+      // Ignore storage write failures.
+    }
+  }, [
+    customEditorColorProfile,
+    customEditorFontPreset,
+    customEditorFontSize,
+    customEditorLineHeight,
+    customEditorWordWrap,
+    customEditorLigatures,
+  ])
 
   const node = nodes.find(n => n.id === selectedNodeId)
   const data: ETLNodeData | undefined = node?.data
@@ -2603,6 +3363,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     })
     return out
   }, [expressionFieldOptions])
+  // Keep validation/autocomplete context in sync before Monaco editor mount.
+  setExpressionCompletionEntries(expressionCompletionEntries)
   const customFieldExampleCategoryOptions = useMemo(
     () => {
       const categories = Array.from(
@@ -2891,10 +3653,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       return null
     })
     .filter((opt): opt is { value: string; label: string } => !!opt)
-
-  useEffect(() => {
-    setExpressionCompletionEntries(expressionCompletionEntries)
-  }, [expressionCompletionEntries])
 
   useEffect(() => {
     if (!customFieldStudioOpen || nodeType !== 'map_transform' || !customProfileEnabledDraft) return
@@ -3477,6 +4235,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setActiveExpressionFieldId(null)
     setExampleRepoCategory('all')
     setExampleRepoSearch('')
+    setCustomFieldBeautifyUndoById({})
+    setCustomFieldBeautifyUndoAllSnapshot(null)
     setCustomFieldStudioOpen(true)
     setProfileMonitorData(null)
     setProfileMonitorError(null)
@@ -3493,6 +4253,167 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     )
   }
 
+  const beautifyCustomFieldDraft = (id: string) => {
+    const target = customFieldDraft.find((item) => item.id === id)
+    if (!target) return
+    if (target.mode === 'json') {
+      try {
+        const formatted = beautifyJsonTemplateText(target.jsonTemplate)
+        if (formatted === target.jsonTemplate) {
+          notification.info({
+            message: 'Already formatted',
+            description: 'No beautify changes were needed.',
+            placement: 'bottomRight',
+            duration: 1.2,
+          })
+          return
+        }
+        setCustomFieldBeautifyUndoById((prev) => ({
+          ...prev,
+          [id]: {
+            expression: String(target.expression || ''),
+            jsonTemplate: String(target.jsonTemplate || ''),
+          },
+        }))
+        updateCustomFieldDraft(id, { jsonTemplate: formatted })
+        notification.success({
+          message: 'Beautified',
+          description: 'JSON template formatted successfully.',
+          placement: 'bottomRight',
+          duration: 1.5,
+        })
+      } catch (err: any) {
+        notification.error({
+          message: 'Beautify failed',
+          description: String(err?.message || 'JSON template is invalid. Fix syntax and try again.'),
+          placement: 'bottomRight',
+        })
+      }
+      return
+    }
+    const formatted = beautifyExpressionText(target.expression)
+    if (formatted === target.expression) {
+      notification.info({
+        message: 'Already formatted',
+        description: 'No beautify changes were needed.',
+        placement: 'bottomRight',
+        duration: 1.2,
+      })
+      return
+    }
+    setCustomFieldBeautifyUndoById((prev) => ({
+      ...prev,
+      [id]: {
+        expression: String(target.expression || ''),
+        jsonTemplate: String(target.jsonTemplate || ''),
+      },
+    }))
+    updateCustomFieldDraft(id, { expression: formatted })
+    notification.success({
+      message: 'Beautified',
+      description: 'Expression formatted successfully.',
+      placement: 'bottomRight',
+      duration: 1.5,
+    })
+  }
+
+  const undoBeautifyCustomFieldDraft = (id: string) => {
+    const backup = customFieldBeautifyUndoById[id]
+    if (!backup) {
+      notification.info({
+        message: 'Nothing to revert',
+        description: 'No beautify history found for this field.',
+        placement: 'bottomRight',
+        duration: 1.5,
+      })
+      return
+    }
+    updateCustomFieldDraft(id, {
+      expression: backup.expression,
+      jsonTemplate: backup.jsonTemplate,
+    })
+    setCustomFieldBeautifyUndoById((prev) => {
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
+    notification.success({
+      message: 'Beautify reverted',
+      description: 'Field content restored to previous version.',
+      placement: 'bottomRight',
+      duration: 1.5,
+    })
+  }
+
+  const beautifyAllCustomFieldDrafts = () => {
+    const snapshot = cloneCustomFieldSpecs(customFieldDraft)
+    if (snapshot.length === 0) return
+    const backupById: Record<string, CustomFieldBeautifyBackup> = {}
+    snapshot.forEach((item) => {
+      backupById[item.id] = {
+        expression: String(item.expression || ''),
+        jsonTemplate: String(item.jsonTemplate || ''),
+      }
+    })
+
+    let formattedCount = 0
+    let failedCount = 0
+    const next = snapshot.map((item) => {
+      if (item.mode === 'json') {
+        try {
+          const formatted = beautifyJsonTemplateText(item.jsonTemplate)
+          if (formatted !== item.jsonTemplate) formattedCount += 1
+          return { ...item, jsonTemplate: formatted }
+        } catch {
+          failedCount += 1
+          return item
+        }
+      }
+      const formatted = beautifyExpressionText(item.expression)
+      if (formatted !== item.expression) formattedCount += 1
+      return { ...item, expression: formatted }
+    })
+    setCustomFieldBeautifyUndoAllSnapshot(snapshot)
+    setCustomFieldBeautifyUndoById((prev) => ({ ...prev, ...backupById }))
+    setCustomFieldDraft(next)
+    if (failedCount > 0) {
+      notification.warning({
+        message: 'Beautify completed with warnings',
+        description: `${formattedCount} field(s) formatted. ${failedCount} JSON field(s) have invalid JSON and were skipped.`,
+        placement: 'bottomRight',
+      })
+      return
+    }
+    notification.success({
+      message: 'Beautify completed',
+      description: `${formattedCount} field(s) formatted.`,
+      placement: 'bottomRight',
+      duration: 1.8,
+    })
+  }
+
+  const undoBeautifyAllCustomFieldDrafts = () => {
+    if (!customFieldBeautifyUndoAllSnapshot || customFieldBeautifyUndoAllSnapshot.length === 0) {
+      notification.info({
+        message: 'Nothing to revert',
+        description: 'No "Beautify All" snapshot available.',
+        placement: 'bottomRight',
+        duration: 1.5,
+      })
+      return
+    }
+    const snapshot = cloneCustomFieldSpecs(customFieldBeautifyUndoAllSnapshot)
+    setCustomFieldDraft(snapshot)
+    setCustomFieldBeautifyUndoAllSnapshot(null)
+    setCustomFieldBeautifyUndoById({})
+    notification.success({
+      message: 'Beautify All reverted',
+      description: 'All custom fields restored to previous version.',
+      placement: 'bottomRight',
+      duration: 1.8,
+    })
+  }
+
   const addCustomFieldDraft = (seed?: Partial<CustomFieldSpec>) => {
     setCustomFieldDraft((prev) => [...prev, createCustomFieldSpec(seed)])
   }
@@ -3500,6 +4421,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const removeCustomFieldDraft = (id: string) => {
     setCustomFieldDraft((prev) => prev.filter((item) => item.id !== id))
     setCollapsedCustomFieldIds((prev) => prev.filter((itemId) => itemId !== id))
+    setCustomFieldBeautifyUndoById((prev) => {
+      if (!prev[id]) return prev
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
   }
 
   const setAllCustomFieldsEnabled = (enabled: boolean) => {
@@ -3512,14 +4439,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
   const collapseAllCustomFields = () => {
     setCollapsedCustomFieldIds(customFieldDraft.map((item) => item.id))
-  }
-
-  const toggleCustomFieldCollapsed = (id: string) => {
-    setCollapsedCustomFieldIds((prev) => (
-      prev.includes(id)
-        ? prev.filter((itemId) => itemId !== id)
-        : [...prev, id]
-    ))
   }
 
   const insertIntoActiveExpression = (token: string) => {
@@ -5145,6 +6064,23 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             >
               Add Field
             </Button>
+            <Space size={4}>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Beautify All</Text>
+              <Switch
+                size="small"
+                disabled={customFieldDraft.length === 0}
+                checked={Boolean(customFieldBeautifyUndoAllSnapshot && customFieldBeautifyUndoAllSnapshot.length > 0)}
+                checkedChildren="Undo"
+                unCheckedChildren="Beautify"
+                onChange={(checked) => {
+                  if (checked) {
+                    beautifyAllCustomFieldDrafts()
+                    return
+                  }
+                  undoBeautifyAllCustomFieldDrafts()
+                }}
+              />
+            </Space>
             <Button onClick={() => setCustomFieldStudioOpen(false)}>Close</Button>
             <Button
               type="primary"
@@ -5970,31 +6906,23 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               <Space size={6} wrap>
                 <Button
                   size="small"
-                  disabled={customFieldDraftCount === 0 || customFieldDraftEnabledCount === customFieldDraftCount}
-                  onClick={() => setAllCustomFieldsEnabled(true)}
+                  disabled={customFieldDraftCount === 0}
+                  onClick={() => setAllCustomFieldsEnabled(customFieldDraftEnabledCount !== customFieldDraftCount)}
                 >
-                  Enable All
+                  {customFieldDraftEnabledCount === customFieldDraftCount ? 'Disable All' : 'Enable All'}
                 </Button>
                 <Button
                   size="small"
-                  disabled={customFieldDraftCount === 0 || customFieldDraftEnabledCount === 0}
-                  onClick={() => setAllCustomFieldsEnabled(false)}
+                  disabled={customFieldDraftCount === 0}
+                  onClick={() => {
+                    if (customFieldDraftCollapsedCount === customFieldDraftCount) {
+                      expandAllCustomFields()
+                      return
+                    }
+                    collapseAllCustomFields()
+                  }}
                 >
-                  Disable All
-                </Button>
-                <Button
-                  size="small"
-                  disabled={customFieldDraftCount === 0 || customFieldDraftCollapsedCount === 0}
-                  onClick={expandAllCustomFields}
-                >
-                  Expand All
-                </Button>
-                <Button
-                  size="small"
-                  disabled={customFieldDraftCount === 0 || customFieldDraftCollapsedCount === customFieldDraftCount}
-                  onClick={collapseAllCustomFields}
-                >
-                  Collapse All
+                  {customFieldDraftCollapsedCount === customFieldDraftCount ? 'Expand All' : 'Collapse All'}
                 </Button>
               </Space>
             </Space>
@@ -6025,26 +6953,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     <Space align="center" style={{ justifyContent: 'space-between', width: '100%' }}>
                       <Space size={8} align="center">
                         <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Field #{idx + 1}</Text>
-                        <Tag
-                          style={{
-                            marginInlineEnd: 0,
-                            background: item.enabled ? '#22c55e1a' : '#64748b1a',
-                            border: item.enabled ? '1px solid #22c55e40' : '1px solid #64748b40',
-                            color: item.enabled ? '#22c55e' : '#94a3b8',
-                          }}
-                        >
-                          {item.enabled ? 'Enabled' : 'Disabled'}
-                        </Tag>
-                        <Tag
-                          style={{
-                            marginInlineEnd: 0,
-                            background: isCollapsed ? '#0ea5e91a' : '#6366f11a',
-                            border: isCollapsed ? '1px solid #0ea5e940' : '1px solid #6366f140',
-                            color: isCollapsed ? '#0284c7' : '#6366f1',
-                          }}
-                        >
-                          {isCollapsed ? 'Collapsed' : 'Expanded'}
-                        </Tag>
                       </Space>
                       <Space size={6} align="center" wrap>
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Enable</Text>
@@ -6053,18 +6961,37 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           checked={item.enabled}
                           onChange={(value) => updateCustomFieldDraft(item.id, { enabled: value })}
                         />
-                        <Button
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Expand</Text>
+                        <Switch
                           size="small"
-                          onClick={() => toggleCustomFieldCollapsed(item.id)}
-                        >
-                          {isCollapsed ? 'Expand' : 'Collapse'}
-                        </Button>
+                          checked={!isCollapsed}
+                          onChange={(checked) => {
+                            setCollapsedCustomFieldIds((prev) => {
+                              if (checked) return prev.filter((itemId) => itemId !== item.id)
+                              return prev.includes(item.id) ? prev : [...prev, item.id]
+                            })
+                          }}
+                        />
                         <Button
                           size="small"
                           onClick={() => openExpandedEditor(item.id, item.mode)}
                         >
                           Expand Editor
                         </Button>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Beautify</Text>
+                        <Switch
+                          size="small"
+                          checked={Boolean(customFieldBeautifyUndoById[item.id])}
+                          checkedChildren="Undo"
+                          unCheckedChildren="Beautify"
+                          onChange={(checked) => {
+                            if (checked) {
+                              beautifyCustomFieldDraft(item.id)
+                              return
+                            }
+                            undoBeautifyCustomFieldDraft(item.id)
+                          }}
+                        />
                         <Button
                           danger
                           type="text"
@@ -6483,6 +7410,24 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             options={[11, 12, 13, 14, 15, 16, 18, 20].map((size) => ({ value: size, label: `Size ${size}` }))}
             style={{ width: 108 }}
           />
+          <Space size={4}>
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Beautify</Text>
+            <Switch
+              size="small"
+              disabled={!expandedEditorField}
+              checked={Boolean(expandedEditorField && customFieldBeautifyUndoById[expandedEditorField.id])}
+              checkedChildren="Undo"
+              unCheckedChildren="Beautify"
+              onChange={(checked) => {
+                if (!expandedEditorField) return
+                if (checked) {
+                  beautifyCustomFieldDraft(expandedEditorField.id)
+                  return
+                }
+                undoBeautifyCustomFieldDraft(expandedEditorField.id)
+              }}
+            />
+          </Space>
           <Tooltip title="Close">
             <Button
               shape="circle"
