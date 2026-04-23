@@ -57,6 +57,8 @@ type CustomProfileComputeExecutor = 'thread' | 'process'
 type CustomExpressionEngine = 'auto' | 'python' | 'polars'
 type CustomProfileStorage = 'lmdb' | 'rocksdb' | 'redis' | 'oracle'
 type CustomProfileOracleWriteStrategy = 'single' | 'parallel_key'
+type CustomEditorColorProfile = 'high_contrast' | 'soft' | 'js_like'
+type CustomEditorFontPreset = 'jetbrains_mono' | 'fira_code' | 'consolas'
 
 interface CustomFieldSpec {
   id: string
@@ -551,17 +553,143 @@ type ExpressionCompletionEntry = {
   documentation?: string
 }
 
+const EXPR_LANGUAGE_ID = 'etl-expr'
+const JSON_TEMPLATE_LANGUAGE_ID = 'etl-json-template'
+const EXPR_VALIDATION_OWNER = 'etl-expr-validator'
+const JSON_TEMPLATE_VALIDATION_OWNER = 'etl-json-template-validator'
+const EXPR_FIELD_SINGLE_QUOTED_PATTERN = /'(?=[^']*[A-Z])(?:[^'\\]|\\.)*'/
+const EXPR_LITERAL_SINGLE_QUOTED_PATTERN = /'(?:min|max|sum|mean|avg|count|count_non_null|distinct|distinct_count|value_counts|first|last|row_count|customer|servicename|datewise|timeseries|daily|weekly|monthly|yearly|eq|not|contains|not_contains|like|not_like|in|not_in|startswith|not_startswith|endswith|not_endswith|regex|not_regex)'/
+const CUSTOM_EDITOR_THEME_IDS = {
+  high_contrast: 'opsfabric-custom-field-dark-hc',
+  soft: 'opsfabric-custom-field-dark-soft',
+  js_like: 'opsfabric-custom-field-dark-js',
+} as const
+
+const CUSTOM_EDITOR_COLOR_PROFILE_OPTIONS: Array<{ value: CustomEditorColorProfile; label: string }> = [
+  { value: 'high_contrast', label: 'High Contrast' },
+  { value: 'soft', label: 'Soft' },
+  { value: 'js_like', label: 'JS-like' },
+]
+
+const CUSTOM_EDITOR_FONT_FAMILY_OPTIONS: Array<{ value: CustomEditorFontPreset; label: string }> = [
+  { value: 'jetbrains_mono', label: 'JetBrains Mono' },
+  { value: 'fira_code', label: 'Fira Code' },
+  { value: 'consolas', label: 'Consolas' },
+]
+
+function resolveEditorFontFamily(preset: CustomEditorFontPreset): string {
+  if (preset === 'fira_code') return '"Fira Code", Menlo, Monaco, Consolas, "Courier New", monospace'
+  if (preset === 'consolas') return 'Consolas, Menlo, Monaco, "Courier New", monospace'
+  return '"JetBrains Mono", Menlo, Monaco, Consolas, "Courier New", monospace'
+}
+
 let exprLanguageRegistered = false
+let jsonTemplateLanguageRegistered = false
+let customEditorThemeRegistered = false
 let exprCompletionEntries: ExpressionCompletionEntry[] = []
 
 function setExpressionCompletionEntries(entries: ExpressionCompletionEntry[]): void {
   exprCompletionEntries = entries
 }
 
+function ensureCustomEditorTheme(monaco: Monaco): void {
+  if (customEditorThemeRegistered) return
+
+  monaco.editor.defineTheme(CUSTOM_EDITOR_THEME_IDS.high_contrast, {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      { token: 'entity.name.function', foreground: '00E5FF', fontStyle: 'bold' },
+      { token: 'field.function', foreground: '4DA3FF', fontStyle: 'bold' },
+      { token: 'parameter.name', foreground: '9CDCFE', fontStyle: 'bold' },
+      { token: 'variable.field', foreground: 'FFEA00', fontStyle: 'bold' },
+      { token: 'string.literal.value', foreground: 'FF4D9A', fontStyle: 'bold' },
+      { token: 'string.expression', foreground: 'D1FAE5' },
+      { token: 'string.expression.quote', foreground: '34D399', fontStyle: 'bold' },
+      { token: 'key', foreground: 'C084FC', fontStyle: 'bold' },
+      { token: 'number', foreground: 'FB7185', fontStyle: 'bold' },
+      { token: 'operator', foreground: 'F472B6', fontStyle: 'bold' },
+      { token: 'delimiter.bracket', foreground: 'F8FAFC', fontStyle: 'bold' },
+      { token: 'string', foreground: 'A7F3D0' },
+    ],
+    colors: {
+      'editor.background': '#0b1020',
+      'editor.foreground': '#e2e8f0',
+      'editorCursor.foreground': '#f8fafc',
+      'editorLineNumber.foreground': '#64748b',
+      'editorLineNumber.activeForeground': '#cbd5e1',
+      'editorBracketMatch.background': '#1d4ed833',
+      'editorBracketMatch.border': '#38bdf8',
+      'editorError.foreground': '#ef4444',
+      'editorWarning.foreground': '#f59e0b',
+    },
+  })
+  monaco.editor.defineTheme(CUSTOM_EDITOR_THEME_IDS.soft, {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      { token: 'entity.name.function', foreground: '67E8F9', fontStyle: 'bold' },
+      { token: 'field.function', foreground: '93C5FD', fontStyle: 'bold' },
+      { token: 'parameter.name', foreground: '9CDCFE', fontStyle: 'bold' },
+      { token: 'variable.field', foreground: 'FDE68A', fontStyle: 'bold' },
+      { token: 'string.literal.value', foreground: 'F9A8D4', fontStyle: 'bold' },
+      { token: 'string.expression', foreground: 'D1FAE5' },
+      { token: 'string.expression.quote', foreground: '6EE7B7' },
+      { token: 'key', foreground: 'DDD6FE', fontStyle: 'bold' },
+      { token: 'number', foreground: 'FBCFE8' },
+      { token: 'operator', foreground: 'C4B5FD' },
+      { token: 'delimiter.bracket', foreground: 'E2E8F0', fontStyle: 'bold' },
+      { token: 'string', foreground: 'A7F3D0' },
+    ],
+    colors: {
+      'editor.background': '#111827',
+      'editor.foreground': '#e5e7eb',
+      'editorCursor.foreground': '#f8fafc',
+      'editorLineNumber.foreground': '#6b7280',
+      'editorLineNumber.activeForeground': '#d1d5db',
+      'editorBracketMatch.background': '#33415533',
+      'editorBracketMatch.border': '#93c5fd',
+      'editorError.foreground': '#ef4444',
+      'editorWarning.foreground': '#f59e0b',
+    },
+  })
+  monaco.editor.defineTheme(CUSTOM_EDITOR_THEME_IDS.js_like, {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      { token: 'entity.name.function', foreground: 'DCDCAA', fontStyle: 'bold' },
+      { token: 'field.function', foreground: '4FC1FF', fontStyle: 'bold' },
+      { token: 'parameter.name', foreground: '9CDCFE', fontStyle: 'bold' },
+      { token: 'variable.field', foreground: '4FC1FF', fontStyle: 'bold' },
+      { token: 'string.literal.value', foreground: 'CE9178', fontStyle: 'bold' },
+      { token: 'string.expression', foreground: 'd4d4d4' },
+      { token: 'string.expression.quote', foreground: 'CE9178' },
+      { token: 'key', foreground: '9CDCFE', fontStyle: 'bold' },
+      { token: 'number', foreground: 'B5CEA8' },
+      { token: 'operator', foreground: 'D4D4D4' },
+      { token: 'delimiter.bracket', foreground: 'FFD700', fontStyle: 'bold' },
+      { token: 'string', foreground: 'CE9178' },
+    ],
+    colors: {
+      'editor.background': '#1e1e1e',
+      'editor.foreground': '#d4d4d4',
+      'editorCursor.foreground': '#f8fafc',
+      'editorLineNumber.foreground': '#858585',
+      'editorLineNumber.activeForeground': '#c6c6c6',
+      'editorBracketMatch.background': '#264f7840',
+      'editorBracketMatch.border': '#4FC1FF',
+      'editorError.foreground': '#f44747',
+      'editorWarning.foreground': '#cca700',
+    },
+  })
+  customEditorThemeRegistered = true
+}
+
 function ensureExpressionLanguage(monaco: Monaco): void {
+  ensureCustomEditorTheme(monaco)
   if (!exprLanguageRegistered) {
-    monaco.languages.register({ id: 'etl-expr' })
-    monaco.languages.setLanguageConfiguration('etl-expr', {
+    monaco.languages.register({ id: EXPR_LANGUAGE_ID })
+    monaco.languages.setLanguageConfiguration(EXPR_LANGUAGE_ID, {
       brackets: [['(', ')'], ['[', ']'], ['{', '}']],
       autoClosingPairs: [
         { open: '(', close: ')' },
@@ -570,8 +698,34 @@ function ensureExpressionLanguage(monaco: Monaco): void {
         { open: "'", close: "'" },
         { open: '"', close: '"' },
       ],
+      surroundingPairs: [
+        { open: '(', close: ')' },
+        { open: '[', close: ']' },
+        { open: '{', close: '}' },
+        { open: "'", close: "'" },
+        { open: '"', close: '"' },
+      ],
     })
-    monaco.languages.registerCompletionItemProvider('etl-expr', {
+    monaco.languages.setMonarchTokensProvider(EXPR_LANGUAGE_ID, {
+      tokenizer: {
+        root: [
+          [/\s+/, 'white'],
+          [/\b[A-Za-z_][\w]*(?=\s*=)/, 'parameter.name'],
+          [/\b(field|values|prev|path)\b(?=\s*\()/, 'field.function'],
+          [/\b[A-Za-z_][\w]*(?=\s*\()/, 'entity.name.function'],
+          [EXPR_LITERAL_SINGLE_QUOTED_PATTERN, 'string.literal.value'],
+          [EXPR_FIELD_SINGLE_QUOTED_PATTERN, 'variable.field'],
+          [/'(?:[^'\\]|\\.)*'/, 'variable.field'],
+          [/"(?:[^"\\]|\\.)*"/, 'string'],
+          [/-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?/, 'number'],
+          [/[+\-*/%<>=!&|?:.,]+/, 'operator'],
+          [/[{}[\]()]/, 'delimiter.bracket'],
+          [/\b(true|false|null)\b/, 'keyword'],
+          [/[A-Za-z_][\w.]*/, 'identifier'],
+        ],
+      },
+    })
+    monaco.languages.registerCompletionItemProvider(EXPR_LANGUAGE_ID, {
       triggerCharacters: ['.', '(', "'", '"', '_'],
       provideCompletionItems(model: any, position: any) {
         const word = model.getWordUntilPosition(position)
@@ -606,6 +760,287 @@ function ensureExpressionLanguage(monaco: Monaco): void {
     })
     exprLanguageRegistered = true
   }
+}
+
+function ensureJsonTemplateLanguage(monaco: Monaco): void {
+  ensureCustomEditorTheme(monaco)
+  if (jsonTemplateLanguageRegistered) return
+  monaco.languages.register({ id: JSON_TEMPLATE_LANGUAGE_ID })
+  monaco.languages.setLanguageConfiguration(JSON_TEMPLATE_LANGUAGE_ID, {
+    brackets: [['{', '}'], ['[', ']'], ['(', ')']],
+    autoClosingPairs: [
+      { open: '{', close: '}' },
+      { open: '[', close: ']' },
+      { open: '(', close: ')' },
+      { open: '"', close: '"' },
+      { open: "'", close: "'" },
+    ],
+    surroundingPairs: [
+      { open: '{', close: '}' },
+      { open: '[', close: ']' },
+      { open: '(', close: ')' },
+      { open: '"', close: '"' },
+      { open: "'", close: "'" },
+    ],
+  })
+  monaco.languages.setMonarchTokensProvider(JSON_TEMPLATE_LANGUAGE_ID, {
+    tokenizer: {
+      root: [
+        [/\s+/, 'white'],
+        [/[{}[\]()]/, 'delimiter.bracket'],
+        [/"(?:[^"\\]|\\.)*"(?=\s*:)/, 'key'],
+        [/"=/, { token: 'string.expression.quote', next: '@exprstring' }],
+        [/"/, { token: 'string', next: '@string' }],
+        [/-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?/, 'number'],
+        [/\b(true|false|null)\b/, 'keyword'],
+        [/[,:]/, 'delimiter'],
+      ],
+      string: [
+        [/[^\\"]+/, 'string'],
+        [/\\./, 'string.escape'],
+        [/"/, { token: 'string', next: '@pop' }],
+      ],
+      exprstring: [
+        [/\s+/, 'white'],
+        [/\b[A-Za-z_][\w]*(?=\s*=)/, 'parameter.name'],
+        [/\b(field|values|prev|path)\b(?=\s*\()/, 'field.function'],
+        [/\b[A-Za-z_][\w]*(?=\s*\()/, 'entity.name.function'],
+        [EXPR_LITERAL_SINGLE_QUOTED_PATTERN, 'string.literal.value'],
+        [EXPR_FIELD_SINGLE_QUOTED_PATTERN, 'variable.field'],
+        [/'(?:[^'\\]|\\.)*'/, 'variable.field'],
+        [/"(?:[^"\\]|\\.)*"/, 'string'],
+        [/-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?/, 'number'],
+        [/[+\-*/%<>=!&|?:.,]+/, 'operator'],
+        [/[{}[\]()]/, 'delimiter.bracket'],
+        [/\b[A-Za-z_][\w.]*\b/, 'string.expression'],
+        [/\\./, 'string.escape'],
+        [/"/, { token: 'string.expression.quote', next: '@pop' }],
+        [/./, 'string.expression'],
+      ],
+    },
+  })
+  jsonTemplateLanguageRegistered = true
+}
+
+type ExpressionValidationIssue = {
+  startOffset: number
+  endOffset: number
+  message: string
+  severity: 'error' | 'warning'
+}
+
+function decodeJsonStringContent(raw: string): string {
+  try {
+    return JSON.parse(`"${raw}"`)
+  } catch {
+    return raw
+  }
+}
+
+function extractExpressionStringRanges(text: string): Array<{ value: string; startOffset: number; endOffset: number }> {
+  const out: Array<{ value: string; startOffset: number; endOffset: number }> = []
+  let inString = false
+  let escaped = false
+  let stringStart = -1
+  let buffer = ''
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    if (!inString) {
+      if (ch === '"') {
+        inString = true
+        escaped = false
+        stringStart = i
+        buffer = ''
+      }
+      continue
+    }
+    if (escaped) {
+      buffer += ch
+      escaped = false
+      continue
+    }
+    if (ch === '\\') {
+      buffer += ch
+      escaped = true
+      continue
+    }
+    if (ch === '"') {
+      const decoded = decodeJsonStringContent(buffer)
+      if (decoded.startsWith('=')) {
+        out.push({
+          value: decoded,
+          startOffset: stringStart + 1,
+          endOffset: i,
+        })
+      }
+      inString = false
+      escaped = false
+      buffer = ''
+      stringStart = -1
+      continue
+    }
+    buffer += ch
+  }
+
+  return out
+}
+
+function validateExpressionSyntax(
+  expression: string,
+  baseOffset = 0,
+  options?: { requireEqualsPrefix?: boolean }
+): ExpressionValidationIssue[] {
+  const issues: ExpressionValidationIssue[] = []
+  const source = String(expression || '')
+  const trimmed = source.trim()
+  const requireEqualsPrefix = options?.requireEqualsPrefix ?? true
+
+  if (!trimmed) return issues
+  if (requireEqualsPrefix && !trimmed.startsWith('=')) {
+    issues.push({
+      startOffset: baseOffset,
+      endOffset: baseOffset + Math.max(1, Math.min(source.length, 2)),
+      message: 'Expression should start with "="',
+      severity: 'warning',
+    })
+  }
+  if (trimmed === '=') {
+    issues.push({
+      startOffset: baseOffset,
+      endOffset: baseOffset + Math.max(1, source.length),
+      message: 'Expression is empty',
+      severity: 'error',
+    })
+    return issues
+  }
+
+  const stack: Array<{ ch: string; offset: number }> = []
+  let quote: '"' | "'" | null = null
+  let escaped = false
+
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i]
+    if (quote) {
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        continue
+      }
+      if (ch === quote) {
+        quote = null
+      }
+      continue
+    }
+
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      continue
+    }
+    if (ch === '(' || ch === '[' || ch === '{') {
+      stack.push({ ch, offset: i })
+      continue
+    }
+    if (ch === ')' || ch === ']' || ch === '}') {
+      const expectedOpen = ch === ')' ? '(' : ch === ']' ? '[' : '{'
+      const top = stack[stack.length - 1]
+      if (!top || top.ch !== expectedOpen) {
+        issues.push({
+          startOffset: baseOffset + i,
+          endOffset: baseOffset + i + 1,
+          message: `Unexpected closing "${ch}"`,
+          severity: 'error',
+        })
+      } else {
+        stack.pop()
+      }
+    }
+  }
+
+  if (quote) {
+    issues.push({
+      startOffset: baseOffset + source.length - 1,
+      endOffset: baseOffset + source.length,
+      message: 'Unclosed quoted string',
+      severity: 'error',
+    })
+  }
+
+  while (stack.length > 0) {
+    const unclosed = stack.pop()!
+    const expectedClose = unclosed.ch === '(' ? ')' : unclosed.ch === '[' ? ']' : '}'
+    issues.push({
+      startOffset: baseOffset + unclosed.offset,
+      endOffset: baseOffset + unclosed.offset + 1,
+      message: `Missing closing "${expectedClose}"`,
+      severity: 'error',
+    })
+  }
+
+  return issues
+}
+
+function toMonacoMarkers(
+  monaco: Monaco,
+  model: any,
+  issues: ExpressionValidationIssue[],
+) {
+  return issues.map((issue) => {
+    const safeStart = Math.max(0, issue.startOffset)
+    const safeEnd = Math.max(safeStart + 1, issue.endOffset)
+    const start = model.getPositionAt(safeStart)
+    const end = model.getPositionAt(safeEnd)
+    return {
+      startLineNumber: start.lineNumber,
+      startColumn: start.column,
+      endLineNumber: end.lineNumber,
+      endColumn: end.column,
+      message: issue.message,
+      severity: issue.severity === 'error'
+        ? monaco.editor.MarkerSeverity.Error
+        : monaco.editor.MarkerSeverity.Warning,
+    }
+  })
+}
+
+function attachExpressionValidation(editor: any, monaco: Monaco): void {
+  const validate = () => {
+    const model = editor.getModel()
+    if (!model) return
+    const text = String(model.getValue() || '')
+    const issues = validateExpressionSyntax(text, 0, { requireEqualsPrefix: true })
+    monaco.editor.setModelMarkers(model, EXPR_VALIDATION_OWNER, toMonacoMarkers(monaco, model, issues))
+  }
+  validate()
+  editor.onDidChangeModelContent(validate)
+  editor.onDidDispose(() => {
+    const model = editor.getModel()
+    if (!model) return
+    monaco.editor.setModelMarkers(model, EXPR_VALIDATION_OWNER, [])
+  })
+}
+
+function attachJsonTemplateExpressionValidation(editor: any, monaco: Monaco): void {
+  const validate = () => {
+    const model = editor.getModel()
+    if (!model) return
+    const text = String(model.getValue() || '')
+    const ranges = extractExpressionStringRanges(text)
+    const issues = ranges.flatMap((entry) =>
+      validateExpressionSyntax(entry.value, entry.startOffset, { requireEqualsPrefix: false })
+    )
+    monaco.editor.setModelMarkers(model, JSON_TEMPLATE_VALIDATION_OWNER, toMonacoMarkers(monaco, model, issues))
+  }
+  validate()
+  editor.onDidChangeModelContent(validate)
+  editor.onDidDispose(() => {
+    const model = editor.getModel()
+    if (!model) return
+    monaco.editor.setModelMarkers(model, JSON_TEMPLATE_VALIDATION_OWNER, [])
+  })
 }
 
 function createCustomFieldSpec(seed?: Partial<CustomFieldSpec>): CustomFieldSpec {
@@ -1433,6 +1868,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [validationLmdbKeyContainsDraft, setValidationLmdbKeyContainsDraft] = useState('')
   const [validationLmdbLimitDraft, setValidationLmdbLimitDraft] = useState(50)
   const [activeExpressionFieldId, setActiveExpressionFieldId] = useState<string | null>(null)
+  const [customEditorColorProfile, setCustomEditorColorProfile] = useState<CustomEditorColorProfile>('high_contrast')
+  const [customEditorFontPreset, setCustomEditorFontPreset] = useState<CustomEditorFontPreset>('jetbrains_mono')
+  const [customEditorFontSize, setCustomEditorFontSize] = useState(13)
+  const [customEditorLineHeight, setCustomEditorLineHeight] = useState(22)
+  const [customEditorWordWrap, setCustomEditorWordWrap] = useState(true)
+  const [customEditorLigatures, setCustomEditorLigatures] = useState(false)
   const [collapsedCustomFieldIds, setCollapsedCustomFieldIds] = useState<string[]>([])
   const [exampleRepoCategory, setExampleRepoCategory] = useState<string>('all')
   const [exampleRepoSearch, setExampleRepoSearch] = useState('')
@@ -1477,6 +1918,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [lmdbJsonEditorField, setLmdbJsonEditorField] = useState('')
   const [lmdbJsonEditorError, setLmdbJsonEditorError] = useState<string | null>(null)
   const [lmdbJsonTagFilter, setLmdbJsonTagFilter] = useState('')
+
+  const customEditorThemeId = CUSTOM_EDITOR_THEME_IDS[customEditorColorProfile]
+  const customEditorFontFamily = resolveEditorFontFamily(customEditorFontPreset)
 
   const node = nodes.find(n => n.id === selectedNodeId)
   const data: ETLNodeData | undefined = node?.data
@@ -4643,7 +5087,44 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               Build formula fields + nested JSON object/array outputs using source fields and custom fields.
             </Text>
           </div>
-          <Space>
+          <Space wrap>
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Editor Style</Text>
+            <Select
+              size="small"
+              value={customEditorColorProfile}
+              onChange={(value) => setCustomEditorColorProfile(value as CustomEditorColorProfile)}
+              options={CUSTOM_EDITOR_COLOR_PROFILE_OPTIONS}
+              style={{ width: 150 }}
+            />
+            <Select
+              size="small"
+              value={customEditorFontPreset}
+              onChange={(value) => setCustomEditorFontPreset(value as CustomEditorFontPreset)}
+              options={CUSTOM_EDITOR_FONT_FAMILY_OPTIONS}
+              style={{ width: 150 }}
+            />
+            <Select
+              size="small"
+              value={customEditorFontSize}
+              onChange={(value) => setCustomEditorFontSize(Number(value || 13))}
+              options={[11, 12, 13, 14, 15, 16, 18, 20].map((size) => ({ value: size, label: `Size ${size}` }))}
+              style={{ width: 108 }}
+            />
+            <Select
+              size="small"
+              value={customEditorLineHeight}
+              onChange={(value) => setCustomEditorLineHeight(Number(value || 22))}
+              options={[18, 20, 22, 24, 26, 28].map((line) => ({ value: line, label: `Line ${line}` }))}
+              style={{ width: 108 }}
+            />
+            <Space size={4}>
+              <Switch size="small" checked={customEditorWordWrap} onChange={setCustomEditorWordWrap} />
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Wrap</Text>
+            </Space>
+            <Space size={4}>
+              <Switch size="small" checked={customEditorLigatures} onChange={setCustomEditorLigatures} />
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Ligatures</Text>
+            </Space>
             <Switch
               checked={customIncludeSourceDraft}
               onChange={setCustomIncludeSourceDraft}
@@ -5646,23 +6127,38 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           <div style={{ marginTop: 10, border: '1px solid var(--app-border-strong)', borderRadius: 8, overflow: 'hidden' }}>
                             <Editor
                               height="120px"
-                              language="etl-expr"
+                              language={EXPR_LANGUAGE_ID}
                               value={item.expression}
                               beforeMount={(monaco) => ensureExpressionLanguage(monaco)}
-                              onMount={(editor) => {
+                              onMount={(editor, monaco) => {
+                                attachExpressionValidation(editor, monaco)
                                 editor.onDidFocusEditorText(() => {
                                   setActiveExpressionFieldId(item.id)
                                 })
                               }}
                               onChange={(value) => updateCustomFieldDraft(item.id, { expression: value || '' })}
-                              theme="vs-dark"
+                              theme={customEditorThemeId}
                               options={{
                                 minimap: { enabled: false },
-                                fontSize: 12,
+                                fontFamily: customEditorFontFamily,
+                                fontSize: customEditorFontSize,
+                                lineHeight: customEditorLineHeight,
+                                fontLigatures: customEditorLigatures,
                                 scrollBeyondLastLine: false,
-                                wordWrap: 'on',
+                                wordWrap: customEditorWordWrap ? 'on' : 'off',
                                 quickSuggestions: true,
                                 suggestOnTriggerCharacters: true,
+                                matchBrackets: 'always',
+                                autoClosingBrackets: 'always',
+                                bracketPairColorization: {
+                                  enabled: true,
+                                  independentColorPoolPerBracketType: true,
+                                },
+                                guides: {
+                                  bracketPairs: true,
+                                  bracketPairsHorizontal: true,
+                                  highlightActiveBracketPair: true,
+                                },
                                 padding: { top: 8, bottom: 8 },
                               }}
                             />
@@ -5671,15 +6167,35 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           <div style={{ marginTop: 10, border: '1px solid var(--app-border-strong)', borderRadius: 8, overflow: 'hidden' }}>
                             <Editor
                               height="200px"
-                              language="json"
+                              language={JSON_TEMPLATE_LANGUAGE_ID}
                               value={item.jsonTemplate}
+                              beforeMount={(monaco) => ensureJsonTemplateLanguage(monaco)}
+                              onMount={(editor, monaco) => {
+                                attachJsonTemplateExpressionValidation(editor, monaco)
+                              }}
                               onChange={(value) => updateCustomFieldDraft(item.id, { jsonTemplate: value || '' })}
-                              theme="vs-dark"
+                              theme={customEditorThemeId}
                               options={{
                                 minimap: { enabled: false },
-                                fontSize: 12,
+                                fontFamily: customEditorFontFamily,
+                                fontSize: customEditorFontSize,
+                                lineHeight: customEditorLineHeight,
+                                fontLigatures: customEditorLigatures,
                                 scrollBeyondLastLine: false,
-                                wordWrap: 'on',
+                                wordWrap: customEditorWordWrap ? 'on' : 'off',
+                                quickSuggestions: true,
+                                suggestOnTriggerCharacters: true,
+                                matchBrackets: 'always',
+                                autoClosingBrackets: 'always',
+                                bracketPairColorization: {
+                                  enabled: true,
+                                  independentColorPoolPerBracketType: true,
+                                },
+                                guides: {
+                                  bracketPairs: true,
+                                  bracketPairsHorizontal: true,
+                                  highlightActiveBracketPair: true,
+                                },
                                 padding: { top: 8, bottom: 8 },
                               }}
                             />
@@ -5945,7 +6461,28 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             {expandedEditorField ? `Field: ${expandedEditorField.name || '(unnamed)'}` : ''}
           </Text>
         </div>
-        <Space>
+        <Space wrap>
+          <Select
+            size="small"
+            value={customEditorColorProfile}
+            onChange={(value) => setCustomEditorColorProfile(value as CustomEditorColorProfile)}
+            options={CUSTOM_EDITOR_COLOR_PROFILE_OPTIONS}
+            style={{ width: 150 }}
+          />
+          <Select
+            size="small"
+            value={customEditorFontPreset}
+            onChange={(value) => setCustomEditorFontPreset(value as CustomEditorFontPreset)}
+            options={CUSTOM_EDITOR_FONT_FAMILY_OPTIONS}
+            style={{ width: 150 }}
+          />
+          <Select
+            size="small"
+            value={customEditorFontSize}
+            onChange={(value) => setCustomEditorFontSize(Number(value || 13))}
+            options={[11, 12, 13, 14, 15, 16, 18, 20].map((size) => ({ value: size, label: `Size ${size}` }))}
+            style={{ width: 108 }}
+          />
           <Tooltip title="Close">
             <Button
               shape="circle"
@@ -5976,10 +6513,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             <div style={{ flex: 1, minHeight: 0 }}>
               <Editor
                 height="100%"
-                language={expandedEditorMode === 'json' ? 'json' : 'etl-expr'}
+                language={expandedEditorMode === 'json' ? JSON_TEMPLATE_LANGUAGE_ID : EXPR_LANGUAGE_ID}
                 value={expandedEditorMode === 'json' ? expandedEditorField.jsonTemplate : expandedEditorField.expression}
                 beforeMount={(monaco) => {
                   if (expandedEditorMode === 'value') ensureExpressionLanguage(monaco)
+                  else ensureJsonTemplateLanguage(monaco)
+                }}
+                onMount={(editor, monaco) => {
+                  if (expandedEditorMode === 'value') {
+                    attachExpressionValidation(editor, monaco)
+                  } else {
+                    attachJsonTemplateExpressionValidation(editor, monaco)
+                  }
                 }}
                 onChange={(value) => {
                   if (!expandedEditorField) return
@@ -5989,14 +6534,28 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     updateCustomFieldDraft(expandedEditorField.id, { expression: value || '' })
                   }
                 }}
-                theme="vs-dark"
+                theme={customEditorThemeId}
                 options={{
                   minimap: { enabled: false },
-                  fontSize: 14,
+                  fontFamily: customEditorFontFamily,
+                  fontSize: customEditorFontSize,
+                  lineHeight: customEditorLineHeight,
+                  fontLigatures: customEditorLigatures,
                   scrollBeyondLastLine: false,
-                  wordWrap: 'on',
+                  wordWrap: customEditorWordWrap ? 'on' : 'off',
                   quickSuggestions: true,
                   suggestOnTriggerCharacters: true,
+                  matchBrackets: 'always',
+                  autoClosingBrackets: 'always',
+                  bracketPairColorization: {
+                    enabled: true,
+                    independentColorPoolPerBracketType: true,
+                  },
+                  guides: {
+                    bracketPairs: true,
+                    bracketPairsHorizontal: true,
+                    highlightActiveBracketPair: true,
+                  },
                   padding: { top: 10, bottom: 10 },
                 }}
               />

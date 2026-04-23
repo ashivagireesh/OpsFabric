@@ -107,21 +107,35 @@ export const ETLNode = memo(({ id, data, selected }: ETLNodeProps) => {
         minWidth: 180,
         maxWidth: 220,
         background: 'var(--app-card-bg)',
-        border: `1px solid ${selected ? color : isDisabled ? '#94a3b8' : 'var(--app-border-strong)'}`,
+        border: `${selected ? 2 : 1}px solid ${selected ? color : isDisabled ? '#94a3b8' : 'var(--app-border-strong)'}`,
         borderRadius: 12,
         boxShadow: selected
-          ? `0 0 0 2px ${color}40, 0 8px 32px rgba(0,0,0,0.4)`
+          ? `0 0 0 2px ${color}55, 0 0 0 6px ${color}22, 0 10px 36px rgba(0,0,0,0.48)`
           : '0 4px 16px rgba(0,0,0,0.3)',
         transition: 'all 0.2s',
         overflow: 'visible',
         position: 'relative',
-        opacity: isDisabled ? 0.4 : 1,
+        opacity: selected ? 1 : isDisabled ? 0.4 : 1,
         filter: isDisabled ? 'saturate(0.85)' : 'none',
         ...(isRunning ? {
-          boxShadow: `0 0 0 2px ${color}80, 0 0 20px ${color}30`,
+          boxShadow: selected
+            ? `0 0 0 2px ${color}95, 0 0 0 6px ${color}35, 0 0 24px ${color}45`
+            : `0 0 0 2px ${color}80, 0 0 20px ${color}30`,
         } : {}),
       }}
     >
+      {selected && (
+        <div
+          style={{
+            position: 'absolute',
+            inset: -7,
+            borderRadius: 16,
+            border: `1px solid ${color}66`,
+            pointerEvents: 'none',
+          }}
+        />
+      )}
+
       {/* Category accent bar */}
       <div style={{
         position: 'absolute', top: 0, left: 0, right: 0,

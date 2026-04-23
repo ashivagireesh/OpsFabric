@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   Button, Input, Space, Tag, Tooltip, Typography, Dropdown,
@@ -119,6 +119,17 @@ function toBoundedInt(value: unknown, fallback: number, min: number, max: number
   return Math.max(min, Math.min(max, Math.floor(parsed)))
 }
 
+function parseNodeEnabledValue(value: unknown): boolean {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase()
+    if (['false', '0', 'no', 'off', 'disabled', 'disable'].includes(normalized)) return false
+    if (['true', '1', 'yes', 'on', 'enabled', 'enable'].includes(normalized)) return true
+  }
+  return true
+}
+
 function extractExecutionRuntimeFromNodes(nodes: any[] | undefined): {
   executionMode: ExecutionMode
   batchSize: number
@@ -212,6 +223,70 @@ export default function PipelineEditor() {
   const historyIndexRef = useRef<number>(-1)
   const applyingHistoryRef = useRef(false)
   const activeHistoryPipelineRef = useRef<string | null>(null)
+
+  const selectedNodeIds = useMemo(() => {
+    const explicitlySelected = nodes
+      .filter((node) => Boolean((node as any)?.selected))
+      .map((node) => String(node.id))
+    if (explicitlySelected.length > 0) return explicitlySelected
+    return selectedNodeId ? [selectedNodeId] : []
+  }, [nodes, selectedNodeId])
+  const actionTargetNodeIds = selectedNodeIds
+  const actionTargetCount = actionTargetNodeIds.length
+  const actionTargetStats = useMemo(() => {
+    const targetSet = new Set(actionTargetNodeIds)
+    let enabledCount = 0
+    let disabledCount = 0
+    nodes.forEach((node) => {
+      if (!targetSet.has(String(node.id))) return
+      const raw = (
+        node?.data?.config && typeof node.data.config === 'object'
+          ? (node.data.config as Record<string, unknown>).node_enabled
+          : undefined
+      )
+      if (parseNodeEnabledValue(raw)) enabledCount += 1
+      else disabledCount += 1
+    })
+    return { enabledCount, disabledCount }
+  }, [actionTargetNodeIds, nodes])
+
+  const setNodeEnabledForSelection = useCallback((enabled: boolean) => {
+    if (isExecuting || actionTargetNodeIds.length === 0) return
+    const targetSet = new Set(actionTargetNodeIds)
+    let changedCount = 0
+    useWorkflowStore.setState((state) => ({
+      ...state,
+      nodes: state.nodes.map((node) => {
+        if (!targetSet.has(String(node.id))) return node
+        const currentConfig = (
+          node.data?.config && typeof node.data.config === 'object'
+            ? (node.data.config as Record<string, unknown>)
+            : {}
+        )
+        const currentEnabled = parseNodeEnabledValue(currentConfig.node_enabled)
+        if (currentEnabled === enabled) return node
+        changedCount += 1
+        return {
+          ...node,
+          data: {
+            ...node.data,
+            config: {
+              ...currentConfig,
+              node_enabled: enabled,
+            },
+          },
+        }
+      }),
+      isDirty: changedCount > 0 ? true : state.isDirty,
+    }))
+    if (changedCount > 0) {
+      notification.success({
+        message: `${enabled ? 'Enabled' : 'Disabled'} ${changedCount} node${changedCount > 1 ? 's' : ''}`,
+        placement: 'bottomRight',
+        duration: 2,
+      })
+    }
+  }, [actionTargetNodeIds, isExecuting])
 
   const updateHistoryFlags = useCallback(() => {
     const idx = historyIndexRef.current
@@ -570,6 +645,31 @@ export default function PipelineEditor() {
                 style={{ background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)', color: 'var(--app-text-muted)' }}
               />
             </Tooltip>
+
+            {actionTargetCount > 0 && (
+              <Space
+                size={6}
+                style={{
+                  padding: '2px 8px',
+                  borderRadius: 8,
+                  border: '1px solid var(--app-border-strong)',
+                  background: 'var(--app-card-bg)',
+                }}
+              >
+                <Tag style={{ marginInlineEnd: 0, borderRadius: 6, background: 'var(--app-panel-bg)', border: '1px solid var(--app-border-strong)', color: 'var(--app-text-muted)' }}>
+                  {actionTargetCount} selected
+                </Tag>
+                <Text style={{ color: 'var(--app-text-muted)', fontSize: 12 }}>Enabled</Text>
+                <Tooltip title={actionTargetStats.disabledCount === 0 ? 'Disable selected nodes' : 'Enable selected nodes'}>
+                  <Switch
+                    size="small"
+                    checked={actionTargetStats.disabledCount === 0}
+                    disabled={isExecuting}
+                    onChange={(checked) => setNodeEnabledForSelection(checked)}
+                  />
+                </Tooltip>
+              </Space>
+            )}
 
             {/* Execution status badge */}
             {hasError && (
