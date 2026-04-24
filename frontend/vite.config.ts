@@ -2,7 +2,14 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [
+    react({
+      // Prevent Babel "deoptimised the styling ... exceeds 500KB" note for large modules.
+      babel: {
+        compact: true,
+      },
+    }),
+  ],
   server: {
     port: 3001,
     host: true,

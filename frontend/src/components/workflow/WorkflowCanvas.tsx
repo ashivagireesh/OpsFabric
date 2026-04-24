@@ -156,8 +156,11 @@ export default function WorkflowCanvas() {
   }, [setSelectedNode])
 
   const onPaneClick = useCallback(() => {
-    setSelectedNode(null)
-  }, [setSelectedNode])
+    // Intentionally keep current node selection.
+    // Deselecting on pane click causes intermittent drawer unmounts while
+    // interacting with right-panel controls (including Custom Field Studio open).
+    // Node can still be closed explicitly via drawer close action.
+  }, [])
 
   const handleReconnect = useCallback((oldEdge: Edge, connection: Connection) => {
     reconnectStateRef.current.success = true
@@ -206,6 +209,8 @@ export default function WorkflowCanvas() {
         onDrop={onDrop}
         onDragOver={onDragOver}
         edgesUpdatable
+        deleteKeyCode={['Delete']}
+        panActivationKeyCode={null}
         reconnectRadius={18}
         edgeUpdaterRadius={18}
         fitView

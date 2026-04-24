@@ -1,12 +1,29 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Drawer, Form, Input, Select, Switch, InputNumber,
-  Button, Typography, Space, Tabs, Divider, Tag, Tooltip, Table, notification, Modal
+  Button, Typography, Space, Tabs, Divider, Tag, Tooltip, Table, notification, Modal, Popover, AutoComplete
 } from 'antd'
 import { CloseOutlined, CopyOutlined, DeleteOutlined, InfoCircleOutlined } from '@ant-design/icons'
 import Editor, { type Monaco } from '@monaco-editor/react'
 import { useWorkflowStore } from '../../store'
 import { SourceFilePicker, DestinationPathPicker } from './FilePicker'
+import ConditionBuilderModal from './ConditionBuilderModal'
+import FieldBuilderModal from './FieldBuilderModal'
+import {
+  CUSTOM_FIELD_EXAMPLE_REPOSITORY,
+  CUSTOM_FIELD_TIPS_TEXT,
+  EXPRESSION_FUNCTION_SNIPPETS,
+} from './CustomFieldStudioConstants'
+import {
+  BRE_CLAUSE_OPERATOR_OPTIONS,
+  DEFAULT_EXPRESSION_FUNCTION_NAMES,
+} from './expressionDefaults'
+import {
+  buildUiFieldBuilderExpression,
+  createDefaultUiFieldBuilderState,
+  parseUiFieldBuilderFromCurrent,
+  type UiFieldBuilderState,
+} from './uiFieldBuilderUtils'
 import api from '../../api/client'
 import type { ConfigField, ETLNode, ETLNodeData } from '../../types'
 
@@ -73,6 +90,82 @@ interface CustomFieldSpec {
 type CustomFieldBeautifyBackup = {
   expression: string
   jsonTemplate: string
+}
+
+type UiExpressionEditorTab = 'expression' | 'ui_expression'
+
+type UiExpressionBuilderRow = {
+  id: string
+  key: string
+  expression: string
+  valueType: 'expression' | 'json'
+}
+
+type SnippetPlaceholder = {
+  index: number
+  token: string
+  kind: 'text' | 'choice'
+  defaultValue: string
+  options: string[]
+}
+
+type UiExpressionParameterMode = 'field' | 'values' | 'variable' | 'literal' | 'raw'
+
+type UiExpressionVariableSpec = {
+  id: string
+  name: string
+  value: string
+}
+
+type UiGroupAggregateMetric = {
+  id: string
+  outputName: string
+  path: string
+  agg: string
+}
+
+type UiConditionClauseRightMode = 'literal' | 'field' | 'values' | 'variable' | 'raw'
+type UiConditionLogicalJoin = 'and' | 'or'
+
+type UiConditionCluster = {
+  id: string
+  joinWithPrev: UiConditionLogicalJoin
+}
+
+type UiConditionClause = {
+  id: string
+  clusterId: string
+  joinWithPrev: UiConditionLogicalJoin
+  leftField: string
+  operator: string
+  rightMode: UiConditionClauseRightMode
+  rightValue: string
+}
+
+type UiConditionBuilderState = {
+  clusters: UiConditionCluster[]
+  clauses: UiConditionClause[]
+}
+
+type BreClauseOperator = '==' | '!=' | '>' | '>=' | '<' | '<=' | 'raw'
+type BreClauseJoin = 'and' | 'or'
+type BreClauseOperandKind = 'field' | 'literal' | 'raw'
+
+type BreClause = {
+  id: string
+  joinWithPrev: BreClauseJoin
+  leftKind: BreClauseOperandKind
+  leftValue: string
+  operator: BreClauseOperator
+  rightKind: BreClauseOperandKind
+  rightValue: string
+}
+
+type BreModel = {
+  clauses: BreClause[]
+  thenExpr: string
+  elseExpr: string
+  parseError: string | null
 }
 
 interface OracleColumnMappingSpec {
@@ -155,413 +248,25 @@ const MAX_OBJECT_KEYS_PER_LEVEL = 40
 const MAX_JSON_TAG_DEPTH = 8
 const MAX_JSON_TAG_MAPPINGS = 320
 
-const CUSTOM_FIELD_EXAMPLE_REPOSITORY: CustomFieldExampleItem[] = [
-  {
-    id: 'value_net_amount',
-    title: 'Net Amount (Math)',
-    category: 'Math & Text',
-    mode: 'value',
-    name: 'net_amount',
-    expression: "=coalesce(field('AMOUNT'), 0) - coalesce(field('DISCOUNT'), 0) + coalesce(field('TAX'), 0)",
-    description: 'Null-safe arithmetic expression.',
-    tags: ['math', 'coalesce'],
-  },
-  {
-    id: 'value_case_tier',
-    title: 'Tier by Amount (CASE/IF)',
-    category: 'Conditional Logic',
-    mode: 'value',
-    name: 'amount_tier',
-    expression: "=if_(coalesce(field('AMOUNT'), 0) >= 10000, 'HIGH', if_(coalesce(field('AMOUNT'), 0) >= 5000, 'MEDIUM', 'LOW'))",
-    description: 'Nested if_ to create business tier.',
-    tags: ['if_', 'case'],
-  },
-  {
-    id: 'value_sum_amount',
-    title: 'Total Amount (SUM)',
-    category: 'Aggregation',
-    mode: 'value',
-    name: 'total_amount',
-    expression: "=sum(values('AMOUNT'))",
-    description: 'Sum across grouped rows.',
-    tags: ['sum'],
-  },
-  {
-    id: 'value_avg_amount',
-    title: 'Average Amount (MEAN)',
-    category: 'Aggregation',
-    mode: 'value',
-    name: 'avg_amount',
-    expression: "=mean(values('AMOUNT'))",
-    description: 'Average across grouped rows.',
-    tags: ['mean', 'avg'],
-  },
-  {
-    id: 'value_min_max_amount',
-    title: 'Min/Max Amount',
-    category: 'Aggregation',
-    mode: 'json',
-    name: 'amount_range',
-    jsonTemplate: `{
-  "min_amount": "=min(values('AMOUNT'))",
-  "max_amount": "=max(values('AMOUNT'))"
-}`,
-    description: 'Get minimum and maximum values.',
-    tags: ['min', 'max'],
-  },
-  {
-    id: 'value_distinct_customers',
-    title: 'Distinct Customer Count',
-    category: 'Aggregation',
-    mode: 'value',
-    name: 'distinct_customer_count',
-    expression: "=count(distinct(values('CUSTACCOUNTNUMBER')))",
-    description: 'Count unique customers within group.',
-    tags: ['distinct', 'count'],
-  },
-  {
-    id: 'value_count_non_null_txn',
-    title: 'Transaction Count (Non-null)',
-    category: 'Aggregation',
-    mode: 'value',
-    name: 'transaction_count',
-    expression: "=count(values('TRANSACTIONID'))",
-    description: 'Count non-null TRANSACTIONID values.',
-    tags: ['count'],
-  },
-  {
-    id: 'value_count_if_eq',
-    title: 'count_if EQ (Success 00)',
-    category: 'Conditional Aggregation',
-    mode: 'value',
-    name: 'success_rrn_count',
-    expression: "=count_if('RRN','RESPTOCLIENT','00')",
-    description: "Count RRN where RESPTOCLIENT = '00'.",
-    tags: ['count_if', 'eq'],
-  },
-  {
-    id: 'value_sum_if_eq',
-    title: 'sum_if EQ (Success Amount)',
-    category: 'Conditional Aggregation',
-    mode: 'value',
-    name: 'success_amount_sum',
-    expression: "=sum_if('AMOUNT','RESPTOCLIENT','00')",
-    description: "Sum AMOUNT where RESPTOCLIENT = '00'.",
-    tags: ['sum_if', 'eq'],
-  },
-  {
-    id: 'value_mean_if_like',
-    title: 'mean_if LIKE',
-    category: 'Conditional Aggregation',
-    mode: 'value',
-    name: 'upi_avg_amount',
-    expression: "=mean_if('AMOUNT','SERVICENAME','UPI%','like')",
-    description: "Average AMOUNT where SERVICENAME LIKE 'UPI%'.",
-    tags: ['mean_if', 'like'],
-  },
-  {
-    id: 'value_agg_if_generic',
-    title: 'agg_if Generic',
-    category: 'Conditional Aggregation',
-    mode: 'value',
-    name: 'success_amount_max',
-    expression: "=agg_if('AMOUNT','RESPTOCLIENT','00','max')",
-    description: 'Generic conditional aggregation using agg_if.',
-    tags: ['agg_if', 'max'],
-  },
-  {
-    id: 'value_count_if_not',
-    title: 'count_if NOT / !=',
-    category: 'Conditional Aggregation',
-    mode: 'value',
-    name: 'non_success_rrn_count',
-    expression: "=count_if('RRN','RESPTOCLIENT','00','!=')",
-    description: 'Count rows not equal to expected value.',
-    tags: ['count_if', 'not', '!='],
-  },
-  {
-    id: 'value_count_if_contains',
-    title: 'count_if CONTAINS',
-    category: 'Conditional Aggregation',
-    mode: 'value',
-    name: 'upi_txn_count',
-    expression: "=count_if('RRN','SERVICENAME','UPI','contains')",
-    description: "Count rows where SERVICENAME contains 'UPI'.",
-    tags: ['count_if', 'contains'],
-  },
-  {
-    id: 'value_count_if_like',
-    title: 'count_if LIKE',
-    category: 'Conditional Aggregation',
-    mode: 'value',
-    name: 'upi_prefix_count',
-    expression: "=count_if('RRN','SERVICENAME','UPI%','like')",
-    description: 'SQL-like match using % and _.',
-    tags: ['count_if', 'like'],
-  },
-  {
-    id: 'value_count_if_in',
-    title: 'count_if IN List',
-    category: 'Conditional Aggregation',
-    mode: 'value',
-    name: 'ok_or_warn_count',
-    expression: "=count_if('RRN','RESPTOCLIENT',array('00','05'),'in')",
-    description: 'Match multiple values using IN.',
-    tags: ['count_if', 'in'],
-  },
-  {
-    id: 'value_count_if_regex',
-    title: 'count_if Regex',
-    category: 'Conditional Aggregation',
-    mode: 'value',
-    name: 'upi_regex_count',
-    expression: "=count_if('RRN','SERVICENAME','^UPI-','regex')",
-    description: 'Regex match for advanced text conditions.',
-    tags: ['count_if', 'regex'],
-  },
-  {
-    id: 'value_running_latest',
-    title: 'Latest Running Sum',
-    category: 'Running & Rolling',
-    mode: 'value',
-    name: 'latest_running_sum',
-    expression: "=last(running_sum(values('AMOUNT')))",
-    description: 'Latest cumulative sum.',
-    tags: ['running_sum', 'last'],
-  },
-  {
-    id: 'value_rolling_latest',
-    title: 'Latest Rolling Mean (7)',
-    category: 'Running & Rolling',
-    mode: 'value',
-    name: 'latest_rolling_mean_7',
-    expression: "=last(rolling_mean(values('AMOUNT'), 7))",
-    description: 'Latest 7-window rolling mean.',
-    tags: ['rolling_mean', 'window'],
-  },
-  {
-    id: 'json_series',
-    title: 'Series Output JSON',
-    category: 'Running & Rolling',
-    mode: 'json',
-    name: 'amount_series',
-    jsonTemplate: `{
-  "running_sum_series": "=running_all(values('AMOUNT'), 'sum')",
-  "rolling_mean_7_series": "=rolling_all(values('AMOUNT'), 7, 'mean')",
-  "latest_running_sum": "=last(running_sum(values('AMOUNT')))",
-  "latest_rolling_mean_7": "=last(rolling_mean(values('AMOUNT'), 7))"
-}`,
-    description: 'Expose full running/rolling series + latest values.',
-    tags: ['running_all', 'rolling_all'],
-  },
-  {
-    id: 'value_group_aggregate_customer',
-    title: 'Customer Profile Aggregate',
-    category: 'Group Aggregate',
-    mode: 'value',
-    name: 'customer_profiles',
-    expression: "=group_aggregate('CUSTACCOUNTNUMBER', obj(mintime=obj(path='SERVERTIME',agg='min'), maxtime=obj(path='SERVERTIME',agg='max'), total_transaction_count=obj(path='TRANSACTIONID',agg='count_non_null')), 'customer')",
-    description: 'Customer-wise min/max time and transaction count.',
-    tags: ['group_aggregate', 'min', 'max', 'count_non_null'],
-  },
-  {
-    id: 'value_group_aggregate_service_counts',
-    title: 'Service-wise Frequency in Profile',
-    category: 'Group Aggregate',
-    mode: 'value',
-    name: 'customer_profiles',
-    expression: "=group_aggregate('CUSTACCOUNTNUMBER', obj(service_wise_count=obj(path='SERVICENAME',agg='value_counts'), total_service_name=obj(path='SERVICENAME',agg='distinct')), 'customer')",
-    description: 'Per customer service frequency + distinct service names.',
-    tags: ['group_aggregate', 'value_counts', 'distinct'],
-  },
-  {
-    id: 'json_operational_summary',
-    title: 'Operational Summary JSON',
-    category: 'JSON Templates',
-    mode: 'json',
-    name: 'ops_summary',
-    jsonTemplate: `{
-  "success_rrn_count": "=count_if('RRN','RESPTOCLIENT','00')",
-  "failure_rrn_count": "=count_if('RRN','RESPTOCLIENT','00','!=')",
-  "total_amount": "=sum(values('AMOUNT'))",
-  "avg_amount": "=mean(values('AMOUNT'))",
-  "status": "=if_(count_if('RRN','RESPTOCLIENT','00','!=') > 0, 'REVIEW', 'OK')"
-}`,
-    description: 'JSON output for operational KPIs and status.',
-    tags: ['json', 'count_if', 'sum', 'mean'],
-  },
-  {
-    id: 'json_text_and_flags',
-    title: 'Text Normalization + Flags',
-    category: 'Math & Text',
-    mode: 'json',
-    name: 'text_flags',
-    jsonTemplate: `{
-  "service_upper": "=upper(field('SERVICENAME'))",
-  "service_trimmed": "=trim(field('SERVICENAME'))",
-  "is_upi": "=contains(lower(field('SERVICENAME')), 'upi')",
-  "risk_band": "=if_(coalesce(field('AMOUNT'),0) >= 10000, 'HIGH', 'NORMAL')"
-}`,
-    description: 'Text transforms and boolean flags.',
-    tags: ['upper', 'lower', 'trim', 'contains'],
-  },
-  {
-    id: 'profile_txn_counter',
-    title: 'Profile: Increment Transaction Count',
-    category: 'Profile Documents',
-    mode: 'value',
-    name: 'txn_count',
-    expression: "=inc('txn_count', 1)",
-    description: 'Stateful increment using previous profile value.',
-    tags: ['profile', 'inc', 'streaming'],
-  },
-  {
-    id: 'profile_amount_totals',
-    title: 'Profile: Total + Avg Amount',
-    category: 'Profile Documents',
-    mode: 'json',
-    name: 'amount_profile',
-    jsonTemplate: `{
-  "total_amount": "=inc('total_amount', field('amount'))",
-  "txn_count": "=inc('txn_count', 1)",
-  "avg_amount": "=safe_div(prev('total_amount',0) + coalesce(field('amount'),0), prev('txn_count',0) + 1, 0)"
-}`,
-    description: 'Incremental total/count and derived average per entity.',
-    tags: ['profile', 'safe_div', 'prev'],
-  },
-  {
-    id: 'profile_txn_type_map',
-    title: 'Profile: Transaction Type Frequency',
-    category: 'Profile Documents',
-    mode: 'value',
-    name: 'txn_types',
-    expression: "=map_inc('txn_types', field('txn_type'), 1)",
-    description: 'Increment map counter by transaction type.',
-    tags: ['profile', 'map_inc', 'object'],
-  },
-  {
-    id: 'profile_customer_group_aggregate',
-    title: 'Profile: Customer Aggregate Array',
-    category: 'Profile Documents',
-    mode: 'value',
-    name: 'customer_profiles',
-    expression: "=group_aggregate('CUSTACCOUNTNUMBER', obj(mintime=obj(path='MIS_TXNDATE',agg='min'), maxtime=obj(path='MIS_TXNDATE',agg='max'), total_transaction_count=obj(path='TRANSACTIONID',agg='count_non_null'), total_service_name=obj(path='SERVICENAME',agg='value_counts')), 'customer')",
-    description: 'In profile mode this keeps incremental state and returns batch-like grouped array output.',
-    tags: ['profile', 'group_aggregate', 'value_counts', 'count_non_null'],
-  },
-  {
-    id: 'profile_rolling_windows',
-    title: 'Profile: 1/7/30 Day Rolling Metrics',
-    category: 'Profile Documents',
-    mode: 'value',
-    name: 'amount_rolling',
-    expression: "=rolling_update('amount', field('amount'), field('txn_time'), array(1,7,30))",
-    description: 'Rolling count/sum/avg/min/max for profile timeline.',
-    tags: ['profile', 'rolling_update', 'windows'],
-  },
-]
-
-const EXPRESSION_FUNCTION_SNIPPETS: Array<{ label: string; snippet: string }> = [
-  { label: 'field(path)', snippet: "field('${1:column_name}')" },
-  { label: 'values(path)', snippet: "values('${1:column_name}')" },
-  { label: 'coalesce(a,b,...)', snippet: "coalesce(${1:value}, ${2:fallback})" },
-  { label: 'if_(cond,yes,no)', snippet: "if_(${1:condition}, ${2:yes}, ${3:no})" },
-  { label: 'count_if(value,cond,expected,op)', snippet: "count_if('${1:value_field}','${2:condition_field}','${3:00}','${4:eq}')" },
-  { label: 'sum_if(value,cond,expected,op)', snippet: "sum_if('${1:value_field}','${2:condition_field}','${3:00}','${4:eq}')" },
-  { label: 'mean_if(value,cond,expected,op)', snippet: "mean_if('${1:value_field}','${2:condition_field}','${3:00}','${4:eq}')" },
-  { label: 'min_if(value,cond,expected,op)', snippet: "min_if('${1:value_field}','${2:condition_field}','${3:00}','${4:eq}')" },
-  { label: 'max_if(value,cond,expected,op)', snippet: "max_if('${1:value_field}','${2:condition_field}','${3:00}','${4:eq}')" },
-  { label: 'agg_if(value,cond,expected,agg,op)', snippet: "agg_if('${1:value_field}','${2:condition_field}','${3:00}','${4:sum}','${5:eq}')" },
-  { label: 'distinct_count_if(value,cond,expected,op)', snippet: "distinct_count_if('${1:value_field}','${2:condition_field}','${3:00}','${4:eq}')" },
-  { label: 'count_non_null_if(value,cond,expected,op)', snippet: "count_non_null_if('${1:value_field}','${2:condition_field}','${3:00}','${4:eq}')" },
-  { label: 'round(x,2)', snippet: 'round(${1:value}, ${2:2})' },
-  { label: 'count(values)', snippet: 'count(${1:values})' },
-  { label: 'distinct(values)', snippet: 'distinct(${1:values})' },
-  { label: 'group_aggregate(key,metrics,name)', snippet: "group_aggregate('${1:key_field}', obj(${2:metric}=obj(path='${3:value_field}',agg='${4:sum}')), '${5:key_name}')" },
-  { label: 'value_counts metric', snippet: "group_aggregate('${1:key_field}', obj(service_wise_count=obj(path='${2:SERVICENAME}',agg='value_counts')), '${3:key_name}')" },
-  { label: 'running_sum(values)', snippet: "running_sum(field('${1:column_name}'))" },
-  { label: 'running_mean(values)', snippet: "running_mean(field('${1:column_name}'))" },
-  { label: 'rolling_sum(values,w)', snippet: "rolling_sum(field('${1:column_name}'), ${2:7})" },
-  { label: 'rolling_mean(values,w)', snippet: "rolling_mean(field('${1:column_name}'), ${2:7})" },
-  { label: 'running_all(values,func)', snippet: "running_all(values('${1:column_name}'), '${2:sum}')" },
-  { label: 'rolling_all(values,w,func)', snippet: "rolling_all(values('${1:column_name}'), ${2:7}, '${3:mean}')" },
-  { label: 'rolling(values,w,func)', snippet: "rolling(field('${1:column_name}'), ${2:7}, '${3:mean}')" },
-  { label: 'last(values)', snippet: "last(${1:running_sum(field('amount'))})" },
-  { label: 'max(a,b)', snippet: 'max(${1:a}, ${2:b})' },
-  { label: 'min(a,b)', snippet: 'min(${1:a}, ${2:b})' },
-  { label: 'mean(list)', snippet: 'mean(${1:values})' },
-  { label: 'upper(text)', snippet: 'upper(${1:text})' },
-  { label: 'lower(text)', snippet: 'lower(${1:text})' },
-  { label: 'trim(text)', snippet: 'trim(${1:text})' },
-  { label: 'contains(text,needle)', snippet: 'contains(${1:text}, ${2:needle})' },
-  { label: 'array(...)', snippet: 'array(${1:value1}, ${2:value2})' },
-  { label: 'obj(...)', snippet: "obj(${1:key}=${2:value})" },
-  { label: 'prev(path,default)', snippet: "prev('${1:field_name}', ${2:0})" },
-  { label: 'inc(path,amount)', snippet: "inc('${1:txn_count}', ${2:1})" },
-  { label: 'map_inc(path,key,amount)', snippet: "map_inc('${1:txn_types}', ${2:field('txn_type')}, ${3:1})" },
-  { label: 'profile group_aggregate', snippet: "group_aggregate('${1:key_field}', obj(${2:mintime}=obj(path='${3:MIS_TXNDATE}',agg='min'), ${4:maxtime}=obj(path='${3:MIS_TXNDATE}',agg='max'), ${5:total_transaction_count}=obj(path='${6:TRANSACTIONID}',agg='count_non_null')), '${7:key_name}')" },
-  { label: 'append_unique(path,value)', snippet: "append_unique('${1:agent_ids}', ${2:field('agent_id')})" },
-  { label: 'safe_div(num,den,default)', snippet: 'safe_div(${1:numerator}, ${2:denominator}, ${3:0})' },
-  { label: 'rolling_update(name,value,time,windows)', snippet: "rolling_update('${1:amount}', ${2:field('amount')}, ${3:field('txn_time')}, array(${4:1},${5:7},${6:30}))" },
-]
-
-const CUSTOM_FIELD_TIPS_TEXT = `Available functions:
-field(path), values(path), coalesce(...), if_(cond,a,b), upper(), lower(), trim(), length(),
-round(), abs(), min(), max(), sum(), mean(), count(), distinct(), agg(path,'sum'),
-count_if(value_path, condition_path, expected, op, include_null_values, case_sensitive),
-sum_if(value_path, condition_path, expected, op, include_null_values, case_sensitive),
-mean_if(value_path, condition_path, expected, op, include_null_values, case_sensitive),
-min_if(value_path, condition_path, expected, op, include_null_values, case_sensitive),
-max_if(value_path, condition_path, expected, op, include_null_values, case_sensitive),
-distinct_if(value_path, condition_path, expected, op, include_null_values, case_sensitive),
-distinct_count_if(value_path, condition_path, expected, op, include_null_values, case_sensitive),
-count_non_null_if(value_path, condition_path, expected, op, include_null_values, case_sensitive),
-agg_if(value_path, condition_path, expected, agg, op, include_null_values, case_sensitive),
-group_aggregate(key_path, obj(metric=obj(path='field',agg='sum')), 'key_name'),
-running_sum(), running_mean(), running_min(), running_max(), running_count(), running_std(),
-rolling_sum(values,window), rolling_mean(values,window), rolling_min(), rolling_max(), rolling_count(), rolling_std(),
-rolling(values, window, 'mean'), running_all(values,'sum'), rolling_all(values,window,'mean'), last(values),
-sqrt(), log(), exp(), ceil(), floor(), sin(), cos(), tan()
-
-Profile document helpers:
-prev(path, default), inc(path_or_value, amount, default), map_inc(path_or_map,key,amount,default),
-append_unique(path_or_list,value,max_items), safe_div(num,den,default),
-rolling_update(name,value,txn_time,windows,retention_days),
-group_aggregate(key_path, metrics, key_name) [profile mode keeps incremental state and returns grouped array]
-
-count_if operators:
-eq / ==, != / not, contains / not_contains, like / not_like, in / not_in,
-startswith / not_startswith, endswith / not_endswith, regex / not_regex
-
-group_aggregate metric aggs:
-sum, mean, min, max, count, count_non_null, distinct, distinct_count, value_counts, first, last, row_count
-
-JSON template mode:
-Any string starting with "=" is evaluated as expression.
-Example:
-{
-  "score": "=round(coalesce(score,0),2)",
-  "status": "=if_(count_if('RRN','RESPTOCLIENT','00','!=') > 0, 'REVIEW', 'OK')",
-  "tags": ["=field('SERVICENAME')"]
-}
-
-Expression editor autocomplete:
-- Functions list
-- Source fields and custom fields
-Use Ctrl+Space if suggestions are not shown automatically.`
-
 type ExpressionCompletionEntry = {
   label: string
   insertText: string
-  kind: 'function' | 'field' | 'keyword'
+  kind: 'function' | 'field' | 'path' | 'keyword'
   detail?: string
   documentation?: string
+  command?: { id: string; title?: string }
 }
 
 const EXPR_LANGUAGE_ID = 'etl-expr'
 const JSON_TEMPLATE_LANGUAGE_ID = 'etl-json-template'
 const EXPR_VALIDATION_OWNER = 'etl-expr-validator'
 const JSON_TEMPLATE_VALIDATION_OWNER = 'etl-json-template-validator'
+const EXPR_INLINE_ERROR_CLASS = 'opsfabric-expr-inline-error'
+const EXPR_INLINE_WARNING_CLASS = 'opsfabric-expr-inline-warning'
+const EXPR_RANGE_ERROR_CLASS = 'opsfabric-expr-range-error'
+const EXPR_RANGE_WARNING_CLASS = 'opsfabric-expr-range-warning'
+const EXPR_GLYPH_ERROR_CLASS = 'opsfabric-expr-glyph-error'
+const EXPR_GLYPH_WARNING_CLASS = 'opsfabric-expr-glyph-warning'
 const EXPR_FIELD_SINGLE_QUOTED_PATTERN = /'(?=[^']*[A-Z])(?:[^'\\]|\\.)*'/
 const EXPR_LITERAL_SINGLE_QUOTED_PATTERN = /'(?:min|max|sum|mean|avg|count|count_non_null|distinct|distinct_count|value_counts|first|last|row_count|customer|servicename|datewise|timeseries|daily|weekly|monthly|yearly|eq|not|contains|not_contains|like|not_like|in|not_in|startswith|not_startswith|endswith|not_endswith|regex|not_regex)'/
 const CUSTOM_EDITOR_THEME_IDS = {
@@ -644,6 +349,7 @@ let exprLanguageRegistered = false
 let jsonTemplateLanguageRegistered = false
 let customEditorThemeRegistered = false
 let exprCompletionEntries: ExpressionCompletionEntry[] = []
+let exprFunctionSignatureMap = new Map<string, { name: string; label: string; parameters: string[]; documentation: string }>()
 const EXPR_ALLOWED_AGG_VALUES = new Set([
   'sum',
   'mean',
@@ -680,48 +386,33 @@ const EXPR_ALLOWED_CONDITION_OPERATORS = new Set([
   'not_regex',
 ])
 
-const DEFAULT_EXPRESSION_FUNCTION_NAMES = new Set(
-  [
-    ...EXPRESSION_FUNCTION_SNIPPETS.map((item) => item.snippet),
-    ...EXPRESSION_FUNCTION_SNIPPETS.map((item) => item.label),
-    // Extra runtime helpers that may be available even if not listed in snippets.
-    'num(value,default)',
-    'str(value)',
-    'length(value)',
-    'abs(value)',
-    'sqrt(value)',
-    'log(value)',
-    'exp(value)',
-    'ceil(value)',
-    'floor(value)',
-    'sin(value)',
-    'cos(value)',
-    'tan(value)',
-    'agg(value,agg_name)',
-  ]
-    .map((text) => {
-      const m = String(text || '').match(/\b([A-Za-z_]\w*)\s*\(/)
-      return m ? m[1].toLowerCase() : ''
-    })
-    .filter(Boolean)
-)
-
+const EXPR_ALLOWED_AGG_VALUES_OPTIONS = Array.from(EXPR_ALLOWED_AGG_VALUES).sort((a, b) => a.localeCompare(b))
+const EXPR_ALLOWED_CONDITION_OPERATORS_OPTIONS = Array.from(EXPR_ALLOWED_CONDITION_OPERATORS).sort((a, b) => a.localeCompare(b))
 type ExpressionValidationContext = {
   allowedFunctionNames: Set<string>
   allowedFieldNames: Set<string>
   allowedFieldNamesLower: Set<string>
+  allowedPathNames: Set<string>
+  allowedPathNamesLower: Set<string>
 }
 
 let exprValidationContext: ExpressionValidationContext = {
   allowedFunctionNames: new Set(DEFAULT_EXPRESSION_FUNCTION_NAMES),
   allowedFieldNames: new Set(),
   allowedFieldNamesLower: new Set(),
+  allowedPathNames: new Set(),
+  allowedPathNamesLower: new Set(),
 }
+const editorValidationDecorations = new WeakMap<any, string[]>()
+const modelValidationIssues = new WeakMap<any, ExpressionValidationIssue[]>()
+const modelSuggestIntent = new WeakMap<any, 'issue_click'>()
 
 function buildExpressionValidationContext(entries: ExpressionCompletionEntry[]): ExpressionValidationContext {
   const allowedFunctionNames = new Set(DEFAULT_EXPRESSION_FUNCTION_NAMES)
   const allowedFieldNames = new Set<string>()
   const allowedFieldNamesLower = new Set<string>()
+  const allowedPathNames = new Set<string>()
+  const allowedPathNamesLower = new Set<string>()
   ;(entries || []).forEach((entry) => {
     if (!entry) return
     if (entry.kind === 'function') {
@@ -739,9 +430,29 @@ function buildExpressionValidationContext(entries: ExpressionCompletionEntry[]):
       if (!fieldName) return
       allowedFieldNames.add(fieldName)
       allowedFieldNamesLower.add(fieldName.toLowerCase())
+      allowedPathNames.add(fieldName)
+      allowedPathNamesLower.add(fieldName.toLowerCase())
+      return
+    }
+    if (entry.kind === 'path') {
+      const pathName = String(entry.label || '').trim()
+      if (!pathName) return
+      allowedPathNames.add(pathName)
+      allowedPathNamesLower.add(pathName.toLowerCase())
+      const root = extractPathRoot(pathName)
+      if (root) {
+        allowedFieldNames.add(root)
+        allowedFieldNamesLower.add(root.toLowerCase())
+      }
     }
   })
-  return { allowedFunctionNames, allowedFieldNames, allowedFieldNamesLower }
+  return {
+    allowedFunctionNames,
+    allowedFieldNames,
+    allowedFieldNamesLower,
+    allowedPathNames,
+    allowedPathNamesLower,
+  }
 }
 
 function getExpressionValidationContext(): ExpressionValidationContext {
@@ -751,6 +462,7 @@ function getExpressionValidationContext(): ExpressionValidationContext {
 function setExpressionCompletionEntries(entries: ExpressionCompletionEntry[]): void {
   exprCompletionEntries = entries
   exprValidationContext = buildExpressionValidationContext(entries)
+  exprFunctionSignatureMap = buildFunctionSignatureMap(entries)
 }
 
 function ensureCustomEditorTheme(monaco: Monaco): void {
@@ -846,6 +558,1213 @@ function ensureCustomEditorTheme(monaco: Monaco): void {
   customEditorThemeRegistered = true
 }
 
+function extractSuggestionFromIssueMessage(message: string): string | null {
+  const text = String(message || '')
+  if (!text) return null
+  const match = text.match(/Did you mean "([^"]+)"/)
+  const suggestion = String(match?.[1] || '').trim()
+  return suggestion || null
+}
+
+function findIssueQuickFixAtOffset(
+  model: any,
+  offset: number
+): { replacement: string; startOffset: number; endOffset: number } | null {
+  const issues = modelValidationIssues.get(model) || []
+  const cursorOffset = Math.max(0, Number(offset || 0))
+  let best: { replacement: string; startOffset: number; endOffset: number } | null = null
+  let bestSpan = Number.POSITIVE_INFINITY
+
+  issues.forEach((issue) => {
+    if (!issue) return
+    const start = Math.max(0, Number(issue.startOffset || 0))
+    const end = Math.max(start + 1, Number(issue.endOffset || 0))
+    if (cursorOffset < start || cursorOffset > end) return
+    const replacement = extractSuggestionFromIssueMessage(issue.message)
+    if (!replacement) return
+    const span = end - start
+    if (span < bestSpan) {
+      bestSpan = span
+      best = { replacement, startOffset: start, endOffset: end }
+    }
+  })
+
+  return best
+}
+
+type ExpressionCompletionMode = 'default' | 'field_path' | 'profile_path'
+
+function isEscapedAt(source: string, index: number): boolean {
+  let backslashCount = 0
+  for (let i = index - 1; i >= 0; i -= 1) {
+    if (source[i] !== '\\') break
+    backslashCount += 1
+  }
+  return backslashCount % 2 === 1
+}
+
+function findActiveQuotedLiteralRange(
+  source: string,
+  cursorOffset: number
+): { startOffset: number; endOffset: number } | null {
+  const text = String(source || '')
+  const cursor = Math.max(0, Math.min(Number(cursorOffset || 0), text.length))
+  if (!text || cursor <= 0) return null
+
+  let openQuoteOffset = -1
+  let quoteChar: "'" | '"' | null = null
+
+  for (let idx = cursor - 1; idx >= 0; idx -= 1) {
+    const ch = text[idx]
+    if ((ch === "'" || ch === '"') && !isEscapedAt(text, idx)) {
+      openQuoteOffset = idx
+      quoteChar = ch
+      break
+    }
+  }
+  if (openQuoteOffset < 0 || !quoteChar) return null
+
+  for (let idx = openQuoteOffset + 1; idx < cursor; idx += 1) {
+    if (text[idx] === quoteChar && !isEscapedAt(text, idx)) {
+      return null
+    }
+  }
+
+  let closeQuoteOffset = text.length
+  for (let idx = cursor; idx < text.length; idx += 1) {
+    const ch = text[idx]
+    if (ch === '\n' || ch === '\r') break
+    if (ch === quoteChar && !isEscapedAt(text, idx)) {
+      closeQuoteOffset = idx
+      break
+    }
+  }
+
+  return {
+    startOffset: openQuoteOffset + 1,
+    endOffset: closeQuoteOffset,
+  }
+}
+
+function detectExpressionCompletionMode(
+  source: string,
+  cursorOffset: number,
+  leftContextOffset = cursorOffset
+): ExpressionCompletionMode {
+  const fnContext = findActiveFunctionCallContext(source, cursorOffset)
+  const fnName = String(fnContext?.name || '').trim().toLowerCase()
+  const argIndex = Math.max(0, Number(fnContext?.activeParameter || 0))
+  const contextOffset = Math.max(0, Math.min(Number(leftContextOffset || 0), source.length))
+  const leftContext = source.slice(Math.max(0, contextOffset - 180), contextOffset)
+  const isPathAssignment = /\bpath\s*=\s*$/i.test(leftContext)
+
+  if (isPathAssignment) return 'field_path'
+  if ((fnName === 'field' || fnName === 'values' || fnName === 'group_aggregate') && argIndex === 0) {
+    return 'field_path'
+  }
+  if (
+    (fnName === 'prev' && argIndex === 0)
+    || ((fnName === 'inc' || fnName === 'map_inc' || fnName === 'append_unique' || fnName === 'rolling_update') && argIndex === 0)
+  ) {
+    return 'profile_path'
+  }
+  return 'default'
+}
+
+function buildExpressionCompletionSuggestions(monaco: Monaco, model: any, position: any) {
+  const source = String(model?.getValue?.() || '')
+  const cursorOffset = Number(model?.getOffsetAt?.(position) || 0)
+  const suggestIntent = modelSuggestIntent.get(model)
+  if (suggestIntent === 'issue_click') {
+    modelSuggestIntent.delete(model)
+  }
+  const issueFix = findIssueQuickFixAtOffset(model, cursorOffset)
+  if (suggestIntent === 'issue_click' && issueFix) {
+    const completionKind = (monaco as any)?.languages?.CompletionItemKind || {}
+    const start = model.getPositionAt(issueFix.startOffset)
+    const end = model.getPositionAt(issueFix.endOffset)
+    return {
+      suggestions: [
+        {
+          label: `Replace with "${issueFix.replacement}"`,
+          kind: completionKind.Text ?? completionKind.Variable ?? 18,
+          insertText: issueFix.replacement,
+          detail: 'Suggested fix from validation',
+          range: {
+            startLineNumber: start.lineNumber,
+            endLineNumber: end.lineNumber,
+            startColumn: start.column,
+            endColumn: end.column,
+          },
+        },
+      ],
+    }
+  }
+  const word = model.getWordUntilPosition(position)
+  const defaultRange = {
+    startLineNumber: position.lineNumber,
+    endLineNumber: position.lineNumber,
+    startColumn: word.startColumn,
+    endColumn: word.endColumn,
+  }
+  const contextMode = detectExpressionCompletionMode(source, cursorOffset)
+  let mode: ExpressionCompletionMode = contextMode
+  let range = defaultRange
+  let prefixRaw = String(word.word || '')
+  const literalRange = findActiveQuotedLiteralRange(source, cursorOffset)
+  if (literalRange) {
+    const detectedMode = detectExpressionCompletionMode(source, cursorOffset, literalRange.startOffset)
+    if (detectedMode !== 'default') {
+      mode = detectedMode
+      const start = model.getPositionAt(literalRange.startOffset)
+      const end = model.getPositionAt(Math.max(literalRange.startOffset, literalRange.endOffset))
+      range = {
+        startLineNumber: start.lineNumber,
+        endLineNumber: end.lineNumber,
+        startColumn: start.column,
+        endColumn: end.column,
+      }
+      prefixRaw = source.slice(literalRange.startOffset, cursorOffset)
+    }
+  }
+
+  const useRawPathInsert = mode !== 'default'
+  const prefix = prefixRaw.toLowerCase()
+  const toSearchKey = (label: string): string => {
+    if (useRawPathInsert) return String(label || '').toLowerCase()
+    const text = String(label || '')
+    const open = text.indexOf('(')
+    return (open > 0 ? text.slice(0, open) : text).toLowerCase()
+  }
+  const rankEntry = (entry: ExpressionCompletionEntry): number => {
+    if (!prefix) return 100
+    const key = toSearchKey(entry.label)
+    if (key === prefix) return 0
+    if (key.startsWith(prefix)) return 1
+    if (key.includes(prefix)) return 2
+    const distance = levenshteinDistance(prefix, key)
+    return 10 + distance
+  }
+
+  let items = exprCompletionEntries
+  if (useRawPathInsert) {
+    items = exprCompletionEntries.filter((entry) => entry.kind === 'field' || entry.kind === 'path')
+    const deduped = new Map<string, ExpressionCompletionEntry>()
+    items.forEach((entry) => {
+      const key = String(entry.label || '').trim().toLowerCase()
+      if (!key) return
+      const existing = deduped.get(key)
+      if (!existing || (entry.kind === 'path' && existing.kind !== 'path')) {
+        deduped.set(key, entry)
+      }
+    })
+    items = Array.from(deduped.values())
+  }
+
+  if (prefix) {
+    const strict = items.filter((entry) => {
+      const key = toSearchKey(entry.label)
+      return key.startsWith(prefix) || key.includes(prefix)
+    })
+    if (strict.length > 0) {
+      items = strict
+    } else {
+      // No direct match: show nearest recommendations so user can pick a fix.
+      items = [...items]
+        .sort((a, b) => rankEntry(a) - rankEntry(b))
+        .slice(0, 12)
+    }
+  }
+  items = [...items].sort((a, b) => rankEntry(a) - rankEntry(b))
+  const completionKind = (monaco as any)?.languages?.CompletionItemKind || {}
+  const snippetInsertRule = (monaco as any)?.languages?.CompletionItemInsertTextRule?.InsertAsSnippet
+
+  const suggestions = items.map((entry) => ({
+    label: entry.label,
+    kind:
+      entry.kind === 'function'
+        ? (completionKind.Function ?? completionKind.Method ?? completionKind.Keyword ?? 17)
+        : entry.kind === 'field' || entry.kind === 'path'
+          ? (completionKind.Field ?? completionKind.Variable ?? completionKind.Text ?? 18)
+          : (completionKind.Keyword ?? completionKind.Text ?? 18),
+    insertText: useRawPathInsert ? entry.label : entry.insertText,
+    insertTextRules: !useRawPathInsert && entry.insertText.includes('${') && snippetInsertRule !== undefined
+      ? snippetInsertRule
+      : undefined,
+    detail: entry.detail,
+    documentation: entry.documentation,
+    command: entry.command,
+    range,
+  }))
+  return { suggestions }
+}
+
+function normalizeSnippetTemplateText(snippet: string): string {
+  return String(snippet || '')
+    .replace(/\$\{\d+:([^}]+)\}/g, '$1')
+    .replace(/\$\{\d+\|([^}]+)\|\}/g, (_all, choices) => String(choices || '').split(',')[0] || '')
+    .replace(/\$\d+/g, '')
+}
+
+function escapeSnippetChoiceValue(value: string): string {
+  return String(value || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/\|/g, '\\|')
+    .replace(/,/g, '\\,')
+    .replace(/\}/g, '\\}')
+}
+
+function unescapeSnippetChoiceValue(value: string): string {
+  return String(value || '')
+    .replace(/\\,/g, ',')
+    .replace(/\\\|/g, '|')
+    .replace(/\\}/g, '}')
+    .replace(/\\\\/g, '\\')
+}
+
+function splitSnippetChoiceValues(raw: string): string[] {
+  const text = String(raw || '')
+  if (!text) return []
+  const out: string[] = []
+  let current = ''
+  let escaped = false
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    if (escaped) {
+      current += ch
+      escaped = false
+      continue
+    }
+    if (ch === '\\') {
+      escaped = true
+      continue
+    }
+    if (ch === ',') {
+      out.push(unescapeSnippetChoiceValue(current))
+      current = ''
+      continue
+    }
+    current += ch
+  }
+  out.push(unescapeSnippetChoiceValue(current))
+  return out.map((item) => String(item || '').trim()).filter(Boolean)
+}
+
+function parseSnippetPlaceholders(snippet: string): SnippetPlaceholder[] {
+  const text = String(snippet || '')
+  if (!text) return []
+  const out: SnippetPlaceholder[] = []
+  const seen = new Set<number>()
+  const regex = /\$\{(\d+):([^}]+)\}|\$\{(\d+)\|([^}]*)\|\}/g
+  let match = regex.exec(text)
+  while (match) {
+    const textIndexRaw = match[1]
+    const textDefaultRaw = match[2]
+    const choiceIndexRaw = match[3]
+    const choiceRaw = match[4]
+    if (textIndexRaw) {
+      const idx = Number(textIndexRaw)
+      if (Number.isFinite(idx) && !seen.has(idx)) {
+        seen.add(idx)
+        const defaultValue = String(textDefaultRaw || '')
+        out.push({
+          index: idx,
+          token: String(match[0] || ''),
+          kind: 'text',
+          defaultValue,
+          options: defaultValue ? [defaultValue] : [],
+        })
+      }
+    } else if (choiceIndexRaw) {
+      const idx = Number(choiceIndexRaw)
+      if (Number.isFinite(idx) && !seen.has(idx)) {
+        seen.add(idx)
+        const options = splitSnippetChoiceValues(String(choiceRaw || ''))
+        out.push({
+          index: idx,
+          token: String(match[0] || ''),
+          kind: 'choice',
+          defaultValue: String(options[0] || ''),
+          options,
+        })
+      }
+    }
+    match = regex.exec(text)
+  }
+  return out.sort((a, b) => a.index - b.index)
+}
+
+function buildExpressionFromSnippet(snippet: string, valuesByIndex: Record<number, string>): string {
+  const text = String(snippet || '')
+  if (!text) return ''
+  const resolved = text
+    .replace(/\$\{(\d+):([^}]+)\}/g, (_full, indexRaw, fallbackRaw) => {
+      const index = Number(indexRaw)
+      const candidate = String(valuesByIndex[index] ?? fallbackRaw ?? '')
+      return candidate
+    })
+    .replace(/\$\{(\d+)\|([^}]*)\|\}/g, (_full, indexRaw, choicesRaw) => {
+      const index = Number(indexRaw)
+      const choices = splitSnippetChoiceValues(String(choicesRaw || ''))
+      const fallback = String(choices[0] || '')
+      const candidate = String(valuesByIndex[index] ?? fallback)
+      return candidate
+    })
+    .replace(/\$\d+/g, '')
+  return resolved
+}
+
+function normalizeExpressionValue(text: string): string {
+  const raw = String(text || '').trim()
+  if (!raw) return ''
+  if (raw.startsWith('=')) return raw
+  return `=${raw}`
+}
+
+function createBreClause(seed?: Partial<BreClause>): BreClause {
+  return {
+    id: String(seed?.id || `bre_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+    joinWithPrev: (seed?.joinWithPrev || 'and') as BreClauseJoin,
+    leftKind: (seed?.leftKind || 'field') as BreClauseOperandKind,
+    leftValue: String(seed?.leftValue || ''),
+    operator: (seed?.operator || '==') as BreClauseOperator,
+    rightKind: (seed?.rightKind || 'literal') as BreClauseOperandKind,
+    rightValue: String(seed?.rightValue || ''),
+  }
+}
+
+function parseTopLevelFunctionCallSource(source: string): { name: string; args: string[] } | null {
+  const text = String(source || '').trim()
+  if (!text) return null
+  const fnMatch = text.match(/^([A-Za-z_]\w*)\s*\(/)
+  if (!fnMatch?.[1]) return null
+  const name = String(fnMatch[1]).trim()
+  const openParenOffset = text.indexOf('(')
+  if (openParenOffset < 0) return null
+  const closeParenOffset = findMatchingParenOffset(text, openParenOffset)
+  if (closeParenOffset <= openParenOffset) return null
+  if (text.slice(closeParenOffset + 1).trim()) return null
+  const argsSource = text.slice(openParenOffset + 1, closeParenOffset)
+  const args = splitTopLevelArgsWithOffsets(argsSource).map((segment) => String(segment.text || '').trim())
+  return { name, args }
+}
+
+function splitBreConditionClauses(source: string): Array<{ joinWithPrev: BreClauseJoin; text: string }> {
+  const text = String(source || '')
+  if (!text.trim()) return []
+  const out: Array<{ joinWithPrev: BreClauseJoin; text: string }> = []
+  const joins: BreClauseJoin[] = []
+  let start = 0
+  let depthRound = 0
+  let depthSquare = 0
+  let depthCurly = 0
+  let quote: "'" | '"' | null = null
+  let escaped = false
+  const lower = text.toLowerCase()
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    if (quote) {
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        continue
+      }
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      continue
+    }
+    if (ch === '(') depthRound += 1
+    else if (ch === ')') depthRound = Math.max(0, depthRound - 1)
+    else if (ch === '[') depthSquare += 1
+    else if (ch === ']') depthSquare = Math.max(0, depthSquare - 1)
+    else if (ch === '{') depthCurly += 1
+    else if (ch === '}') depthCurly = Math.max(0, depthCurly - 1)
+    if (depthRound !== 0 || depthSquare !== 0 || depthCurly !== 0) continue
+    if (lower.startsWith(' and ', i)) {
+      out.push({ joinWithPrev: 'and', text: text.slice(start, i).trim() })
+      joins.push('and')
+      start = i + 5
+      i += 4
+      continue
+    }
+    if (lower.startsWith(' or ', i)) {
+      out.push({ joinWithPrev: 'and', text: text.slice(start, i).trim() })
+      joins.push('or')
+      start = i + 4
+      i += 3
+      continue
+    }
+  }
+  out.push({ joinWithPrev: 'and', text: text.slice(start).trim() })
+  return out
+    .map((item, idx) => ({
+      joinWithPrev: idx === 0 ? 'and' : joins[idx - 1] || 'and',
+      text: item.text,
+    }))
+    .filter((item) => item.text)
+}
+
+function findTopLevelComparator(source: string): { operator: BreClauseOperator; index: number } | null {
+  const text = String(source || '')
+  const operators: BreClauseOperator[] = ['>=', '<=', '!=', '==', '>', '<']
+  let depthRound = 0
+  let depthSquare = 0
+  let depthCurly = 0
+  let quote: "'" | '"' | null = null
+  let escaped = false
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    if (quote) {
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        continue
+      }
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      continue
+    }
+    if (ch === '(') depthRound += 1
+    else if (ch === ')') depthRound = Math.max(0, depthRound - 1)
+    else if (ch === '[') depthSquare += 1
+    else if (ch === ']') depthSquare = Math.max(0, depthSquare - 1)
+    else if (ch === '{') depthCurly += 1
+    else if (ch === '}') depthCurly = Math.max(0, depthCurly - 1)
+    if (depthRound !== 0 || depthSquare !== 0 || depthCurly !== 0) continue
+
+    const rest = text.slice(i)
+    const hit = operators.find((op) => rest.startsWith(op))
+    if (hit) return { operator: hit, index: i }
+  }
+  return null
+}
+
+function parseBreOperand(text: string): { kind: BreClauseOperandKind; value: string } {
+  const raw = String(text || '').trim()
+  if (!raw) return { kind: 'literal', value: '' }
+  const fieldMatch = raw.match(/^field\s*\(\s*'((?:[^'\\]|\\.)*)'\s*\)$/i)
+  if (fieldMatch?.[1] !== undefined) {
+    return { kind: 'field', value: decodeSingleQuotedLiteral(fieldMatch[1]) }
+  }
+  if (/^-?\d+(\.\d+)?$/.test(raw) || /^(true|false|null)$/i.test(raw)) {
+    return { kind: 'literal', value: raw }
+  }
+  const singleQuoted = raw.match(/^'((?:[^'\\]|\\.)*)'$/)
+  if (singleQuoted?.[1] !== undefined) {
+    return { kind: 'literal', value: decodeSingleQuotedLiteral(singleQuoted[1]) }
+  }
+  const doubleQuoted = raw.match(/^"((?:[^"\\]|\\.)*)"$/)
+  if (doubleQuoted?.[1] !== undefined) {
+    return { kind: 'literal', value: String(doubleQuoted[1]).replace(/\\"/g, '"').replace(/\\\\/g, '\\') }
+  }
+  return { kind: 'raw', value: raw }
+}
+
+function parseBreClauseText(text: string, joinWithPrev: BreClauseJoin): BreClause {
+  const raw = String(text || '').trim()
+  if (!raw) return createBreClause({ joinWithPrev, operator: 'raw', leftKind: 'raw', leftValue: '' })
+  const cmp = findTopLevelComparator(raw)
+  if (!cmp) {
+    return createBreClause({
+      joinWithPrev,
+      operator: 'raw',
+      leftKind: 'raw',
+      leftValue: raw,
+      rightKind: 'raw',
+      rightValue: '',
+    })
+  }
+  const leftText = raw.slice(0, cmp.index).trim()
+  const rightText = raw.slice(cmp.index + cmp.operator.length).trim()
+  const left = parseBreOperand(leftText)
+  const right = parseBreOperand(rightText)
+  return createBreClause({
+    joinWithPrev,
+    operator: cmp.operator,
+    leftKind: left.kind,
+    leftValue: left.value,
+    rightKind: right.kind,
+    rightValue: right.value,
+  })
+}
+
+function parseBreModelFromExpression(expression: string): BreModel {
+  const text = String(expression || '').trim()
+  if (!text) {
+    return {
+      clauses: [createBreClause()],
+      thenExpr: "'YES'",
+      elseExpr: "'NO'",
+      parseError: 'Expression is empty',
+    }
+  }
+  const body = text.startsWith('=') ? text.slice(1).trim() : text
+  const call = parseTopLevelFunctionCallSource(body)
+  if (!call || call.name.toLowerCase() !== 'if_' || call.args.length < 3) {
+    return {
+      clauses: [createBreClause({ operator: 'raw', leftKind: 'raw', leftValue: body })],
+      thenExpr: "'YES'",
+      elseExpr: "'NO'",
+      parseError: 'BRE parser supports if_(condition, then, else) expressions.',
+    }
+  }
+  const conditionText = String(call.args[0] || '').trim()
+  const thenExpr = String(call.args[1] || '').trim() || "'YES'"
+  const elseExpr = String(call.args[2] || '').trim() || "'NO'"
+  const conditionClauses = splitBreConditionClauses(conditionText)
+  const clauses = conditionClauses.length > 0
+    ? conditionClauses.map((item) => parseBreClauseText(item.text, item.joinWithPrev))
+    : [createBreClause()]
+  return {
+    clauses,
+    thenExpr,
+    elseExpr,
+    parseError: null,
+  }
+}
+
+function renderBreLiteral(raw: string): string {
+  const text = String(raw || '').trim()
+  if (!text) return "''"
+  if (/^-?\d+(\.\d+)?$/.test(text) || /^(true|false|null)$/i.test(text)) {
+    return text.toLowerCase()
+  }
+  if ((text.startsWith("'") && text.endsWith("'")) || (text.startsWith('"') && text.endsWith('"'))) {
+    return text
+  }
+  return `'${escapeExprPath(text)}'`
+}
+
+function renderBreOperand(kind: BreClauseOperandKind, value: string): string {
+  const text = String(value || '').trim()
+  if (kind === 'field') {
+    return `field('${escapeExprPath(text)}')`
+  }
+  if (kind === 'literal') {
+    return renderBreLiteral(text)
+  }
+  return text || "''"
+}
+
+function buildBreConditionExpression(clause: BreClause): string {
+  if (!clause) return 'true'
+  if (clause.operator === 'raw') {
+    return String(clause.leftValue || '').trim() || 'true'
+  }
+  const left = renderBreOperand(clause.leftKind, clause.leftValue)
+  const right = renderBreOperand(clause.rightKind, clause.rightValue)
+  return `${left} ${clause.operator} ${right}`
+}
+
+function buildExpressionFromBreModel(model: BreModel): string {
+  const clauses = Array.isArray(model?.clauses) ? model.clauses : []
+  const condition = (
+    clauses.length > 0
+      ? clauses
+        .map((clause, idx) => {
+          const text = buildBreConditionExpression(clause)
+          if (idx === 0) return text
+          const join = clause.joinWithPrev === 'or' ? 'or' : 'and'
+          return `${join} ${text}`
+        })
+        .join(' ')
+      : 'true'
+  )
+  const thenExpr = String(model?.thenExpr || '').trim() || "'YES'"
+  const elseExpr = String(model?.elseExpr || '').trim() || "'NO'"
+  return `=if_(${condition}, ${thenExpr}, ${elseExpr})`
+}
+
+function parseJsonTemplateExpressionMap(jsonTemplate: string): Record<string, string> {
+  const obj = parseJsonTemplateObject(jsonTemplate)
+  return Object.entries(obj).reduce((acc, [key, value]) => {
+    const keyName = String(key || '').trim()
+    if (!keyName) return acc
+    if (typeof value === 'string') {
+      acc[keyName] = value
+      return acc
+    }
+    try {
+      acc[keyName] = JSON.stringify(value, null, 2)
+    } catch {
+      acc[keyName] = String(value ?? '')
+    }
+    return acc
+  }, {} as Record<string, string>)
+}
+
+function parseJsonTemplateObject(jsonTemplate: string): Record<string, unknown> {
+  const text = String(jsonTemplate || '').trim()
+  if (!text) return {}
+  try {
+    const parsed = JSON.parse(text)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    return parsed as Record<string, unknown>
+  } catch {
+    return {}
+  }
+}
+
+function parseJsonTemplateRows(jsonTemplate: string): UiExpressionBuilderRow[] {
+  const obj = parseJsonTemplateObject(jsonTemplate)
+  return Object.entries(obj).map(([key, value], idx) => {
+    const keyName = String(key || '').trim()
+    const isExpression = typeof value === 'string' && String(value || '').trim().startsWith('=')
+    const valueType: UiExpressionBuilderRow['valueType'] = isExpression ? 'expression' : 'json'
+    let textValue = ''
+    if (typeof value === 'string') {
+      textValue = value
+    } else {
+      try {
+        textValue = JSON.stringify(value, null, 2)
+      } catch {
+        textValue = String(value ?? '')
+      }
+    }
+    return {
+      id: `ui_sync_${idx}_${keyName || 'key'}`,
+      key: keyName,
+      expression: normalizeExpressionValue(String(textValue || '')),
+      valueType,
+    }
+  }).filter((row) => row.key)
+}
+
+function parseUiBuilderRowValue(row: UiExpressionBuilderRow): unknown {
+  const text = String(row.expression || '').trim()
+  if ((row.valueType || 'expression') === 'expression') {
+    return normalizeExpressionValue(text)
+  }
+  if (!text) return {}
+  try {
+    return JSON.parse(text)
+  } catch {
+    return text
+  }
+}
+
+function extractSnippetFunctionName(snippet: string): string {
+  const text = String(snippet || '').trim()
+  if (!text) return ''
+  const match = text.match(/^([A-Za-z_]\w*)\s*\(/)
+  return String(match?.[1] || '').trim()
+}
+
+function stripEnclosingQuotes(token: string): string {
+  const text = String(token || '').trim()
+  if (!text) return ''
+  if (text.length >= 2) {
+    const first = text[0]
+    const last = text[text.length - 1]
+    if ((first === "'" && last === "'") || (first === '"' && last === '"')) {
+      return text
+        .slice(1, -1)
+        .replace(/\\\\/g, '\\')
+        .replace(/\\'/g, "'")
+        .replace(/\\"/g, '"')
+    }
+  }
+  return text
+}
+
+function inferUiExpressionModeAndValue(token: string): { mode: UiExpressionParameterMode; value: string } {
+  const text = String(token || '').trim()
+  if (!text) {
+    return { mode: 'literal', value: '' }
+  }
+  const fieldMatch = text.match(/^field\(\s*(['"])([\s\S]*)\1\s*\)$/i)
+  if (fieldMatch) {
+    return { mode: 'field', value: stripEnclosingQuotes(fieldMatch[1] + fieldMatch[2] + fieldMatch[1]) }
+  }
+  const valuesMatch = text.match(/^values\(\s*(['"])([\s\S]*)\1\s*\)$/i)
+  if (valuesMatch) {
+    return { mode: 'values', value: stripEnclosingQuotes(valuesMatch[1] + valuesMatch[2] + valuesMatch[1]) }
+  }
+  if (/^-?\d+(\.\d+)?$/.test(text) || /^(true|false|null)$/i.test(text) || /^(['"]).*\1$/.test(text)) {
+    return { mode: 'literal', value: text }
+  }
+  return { mode: 'raw', value: text }
+}
+
+function parseNamedObjLiteralArg(args: string[], name: string): string {
+  const key = String(name || '').trim().toLowerCase()
+  if (!key) return ''
+  for (const arg of args || []) {
+    const text = String(arg || '').trim()
+    if (!text) continue
+    const equalIndex = text.indexOf('=')
+    if (equalIndex <= 0) continue
+    const lhs = String(text.slice(0, equalIndex) || '').trim().toLowerCase()
+    if (lhs !== key) continue
+    return stripEnclosingQuotes(text.slice(equalIndex + 1))
+  }
+  return ''
+}
+
+function parseGroupAggregateMetricsFromArg(metricsArg: string): UiGroupAggregateMetric[] {
+  const raw = String(metricsArg || '').trim()
+  if (!raw) return []
+  let metricsSource = raw
+  const metricsCall = parseTopLevelFunctionCallSource(raw)
+  if (metricsCall && metricsCall.name.toLowerCase() === 'obj') {
+    metricsSource = String(metricsCall.args.join(', ') || '').trim()
+  }
+  const segments = splitTopLevelArgsWithOffsets(metricsSource)
+    .map((segment) => String(segment.text || '').trim())
+    .filter(Boolean)
+  const parsed: UiGroupAggregateMetric[] = []
+  segments.forEach((segment, idx) => {
+    const equalIndex = segment.indexOf('=')
+    if (equalIndex <= 0) return
+    const outputName = normalizeUiGroupAggregateOutputName(segment.slice(0, equalIndex))
+    const rhs = String(segment.slice(equalIndex + 1) || '').trim()
+    const rhsCall = parseTopLevelFunctionCallSource(rhs)
+    if (!rhsCall || rhsCall.name.toLowerCase() !== 'obj') return
+    const path = parseNamedObjLiteralArg(rhsCall.args, 'path')
+    const agg = parseNamedObjLiteralArg(rhsCall.args, 'agg').toLowerCase() || 'sum'
+    parsed.push(
+      createUiGroupAggregateMetric({
+        outputName: outputName || `metric_${idx + 1}`,
+        path,
+        agg: EXPR_ALLOWED_AGG_VALUES.has(agg) ? agg : 'sum',
+      })
+    )
+  })
+  return parsed
+}
+
+function isFieldLikePlaceholder(placeholder: SnippetPlaceholder): boolean {
+  const text = String(placeholder.defaultValue || '').toLowerCase()
+  if (!text) return false
+  return /(field|column|path|key_field|condition_field|value_field)/.test(text)
+}
+
+function isAggregateLikePlaceholder(placeholder: SnippetPlaceholder): boolean {
+  const text = String(placeholder.defaultValue || '').toLowerCase()
+  if (!text) return false
+  return /\b(agg|aggregate)\b/.test(text)
+}
+
+function isOperatorLikePlaceholder(placeholder: SnippetPlaceholder): boolean {
+  const text = String(placeholder.defaultValue || '').toLowerCase()
+  if (!text) return false
+  return /\bop\b|operator/.test(text)
+}
+
+function isConditionLikePlaceholder(placeholder: SnippetPlaceholder): boolean {
+  const text = String(placeholder.defaultValue || '').toLowerCase()
+  if (!text) return false
+  return /\bcond\b|\bcondition\b/.test(text)
+}
+
+function isBooleanLikePlaceholder(placeholder: SnippetPlaceholder): boolean {
+  const text = String(placeholder.defaultValue || '').toLowerCase()
+  if (!text) return false
+  return /\b(include_null|case_sensitive|enabled|flag|bool|boolean)\b/.test(text)
+}
+
+function createUiConditionCluster(seed?: Partial<UiConditionCluster>): UiConditionCluster {
+  const rand = Math.random().toString(36).slice(2, 8)
+  const now = Date.now().toString(36)
+  return {
+    id: String(seed?.id || `cluster_${now}_${rand}`),
+    joinWithPrev: seed?.joinWithPrev === 'or' ? 'or' : 'and',
+  }
+}
+
+function createUiConditionClause(clusterId: string, seed?: Partial<UiConditionClause>): UiConditionClause {
+  const rand = Math.random().toString(36).slice(2, 8)
+  const now = Date.now().toString(36)
+  const mode = seed?.rightMode
+  const rightMode: UiConditionClauseRightMode = (
+    mode === 'field' || mode === 'values' || mode === 'variable' || mode === 'literal' || mode === 'raw'
+      ? mode
+      : 'literal'
+  )
+  return {
+    id: String(seed?.id || `clause_${now}_${rand}`),
+    clusterId: String(seed?.clusterId || clusterId || 'cluster_1'),
+    joinWithPrev: seed?.joinWithPrev === 'or' ? 'or' : 'and',
+    leftField: String(seed?.leftField || ''),
+    operator: String(seed?.operator || '=='),
+    rightMode,
+    rightValue: String(seed?.rightValue || ''),
+  }
+}
+
+function createDefaultUiConditionBuilderState(seed?: Partial<UiConditionBuilderState>): UiConditionBuilderState {
+  const seedClusters = Array.isArray(seed?.clusters) ? seed.clusters : []
+  const clusters: UiConditionCluster[] = []
+  const clusterIdSet = new Set<string>()
+  seedClusters.forEach((cluster) => {
+    const normalized = createUiConditionCluster(cluster)
+    const id = String(normalized.id || '').trim()
+    if (!id || clusterIdSet.has(id)) return
+    clusters.push({ ...normalized, id })
+    clusterIdSet.add(id)
+  })
+  if (clusters.length === 0) {
+    const fallback = createUiConditionCluster({ id: 'cluster_1', joinWithPrev: 'and' })
+    clusters.push(fallback)
+    clusterIdSet.add(fallback.id)
+  }
+
+  const seedClauses = Array.isArray(seed?.clauses) ? seed.clauses : []
+  const clauses: UiConditionClause[] = []
+  const clauseIdSet = new Set<string>()
+  seedClauses.forEach((clause) => {
+    const clusterId = clusterIdSet.has(String(clause.clusterId || ''))
+      ? String(clause.clusterId)
+      : clusters[0].id
+    const normalized = createUiConditionClause(clusterId, clause)
+    const id = String(normalized.id || '').trim()
+    if (!id || clauseIdSet.has(id)) return
+    clauses.push({ ...normalized, id })
+    clauseIdSet.add(id)
+  })
+  if (clauses.length === 0) {
+    clauses.push(createUiConditionClause(clusters[0].id, { id: 'clause_1', joinWithPrev: 'and' }))
+  }
+
+  const referencedClusters = new Set(clauses.map((clause) => clause.clusterId))
+  const normalizedClusters = clusters.filter((cluster) => referencedClusters.has(cluster.id))
+  if (normalizedClusters.length === 0) {
+    const fallback = createUiConditionCluster({ id: 'cluster_1', joinWithPrev: 'and' })
+    return {
+      clusters: [fallback],
+      clauses: clauses.map((clause, index) => createUiConditionClause(fallback.id, {
+        ...clause,
+        id: index === 0 ? 'clause_1' : clause.id,
+        clusterId: fallback.id,
+      })),
+    }
+  }
+
+  return {
+    clusters: normalizedClusters,
+    clauses,
+  }
+}
+
+function createUiExpressionVariableSpec(seed?: Partial<UiExpressionVariableSpec>): UiExpressionVariableSpec {
+  const rand = Math.random().toString(36).slice(2, 9)
+  const now = Date.now().toString(36)
+  const name = String(seed?.name || '').trim()
+  return {
+    id: String(seed?.id || `uivar_${now}_${rand}`),
+    name: name || `var_${rand.slice(0, 4)}`,
+    value: String(seed?.value || ''),
+  }
+}
+
+function normalizeUiGroupAggregateOutputName(name: string): string {
+  const normalized = String(name || '').trim().replace(/\s+/g, '_').replace(/[^A-Za-z0-9_]/g, '_')
+  return normalized || 'metric'
+}
+
+function createUiGroupAggregateMetric(seed?: Partial<UiGroupAggregateMetric>): UiGroupAggregateMetric {
+  const rand = Math.random().toString(36).slice(2, 9)
+  const now = Date.now().toString(36)
+  return {
+    id: String(seed?.id || `uimetric_${now}_${rand}`),
+    outputName: normalizeUiGroupAggregateOutputName(String(seed?.outputName || 'metric')),
+    path: String(seed?.path || ''),
+    agg: String(seed?.agg || 'sum'),
+  }
+}
+
+function defaultUiExpressionParameterMode(placeholder: SnippetPlaceholder): UiExpressionParameterMode {
+  if (placeholder.kind === 'choice') return 'raw'
+  if (isFieldLikePlaceholder(placeholder)) return 'field'
+  return 'literal'
+}
+
+function toExpressionLiteralToken(value: string): string {
+  const raw = String(value || '').trim()
+  if (!raw) return "''"
+  if (/^-?\d+(\.\d+)?$/.test(raw)) return raw
+  if (/^(true|false|null)$/i.test(raw)) return raw.toLowerCase()
+  if ((raw.startsWith("'") && raw.endsWith("'")) || (raw.startsWith('"') && raw.endsWith('"'))) {
+    return raw
+  }
+  return `'${raw.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`
+}
+
+function resolveUiExpressionParameterToken(
+  mode: UiExpressionParameterMode,
+  rawValue: string,
+  variables: UiExpressionVariableSpec[]
+): string {
+  const value = String(rawValue || '').trim()
+  if (mode === 'field') {
+    return value ? `field('${value.replace(/'/g, "\\'")}')` : "field('')"
+  }
+  if (mode === 'values') {
+    return value ? `values('${value.replace(/'/g, "\\'")}')` : "values('')"
+  }
+  if (mode === 'variable') {
+    const variableName = value
+    const variable = (variables || []).find((item) => String(item.name || '').trim() === variableName)
+    const variableValue = String(variable?.value || '').trim()
+    return variableValue || "''"
+  }
+  if (mode === 'raw') {
+    return value || "''"
+  }
+  return toExpressionLiteralToken(value)
+}
+
+function enrichFunctionSnippetWithFieldChoices(snippet: string, fieldNames: string[]): string {
+  const fields = uniqueFieldNames(fieldNames || []).slice(0, 40)
+  if (fields.length === 0) return String(snippet || '')
+  return String(snippet || '').replace(/\$\{(\d+):([^}]+)\}/g, (_full, indexRaw, placeholderRaw) => {
+    const index = String(indexRaw || '')
+    const placeholder = String(placeholderRaw || '')
+    const normalized = placeholder.toLowerCase()
+    if (!/(field|column|path)/.test(normalized)) {
+      return `\${${index}:${placeholder}}`
+    }
+    const options = uniqueFieldNames([placeholder, ...fields]).slice(0, 40)
+    const choiceList = options.map(escapeSnippetChoiceValue).join(',')
+    if (!choiceList) return `\${${index}:${placeholder}}`
+    return `\${${index}|${choiceList}|}`
+  })
+}
+
+function parseFunctionLabelSignature(label: string): { name: string; parameters: string[] } | null {
+  const text = String(label || '').trim()
+  if (!text) return null
+  const open = text.indexOf('(')
+  const close = text.lastIndexOf(')')
+  if (open <= 0 || close <= open) return null
+  const name = text.slice(0, open).trim()
+  if (!/^[A-Za-z_]\w*$/.test(name)) return null
+  const rawParams = text.slice(open + 1, close).trim()
+  const parameters = rawParams
+    ? rawParams.split(',').map((p) => p.trim()).filter(Boolean)
+    : []
+  return { name, parameters }
+}
+
+function buildFunctionSignatureMap(entries: ExpressionCompletionEntry[]): Map<string, { name: string; label: string; parameters: string[]; documentation: string }> {
+  const map = new Map<string, { name: string; label: string; parameters: string[]; documentation: string }>()
+  ;(entries || []).forEach((entry) => {
+    if (!entry || entry.kind !== 'function') return
+    const parsed = parseFunctionLabelSignature(entry.label)
+    if (!parsed?.name) return
+    const key = parsed.name.toLowerCase()
+    if (map.has(key)) return
+    const template = normalizeSnippetTemplateText(entry.insertText)
+    map.set(key, {
+      name: parsed.name,
+      label: `${parsed.name}(${parsed.parameters.join(', ')})`,
+      parameters: parsed.parameters.length > 0 ? parsed.parameters : ['arg1'],
+      documentation: `Template: \`${template}\`\n\nUse Tab to move across parameters.`,
+    })
+  })
+  return map
+}
+
+function findActiveFunctionCallContext(source: string, offset: number): { name: string; activeParameter: number } | null {
+  const stack: Array<{ name: string | null; activeParameter: number }> = []
+  let quote: '"' | "'" | null = null
+  let escaped = false
+  for (let i = 0; i < Math.min(source.length, Math.max(0, offset)); i += 1) {
+    const ch = source[i]
+    if (quote) {
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        continue
+      }
+      if (ch === quote) {
+        quote = null
+      }
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      continue
+    }
+    if (ch === '(') {
+      let j = i - 1
+      while (j >= 0 && /\s/.test(source[j])) j -= 1
+      let end = j
+      while (j >= 0 && /[A-Za-z0-9_]/.test(source[j])) j -= 1
+      const candidate = end >= 0 ? source.slice(j + 1, end + 1).trim() : ''
+      const name = /^[A-Za-z_]\w*$/.test(candidate) ? candidate : null
+      stack.push({ name, activeParameter: 0 })
+      continue
+    }
+    if (ch === ',') {
+      if (stack.length > 0) {
+        stack[stack.length - 1].activeParameter += 1
+      }
+      continue
+    }
+    if (ch === ')') {
+      stack.pop()
+      continue
+    }
+  }
+  for (let i = stack.length - 1; i >= 0; i -= 1) {
+    const frame = stack[i]
+    if (frame?.name) {
+      return { name: frame.name, activeParameter: Math.max(0, frame.activeParameter) }
+    }
+  }
+  return null
+}
+
+function attachExpressionAutoSuggest(editor: any): void {
+  const applyAutoCorrectEdits = (
+    rangeStartOffset: number,
+    rangeEndOffset: number,
+    replacementText: string,
+    cursorOffsetAfter: number
+  ): void => {
+    const model = editor.getModel?.()
+    if (!model) return
+    const safeStart = Math.max(0, Math.min(Number(rangeStartOffset || 0), Number(rangeEndOffset || 0)))
+    const safeEnd = Math.max(safeStart, Math.max(Number(rangeStartOffset || 0), Number(rangeEndOffset || 0)))
+    const startPos = model.getPositionAt(safeStart)
+    const endPos = model.getPositionAt(safeEnd)
+    const targetOffset = Math.max(0, Number(cursorOffsetAfter || 0))
+    editor.pushUndoStop?.()
+    editor.executeEdits('opsfabric-autocorrect', [
+      {
+        range: {
+          startLineNumber: startPos.lineNumber,
+          startColumn: startPos.column,
+          endLineNumber: endPos.lineNumber,
+          endColumn: endPos.column,
+        },
+        text: String(replacementText || ''),
+        forceMoveMarkers: true,
+      },
+    ])
+    editor.setPosition?.(model.getPositionAt(targetOffset))
+    editor.pushUndoStop?.()
+  }
+
+  const autoCorrectFunctionNameAtCursor = (): boolean => {
+    const model = editor.getModel?.()
+    const position = editor.getPosition?.()
+    if (!model || !position) return false
+    const source = String(model.getValue?.() || '')
+    const cursorOffset = Number(model.getOffsetAt?.(position) || 0)
+    if (cursorOffset <= 0 || source[cursorOffset - 1] !== '(') return false
+
+    let idx = cursorOffset - 2
+    while (idx >= 0 && /\s/.test(source[idx])) idx -= 1
+    const end = idx
+    while (idx >= 0 && /[A-Za-z0-9_]/.test(source[idx])) idx -= 1
+    const start = idx + 1
+    if (end < start) return false
+
+    const currentName = String(source.slice(start, end + 1) || '').trim()
+    if (!/^[A-Za-z_]\w*$/.test(currentName)) return false
+
+    const validationContext = getExpressionValidationContext()
+    const functionCandidates = Array.from(validationContext.allowedFunctionNames || [])
+    const currentLower = currentName.toLowerCase()
+    if (validationContext.allowedFunctionNames.has(currentLower)) return false
+
+    const suggestion = findClosestSuggestion(currentLower, functionCandidates)
+    if (!suggestion || suggestion.toLowerCase() === currentLower) return false
+
+    const nextCursorOffset = cursorOffset + (suggestion.length - currentName.length)
+    applyAutoCorrectEdits(start, end + 1, suggestion, nextCursorOffset)
+    return true
+  }
+
+  const autoCorrectFieldLiteralAtCursor = (typedChar: string): boolean => {
+    if (typedChar !== "'" && typedChar !== '"') return false
+    const model = editor.getModel?.()
+    const position = editor.getPosition?.()
+    if (!model || !position) return false
+    const source = String(model.getValue?.() || '')
+    const cursorOffset = Number(model.getOffsetAt?.(position) || 0)
+    if (cursorOffset <= 1 || source[cursorOffset - 1] !== typedChar) return false
+
+    let openQuoteOffset = -1
+    let escaped = false
+    for (let idx = cursorOffset - 2; idx >= 0; idx -= 1) {
+      const ch = source[idx]
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        continue
+      }
+      if (ch === typedChar) {
+        openQuoteOffset = idx
+        break
+      }
+      if (ch === '\n') break
+    }
+    if (openQuoteOffset < 0) return false
+
+    const rawLiteral = String(source.slice(openQuoteOffset + 1, cursorOffset - 1) || '')
+    const fieldName = rawLiteral.trim()
+    if (!fieldName) return false
+
+    const leftContext = source.slice(Math.max(0, openQuoteOffset - 180), openQuoteOffset)
+    const isFieldContext = /\b(field|values|group_aggregate)\s*\(\s*$/i.test(leftContext)
+      || /\bpath\s*=\s*$/i.test(leftContext)
+    if (!isFieldContext) return false
+
+    const validationContext = getExpressionValidationContext()
+    if (isAllowedFieldName(fieldName, validationContext)) return false
+    const fieldCandidates = Array.from(validationContext.allowedFieldNames || [])
+    const suggestion = findClosestSuggestion(fieldName, fieldCandidates)
+    if (!suggestion || suggestion === fieldName) return false
+
+    const literalStart = openQuoteOffset + 1
+    const literalEnd = cursorOffset - 1
+    const nextCursorOffset = cursorOffset + (suggestion.length - fieldName.length)
+    applyAutoCorrectEdits(literalStart, literalEnd, suggestion, nextCursorOffset)
+    return true
+  }
+
+  const typedDisposable = editor.onDidType((typedText: string) => {
+    const text = String(typedText || '')
+    if (!text) return
+    const lastChar = text[text.length - 1]
+    if (lastChar === '(') {
+      const corrected = autoCorrectFunctionNameAtCursor()
+      if (corrected) {
+        editor.trigger('keyboard', 'editor.action.triggerParameterHints', {})
+      }
+    } else if (lastChar === "'" || lastChar === '"') {
+      autoCorrectFieldLiteralAtCursor(lastChar)
+    }
+    if (!/[A-Za-z0-9_.'"(]/.test(lastChar)) return
+    editor.trigger('keyboard', 'editor.action.triggerSuggest', {})
+  })
+
+  editor.onDidDispose(() => {
+    typedDisposable.dispose()
+  })
+}
+
 function ensureExpressionLanguage(monaco: Monaco): void {
   ensureCustomEditorTheme(monaco)
   if (!exprLanguageRegistered) {
@@ -889,34 +1808,37 @@ function ensureExpressionLanguage(monaco: Monaco): void {
     monaco.languages.registerCompletionItemProvider(EXPR_LANGUAGE_ID, {
       triggerCharacters: ['.', '(', "'", '"', '_'],
       provideCompletionItems(model: any, position: any) {
-        const word = model.getWordUntilPosition(position)
-        const range = {
-          startLineNumber: position.lineNumber,
-          endLineNumber: position.lineNumber,
-          startColumn: word.startColumn,
-          endColumn: word.endColumn,
+        return buildExpressionCompletionSuggestions(monaco, model, position)
+      },
+    })
+    monaco.languages.registerSignatureHelpProvider(EXPR_LANGUAGE_ID, {
+      signatureHelpTriggerCharacters: ['(', ','],
+      signatureHelpRetriggerCharacters: [','],
+      provideSignatureHelp(model: any, position: any) {
+        const source = String(model?.getValue?.() || '')
+        const offset = Number(model?.getOffsetAt?.(position) || 0)
+        const context = findActiveFunctionCallContext(source, offset)
+        if (!context?.name) {
+          return { value: { signatures: [], activeSignature: 0, activeParameter: 0 }, dispose: () => {} }
         }
-        const prefix = word.word.toLowerCase()
-        const items = exprCompletionEntries.filter((entry) => (
-          !prefix || entry.label.toLowerCase().includes(prefix)
-        ))
-        const suggestions = items.map((entry) => ({
-          label: entry.label,
-          kind:
-            entry.kind === 'function'
-              ? monaco.languages.CompletionItemKind.Function
-              : entry.kind === 'field'
-                ? monaco.languages.CompletionItemKind.Field
-                : monaco.languages.CompletionItemKind.Keyword,
-          insertText: entry.insertText,
-          insertTextRules: entry.insertText.includes('${')
-            ? monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet
-            : undefined,
-          detail: entry.detail,
-          documentation: entry.documentation,
-          range,
-        }))
-        return { suggestions }
+        const signature = exprFunctionSignatureMap.get(String(context.name).toLowerCase())
+        if (!signature) {
+          return { value: { signatures: [], activeSignature: 0, activeParameter: 0 }, dispose: () => {} }
+        }
+        return {
+          value: {
+            signatures: [
+              {
+                label: signature.label,
+                documentation: { value: signature.documentation },
+                parameters: signature.parameters.map((param) => ({ label: param })),
+              },
+            ],
+            activeSignature: 0,
+            activeParameter: Math.min(context.activeParameter, Math.max(0, signature.parameters.length - 1)),
+          },
+          dispose: () => {},
+        }
       },
     })
     exprLanguageRegistered = true
@@ -980,6 +1902,42 @@ function ensureJsonTemplateLanguage(monaco: Monaco): void {
       ],
     },
   })
+  monaco.languages.registerCompletionItemProvider(JSON_TEMPLATE_LANGUAGE_ID, {
+    triggerCharacters: ['.', '(', "'", '"', '_'],
+    provideCompletionItems(model: any, position: any) {
+      return buildExpressionCompletionSuggestions(monaco, model, position)
+    },
+  })
+  monaco.languages.registerSignatureHelpProvider(JSON_TEMPLATE_LANGUAGE_ID, {
+    signatureHelpTriggerCharacters: ['(', ','],
+    signatureHelpRetriggerCharacters: [','],
+    provideSignatureHelp(model: any, position: any) {
+      const source = String(model?.getValue?.() || '')
+      const offset = Number(model?.getOffsetAt?.(position) || 0)
+      const context = findActiveFunctionCallContext(source, offset)
+      if (!context?.name) {
+        return { value: { signatures: [], activeSignature: 0, activeParameter: 0 }, dispose: () => {} }
+      }
+      const signature = exprFunctionSignatureMap.get(String(context.name).toLowerCase())
+      if (!signature) {
+        return { value: { signatures: [], activeSignature: 0, activeParameter: 0 }, dispose: () => {} }
+      }
+      return {
+        value: {
+          signatures: [
+            {
+              label: signature.label,
+              documentation: { value: signature.documentation },
+              parameters: signature.parameters.map((param) => ({ label: param })),
+            },
+          ],
+          activeSignature: 0,
+          activeParameter: Math.min(context.activeParameter, Math.max(0, signature.parameters.length - 1)),
+        },
+        dispose: () => {},
+      }
+    },
+  })
   jsonTemplateLanguageRegistered = true
 }
 
@@ -995,6 +1953,38 @@ function decodeJsonStringContent(raw: string): string {
     return JSON.parse(`"${raw}"`)
   } catch {
     return raw
+  }
+}
+
+function tryExtractJsonParseErrorOffset(message: string): number | null {
+  const text = String(message || '')
+  const m = text.match(/position\s+(\d+)/i)
+  if (!m) return null
+  const value = Number(m[1])
+  if (!Number.isFinite(value) || value < 0) return null
+  return Math.floor(value)
+}
+
+function validateJsonTemplateSyntax(text: string): ExpressionValidationIssue[] {
+  const source = String(text || '')
+  const trimmed = source.trim()
+  if (!trimmed) return []
+  try {
+    JSON.parse(source)
+    return []
+  } catch (err: any) {
+    const rawMessage = String(err?.message || 'Invalid JSON syntax')
+    const pos = tryExtractJsonParseErrorOffset(rawMessage)
+    const startOffset = Math.max(0, Math.min(source.length, pos ?? 0))
+    const endOffset = Math.max(startOffset + 1, Math.min(source.length, startOffset + 1))
+    return [
+      {
+        startOffset,
+        endOffset,
+        message: rawMessage,
+        severity: 'error',
+      },
+    ]
   }
 }
 
@@ -1385,11 +2375,20 @@ function splitTopLevelArgsWithOffsets(argsSource: string): ParsedArgSegment[] {
   return segments
 }
 
-function extractSingleQuotedLiteralFromSegment(segment: ParsedArgSegment): { value: string; startOffset: number; endOffset: number } | null {
+function extractQuotedLiteralFromSegment(segment: ParsedArgSegment): { value: string; startOffset: number; endOffset: number } | null {
   const text = segment.text
   if (!text) return null
-  const firstQuote = text.indexOf("'")
+  const singleQuoteOffset = text.indexOf("'")
+  const doubleQuoteOffset = text.indexOf('"')
+  const firstQuote = (
+    singleQuoteOffset >= 0 && doubleQuoteOffset >= 0
+      ? Math.min(singleQuoteOffset, doubleQuoteOffset)
+      : singleQuoteOffset >= 0
+        ? singleQuoteOffset
+        : doubleQuoteOffset
+  )
   if (firstQuote < 0 || text.slice(0, firstQuote).trim()) return null
+  const quoteChar = text[firstQuote]
   let escaped = false
   for (let i = firstQuote + 1; i < text.length; i += 1) {
     const ch = text[i]
@@ -1401,11 +2400,14 @@ function extractSingleQuotedLiteralFromSegment(segment: ParsedArgSegment): { val
       escaped = true
       continue
     }
-    if (ch === "'") {
+    if (ch === quoteChar) {
       if (text.slice(i + 1).trim()) return null
       const raw = text.slice(firstQuote + 1, i)
       return {
-        value: decodeSingleQuotedLiteral(raw),
+        value: String(raw || '')
+          .replace(/\\\\/g, '\\')
+          .replace(/\\'/g, "'")
+          .replace(/\\"/g, '"'),
         startOffset: segment.startOffset + firstQuote + 1,
         endOffset: segment.startOffset + i,
       }
@@ -1415,10 +2417,85 @@ function extractSingleQuotedLiteralFromSegment(segment: ParsedArgSegment): { val
 }
 
 function isAllowedFieldName(fieldName: string, validationContext: ExpressionValidationContext): boolean {
-  if (!fieldName) return true
+  const normalized = String(fieldName || '').trim()
+  if (!normalized) return true
   if (!validationContext.allowedFieldNames.size && !validationContext.allowedFieldNamesLower.size) return true
-  if (validationContext.allowedFieldNames.has(fieldName)) return true
-  return validationContext.allowedFieldNamesLower.has(fieldName.toLowerCase())
+  if (validationContext.allowedFieldNames.has(normalized)) return true
+  return validationContext.allowedFieldNamesLower.has(normalized.toLowerCase())
+}
+
+function levenshteinDistance(a: string, b: string): number {
+  const x = String(a || '')
+  const y = String(b || '')
+  const n = x.length
+  const m = y.length
+  if (n === 0) return m
+  if (m === 0) return n
+  const dp: number[][] = Array.from({ length: n + 1 }, () => Array(m + 1).fill(0))
+  for (let i = 0; i <= n; i += 1) dp[i][0] = i
+  for (let j = 0; j <= m; j += 1) dp[0][j] = j
+  for (let i = 1; i <= n; i += 1) {
+    for (let j = 1; j <= m; j += 1) {
+      const cost = x[i - 1] === y[j - 1] ? 0 : 1
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost,
+      )
+    }
+  }
+  return dp[n][m]
+}
+
+function findClosestSuggestion(value: string, candidates: string[]): string | null {
+  const source = String(value || '').trim().toLowerCase()
+  if (!source) return null
+  const normalizedCandidates = uniqueFieldNames(candidates || []).filter(Boolean)
+  if (!normalizedCandidates.length) return null
+
+  const exact = normalizedCandidates.find((candidate) => candidate.toLowerCase() === source)
+  if (exact) return exact
+
+  const startsWithMatch = normalizedCandidates
+    .filter((candidate) => candidate.toLowerCase().startsWith(source))
+    .sort((a, b) => a.length - b.length)[0]
+  if (startsWithMatch) return startsWithMatch
+
+  let bestCandidate: string | null = null
+  let bestScore = Number.POSITIVE_INFINITY
+  normalizedCandidates.forEach((candidate) => {
+    const score = levenshteinDistance(source, candidate.toLowerCase())
+    if (score < bestScore) {
+      bestScore = score
+      bestCandidate = candidate
+    }
+  })
+
+  if (!bestCandidate) return null
+  const threshold = Math.max(2, Math.floor(source.length * 0.4))
+  return bestScore <= threshold ? bestCandidate : null
+}
+
+function isAllowedPathName(pathName: string, validationContext: ExpressionValidationContext): boolean {
+  const normalized = String(pathName || '').trim()
+  if (!normalized) return true
+  if (!validationContext.allowedPathNames.size && !validationContext.allowedPathNamesLower.size) return true
+  if (validationContext.allowedPathNames.has(normalized)) return true
+  return validationContext.allowedPathNamesLower.has(normalized.toLowerCase())
+}
+
+function extractPathRoot(pathName: string): string {
+  const normalized = String(pathName || '').trim()
+  if (!normalized) return ''
+  const rootMatch = normalized.match(/^[^.[\]]+/)
+  return String(rootMatch?.[0] || '').trim()
+}
+
+function withSuggestion(message: string, suggestion: string | null): string {
+  const base = String(message || '')
+  const hint = String(suggestion || '').trim()
+  if (!hint) return base
+  return `${base}. Did you mean "${hint}"?`
 }
 
 function validateExpressionSemantics(
@@ -1428,6 +2505,7 @@ function validateExpressionSemantics(
 ): ExpressionValidationIssue[] {
   const issues: ExpressionValidationIssue[] = []
   const seen = new Set<string>()
+  const quoteMask = buildQuoteMask(source)
   const functionRefs = collectExpressionFunctionCalls(source)
   const conditionFunctions = new Set([
     'count_if',
@@ -1447,12 +2525,85 @@ function validateExpressionSemantics(
     issues.push(issue)
   }
 
+  // Validate callable names even if the expression is partially malformed.
+  // This catches typos like feild(), innc(), group_aggrigate() early.
+  const callMatcher = /\b([A-Za-z_]\w*)\s*\(/g
+  let callMatch = callMatcher.exec(source)
+  while (callMatch) {
+    const fnName = String(callMatch[1] || '')
+    const fnStart = Number(callMatch.index || 0)
+    if (fnName && !quoteMask[fnStart]) {
+      const fnLower = fnName.toLowerCase()
+      if (!validationContext.allowedFunctionNames.has(fnLower)) {
+        const fnSuggestion = findClosestSuggestion(fnName, Array.from(validationContext.allowedFunctionNames))
+        addIssue({
+          startOffset: baseOffset + fnStart,
+          endOffset: baseOffset + fnStart + fnName.length,
+          message: withSuggestion(`Function "${fnName}" is not available`, fnSuggestion),
+          severity: 'error',
+        })
+      }
+    }
+    callMatch = callMatcher.exec(source)
+  }
+
   const markUnknownField = (fieldName: string, startOffset: number, endOffset: number, contextLabel: string) => {
     if (isAllowedFieldName(fieldName, validationContext)) return
+    const fieldSuggestion = findClosestSuggestion(fieldName, Array.from(validationContext.allowedFieldNames))
     addIssue({
       startOffset: baseOffset + startOffset,
       endOffset: baseOffset + Math.max(startOffset + 1, endOffset),
-      message: `Field "${fieldName}" is not available (${contextLabel})`,
+      message: withSuggestion(`Field "${fieldName}" is not available (${contextLabel})`, fieldSuggestion),
+      severity: 'error',
+    })
+  }
+
+  const validatePathRootReference = (
+    literalValue: string,
+    literalStartOffset: number,
+    contextLabel: string
+  ) => {
+    const pathText = String(literalValue || '').trim()
+    if (!pathText) return
+    const rootMatch = pathText.match(/^[^.[\]]+/)
+    const root = String(rootMatch?.[0] || '').trim()
+    if (!root) return
+    const rootStart = literalStartOffset
+    const rootEnd = literalStartOffset + root.length
+    markUnknownField(root, rootStart, rootEnd, `${contextLabel} path root`)
+  }
+
+  const validateFullPathReference = (
+    literalValue: string,
+    literalStartOffset: number,
+    literalEndOffset: number,
+    contextLabel: string
+  ) => {
+    const pathText = String(literalValue || '').trim()
+    if (!pathText) return
+    if (isAllowedPathName(pathText, validationContext)) return
+
+    const root = extractPathRoot(pathText)
+    if (!root) return
+
+    if (!isAllowedFieldName(root, validationContext)) {
+      const rootStart = literalStartOffset
+      const rootEnd = literalStartOffset + root.length
+      markUnknownField(root, rootStart, rootEnd, `${contextLabel} path root`)
+      return
+    }
+
+    const sameRootCandidates = Array.from(validationContext.allowedPathNames).filter((candidate) => {
+      const cRoot = extractPathRoot(candidate)
+      return cRoot.toLowerCase() === root.toLowerCase()
+    })
+
+    if (sameRootCandidates.length === 0) return
+    const suggestion = findClosestSuggestion(pathText, sameRootCandidates)
+    addIssue({
+      startOffset: baseOffset + literalStartOffset,
+      endOffset: baseOffset + Math.max(literalStartOffset + 1, literalEndOffset),
+      message: withSuggestion(`Path "${pathText}" is not available (${contextLabel})`, suggestion),
       severity: 'error',
     })
   }
@@ -1460,10 +2611,11 @@ function validateExpressionSemantics(
   functionRefs.forEach((ref) => {
     const fnNameLower = ref.name.toLowerCase()
     if (!validationContext.allowedFunctionNames.has(fnNameLower)) {
+      const fnSuggestion = findClosestSuggestion(ref.name, Array.from(validationContext.allowedFunctionNames))
       addIssue({
         startOffset: baseOffset + ref.nameStart,
         endOffset: baseOffset + ref.nameStart + ref.name.length,
-        message: `Function "${ref.name}" is not available`,
+        message: withSuggestion(`Function "${ref.name}" is not available`, fnSuggestion),
         severity: 'error',
       })
     }
@@ -1483,9 +2635,20 @@ function validateExpressionSemantics(
     fieldArgIndexes.forEach((argIdx) => {
       const segment = args[argIdx]
       if (!segment) return
-      const literal = extractSingleQuotedLiteralFromSegment(segment)
+      const literal = extractQuotedLiteralFromSegment(segment)
       if (!literal) return
-      if (fnNameLower === 'prev' && literal.value.includes('.')) {
+      if (fnNameLower === 'prev' && /[.[\]]/.test(literal.value)) {
+        validateFullPathReference(
+          literal.value,
+          ref.openParenOffset + 1 + literal.startOffset,
+          ref.openParenOffset + 1 + literal.endOffset,
+          `${ref.name}()`
+        )
+        validatePathRootReference(
+          literal.value,
+          ref.openParenOffset + 1 + literal.startOffset,
+          `${ref.name}()`
+        )
         return
       }
       markUnknownField(
@@ -1496,16 +2659,36 @@ function validateExpressionSemantics(
       )
     })
 
+    // Validate path-root for profile path helpers where first argument is a dotted path.
+    if (['inc', 'map_inc', 'append_unique', 'rolling_update'].includes(fnNameLower)) {
+      const firstArg = args[0]
+      const firstLiteral = firstArg ? extractQuotedLiteralFromSegment(firstArg) : null
+      if (firstLiteral && /[.[\]]/.test(firstLiteral.value)) {
+        validateFullPathReference(
+          firstLiteral.value,
+          ref.openParenOffset + 1 + firstLiteral.startOffset,
+          ref.openParenOffset + 1 + firstLiteral.endOffset,
+          `${ref.name}()`
+        )
+        validatePathRootReference(
+          firstLiteral.value,
+          ref.openParenOffset + 1 + firstLiteral.startOffset,
+          `${ref.name}()`
+        )
+      }
+    }
+
     if (conditionFunctions.has(fnNameLower)) {
       const opArg = args[3]
-      const opLiteral = opArg ? extractSingleQuotedLiteralFromSegment(opArg) : null
+      const opLiteral = opArg ? extractQuotedLiteralFromSegment(opArg) : null
       if (opLiteral) {
         const opLower = opLiteral.value.trim().toLowerCase()
         if (opLower && !EXPR_ALLOWED_CONDITION_OPERATORS.has(opLower)) {
+          const opSuggestion = findClosestSuggestion(opLiteral.value, Array.from(EXPR_ALLOWED_CONDITION_OPERATORS))
           addIssue({
             startOffset: baseOffset + ref.openParenOffset + 1 + opLiteral.startOffset,
             endOffset: baseOffset + ref.openParenOffset + 1 + opLiteral.endOffset,
-            message: `Operator "${opLiteral.value}" is not supported`,
+            message: withSuggestion(`Operator "${opLiteral.value}" is not supported`, opSuggestion),
             severity: 'error',
           })
         }
@@ -1513,27 +2696,29 @@ function validateExpressionSemantics(
     }
     if (fnNameLower === 'agg_if') {
       const aggArg = args[3]
-      const aggLiteral = aggArg ? extractSingleQuotedLiteralFromSegment(aggArg) : null
+      const aggLiteral = aggArg ? extractQuotedLiteralFromSegment(aggArg) : null
       if (aggLiteral) {
         const aggLower = aggLiteral.value.trim().toLowerCase()
         if (aggLower && !EXPR_ALLOWED_AGG_VALUES.has(aggLower)) {
+          const aggSuggestion = findClosestSuggestion(aggLiteral.value, Array.from(EXPR_ALLOWED_AGG_VALUES))
           addIssue({
             startOffset: baseOffset + ref.openParenOffset + 1 + aggLiteral.startOffset,
             endOffset: baseOffset + ref.openParenOffset + 1 + aggLiteral.endOffset,
-            message: `Aggregate "${aggLiteral.value}" is not supported`,
+            message: withSuggestion(`Aggregate "${aggLiteral.value}" is not supported`, aggSuggestion),
             severity: 'error',
           })
         }
       }
       const opArg = args[4]
-      const opLiteral = opArg ? extractSingleQuotedLiteralFromSegment(opArg) : null
+      const opLiteral = opArg ? extractQuotedLiteralFromSegment(opArg) : null
       if (opLiteral) {
         const opLower = opLiteral.value.trim().toLowerCase()
         if (opLower && !EXPR_ALLOWED_CONDITION_OPERATORS.has(opLower)) {
+          const opSuggestion = findClosestSuggestion(opLiteral.value, Array.from(EXPR_ALLOWED_CONDITION_OPERATORS))
           addIssue({
             startOffset: baseOffset + ref.openParenOffset + 1 + opLiteral.startOffset,
             endOffset: baseOffset + ref.openParenOffset + 1 + opLiteral.endOffset,
-            message: `Operator "${opLiteral.value}" is not supported`,
+            message: withSuggestion(`Operator "${opLiteral.value}" is not supported`, opSuggestion),
             severity: 'error',
           })
         }
@@ -1541,14 +2726,15 @@ function validateExpressionSemantics(
     }
     if (fnNameLower === 'agg' || fnNameLower === 'running_all') {
       const aggArg = args[1]
-      const aggLiteral = aggArg ? extractSingleQuotedLiteralFromSegment(aggArg) : null
+      const aggLiteral = aggArg ? extractQuotedLiteralFromSegment(aggArg) : null
       if (aggLiteral) {
         const aggLower = aggLiteral.value.trim().toLowerCase()
         if (aggLower && !EXPR_ALLOWED_AGG_VALUES.has(aggLower)) {
+          const aggSuggestion = findClosestSuggestion(aggLiteral.value, Array.from(EXPR_ALLOWED_AGG_VALUES))
           addIssue({
             startOffset: baseOffset + ref.openParenOffset + 1 + aggLiteral.startOffset,
             endOffset: baseOffset + ref.openParenOffset + 1 + aggLiteral.endOffset,
-            message: `Aggregate "${aggLiteral.value}" is not supported`,
+            message: withSuggestion(`Aggregate "${aggLiteral.value}" is not supported`, aggSuggestion),
             severity: 'error',
           })
         }
@@ -1556,14 +2742,15 @@ function validateExpressionSemantics(
     }
     if (fnNameLower === 'rolling' || fnNameLower === 'rolling_all') {
       const aggArg = args[2]
-      const aggLiteral = aggArg ? extractSingleQuotedLiteralFromSegment(aggArg) : null
+      const aggLiteral = aggArg ? extractQuotedLiteralFromSegment(aggArg) : null
       if (aggLiteral) {
         const aggLower = aggLiteral.value.trim().toLowerCase()
         if (aggLower && !EXPR_ALLOWED_AGG_VALUES.has(aggLower)) {
+          const aggSuggestion = findClosestSuggestion(aggLiteral.value, Array.from(EXPR_ALLOWED_AGG_VALUES))
           addIssue({
             startOffset: baseOffset + ref.openParenOffset + 1 + aggLiteral.startOffset,
             endOffset: baseOffset + ref.openParenOffset + 1 + aggLiteral.endOffset,
-            message: `Aggregate "${aggLiteral.value}" is not supported`,
+            message: withSuggestion(`Aggregate "${aggLiteral.value}" is not supported`, aggSuggestion),
             severity: 'error',
           })
         }
@@ -1598,10 +2785,11 @@ function validateExpressionSemantics(
     const quoteOffset = full.indexOf("'")
     const aggLower = raw.trim().toLowerCase()
     if (aggLower && !EXPR_ALLOWED_AGG_VALUES.has(aggLower) && quoteOffset >= 0) {
+      const aggSuggestion = findClosestSuggestion(raw, Array.from(EXPR_ALLOWED_AGG_VALUES))
       addIssue({
         startOffset: baseOffset + aggMatch.index + quoteOffset + 1,
         endOffset: baseOffset + aggMatch.index + quoteOffset + 1 + String(aggMatch[1] || '').length,
-        message: `Aggregate "${raw}" is not supported`,
+        message: withSuggestion(`Aggregate "${raw}" is not supported`, aggSuggestion),
         severity: 'error',
       })
     }
@@ -1677,7 +2865,7 @@ function validateExpressionSyntax(
         issues.push({
           startOffset: baseOffset + i,
           endOffset: baseOffset + i + 1,
-          message: `Unexpected closing "${ch}"`,
+          message: `Unexpected closing "${ch}". Check bracket order or remove this "${ch}".`,
           severity: 'error',
         })
       } else {
@@ -1690,7 +2878,7 @@ function validateExpressionSyntax(
     issues.push({
       startOffset: baseOffset + source.length - 1,
       endOffset: baseOffset + source.length,
-      message: 'Unclosed quoted string',
+      message: `Unclosed quoted string. Add closing ${quote}.`,
       severity: 'error',
     })
   }
@@ -1701,7 +2889,7 @@ function validateExpressionSyntax(
     issues.push({
       startOffset: baseOffset + unclosed.offset,
       endOffset: baseOffset + unclosed.offset + 1,
-      message: `Missing closing "${expectedClose}"`,
+      message: `Missing closing "${expectedClose}". Add "${expectedClose}" to complete this block.`,
       severity: 'error',
     })
   }
@@ -1716,6 +2904,13 @@ function toMonacoMarkers(
   model: any,
   issues: ExpressionValidationIssue[],
 ) {
+  const markerSeverity =
+    (monaco as any)?.MarkerSeverity
+    || (monaco as any)?.editor?.MarkerSeverity
+    || {}
+  const markerErrorSeverity = markerSeverity?.Error ?? 8
+  const markerWarningSeverity = markerSeverity?.Warning ?? 4
+
   return issues.map((issue) => {
     const safeStart = Math.max(0, issue.startOffset)
     const safeEnd = Math.max(safeStart + 1, issue.endOffset)
@@ -1728,10 +2923,75 @@ function toMonacoMarkers(
       endColumn: end.column,
       message: issue.message,
       severity: issue.severity === 'error'
-        ? monaco.editor.MarkerSeverity.Error
-        : monaco.editor.MarkerSeverity.Warning,
+        ? markerErrorSeverity
+        : markerWarningSeverity,
     }
   })
+}
+
+function toMonacoDecorations(
+  monaco: Monaco,
+  model: any,
+  issues: ExpressionValidationIssue[],
+) {
+  const minimapInlinePosition = (monaco as any)?.editor?.MinimapPosition?.Inline
+  const overviewRightLane = (monaco as any)?.editor?.OverviewRulerLane?.Right
+  return issues.map((issue) => {
+    const safeStart = Math.max(0, issue.startOffset)
+    const safeEnd = Math.max(safeStart + 1, issue.endOffset)
+    const start = model.getPositionAt(safeStart)
+    const end = model.getPositionAt(safeEnd)
+    const severityLabel = issue.severity === 'error' ? 'Error' : 'Warning'
+    return {
+      range: new monaco.Range(start.lineNumber, start.column, end.lineNumber, end.column),
+      options: {
+        className: issue.severity === 'error' ? EXPR_RANGE_ERROR_CLASS : EXPR_RANGE_WARNING_CLASS,
+        inlineClassName: issue.severity === 'error' ? EXPR_INLINE_ERROR_CLASS : EXPR_INLINE_WARNING_CLASS,
+        inlineClassNameAffectsLetterSpacing: true,
+        glyphMarginClassName: issue.severity === 'error' ? EXPR_GLYPH_ERROR_CLASS : EXPR_GLYPH_WARNING_CLASS,
+        glyphMarginHoverMessage: [{ value: `${severityLabel}: ${issue.message}` }],
+        hoverMessage: [{ value: `${severityLabel}: ${issue.message}` }],
+        ...(minimapInlinePosition !== undefined
+          ? {
+            minimap: {
+              color: issue.severity === 'error' ? '#ef4444' : '#f59e0b',
+              position: minimapInlinePosition,
+            },
+          }
+          : {}),
+        ...(overviewRightLane !== undefined
+          ? {
+            overviewRuler: {
+              color: issue.severity === 'error' ? '#ef4444' : '#f59e0b',
+              position: overviewRightLane,
+            },
+          }
+          : {}),
+      },
+    }
+  })
+}
+
+function applyValidationDecorations(
+  editor: any,
+  monaco: Monaco,
+  model: any,
+  issues: ExpressionValidationIssue[],
+): void {
+  const prevDecorationIds = editorValidationDecorations.get(editor) || []
+  const nextDecorationIds = editor.deltaDecorations(
+    prevDecorationIds,
+    toMonacoDecorations(monaco, model, issues),
+  )
+  editorValidationDecorations.set(editor, nextDecorationIds)
+}
+
+function clearValidationDecorations(editor: any): void {
+  const prevDecorationIds = editorValidationDecorations.get(editor) || []
+  if (prevDecorationIds.length > 0) {
+    editor.deltaDecorations(prevDecorationIds, [])
+  }
+  editorValidationDecorations.delete(editor)
 }
 
 function attachExpressionValidation(editor: any, monaco: Monaco): void {
@@ -1740,13 +3000,31 @@ function attachExpressionValidation(editor: any, monaco: Monaco): void {
     if (!model) return
     const text = String(model.getValue() || '')
     const issues = validateExpressionSyntax(text, 0, { requireEqualsPrefix: true })
+    modelValidationIssues.set(model, issues)
     monaco.editor.setModelMarkers(model, EXPR_VALIDATION_OWNER, toMonacoMarkers(monaco, model, issues))
+    applyValidationDecorations(editor, monaco, model, issues)
   }
   validate()
+  editor.focus()
   editor.onDidChangeModelContent(validate)
+  const mouseDisposable = editor.onMouseDown((event: any) => {
+    const model = editor.getModel()
+    const pos = event?.target?.position
+    if (!model || !pos) return
+    const offset = Number(model.getOffsetAt(pos) || 0)
+    const quickFix = findIssueQuickFixAtOffset(model, offset)
+    if (!quickFix) return
+    modelSuggestIntent.set(model, 'issue_click')
+    editor.setPosition(pos)
+    editor.trigger('mouse', 'editor.action.triggerSuggest', {})
+  })
   editor.onDidDispose(() => {
+    mouseDisposable.dispose()
+    clearValidationDecorations(editor)
     const model = editor.getModel()
     if (!model) return
+    modelValidationIssues.delete(model)
+    modelSuggestIntent.delete(model)
     monaco.editor.setModelMarkers(model, EXPR_VALIDATION_OWNER, [])
   })
 }
@@ -1756,17 +3034,37 @@ function attachJsonTemplateExpressionValidation(editor: any, monaco: Monaco): vo
     const model = editor.getModel()
     if (!model) return
     const text = String(model.getValue() || '')
+    const jsonIssues = validateJsonTemplateSyntax(text)
     const ranges = extractExpressionStringRanges(text)
-    const issues = ranges.flatMap((entry) =>
+    const expressionIssues = ranges.flatMap((entry) =>
       validateExpressionSyntax(entry.value, entry.startOffset, { requireEqualsPrefix: false })
     )
+    const issues = [...jsonIssues, ...expressionIssues]
+    modelValidationIssues.set(model, issues)
     monaco.editor.setModelMarkers(model, JSON_TEMPLATE_VALIDATION_OWNER, toMonacoMarkers(monaco, model, issues))
+    applyValidationDecorations(editor, monaco, model, issues)
   }
   validate()
+  editor.focus()
   editor.onDidChangeModelContent(validate)
+  const mouseDisposable = editor.onMouseDown((event: any) => {
+    const model = editor.getModel()
+    const pos = event?.target?.position
+    if (!model || !pos) return
+    const offset = Number(model.getOffsetAt(pos) || 0)
+    const quickFix = findIssueQuickFixAtOffset(model, offset)
+    if (!quickFix) return
+    modelSuggestIntent.set(model, 'issue_click')
+    editor.setPosition(pos)
+    editor.trigger('mouse', 'editor.action.triggerSuggest', {})
+  })
   editor.onDidDispose(() => {
+    mouseDisposable.dispose()
+    clearValidationDecorations(editor)
     const model = editor.getModel()
     if (!model) return
+    modelValidationIssues.delete(model)
+    modelSuggestIntent.delete(model)
     monaco.editor.setModelMarkers(model, JSON_TEMPLATE_VALIDATION_OWNER, [])
   })
 }
@@ -2107,6 +3405,83 @@ function uniqueFieldNames(values: string[]): string[] {
     out.push(name)
   })
   return out
+}
+
+function collectJsonTemplateKeyPaths(
+  value: unknown,
+  basePath: string,
+  out: Set<string>,
+  depth: number
+): void {
+  if (depth > MAX_PATH_DEPTH || out.size >= MAX_PATH_OPTIONS) return
+
+  if (Array.isArray(value)) {
+    if (!basePath) return
+    out.add(basePath)
+    const wildcardPath = `${basePath}[]`
+    out.add(wildcardPath)
+    const sampleItems = value.slice(0, MAX_ARRAY_INDEX_OPTIONS)
+    sampleItems.forEach((item, idx) => {
+      const idxPath = `${basePath}[${idx}]`
+      out.add(idxPath)
+      collectJsonTemplateKeyPaths(item, idxPath, out, depth + 1)
+    })
+    const exemplar = value.find((item) => item !== null && item !== undefined)
+    if (exemplar !== undefined) {
+      collectJsonTemplateKeyPaths(exemplar, wildcardPath, out, depth + 1)
+    }
+    return
+  }
+
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>).slice(0, MAX_OBJECT_KEYS_PER_LEVEL)
+    entries.forEach(([key, child]) => {
+      const nextPath = basePath ? `${basePath}.${key}` : key
+      out.add(nextPath)
+      collectJsonTemplateKeyPaths(child, nextPath, out, depth + 1)
+    })
+  }
+}
+
+function extractJsonTemplateKeyPaths(jsonTemplate: string): string[] {
+  const text = String(jsonTemplate || '').trim()
+  if (!text) return []
+  try {
+    const parsed = JSON.parse(text)
+    const out = new Set<string>()
+    collectJsonTemplateKeyPaths(parsed, '', out, 0)
+    return uniqueFieldNames(Array.from(out))
+  } catch {
+    // Best-effort fallback while user is still typing malformed JSON.
+    const out = new Set<string>()
+    const keyMatcher = /"([^"\\]+)"\s*:/g
+    let keyMatch = keyMatcher.exec(text)
+    while (keyMatch) {
+      const key = String(keyMatch[1] || '').trim()
+      if (key) out.add(key)
+      keyMatch = keyMatcher.exec(text)
+    }
+    return uniqueFieldNames(Array.from(out))
+  }
+}
+
+function buildCustomProfilePathSuggestions(specs: CustomFieldSpec[]): string[] {
+  const out = new Set<string>()
+  ;(specs || []).forEach((spec) => {
+    if (!spec?.enabled) return
+    const rootName = String(spec.name || '').trim()
+    if (!rootName) return
+    out.add(rootName)
+    if (spec.mode !== 'json') return
+    const keyPaths = extractJsonTemplateKeyPaths(spec.jsonTemplate)
+    keyPaths.forEach((path) => {
+      const normalized = String(path || '').trim()
+      if (!normalized) return
+      out.add(normalized)
+      out.add(`${rootName}.${normalized}`)
+    })
+  })
+  return uniqueFieldNames(Array.from(out))
 }
 
 const INTERNAL_FIELD_ROOT_PREFIXES = ['_lmdb_', '__lmdb_', '_profile_', '_detected_', '_preview_']
@@ -2545,7 +3920,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [customFieldStudioOpen, setCustomFieldStudioOpen] = useState(false)
   const [customFieldDraft, setCustomFieldDraft] = useState<CustomFieldSpec[]>([])
   const [customFieldBeautifyUndoById, setCustomFieldBeautifyUndoById] = useState<Record<string, CustomFieldBeautifyBackup>>({})
-  const [customFieldBeautifyUndoAllSnapshot, setCustomFieldBeautifyUndoAllSnapshot] = useState<CustomFieldSpec[] | null>(null)
   const [customIncludeSourceDraft, setCustomIncludeSourceDraft] = useState(true)
   const [customExpressionEngineDraft, setCustomExpressionEngineDraft] = useState<CustomExpressionEngine>('auto')
   const [customPrimaryKeyFieldDraft, setCustomPrimaryKeyFieldDraft] = useState('')
@@ -2564,7 +3938,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [customProfileOracleParallelMinTokensDraft, setCustomProfileOracleParallelMinTokensDraft] = useState(2000)
   const [customProfileOracleMergeBatchSizeDraft, setCustomProfileOracleMergeBatchSizeDraft] = useState(500)
   const [customProfileOracleQueueEnabledDraft, setCustomProfileOracleQueueEnabledDraft] = useState(true)
-  const [customProfileOracleQueueWaitOnForceFlushDraft, setCustomProfileOracleQueueWaitOnForceFlushDraft] = useState(false)
+  const [customProfileOracleQueueWaitOnForceFlushDraft, setCustomProfileOracleQueueWaitOnForceFlushDraft] = useState(true)
   const [customProfileProcessingModeDraft, setCustomProfileProcessingModeDraft] = useState<CustomProfileProcessingMode>('batch')
   const [customProfileComputeStrategyDraft, setCustomProfileComputeStrategyDraft] = useState<CustomProfileComputeStrategy>('single')
   const [customProfileComputeExecutorDraft, setCustomProfileComputeExecutorDraft] = useState<CustomProfileComputeExecutor>('thread')
@@ -2592,6 +3966,32 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [selectedProfileEntityKey, setSelectedProfileEntityKey] = useState<string>('')
   const [expandedEditorFieldId, setExpandedEditorFieldId] = useState<string | null>(null)
   const [expandedEditorMode, setExpandedEditorMode] = useState<CustomFieldMode>('value')
+  const [expandedEditorTab, setExpandedEditorTab] = useState<UiExpressionEditorTab>('expression')
+  const [uiExpressionTemplateLabel, setUiExpressionTemplateLabel] = useState<string>(EXPRESSION_FUNCTION_SNIPPETS[0]?.label || '')
+  const [uiExpressionValuesByIndex, setUiExpressionValuesByIndex] = useState<Record<number, string>>({})
+  const [uiExpressionParamModeByIndex, setUiExpressionParamModeByIndex] = useState<Record<number, UiExpressionParameterMode>>({})
+  const [uiExpressionVariables, setUiExpressionVariables] = useState<UiExpressionVariableSpec[]>([])
+  const [uiExpressionBuilderTouched, setUiExpressionBuilderTouched] = useState(false)
+  const [uiGroupAggregateKeyField, setUiGroupAggregateKeyField] = useState('')
+  const [uiGroupAggregateKeyName, setUiGroupAggregateKeyName] = useState('group')
+  const [uiGroupAggregateMetrics, setUiGroupAggregateMetrics] = useState<UiGroupAggregateMetric[]>([
+    createUiGroupAggregateMetric({ outputName: 'metric', path: '', agg: 'sum' }),
+  ])
+  const [uiExpressionJsonKey, setUiExpressionJsonKey] = useState<string>('value')
+  const [uiExpressionNewJsonKeyDraft, setUiExpressionNewJsonKeyDraft] = useState<string>('')
+  const [uiConditionBuilderByIndex, setUiConditionBuilderByIndex] = useState<Record<number, UiConditionBuilderState>>({})
+  const [uiConditionUndoByIndex, setUiConditionUndoByIndex] = useState<Record<number, UiConditionBuilderState[]>>({})
+  const [uiConditionRedoByIndex, setUiConditionRedoByIndex] = useState<Record<number, UiConditionBuilderState[]>>({})
+  const [uiConditionBuilderModalIndex, setUiConditionBuilderModalIndex] = useState<number | null>(null)
+  const [uiFieldBuilderByIndex, setUiFieldBuilderByIndex] = useState<Record<number, UiFieldBuilderState>>({})
+  const [uiFieldBuilderModalIndex, setUiFieldBuilderModalIndex] = useState<number | null>(null)
+  const [uiBreJsonKey, setUiBreJsonKey] = useState<string>('value')
+  const [uiBreModel, setUiBreModel] = useState<BreModel>(() => parseBreModelFromExpression("=if_(true, 'YES', 'NO')"))
+  const [uiExpressionRows, setUiExpressionRows] = useState<UiExpressionBuilderRow[]>([])
+  const uiBreLastAppliedExpressionRef = useRef<string>('')
+  const uiConditionBuilderByIndexRef = useRef<Record<number, UiConditionBuilderState>>({})
+  const uiConditionUndoByIndexRef = useRef<Record<number, UiConditionBuilderState[]>>({})
+  const uiConditionRedoByIndexRef = useRef<Record<number, UiConditionBuilderState[]>>({})
   const [validationLoading, setValidationLoading] = useState(false)
   const [validationResult, setValidationResult] = useState<CustomFieldValidationResult | null>(null)
   const [validationModalOpen, setValidationModalOpen] = useState(false)
@@ -2657,6 +4057,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
   const customEditorThemeId = CUSTOM_EDITOR_THEME_IDS[customEditorColorProfile]
   const customEditorFontFamily = resolveEditorFontFamily(customEditorFontPreset)
+
+  useEffect(() => {
+    uiConditionBuilderByIndexRef.current = uiConditionBuilderByIndex
+  }, [uiConditionBuilderByIndex])
+
+  useEffect(() => {
+    uiConditionUndoByIndexRef.current = uiConditionUndoByIndex
+  }, [uiConditionUndoByIndex])
+
+  useEffect(() => {
+    uiConditionRedoByIndexRef.current = uiConditionRedoByIndex
+  }, [uiConditionRedoByIndex])
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.localStorage) return
@@ -3283,6 +4695,19 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     ),
     [nodeType, selectedNodeId, nodes, edges]
   )
+  const upstreamPreviewReferenceFields = useMemo(
+    () => {
+      if (nodeType !== 'map_transform' || !selectedNodeId) return []
+      const previewRows = inferUpstreamPreviewRows(selectedNodeId, nodes, edges, 300)
+      if (!previewRows.length) return []
+      return filterUserFacingFieldNames(extractSampleFieldPaths(previewRows))
+    },
+    [nodeType, selectedNodeId, nodes, edges]
+  )
+  const currentNodeReferenceFields = useMemo(
+    () => (nodeType === 'map_transform' ? extractDirectNodeFields(node) : []),
+    [nodeType, node]
+  )
   const configuredMapFields = useMemo(
     () => parseFieldList(nodeConfig.fields),
     [nodeConfig.fields]
@@ -3332,18 +4757,34 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const referenceFieldOptions = primaryKeyFieldOptionPool
   const expressionFieldOptions = filterUserFacingFieldNames([
     ...(primaryKeyScopedUpstreamFields.length > 0 ? primaryKeyScopedUpstreamFields : upstreamReferenceFields),
+    ...upstreamPreviewReferenceFields,
+    ...currentNodeReferenceFields,
+    ...parseFieldList(nodeConfig._detected_columns),
+    ...parseDetectedJsonPaths(nodeConfig._json_paths),
     ...(primaryKeyFieldForFilter ? [primaryKeyFieldForFilter] : []),
     ...mapInputFieldOptions,
     ...customFieldDraft.map((item) => String(item.name || '').trim()).filter(Boolean),
   ])
+  const customProfilePathOptions = useMemo(
+    () => filterUserFacingFieldNames(buildCustomProfilePathSuggestions(customFieldDraft)),
+    [customFieldDraft]
+  )
+  const expressionPathOptions = useMemo(
+    () => filterUserFacingFieldNames([...expressionFieldOptions, ...customProfilePathOptions]),
+    [expressionFieldOptions, customProfilePathOptions]
+  )
   const expressionCompletionEntries = useMemo<ExpressionCompletionEntry[]>(() => {
     const out: ExpressionCompletionEntry[] = []
     EXPRESSION_FUNCTION_SNIPPETS.forEach((fn) => {
+      const enrichedSnippet = enrichFunctionSnippetWithFieldChoices(fn.snippet, expressionFieldOptions)
+      const normalizedTemplate = normalizeSnippetTemplateText(enrichedSnippet)
       out.push({
         label: fn.label,
-        insertText: fn.snippet,
+        insertText: enrichedSnippet,
         kind: 'function',
-        detail: 'ETL Function',
+        detail: fn.label,
+        documentation: `Template: \`${normalizedTemplate}\`\n\nSelect and use Tab to fill parameters.`,
+        command: { id: 'editor.action.triggerParameterHints' },
       })
     })
     expressionFieldOptions.forEach((fieldName) => {
@@ -3354,6 +4795,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         detail: 'Source/Custom Field',
       })
     })
+    expressionPathOptions.forEach((pathName) => {
+      out.push({
+        label: pathName,
+        insertText: pathName,
+        kind: 'path',
+        detail: 'Field/Profile Path',
+      })
+    })
     ;[
       { label: 'null', value: 'null' },
       { label: 'true', value: 'true' },
@@ -3362,9 +4811,104 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       out.push({ label: kw.label, insertText: kw.value, kind: 'keyword', detail: 'Literal' })
     })
     return out
-  }, [expressionFieldOptions])
+  }, [expressionFieldOptions, expressionPathOptions])
   // Keep validation/autocomplete context in sync before Monaco editor mount.
   setExpressionCompletionEntries(expressionCompletionEntries)
+  const uiExpressionTemplateOptions = useMemo(
+    () => EXPRESSION_FUNCTION_SNIPPETS.map((item) => ({
+      value: item.label,
+      label: item.label,
+      snippet: item.snippet,
+    })),
+    []
+  )
+  const selectedUiExpressionTemplate = useMemo(
+    () => uiExpressionTemplateOptions.find((item) => item.value === uiExpressionTemplateLabel) || uiExpressionTemplateOptions[0],
+    [uiExpressionTemplateOptions, uiExpressionTemplateLabel]
+  )
+  const selectedUiExpressionTemplateSnippet = String(selectedUiExpressionTemplate?.snippet || '')
+  const isUiGroupAggregateTemplate = useMemo(
+    () => /group_aggregate/i.test(String(selectedUiExpressionTemplate?.value || ''))
+      || /group_aggregate/i.test(selectedUiExpressionTemplateSnippet),
+    [selectedUiExpressionTemplate?.value, selectedUiExpressionTemplateSnippet]
+  )
+  const uiExpressionPlaceholders = useMemo(
+    () => parseSnippetPlaceholders(selectedUiExpressionTemplateSnippet),
+    [selectedUiExpressionTemplateSnippet]
+  )
+  const uiExpressionResolvedValuesByIndex = useMemo(
+    () => (
+      (uiExpressionPlaceholders || []).reduce((acc, placeholder) => {
+        const inputValue = String(
+          uiExpressionValuesByIndex[placeholder.index] ?? placeholder.defaultValue ?? ''
+        )
+        const mode = (uiExpressionParamModeByIndex[placeholder.index] || defaultUiExpressionParameterMode(placeholder)) as UiExpressionParameterMode
+        acc[placeholder.index] = resolveUiExpressionParameterToken(mode, inputValue, uiExpressionVariables)
+        return acc
+      }, {} as Record<number, string>)
+    ),
+    [uiExpressionPlaceholders, uiExpressionValuesByIndex, uiExpressionParamModeByIndex, uiExpressionVariables]
+  )
+  const uiGroupAggregateExpression = useMemo(() => {
+    if (!isUiGroupAggregateTemplate) return ''
+    const keyField = String(uiGroupAggregateKeyField || '').trim()
+    const keyName = String(uiGroupAggregateKeyName || '').trim() || 'group'
+    const metrics = (uiGroupAggregateMetrics || [])
+      .map((metric) => ({
+        outputName: normalizeUiGroupAggregateOutputName(String(metric.outputName || '').trim()),
+        path: String(metric.path || '').trim(),
+        agg: String(metric.agg || '').trim().toLowerCase(),
+      }))
+      .filter((metric) => metric.outputName)
+    const effectiveMetrics = metrics.length > 0
+      ? metrics
+      : [{ outputName: 'metric', path: '', agg: 'sum' }]
+    const metricFragments = effectiveMetrics.map((metric) => {
+      const metricPath = metric.path.replace(/'/g, "\\'")
+      const metricAgg = EXPR_ALLOWED_AGG_VALUES.has(metric.agg) ? metric.agg : 'sum'
+      return `${metric.outputName}=obj(path='${metricPath}',agg='${metricAgg}')`
+    })
+    return `=group_aggregate('${keyField.replace(/'/g, "\\'")}', obj(${metricFragments.join(', ')}), '${keyName.replace(/'/g, "\\'")}')`
+  }, [isUiGroupAggregateTemplate, uiGroupAggregateKeyField, uiGroupAggregateKeyName, uiGroupAggregateMetrics])
+  const uiExpressionPreviewRaw = useMemo(
+    () => (
+      isUiGroupAggregateTemplate
+        ? uiGroupAggregateExpression
+        : buildExpressionFromSnippet(selectedUiExpressionTemplateSnippet, uiExpressionResolvedValuesByIndex)
+    ),
+    [isUiGroupAggregateTemplate, uiGroupAggregateExpression, selectedUiExpressionTemplateSnippet, uiExpressionResolvedValuesByIndex]
+  )
+  const uiExpressionPreview = useMemo(
+    () => normalizeExpressionValue(uiExpressionPreviewRaw),
+    [uiExpressionPreviewRaw]
+  )
+  const uiExpressionJsonPreview = useMemo(
+    () => JSON.stringify(
+      uiExpressionRows.reduce((acc, row) => {
+        const key = String(row.key || '').trim()
+        const raw = String(row.expression || '').trim()
+        if (!key || !raw) return acc
+        acc[key] = parseUiBuilderRowValue(row)
+        return acc
+      }, {} as Record<string, unknown>),
+      null,
+      2
+    ),
+    [uiExpressionRows]
+  )
+  const uiFieldAutoCompleteOptions = useMemo(
+    () => expressionPathOptions.slice(0, 600).map((value) => ({ value })),
+    [expressionPathOptions]
+  )
+  const uiExpressionVariableOptions = useMemo(
+    () => (
+      (uiExpressionVariables || [])
+        .map((item) => String(item.name || '').trim())
+        .filter(Boolean)
+        .map((value) => ({ value, label: value }))
+    ),
+    [uiExpressionVariables]
+  )
   const customFieldExampleCategoryOptions = useMemo(
     () => {
       const categories = Array.from(
@@ -3521,7 +5065,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     ? Math.max(50, Math.min(Math.floor(configuredProfileOracleMergeBatchSizeRaw), 2000))
     : 500
   const configuredProfileOracleQueueEnabled = Boolean(nodeConfig.custom_profile_oracle_queue_enabled ?? true)
-  const configuredProfileOracleQueueWaitOnForceFlush = Boolean(nodeConfig.custom_profile_oracle_queue_wait_on_force_flush ?? false)
+  const configuredProfileOracleQueueWaitOnForceFlush = Boolean(nodeConfig.custom_profile_oracle_queue_wait_on_force_flush ?? true)
   const configuredProfileLivePersist = Boolean(nodeConfig.custom_profile_live_persist ?? false)
   const hasConfiguredProfileFlushEveryRows = Object.prototype.hasOwnProperty.call(nodeConfig, 'custom_profile_flush_every_rows')
   const hasConfiguredProfileFlushIntervalSeconds = Object.prototype.hasOwnProperty.call(nodeConfig, 'custom_profile_flush_interval_seconds')
@@ -3604,6 +5148,133 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => customFieldDraft.find((item) => item.id === expandedEditorFieldId) || null,
     [customFieldDraft, expandedEditorFieldId]
   )
+  const uiExpressionJsonObjectFromEditor = useMemo(
+    () => parseJsonTemplateObject(String(expandedEditorField?.jsonTemplate || '')),
+    [expandedEditorField?.jsonTemplate]
+  )
+  const uiExpressionJsonKeyOptions = useMemo(
+    () => uniqueFieldNames([
+      ...Object.keys(uiExpressionJsonObjectFromEditor || {}),
+      ...uiExpressionRows.map((row) => String(row.key || '').trim()).filter(Boolean),
+      String(uiExpressionJsonKey || '').trim(),
+      String(uiBreJsonKey || '').trim(),
+      String(expandedEditorField?.name || '').trim(),
+      'value',
+    ]).map((value) => ({ value, label: value })),
+    [uiExpressionJsonObjectFromEditor, uiExpressionRows, uiExpressionJsonKey, uiBreJsonKey, expandedEditorField?.name]
+  )
+  const uiBreTargetExpression = useMemo(
+    () => {
+      if (expandedEditorMode === 'json') {
+        const key = String(uiBreJsonKey || '').trim()
+        if (key && uiExpressionJsonObjectFromEditor[key] !== undefined) {
+          return String(uiExpressionJsonObjectFromEditor[key] || '')
+        }
+        const firstEntry = Object.entries(uiExpressionJsonObjectFromEditor || {})[0]
+        return String(firstEntry?.[1] || '')
+      }
+      return String(expandedEditorField?.expression || '')
+    },
+    [expandedEditorMode, uiBreJsonKey, uiExpressionJsonObjectFromEditor, expandedEditorField?.expression]
+  )
+  const uiBreRenderedExpression = useMemo(
+    () => normalizeExpressionValue(buildExpressionFromBreModel(uiBreModel)),
+    [uiBreModel]
+  )
+  useEffect(() => {
+    if (!uiExpressionPlaceholders.length) return
+    setUiExpressionValuesByIndex((prev) => {
+      const next = { ...prev }
+      uiExpressionPlaceholders.forEach((placeholder) => {
+        if (next[placeholder.index] === undefined) {
+          next[placeholder.index] = placeholder.defaultValue
+        }
+      })
+      return next
+    })
+    setUiExpressionParamModeByIndex((prev) => {
+      const next = { ...prev }
+      uiExpressionPlaceholders.forEach((placeholder) => {
+        if (!next[placeholder.index]) {
+          next[placeholder.index] = defaultUiExpressionParameterMode(placeholder)
+        }
+      })
+      return next
+    })
+  }, [uiExpressionPlaceholders])
+  useEffect(() => {
+    if (!isUiGroupAggregateTemplate) return
+    setUiGroupAggregateKeyField((prev) => (String(prev || '').trim() ? prev : (expressionPathOptions[0] || '')))
+    setUiGroupAggregateKeyName((prev) => (String(prev || '').trim() ? prev : 'group'))
+    setUiGroupAggregateMetrics((prev) => (
+      Array.isArray(prev) && prev.length > 0
+        ? prev
+        : [createUiGroupAggregateMetric({ outputName: 'metric', path: expressionPathOptions[0] || '', agg: 'sum' })]
+    ))
+  }, [isUiGroupAggregateTemplate, expressionPathOptions])
+
+  useEffect(() => {
+    if (!expandedEditorField) return
+    if (!String(uiExpressionJsonKey || '').trim()) {
+      setUiExpressionJsonKey(expandedEditorField.name || 'value')
+    }
+  }, [expandedEditorField, uiExpressionJsonKey])
+  useEffect(() => {
+    if (!expandedEditorField || expandedEditorMode !== 'json') return
+    if (!String(uiBreJsonKey || '').trim()) {
+      const firstKey = Object.keys(uiExpressionJsonObjectFromEditor || {})[0] || expandedEditorField.name || 'value'
+      setUiBreJsonKey(String(firstKey || 'value'))
+    }
+  }, [expandedEditorField, expandedEditorMode, uiBreJsonKey, uiExpressionJsonObjectFromEditor])
+
+  useEffect(() => {
+    if (!expandedEditorField || expandedEditorMode !== 'json') return
+    const nextRows = parseJsonTemplateRows(String(expandedEditorField.jsonTemplate || ''))
+    setUiExpressionRows(nextRows)
+  }, [expandedEditorField?.id, expandedEditorField?.jsonTemplate, expandedEditorMode])
+
+  useEffect(() => {
+    if (!expandedEditorField) return
+    const normalizedTargetExpression = normalizeExpressionValue(String(uiBreTargetExpression || '')).trim()
+    if (!normalizedTargetExpression) {
+      setUiBreModel(parseBreModelFromExpression("=if_(true, 'YES', 'NO')"))
+      return
+    }
+    if (
+      uiBreLastAppliedExpressionRef.current
+      && normalizedTargetExpression === uiBreLastAppliedExpressionRef.current
+    ) {
+      uiBreLastAppliedExpressionRef.current = ''
+      return
+    }
+    const parsed = parseBreModelFromExpression(normalizedTargetExpression)
+    setUiBreModel(parsed)
+  }, [expandedEditorField?.id, expandedEditorMode, uiBreJsonKey, uiBreTargetExpression])
+  useEffect(() => {
+    if (!expandedEditorField) return
+    if (expandedEditorTab !== 'ui_expression') return
+    if (!uiExpressionBuilderTouched) return
+    const expression = normalizeExpressionValue(uiExpressionPreviewRaw)
+    if (!expression) return
+    if (expandedEditorMode === 'json') {
+      const key = String(uiExpressionJsonKey || '').trim() || 'value'
+      const currentObject = parseJsonTemplateObject(String(expandedEditorField.jsonTemplate || ''))
+      if (String(currentObject[key] || '').trim() === expression.trim()) return
+      currentObject[key] = expression
+      updateCustomFieldDraft(expandedEditorField.id, { jsonTemplate: JSON.stringify(currentObject, null, 2) })
+      return
+    }
+    if (String(expandedEditorField.expression || '').trim() === expression.trim()) return
+    updateCustomFieldDraft(expandedEditorField.id, { expression })
+  }, [
+    expandedEditorField,
+    expandedEditorTab,
+    uiExpressionBuilderTouched,
+    uiExpressionPreviewRaw,
+    expandedEditorMode,
+    uiExpressionJsonKey,
+  ])
+
   const oracleUpstreamFieldOptions = useMemo(
     () => (
       nodeType === 'oracle_destination' && selectedNodeId
@@ -3911,7 +5582,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     if (!activeProfileDocuments.length) {
       notification.info({
         message: 'No profile data available',
-        description: 'Run pipeline and refresh Profile Monitoring to load stored profile documents.',
+        description: 'Run pipeline and refresh Profile Monitoring.',
         placement: 'bottomRight',
       })
       return
@@ -3924,6 +5595,1066 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const openExpandedEditor = (fieldId: string, mode: CustomFieldMode) => {
     setExpandedEditorFieldId(fieldId)
     setExpandedEditorMode(mode)
+    setExpandedEditorTab('expression')
+    setUiExpressionTemplateLabel(EXPRESSION_FUNCTION_SNIPPETS[0]?.label || '')
+    setUiExpressionValuesByIndex({})
+    setUiExpressionParamModeByIndex({})
+    setUiExpressionVariables([])
+    setUiExpressionBuilderTouched(false)
+    setUiGroupAggregateKeyField('')
+    setUiGroupAggregateKeyName('group')
+    setUiGroupAggregateMetrics([createUiGroupAggregateMetric({ outputName: 'metric', path: '', agg: 'sum' })])
+    setUiExpressionJsonKey('value')
+    setUiExpressionNewJsonKeyDraft('')
+    setUiConditionBuilderByIndex({})
+    setUiConditionUndoByIndex({})
+    setUiConditionRedoByIndex({})
+    setUiConditionBuilderModalIndex(null)
+    setUiFieldBuilderByIndex({})
+    setUiFieldBuilderModalIndex(null)
+    setUiBreJsonKey('value')
+    setUiBreModel(parseBreModelFromExpression("=if_(true, 'YES', 'NO')"))
+    setUiExpressionRows([])
+  }
+
+  const syncBreModelToEditor = (nextModel: BreModel) => {
+    if (!expandedEditorField) return
+    const expression = normalizeExpressionValue(buildExpressionFromBreModel(nextModel))
+    if (!String(expression || '').trim()) return
+    uiBreLastAppliedExpressionRef.current = expression.trim()
+    if (expandedEditorMode === 'json') {
+      const key = String(uiBreJsonKey || '').trim() || 'value'
+      const currentObject = parseJsonTemplateObject(String(expandedEditorField.jsonTemplate || ''))
+      if (String(currentObject[key] || '').trim() === expression.trim()) return
+      currentObject[key] = expression
+      updateCustomFieldDraft(expandedEditorField.id, { jsonTemplate: JSON.stringify(currentObject, null, 2) })
+      return
+    }
+    if (String(expandedEditorField.expression || '').trim() === expression.trim()) return
+    updateCustomFieldDraft(expandedEditorField.id, { expression })
+  }
+
+  const updateUiExpressionPlaceholderValue = (index: number, value: string) => {
+    const safeIndex = Number(index)
+    if (!Number.isFinite(safeIndex)) return
+    setUiExpressionBuilderTouched(true)
+    setUiExpressionValuesByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: String(value || ''),
+    }))
+  }
+
+  const updateUiExpressionPlaceholderMode = (index: number, mode: UiExpressionParameterMode) => {
+    const safeIndex = Number(index)
+    if (!Number.isFinite(safeIndex)) return
+    setUiExpressionBuilderTouched(true)
+    setUiExpressionParamModeByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: mode,
+    }))
+  }
+
+  const splitUiConditionSegmentsByLogical = (sourceRaw: string): Array<{ text: string; joinWithPrev: UiConditionLogicalJoin }> => {
+    const source = String(sourceRaw || '')
+    const segments: Array<{ text: string; joinWithPrev: UiConditionLogicalJoin }> = []
+    let start = 0
+    let quote: '"' | "'" | null = null
+    let escaped = false
+    let depthRound = 0
+    let depthSquare = 0
+    let depthCurly = 0
+    let pendingJoin: UiConditionLogicalJoin = 'and'
+
+    const isBoundary = (ch: string): boolean => (!ch || /[\s()[\]{}:,]/.test(ch))
+
+    for (let i = 0; i < source.length; i += 1) {
+      const ch = source[i]
+      if (quote) {
+        if (escaped) {
+          escaped = false
+          continue
+        }
+        if (ch === '\\') {
+          escaped = true
+          continue
+        }
+        if (ch === quote) {
+          quote = null
+        }
+        continue
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch
+        continue
+      }
+      if (ch === '(') depthRound += 1
+      else if (ch === ')') depthRound = Math.max(0, depthRound - 1)
+      else if (ch === '[') depthSquare += 1
+      else if (ch === ']') depthSquare = Math.max(0, depthSquare - 1)
+      else if (ch === '{') depthCurly += 1
+      else if (ch === '}') depthCurly = Math.max(0, depthCurly - 1)
+
+      if (depthRound || depthSquare || depthCurly) continue
+
+      const remaining = source.slice(i).toLowerCase()
+      const matchedJoin = remaining.startsWith('and')
+        ? 'and'
+        : remaining.startsWith('or')
+          ? 'or'
+          : null
+      if (!matchedJoin) continue
+
+      const prevChar = source[i - 1] || ''
+      const nextChar = source[i + matchedJoin.length] || ''
+      if (!isBoundary(prevChar) || !isBoundary(nextChar)) continue
+
+      const segmentText = source.slice(start, i).trim()
+      if (segmentText) {
+        segments.push({ text: segmentText, joinWithPrev: pendingJoin })
+      }
+      pendingJoin = matchedJoin
+      start = i + matchedJoin.length
+      i = start - 1
+    }
+
+    const tail = source.slice(start).trim()
+    if (tail) {
+      segments.push({ text: tail, joinWithPrev: pendingJoin })
+    }
+
+    return segments.length > 0 ? segments : [{ text: source.trim(), joinWithPrev: 'and' }]
+  }
+
+  const unwrapUiConditionOuterParens = (valueRaw: string): string => {
+    let value = String(valueRaw || '').trim()
+    if (!value) return value
+
+    const isWrappedOnce = (text: string): boolean => {
+      if (!text.startsWith('(') || !text.endsWith(')')) return false
+      let quote: '"' | "'" | null = null
+      let escaped = false
+      let depth = 0
+      for (let i = 0; i < text.length; i += 1) {
+        const ch = text[i]
+        if (quote) {
+          if (escaped) {
+            escaped = false
+            continue
+          }
+          if (ch === '\\') {
+            escaped = true
+            continue
+          }
+          if (ch === quote) quote = null
+          continue
+        }
+        if (ch === '"' || ch === "'") {
+          quote = ch
+          continue
+        }
+        if (ch === '(') depth += 1
+        else if (ch === ')') {
+          depth -= 1
+          if (depth === 0 && i < text.length - 1) return false
+        }
+      }
+      return depth === 0
+    }
+
+    while (isWrappedOnce(value)) {
+      value = value.slice(1, -1).trim()
+    }
+    return value
+  }
+
+  const parseUiConditionRightOperand = (tokenRaw: string): { rightMode: UiConditionClauseRightMode; rightValue: string } => {
+    const token = String(tokenRaw || '').trim()
+    if (!token) return { rightMode: 'literal', rightValue: '' }
+
+    const fieldMatch = token.match(/^field\s*\(\s*(['"])(.*?)\1\s*\)$/i)
+    if (fieldMatch) return { rightMode: 'field', rightValue: String(fieldMatch[2] || '') }
+
+    const valuesMatch = token.match(/^values\s*\(\s*(['"])(.*?)\1\s*\)$/i)
+    if (valuesMatch) return { rightMode: 'values', rightValue: String(valuesMatch[2] || '') }
+
+    const variableMatch = (uiExpressionVariables || []).find((item) => (
+      String(item.value || '').trim() && String(item.value || '').trim() === token
+    ))
+    if (variableMatch) return { rightMode: 'variable', rightValue: String(variableMatch.name || '') }
+
+    const singleQuoted = token.match(/^'(.*)'$/)
+    if (singleQuoted) {
+      return { rightMode: 'literal', rightValue: String(singleQuoted[1] || '').replace(/\\'/g, "'") }
+    }
+    const doubleQuoted = token.match(/^"(.*)"$/)
+    if (doubleQuoted) {
+      return { rightMode: 'literal', rightValue: String(doubleQuoted[1] || '').replace(/\\"/g, '"') }
+    }
+
+    if (/^-?\d+(\.\d+)?$/.test(token) || /^(true|false|null)$/i.test(token)) {
+      return { rightMode: 'literal', rightValue: token }
+    }
+
+    return { rightMode: 'raw', rightValue: token }
+  }
+
+  const parseUiConditionClauseFromText = (
+    sourceRaw: string,
+    clusterId: string,
+    joinWithPrev: UiConditionLogicalJoin,
+  ): UiConditionClause => {
+    const source = unwrapUiConditionOuterParens(String(sourceRaw || '').trim())
+    const fallback = createUiConditionClause(clusterId, {
+      joinWithPrev,
+      operator: 'raw',
+      rightMode: 'raw',
+      rightValue: source || "field('') == ''",
+    })
+    if (!source) return fallback
+
+    const fieldPrefix = source.match(/^field\s*\(/i)
+    if (!fieldPrefix) return fallback
+
+    const openParen = source.indexOf('(', Number(fieldPrefix.index || 0))
+    if (openParen < 0) return fallback
+    const closeParen = findMatchingParenOffset(source, openParen)
+    if (closeParen <= openParen) return fallback
+
+    const leftCall = source.slice(0, closeParen + 1).trim()
+    const leftMatch = leftCall.match(/^field\s*\(\s*(['"])(.*?)\1\s*\)$/i)
+    if (!leftMatch) return fallback
+
+    const leftField = String(leftMatch[2] || '')
+    const remainder = source.slice(closeParen + 1).trim()
+    if (!remainder) return createUiConditionClause(clusterId, {
+      joinWithPrev,
+      leftField,
+      operator: '==',
+      rightMode: 'literal',
+      rightValue: '',
+    })
+
+    const conditionOperators = EXPR_ALLOWED_CONDITION_OPERATORS_OPTIONS
+      .map((op) => String(op || '').trim())
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length)
+
+    let matchedOperator = ''
+    let rightRaw = ''
+    for (const operator of conditionOperators) {
+      const lowerRemainder = remainder.toLowerCase()
+      const lowerOp = operator.toLowerCase()
+      if (!lowerRemainder.startsWith(lowerOp)) continue
+      const nextChar = remainder[operator.length] || ''
+      const requiresBoundary = /^[a-z_]/i.test(operator)
+      if (requiresBoundary && nextChar && !/[\s()[\]{}:,]/.test(nextChar)) continue
+      matchedOperator = operator
+      rightRaw = remainder.slice(operator.length).trim()
+      break
+    }
+
+    if (!matchedOperator) return fallback
+
+    const parsedRight = parseUiConditionRightOperand(rightRaw)
+    return createUiConditionClause(clusterId, {
+      joinWithPrev,
+      leftField,
+      operator: matchedOperator,
+      rightMode: parsedRight.rightMode,
+      rightValue: parsedRight.rightValue,
+    })
+  }
+
+  const parseUiConditionBuilderFromRaw = (rawCondition: string): UiConditionBuilderState => {
+    const source = String(rawCondition || '').trim().replace(/^=\s*/, '').trim()
+    if (!source) return createDefaultUiConditionBuilderState()
+
+    const topLevelSegments = splitUiConditionSegmentsByLogical(source)
+    const clusters: UiConditionCluster[] = []
+    const clauses: UiConditionClause[] = []
+
+    topLevelSegments.forEach((topSegment, topIndex) => {
+      const clusterBody = unwrapUiConditionOuterParens(String(topSegment.text || '').trim())
+      if (!clusterBody) return
+      const cluster = createUiConditionCluster({ joinWithPrev: topIndex === 0 ? 'and' : topSegment.joinWithPrev })
+      clusters.push(cluster)
+      const clauseSegments = splitUiConditionSegmentsByLogical(clusterBody)
+      clauseSegments.forEach((clauseSegment, clauseIndex) => {
+        const clause = parseUiConditionClauseFromText(
+          clauseSegment.text,
+          cluster.id,
+          clauseIndex === 0 ? 'and' : clauseSegment.joinWithPrev,
+        )
+        clauses.push(clause)
+      })
+    })
+
+    if (clusters.length === 0 || clauses.length === 0) {
+      return createDefaultUiConditionBuilderState({
+        clusters: [createUiConditionCluster({ joinWithPrev: 'and' })],
+        clauses: [
+          parseUiConditionClauseFromText(source, 'cluster_1', 'and'),
+        ],
+      })
+    }
+
+    return createDefaultUiConditionBuilderState({ clusters, clauses })
+  }
+
+  const openUiConditionBuilderModal = (index: number, rawCondition: string) => {
+    const safeIndex = Number(index)
+    if (!Number.isFinite(safeIndex)) return
+    const parsed = parseUiConditionBuilderFromRaw(rawCondition)
+    setUiConditionBuilderByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: parsed,
+    }))
+    setUiConditionUndoByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: [],
+    }))
+    setUiConditionRedoByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: [],
+    }))
+    setUiConditionBuilderModalIndex(safeIndex)
+  }
+
+  const updateUiConditionBuilder = (
+    index: number,
+    updater: (state: UiConditionBuilderState) => UiConditionBuilderState,
+  ) => {
+    const safeIndex = Number(index)
+    if (!Number.isFinite(safeIndex)) return
+    const current = createDefaultUiConditionBuilderState(
+      uiConditionBuilderByIndexRef.current[safeIndex] || createDefaultUiConditionBuilderState()
+    )
+    const next = createDefaultUiConditionBuilderState(updater(current))
+    const currentSignature = JSON.stringify(current)
+    const nextSignature = JSON.stringify(next)
+    if (currentSignature === nextSignature) return
+    setUiExpressionBuilderTouched(true)
+    setUiConditionBuilderByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: next,
+    }))
+    const undoStack = [...(uiConditionUndoByIndexRef.current[safeIndex] || []), current].slice(-60)
+    setUiConditionUndoByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: undoStack,
+    }))
+    setUiConditionRedoByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: [],
+    }))
+  }
+
+  const undoUiConditionBuilder = (index: number) => {
+    const safeIndex = Number(index)
+    if (!Number.isFinite(safeIndex)) return
+    const undoStack = [...(uiConditionUndoByIndexRef.current[safeIndex] || [])]
+    if (undoStack.length === 0) return
+    const current = createDefaultUiConditionBuilderState(
+      uiConditionBuilderByIndexRef.current[safeIndex] || createDefaultUiConditionBuilderState()
+    )
+    const previous = createDefaultUiConditionBuilderState(undoStack.pop() || createDefaultUiConditionBuilderState())
+    setUiExpressionBuilderTouched(true)
+    setUiConditionBuilderByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: previous,
+    }))
+    setUiConditionUndoByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: undoStack,
+    }))
+    const redoStack = [...(uiConditionRedoByIndexRef.current[safeIndex] || []), current].slice(-60)
+    setUiConditionRedoByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: redoStack,
+    }))
+  }
+
+  const redoUiConditionBuilder = (index: number) => {
+    const safeIndex = Number(index)
+    if (!Number.isFinite(safeIndex)) return
+    const redoStack = [...(uiConditionRedoByIndexRef.current[safeIndex] || [])]
+    if (redoStack.length === 0) return
+    const current = createDefaultUiConditionBuilderState(
+      uiConditionBuilderByIndexRef.current[safeIndex] || createDefaultUiConditionBuilderState()
+    )
+    const next = createDefaultUiConditionBuilderState(redoStack.pop() || createDefaultUiConditionBuilderState())
+    setUiExpressionBuilderTouched(true)
+    setUiConditionBuilderByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: next,
+    }))
+    const undoStack = [...(uiConditionUndoByIndexRef.current[safeIndex] || []), current].slice(-60)
+    setUiConditionUndoByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: undoStack,
+    }))
+    setUiConditionRedoByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: redoStack,
+    }))
+  }
+
+  const openUiFieldBuilderModal = (index: number, mode: UiExpressionParameterMode, value: string) => {
+    const safeIndex = Number(index)
+    if (!Number.isFinite(safeIndex)) return
+    const nextState = parseUiFieldBuilderFromCurrent(mode, value)
+    setUiFieldBuilderByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: nextState,
+    }))
+    setUiFieldBuilderModalIndex(safeIndex)
+  }
+
+  const updateUiFieldBuilder = (index: number, patch: Partial<UiFieldBuilderState>) => {
+    const safeIndex = Number(index)
+    if (!Number.isFinite(safeIndex)) return
+    setUiFieldBuilderByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: createDefaultUiFieldBuilderState({
+        ...(prev[safeIndex] || createDefaultUiFieldBuilderState()),
+        ...patch,
+      }),
+    }))
+  }
+
+  const applyUiFieldBuilder = (index: number) => {
+    const safeIndex = Number(index)
+    if (!Number.isFinite(safeIndex)) return
+    const state = createDefaultUiFieldBuilderState(uiFieldBuilderByIndex[safeIndex] || createDefaultUiFieldBuilderState())
+    const expression = buildUiFieldBuilderExpression(state)
+    if (state.template === 'field') {
+      updateUiExpressionPlaceholderMode(safeIndex, 'field')
+      updateUiExpressionPlaceholderValue(safeIndex, state.fieldPath)
+    } else if (state.template === 'values') {
+      updateUiExpressionPlaceholderMode(safeIndex, 'values')
+      updateUiExpressionPlaceholderValue(safeIndex, state.fieldPath)
+    } else {
+      updateUiExpressionPlaceholderMode(safeIndex, 'raw')
+      updateUiExpressionPlaceholderValue(safeIndex, expression)
+    }
+    setUiFieldBuilderModalIndex(null)
+    notification.success({
+      message: 'Field expression applied',
+      description: `Parameter #${safeIndex} updated.`,
+      placement: 'bottomRight',
+      duration: 1.8,
+    })
+  }
+
+  const addUiConditionCluster = (index: number) => {
+    updateUiConditionBuilder(index, (state) => {
+      const existingIds = new Set((state.clusters || []).map((cluster) => String(cluster.id || '').toLowerCase()))
+      let counter = (state.clusters || []).length + 1
+      let nextId = `cluster_${counter}`
+      while (existingIds.has(nextId.toLowerCase())) {
+        counter += 1
+        nextId = `cluster_${counter}`
+      }
+      const nextCluster = createUiConditionCluster({ id: nextId, joinWithPrev: 'and' })
+      const nextClause = createUiConditionClause(nextCluster.id, { joinWithPrev: 'and' })
+      return {
+        ...state,
+        clusters: [...state.clusters, nextCluster],
+        clauses: [...state.clauses, nextClause],
+      }
+    })
+  }
+
+  const removeUiConditionCluster = (index: number, clusterId: string) => {
+    updateUiConditionBuilder(index, (state) => {
+      const safeClusterId = String(clusterId || '').trim()
+      if (!safeClusterId || state.clusters.length <= 1) return state
+      const nextClusters = state.clusters.filter((cluster) => cluster.id !== safeClusterId)
+      const nextClauses = state.clauses.filter((clause) => clause.clusterId !== safeClusterId)
+      if (nextClauses.length === 0) {
+        const fallbackCluster = nextClusters[0] || createUiConditionCluster({ id: 'cluster_1', joinWithPrev: 'and' })
+        return {
+          clusters: nextClusters.length > 0 ? nextClusters : [fallbackCluster],
+          clauses: [createUiConditionClause(fallbackCluster.id, { id: 'clause_1', joinWithPrev: 'and' })],
+        }
+      }
+      return {
+        clusters: nextClusters,
+        clauses: nextClauses,
+      }
+    })
+  }
+
+  const updateUiConditionClusterJoin = (index: number, clusterId: string, joinWithPrev: UiConditionLogicalJoin) => {
+    updateUiConditionBuilder(index, (state) => ({
+      ...state,
+      clusters: state.clusters.map((cluster) => (
+        cluster.id === clusterId
+          ? { ...cluster, joinWithPrev: joinWithPrev === 'or' ? 'or' : 'and' }
+          : cluster
+      )),
+    }))
+  }
+
+  const addUiConditionClause = (index: number, clusterId: string) => {
+    const safeClusterId = String(clusterId || '').trim()
+    if (!safeClusterId) return
+    updateUiConditionBuilder(index, (state) => ({
+      ...state,
+      clauses: [...state.clauses, createUiConditionClause(safeClusterId, { joinWithPrev: 'and' })],
+    }))
+  }
+
+  const removeUiConditionClause = (index: number, clauseId: string) => {
+    const safeClauseId = String(clauseId || '').trim()
+    if (!safeClauseId) return
+    updateUiConditionBuilder(index, (state) => {
+      const nextClauses = state.clauses.filter((clause) => clause.id !== safeClauseId)
+      if (nextClauses.length === 0) {
+        const fallbackCluster = state.clusters[0] || createUiConditionCluster({ id: 'cluster_1', joinWithPrev: 'and' })
+        return {
+          clusters: state.clusters.length > 0 ? state.clusters : [fallbackCluster],
+          clauses: [createUiConditionClause(fallbackCluster.id, { id: 'clause_1', joinWithPrev: 'and' })],
+        }
+      }
+      const referencedClusters = new Set(nextClauses.map((clause) => clause.clusterId))
+      const nextClusters = state.clusters.filter((cluster) => referencedClusters.has(cluster.id))
+      return {
+        clusters: nextClusters.length > 0 ? nextClusters : state.clusters.slice(0, 1),
+        clauses: nextClauses,
+      }
+    })
+  }
+
+  const updateUiConditionClause = (index: number, clauseId: string, patch: Partial<UiConditionClause>) => {
+    const safeClauseId = String(clauseId || '').trim()
+    if (!safeClauseId) return
+    updateUiConditionBuilder(index, (state) => ({
+      ...state,
+      clauses: state.clauses.map((clause) => (
+        clause.id === safeClauseId
+          ? {
+            ...clause,
+            ...patch,
+            joinWithPrev: patch.joinWithPrev === 'or' ? 'or' : patch.joinWithPrev === 'and' ? 'and' : clause.joinWithPrev,
+            rightMode: (
+              patch.rightMode === 'field'
+              || patch.rightMode === 'values'
+              || patch.rightMode === 'variable'
+              || patch.rightMode === 'raw'
+              || patch.rightMode === 'literal'
+                ? patch.rightMode
+                : clause.rightMode
+            ),
+          }
+          : clause
+      )),
+    }))
+  }
+
+  const buildUiConditionClauseExpression = (clause: UiConditionClause): string => {
+    const leftField = String(clause.leftField || '').trim()
+    const leftToken = leftField ? `field('${leftField.replace(/'/g, "\\'")}')` : "field('')"
+    const operator = String(clause.operator || '==').trim() || '=='
+    if (operator.toLowerCase() === 'raw') {
+      return String(clause.rightValue || '').trim() || "field('') == ''"
+    }
+    const rightMode: UiExpressionParameterMode = clause.rightMode === 'field'
+      ? 'field'
+      : clause.rightMode === 'values'
+        ? 'values'
+        : clause.rightMode === 'variable'
+          ? 'variable'
+          : clause.rightMode === 'raw'
+            ? 'raw'
+            : 'literal'
+    const rightToken = resolveUiExpressionParameterToken(
+      rightMode,
+      String(clause.rightValue || ''),
+      uiExpressionVariables,
+    )
+    return `${leftToken} ${operator} ${rightToken}`
+  }
+
+  const applyUiConditionBuilderToPlaceholder = (index: number) => {
+    const safeIndex = Number(index)
+    if (!Number.isFinite(safeIndex)) return
+    const state = uiConditionBuilderByIndex[safeIndex] || createDefaultUiConditionBuilderState()
+    const normalizedState = createDefaultUiConditionBuilderState(state)
+    const clusterMap = new Map<string, UiConditionClause[]>()
+    normalizedState.clauses.forEach((clause) => {
+      const clusterId = String(clause.clusterId || '')
+      if (!clusterId) return
+      if (!clusterMap.has(clusterId)) clusterMap.set(clusterId, [])
+      clusterMap.get(clusterId)?.push(clause)
+    })
+    const clusterExpressions: Array<{ joinWithPrev: UiConditionLogicalJoin; expression: string }> = []
+    normalizedState.clusters.forEach((cluster, clusterIndex) => {
+      const clusterClauses = clusterMap.get(cluster.id) || []
+      if (clusterClauses.length === 0) return
+      const clauseExpression = clusterClauses
+        .map((clause, clauseIndex) => {
+          const expr = buildUiConditionClauseExpression(clause)
+          if (clauseIndex === 0) return expr
+          return `${clause.joinWithPrev === 'or' ? 'or' : 'and'} ${expr}`
+        })
+        .join(' ')
+      clusterExpressions.push({
+        joinWithPrev: clusterIndex === 0 ? 'and' : (cluster.joinWithPrev === 'or' ? 'or' : 'and'),
+        expression: `(${clauseExpression})`,
+      })
+    })
+    const conditionExpression = clusterExpressions.length > 0
+      ? clusterExpressions
+        .map((item, idx) => (idx === 0 ? item.expression : `${item.joinWithPrev} ${item.expression}`))
+        .join(' ')
+      : "field('') == ''"
+    updateUiExpressionPlaceholderMode(safeIndex, 'raw')
+    updateUiExpressionPlaceholderValue(safeIndex, conditionExpression)
+    notification.success({
+      message: 'Condition applied',
+      description: `Parameter #${safeIndex} updated.`,
+      placement: 'bottomRight',
+      duration: 1.8,
+    })
+  }
+
+  const createUiExpressionJsonRow = () => {
+    const key = String(uiExpressionNewJsonKeyDraft || '').trim()
+    if (!key) {
+      notification.warning({
+        message: 'Key name required',
+        description: 'Enter a key name to create a new JSON mapping row.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    const exists = (uiExpressionRows || []).some(
+      (row) => String(row.key || '').trim().toLowerCase() === key.toLowerCase()
+    )
+    if (exists) {
+      notification.info({
+        message: 'Key already exists',
+        description: `JSON key "${key}" is already present. You can edit it.`,
+        placement: 'bottomRight',
+      })
+      setUiExpressionJsonKey(key)
+      return
+    }
+    const rowId = `ui_row_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    setUiExpressionRows((prev) => ([
+      ...prev,
+      { id: rowId, key, expression: "=field('')", valueType: 'expression' },
+    ]))
+    setUiExpressionJsonKey(key)
+    setUiExpressionNewJsonKeyDraft('')
+    notification.success({
+      message: 'New key created',
+      description: `Created JSON key "${key}". Use Edit to configure expression.`,
+      placement: 'bottomRight',
+    })
+  }
+
+  const addUiExpressionVariable = () => {
+    setUiExpressionBuilderTouched(true)
+    const existingNames = new Set(
+      (uiExpressionVariables || []).map((item) => String(item.name || '').trim().toLowerCase()).filter(Boolean)
+    )
+    let counter = (uiExpressionVariables || []).length + 1
+    let candidate = `var_${counter}`
+    while (existingNames.has(candidate.toLowerCase())) {
+      counter += 1
+      candidate = `var_${counter}`
+    }
+    setUiExpressionVariables((prev) => [
+      ...prev,
+      createUiExpressionVariableSpec({ name: candidate, value: "''" }),
+    ])
+  }
+
+  const updateUiExpressionVariable = (id: string, patch: Partial<UiExpressionVariableSpec>) => {
+    setUiExpressionBuilderTouched(true)
+    setUiExpressionVariables((prev) => (
+      (prev || []).map((item) => (item.id === id ? { ...item, ...patch } : item))
+    ))
+  }
+
+  const removeUiExpressionVariable = (id: string) => {
+    setUiExpressionBuilderTouched(true)
+    setUiExpressionVariables((prev) => (prev || []).filter((item) => item.id !== id))
+  }
+
+  const addUiGroupAggregateMetric = () => {
+    setUiExpressionBuilderTouched(true)
+    const defaultPath = expressionPathOptions[0] || ''
+    setUiGroupAggregateMetrics((prev) => [
+      ...(prev || []),
+      createUiGroupAggregateMetric({ outputName: `metric_${(prev || []).length + 1}`, path: defaultPath, agg: 'sum' }),
+    ])
+  }
+
+  const updateUiGroupAggregateMetric = (id: string, patch: Partial<UiGroupAggregateMetric>) => {
+    setUiExpressionBuilderTouched(true)
+    setUiGroupAggregateMetrics((prev) => (
+      (prev || []).map((metric) => {
+        if (metric.id !== id) return metric
+        return {
+          ...metric,
+          ...patch,
+          outputName: patch.outputName !== undefined
+            ? normalizeUiGroupAggregateOutputName(String(patch.outputName || ''))
+            : metric.outputName,
+        }
+      })
+    ))
+  }
+
+  const removeUiGroupAggregateMetric = (id: string) => {
+    setUiExpressionBuilderTouched(true)
+    setUiGroupAggregateMetrics((prev) => {
+      const next = (prev || []).filter((metric) => metric.id !== id)
+      return next.length > 0 ? next : [createUiGroupAggregateMetric({ outputName: 'metric', path: expressionPathOptions[0] || '', agg: 'sum' })]
+    })
+  }
+
+  const addUiBreClause = () => {
+    setUiBreModel((prev) => {
+      const nextModel: BreModel = {
+        ...prev,
+        clauses: [
+          ...(Array.isArray(prev.clauses) ? prev.clauses : []),
+          createBreClause({
+            joinWithPrev: 'and',
+            leftKind: 'field',
+            leftValue: expressionPathOptions[0] || '',
+            operator: '==',
+            rightKind: 'literal',
+            rightValue: '',
+          }),
+        ],
+        parseError: null,
+      }
+      syncBreModelToEditor(nextModel)
+      return nextModel
+    })
+  }
+
+  const updateUiBreClause = (clauseId: string, patch: Partial<BreClause>) => {
+    setUiBreModel((prev) => {
+      const nextModel: BreModel = {
+        ...prev,
+        clauses: (prev.clauses || []).map((clause) => (
+          clause.id === clauseId
+            ? {
+              ...clause,
+              ...patch,
+              joinWithPrev: (patch.joinWithPrev || clause.joinWithPrev || 'and') as BreClauseJoin,
+              leftKind: (patch.leftKind || clause.leftKind || 'field') as BreClauseOperandKind,
+              operator: (patch.operator || clause.operator || '==') as BreClauseOperator,
+              rightKind: (patch.rightKind || clause.rightKind || 'literal') as BreClauseOperandKind,
+            }
+            : clause
+        )),
+        parseError: null,
+      }
+      syncBreModelToEditor(nextModel)
+      return nextModel
+    })
+  }
+
+  const removeUiBreClause = (clauseId: string) => {
+    setUiBreModel((prev) => {
+      const nextClauses = (prev.clauses || []).filter((clause) => clause.id !== clauseId)
+      const nextModel: BreModel = {
+        ...prev,
+        clauses: nextClauses.length > 0 ? nextClauses : [createBreClause()],
+        parseError: null,
+      }
+      syncBreModelToEditor(nextModel)
+      return nextModel
+    })
+  }
+
+  const updateUiBreThenExpr = (nextThenExpr: string) => {
+    setUiBreModel((prev) => {
+      const nextModel: BreModel = {
+        ...prev,
+        thenExpr: String(nextThenExpr || ''),
+        parseError: null,
+      }
+      syncBreModelToEditor(nextModel)
+      return nextModel
+    })
+  }
+
+  const updateUiBreElseExpr = (nextElseExpr: string) => {
+    setUiBreModel((prev) => {
+      const nextModel: BreModel = {
+        ...prev,
+        elseExpr: String(nextElseExpr || ''),
+        parseError: null,
+      }
+      syncBreModelToEditor(nextModel)
+      return nextModel
+    })
+  }
+
+  const reloadUiBreFromExpression = () => {
+    const parsed = parseBreModelFromExpression(uiBreTargetExpression)
+    setUiBreModel(parsed)
+    if (parsed.parseError) {
+      notification.warning({
+        message: 'BRE parsing partial',
+        description: parsed.parseError,
+        placement: 'bottomRight',
+      })
+    } else {
+      notification.success({
+        message: 'BRE synced',
+        description: 'UI BRE model loaded from current expression.',
+        placement: 'bottomRight',
+      })
+    }
+  }
+
+  const applyUiBreNow = () => {
+    if (!expandedEditorField) return
+    syncBreModelToEditor(uiBreModel)
+    notification.success({
+      message: 'BRE expression synced',
+      description: 'Expression editor is synchronized from BRE builder.',
+      placement: 'bottomRight',
+    })
+  }
+
+  const applyUiExpressionToEditor = () => {
+    if (!expandedEditorField) return
+    const expression = normalizeExpressionValue(uiExpressionPreviewRaw)
+    if (!expression) return
+    if (expandedEditorMode === 'json') {
+      const key = String(uiExpressionJsonKey || '').trim() || 'value'
+      let parsed: Record<string, unknown> = {}
+      try {
+        const current = JSON.parse(String(expandedEditorField.jsonTemplate || '{}'))
+        if (current && typeof current === 'object' && !Array.isArray(current)) {
+          parsed = { ...(current as Record<string, unknown>) }
+        }
+      } catch {
+        parsed = {}
+      }
+      parsed[key] = expression
+      updateCustomFieldDraft(expandedEditorField.id, { jsonTemplate: JSON.stringify(parsed, null, 2) })
+      notification.success({
+        message: 'Expression applied',
+        description: `Added/updated JSON key "${key}" in template.`,
+        placement: 'bottomRight',
+      })
+      return
+    }
+    updateCustomFieldDraft(expandedEditorField.id, { expression })
+    notification.success({
+      message: 'Expression applied',
+      description: 'UI Expression output copied to Expression editor.',
+      placement: 'bottomRight',
+    })
+  }
+
+  const loadUiExpressionIntoBuilder = (sourceExpression: string): boolean => {
+    const normalized = normalizeExpressionValue(String(sourceExpression || '')).trim()
+    if (!normalized) {
+      return false
+    }
+    const body = normalized.startsWith('=') ? normalized.slice(1).trim() : normalized
+    const call = parseTopLevelFunctionCallSource(body)
+    if (!call) {
+      return false
+    }
+    const fnNameLower = String(call.name || '').toLowerCase()
+    const matchedTemplate = uiExpressionTemplateOptions.find((item) => (
+      extractSnippetFunctionName(String(item.snippet || '')).toLowerCase() === fnNameLower
+    ))
+    if (!matchedTemplate) {
+      return false
+    }
+
+    setUiExpressionBuilderTouched(true)
+    setUiExpressionTemplateLabel(String(matchedTemplate.value || ''))
+
+    if (fnNameLower === 'group_aggregate') {
+      const keyField = stripEnclosingQuotes(String(call.args[0] || ''))
+      const metrics = parseGroupAggregateMetricsFromArg(String(call.args[1] || ''))
+      const keyName = stripEnclosingQuotes(String(call.args[2] || '')) || 'group'
+      setUiGroupAggregateKeyField(keyField)
+      setUiGroupAggregateKeyName(keyName)
+      setUiGroupAggregateMetrics(
+        metrics.length > 0
+          ? metrics
+          : [createUiGroupAggregateMetric({ outputName: 'metric', path: expressionPathOptions[0] || '', agg: 'sum' })]
+      )
+      return true
+    }
+
+    const placeholders = parseSnippetPlaceholders(String(matchedTemplate.snippet || ''))
+    const nextModes: Record<number, UiExpressionParameterMode> = {}
+    const nextValues: Record<number, string> = {}
+    placeholders.forEach((placeholder) => {
+      const argIndex = Math.max(0, Number(placeholder.index) - 1)
+      const argValue = String(call.args[argIndex] || '').trim()
+      if (!argValue) return
+      const inferred = inferUiExpressionModeAndValue(argValue)
+      nextModes[placeholder.index] = inferred.mode
+      nextValues[placeholder.index] = inferred.value
+    })
+    setUiExpressionParamModeByIndex(nextModes)
+    setUiExpressionValuesByIndex(nextValues)
+    return true
+  }
+
+  const loadUiExpressionFromEditor = () => {
+    if (!expandedEditorField) return
+    const activeExpression = (() => {
+      if (expandedEditorMode !== 'json') return String(expandedEditorField.expression || '')
+      const key = String(uiExpressionJsonKey || '').trim()
+      const fromJson = parseJsonTemplateObject(String(expandedEditorField.jsonTemplate || '{}'))
+      if (key && typeof fromJson[key] === 'string') return String(fromJson[key] || '')
+      const firstStringEntry = Object.values(fromJson).find((value) => typeof value === 'string')
+      return String(firstStringEntry || '')
+    })()
+
+    const loaded = loadUiExpressionIntoBuilder(activeExpression)
+    if (loaded) {
+      notification.success({
+        message: 'Builder synced',
+        description: 'Loaded expression from editor into UI Expression Builder.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    notification.warning({
+      message: 'Unable to load',
+      description: 'UI builder can load supported top-level function expressions only.',
+      placement: 'bottomRight',
+    })
+  }
+
+  const editUiExpressionJsonRowInBuilder = (row: UiExpressionBuilderRow) => {
+    const key = String(row.key || '').trim()
+    if (key) setUiExpressionJsonKey(key)
+    if ((row.valueType || 'expression') !== 'expression') {
+      notification.info({
+        message: 'JSON row selected',
+        description: 'This row stores JSON. Edit its JSON directly in the row editor.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    const loaded = loadUiExpressionIntoBuilder(String(row.expression || ''))
+    if (!loaded) {
+      notification.warning({
+        message: 'Unable to load row',
+        description: 'Selected row expression is not supported by UI builder parser.',
+        placement: 'bottomRight',
+      })
+    }
+  }
+
+  const upsertUiExpressionJsonRow = () => {
+    const key = String(uiExpressionJsonKey || '').trim()
+    const expression = normalizeExpressionValue(uiExpressionPreviewRaw)
+    if (!key) {
+      notification.warning({
+        message: 'JSON key required',
+        description: 'Enter a JSON key before adding expression row.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    if (!expression) {
+      notification.warning({
+        message: 'Expression required',
+        description: 'Build an expression before adding JSON row.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    const rowId = `ui_row_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    setUiExpressionRows((prev) => {
+      const next = [...prev]
+      const existingIdx = next.findIndex((row) => row.key.trim().toLowerCase() === key.toLowerCase())
+      if (existingIdx >= 0) {
+        next[existingIdx] = { ...next[existingIdx], expression, key, valueType: next[existingIdx].valueType || 'expression' }
+      } else {
+        next.push({ id: rowId, key, expression, valueType: 'expression' })
+      }
+      return next
+    })
+  }
+
+  const updateUiExpressionJsonRow = (rowId: string, patch: Partial<UiExpressionBuilderRow>) => {
+    setUiExpressionRows((prev) =>
+      prev.map((row) => (row.id === rowId
+        ? {
+          ...row,
+          ...(patch.key !== undefined ? { key: String(patch.key || '') } : {}),
+          ...(patch.expression !== undefined ? { expression: String(patch.expression || '') } : {}),
+          ...(patch.valueType !== undefined ? { valueType: patch.valueType } : {}),
+        }
+        : row
+      ))
+    )
+  }
+
+  const removeUiExpressionJsonRow = (rowId: string) => {
+    setUiExpressionRows((prev) => prev.filter((row) => row.id !== rowId))
+  }
+
+  const applyUiExpressionJsonRowsToEditor = () => {
+    if (!expandedEditorField || expandedEditorMode !== 'json') return
+    const normalizedRows = uiExpressionRows
+      .map((row) => ({
+        key: String(row.key || '').trim(),
+        raw: String(row.expression || '').trim(),
+        value: parseUiBuilderRowValue(row),
+      }))
+      .filter((row) => row.key && row.raw)
+    if (!normalizedRows.length) {
+      notification.warning({
+        message: 'No rows to apply',
+        description: 'Add at least one JSON expression row in UI builder.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    const payload: Record<string, unknown> = {}
+    normalizedRows.forEach((row) => {
+      payload[row.key] = row.value
+    })
+    updateCustomFieldDraft(expandedEditorField.id, { jsonTemplate: JSON.stringify(payload, null, 2) })
+    notification.success({
+      message: 'JSON template applied',
+      description: `Applied ${normalizedRows.length} UI-built expression row${normalizedRows.length === 1 ? '' : 's'}.`,
+      placement: 'bottomRight',
+    })
+  }
+
+  const loadUiExpressionRowsFromEditor = () => {
+    if (!expandedEditorField || expandedEditorMode !== 'json') return
+    try {
+      const rows = parseJsonTemplateRows(String(expandedEditorField.jsonTemplate || '{}'))
+      setUiExpressionRows(rows)
+      if (rows[0]) setUiExpressionJsonKey(rows[0].key)
+      notification.success({
+        message: 'UI rows loaded',
+        description: `Loaded ${rows.length} expression row${rows.length === 1 ? '' : 's'} from JSON template.`,
+        placement: 'bottomRight',
+      })
+    } catch (err: any) {
+      notification.error({
+        message: 'Load failed',
+        description: String(err?.message || 'JSON template is invalid'),
+        placement: 'bottomRight',
+      })
+    }
   }
 
   const runCustomFieldValidation = async () => {
@@ -4236,7 +6967,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setExampleRepoCategory('all')
     setExampleRepoSearch('')
     setCustomFieldBeautifyUndoById({})
-    setCustomFieldBeautifyUndoAllSnapshot(null)
     setCustomFieldStudioOpen(true)
     setProfileMonitorData(null)
     setProfileMonitorError(null)
@@ -4247,7 +6977,26 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setCollapsedCustomFieldIds(collapsedIds.filter((id) => draftIdSet.has(id)))
   }
 
-  const updateCustomFieldDraft = (id: string, patch: Partial<CustomFieldSpec>) => {
+  const updateCustomFieldDraft = (
+    id: string,
+    patch: Partial<CustomFieldSpec>,
+    options?: { preserveBeautifyUndo?: boolean },
+  ) => {
+    const shouldClearBeautifyUndo = (
+      !options?.preserveBeautifyUndo
+      && (
+        Object.prototype.hasOwnProperty.call(patch, 'expression')
+        || Object.prototype.hasOwnProperty.call(patch, 'jsonTemplate')
+      )
+    )
+    if (shouldClearBeautifyUndo) {
+      setCustomFieldBeautifyUndoById((prev) => {
+        if (!prev[id]) return prev
+        const next = { ...prev }
+        delete next[id]
+        return next
+      })
+    }
     setCustomFieldDraft((prev) =>
       prev.map((item) => (item.id === id ? { ...item, ...patch } : item))
     )
@@ -4275,7 +7024,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             jsonTemplate: String(target.jsonTemplate || ''),
           },
         }))
-        updateCustomFieldDraft(id, { jsonTemplate: formatted })
+        updateCustomFieldDraft(id, { jsonTemplate: formatted }, { preserveBeautifyUndo: true })
         notification.success({
           message: 'Beautified',
           description: 'JSON template formatted successfully.',
@@ -4308,7 +7057,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         jsonTemplate: String(target.jsonTemplate || ''),
       },
     }))
-    updateCustomFieldDraft(id, { expression: formatted })
+    updateCustomFieldDraft(id, { expression: formatted }, { preserveBeautifyUndo: true })
     notification.success({
       message: 'Beautified',
       description: 'Expression formatted successfully.',
@@ -4331,7 +7080,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     updateCustomFieldDraft(id, {
       expression: backup.expression,
       jsonTemplate: backup.jsonTemplate,
-    })
+    }, { preserveBeautifyUndo: true })
     setCustomFieldBeautifyUndoById((prev) => {
       const next = { ...prev }
       delete next[id]
@@ -4342,75 +7091,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       description: 'Field content restored to previous version.',
       placement: 'bottomRight',
       duration: 1.5,
-    })
-  }
-
-  const beautifyAllCustomFieldDrafts = () => {
-    const snapshot = cloneCustomFieldSpecs(customFieldDraft)
-    if (snapshot.length === 0) return
-    const backupById: Record<string, CustomFieldBeautifyBackup> = {}
-    snapshot.forEach((item) => {
-      backupById[item.id] = {
-        expression: String(item.expression || ''),
-        jsonTemplate: String(item.jsonTemplate || ''),
-      }
-    })
-
-    let formattedCount = 0
-    let failedCount = 0
-    const next = snapshot.map((item) => {
-      if (item.mode === 'json') {
-        try {
-          const formatted = beautifyJsonTemplateText(item.jsonTemplate)
-          if (formatted !== item.jsonTemplate) formattedCount += 1
-          return { ...item, jsonTemplate: formatted }
-        } catch {
-          failedCount += 1
-          return item
-        }
-      }
-      const formatted = beautifyExpressionText(item.expression)
-      if (formatted !== item.expression) formattedCount += 1
-      return { ...item, expression: formatted }
-    })
-    setCustomFieldBeautifyUndoAllSnapshot(snapshot)
-    setCustomFieldBeautifyUndoById((prev) => ({ ...prev, ...backupById }))
-    setCustomFieldDraft(next)
-    if (failedCount > 0) {
-      notification.warning({
-        message: 'Beautify completed with warnings',
-        description: `${formattedCount} field(s) formatted. ${failedCount} JSON field(s) have invalid JSON and were skipped.`,
-        placement: 'bottomRight',
-      })
-      return
-    }
-    notification.success({
-      message: 'Beautify completed',
-      description: `${formattedCount} field(s) formatted.`,
-      placement: 'bottomRight',
-      duration: 1.8,
-    })
-  }
-
-  const undoBeautifyAllCustomFieldDrafts = () => {
-    if (!customFieldBeautifyUndoAllSnapshot || customFieldBeautifyUndoAllSnapshot.length === 0) {
-      notification.info({
-        message: 'Nothing to revert',
-        description: 'No "Beautify All" snapshot available.',
-        placement: 'bottomRight',
-        duration: 1.5,
-      })
-      return
-    }
-    const snapshot = cloneCustomFieldSpecs(customFieldBeautifyUndoAllSnapshot)
-    setCustomFieldDraft(snapshot)
-    setCustomFieldBeautifyUndoAllSnapshot(null)
-    setCustomFieldBeautifyUndoById({})
-    notification.success({
-      message: 'Beautify All reverted',
-      description: 'All custom fields restored to previous version.',
-      placement: 'bottomRight',
-      duration: 1.8,
     })
   }
 
@@ -5325,7 +8005,19 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             <Space direction="vertical" size={6} style={{ width: '100%' }}>
               <Space style={{ justifyContent: 'space-between', width: '100%' }}>
                 <Button
-                  onClick={openCustomFieldStudio}
+                  onMouseDown={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                  }}
+                  onPointerDown={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                  }}
+                  onClick={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    openCustomFieldStudio()
+                  }}
                   style={{
                     background: '#6366f11a',
                     border: '1px solid #6366f140',
@@ -5550,6 +8242,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   }
 
   // Filter out internal fields (prefixed with _)
+  if (!data || !definition) {
+    return null
+  }
+
   const visibleFields = definition.configFields.filter((f) => {
     if (f.name.startsWith('_')) return false
     if (nodeType === 'oracle_destination' && (f.name === 'table' || f.name === 'if_exists')) {
@@ -5963,7 +8659,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         onCancel={() => setCustomFieldStudioOpen(false)}
         footer={null}
         closable={false}
-        maskClosable
+        maskClosable={false}
         centered
         width="96vw"
         styles={{
@@ -6002,48 +8698,57 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               Custom Fields Studio
             </Text>
             <br />
-            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
-              Build formula fields + nested JSON object/array outputs using source fields and custom fields.
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+              Build formula fields and nested JSON outputs.
             </Text>
           </div>
           <Space wrap>
-            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Editor Style</Text>
-            <Select
-              size="small"
-              value={customEditorColorProfile}
-              onChange={(value) => setCustomEditorColorProfile(value as CustomEditorColorProfile)}
-              options={CUSTOM_EDITOR_COLOR_PROFILE_OPTIONS}
-              style={{ width: 150 }}
-            />
-            <Select
-              size="small"
-              value={customEditorFontPreset}
-              onChange={(value) => setCustomEditorFontPreset(value as CustomEditorFontPreset)}
-              options={CUSTOM_EDITOR_FONT_FAMILY_OPTIONS}
-              style={{ width: 150 }}
-            />
-            <Select
-              size="small"
-              value={customEditorFontSize}
-              onChange={(value) => setCustomEditorFontSize(Number(value || 13))}
-              options={[11, 12, 13, 14, 15, 16, 18, 20].map((size) => ({ value: size, label: `Size ${size}` }))}
-              style={{ width: 108 }}
-            />
-            <Select
-              size="small"
-              value={customEditorLineHeight}
-              onChange={(value) => setCustomEditorLineHeight(Number(value || 22))}
-              options={[18, 20, 22, 24, 26, 28].map((line) => ({ value: line, label: `Line ${line}` }))}
-              style={{ width: 108 }}
-            />
-            <Space size={4}>
-              <Switch size="small" checked={customEditorWordWrap} onChange={setCustomEditorWordWrap} />
-              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Wrap</Text>
-            </Space>
-            <Space size={4}>
-              <Switch size="small" checked={customEditorLigatures} onChange={setCustomEditorLigatures} />
-              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Ligatures</Text>
-            </Space>
+            <Popover
+              trigger="click"
+              placement="bottomRight"
+              content={(
+                <div style={{ width: 320, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                  <Select
+                    size="small"
+                    value={customEditorColorProfile}
+                    onChange={(value) => setCustomEditorColorProfile(value as CustomEditorColorProfile)}
+                    options={CUSTOM_EDITOR_COLOR_PROFILE_OPTIONS}
+                    style={{ width: '100%' }}
+                  />
+                  <Select
+                    size="small"
+                    value={customEditorFontPreset}
+                    onChange={(value) => setCustomEditorFontPreset(value as CustomEditorFontPreset)}
+                    options={CUSTOM_EDITOR_FONT_FAMILY_OPTIONS}
+                    style={{ width: '100%' }}
+                  />
+                  <Select
+                    size="small"
+                    value={customEditorFontSize}
+                    onChange={(value) => setCustomEditorFontSize(Number(value || 13))}
+                    options={[11, 12, 13, 14, 15, 16, 18, 20].map((size) => ({ value: size, label: `Size ${size}` }))}
+                    style={{ width: '100%' }}
+                  />
+                  <Select
+                    size="small"
+                    value={customEditorLineHeight}
+                    onChange={(value) => setCustomEditorLineHeight(Number(value || 22))}
+                    options={[18, 20, 22, 24, 26, 28].map((line) => ({ value: line, label: `Line ${line}` }))}
+                    style={{ width: '100%' }}
+                  />
+                  <Space size={4}>
+                    <Switch size="small" checked={customEditorWordWrap} onChange={setCustomEditorWordWrap} />
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Wrap</Text>
+                  </Space>
+                  <Space size={4}>
+                    <Switch size="small" checked={customEditorLigatures} onChange={setCustomEditorLigatures} />
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Ligatures</Text>
+                  </Space>
+                </div>
+              )}
+            >
+              <Button size="small">Editor Style</Button>
+            </Popover>
             <Switch
               checked={customIncludeSourceDraft}
               onChange={setCustomIncludeSourceDraft}
@@ -6064,23 +8769,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             >
               Add Field
             </Button>
-            <Space size={4}>
-              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Beautify All</Text>
-              <Switch
-                size="small"
-                disabled={customFieldDraft.length === 0}
-                checked={Boolean(customFieldBeautifyUndoAllSnapshot && customFieldBeautifyUndoAllSnapshot.length > 0)}
-                checkedChildren="Undo"
-                unCheckedChildren="Beautify"
-                onChange={(checked) => {
-                  if (checked) {
-                    beautifyAllCustomFieldDrafts()
-                    return
-                  }
-                  undoBeautifyAllCustomFieldDrafts()
-                }}
-              />
-            </Space>
             <Button onClick={() => setCustomFieldStudioOpen(false)}>Close</Button>
             <Button
               type="primary"
@@ -7059,6 +9747,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                               beforeMount={(monaco) => ensureExpressionLanguage(monaco)}
                               onMount={(editor, monaco) => {
                                 attachExpressionValidation(editor, monaco)
+                                attachExpressionAutoSuggest(editor)
                                 editor.onDidFocusEditorText(() => {
                                   setActiveExpressionFieldId(item.id)
                                 })
@@ -7073,8 +9762,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                 fontLigatures: customEditorLigatures,
                                 scrollBeyondLastLine: false,
                                 wordWrap: customEditorWordWrap ? 'on' : 'off',
-                                quickSuggestions: true,
+                                quickSuggestions: { other: true, comments: false, strings: true },
                                 suggestOnTriggerCharacters: true,
+                                renderValidationDecorations: 'on',
+                                glyphMargin: true,
                                 matchBrackets: 'always',
                                 autoClosingBrackets: 'always',
                                 bracketPairColorization: {
@@ -7099,6 +9790,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                               beforeMount={(monaco) => ensureJsonTemplateLanguage(monaco)}
                               onMount={(editor, monaco) => {
                                 attachJsonTemplateExpressionValidation(editor, monaco)
+                                attachExpressionAutoSuggest(editor)
                               }}
                               onChange={(value) => updateCustomFieldDraft(item.id, { jsonTemplate: value || '' })}
                               theme={customEditorThemeId}
@@ -7110,8 +9802,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                 fontLigatures: customEditorLigatures,
                                 scrollBeyondLastLine: false,
                                 wordWrap: customEditorWordWrap ? 'on' : 'off',
-                                quickSuggestions: true,
+                                quickSuggestions: { other: true, comments: false, strings: true },
                                 suggestOnTriggerCharacters: true,
+                                renderValidationDecorations: 'on',
+                                glyphMargin: true,
                                 matchBrackets: 'always',
                                 autoClosingBrackets: 'always',
                                 bracketPairColorization: {
@@ -7343,7 +10037,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     </Modal>
     <Modal
       open={Boolean(expandedEditorField)}
-      onCancel={() => setExpandedEditorFieldId(null)}
+      onCancel={() => {
+        setUiConditionBuilderModalIndex(null)
+        setUiFieldBuilderModalIndex(null)
+        setExpandedEditorFieldId(null)
+      }}
       footer={null}
       closable={false}
       centered
@@ -7432,79 +10130,754 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             <Button
               shape="circle"
               icon={<CloseOutlined />}
-              onClick={() => setExpandedEditorFieldId(null)}
+              onClick={() => {
+                setUiConditionBuilderModalIndex(null)
+                setUiFieldBuilderModalIndex(null)
+                setExpandedEditorFieldId(null)
+              }}
               aria-label="Close expanded editor"
             />
           </Tooltip>
         </Space>
       </div>
-      <div style={{ flex: 1, minHeight: 0, padding: 10 }}>
+      <div style={{ flex: 1, minHeight: 0, padding: '0 10px 10px' }}>
         {expandedEditorField ? (
           <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {expandedEditorMode === 'value' ? (
-              <Space size={8} align="center" wrap style={{ flex: '0 0 auto' }}>
-                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Single Value Output</Text>
-                <Select
-                  value={expandedEditorField.singleValueOutput}
-                  options={[
-                    { value: 'json', label: 'JSON' },
-                    { value: 'plain_text', label: 'Plain Text' },
-                  ]}
-                  onChange={(value) => updateCustomFieldDraft(expandedEditorField.id, { singleValueOutput: value as SingleValueOutputMode })}
-                  style={{ width: 180 }}
-                />
-              </Space>
-            ) : null}
-            <div style={{ flex: 1, minHeight: 0 }}>
-              <Editor
-                height="100%"
-                language={expandedEditorMode === 'json' ? JSON_TEMPLATE_LANGUAGE_ID : EXPR_LANGUAGE_ID}
-                value={expandedEditorMode === 'json' ? expandedEditorField.jsonTemplate : expandedEditorField.expression}
-                beforeMount={(monaco) => {
-                  if (expandedEditorMode === 'value') ensureExpressionLanguage(monaco)
-                  else ensureJsonTemplateLanguage(monaco)
+            <Tabs
+              size="small"
+              activeKey={expandedEditorTab}
+              onChange={(key) => setExpandedEditorTab(key as UiExpressionEditorTab)}
+              items={[
+                { key: 'expression', label: 'Expression' },
+                { key: 'ui_expression', label: 'UI Expression' },
+              ]}
+              style={{ flex: '0 0 auto' }}
+            />
+            {expandedEditorTab === 'expression' ? (
+              <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {expandedEditorMode === 'value' ? (
+                  <Space size={8} align="center" wrap style={{ flex: '0 0 auto' }}>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Single Value Output</Text>
+                    <Select
+                      value={expandedEditorField.singleValueOutput}
+                      options={[
+                        { value: 'json', label: 'JSON' },
+                        { value: 'plain_text', label: 'Plain Text' },
+                      ]}
+                      onChange={(value) => updateCustomFieldDraft(expandedEditorField.id, { singleValueOutput: value as SingleValueOutputMode })}
+                      style={{ width: 180 }}
+                    />
+                  </Space>
+                ) : null}
+                <div style={{ flex: 1, minHeight: 0 }}>
+                  <Editor
+                    height="100%"
+                    language={expandedEditorMode === 'json' ? JSON_TEMPLATE_LANGUAGE_ID : EXPR_LANGUAGE_ID}
+                    value={expandedEditorMode === 'json' ? expandedEditorField.jsonTemplate : expandedEditorField.expression}
+                    beforeMount={(monaco) => {
+                      if (expandedEditorMode === 'value') ensureExpressionLanguage(monaco)
+                      else ensureJsonTemplateLanguage(monaco)
+                    }}
+                    onMount={(editor, monaco) => {
+                      if (expandedEditorMode === 'value') {
+                        attachExpressionValidation(editor, monaco)
+                      } else {
+                        attachJsonTemplateExpressionValidation(editor, monaco)
+                      }
+                      attachExpressionAutoSuggest(editor)
+                    }}
+                    onChange={(value) => {
+                      if (!expandedEditorField) return
+                      if (expandedEditorMode === 'json') {
+                        updateCustomFieldDraft(expandedEditorField.id, { jsonTemplate: value || '' })
+                      } else {
+                        updateCustomFieldDraft(expandedEditorField.id, { expression: value || '' })
+                      }
+                    }}
+                    theme={customEditorThemeId}
+                    options={{
+                      minimap: { enabled: false },
+                      fontFamily: customEditorFontFamily,
+                      fontSize: customEditorFontSize,
+                      lineHeight: customEditorLineHeight,
+                      fontLigatures: customEditorLigatures,
+                      scrollBeyondLastLine: false,
+                      wordWrap: customEditorWordWrap ? 'on' : 'off',
+                      quickSuggestions: { other: true, comments: false, strings: true },
+                      suggestOnTriggerCharacters: true,
+                      renderValidationDecorations: 'on',
+                      glyphMargin: true,
+                      matchBrackets: 'always',
+                      autoClosingBrackets: 'always',
+                      bracketPairColorization: {
+                        enabled: true,
+                        independentColorPoolPerBracketType: true,
+                      },
+                      guides: {
+                        bracketPairs: true,
+                        bracketPairsHorizontal: true,
+                        highlightActiveBracketPair: true,
+                      },
+                      padding: { top: 10, bottom: 10 },
+                    }}
+                  />
+                </div>
+              </div>
+            ) : (
+              <div
+                style={{
+                  width: '100%',
+                  height: '100%',
+                  display: 'grid',
+                  gridTemplateColumns: 'minmax(380px, 40%) minmax(0, 1fr)',
+                  gap: 8,
                 }}
-                onMount={(editor, monaco) => {
-                  if (expandedEditorMode === 'value') {
-                    attachExpressionValidation(editor, monaco)
-                  } else {
-                    attachJsonTemplateExpressionValidation(editor, monaco)
-                  }
-                }}
-                onChange={(value) => {
-                  if (!expandedEditorField) return
-                  if (expandedEditorMode === 'json') {
-                    updateCustomFieldDraft(expandedEditorField.id, { jsonTemplate: value || '' })
-                  } else {
-                    updateCustomFieldDraft(expandedEditorField.id, { expression: value || '' })
-                  }
-                }}
-                theme={customEditorThemeId}
-                options={{
-                  minimap: { enabled: false },
-                  fontFamily: customEditorFontFamily,
-                  fontSize: customEditorFontSize,
-                  lineHeight: customEditorLineHeight,
-                  fontLigatures: customEditorLigatures,
-                  scrollBeyondLastLine: false,
-                  wordWrap: customEditorWordWrap ? 'on' : 'off',
-                  quickSuggestions: true,
-                  suggestOnTriggerCharacters: true,
-                  matchBrackets: 'always',
-                  autoClosingBrackets: 'always',
-                  bracketPairColorization: {
-                    enabled: true,
-                    independentColorPoolPerBracketType: true,
-                  },
-                  guides: {
-                    bracketPairs: true,
-                    bracketPairsHorizontal: true,
-                    highlightActiveBracketPair: true,
-                  },
-                  padding: { top: 10, bottom: 10 },
-                }}
-              />
-            </div>
+              >
+                <div
+                  style={{
+                    border: '1px solid var(--app-border-strong)',
+                    borderRadius: 10,
+                    background: 'var(--app-card-bg)',
+                    padding: 10,
+                    overflowY: 'auto',
+                  }}
+                >
+                  <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Visual Expression Builder</Text>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                      Visual builder for functions, params, variables, and fields.
+                    </Text>
+
+                    <Divider style={{ margin: '6px 0' }} />
+                    <Space align="center" style={{ justifyContent: 'space-between', width: '100%' }}>
+                      <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>1) Select Function</Text>
+                      <Button size="small" onClick={loadUiExpressionFromEditor}>
+                        Load From Editor
+                      </Button>
+                    </Space>
+                    <Select
+                      size="small"
+                      showSearch
+                      optionFilterProp="label"
+                      value={selectedUiExpressionTemplate?.value}
+                      options={uiExpressionTemplateOptions}
+                      onChange={(value) => {
+                        setUiExpressionBuilderTouched(true)
+                        setUiExpressionTemplateLabel(String(value || ''))
+                      }}
+                      style={{ width: '100%' }}
+                    />
+
+                    <Divider style={{ margin: '6px 0' }} />
+                    <Space align="center" style={{ justifyContent: 'space-between', width: '100%' }}>
+                      <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>2) Manage Variables</Text>
+                      <Button size="small" onClick={addUiExpressionVariable}>Add Variable</Button>
+                    </Space>
+                    {uiExpressionVariables.length === 0 ? (
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                        No variables defined.
+                      </Text>
+                    ) : (
+                      <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                        {uiExpressionVariables.map((variable) => (
+                          <div
+                            key={variable.id}
+                            style={{
+                              border: '1px solid var(--app-border-strong)',
+                              borderRadius: 8,
+                              background: 'var(--app-panel-bg)',
+                              padding: 8,
+                            }}
+                          >
+                            <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                              <Input
+                                size="small"
+                                value={variable.name}
+                                placeholder="variable_name"
+                                onChange={(event) => updateUiExpressionVariable(variable.id, { name: event.target.value })}
+                              />
+                              <Input
+                                size="small"
+                                value={variable.value}
+                                placeholder="value or expression, e.g. field('AMOUNT')"
+                                onChange={(event) => updateUiExpressionVariable(variable.id, { value: event.target.value })}
+                              />
+                              <Button size="small" danger onClick={() => removeUiExpressionVariable(variable.id)}>
+                                Delete Variable
+                              </Button>
+                            </Space>
+                          </div>
+                        ))}
+                      </Space>
+                    )}
+
+                    <Divider style={{ margin: '6px 0' }} />
+                    {isUiGroupAggregateTemplate ? (
+                      <>
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>3) Configure Group Aggregate</Text>
+                        <div
+                          style={{
+                            border: '1px solid var(--app-border-strong)',
+                            borderRadius: 8,
+                            background: 'var(--app-panel-bg)',
+                            padding: 8,
+                          }}
+                        >
+                          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                              Group Key Field
+                            </Text>
+                            <AutoComplete
+                              value={uiGroupAggregateKeyField}
+                              options={uiFieldAutoCompleteOptions}
+                              onChange={(value) => {
+                                setUiExpressionBuilderTouched(true)
+                                setUiGroupAggregateKeyField(String(value || ''))
+                              }}
+                              filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                            >
+                              <Input size="small" placeholder="CUSTACCOUNTNUMBER" />
+                            </AutoComplete>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                              Group Output Name
+                            </Text>
+                            <Input
+                              size="small"
+                              value={uiGroupAggregateKeyName}
+                              placeholder="customer"
+                              onChange={(event) => {
+                                setUiExpressionBuilderTouched(true)
+                                setUiGroupAggregateKeyName(event.target.value)
+                              }}
+                            />
+                          </Space>
+                        </div>
+
+                        <Space align="center" style={{ justifyContent: 'space-between', width: '100%' }}>
+                          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Metrics</Text>
+                          <Button size="small" onClick={addUiGroupAggregateMetric}>Add Metric</Button>
+                        </Space>
+
+                        <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                          {uiGroupAggregateMetrics.map((metric) => (
+                            <div
+                              key={metric.id}
+                              style={{
+                                border: '1px solid var(--app-border-strong)',
+                                borderRadius: 8,
+                                background: 'var(--app-panel-bg)',
+                                padding: 6,
+                              }}
+                            >
+                              <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(130px, 1fr) minmax(140px, 1.2fr) minmax(110px, 0.8fr) auto', gap: 6 }}>
+                                  <Input
+                                    size="small"
+                                    value={metric.outputName}
+                                    placeholder="metric_name"
+                                    onChange={(event) => updateUiGroupAggregateMetric(metric.id, { outputName: event.target.value })}
+                                  />
+                                  <AutoComplete
+                                    value={metric.path}
+                                    options={uiFieldAutoCompleteOptions}
+                                    onChange={(value) => updateUiGroupAggregateMetric(metric.id, { path: String(value || '') })}
+                                    filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                                  >
+                                    <Input size="small" placeholder="source_path" />
+                                  </AutoComplete>
+                                  <Select
+                                    size="small"
+                                    value={metric.agg}
+                                    options={EXPR_ALLOWED_AGG_VALUES_OPTIONS.map((agg) => ({ value: agg, label: agg }))}
+                                    onChange={(value) => updateUiGroupAggregateMetric(metric.id, { agg: String(value || 'sum') })}
+                                    style={{ width: '100%' }}
+                                  />
+                                  <Button size="small" danger onClick={() => removeUiGroupAggregateMetric(metric.id)}>
+                                    Delete
+                                  </Button>
+                                </div>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                                  Format: output_name + source_path + aggregate
+                                </Text>
+                              </Space>
+                            </div>
+                          ))}
+                        </Space>
+                      </>
+                    ) : (
+                      <>
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>3) Configure Parameters</Text>
+                        {uiExpressionPlaceholders.length === 0 ? (
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                            Selected function has no parameters.
+                          </Text>
+                        ) : (
+                          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                            {uiExpressionPlaceholders.map((placeholder) => {
+                              const currentValue = String(
+                                uiExpressionValuesByIndex[placeholder.index] ?? placeholder.defaultValue ?? ''
+                              )
+                              const currentMode = (
+                                uiExpressionParamModeByIndex[placeholder.index]
+                                || defaultUiExpressionParameterMode(placeholder)
+                              ) as UiExpressionParameterMode
+                              const isConditionParam = isConditionLikePlaceholder(placeholder)
+                              const isBooleanParam = isBooleanLikePlaceholder(placeholder)
+                              const choiceOptions = (
+                                placeholder.kind === 'choice'
+                                  ? placeholder.options
+                                  : isAggregateLikePlaceholder(placeholder)
+                                    ? EXPR_ALLOWED_AGG_VALUES_OPTIONS
+                                    : isOperatorLikePlaceholder(placeholder)
+                                      ? EXPR_ALLOWED_CONDITION_OPERATORS_OPTIONS
+                                      : []
+                              )
+                              const literalChoiceOptions = (
+                                isBooleanParam
+                                  ? ['true', 'false']
+                                  : choiceOptions
+                              )
+                              const conditionState = uiConditionBuilderByIndex[placeholder.index]
+                                || createDefaultUiConditionBuilderState()
+                              const conditionUndoCount = (uiConditionUndoByIndex[placeholder.index] || []).length
+                              const conditionRedoCount = (uiConditionRedoByIndex[placeholder.index] || []).length
+                              const conditionClusters = Array.isArray(conditionState.clusters)
+                                ? conditionState.clusters
+                                : []
+                              const conditionClausesByCluster = conditionClusters.map((cluster) => ({
+                                cluster,
+                                clauses: (conditionState.clauses || []).filter((clause) => clause.clusterId === cluster.id),
+                              }))
+                              const fieldBuilderState = createDefaultUiFieldBuilderState(
+                                uiFieldBuilderByIndex[placeholder.index] || createDefaultUiFieldBuilderState()
+                              )
+                              const parameterModeOptions: Array<{ value: UiExpressionParameterMode; label: string }> = [
+                                { value: 'field', label: 'Field' },
+                                { value: 'values', label: 'Values' },
+                                { value: 'variable', label: 'Variable' },
+                                { value: 'literal', label: 'Literal' },
+                                { value: 'raw', label: 'Raw' },
+                              ]
+                              return (
+                                <div
+                                  key={`ui_expr_placeholder_${placeholder.index}`}
+                                  style={{
+                                    border: '1px solid var(--app-border-strong)',
+                                    borderRadius: 8,
+                                    background: 'var(--app-panel-bg)',
+                                    padding: 8,
+                                  }}
+                                >
+                                  <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                                    <div style={{ display: 'grid', gridTemplateColumns: 'minmax(165px, 1fr) minmax(105px, 0.8fr) minmax(170px, 1.4fr) auto', gap: 6 }}>
+                                      <div
+                                        style={{
+                                          alignSelf: 'center',
+                                          color: 'var(--app-text-subtle)',
+                                          fontSize: 11,
+                                          fontFamily: 'monospace',
+                                          overflow: 'hidden',
+                                          textOverflow: 'ellipsis',
+                                          whiteSpace: 'nowrap',
+                                        }}
+                                        title={`Parameter #${placeholder.index} (${placeholder.defaultValue || 'value'})`}
+                                      >
+                                        #{placeholder.index} {placeholder.defaultValue || 'value'}
+                                      </div>
+                                      <Select
+                                        size="small"
+                                        value={currentMode}
+                                        options={parameterModeOptions}
+                                        onChange={(value) => updateUiExpressionPlaceholderMode(placeholder.index, value as UiExpressionParameterMode)}
+                                        style={{ width: '100%' }}
+                                      />
+                                      {currentMode === 'field' || currentMode === 'values' ? (
+                                        <AutoComplete
+                                          value={currentValue}
+                                          options={uiFieldAutoCompleteOptions}
+                                          onChange={(value) => updateUiExpressionPlaceholderValue(placeholder.index, String(value || ''))}
+                                          filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                                        >
+                                          <Input size="small" placeholder="field/path" />
+                                        </AutoComplete>
+                                      ) : currentMode === 'variable' ? (
+                                        <Select
+                                          size="small"
+                                          showSearch
+                                          value={currentValue || undefined}
+                                          options={uiExpressionVariableOptions}
+                                          onChange={(value) => updateUiExpressionPlaceholderValue(placeholder.index, String(value || ''))}
+                                          placeholder="variable"
+                                          style={{ width: '100%' }}
+                                          optionFilterProp="label"
+                                        />
+                                      ) : literalChoiceOptions.length > 0 ? (
+                                        <Select
+                                          size="small"
+                                          value={currentValue || placeholder.defaultValue}
+                                          options={literalChoiceOptions.map((opt) => ({ value: opt, label: opt }))}
+                                          onChange={(value) => updateUiExpressionPlaceholderValue(placeholder.index, String(value || ''))}
+                                          style={{ width: '100%' }}
+                                        />
+                                      ) : (
+                                        <Input
+                                          size="small"
+                                          value={currentValue}
+                                          placeholder={currentMode === 'raw' ? 'raw expression' : 'value'}
+                                          onChange={(event) => updateUiExpressionPlaceholderValue(placeholder.index, event.target.value)}
+                                        />
+                                      )}
+                                      {isConditionParam ? (
+                                        <>
+                                          <Button
+                                            size="small"
+                                            onClick={() => openUiConditionBuilderModal(placeholder.index, currentValue)}
+                                          >
+                                            Condition
+                                          </Button>
+                                          <ConditionBuilderModal
+                                            open={uiConditionBuilderModalIndex === placeholder.index}
+                                            onClose={() => setUiConditionBuilderModalIndex(null)}
+                                            placeholderIndex={placeholder.index}
+                                            conditionState={conditionState}
+                                            conditionClusters={conditionClusters}
+                                            conditionClausesByCluster={conditionClausesByCluster}
+                                            conditionUndoCount={conditionUndoCount}
+                                            conditionRedoCount={conditionRedoCount}
+                                            uiFieldAutoCompleteOptions={uiFieldAutoCompleteOptions}
+                                            uiExpressionVariableOptions={uiExpressionVariableOptions}
+                                            conditionOperatorOptions={EXPR_ALLOWED_CONDITION_OPERATORS_OPTIONS}
+                                            addUiConditionCluster={addUiConditionCluster}
+                                            undoUiConditionBuilder={undoUiConditionBuilder}
+                                            redoUiConditionBuilder={redoUiConditionBuilder}
+                                            updateUiConditionClusterJoin={updateUiConditionClusterJoin}
+                                            addUiConditionClause={addUiConditionClause}
+                                            removeUiConditionCluster={removeUiConditionCluster}
+                                            updateUiConditionClause={updateUiConditionClause}
+                                            removeUiConditionClause={removeUiConditionClause}
+                                            applyUiConditionBuilderToPlaceholder={applyUiConditionBuilderToPlaceholder}
+                                          />
+                                        </>
+                                      ) : (
+                                        <>
+                                          <Button
+                                            size="small"
+                                            onClick={() => openUiFieldBuilderModal(placeholder.index, currentMode, currentValue)}
+                                          >
+                                            Field Builder
+                                          </Button>
+                                          <FieldBuilderModal
+                                            open={uiFieldBuilderModalIndex === placeholder.index}
+                                            onClose={() => setUiFieldBuilderModalIndex(null)}
+                                            placeholderIndex={placeholder.index}
+                                            fieldBuilderState={fieldBuilderState}
+                                            uiFieldAutoCompleteOptions={uiFieldAutoCompleteOptions}
+                                            aggOptions={EXPR_ALLOWED_AGG_VALUES_OPTIONS}
+                                            updateUiFieldBuilder={updateUiFieldBuilder}
+                                            buildUiFieldBuilderExpression={buildUiFieldBuilderExpression}
+                                            applyUiFieldBuilder={applyUiFieldBuilder}
+                                          />
+                                        </>
+                                      )}
+                                    </div>
+                                  </Space>
+                                </div>
+                              )
+                            })}
+                          </Space>
+                        )}
+                      </>
+                    )}
+
+                    {expandedEditorMode === 'json' ? (
+                      <>
+                        <Divider style={{ margin: '6px 0' }} />
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>4) JSON Key Mapping</Text>
+                        <Select
+                          size="small"
+                          showSearch
+                          value={String(uiExpressionJsonKey || '').trim() || undefined}
+                          options={uiExpressionJsonKeyOptions}
+                          onChange={(value) => setUiExpressionJsonKey(String(value || 'value'))}
+                          style={{ width: '100%' }}
+                          optionFilterProp="label"
+                        />
+                        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) auto', gap: 6 }}>
+                          <Input
+                            size="small"
+                            value={uiExpressionNewJsonKeyDraft}
+                            placeholder="new_key_name"
+                            onChange={(event) => setUiExpressionNewJsonKeyDraft(event.target.value)}
+                          />
+                          <Button size="small" onClick={createUiExpressionJsonRow}>
+                            Create New Key
+                          </Button>
+                        </div>
+                        <Space size={8} wrap>
+                          <Button size="small" onClick={upsertUiExpressionJsonRow}>
+                            Add/Update Key
+                          </Button>
+                          <Button size="small" onClick={loadUiExpressionRowsFromEditor}>
+                            Load From Editor
+                          </Button>
+                          <Button
+                            size="small"
+                            onClick={() => setUiExpressionRows([])}
+                            disabled={uiExpressionRows.length === 0}
+                          >
+                            Clear Keys
+                          </Button>
+                        </Space>
+                      </>
+                    ) : null}
+
+                    <Divider style={{ margin: '6px 0' }} />
+                    <Space size={8} wrap>
+                      <Button type="primary" onClick={applyUiExpressionToEditor}>
+                        Apply To Expression
+                      </Button>
+                      {expandedEditorMode === 'json' ? (
+                        <Button onClick={applyUiExpressionJsonRowsToEditor} disabled={uiExpressionRows.length === 0}>
+                          Apply JSON Template
+                        </Button>
+                      ) : null}
+                    </Space>
+                  </Space>
+                </div>
+
+                <div
+                  style={{
+                    border: '1px solid var(--app-border-strong)',
+                    borderRadius: 10,
+                    background: 'var(--app-card-bg)',
+                    padding: 10,
+                    overflowY: 'auto',
+                  }}
+                >
+                  <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Builder Output</Text>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                      Generated expression preview.
+                    </Text>
+                    <div
+                      style={{
+                        border: '1px solid var(--app-border-strong)',
+                        borderRadius: 8,
+                        overflow: 'hidden',
+                      }}
+                    >
+                      <Editor
+                        height="170px"
+                        language={EXPR_LANGUAGE_ID}
+                        value={uiExpressionPreview}
+                        beforeMount={(monaco) => {
+                          ensureCustomEditorTheme(monaco)
+                          ensureExpressionLanguage(monaco)
+                        }}
+                        onMount={(editor, monaco) => {
+                          attachExpressionValidation(editor, monaco)
+                          attachExpressionAutoSuggest(editor)
+                        }}
+                        theme={customEditorThemeId}
+                        options={{
+                          readOnly: true,
+                          minimap: { enabled: false },
+                          fontFamily: customEditorFontFamily,
+                          fontSize: 12,
+                          lineHeight: customEditorLineHeight,
+                          wordWrap: 'on',
+                          glyphMargin: true,
+                          renderLineHighlight: 'none',
+                          scrollBeyondLastLine: false,
+                          padding: { top: 8, bottom: 8 },
+                        }}
+                      />
+                    </div>
+
+                    <Divider style={{ margin: '6px 0' }} />
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>
+                      {isUiGroupAggregateTemplate ? 'Group Aggregate Mapping' : 'Resolved Parameters'}
+                    </Text>
+                    {isUiGroupAggregateTemplate ? (
+                      <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                          <Tag style={{ marginInlineEnd: 0 }}>key</Tag>
+                          <Text style={{ color: 'var(--app-text-subtle)', minWidth: 140 }}>Group Key Field</Text>
+                          <Text style={{ color: 'var(--app-text)', fontFamily: 'monospace', fontSize: 12, wordBreak: 'break-all' }}>
+                            {uiGroupAggregateKeyField || '(empty)'}
+                          </Text>
+                        </div>
+                        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                          <Tag style={{ marginInlineEnd: 0 }}>name</Tag>
+                          <Text style={{ color: 'var(--app-text-subtle)', minWidth: 140 }}>Group Output Name</Text>
+                          <Text style={{ color: 'var(--app-text)', fontFamily: 'monospace', fontSize: 12, wordBreak: 'break-all' }}>
+                            {uiGroupAggregateKeyName || '(empty)'}
+                          </Text>
+                        </div>
+                        {(uiGroupAggregateMetrics || []).map((metric, idx) => (
+                          <div key={`ui_group_metric_preview_${metric.id}`} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                            <Tag style={{ marginInlineEnd: 0 }}>m{idx + 1}</Tag>
+                            <Text style={{ color: 'var(--app-text-subtle)', minWidth: 140 }}>
+                              {metric.outputName || `metric_${idx + 1}`}
+                            </Text>
+                            <Text style={{ color: 'var(--app-text)', fontFamily: 'monospace', fontSize: 12, wordBreak: 'break-all' }}>
+                              path='{metric.path || ''}', agg='{metric.agg || ''}'
+                            </Text>
+                          </div>
+                        ))}
+                      </Space>
+                    ) : (
+                      <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                        {uiExpressionPlaceholders.map((placeholder) => (
+                          <div key={`ui_expr_preview_param_${placeholder.index}`} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                            <Tag style={{ marginInlineEnd: 0 }}>#{placeholder.index}</Tag>
+                            <Text style={{ color: 'var(--app-text-subtle)', minWidth: 140 }}>
+                              {placeholder.defaultValue || 'value'}
+                            </Text>
+                            <Text
+                              style={{
+                                color: 'var(--app-text)',
+                                fontFamily: 'monospace',
+                                fontSize: 12,
+                                wordBreak: 'break-all',
+                              }}
+                            >
+                              {String(uiExpressionResolvedValuesByIndex[placeholder.index] || '')}
+                            </Text>
+                          </div>
+                        ))}
+                      </Space>
+                    )}
+
+                    {expandedEditorMode === 'json' ? (
+                      <>
+                        <Divider style={{ margin: '6px 0' }} />
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>JSON Keys</Text>
+                        {uiExpressionRows.length === 0 ? (
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                            No JSON keys yet. Add from left panel.
+                          </Text>
+                        ) : (
+                          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                            {uiExpressionRows.map((row) => (
+                              <div
+                                key={row.id}
+                                style={{
+                                  border: '1px solid var(--app-border-strong)',
+                                  borderRadius: 8,
+                                  background: 'var(--app-panel-bg)',
+                                  padding: 8,
+                                }}
+                              >
+                                <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                                  <div style={{ display: 'grid', gridTemplateColumns: 'minmax(140px, 1fr) minmax(120px, 0.8fr) auto auto', gap: 6 }}>
+                                    <Input
+                                      size="small"
+                                      value={row.key}
+                                      placeholder="json_key"
+                                      onChange={(event) => updateUiExpressionJsonRow(row.id, { key: event.target.value })}
+                                    />
+                                    <Select
+                                      size="small"
+                                      value={row.valueType || 'expression'}
+                                      options={[
+                                        { value: 'expression', label: 'Expression' },
+                                        { value: 'json', label: 'JSON' },
+                                      ]}
+                                      onChange={(value) => updateUiExpressionJsonRow(row.id, { valueType: value as UiExpressionBuilderRow['valueType'] })}
+                                      style={{ width: '100%' }}
+                                    />
+                                    <Button size="small" onClick={() => editUiExpressionJsonRowInBuilder(row)}>
+                                      Edit
+                                    </Button>
+                                    <Button size="small" danger onClick={() => removeUiExpressionJsonRow(row.id)}>
+                                      Delete
+                                    </Button>
+                                  </div>
+                                  <div
+                                    style={{
+                                      border: '1px solid var(--app-border-strong)',
+                                      borderRadius: 8,
+                                      overflow: 'hidden',
+                                    }}
+                                  >
+                                    <Editor
+                                      height={row.valueType === 'json' ? '220px' : '120px'}
+                                      language={row.valueType === 'json' ? JSON_TEMPLATE_LANGUAGE_ID : EXPR_LANGUAGE_ID}
+                                      value={row.expression}
+                                      beforeMount={(monaco) => {
+                                        ensureCustomEditorTheme(monaco)
+                                        if (row.valueType === 'json') ensureJsonTemplateLanguage(monaco)
+                                        else ensureExpressionLanguage(monaco)
+                                      }}
+                                      onMount={(editor, monaco) => {
+                                        if (row.valueType === 'json') {
+                                          attachJsonTemplateExpressionValidation(editor, monaco)
+                                        } else {
+                                          attachExpressionValidation(editor, monaco)
+                                          attachExpressionAutoSuggest(editor)
+                                        }
+                                      }}
+                                      onChange={(value) => updateUiExpressionJsonRow(row.id, { expression: String(value || '') })}
+                                      theme={customEditorThemeId}
+                                      options={{
+                                        minimap: { enabled: false },
+                                        fontFamily: customEditorFontFamily,
+                                        fontSize: 12,
+                                        lineHeight: customEditorLineHeight,
+                                        wordWrap: 'on',
+                                        glyphMargin: true,
+                                        renderValidationDecorations: 'on',
+                                        scrollBeyondLastLine: false,
+                                        padding: { top: 8, bottom: 8 },
+                                      }}
+                                    />
+                                  </div>
+                                </Space>
+                              </div>
+                            ))}
+                          </Space>
+                        )}
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 700, marginTop: 6 }}>Generated JSON Template</Text>
+                        <div
+                          style={{
+                            border: '1px solid var(--app-border-strong)',
+                            borderRadius: 8,
+                            overflow: 'hidden',
+                          }}
+                        >
+                          <Editor
+                            height="300px"
+                            language={JSON_TEMPLATE_LANGUAGE_ID}
+                            value={uiExpressionJsonPreview}
+                            beforeMount={(monaco) => {
+                              ensureCustomEditorTheme(monaco)
+                              ensureJsonTemplateLanguage(monaco)
+                            }}
+                            onMount={(editor, monaco) => {
+                              attachJsonTemplateExpressionValidation(editor, monaco)
+                            }}
+                            theme={customEditorThemeId}
+                            options={{
+                              readOnly: true,
+                              minimap: { enabled: false },
+                              fontFamily: customEditorFontFamily,
+                              fontSize: 12,
+                              lineHeight: customEditorLineHeight,
+                              wordWrap: 'on',
+                              glyphMargin: true,
+                              renderLineHighlight: 'none',
+                              scrollBeyondLastLine: false,
+                              padding: { top: 8, bottom: 8 },
+                            }}
+                          />
+                        </div>
+                      </>
+                    ) : null}
+                  </Space>
+                </div>
+              </div>
+            )}
           </div>
         ) : null}
       </div>

@@ -1556,6 +1556,31 @@ END;"""
                 "pending_batches": int(pending_batches),
             }
 
+    def _wait_for_oracle_profile_write_queue_drain(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        timeout_seconds: float = 60.0,
+        poll_interval_seconds: float = 0.05,
+    ) -> Dict[str, Any]:
+        deadline = pytime.monotonic() + max(0.1, float(timeout_seconds or 0.1))
+        poll_seconds = max(0.01, min(float(poll_interval_seconds or 0.05), 1.0))
+        last_stats: Dict[str, Any] = self._get_oracle_profile_write_queue_stats(pipeline_id, node_id)
+        while True:
+            queue_depth = int(last_stats.get("queue_depth") or 0)
+            pending_batches = int(last_stats.get("pending_batches") or 0)
+            inflight_batches = int(last_stats.get("inflight_batches") or 0)
+            if queue_depth <= 0 and pending_batches <= 0 and inflight_batches <= 0:
+                out = dict(last_stats)
+                out["timed_out"] = False
+                return out
+            if pytime.monotonic() >= deadline:
+                out = dict(last_stats)
+                out["timed_out"] = True
+                return out
+            pytime.sleep(poll_seconds)
+            last_stats = self._get_oracle_profile_write_queue_stats(pipeline_id, node_id)
+
     def _load_runtime_profile_state_by_node(self, pipeline_id: str) -> Dict[str, Any]:
         runtime_state = self._load_runtime_state()
         pipelines_state = runtime_state.get("pipelines") if isinstance(runtime_state, dict) else {}
@@ -11696,6 +11721,22 @@ END;"""
                     _flush_incremental_profile_state(force=False)
                 _emit_profile_progress()
 
+            if (
+                profile_storage == "oracle"
+                and profile_enabled
+                and len(base_rows) > 0
+                and len(changed_tokens) == 0
+            ):
+                _record_custom_field_warning(
+                    "Oracle profile persist no-op: processed rows produced no profile changes "
+                    "(keys/values already up-to-date)."
+                )
+                stats_store["custom_fields_oracle_noop"] = True
+                stats_store["custom_fields_oracle_noop_reason"] = (
+                    "processed_rows_with_zero_changed_tokens"
+                )
+                stats_store["custom_fields_oracle_changed_tokens"] = 0
+
             if is_profile_incremental_mode:
                 # Materialize lazy aggregate placeholders once per entity before the
                 # terminal flush so persisted LMDB docs stay directly consumable.
@@ -11978,6 +12019,33 @@ END;"""
         oracle_queue_enqueue_timeout_seconds = max(
             0.01,
             min(oracle_queue_enqueue_timeout_seconds, 5.0),
+        )
+        oracle_queue_wait_on_force_flush_cfg = config.get(
+            "custom_profile_oracle_queue_wait_on_force_flush",
+            None,
+        )
+        if (
+            oracle_queue_wait_on_force_flush_cfg is None
+            or str(oracle_queue_wait_on_force_flush_cfg).strip() == ""
+        ):
+            oracle_queue_wait_on_force_flush_cfg = os.getenv(
+                "PROFILE_ORACLE_QUEUE_WAIT_ON_FORCE_FLUSH",
+                "1",
+            )
+        oracle_queue_wait_on_force_flush = bool(
+            is_profile_incremental_mode
+            and self._parse_bool_like(oracle_queue_wait_on_force_flush_cfg, True)
+        )
+        try:
+            oracle_queue_wait_timeout_seconds = float(
+                config.get("custom_profile_oracle_queue_wait_timeout_seconds")
+                or os.getenv("PROFILE_ORACLE_QUEUE_WAIT_TIMEOUT_SECONDS", "60")
+            )
+        except Exception:
+            oracle_queue_wait_timeout_seconds = 60.0
+        oracle_queue_wait_timeout_seconds = max(
+            1.0,
+            min(oracle_queue_wait_timeout_seconds, 1800.0),
         )
 
         default_workers = min(8, max(2, int(os.cpu_count() or 4)))
@@ -12460,6 +12528,23 @@ END;"""
                     if str(token).strip()
                 }
             )
+            if profile_storage == "oracle" and len(changed_tokens) == 0:
+                if isinstance((execution_context or {}).get("node_warnings"), list):
+                    warn_target = (execution_context or {}).get("node_warnings")
+                    msg = (
+                        "Oracle profile persist no-op: processed rows produced no profile changes "
+                        "(keys/values already up-to-date)."
+                    )
+                    if msg not in warn_target:
+                        warn_target.append(msg)
+                if isinstance(profile_state_by_node, dict):
+                    node_stats = profile_state_by_node.get(node_id, {}).get("stats")
+                    if isinstance(node_stats, dict):
+                        node_stats["custom_fields_oracle_noop"] = True
+                        node_stats["custom_fields_oracle_noop_reason"] = (
+                            "processed_rows_with_zero_changed_tokens"
+                        )
+                        node_stats["custom_fields_oracle_changed_tokens"] = 0
             node_state_payload = {
                 "documents": merged_documents,
                 "meta": merged_meta,
@@ -12471,6 +12556,11 @@ END;"""
             }
             persisted = False
             if profile_storage == "oracle" and oracle_queue_enabled and changed_tokens:
+                queue_stats_before = self._get_oracle_profile_write_queue_stats(
+                    pipeline_id,
+                    node_id,
+                )
+                failed_batches_before = int(queue_stats_before.get("failed_batches") or 0)
                 enqueued, enqueue_error = self._enqueue_oracle_profile_write(
                     pipeline_id,
                     node_id,
@@ -12483,37 +12573,66 @@ END;"""
                 )
                 if enqueued:
                     persisted = True
-                    queue_stats = self._get_oracle_profile_write_queue_stats(
+                    queue_stats_after_enqueue = self._get_oracle_profile_write_queue_stats(
                         pipeline_id,
                         node_id,
                     )
+                    queue_timed_out = False
+                    if oracle_queue_wait_on_force_flush:
+                        drained_stats = self._wait_for_oracle_profile_write_queue_drain(
+                            pipeline_id,
+                            node_id,
+                            timeout_seconds=oracle_queue_wait_timeout_seconds,
+                        )
+                        queue_timed_out = bool(drained_stats.get("timed_out", False))
+                        queue_stats_after_enqueue = drained_stats
+                    queue_failed_batches = int(queue_stats_after_enqueue.get("failed_batches") or 0)
+                    queue_worker_alive = bool(queue_stats_after_enqueue.get("worker_alive", False))
+                    queue_failed_after_enqueue = queue_failed_batches > failed_batches_before
+                    if queue_timed_out or queue_failed_after_enqueue or not queue_worker_alive:
+                        logger.warning(
+                            f"Oracle profile queue durability fallback for pipeline {pipeline_id}, node {node_id}: "
+                            f"timed_out={queue_timed_out}, worker_alive={queue_worker_alive}, "
+                            f"failed_batches_before={failed_batches_before}, failed_batches_after={queue_failed_batches}. "
+                            "Applying synchronous persist fallback."
+                        )
+                        persisted = False
                     if isinstance(profile_state_by_node, dict):
                         node_stats = profile_state_by_node.get(node_id, {}).get("stats")
                         if isinstance(node_stats, dict):
                             node_stats["custom_fields_oracle_queue_enabled"] = True
+                            node_stats["custom_fields_oracle_queue_wait_on_force_flush"] = bool(
+                                oracle_queue_wait_on_force_flush
+                            )
+                            node_stats["custom_fields_oracle_queue_wait_timeout_seconds"] = float(
+                                oracle_queue_wait_timeout_seconds
+                            )
                             node_stats["custom_fields_oracle_queue_depth"] = int(
-                                queue_stats.get("queue_depth") or 0
+                                queue_stats_after_enqueue.get("queue_depth") or 0
                             )
                             node_stats["custom_fields_oracle_queue_pending_batches"] = int(
-                                queue_stats.get("pending_batches") or 0
+                                queue_stats_after_enqueue.get("pending_batches") or 0
                             )
                             node_stats["custom_fields_oracle_queue_inflight_batches"] = int(
-                                queue_stats.get("inflight_batches") or 0
+                                queue_stats_after_enqueue.get("inflight_batches") or 0
                             )
                             node_stats["custom_fields_oracle_queue_enqueued_batches"] = int(
-                                queue_stats.get("enqueued_batches") or 0
+                                queue_stats_after_enqueue.get("enqueued_batches") or 0
                             )
                             node_stats["custom_fields_oracle_queue_processed_batches"] = int(
-                                queue_stats.get("processed_batches") or 0
+                                queue_stats_after_enqueue.get("processed_batches") or 0
                             )
                             node_stats["custom_fields_oracle_queue_failed_batches"] = int(
-                                queue_stats.get("failed_batches") or 0
+                                queue_stats_after_enqueue.get("failed_batches") or 0
                             )
                             node_stats["custom_fields_oracle_queue_worker_alive"] = bool(
-                                queue_stats.get("worker_alive", False)
+                                queue_stats_after_enqueue.get("worker_alive", False)
                             )
                             node_stats["custom_fields_oracle_queue_last_error"] = str(
-                                queue_stats.get("last_error") or ""
+                                queue_stats_after_enqueue.get("last_error") or ""
+                            )
+                            node_stats["custom_fields_oracle_queue_wait_timed_out"] = bool(
+                                queue_timed_out
                             )
                 else:
                     logger.warning(

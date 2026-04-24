@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Component, type ErrorInfo, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   Button, Input, Space, Tag, Tooltip, Typography, Dropdown,
@@ -40,6 +40,66 @@ type CanvasHistorySnapshot = {
   nodes: any[]
   edges: any[]
   key: string
+}
+
+type ConfigDrawerErrorBoundaryProps = {
+  resetKey: string | null
+  children: ReactNode
+}
+
+type ConfigDrawerErrorBoundaryState = {
+  hasError: boolean
+  message: string
+}
+
+class ConfigDrawerErrorBoundary extends Component<ConfigDrawerErrorBoundaryProps, ConfigDrawerErrorBoundaryState> {
+  state: ConfigDrawerErrorBoundaryState = {
+    hasError: false,
+    message: '',
+  }
+
+  static getDerivedStateFromError(error: unknown): ConfigDrawerErrorBoundaryState {
+    return {
+      hasError: true,
+      message: String((error as any)?.message || error || 'Unknown render error'),
+    }
+  }
+
+  componentDidCatch(error: unknown, info: ErrorInfo): void {
+    console.error('ConfigDrawer render failed:', error, info)
+  }
+
+  componentDidUpdate(prevProps: ConfigDrawerErrorBoundaryProps): void {
+    if (this.state.hasError && prevProps.resetKey !== this.props.resetKey) {
+      this.setState({ hasError: false, message: '' })
+    }
+  }
+
+  render(): ReactNode {
+    if (!this.state.hasError) return this.props.children
+    return (
+      <div
+        style={{
+          width: 360,
+          borderLeft: '1px solid var(--app-border-strong)',
+          background: 'var(--app-panel-bg)',
+          color: 'var(--app-text)',
+          padding: 16,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 8,
+        }}
+      >
+        <Text style={{ color: '#ef4444', fontWeight: 700 }}>Configuration panel crashed</Text>
+        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+          {this.state.message || 'Unknown error'}
+        </Text>
+        <Button size="small" onClick={() => this.setState({ hasError: false, message: '' })}>
+          Retry
+        </Button>
+      </div>
+    )
+  }
 }
 
 function cloneStructured<T>(value: T): T {
@@ -471,13 +531,19 @@ export default function PipelineEditor() {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null
+      const active = document.activeElement as HTMLElement | null
       const tag = String(target?.tagName || '').toUpperCase()
+      const isMonacoActive =
+        !!active?.closest('.monaco-editor')
+        || active?.classList?.contains('inputarea')
+        || !!target?.closest('.monaco-editor')
+        || !!target?.closest('.monaco-editor *')
       const isTyping =
         !!target?.isContentEditable
         || tag === 'INPUT'
         || tag === 'TEXTAREA'
         || tag === 'SELECT'
-        || !!target?.closest('.monaco-editor')
+        || isMonacoActive
       if (isTyping) return
       const withMod = event.metaKey || event.ctrlKey
       if (!withMod) return
@@ -759,10 +825,12 @@ export default function PipelineEditor() {
           </div>
 
           {/* Right: Config Drawer (inline, not overlay) */}
-          <ConfigDrawer
-            open={!!selectedNodeId}
-            onClose={() => setSelectedNode(null)}
-          />
+          <ConfigDrawerErrorBoundary resetKey={selectedNodeId ? String(selectedNodeId) : null}>
+            <ConfigDrawer
+              open={!!selectedNodeId}
+              onClose={() => setSelectedNode(null)}
+            />
+          </ConfigDrawerErrorBoundary>
         </div>
       </div>
 

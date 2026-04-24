@@ -40,3 +40,51 @@ body {
   background: var(--app-shell-bg);
   color: var(--app-text);
 }
+
+.monaco-editor .opsfabric-expr-inline-error {
+  background: rgba(239, 68, 68, 0.22) !important;
+  border-bottom: 2px solid rgba(248, 113, 113, 0.98) !important;
+  border-radius: 2px !important;
+  text-decoration: underline wavy rgba(248, 113, 113, 0.98) !important;
+  text-decoration-thickness: 1.5px !important;
+}
+
+.monaco-editor .opsfabric-expr-inline-warning {
+  background: rgba(245, 158, 11, 0.22) !important;
+  border-bottom: 2px solid rgba(251, 191, 36, 0.98) !important;
+  border-radius: 2px !important;
+  text-decoration: underline wavy rgba(251, 191, 36, 0.98) !important;
+  text-decoration-thickness: 1.5px !important;
+}
+
+.monaco-editor .opsfabric-expr-range-error {
+  background: rgba(239, 68, 68, 0.12) !important;
+}
+
+.monaco-editor .opsfabric-expr-range-warning {
+  background: rgba(245, 158, 11, 0.1) !important;
+}
+
+.monaco-editor .glyph-margin .opsfabric-expr-glyph-error {
+  background: radial-gradient(circle at center, rgba(248, 113, 113, 0.95) 0%, rgba(248, 113, 113, 0.25) 72%, transparent 73%) !important;
+}
+
+.monaco-editor .glyph-margin .opsfabric-expr-glyph-warning {
+  background: radial-gradient(circle at center, rgba(251, 191, 36, 0.95) 0%, rgba(251, 191, 36, 0.25) 72%, transparent 73%) !important;
+}
+
+:root[data-app-theme='light'] .monaco-editor .opsfabric-expr-inline-error {
+  background: rgba(239, 68, 68, 0.14) !important;
+}
+
+:root[data-app-theme='light'] .monaco-editor .opsfabric-expr-inline-warning {
+  background: rgba(245, 158, 11, 0.16) !important;
+}
+
+:root[data-app-theme='light'] .monaco-editor .opsfabric-expr-range-error {
+  background: rgba(239, 68, 68, 0.08) !important;
+}
+
+:root[data-app-theme='light'] .monaco-editor .opsfabric-expr-range-warning {
+  background: rgba(245, 158, 11, 0.06) !important;
+}

@@ -1238,12 +1238,6 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     const targetPipelineId = String(pipelineId || '').trim()
     if (!targetPipelineId) return false
 
-    const current = get()
-    const currentPipelineId = current.pipeline?.id ? String(current.pipeline.id) : ''
-    if (current.isExecuting && current.executionId && currentPipelineId === targetPipelineId) {
-      return true
-    }
-
     const forceStopRunningNodes = (fallbackStatus: 'success' | 'error' = 'error') => {
       const nowMs = Date.now()
       const nowIso = new Date(nowMs).toISOString()
@@ -1301,7 +1295,18 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         const status = String(item?.status || '').trim().toLowerCase()
         return status === 'running' || status === 'cancelling'
       })
-      if (!activeExecution?.id) return false
+      if (!activeExecution?.id) {
+        const live = get()
+        const livePipelineId = live.pipeline?.id ? String(live.pipeline.id) : ''
+        if (
+          livePipelineId === targetPipelineId
+          && (live.isExecuting || live.executionAbortRequested || Boolean(live.executionId))
+        ) {
+          forceStopRunningNodes()
+          set({ isExecuting: false, executionId: null, executionAbortRequested: false })
+        }
+        return false
+      }
 
       const executionId = String(activeExecution.id)
       const executionSnapshot = await api.getExecution(executionId, {
@@ -1397,7 +1402,27 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     if (!isExecuting || !executionId) return
     set({ executionAbortRequested: true })
     try {
-      await api.abortExecution(executionId)
+      const response = await api.abortExecution(executionId)
+      const responseStatus = String(response?.status || '').trim().toLowerCase()
+      if (responseStatus && responseStatus !== 'running' && responseStatus !== 'cancelling') {
+        set((state) => ({
+          isExecuting: false,
+          executionId: null,
+          executionAbortRequested: false,
+          executionLogs: [
+            ...state.executionLogs,
+            {
+              nodeId: '__system__',
+              nodeLabel: 'System',
+              timestamp: new Date().toISOString(),
+              status: responseStatus === 'cancelled' ? 'error' : 'success',
+              message: String(response?.message || `Execution is already ${responseStatus}.`),
+              rows: 0,
+            },
+          ],
+        }))
+        return
+      }
       set((state) => ({
         executionLogs: [
           ...state.executionLogs,

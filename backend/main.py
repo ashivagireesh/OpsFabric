@@ -8635,6 +8635,14 @@ async def list_executions(
             models.Execution.error_message,
         ))
     execs = query.limit(200).all()
+    for execution in execs:
+        try:
+            status_norm = str(getattr(execution, "status", "") or "").strip().lower()
+            if status_norm in {"running", "cancelling"}:
+                _try_finalize_stale_running_execution(execution, db)
+        except Exception:
+            continue
+
     pipeline_ids = list({e.pipeline_id for e in execs if getattr(e, "pipeline_id", None)})
     pipeline_name_by_id: Dict[str, str] = {}
     if pipeline_ids:
@@ -8668,13 +8676,15 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
     finalize it so frontend polling does not continue forever.
     """
     try:
-        if execution is None or str(execution.status or "").strip().lower() not in {"running", "cancelling"}:
+        if execution is None:
+            return
+        status_norm = str(execution.status or "").strip().lower()
+        if status_norm not in {"running", "cancelling"}:
             return
         logs = execution.logs if isinstance(execution.logs, list) else []
-        if not logs:
-            return
-        stale_after_s = max(15, int(str(_os.getenv("EXECUTION_STALE_AUTOFINALIZE_SECONDS", "120")).strip() or "120"))
+
         now = datetime.utcnow()
+        age_s: Optional[float] = None
         if execution.started_at is not None:
             try:
                 started_at = execution.started_at
@@ -8683,10 +8693,59 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
                 else:
                     now_for_started = now
                 age_s = (now_for_started - started_at).total_seconds()
-                if age_s < stale_after_s:
-                    return
             except Exception:
-                pass
+                age_s = None
+
+        worker = execution_workers.get(str(execution.id or ""))
+        worker_alive = bool(worker and worker.is_alive())
+        no_worker_grace_s = max(
+            2,
+            int(str(_os.getenv("EXECUTION_NO_WORKER_AUTOFINALIZE_GRACE_SECONDS", "5")).strip() or "5"),
+        )
+        fast_finalize_worker_missing = (not worker_alive) and (age_s is None or age_s >= no_worker_grace_s)
+
+        if not logs:
+            if not fast_finalize_worker_missing:
+                return
+            if status_norm == "cancelling":
+                execution.status = "cancelled"
+                execution.finished_at = execution.finished_at or datetime.utcnow()
+                cancel_message = "Execution cancelled by user."
+                cancel_log = {
+                    "nodeId": "__system__",
+                    "nodeLabel": "System",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "status": "error",
+                    "message": f"✗ {cancel_message}",
+                    "rows": 0,
+                }
+                execution.logs = [cancel_log]
+                if not execution.error_message:
+                    execution.error_message = cancel_message
+                db.commit()
+                return
+
+            stale_message = "Execution auto-finalized as failed: worker thread is not active."
+            execution.status = "failed"
+            execution.finished_at = execution.finished_at or datetime.utcnow()
+            if not execution.error_message:
+                execution.error_message = stale_message
+            stale_log = {
+                "nodeId": "__system__",
+                "nodeLabel": "System",
+                "timestamp": datetime.utcnow().isoformat(),
+                "status": "error",
+                "message": f"✗ {stale_message}",
+                "rows": 0,
+            }
+            execution.logs = [stale_log]
+            db.commit()
+            return
+
+        stale_after_s = max(15, int(str(_os.getenv("EXECUTION_STALE_AUTOFINALIZE_SECONDS", "120")).strip() or "120"))
+        if not fast_finalize_worker_missing:
+            if age_s is not None and age_s < stale_after_s:
+                return
 
         latest_log_ts: Optional[datetime] = None
         for entry in logs:
@@ -8701,7 +8760,7 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
                 continue
             if latest_log_ts is None or parsed > latest_log_ts:
                 latest_log_ts = parsed
-        if latest_log_ts is not None:
+        if latest_log_ts is not None and not fast_finalize_worker_missing:
             try:
                 if getattr(latest_log_ts, "tzinfo", None) is not None:
                     now_for_log = datetime.now(latest_log_ts.tzinfo)
@@ -8717,11 +8776,34 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
             for entry in logs
             if isinstance(entry, dict)
         )
-        worker = execution_workers.get(str(execution.id or ""))
-        worker_alive = bool(worker and worker.is_alive())
         if has_running_log and worker_alive:
             return
         if has_running_log and not worker_alive:
+            if status_norm == "cancelling":
+                cancel_message = "Execution cancelled by user."
+                execution.status = "cancelled"
+                execution.finished_at = execution.finished_at or datetime.utcnow()
+                if not execution.error_message:
+                    execution.error_message = cancel_message
+                has_cancel_log = any(
+                    isinstance(entry, dict)
+                    and "cancel" in str(entry.get("message") or "").strip().lower()
+                    for entry in logs
+                )
+                if not has_cancel_log:
+                    stale_log = {
+                        "nodeId": "__system__",
+                        "nodeLabel": "System",
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "status": "error",
+                        "message": f"✗ {cancel_message}",
+                        "rows": 0,
+                    }
+                    merged_logs = logs if isinstance(logs, list) else []
+                    merged_logs.append(stale_log)
+                    execution.logs = merged_logs
+                db.commit()
+                return
             stale_message = "Execution auto-finalized as failed: worker thread is not active."
             execution.status = "failed"
             execution.finished_at = execution.finished_at or datetime.utcnow()
@@ -8738,6 +8820,32 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
             merged_logs = logs if isinstance(logs, list) else []
             merged_logs.append(stale_log)
             execution.logs = merged_logs
+            db.commit()
+            return
+
+        if status_norm == "cancelling" and not worker_alive:
+            cancel_message = "Execution cancelled by user."
+            execution.status = "cancelled"
+            execution.finished_at = execution.finished_at or datetime.utcnow()
+            if not execution.error_message:
+                execution.error_message = cancel_message
+            has_cancel_log = any(
+                isinstance(entry, dict)
+                and "cancel" in str(entry.get("message") or "").strip().lower()
+                for entry in logs
+            )
+            if not has_cancel_log:
+                stale_log = {
+                    "nodeId": "__system__",
+                    "nodeLabel": "System",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "status": "error",
+                    "message": f"✗ {cancel_message}",
+                    "rows": 0,
+                }
+                merged_logs = logs if isinstance(logs, list) else []
+                merged_logs.append(stale_log)
+                execution.logs = merged_logs
             db.commit()
             return
 
