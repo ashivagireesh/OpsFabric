@@ -14,7 +14,7 @@ import threading
 import tempfile
 import time as pytime
 import uuid
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
 from datetime import date, datetime, time, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
@@ -205,6 +205,8 @@ class ETLEngine:
         self._oracle_full_scan_block_until: Dict[str, float] = {}
         self._oracle_profile_write_queue_lock = threading.Lock()
         self._oracle_profile_write_queues: Dict[str, Dict[str, Any]] = {}
+        self._oracle_destination_write_queue_lock = threading.Lock()
+        self._oracle_destination_write_queues: Dict[str, Dict[str, Any]] = {}
 
     def _uploads_dir(self) -> str:
         return os.path.join(os.path.dirname(__file__), "uploads")
@@ -1562,11 +1564,22 @@ END;"""
         node_id: str,
         timeout_seconds: float = 60.0,
         poll_interval_seconds: float = 0.05,
+        should_abort: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         deadline = pytime.monotonic() + max(0.1, float(timeout_seconds or 0.1))
         poll_seconds = max(0.01, min(float(poll_interval_seconds or 0.05), 1.0))
         last_stats: Dict[str, Any] = self._get_oracle_profile_write_queue_stats(pipeline_id, node_id)
         while True:
+            if callable(should_abort):
+                try:
+                    if bool(should_abort()):
+                        raise ExecutionAbortedError(
+                            "Execution aborted while waiting for Oracle profile queue drain."
+                        )
+                except ExecutionAbortedError:
+                    raise
+                except Exception:
+                    pass
             queue_depth = int(last_stats.get("queue_depth") or 0)
             pending_batches = int(last_stats.get("pending_batches") or 0)
             inflight_batches = int(last_stats.get("inflight_batches") or 0)
@@ -1580,6 +1593,332 @@ END;"""
                 return out
             pytime.sleep(poll_seconds)
             last_stats = self._get_oracle_profile_write_queue_stats(pipeline_id, node_id)
+
+    def _oracle_destination_queue_key(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        execution_id: str,
+    ) -> str:
+        return f"{str(pipeline_id)}::{str(node_id)}::{str(execution_id)}"
+
+    def _ensure_oracle_destination_queue_runtime_state(self) -> None:
+        if not hasattr(self, "_oracle_destination_write_queue_lock"):
+            self._oracle_destination_write_queue_lock = threading.Lock()
+        if not hasattr(self, "_oracle_destination_write_queues") or not isinstance(
+            getattr(self, "_oracle_destination_write_queues", None),
+            dict,
+        ):
+            self._oracle_destination_write_queues = {}
+
+    def _oracle_destination_write_queue_worker(self, queue_key: str) -> None:
+        self._ensure_oracle_destination_queue_runtime_state()
+        while True:
+            with self._oracle_destination_write_queue_lock:
+                state = self._oracle_destination_write_queues.get(queue_key)
+            if not isinstance(state, dict):
+                return
+            queue_obj = state.get("queue")
+            stop_event = state.get("stop_event")
+            if not isinstance(queue_obj, _queue.Queue):
+                return
+            if isinstance(stop_event, threading.Event) and stop_event.is_set() and queue_obj.empty():
+                break
+
+            try:
+                item = queue_obj.get(timeout=0.2)
+            except _queue.Empty:
+                continue
+
+            success = False
+            error_text = ""
+            started_at = pytime.monotonic()
+            try:
+                if not isinstance(item, dict):
+                    raise RuntimeError("invalid oracle destination queue payload")
+                cfg = item.get("config")
+                if not isinstance(cfg, dict):
+                    raise RuntimeError("invalid oracle destination queue config")
+                frame = item.get("df")
+                if frame is None:
+                    records = item.get("records")
+                    if isinstance(records, list):
+                        import pandas as _pd
+
+                        frame = _pd.DataFrame(records)
+                    else:
+                        raise RuntimeError("invalid oracle destination queue frame")
+                exec_ctx = item.get("execution_context")
+                if not isinstance(exec_ctx, dict):
+                    exec_ctx = {}
+                exec_ctx = dict(exec_ctx)
+                exec_ctx["oracle_destination_async_enabled"] = False
+                self._dest_oracle_sync(cfg, frame, execution_context=exec_ctx)
+                success = True
+            except Exception as exc:
+                success = False
+                error_text = str(exc or "oracle destination queue persist exception")
+                logger.warning(
+                    f"Oracle destination async worker failed for queue={queue_key}: {error_text}"
+                )
+            finally:
+                latency_ms = int(max(0.0, (pytime.monotonic() - started_at) * 1000.0))
+                with self._oracle_destination_write_queue_lock:
+                    current = self._oracle_destination_write_queues.get(queue_key)
+                    if isinstance(current, dict):
+                        stats = current.get("stats") if isinstance(current.get("stats"), dict) else {}
+                        if not isinstance(current.get("stats"), dict):
+                            current["stats"] = stats
+                        stats["processed_jobs"] = int(stats.get("processed_jobs") or 0) + 1
+                        if success:
+                            stats["last_error"] = ""
+                        else:
+                            stats["failed_jobs"] = int(stats.get("failed_jobs") or 0) + 1
+                            stats["last_error"] = str(error_text or "oracle destination queue failed")
+                        stats["inflight_jobs"] = max(0, int(stats.get("inflight_jobs") or 0) - 1)
+                        stats["last_latency_ms"] = latency_ms
+                        stats["last_finished_at"] = datetime.utcnow().isoformat()
+                try:
+                    queue_obj.task_done()
+                except Exception:
+                    pass
+
+        with self._oracle_destination_write_queue_lock:
+            current = self._oracle_destination_write_queues.get(queue_key)
+            if isinstance(current, dict):
+                current["worker_alive"] = False
+
+    def _ensure_oracle_destination_write_queue(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        execution_id: str,
+        maxsize: int,
+    ) -> Dict[str, Any]:
+        self._ensure_oracle_destination_queue_runtime_state()
+        queue_key = self._oracle_destination_queue_key(pipeline_id, node_id, execution_id)
+        with self._oracle_destination_write_queue_lock:
+            existing = self._oracle_destination_write_queues.get(queue_key)
+            if isinstance(existing, dict):
+                existing["last_touched_at"] = datetime.utcnow().isoformat()
+                return existing
+
+            safe_maxsize = max(1, min(int(maxsize or 8), 128))
+            q: _queue.Queue = _queue.Queue(maxsize=safe_maxsize)
+            stop_event = threading.Event()
+            state: Dict[str, Any] = {
+                "pipeline_id": str(pipeline_id),
+                "node_id": str(node_id),
+                "execution_id": str(execution_id),
+                "queue": q,
+                "stop_event": stop_event,
+                "worker_thread": None,
+                "worker_alive": True,
+                "created_at": datetime.utcnow().isoformat(),
+                "last_touched_at": datetime.utcnow().isoformat(),
+                "stats": {
+                    "enqueued_jobs": 0,
+                    "processed_jobs": 0,
+                    "failed_jobs": 0,
+                    "inflight_jobs": 0,
+                    "last_latency_ms": 0,
+                    "last_error": "",
+                    "last_enqueue_at": "",
+                    "last_finished_at": "",
+                },
+            }
+            worker = threading.Thread(
+                target=self._oracle_destination_write_queue_worker,
+                args=(queue_key,),
+                daemon=True,
+                name=f"oracle-dest-q-{str(node_id)[:8]}-{str(execution_id)[:8]}",
+            )
+            state["worker_thread"] = worker
+            self._oracle_destination_write_queues[queue_key] = state
+        worker.start()
+        return state
+
+    def _enqueue_oracle_destination_write(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        execution_id: str,
+        config: Dict[str, Any],
+        df: Any,
+        execution_context: Optional[Dict[str, Any]],
+        queue_maxsize: int,
+        enqueue_timeout_seconds: float = 0.2,
+    ) -> Tuple[bool, str]:
+        self._ensure_oracle_destination_queue_runtime_state()
+        state = self._ensure_oracle_destination_write_queue(
+            pipeline_id,
+            node_id,
+            execution_id,
+            maxsize=queue_maxsize,
+        )
+        queue_obj = state.get("queue")
+        if not isinstance(queue_obj, _queue.Queue):
+            return False, "oracle_destination_queue_not_initialized"
+
+        timeout_s = max(0.01, min(float(enqueue_timeout_seconds or 0.2), 5.0))
+        payload = {
+            "pipeline_id": str(pipeline_id),
+            "node_id": str(node_id),
+            "execution_id": str(execution_id),
+            "config": dict(config or {}),
+            "df": df,
+            "execution_context": dict(execution_context or {}),
+        }
+        try:
+            queue_obj.put(payload, timeout=timeout_s)
+        except _queue.Full:
+            return False, "oracle_destination_queue_full"
+        except Exception as exc:
+            return False, str(exc or "oracle_destination_queue_enqueue_failed")
+
+        queue_key = self._oracle_destination_queue_key(pipeline_id, node_id, execution_id)
+        with self._oracle_destination_write_queue_lock:
+            current = self._oracle_destination_write_queues.get(queue_key)
+            if isinstance(current, dict):
+                stats = current.get("stats") if isinstance(current.get("stats"), dict) else {}
+                if not isinstance(current.get("stats"), dict):
+                    current["stats"] = stats
+                stats["enqueued_jobs"] = int(stats.get("enqueued_jobs") or 0) + 1
+                stats["inflight_jobs"] = int(stats.get("inflight_jobs") or 0) + 1
+                stats["last_enqueue_at"] = datetime.utcnow().isoformat()
+                current["last_touched_at"] = datetime.utcnow().isoformat()
+        return True, ""
+
+    def _get_oracle_destination_write_queue_stats(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        execution_id: str,
+    ) -> Dict[str, Any]:
+        self._ensure_oracle_destination_queue_runtime_state()
+        queue_key = self._oracle_destination_queue_key(pipeline_id, node_id, execution_id)
+        with self._oracle_destination_write_queue_lock:
+            state = self._oracle_destination_write_queues.get(queue_key)
+            if not isinstance(state, dict):
+                return {
+                    "enabled": False,
+                    "queue_depth": 0,
+                    "inflight_jobs": 0,
+                    "enqueued_jobs": 0,
+                    "processed_jobs": 0,
+                    "failed_jobs": 0,
+                    "last_error": "",
+                    "last_latency_ms": 0,
+                    "worker_alive": False,
+                    "pending_jobs": 0,
+                }
+            queue_obj = state.get("queue")
+            stats = state.get("stats") if isinstance(state.get("stats"), dict) else {}
+            queue_depth = int(queue_obj.qsize()) if isinstance(queue_obj, _queue.Queue) else 0
+            pending_jobs = (
+                max(0, int(getattr(queue_obj, "unfinished_tasks", 0) or 0))
+                if isinstance(queue_obj, _queue.Queue)
+                else 0
+            )
+            return {
+                "enabled": True,
+                "queue_depth": int(queue_depth),
+                "inflight_jobs": int(stats.get("inflight_jobs") or 0),
+                "enqueued_jobs": int(stats.get("enqueued_jobs") or 0),
+                "processed_jobs": int(stats.get("processed_jobs") or 0),
+                "failed_jobs": int(stats.get("failed_jobs") or 0),
+                "last_error": str(stats.get("last_error") or ""),
+                "last_latency_ms": int(stats.get("last_latency_ms") or 0),
+                "worker_alive": bool(state.get("worker_alive", False)),
+                "pending_jobs": int(pending_jobs),
+            }
+
+    def _wait_for_oracle_destination_write_queue_drain(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        execution_id: str,
+        timeout_seconds: float = 3600.0,
+        poll_interval_seconds: float = 0.2,
+        should_abort: Optional[Callable[[], bool]] = None,
+        on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        deadline = pytime.monotonic() + max(0.1, float(timeout_seconds or 0.1))
+        poll_seconds = max(0.05, min(float(poll_interval_seconds or 0.2), 2.0))
+        last_stats: Dict[str, Any] = self._get_oracle_destination_write_queue_stats(
+            pipeline_id,
+            node_id,
+            execution_id,
+        )
+        while True:
+            if callable(should_abort):
+                try:
+                    if bool(should_abort()):
+                        raise ExecutionAbortedError(
+                            "Execution aborted while waiting for Oracle destination queue drain."
+                        )
+                except ExecutionAbortedError:
+                    raise
+                except Exception:
+                    pass
+            if callable(on_progress):
+                try:
+                    on_progress(dict(last_stats))
+                except Exception:
+                    pass
+            queue_depth = int(last_stats.get("queue_depth") or 0)
+            pending_jobs = int(last_stats.get("pending_jobs") or 0)
+            inflight_jobs = int(last_stats.get("inflight_jobs") or 0)
+            if queue_depth <= 0 and pending_jobs <= 0 and inflight_jobs <= 0:
+                out = dict(last_stats)
+                out["timed_out"] = False
+                return out
+            if pytime.monotonic() >= deadline:
+                out = dict(last_stats)
+                out["timed_out"] = True
+                return out
+            pytime.sleep(poll_seconds)
+            last_stats = self._get_oracle_destination_write_queue_stats(
+                pipeline_id,
+                node_id,
+                execution_id,
+            )
+
+    def _teardown_oracle_destination_write_queue(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        execution_id: str,
+        join_timeout_seconds: float = 0.2,
+    ) -> None:
+        self._ensure_oracle_destination_queue_runtime_state()
+        queue_key = self._oracle_destination_queue_key(pipeline_id, node_id, execution_id)
+        worker_thread = None
+        with self._oracle_destination_write_queue_lock:
+            state = self._oracle_destination_write_queues.get(queue_key)
+            if not isinstance(state, dict):
+                return
+            stop_event = state.get("stop_event")
+            if isinstance(stop_event, threading.Event):
+                stop_event.set()
+            worker_thread = state.get("worker_thread")
+        if isinstance(worker_thread, threading.Thread) and worker_thread.is_alive():
+            try:
+                worker_thread.join(timeout=max(0.05, min(float(join_timeout_seconds or 0.2), 5.0)))
+            except Exception:
+                pass
+        with self._oracle_destination_write_queue_lock:
+            state = self._oracle_destination_write_queues.get(queue_key)
+            if not isinstance(state, dict):
+                return
+            queue_obj = state.get("queue")
+            pending_jobs = (
+                max(0, int(getattr(queue_obj, "unfinished_tasks", 0) or 0))
+                if isinstance(queue_obj, _queue.Queue)
+                else 0
+            )
+            if pending_jobs <= 0:
+                self._oracle_destination_write_queues.pop(queue_key, None)
 
     def _load_runtime_profile_state_by_node(self, pipeline_id: str) -> Dict[str, Any]:
         runtime_state = self._load_runtime_state()
@@ -4731,6 +5070,7 @@ END;"""
         results: Dict[str, Any] = {}
         logs: List[dict] = []
         total_rows = 0
+        pending_oracle_destination_jobs: Dict[str, Dict[str, Any]] = {}
         stream_iterations = runtime["streaming_max_batches"] if mode == "streaming" else 1
         if mode == "streaming":
             stream_capable_sources = {"kafka_source", "webhook_trigger"}
@@ -5101,7 +5441,15 @@ END;"""
                             row_count = hint
                     total_rows += row_count
                     pass_rows += row_count
-                    log_entry["status"] = "success"
+                    oracle_async_payload: Dict[str, Any] = {}
+                    if isinstance(output, list) and output and isinstance(output[0], dict):
+                        oracle_async_payload = output[0]
+                    is_oracle_async_queued = bool(
+                        node_type == "oracle_destination"
+                        and isinstance(oracle_async_payload, dict)
+                        and str(oracle_async_payload.get("status") or "").strip().lower() == "queued"
+                    )
+                    log_entry["status"] = "running" if is_oracle_async_queued else "success"
                     log_entry["rows"] = row_count
                     # Remove transient live counters from the final success payload.
                     log_entry.pop("processed_rows", None)
@@ -5110,6 +5458,7 @@ END;"""
 
                     batch_note = f" | batches={chunk_batches}" if chunk_batches > 1 else ""
                     warning_note = ""
+                    info_note = ""
                     if node_warnings:
                         deduped_warnings: List[str] = []
                         seen_warning_text = set()
@@ -5126,15 +5475,69 @@ END;"""
                             warning_note = f" | warnings={len(deduped_warnings)} | {first_warning}"
                             log_entry["warning_count"] = len(deduped_warnings)
                             log_entry["warnings"] = deduped_warnings[:20]
+                    if isinstance(output, list) and output and isinstance(output[0], dict):
+                        raw_note = str(output[0].get("note") or "").strip()
+                        if raw_note:
+                            info_note = f" | {raw_note}"
 
-                    if (
+                    if is_oracle_async_queued:
+                        queue_depth = int(oracle_async_payload.get("queue_depth") or 0)
+                        pending_jobs = int(oracle_async_payload.get("pending_jobs") or 0)
+                        log_entry["message"] = (
+                            f"⟳ {label} — Oracle async write running "
+                            f"(rows={row_count:,}, queue_depth={queue_depth}, pending={pending_jobs})"
+                            f"{batch_note}{incremental_note}{warning_note}{info_note}"
+                        )
+                        queue_pipeline_id = str(
+                            oracle_async_payload.get("queue_pipeline_id") or pipeline_id or ""
+                        ).strip()
+                        queue_node_id = str(
+                            oracle_async_payload.get("queue_node_id") or nid or ""
+                        ).strip()
+                        queue_execution_id = str(
+                            oracle_async_payload.get("queue_execution_id") or execution_id or ""
+                        ).strip()
+                        wait_on_execution_end = bool(
+                            oracle_async_payload.get("wait_on_execution_end", True)
+                        )
+                        try:
+                            wait_timeout_seconds = float(
+                                oracle_async_payload.get("wait_timeout_seconds") or 3600.0
+                            )
+                        except Exception:
+                            wait_timeout_seconds = 3600.0
+                        wait_timeout_seconds = max(1.0, min(wait_timeout_seconds, 86400.0))
+                        if (
+                            queue_pipeline_id
+                            and queue_node_id
+                            and queue_execution_id
+                            and wait_on_execution_end
+                        ):
+                            queue_key = self._oracle_destination_queue_key(
+                                queue_pipeline_id,
+                                queue_node_id,
+                                queue_execution_id,
+                            )
+                            pending_oracle_destination_jobs[queue_key] = {
+                                "queue_pipeline_id": queue_pipeline_id,
+                                "queue_node_id": queue_node_id,
+                                "queue_execution_id": queue_execution_id,
+                                "node_id": nid,
+                                "node_label": label,
+                                "rows": row_count,
+                                "wait_timeout_seconds": wait_timeout_seconds,
+                            }
+                    elif (
                         isinstance(output, list)
                         and output
                         and isinstance(output[0], dict)
                         and "path" in output[0]
                     ):
                         file_path = output[0]["path"]
-                        log_entry["message"] = f"✓ {label} — written: {file_path} ({row_count:,} rows){batch_note}{incremental_note}{warning_note}"
+                        log_entry["message"] = (
+                            f"✓ {label} — written: {file_path} ({row_count:,} rows)"
+                            f"{batch_note}{incremental_note}{warning_note}{info_note}"
+                        )
                         log_entry["output_path"] = file_path
                     elif (
                         node_type == "map_transform"
@@ -5145,14 +5548,17 @@ END;"""
                         log_entry["message"] = (
                             f"✓ {label} — processed {row_count:,} rows "
                             f"(profile emit output={emitted_row_count:,})"
-                            f"{batch_note}{incremental_note}{warning_note}"
+                            f"{batch_note}{incremental_note}{warning_note}{info_note}"
                         )
                     else:
-                        log_entry["message"] = f"✓ {label} — {row_count:,} rows{batch_note}{incremental_note}{warning_note}"
+                        log_entry["message"] = (
+                            f"✓ {label} — {row_count:,} rows"
+                            f"{batch_note}{incremental_note}{warning_note}{info_note}"
+                        )
 
                     if websocket_manager:
                         await websocket_manager.broadcast(execution_id, {
-                            "type": "node_success",
+                            "type": "node_progress" if is_oracle_async_queued else "node_success",
                             "nodeId": nid,
                             "rows": row_count,
                             "log_entry": dict(log_entry),
@@ -5200,6 +5606,163 @@ END;"""
                 if stream_idx < stream_iterations - 1:
                     _raise_if_aborted()
                     await asyncio.sleep(runtime["streaming_interval_seconds"])
+
+        if pending_oracle_destination_jobs:
+            for queue_key, job in list(pending_oracle_destination_jobs.items()):
+                queue_pipeline_id = str(job.get("queue_pipeline_id") or "").strip()
+                queue_node_id = str(job.get("queue_node_id") or "").strip()
+                queue_execution_id = str(job.get("queue_execution_id") or "").strip()
+                node_id = str(job.get("node_id") or "").strip()
+                node_label = str(job.get("node_label") or node_id or "Oracle Destination").strip()
+                rows = int(job.get("rows") or 0)
+                try:
+                    wait_timeout_seconds = float(job.get("wait_timeout_seconds") or 3600.0)
+                except Exception:
+                    wait_timeout_seconds = 3600.0
+                wait_timeout_seconds = max(1.0, min(wait_timeout_seconds, 86400.0))
+                progress_state = {"last_emit": 0.0}
+
+                def _emit_oracle_queue_progress(stats: Dict[str, Any]) -> None:
+                    now_monotonic = pytime.monotonic()
+                    if now_monotonic - float(progress_state.get("last_emit") or 0.0) < 1.0:
+                        return
+                    progress_state["last_emit"] = now_monotonic
+                    queue_depth = int(stats.get("queue_depth") or 0)
+                    pending_jobs = int(stats.get("pending_jobs") or 0)
+                    inflight_jobs = int(stats.get("inflight_jobs") or 0)
+                    failed_jobs = int(stats.get("failed_jobs") or 0)
+                    message = (
+                        f"⟳ {node_label} — Oracle async write running "
+                        f"(rows={rows:,}, queue_depth={queue_depth}, pending={pending_jobs}, inflight={inflight_jobs}, failed={failed_jobs})"
+                    )
+                    running_entry = {
+                        "nodeId": node_id,
+                        "nodeLabel": node_label,
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "status": "running",
+                        "message": message,
+                        "rows": rows,
+                    }
+                    replaced = False
+                    for idx in range(len(logs) - 1, -1, -1):
+                        log_obj = logs[idx] if isinstance(logs[idx], dict) else None
+                        if not isinstance(log_obj, dict):
+                            continue
+                        if (
+                            str(log_obj.get("nodeId") or "").strip() == node_id
+                            and str(log_obj.get("status") or "").strip().lower() == "running"
+                        ):
+                            logs[idx] = dict(running_entry)
+                            replaced = True
+                            break
+                    if not replaced:
+                        logs.append(dict(running_entry))
+                    if websocket_manager:
+                        asyncio.create_task(websocket_manager.broadcast(execution_id, {
+                            "type": "node_progress",
+                            "nodeId": node_id,
+                            "rows": rows,
+                            "log_entry": dict(running_entry),
+                        }))
+                    if on_node_done:
+                        try:
+                            on_node_done(logs)
+                        except Exception:
+                            pass
+
+                final_stats: Dict[str, Any] = {}
+                queue_wait_error = ""
+                try:
+                    final_stats = self._wait_for_oracle_destination_write_queue_drain(
+                        queue_pipeline_id,
+                        queue_node_id,
+                        queue_execution_id,
+                        timeout_seconds=wait_timeout_seconds,
+                        poll_interval_seconds=0.2,
+                        should_abort=should_abort,
+                        on_progress=_emit_oracle_queue_progress,
+                    )
+                except ExecutionAbortedError:
+                    raise
+                except Exception as queue_exc:
+                    queue_wait_error = str(queue_exc or "oracle_async_wait_failed")
+                    logger.warning(
+                        f"Oracle destination async wait failed for queue={queue_key}: {queue_wait_error}"
+                    )
+                    final_stats = {
+                        "timed_out": True,
+                        "failed_jobs": 0,
+                        "queue_depth": 0,
+                        "pending_jobs": 0,
+                        "inflight_jobs": 0,
+                        "last_error": queue_wait_error,
+                    }
+
+                timed_out = bool(final_stats.get("timed_out", False))
+                failed_jobs = int(final_stats.get("failed_jobs") or 0)
+                queue_depth = int(final_stats.get("queue_depth") or 0)
+                pending_jobs = int(final_stats.get("pending_jobs") or 0)
+                inflight_jobs = int(final_stats.get("inflight_jobs") or 0)
+                tail_note = ""
+                if failed_jobs > 0:
+                    tail_note = f" | failed_jobs={failed_jobs}"
+                elif timed_out:
+                    tail_note = (
+                        f" | queue still running (queue_depth={queue_depth}, pending={pending_jobs}, inflight={inflight_jobs})"
+                    )
+                final_message = (
+                    f"✓ {node_label} — Oracle async write "
+                    f"{'completed' if not timed_out and failed_jobs <= 0 else 'finalized with info'} "
+                    f"(rows={rows:,}){tail_note}"
+                )
+                if queue_wait_error:
+                    final_message += f" | wait_error={queue_wait_error}"
+                final_entry = {
+                    "nodeId": node_id,
+                    "nodeLabel": node_label,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "status": "success",
+                    "message": final_message,
+                    "rows": rows,
+                    "warning_count": 1 if (failed_jobs > 0 or timed_out or queue_wait_error) else 0,
+                    "warnings": (
+                        [str(final_stats.get("last_error") or queue_wait_error or "").strip()]
+                        if (failed_jobs > 0 or timed_out or queue_wait_error)
+                        else []
+                    ),
+                }
+
+                replaced = False
+                for idx in range(len(logs) - 1, -1, -1):
+                    log_obj = logs[idx] if isinstance(logs[idx], dict) else None
+                    if not isinstance(log_obj, dict):
+                        continue
+                    if (
+                        str(log_obj.get("nodeId") or "").strip() == node_id
+                        and str(log_obj.get("status") or "").strip().lower() == "running"
+                    ):
+                        logs[idx] = dict(final_entry)
+                        replaced = True
+                        break
+                if not replaced:
+                    logs.append(dict(final_entry))
+                if websocket_manager:
+                    await websocket_manager.broadcast(execution_id, {
+                        "type": "node_success",
+                        "nodeId": node_id,
+                        "rows": rows,
+                        "log_entry": dict(final_entry),
+                    })
+                if on_node_done:
+                    on_node_done(logs)
+                try:
+                    self._teardown_oracle_destination_write_queue(
+                        queue_pipeline_id,
+                        queue_node_id,
+                        queue_execution_id,
+                    )
+                except Exception:
+                    pass
 
         if pipeline_id:
             if profile_state_by_node and not profile_lazy_incremental_mode:
@@ -9940,7 +10503,7 @@ END;"""
             # Time-driven progress emits are enough for live UX.
             # Keep row-driven checks coarse for throughput.
             node_progress_every = max(500, min(node_progress_every, 5000))
-        abort_check_every = 500 if is_profile_incremental_mode else 25
+        abort_check_every = 100 if is_profile_incremental_mode else 25
 
         def _raise_if_aborted() -> None:
             if callable(raise_if_aborted_cb):
@@ -12390,66 +12953,110 @@ END;"""
                         "runtime": (execution_context or {}).get("runtime"),
                         "node_progress_every": int((execution_context or {}).get("node_progress_every") or 2000),
                     })
-                with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                executor = ProcessPoolExecutor(max_workers=max_workers)
+                abort_shutdown_fast = False
+                try:
                     futures = [
                         executor.submit(_run_custom_profile_partition_process_worker, job)
                         for job in process_jobs
                     ]
-                    for future in as_completed(futures):
+                    pending = set(futures)
+                    while pending:
                         _raise_if_aborted()
-                        partition_result = future.result()
-                        if not isinstance(partition_result, dict):
-                            raise RuntimeError("Parallel profile process partition returned invalid result")
-                        if not bool(partition_result.get("ok")):
-                            raise RuntimeError(
-                                f"Parallel profile process partition failed: "
-                                f"{partition_result.get('error')}"
-                            )
-                        partition_results.append(partition_result)
-                        processed_rows_total += int(partition_result.get("processed") or 0)
-                        validated_rows_total += int(partition_result.get("validated") or 0)
-                        output_rows_total += int(partition_result.get("output_rows") or 0)
-                        flush_count_total += int(partition_result.get("flush_count") or 0)
-                        if emit_node_progress:
-                            try:
-                                emit_node_progress({
-                                    "processed_rows": int(processed_rows_total),
-                                    "validated_rows": int(validated_rows_total),
-                                    "output_rows": int(output_rows_total),
-                                    "message": (
-                                        f"⟳ Running {str((execution_context or {}).get('node_label') or 'Custom Fields')}… "
-                                        f"parallel incremental {processed_rows_total:,}/{len(data):,} processed"
-                                    ),
-                                })
-                            except Exception:
-                                pass
+                        done, pending = wait(
+                            pending,
+                            timeout=0.2,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        if not done:
+                            continue
+                        for future in done:
+                            partition_result = future.result()
+                            if not isinstance(partition_result, dict):
+                                raise RuntimeError("Parallel profile process partition returned invalid result")
+                            if not bool(partition_result.get("ok")):
+                                raise RuntimeError(
+                                    f"Parallel profile process partition failed: "
+                                    f"{partition_result.get('error')}"
+                                )
+                            partition_results.append(partition_result)
+                            processed_rows_total += int(partition_result.get("processed") or 0)
+                            validated_rows_total += int(partition_result.get("validated") or 0)
+                            output_rows_total += int(partition_result.get("output_rows") or 0)
+                            flush_count_total += int(partition_result.get("flush_count") or 0)
+                            if emit_node_progress:
+                                try:
+                                    emit_node_progress({
+                                        "processed_rows": int(processed_rows_total),
+                                        "validated_rows": int(validated_rows_total),
+                                        "output_rows": int(output_rows_total),
+                                        "message": (
+                                            f"⟳ Running {str((execution_context or {}).get('node_label') or 'Custom Fields')}… "
+                                            f"parallel incremental {processed_rows_total:,}/{len(data):,} processed"
+                                        ),
+                                    })
+                                except Exception:
+                                    pass
+                except ExecutionAbortedError:
+                    abort_shutdown_fast = True
+                    raise
+                finally:
+                    try:
+                        executor.shutdown(
+                            wait=not abort_shutdown_fast,
+                            cancel_futures=abort_shutdown_fast,
+                        )
+                    except TypeError:
+                        executor.shutdown(wait=not abort_shutdown_fast)
             else:
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                executor = ThreadPoolExecutor(max_workers=max_workers)
+                abort_shutdown_fast = False
+                try:
                     futures = [
                         executor.submit(_run_partition, partition)
                         for partition in active_partitions
                     ]
-                    for future in as_completed(futures):
+                    pending = set(futures)
+                    while pending:
                         _raise_if_aborted()
-                        partition_result = future.result()
-                        partition_results.append(partition_result)
-                        processed_rows_total += int(partition_result.get("processed") or 0)
-                        validated_rows_total += int(partition_result.get("validated") or 0)
-                        output_rows_total += int(partition_result.get("output_rows") or 0)
-                        flush_count_total += int(partition_result.get("flush_count") or 0)
-                        if emit_node_progress:
-                            try:
-                                emit_node_progress({
-                                    "processed_rows": int(processed_rows_total),
-                                    "validated_rows": int(validated_rows_total),
-                                    "output_rows": int(output_rows_total),
-                                    "message": (
-                                        f"⟳ Running {str((execution_context or {}).get('node_label') or 'Custom Fields')}… "
-                                        f"parallel incremental {processed_rows_total:,}/{len(data):,} processed"
-                                    ),
-                                })
-                            except Exception:
-                                pass
+                        done, pending = wait(
+                            pending,
+                            timeout=0.2,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        if not done:
+                            continue
+                        for future in done:
+                            partition_result = future.result()
+                            partition_results.append(partition_result)
+                            processed_rows_total += int(partition_result.get("processed") or 0)
+                            validated_rows_total += int(partition_result.get("validated") or 0)
+                            output_rows_total += int(partition_result.get("output_rows") or 0)
+                            flush_count_total += int(partition_result.get("flush_count") or 0)
+                            if emit_node_progress:
+                                try:
+                                    emit_node_progress({
+                                        "processed_rows": int(processed_rows_total),
+                                        "validated_rows": int(validated_rows_total),
+                                        "output_rows": int(output_rows_total),
+                                        "message": (
+                                            f"⟳ Running {str((execution_context or {}).get('node_label') or 'Custom Fields')}… "
+                                            f"parallel incremental {processed_rows_total:,}/{len(data):,} processed"
+                                        ),
+                                    })
+                                except Exception:
+                                    pass
+                except ExecutionAbortedError:
+                    abort_shutdown_fast = True
+                    raise
+                finally:
+                    try:
+                        executor.shutdown(
+                            wait=not abort_shutdown_fast,
+                            cancel_futures=abort_shutdown_fast,
+                        )
+                    except TypeError:
+                        executor.shutdown(wait=not abort_shutdown_fast)
         except ExecutionAbortedError:
             raise
         except Exception as exc:
@@ -12583,6 +13190,7 @@ END;"""
                             pipeline_id,
                             node_id,
                             timeout_seconds=oracle_queue_wait_timeout_seconds,
+                            should_abort=should_abort_cb,
                         )
                         queue_timed_out = bool(drained_stats.get("timed_out", False))
                         queue_stats_after_enqueue = drained_stats
@@ -13241,7 +13849,7 @@ END;"""
             )
         return f"oracle+oracledb://{user}:{password}@{host}:{port}/?service_name=ORCLCDB"
 
-    async def _dest_oracle(
+    def _dest_oracle_sync(
         self,
         config: dict,
         df,
@@ -13634,6 +14242,160 @@ END;"""
             raise
         except Exception as e:
             raise RuntimeError(f"Oracle write failed: {e}")
+
+    async def _dest_oracle(
+        self,
+        config: dict,
+        df,
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> list:
+        exec_ctx = execution_context if isinstance(execution_context, dict) else {}
+        queue_worker_mode = bool(exec_ctx.get("oracle_destination_queue_worker", False))
+        async_enabled_cfg = config.get(
+            "oracle_destination_async_enabled",
+            config.get("oracle_async_enabled", os.getenv("ORACLE_DESTINATION_ASYNC_ENABLED", "1")),
+        )
+        async_enabled = bool(self._parse_bool_like(async_enabled_cfg, True))
+
+        if async_enabled and not queue_worker_mode:
+            pipeline_id = str(exec_ctx.get("pipeline_id") or "").strip() or "__pipeline__"
+            node_id = str(exec_ctx.get("node_id") or "").strip() or "__oracle_destination__"
+            execution_id = str(exec_ctx.get("execution_id") or "").strip() or "__execution__"
+            wait_on_execution_end_cfg = config.get(
+                "oracle_destination_async_wait_on_execution_end",
+                config.get(
+                    "oracle_async_wait_on_execution_end",
+                    os.getenv("ORACLE_DESTINATION_ASYNC_WAIT_ON_EXECUTION_END", "1"),
+                ),
+            )
+            wait_on_execution_end = bool(self._parse_bool_like(wait_on_execution_end_cfg, True))
+            try:
+                wait_timeout_seconds = float(
+                    config.get("oracle_destination_async_wait_timeout_seconds")
+                    or config.get("oracle_async_wait_timeout_seconds")
+                    or os.getenv("ORACLE_DESTINATION_ASYNC_WAIT_TIMEOUT_SECONDS", "3600")
+                )
+            except Exception:
+                wait_timeout_seconds = 3600.0
+            wait_timeout_seconds = max(1.0, min(wait_timeout_seconds, 86400.0))
+            try:
+                queue_maxsize = int(
+                    config.get("oracle_destination_async_queue_maxsize")
+                    or config.get("oracle_async_queue_maxsize")
+                    or os.getenv("ORACLE_DESTINATION_ASYNC_QUEUE_MAXSIZE", "8")
+                )
+            except Exception:
+                queue_maxsize = 8
+            queue_maxsize = max(1, min(queue_maxsize, 128))
+            try:
+                enqueue_timeout_seconds = float(
+                    config.get("oracle_destination_async_enqueue_timeout_seconds")
+                    or config.get("oracle_async_enqueue_timeout_seconds")
+                    or os.getenv("ORACLE_DESTINATION_ASYNC_ENQUEUE_TIMEOUT_SECONDS", "0.2")
+                )
+            except Exception:
+                enqueue_timeout_seconds = 0.2
+            enqueue_timeout_seconds = max(0.01, min(enqueue_timeout_seconds, 5.0))
+
+            enqueued, enqueue_error = self._enqueue_oracle_destination_write(
+                pipeline_id=pipeline_id,
+                node_id=node_id,
+                execution_id=execution_id,
+                config=config,
+                df=df,
+                execution_context={
+                    "pipeline_id": pipeline_id,
+                    "node_id": node_id,
+                    "execution_id": execution_id,
+                    "oracle_destination_queue_worker": True,
+                    "should_abort": exec_ctx.get("should_abort"),
+                    "raise_if_aborted": exec_ctx.get("raise_if_aborted"),
+                },
+                queue_maxsize=queue_maxsize,
+                enqueue_timeout_seconds=enqueue_timeout_seconds,
+            )
+            if enqueued:
+                stats = self._get_oracle_destination_write_queue_stats(
+                    pipeline_id=pipeline_id,
+                    node_id=node_id,
+                    execution_id=execution_id,
+                )
+                table = config.get("table", "ETL_OUTPUT")
+                schema = config.get("schema") or None
+                operation = str(config.get("oracle_operation", "insert") or "insert").strip().lower()
+                if operation not in {"insert", "update", "upsert"}:
+                    operation = "insert"
+                if_exists = (config.get("if_exists", "append") or "append").lower()
+                if if_exists not in {"append", "replace", "fail"}:
+                    if_exists = "append"
+                return [{
+                    "status": "queued",
+                    "rows": len(df),
+                    "table": table,
+                    "schema": schema,
+                    "operation": operation,
+                    "if_exists": if_exists if operation == "insert" else None,
+                    "async_processing": True,
+                    "queue_depth": int(stats.get("queue_depth") or 0),
+                    "pending_jobs": int(stats.get("pending_jobs") or 0),
+                    "inflight_jobs": int(stats.get("inflight_jobs") or 0),
+                    "failed_jobs": int(stats.get("failed_jobs") or 0),
+                    "worker_alive": bool(stats.get("worker_alive", False)),
+                    "queue_pipeline_id": pipeline_id,
+                    "queue_node_id": node_id,
+                    "queue_execution_id": execution_id,
+                    "wait_on_execution_end": bool(wait_on_execution_end),
+                    "wait_timeout_seconds": float(wait_timeout_seconds),
+                    "note": (
+                        "Oracle write queued in background (info-only). "
+                        "Downstream nodes continue immediately."
+                    ),
+                }]
+            fallback_sync_cfg = config.get(
+                "oracle_destination_async_fallback_sync",
+                config.get("oracle_async_fallback_sync", os.getenv("ORACLE_DESTINATION_ASYNC_FALLBACK_SYNC", "0")),
+            )
+            fallback_sync = bool(self._parse_bool_like(fallback_sync_cfg, False))
+            table = config.get("table", "ETL_OUTPUT")
+            schema = config.get("schema") or None
+            operation = str(config.get("oracle_operation", "insert") or "insert").strip().lower()
+            if operation not in {"insert", "update", "upsert"}:
+                operation = "insert"
+            if_exists = (config.get("if_exists", "append") or "append").lower()
+            if if_exists not in {"append", "replace", "fail"}:
+                if_exists = "append"
+            if not fallback_sync:
+                logger.warning(
+                    "Oracle destination async enqueue failed for "
+                    f"pipeline={pipeline_id}, node={node_id}: {enqueue_error}. "
+                    "Write skipped to keep pipeline non-blocking."
+                )
+                return [{
+                    "status": "queue_error",
+                    "rows": len(df),
+                    "table": table,
+                    "schema": schema,
+                    "operation": operation,
+                    "if_exists": if_exists if operation == "insert" else None,
+                    "async_processing": True,
+                    "queue_error": str(enqueue_error or "oracle_destination_queue_enqueue_failed"),
+                    "queue_pipeline_id": pipeline_id,
+                    "queue_node_id": node_id,
+                    "queue_execution_id": execution_id,
+                    "wait_on_execution_end": bool(wait_on_execution_end),
+                    "wait_timeout_seconds": float(wait_timeout_seconds),
+                    "note": (
+                        "Oracle async queue enqueue failed; write skipped to keep flow non-blocking. "
+                        "Check backend logs/queue settings."
+                    ),
+                }]
+            logger.warning(
+                "Oracle destination async enqueue failed for "
+                f"pipeline={pipeline_id}, node={node_id}: {enqueue_error}. "
+                "Falling back to synchronous write because oracle_destination_async_fallback_sync is enabled."
+            )
+
+        return self._dest_oracle_sync(config, df, execution_context=execution_context)
 
     async def _dest_mongodb(self, config: dict, data: list) -> list:
         try:
