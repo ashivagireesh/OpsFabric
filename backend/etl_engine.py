@@ -595,6 +595,36 @@ class ETLEngine:
 
         return out_rows
 
+    def _profile_namespace_from_lmdb_key(self, lmdb_key: str) -> str:
+        text = str(lmdb_key or "").strip()
+        if not text:
+            return ""
+        marker = "::@e::"
+        if marker in text:
+            pipeline_part, tail = text.split(marker, 1)
+            node_id, sep, _entity = tail.partition("::")
+            if sep and node_id:
+                return f"{pipeline_part}::{node_id}"
+            return pipeline_part or text
+        first, sep, second = text.partition("::")
+        if sep and first and second:
+            return f"{first}::{second}"
+        return text
+
+    def _profile_row_dedupe_key(self, row: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(row, dict):
+            return None
+        profile_source = str(row.get("_lmdb_profile_source") or "").strip().lower()
+        if profile_source not in {"documents", "document", "profile"}:
+            return None
+        entity_key = str(row.get("lmdb_entity_key") or "").strip()
+        if not entity_key:
+            return None
+        namespace = self._profile_namespace_from_lmdb_key(str(row.get("lmdb_key") or ""))
+        if namespace:
+            return f"{namespace}::{entity_key}"
+        return f"entity::{entity_key}"
+
     def _runtime_state_path(self) -> str:
         state_dir = os.path.join(os.path.dirname(__file__), "state")
         os.makedirs(state_dir, exist_ok=True)
@@ -6495,6 +6525,7 @@ END;"""
 
         rows: List[Dict[str, Any]] = []
         matched_rows = 0
+        seen_profile_entities: set = set()
         env = None
 
         def _to_cell_text(value: Any) -> str:
@@ -6645,6 +6676,11 @@ END;"""
                                 _raise_if_aborted()
                                 if not _row_matches_filters(expanded_row):
                                     continue
+                                dedupe_key = self._profile_row_dedupe_key(expanded_row)
+                                if dedupe_key:
+                                    if dedupe_key in seen_profile_entities:
+                                        continue
+                                    seen_profile_entities.add(dedupe_key)
                                 if matched_rows < preview_offset:
                                     matched_rows += 1
                                     continue
@@ -7075,6 +7111,7 @@ END;"""
         scan_capped = False
         scanned_entries = 0
         matched_rows = 0
+        seen_profile_entities: set = set()
         profile_rows = 0
         non_profile_rows = 0
         unique_keys: set = set()
@@ -7420,6 +7457,11 @@ END;"""
                             for expanded_row in expanded_rows:
                                 if not _row_matches_filters(expanded_row):
                                     continue
+                                dedupe_key = self._profile_row_dedupe_key(expanded_row)
+                                if dedupe_key:
+                                    if dedupe_key in seen_profile_entities:
+                                        continue
+                                    seen_profile_entities.add(dedupe_key)
                                 _track_row(expanded_row)
                                 if summary_scan_limit > 0 and matched_rows >= summary_scan_limit:
                                     scan_capped = True
@@ -11958,21 +12000,56 @@ END;"""
                     else:
                         state["output_key_name"] = output_key_name
 
-                    metric_defs = state.get("metric_defs")
-                    if not isinstance(metric_defs, list) or not metric_defs:
-                        metric_defs = _profile_compile_group_metrics(metrics)
-                        state["metric_defs"] = metric_defs
-                    metric_specs = _profile_bind_group_metrics(metric_defs if isinstance(metric_defs, list) else [])
-                    if metric_defs:
+                    # Rebuild metric defs from expression input every call and
+                    # refresh cached state when definition changed. Without this,
+                    # editing an existing group_aggregate expression (e.g. adding
+                    # `sum_amount`) keeps using stale metric defs from persisted
+                    # profile meta and new metrics never materialize.
+                    compiled_metric_defs = _profile_compile_group_metrics(metrics)
+                    metric_defs_current = state.get("metric_defs")
+                    metric_defs_changed = False
+                    if not isinstance(metric_defs_current, list):
+                        metric_defs_current = []
+                        metric_defs_changed = True
+                    try:
+                        prev_signature = json.dumps(
+                            metric_defs_current,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        )
+                    except Exception:
+                        prev_signature = str(metric_defs_current)
+                    try:
+                        next_signature = json.dumps(
+                            compiled_metric_defs,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        )
+                    except Exception:
+                        next_signature = str(compiled_metric_defs)
+                    if prev_signature != next_signature:
+                        metric_defs_changed = True
+                        metric_defs_current = compiled_metric_defs
+                        state["metric_defs"] = metric_defs_current
+                        state["dirty"] = True
+                        state["cached_rows"] = []
+                        state["row_index"] = {}
+                        profile_meta_touched = True
+
+                    metric_specs = _profile_bind_group_metrics(metric_defs_current)
+                    if metric_defs_current:
                         state["metric_specs"] = [
                             {
                                 "name": str(item.get("name") or "").strip(),
                                 "kind": str(item.get("kind") or "count").strip().lower(),
                             }
-                            for item in metric_defs
+                            for item in metric_defs_current
                             if isinstance(item, dict)
                         ]
-                        profile_meta_touched = True
+                        if metric_defs_changed:
+                            profile_meta_touched = True
                     else:
                         metric_specs = state.get("metric_specs") if isinstance(state.get("metric_specs"), list) else []
 

@@ -74,7 +74,15 @@ type CustomProfileComputeExecutor = 'thread' | 'process'
 type CustomExpressionEngine = 'auto' | 'python' | 'polars'
 type CustomProfileStorage = 'lmdb' | 'rocksdb' | 'redis' | 'oracle'
 type CustomProfileOracleWriteStrategy = 'single' | 'parallel_key'
-type CustomEditorColorProfile = 'high_contrast' | 'soft' | 'js_like'
+type CustomEditorColorProfile =
+  | 'high_contrast'
+  | 'soft'
+  | 'js_like'
+  | 'monokai'
+  | 'dracula'
+  | 'solarized_dark'
+  | 'github_dark'
+  | 'github_light'
 type CustomEditorFontPreset = 'jetbrains_mono' | 'fira_code' | 'consolas'
 
 interface CustomFieldSpec {
@@ -273,12 +281,22 @@ const CUSTOM_EDITOR_THEME_IDS = {
   high_contrast: 'opsfabric-custom-field-dark-hc',
   soft: 'opsfabric-custom-field-dark-soft',
   js_like: 'opsfabric-custom-field-dark-js',
+  monokai: 'opsfabric-custom-field-monokai',
+  dracula: 'opsfabric-custom-field-dracula',
+  solarized_dark: 'opsfabric-custom-field-solarized-dark',
+  github_dark: 'opsfabric-custom-field-github-dark',
+  github_light: 'opsfabric-custom-field-github-light',
 } as const
 
 const CUSTOM_EDITOR_COLOR_PROFILE_OPTIONS: Array<{ value: CustomEditorColorProfile; label: string }> = [
   { value: 'high_contrast', label: 'High Contrast' },
   { value: 'soft', label: 'Soft' },
   { value: 'js_like', label: 'JS-like' },
+  { value: 'monokai', label: 'Monokai' },
+  { value: 'dracula', label: 'Dracula' },
+  { value: 'solarized_dark', label: 'Solarized Dark' },
+  { value: 'github_dark', label: 'GitHub Dark' },
+  { value: 'github_light', label: 'GitHub Light' },
 ]
 
 const CUSTOM_EDITOR_FONT_FAMILY_OPTIONS: Array<{ value: CustomEditorFontPreset; label: string }> = [
@@ -316,7 +334,16 @@ function loadCustomEditorPrefs(): CustomEditorPrefs {
     const parsed = JSON.parse(raw) as Partial<CustomEditorPrefs>
     const colorProfile = parsed?.colorProfile
     const fontPreset = parsed?.fontPreset
-    const allowedColorProfiles = new Set<CustomEditorColorProfile>(['high_contrast', 'soft', 'js_like'])
+    const allowedColorProfiles = new Set<CustomEditorColorProfile>([
+      'high_contrast',
+      'soft',
+      'js_like',
+      'monokai',
+      'dracula',
+      'solarized_dark',
+      'github_dark',
+      'github_light',
+    ])
     const allowedFontPresets = new Set<CustomEditorFontPreset>(['jetbrains_mono', 'fira_code', 'consolas'])
     return {
       colorProfile: allowedColorProfiles.has(colorProfile as CustomEditorColorProfile)
@@ -340,14 +367,14 @@ function loadCustomEditorPrefs(): CustomEditorPrefs {
 }
 
 function resolveEditorFontFamily(preset: CustomEditorFontPreset): string {
-  if (preset === 'fira_code') return '"Fira Code", Menlo, Monaco, Consolas, "Courier New", monospace'
-  if (preset === 'consolas') return 'Consolas, Menlo, Monaco, "Courier New", monospace'
-  return '"JetBrains Mono", Menlo, Monaco, Consolas, "Courier New", monospace'
+  if (preset === 'fira_code') return '"Fira Code", "JetBrains Mono", "Cascadia Mono", "SF Mono", Menlo, Monaco, Consolas, "Courier New", monospace'
+  if (preset === 'consolas') return 'Consolas, "Cascadia Mono", "SF Mono", Menlo, Monaco, "Courier New", monospace'
+  return '"JetBrains Mono", "Fira Code", "Cascadia Mono", "SF Mono", Menlo, Monaco, Consolas, "Courier New", monospace'
 }
 
 let exprLanguageRegistered = false
 let jsonTemplateLanguageRegistered = false
-let customEditorThemeRegistered = false
+let customEditorLastMonaco: Monaco | null = null
 let exprCompletionEntries: ExpressionCompletionEntry[] = []
 let exprFunctionSignatureMap = new Map<string, { name: string; label: string; parameters: string[]; documentation: string }>()
 const EXPR_ALLOWED_AGG_VALUES = new Set([
@@ -466,7 +493,7 @@ function setExpressionCompletionEntries(entries: ExpressionCompletionEntry[]): v
 }
 
 function ensureCustomEditorTheme(monaco: Monaco): void {
-  if (customEditorThemeRegistered) return
+  customEditorLastMonaco = monaco
 
   monaco.editor.defineTheme(CUSTOM_EDITOR_THEME_IDS.high_contrast, {
     base: 'vs-dark',
@@ -555,7 +582,151 @@ function ensureCustomEditorTheme(monaco: Monaco): void {
       'editorWarning.foreground': '#cca700',
     },
   })
-  customEditorThemeRegistered = true
+  monaco.editor.defineTheme(CUSTOM_EDITOR_THEME_IDS.monokai, {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      { token: 'entity.name.function', foreground: 'A6E22E', fontStyle: 'bold' },
+      { token: 'field.function', foreground: '66D9EF', fontStyle: 'bold' },
+      { token: 'parameter.name', foreground: 'FD971F', fontStyle: 'bold' },
+      { token: 'variable.field', foreground: 'E6DB74', fontStyle: 'bold' },
+      { token: 'string.literal.value', foreground: 'E6DB74', fontStyle: 'bold' },
+      { token: 'string.expression', foreground: 'F8F8F2' },
+      { token: 'string.expression.quote', foreground: 'E6DB74' },
+      { token: 'key', foreground: 'F92672', fontStyle: 'bold' },
+      { token: 'number', foreground: 'AE81FF', fontStyle: 'bold' },
+      { token: 'operator', foreground: 'F92672', fontStyle: 'bold' },
+      { token: 'delimiter.bracket', foreground: 'F8F8F2', fontStyle: 'bold' },
+      { token: 'string', foreground: 'E6DB74' },
+    ],
+    colors: {
+      'editor.background': '#272822',
+      'editor.foreground': '#F8F8F2',
+      'editorCursor.foreground': '#F8F8F0',
+      'editorLineNumber.foreground': '#75715E',
+      'editorLineNumber.activeForeground': '#F8F8F2',
+      'editorBracketMatch.background': '#3E3D32',
+      'editorBracketMatch.border': '#A6E22E',
+      'editorError.foreground': '#F92672',
+      'editorWarning.foreground': '#FD971F',
+    },
+  })
+  monaco.editor.defineTheme(CUSTOM_EDITOR_THEME_IDS.dracula, {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      { token: 'entity.name.function', foreground: '50FA7B', fontStyle: 'bold' },
+      { token: 'field.function', foreground: '8BE9FD', fontStyle: 'bold' },
+      { token: 'parameter.name', foreground: 'FFB86C', fontStyle: 'bold' },
+      { token: 'variable.field', foreground: 'F1FA8C', fontStyle: 'bold' },
+      { token: 'string.literal.value', foreground: 'F1FA8C', fontStyle: 'bold' },
+      { token: 'string.expression', foreground: 'F8F8F2' },
+      { token: 'string.expression.quote', foreground: 'F1FA8C' },
+      { token: 'key', foreground: 'FF79C6', fontStyle: 'bold' },
+      { token: 'number', foreground: 'BD93F9', fontStyle: 'bold' },
+      { token: 'operator', foreground: 'FF79C6', fontStyle: 'bold' },
+      { token: 'delimiter.bracket', foreground: 'F8F8F2', fontStyle: 'bold' },
+      { token: 'string', foreground: 'F1FA8C' },
+    ],
+    colors: {
+      'editor.background': '#282A36',
+      'editor.foreground': '#F8F8F2',
+      'editorCursor.foreground': '#F8F8F2',
+      'editorLineNumber.foreground': '#6272A4',
+      'editorLineNumber.activeForeground': '#F8F8F2',
+      'editorBracketMatch.background': '#44475A66',
+      'editorBracketMatch.border': '#8BE9FD',
+      'editorError.foreground': '#FF5555',
+      'editorWarning.foreground': '#FFB86C',
+    },
+  })
+  monaco.editor.defineTheme(CUSTOM_EDITOR_THEME_IDS.solarized_dark, {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      { token: 'entity.name.function', foreground: 'B58900', fontStyle: 'bold' },
+      { token: 'field.function', foreground: '268BD2', fontStyle: 'bold' },
+      { token: 'parameter.name', foreground: '2AA198', fontStyle: 'bold' },
+      { token: 'variable.field', foreground: 'CB4B16', fontStyle: 'bold' },
+      { token: 'string.literal.value', foreground: '859900', fontStyle: 'bold' },
+      { token: 'string.expression', foreground: '93A1A1' },
+      { token: 'string.expression.quote', foreground: '859900' },
+      { token: 'key', foreground: 'D33682', fontStyle: 'bold' },
+      { token: 'number', foreground: '6C71C4', fontStyle: 'bold' },
+      { token: 'operator', foreground: '839496', fontStyle: 'bold' },
+      { token: 'delimiter.bracket', foreground: '93A1A1', fontStyle: 'bold' },
+      { token: 'string', foreground: '859900' },
+    ],
+    colors: {
+      'editor.background': '#002B36',
+      'editor.foreground': '#93A1A1',
+      'editorCursor.foreground': '#93A1A1',
+      'editorLineNumber.foreground': '#586E75',
+      'editorLineNumber.activeForeground': '#EEE8D5',
+      'editorBracketMatch.background': '#073642',
+      'editorBracketMatch.border': '#2AA198',
+      'editorError.foreground': '#DC322F',
+      'editorWarning.foreground': '#B58900',
+    },
+  })
+  monaco.editor.defineTheme(CUSTOM_EDITOR_THEME_IDS.github_dark, {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      { token: 'entity.name.function', foreground: 'D2A8FF', fontStyle: 'bold' },
+      { token: 'field.function', foreground: '79C0FF', fontStyle: 'bold' },
+      { token: 'parameter.name', foreground: 'A5D6FF', fontStyle: 'bold' },
+      { token: 'variable.field', foreground: 'FFA657', fontStyle: 'bold' },
+      { token: 'string.literal.value', foreground: 'A5D6FF', fontStyle: 'bold' },
+      { token: 'string.expression', foreground: 'C9D1D9' },
+      { token: 'string.expression.quote', foreground: 'A5D6FF' },
+      { token: 'key', foreground: 'FF7B72', fontStyle: 'bold' },
+      { token: 'number', foreground: '79C0FF', fontStyle: 'bold' },
+      { token: 'operator', foreground: 'FF7B72', fontStyle: 'bold' },
+      { token: 'delimiter.bracket', foreground: 'C9D1D9', fontStyle: 'bold' },
+      { token: 'string', foreground: 'A5D6FF' },
+    ],
+    colors: {
+      'editor.background': '#0D1117',
+      'editor.foreground': '#C9D1D9',
+      'editorCursor.foreground': '#C9D1D9',
+      'editorLineNumber.foreground': '#6E7681',
+      'editorLineNumber.activeForeground': '#C9D1D9',
+      'editorBracketMatch.background': '#30363D66',
+      'editorBracketMatch.border': '#58A6FF',
+      'editorError.foreground': '#F85149',
+      'editorWarning.foreground': '#D29922',
+    },
+  })
+  monaco.editor.defineTheme(CUSTOM_EDITOR_THEME_IDS.github_light, {
+    base: 'vs',
+    inherit: true,
+    rules: [
+      { token: 'entity.name.function', foreground: '8250DF', fontStyle: 'bold' },
+      { token: 'field.function', foreground: '0550AE', fontStyle: 'bold' },
+      { token: 'parameter.name', foreground: '0A3069', fontStyle: 'bold' },
+      { token: 'variable.field', foreground: '953800', fontStyle: 'bold' },
+      { token: 'string.literal.value', foreground: '0A3069', fontStyle: 'bold' },
+      { token: 'string.expression', foreground: '24292F' },
+      { token: 'string.expression.quote', foreground: '0A3069' },
+      { token: 'key', foreground: 'CF222E', fontStyle: 'bold' },
+      { token: 'number', foreground: '0550AE', fontStyle: 'bold' },
+      { token: 'operator', foreground: 'CF222E', fontStyle: 'bold' },
+      { token: 'delimiter.bracket', foreground: '24292F', fontStyle: 'bold' },
+      { token: 'string', foreground: '0A3069' },
+    ],
+    colors: {
+      'editor.background': '#FFFFFF',
+      'editor.foreground': '#24292F',
+      'editorCursor.foreground': '#24292F',
+      'editorLineNumber.foreground': '#8C959F',
+      'editorLineNumber.activeForeground': '#24292F',
+      'editorBracketMatch.background': '#DDF4FF',
+      'editorBracketMatch.border': '#0969DA',
+      'editorError.foreground': '#CF222E',
+      'editorWarning.foreground': '#9A6700',
+    },
+  })
 }
 
 function extractSuggestionFromIssueMessage(message: string): string | null {
@@ -2037,20 +2208,62 @@ function extractExpressionStringRanges(text: string): Array<{ value: string; sta
   return out
 }
 
+function collapseExpressionWhitespace(raw: string): string {
+  const source = String(raw || '').trim()
+  if (!source) return ''
+  let out = ''
+  let quote: '"' | "'" | null = null
+  let escaped = false
+  let pendingSpace = false
+
+  const appendSpaceIfNeeded = (nextChar: string) => {
+    if (!pendingSpace) return
+    pendingSpace = false
+    if (!out) return
+    const last = out[out.length - 1]
+    if (!last || /\s/.test(last)) return
+    if (/[([{.]/.test(last)) return
+    if (/[)\]},.:]/.test(nextChar)) return
+    out += ' '
+  }
+
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i]
+    if (quote) {
+      out += ch
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        continue
+      }
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      appendSpaceIfNeeded(ch)
+      quote = ch
+      out += ch
+      continue
+    }
+    if (/\s/.test(ch)) {
+      pendingSpace = true
+      continue
+    }
+    appendSpaceIfNeeded(ch)
+    out += ch
+  }
+  return out.trim()
+}
+
 function findNextNonWhitespaceChar(source: string, start: number): string {
-  for (let i = start; i < source.length; i += 1) {
+  for (let i = Math.max(0, start); i < source.length; i += 1) {
     const ch = source[i]
     if (!/\s/.test(ch)) return ch
   }
   return ''
-}
-
-function isMatchingCloseChar(openChar: string, closeChar: string): boolean {
-  return (
-    (openChar === '(' && closeChar === ')')
-    || (openChar === '[' && closeChar === ']')
-    || (openChar === '{' && closeChar === '}')
-  )
 }
 
 function getLastNonWhitespaceChar(source: string): string {
@@ -2061,8 +2274,170 @@ function getLastNonWhitespaceChar(source: string): string {
   return ''
 }
 
-function trimTrailingSpaces(source: string): string {
-  return source.replace(/[ \t]+$/g, '')
+function formatStructuredLiteral(source: string): string {
+  const text = collapseExpressionWhitespace(source)
+  if (!text) return ''
+
+  let out = ''
+  let quote: '"' | "'" | null = null
+  let escaped = false
+  let depthCurly = 0
+  let depthSquare = 0
+  let depthRound = 0
+  const indentUnit = '  '
+
+  const blockDepth = () => Math.max(0, depthCurly + depthSquare)
+  const appendIndent = () => {
+    out += indentUnit.repeat(blockDepth())
+  }
+  const appendNewline = () => {
+    out = out.replace(/[ \t]+$/g, '')
+    if (!out.endsWith('\n')) out += '\n'
+    appendIndent()
+  }
+  const appendTokenSpaceIfNeeded = () => {
+    if (!out) return
+    const last = out[out.length - 1]
+    if (last === ' ' || last === '\n') return
+    out += ' '
+  }
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    if (quote) {
+      out += ch
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        continue
+      }
+      if (ch === quote) quote = null
+      continue
+    }
+
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      out += ch
+      continue
+    }
+
+    if (/\s/.test(ch)) {
+      appendTokenSpaceIfNeeded()
+      continue
+    }
+
+    if (ch === '{' || ch === '[') {
+      out += ch
+      if (ch === '{') depthCurly += 1
+      else depthSquare += 1
+      const next = findNextNonWhitespaceChar(text, i + 1)
+      const isEmptyBlock = (ch === '{' && next === '}') || (ch === '[' && next === ']')
+      if (!isEmptyBlock && next) appendNewline()
+      continue
+    }
+
+    if (ch === '}') {
+      depthCurly = Math.max(0, depthCurly - 1)
+      if (getLastNonWhitespaceChar(out) !== '{') appendNewline()
+      out += ch
+      continue
+    }
+
+    if (ch === ']') {
+      depthSquare = Math.max(0, depthSquare - 1)
+      if (getLastNonWhitespaceChar(out) !== '[') appendNewline()
+      out += ch
+      continue
+    }
+
+    if (ch === '(') {
+      depthRound += 1
+      out += ch
+      continue
+    }
+
+    if (ch === ')') {
+      depthRound = Math.max(0, depthRound - 1)
+      out += ch
+      continue
+    }
+
+    if (ch === ',') {
+      out += ','
+      if (depthRound === 0) appendNewline()
+      else out += ' '
+      continue
+    }
+
+    if (ch === ':') {
+      out = out.replace(/[ \t]+$/g, '')
+      out += ': '
+      continue
+    }
+
+    out += ch
+  }
+
+  return String(out || '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+function indentMultilineExpression(text: string, depth: number, indentUnit = '  '): string {
+  const prefix = indentUnit.repeat(Math.max(0, depth))
+  return String(text || '')
+    .split('\n')
+    .map((line) => `${prefix}${line}`)
+    .join('\n')
+}
+
+function shouldMultilineFunctionCall(name: string, args: string[], inlineCandidate: string): boolean {
+  const fn = String(name || '').trim().toLowerCase()
+  const forceMultiline = new Set([
+    'if_',
+    'group_aggregate',
+    'rolling_update',
+    'agg_if',
+    'count_if',
+    'sum_if',
+    'mean_if',
+    'min_if',
+    'max_if',
+    'distinct_if',
+    'distinct_count_if',
+    'count_non_null_if',
+  ])
+  if (forceMultiline.has(fn)) return true
+  if (args.length >= 4) return true
+  if (inlineCandidate.length > 96) return true
+  return args.some((arg) => {
+    const text = String(arg || '')
+    if (text.includes('\n')) return true
+    if (text.length > 44) return true
+    return false
+  })
+}
+
+function formatExpressionBody(source: string): string {
+  const text = collapseExpressionWhitespace(source)
+  if (!text) return ''
+  const call = parseTopLevelFunctionCallSource(text)
+  if (!call) return text
+
+  const formattedArgs = call.args.map((arg) => formatExpressionBody(String(arg || '')))
+  const inline = `${call.name}(${formattedArgs.join(', ')})`
+  if (!formattedArgs.length || !shouldMultilineFunctionCall(call.name, formattedArgs, inline)) {
+    return inline
+  }
+
+  const argsBlock = formattedArgs
+    .map((arg) => indentMultilineExpression(arg, 1))
+    .join(',\n')
+  return `${call.name}(\n${argsBlock}\n)`
 }
 
 function beautifyExpressionText(rawExpression: string): string {
@@ -2072,132 +2447,19 @@ function beautifyExpressionText(rawExpression: string): string {
   const body = hasEqualsPrefix ? source.slice(1).trim() : source
   if (!body) return hasEqualsPrefix ? '=' : ''
 
-  let out = ''
-  let quote: '"' | "'" | null = null
-  let escaped = false
-  let pendingSpace = false
-  let depth = 0
-  const indentUnit = '  '
-  const operatorPattern = /[+\-*/%<>=!&|?:]/
-
-  const append = (value: string) => {
-    out += value
-  }
-  const ensureSpace = () => {
-    const last = out.slice(-1)
-    if (out && last !== '\n' && last !== ' ') append(' ')
-  }
-  const newlineWithIndent = (indentDepth: number) => {
-    out = trimTrailingSpaces(out)
-    if (!out.endsWith('\n')) append('\n')
-    append(indentUnit.repeat(Math.max(0, indentDepth)))
-  }
-  const flushPendingSpace = () => {
-    if (!pendingSpace) return
-    ensureSpace()
-    pendingSpace = false
-  }
-
-  for (let i = 0; i < body.length; i += 1) {
-    const ch = body[i]
-    if (quote) {
-      append(ch)
-      if (escaped) {
-        escaped = false
-        continue
-      }
-      if (ch === '\\') {
-        escaped = true
-        continue
-      }
-      if (ch === quote) {
-        quote = null
-      }
-      continue
-    }
-
-    if (ch === '"' || ch === "'") {
-      flushPendingSpace()
-      quote = ch
-      append(ch)
-      continue
-    }
-
-    if (/\s/.test(ch)) {
-      pendingSpace = true
-      continue
-    }
-
-    if (ch === '(' || ch === '[' || ch === '{') {
-      flushPendingSpace()
-      out = trimTrailingSpaces(out)
-      append(ch)
-      depth += 1
-      const next = findNextNonWhitespaceChar(body, i + 1)
-      if (next && !isMatchingCloseChar(ch, next)) {
-        newlineWithIndent(depth)
-      }
-      pendingSpace = false
-      continue
-    }
-
-    if (ch === ')' || ch === ']' || ch === '}') {
-      pendingSpace = false
-      depth = Math.max(0, depth - 1)
-      out = trimTrailingSpaces(out)
-      const lastNonWs = getLastNonWhitespaceChar(out)
-      const expectedOpen = ch === ')' ? '(' : ch === ']' ? '[' : '{'
-      if (lastNonWs === expectedOpen) {
-        out = out.replace(/\n[ \t]*$/g, '')
-      } else {
-        newlineWithIndent(depth)
-      }
-      append(ch)
-      const next = findNextNonWhitespaceChar(body, i + 1)
-      if (next && ![',', ')', ']', '}'].includes(next)) {
-        append(' ')
-      }
-      continue
-    }
-
-    if (ch === ',') {
-      append(',')
-      newlineWithIndent(depth)
-      pendingSpace = false
-      continue
-    }
-
-    if (operatorPattern.test(ch)) {
-      flushPendingSpace()
-      out = trimTrailingSpaces(out)
-      const next = body[i + 1] || ''
-      if (ch === '-' && /[0-9.]/.test(next) && /[\s(,[{:=+\-*/%<>=!&|?:]/.test(body[i - 1] || '')) {
-        append(ch)
-        continue
-      }
-      ensureSpace()
-      append(ch)
-      let j = i + 1
-      while (j < body.length && operatorPattern.test(body[j])) {
-        append(body[j])
-        i = j
-        j += 1
-      }
-      append(' ')
-      pendingSpace = false
-      continue
-    }
-
-    flushPendingSpace()
-    append(ch)
-  }
-
-  let formatted = out
+  const parsedTopLevelCall = parseTopLevelFunctionCallSource(body)
+  const formattedBody = (
+    parsedTopLevelCall
+      ? formatExpressionBody(body)
+      : /^[\[{]/.test(body)
+        ? formatStructuredLiteral(body)
+        : collapseExpressionWhitespace(body)
+  )
+  const normalized = String(formattedBody || body)
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
-  if (!formatted) formatted = body
-  return hasEqualsPrefix ? `=${formatted}` : formatted
+  return hasEqualsPrefix ? `=${normalized}` : normalized
 }
 
 function beautifyJsonTemplateText(raw: string): string {
@@ -4057,6 +4319,47 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
   const customEditorThemeId = CUSTOM_EDITOR_THEME_IDS[customEditorColorProfile]
   const customEditorFontFamily = resolveEditorFontFamily(customEditorFontPreset)
+  useEffect(() => {
+    try {
+      const monacoAny = customEditorLastMonaco as any
+      monacoAny?.editor?.setTheme?.(customEditorThemeId)
+    } catch {
+      // no-op
+    }
+  }, [customEditorThemeId])
+
+  useEffect(() => {
+    const remeasure = () => {
+      try {
+        const monacoAny = customEditorLastMonaco as any
+        monacoAny?.editor?.remeasureFonts?.()
+      } catch {
+        // no-op
+      }
+    }
+
+    remeasure()
+
+    if (typeof document === 'undefined') return
+    const docAny = document as any
+    const fontFaceSet = docAny.fonts
+    if (!fontFaceSet) return
+
+    const familyName = (
+      customEditorFontPreset === 'fira_code'
+        ? '"Fira Code"'
+        : customEditorFontPreset === 'consolas'
+          ? 'Consolas'
+          : '"JetBrains Mono"'
+    )
+
+    try {
+      Promise.resolve(fontFaceSet.load(`13px ${familyName}`)).then(() => remeasure()).catch(() => undefined)
+      Promise.resolve(fontFaceSet.ready).then(() => remeasure()).catch(() => undefined)
+    } catch {
+      // no-op
+    }
+  }, [customEditorFontPreset, customEditorFontFamily, customEditorFontSize])
 
   useEffect(() => {
     uiConditionBuilderByIndexRef.current = uiConditionBuilderByIndex

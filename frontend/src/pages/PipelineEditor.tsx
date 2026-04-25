@@ -1,4 +1,4 @@
-import { Component, type ErrorInfo, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Component, type ChangeEvent, type ErrorInfo, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   Button, Input, Space, Tag, Tooltip, Typography, Dropdown,
@@ -10,11 +10,13 @@ import {
   CloseCircleFilled, EllipsisOutlined, ScheduleOutlined,
   StopOutlined,
   HistoryOutlined, CodeOutlined, CopyOutlined,
-  UndoOutlined, RedoOutlined
+  UndoOutlined, RedoOutlined, UploadOutlined
 } from '@ant-design/icons'
 import { ReactFlowProvider } from 'reactflow'
 import { useWorkflowStore } from '../store'
 import {
+  applyConnectorTypeToEdges,
+  resolveConnectorTypeFromEdges,
   WORKFLOW_CONNECTOR_OPTIONS,
   type WorkflowConnectorType,
 } from '../constants/workflowConnectors'
@@ -23,6 +25,7 @@ import NodePalette from '../components/workflow/NodePalette'
 import WorkflowCanvas from '../components/workflow/WorkflowCanvas'
 import ConfigDrawer from '../components/workflow/ConfigDrawer'
 import ExecutionPanel from '../components/workflow/ExecutionPanel'
+import { getNodeDef } from '../constants/nodeTypes'
 
 const { Text } = Typography
 const CUSTOM_SCHEDULE_VALUE = 'custom'
@@ -283,6 +286,7 @@ export default function PipelineEditor() {
   const historyIndexRef = useRef<number>(-1)
   const applyingHistoryRef = useRef(false)
   const activeHistoryPipelineRef = useRef<string | null>(null)
+  const importFileInputRef = useRef<HTMLInputElement | null>(null)
 
   const selectedNodeIds = useMemo(() => {
     const explicitlySelected = nodes
@@ -600,12 +604,180 @@ export default function PipelineEditor() {
     await abortExecution()
   }
 
+  const applyImportedGraph = useCallback((payload: any, fallbackName: string) => {
+    const source = payload?.pipeline && typeof payload.pipeline === 'object' ? payload.pipeline : payload
+    const rawNodes = Array.isArray(source?.nodes) ? source.nodes : []
+    const rawEdges = Array.isArray(source?.edges) ? source.edges : []
+    if (!rawNodes.length && !rawEdges.length) {
+      throw new Error('Import JSON must include `nodes` and `edges` arrays.')
+    }
+
+    const normalizedNodes = rawNodes.map((rawNode: any, index: number) => {
+      const nodeType = String(rawNode?.data?.nodeType || '').trim()
+      const definition = getNodeDef(nodeType)
+      const rawConfig = (
+        rawNode?.data?.config && typeof rawNode.data.config === 'object'
+          ? rawNode.data.config
+          : {}
+      )
+      const nodeId = String(rawNode?.id || '').trim()
+      if (!nodeId) {
+        throw new Error(`Imported node at index ${index + 1} is missing id.`)
+      }
+      if (!nodeType) {
+        throw new Error(`Imported node \`${nodeId}\` is missing data.nodeType.`)
+      }
+      return {
+        ...rawNode,
+        id: nodeId,
+        type: 'etlNode',
+        data: {
+          ...(rawNode?.data || {}),
+          nodeType,
+          label: String(rawNode?.data?.label || definition?.label || `Node ${index + 1}`),
+          definition: definition || rawNode?.data?.definition,
+          config: rawConfig,
+          status: 'idle',
+          executionRows: undefined,
+          executionProcessedRows: undefined,
+          executionValidatedRows: undefined,
+          executionSampleInput: undefined,
+          executionSampleOutput: undefined,
+          executionError: undefined,
+        },
+        selected: false,
+        dragging: false,
+      }
+    })
+
+    const nodeIds = new Set<string>()
+    normalizedNodes.forEach((node: any) => {
+      const nodeId = String(node?.id || '').trim()
+      if (!nodeId) return
+      if (nodeIds.has(nodeId)) {
+        throw new Error(`Duplicate node id found in import: \`${nodeId}\``)
+      }
+      nodeIds.add(nodeId)
+    })
+
+    const normalizedEdges = rawEdges.map((rawEdge: any, index: number) => {
+      const sourceId = String(rawEdge?.source || '').trim()
+      const targetId = String(rawEdge?.target || '').trim()
+      if (!sourceId || !targetId) {
+        throw new Error(`Imported edge at index ${index + 1} is missing source/target.`)
+      }
+      if (!nodeIds.has(sourceId) || !nodeIds.has(targetId)) {
+        throw new Error(`Imported edge \`${rawEdge?.id || `${sourceId}->${targetId}`}\` references unknown node.`)
+      }
+      const edgeId = String(rawEdge?.id || `${sourceId}-${targetId}-${index + 1}`).trim()
+      return {
+        ...rawEdge,
+        id: edgeId,
+        source: sourceId,
+        target: targetId,
+        reconnectable: rawEdge?.reconnectable ?? true,
+        updatable: rawEdge?.updatable ?? true,
+        interactionWidth: Number(rawEdge?.interactionWidth || 44),
+      }
+    })
+
+    const importedConnectorType = resolveConnectorTypeFromEdges(normalizedEdges)
+    const importedEdges = applyConnectorTypeToEdges(normalizedEdges, importedConnectorType)
+    const importedName = String(source?.name || payload?.name || '').trim()
+
+    useWorkflowStore.setState((state) => ({
+      ...state,
+      nodes: normalizedNodes,
+      edges: importedEdges,
+      connectorType: importedConnectorType,
+      selectedNodeId: null,
+      isDirty: true,
+    }))
+
+    if (importedName) {
+      setPipelineName(importedName)
+    } else if (!String(fallbackName || '').trim()) {
+      setPipelineName('Imported Pipeline')
+    }
+  }, [])
+
+  const handleImportFileChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    if (isExecuting) {
+      notification.warning({
+        message: 'Cannot import while pipeline is executing.',
+        placement: 'bottomRight',
+        duration: 3,
+      })
+      return
+    }
+
+    const reader = new FileReader()
+    reader.onload = () => {
+      try {
+        const rawText = String(reader.result || '').trim()
+        if (!rawText) {
+          throw new Error('Selected file is empty.')
+        }
+        const parsed = JSON.parse(rawText)
+        Modal.confirm({
+          title: 'Import Pipeline JSON',
+          content: 'This will replace current canvas nodes and edges.',
+          okText: 'Import',
+          cancelText: 'Cancel',
+          okButtonProps: { danger: true },
+          onOk: () => {
+            try {
+              applyImportedGraph(parsed, pipelineName)
+              notification.success({
+                message: 'Pipeline imported successfully.',
+                placement: 'bottomRight',
+                duration: 2,
+              })
+            } catch (error: any) {
+              notification.error({
+                message: 'Import failed',
+                description: String(error?.message || 'Invalid pipeline JSON'),
+                placement: 'bottomRight',
+                duration: 4,
+              })
+            }
+          },
+        })
+      } catch (error: any) {
+        notification.error({
+          message: 'Import failed',
+          description: String(error?.message || 'Invalid JSON file'),
+          placement: 'bottomRight',
+          duration: 4,
+        })
+      }
+    }
+    reader.onerror = () => {
+      notification.error({
+        message: 'Import failed',
+        description: 'Unable to read selected JSON file.',
+        placement: 'bottomRight',
+        duration: 4,
+      })
+    }
+    reader.readAsText(file)
+  }, [applyImportedGraph, isExecuting, pipelineName])
+
+  const triggerImportPicker = useCallback(() => {
+    if (isExecuting) return
+    importFileInputRef.current?.click()
+  }, [isExecuting])
+
   const hasError = executionLogs.some(l => l.status === 'error')
   const hasSuccess = !isExecuting && executionLogs.length > 0 && !hasError
 
   const moreMenuItems = [
     { key: 'schedule', icon: <ScheduleOutlined />, label: 'Configure Schedule' },
     { key: 'history', icon: <HistoryOutlined />, label: 'Execution History' },
+    { key: 'import', icon: <UploadOutlined />, label: 'Import from JSON' },
     { key: 'export', icon: <CodeOutlined />, label: 'Export as JSON' },
     { type: 'divider' as const },
     { key: 'delete', icon: <CloseCircleFilled />, label: 'Delete Pipeline', danger: true },
@@ -790,6 +962,7 @@ export default function PipelineEditor() {
                 onClick: ({ key }) => {
                   if (key === 'schedule') setScheduleModal(true)
                   else if (key === 'history') navigate('/executions')
+                  else if (key === 'import') triggerImportPicker()
                   else if (key === 'export') {
                     const state = useWorkflowStore.getState()
                     const blob = new Blob([JSON.stringify({ nodes: state.nodes, edges: state.edges }, null, 2)], { type: 'application/json' })
@@ -833,6 +1006,14 @@ export default function PipelineEditor() {
           </ConfigDrawerErrorBoundary>
         </div>
       </div>
+
+      <input
+        ref={importFileInputRef}
+        type="file"
+        accept=".json,application/json"
+        style={{ display: 'none' }}
+        onChange={handleImportFileChange}
+      />
 
       {/* Schedule Modal */}
       <Modal
