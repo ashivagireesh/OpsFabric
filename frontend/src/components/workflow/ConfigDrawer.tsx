@@ -84,6 +84,7 @@ type CustomEditorColorProfile =
   | 'github_dark'
   | 'github_light'
 type CustomEditorFontPreset = 'jetbrains_mono' | 'fira_code' | 'consolas'
+type CustomBeautifyStyle = 'json' | 'js_view'
 
 interface CustomFieldSpec {
   id: string
@@ -304,11 +305,16 @@ const CUSTOM_EDITOR_FONT_FAMILY_OPTIONS: Array<{ value: CustomEditorFontPreset; 
   { value: 'fira_code', label: 'Fira Code' },
   { value: 'consolas', label: 'Consolas' },
 ]
+const CUSTOM_EDITOR_BEAUTIFY_STYLE_OPTIONS: Array<{ value: CustomBeautifyStyle; label: string }> = [
+  { value: 'json', label: 'Beautify: JSON' },
+  { value: 'js_view', label: 'Beautify: JS View' },
+]
 const CUSTOM_EDITOR_PREFS_STORAGE_KEY = 'opsfabric.custom_editor_prefs.v1'
 
 type CustomEditorPrefs = {
   colorProfile: CustomEditorColorProfile
   fontPreset: CustomEditorFontPreset
+  beautifyStyle: CustomBeautifyStyle
   fontSize: number
   lineHeight: number
   wordWrap: boolean
@@ -318,6 +324,7 @@ type CustomEditorPrefs = {
 const DEFAULT_CUSTOM_EDITOR_PREFS: CustomEditorPrefs = {
   colorProfile: 'high_contrast',
   fontPreset: 'jetbrains_mono',
+  beautifyStyle: 'json',
   fontSize: 13,
   lineHeight: 22,
   wordWrap: true,
@@ -334,6 +341,7 @@ function loadCustomEditorPrefs(): CustomEditorPrefs {
     const parsed = JSON.parse(raw) as Partial<CustomEditorPrefs>
     const colorProfile = parsed?.colorProfile
     const fontPreset = parsed?.fontPreset
+    const beautifyStyle = parsed?.beautifyStyle
     const allowedColorProfiles = new Set<CustomEditorColorProfile>([
       'high_contrast',
       'soft',
@@ -345,6 +353,7 @@ function loadCustomEditorPrefs(): CustomEditorPrefs {
       'github_light',
     ])
     const allowedFontPresets = new Set<CustomEditorFontPreset>(['jetbrains_mono', 'fira_code', 'consolas'])
+    const allowedBeautifyStyles = new Set<CustomBeautifyStyle>(['json', 'js_view'])
     return {
       colorProfile: allowedColorProfiles.has(colorProfile as CustomEditorColorProfile)
         ? (colorProfile as CustomEditorColorProfile)
@@ -352,6 +361,9 @@ function loadCustomEditorPrefs(): CustomEditorPrefs {
       fontPreset: allowedFontPresets.has(fontPreset as CustomEditorFontPreset)
         ? (fontPreset as CustomEditorFontPreset)
         : DEFAULT_CUSTOM_EDITOR_PREFS.fontPreset,
+      beautifyStyle: allowedBeautifyStyles.has(beautifyStyle as CustomBeautifyStyle)
+        ? (beautifyStyle as CustomBeautifyStyle)
+        : DEFAULT_CUSTOM_EDITOR_PREFS.beautifyStyle,
       fontSize: Number.isFinite(Number(parsed?.fontSize))
         ? Math.max(11, Math.min(20, Math.floor(Number(parsed?.fontSize))))
         : DEFAULT_CUSTOM_EDITOR_PREFS.fontSize,
@@ -1376,16 +1388,123 @@ function parseJsonTemplateExpressionMap(jsonTemplate: string): Record<string, st
   }, {} as Record<string, string>)
 }
 
-function parseJsonTemplateObject(jsonTemplate: string): Record<string, unknown> {
+function convertTemplateLiteralToJsonQuoted(source: string): string {
+  let out = ''
+  let i = 0
+  while (i < source.length) {
+    const ch = source[i]
+    if (ch !== '`') {
+      out += ch
+      i += 1
+      continue
+    }
+    i += 1
+    let content = ''
+    let escaped = false
+    while (i < source.length) {
+      const curr = source[i]
+      if (escaped) {
+        if (curr === '`' || curr === '\\') content += curr
+        else content += `\\${curr}`
+        escaped = false
+        i += 1
+        continue
+      }
+      if (curr === '\\') {
+        escaped = true
+        i += 1
+        continue
+      }
+      if (curr === '`') {
+        i += 1
+        break
+      }
+      content += curr
+      i += 1
+    }
+    out += JSON.stringify(content)
+  }
+  return out
+}
+
+function escapeNewlinesInsideQuotedStrings(source: string): string {
+  let out = ''
+  let quote: '"' | "'" | null = null
+  let escaped = false
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i]
+    if (!quote) {
+      if (ch === '"' || ch === "'") {
+        quote = ch
+        out += ch
+        continue
+      }
+      out += ch
+      continue
+    }
+    if (escaped) {
+      out += ch
+      escaped = false
+      continue
+    }
+    if (ch === '\\') {
+      out += ch
+      escaped = true
+      continue
+    }
+    if (ch === quote) {
+      out += ch
+      quote = null
+      continue
+    }
+    if (ch === '\r') {
+      if (source[i + 1] === '\n') i += 1
+      out += '\\n'
+      continue
+    }
+    if (ch === '\n') {
+      out += '\\n'
+      continue
+    }
+    out += ch
+  }
+  return out
+}
+
+function normalizeJsLikeTemplateTextToJson(text: string): string {
+  let normalized = String(text || '')
+  normalized = convertTemplateLiteralToJsonQuoted(normalized)
+  normalized = escapeNewlinesInsideQuotedStrings(normalized)
+  normalized = normalized.replace(/([{,]\s*)([A-Za-z_$][\w$]*)(\s*:)/g, '$1"$2"$3')
+  normalized = normalized.replace(/,(\s*[}\]])/g, '$1')
+  return normalized
+}
+
+function parseJsonTemplateLikeValue(jsonTemplate: string): unknown {
   const text = String(jsonTemplate || '').trim()
   if (!text) return {}
   try {
-    const parsed = JSON.parse(text)
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
-    return parsed as Record<string, unknown>
+    return JSON.parse(text)
   } catch {
-    return {}
+    try {
+      const normalized = normalizeJsLikeTemplateTextToJson(text)
+      return JSON.parse(normalized)
+    } catch {
+      return null
+    }
   }
+}
+
+function normalizeJsonTemplateForStorage(jsonTemplate: string): string {
+  const parsed = parseJsonTemplateLikeValue(jsonTemplate)
+  if (parsed === null) return String(jsonTemplate || '').trim()
+  return JSON.stringify(parsed, null, 2)
+}
+
+function parseJsonTemplateObject(jsonTemplate: string): Record<string, unknown> {
+  const parsed = parseJsonTemplateLikeValue(jsonTemplate)
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+  return parsed as Record<string, unknown>
 }
 
 function parseJsonTemplateRows(jsonTemplate: string): UiExpressionBuilderRow[] {
@@ -2140,6 +2259,7 @@ function validateJsonTemplateSyntax(text: string): ExpressionValidationIssue[] {
   const source = String(text || '')
   const trimmed = source.trim()
   if (!trimmed) return []
+  if (parseJsonTemplateLikeValue(source) !== null) return []
   try {
     JSON.parse(source)
     return []
@@ -2162,6 +2282,7 @@ function validateJsonTemplateSyntax(text: string): ExpressionValidationIssue[] {
 function extractExpressionStringRanges(text: string): Array<{ value: string; startOffset: number; endOffset: number }> {
   const out: Array<{ value: string; startOffset: number; endOffset: number }> = []
   let inString = false
+  let quote: '"' | "'" | '`' | null = null
   let escaped = false
   let stringStart = -1
   let buffer = ''
@@ -2169,8 +2290,9 @@ function extractExpressionStringRanges(text: string): Array<{ value: string; sta
   for (let i = 0; i < text.length; i += 1) {
     const ch = text[i]
     if (!inString) {
-      if (ch === '"') {
+      if (ch === '"' || ch === "'" || ch === '`') {
         inString = true
+        quote = ch
         escaped = false
         stringStart = i
         buffer = ''
@@ -2187,8 +2309,8 @@ function extractExpressionStringRanges(text: string): Array<{ value: string; sta
       escaped = true
       continue
     }
-    if (ch === '"') {
-      const decoded = decodeJsonStringContent(buffer)
+    if (ch === quote) {
+      const decoded = quote === '"' ? decodeJsonStringContent(buffer) : buffer
       if (decoded.startsWith('=')) {
         out.push({
           value: decoded,
@@ -2197,6 +2319,7 @@ function extractExpressionStringRanges(text: string): Array<{ value: string; sta
         })
       }
       inString = false
+      quote = null
       escaped = false
       buffer = ''
       stringStart = -1
@@ -2447,6 +2570,17 @@ function beautifyExpressionText(rawExpression: string): string {
   const body = hasEqualsPrefix ? source.slice(1).trim() : source
   if (!body) return hasEqualsPrefix ? '=' : ''
 
+  // Support users who paste JSON object templates into Expression mode.
+  // If it is valid JSON and not a normal "=expr", apply JSON+expression beautify.
+  if (!hasEqualsPrefix && /^[\[{]/.test(body)) {
+    const parsed = parseJsonTemplateLikeValue(body)
+    if (parsed !== null) {
+      const beautified = beautifyJsonTemplateNode(parsed)
+      return JSON.stringify(beautified, null, 2)
+    }
+    // Not valid JSON/JS-like template; continue with regular expression formatting.
+  }
+
   const parsedTopLevelCall = parseTopLevelFunctionCallSource(body)
   const formattedBody = (
     parsedTopLevelCall
@@ -2462,11 +2596,84 @@ function beautifyExpressionText(rawExpression: string): string {
   return hasEqualsPrefix ? `=${normalized}` : normalized
 }
 
-function beautifyJsonTemplateText(raw: string): string {
+function beautifyExpressionForJsonString(rawExpression: string): string {
+  const formatted = beautifyExpressionText(rawExpression)
+  const hasEqualsPrefix = formatted.startsWith('=')
+  const body = hasEqualsPrefix ? formatted.slice(1) : formatted
+  const compact = collapseExpressionWhitespace(body)
+  return hasEqualsPrefix ? `=${compact}` : compact
+}
+
+function toJsPropertyKey(key: string): string {
+  const normalized = String(key || '')
+  return JSON.stringify(normalized)
+}
+
+function toJsViewTemplateText(value: unknown, depth = 0): string {
+  const indentUnit = '  '
+  const indent = indentUnit.repeat(Math.max(0, depth))
+  const nextIndent = indentUnit.repeat(Math.max(0, depth + 1))
+
+  if (typeof value === 'string') {
+    const text = String(value || '')
+    if (text.trim().startsWith('=')) {
+      const formattedExpr = beautifyExpressionText(text)
+      const escaped = formattedExpr
+        .replace(/\\/g, '\\\\')
+        .replace(/"/g, '\\"')
+      return `"${escaped}"`
+    }
+    return JSON.stringify(text)
+  }
+  if (typeof value === 'number' || typeof value === 'boolean' || value === null) {
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) return '[]'
+    const rows = value.map((item) => `${nextIndent}${toJsViewTemplateText(item, depth + 1)}`)
+    return `[\n${rows.join(',\n')}\n${indent}]`
+  }
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+    if (entries.length === 0) return '{}'
+    const rows = entries.map(([key, child]) =>
+      `${nextIndent}${toJsPropertyKey(key)}: ${toJsViewTemplateText(child, depth + 1)}`
+    )
+    return `{\n${rows.join(',\n')}\n${indent}}`
+  }
+  return JSON.stringify(value)
+}
+
+function beautifyJsonTemplateNode(value: unknown): unknown {
+  if (typeof value === 'string') {
+    const text = String(value || '').trim()
+    if (!text.startsWith('=')) return value
+    return beautifyExpressionForJsonString(text)
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => beautifyJsonTemplateNode(item))
+  }
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    const next: Record<string, unknown> = {}
+    Object.entries(obj).forEach(([key, child]) => {
+      next[key] = beautifyJsonTemplateNode(child)
+    })
+    return next
+  }
+  return value
+}
+
+function beautifyJsonTemplateText(raw: string, style: CustomBeautifyStyle = 'json'): string {
   const source = String(raw || '').trim()
-  if (!source) return '{\n}'
-  const parsed = JSON.parse(source)
-  return JSON.stringify(parsed, null, 2)
+  if (!source) return style === 'js_view' ? '{\n}' : '{\n}'
+  const parsed = parseJsonTemplateLikeValue(source)
+  if (parsed === null) throw new Error('Invalid JSON/JS template syntax')
+  const beautified = beautifyJsonTemplateNode(parsed)
+  if (style === 'js_view') {
+    return toJsViewTemplateText(beautified, 0)
+  }
+  return JSON.stringify(beautified, null, 2)
 }
 
 type ExpressionFunctionCallRef = {
@@ -3649,7 +3856,7 @@ function serializeCustomFieldSpecs(items: CustomFieldSpec[]): Array<Record<strin
       mode: item.mode,
       single_value_output: item.mode === 'value' ? item.singleValueOutput : 'json',
       expression: item.mode === 'value' ? String(item.expression || '').trim() : '',
-      json_template: item.mode === 'json' ? String(item.jsonTemplate || '').trim() : '',
+      json_template: item.mode === 'json' ? normalizeJsonTemplateForStorage(String(item.jsonTemplate || '').trim()) : '',
       enabled: Boolean(item.enabled),
     }))
     .filter((item) => item.name)
@@ -3709,17 +3916,18 @@ function extractJsonTemplateKeyPaths(jsonTemplate: string): string[] {
   const text = String(jsonTemplate || '').trim()
   if (!text) return []
   try {
-    const parsed = JSON.parse(text)
+    const parsed = parseJsonTemplateLikeValue(text)
+    if (!parsed) throw new Error('Template parse failed')
     const out = new Set<string>()
     collectJsonTemplateKeyPaths(parsed, '', out, 0)
     return uniqueFieldNames(Array.from(out))
   } catch {
     // Best-effort fallback while user is still typing malformed JSON.
     const out = new Set<string>()
-    const keyMatcher = /"([^"\\]+)"\s*:/g
+    const keyMatcher = /(?:"([^"\\]+)"|([A-Za-z_$][\w$]*))\s*:/g
     let keyMatch = keyMatcher.exec(text)
     while (keyMatch) {
-      const key = String(keyMatch[1] || '').trim()
+      const key = String(keyMatch[1] || keyMatch[2] || '').trim()
       if (key) out.add(key)
       keyMatch = keyMatcher.exec(text)
     }
@@ -3730,7 +3938,6 @@ function extractJsonTemplateKeyPaths(jsonTemplate: string): string[] {
 function buildCustomProfilePathSuggestions(specs: CustomFieldSpec[]): string[] {
   const out = new Set<string>()
   ;(specs || []).forEach((spec) => {
-    if (!spec?.enabled) return
     const rootName = String(spec.name || '').trim()
     if (!rootName) return
     out.add(rootName)
@@ -4268,6 +4475,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [activeExpressionFieldId, setActiveExpressionFieldId] = useState<string | null>(null)
   const [customEditorColorProfile, setCustomEditorColorProfile] = useState<CustomEditorColorProfile>(() => loadCustomEditorPrefs().colorProfile)
   const [customEditorFontPreset, setCustomEditorFontPreset] = useState<CustomEditorFontPreset>(() => loadCustomEditorPrefs().fontPreset)
+  const [customEditorBeautifyStyle, setCustomEditorBeautifyStyle] = useState<CustomBeautifyStyle>(() => loadCustomEditorPrefs().beautifyStyle)
   const [customEditorFontSize, setCustomEditorFontSize] = useState(() => loadCustomEditorPrefs().fontSize)
   const [customEditorLineHeight, setCustomEditorLineHeight] = useState(() => loadCustomEditorPrefs().lineHeight)
   const [customEditorWordWrap, setCustomEditorWordWrap] = useState(() => loadCustomEditorPrefs().wordWrap)
@@ -4379,6 +4587,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       const prefs: CustomEditorPrefs = {
         colorProfile: customEditorColorProfile,
         fontPreset: customEditorFontPreset,
+        beautifyStyle: customEditorBeautifyStyle,
         fontSize: customEditorFontSize,
         lineHeight: customEditorLineHeight,
         wordWrap: customEditorWordWrap,
@@ -4391,6 +4600,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   }, [
     customEditorColorProfile,
     customEditorFontPreset,
+    customEditorBeautifyStyle,
     customEditorFontSize,
     customEditorLineHeight,
     customEditorWordWrap,
@@ -7310,7 +7520,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     if (!target) return
     if (target.mode === 'json') {
       try {
-        const formatted = beautifyJsonTemplateText(target.jsonTemplate)
+        const formatted = beautifyJsonTemplateText(target.jsonTemplate, customEditorBeautifyStyle)
         if (formatted === target.jsonTemplate) {
           notification.info({
             message: 'Already formatted',
@@ -7330,7 +7540,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         updateCustomFieldDraft(id, { jsonTemplate: formatted }, { preserveBeautifyUndo: true })
         notification.success({
           message: 'Beautified',
-          description: 'JSON template formatted successfully.',
+          description: customEditorBeautifyStyle === 'js_view'
+            ? 'Template formatted in JS View style.'
+            : 'JSON template formatted successfully.',
           placement: 'bottomRight',
           duration: 1.5,
         })
@@ -9027,6 +9239,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   />
                   <Select
                     size="small"
+                    value={customEditorBeautifyStyle}
+                    onChange={(value) => setCustomEditorBeautifyStyle(value as CustomBeautifyStyle)}
+                    options={CUSTOM_EDITOR_BEAUTIFY_STYLE_OPTIONS}
+                    style={{ width: '100%' }}
+                  />
+                  <Select
+                    size="small"
                     value={customEditorFontSize}
                     onChange={(value) => setCustomEditorFontSize(Number(value || 13))}
                     options={[11, 12, 13, 14, 15, 16, 18, 20].map((size) => ({ value: size, label: `Size ${size}` }))}
@@ -10403,6 +10622,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             onChange={(value) => setCustomEditorFontPreset(value as CustomEditorFontPreset)}
             options={CUSTOM_EDITOR_FONT_FAMILY_OPTIONS}
             style={{ width: 150 }}
+          />
+          <Select
+            size="small"
+            value={customEditorBeautifyStyle}
+            onChange={(value) => setCustomEditorBeautifyStyle(value as CustomBeautifyStyle)}
+            options={CUSTOM_EDITOR_BEAUTIFY_STYLE_OPTIONS}
+            style={{ width: 172 }}
           />
           <Select
             size="small"
