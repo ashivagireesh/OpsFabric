@@ -2609,16 +2609,23 @@ function toJsPropertyKey(key: string): string {
   return JSON.stringify(normalized)
 }
 
-function toJsViewTemplateText(value: unknown, depth = 0): string {
+function toJsViewTemplateText(
+  value: unknown,
+  depth = 0,
+  options?: {
+    beautifyExpressions?: boolean
+  }
+): string {
   const indentUnit = '  '
   const indent = indentUnit.repeat(Math.max(0, depth))
   const nextIndent = indentUnit.repeat(Math.max(0, depth + 1))
+  const beautifyExpressions = options?.beautifyExpressions !== false
 
   if (typeof value === 'string') {
     const text = String(value || '')
     if (text.trim().startsWith('=')) {
-      const formattedExpr = beautifyExpressionText(text)
-      const escaped = formattedExpr
+      const expressionText = beautifyExpressions ? beautifyExpressionText(text) : text
+      const escaped = expressionText
         .replace(/\\/g, '\\\\')
         .replace(/"/g, '\\"')
       return `"${escaped}"`
@@ -2630,18 +2637,43 @@ function toJsViewTemplateText(value: unknown, depth = 0): string {
   }
   if (Array.isArray(value)) {
     if (value.length === 0) return '[]'
-    const rows = value.map((item) => `${nextIndent}${toJsViewTemplateText(item, depth + 1)}`)
+    const rows = value.map((item) => `${nextIndent}${toJsViewTemplateText(item, depth + 1, options)}`)
     return `[\n${rows.join(',\n')}\n${indent}]`
   }
   if (value && typeof value === 'object') {
     const entries = Object.entries(value as Record<string, unknown>)
     if (entries.length === 0) return '{}'
     const rows = entries.map(([key, child]) =>
-      `${nextIndent}${toJsPropertyKey(key)}: ${toJsViewTemplateText(child, depth + 1)}`
+      `${nextIndent}${toJsPropertyKey(key)}: ${toJsViewTemplateText(child, depth + 1, options)}`
     )
     return `{\n${rows.join(',\n')}\n${indent}}`
   }
   return JSON.stringify(value)
+}
+
+function containsExpressionWithMultilineText(value: unknown): boolean {
+  if (typeof value === 'string') {
+    const text = String(value || '')
+    return text.trim().startsWith('=') && /[\r\n]/.test(text)
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => containsExpressionWithMultilineText(item))
+  }
+  if (value && typeof value === 'object') {
+    return Object.values(value as Record<string, unknown>).some((child) =>
+      containsExpressionWithMultilineText(child)
+    )
+  }
+  return false
+}
+
+function normalizeStoredJsonTemplateForEditor(jsonTemplate: string): string {
+  const source = String(jsonTemplate || '')
+  if (!source.includes('\\n')) return source
+  const parsed = parseJsonTemplateLikeValue(source)
+  if (parsed === null) return source
+  if (!containsExpressionWithMultilineText(parsed)) return source
+  return toJsViewTemplateText(parsed, 0, { beautifyExpressions: false })
 }
 
 function beautifyJsonTemplateNode(value: unknown): unknown {
@@ -3831,6 +3863,7 @@ function parseCustomFieldSpecs(value: unknown): CustomFieldSpec[] {
     const rec = item as Record<string, unknown>
     const modeRaw = String(rec.mode || rec.kind || rec.type || 'value').trim().toLowerCase()
     const mode: CustomFieldMode = modeRaw === 'json' ? 'json' : 'value'
+    const rawJsonTemplate = String(rec.jsonTemplate || rec.json_template || rec.template || '')
     out.push(
       createCustomFieldSpec({
         id: String(rec.id || ''),
@@ -3840,7 +3873,7 @@ function parseCustomFieldSpecs(value: unknown): CustomFieldSpec[] {
           rec.singleValueOutput ?? rec.single_value_output ?? rec.value_output ?? rec.output_format
         ),
         expression: String(rec.expression || rec.expr || ''),
-        jsonTemplate: String(rec.jsonTemplate || rec.json_template || rec.template || ''),
+        jsonTemplate: mode === 'json' ? normalizeStoredJsonTemplateForEditor(rawJsonTemplate) : rawJsonTemplate,
         enabled: parseBoolLike(rec.enabled, true),
       })
     )
@@ -7522,12 +7555,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       try {
         const formatted = beautifyJsonTemplateText(target.jsonTemplate, customEditorBeautifyStyle)
         if (formatted === target.jsonTemplate) {
-          notification.info({
-            message: 'Already formatted',
-            description: 'No beautify changes were needed.',
-            placement: 'bottomRight',
-            duration: 1.2,
-          })
           return
         }
         setCustomFieldBeautifyUndoById((prev) => ({
@@ -7557,12 +7584,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     }
     const formatted = beautifyExpressionText(target.expression)
     if (formatted === target.expression) {
-      notification.info({
-        message: 'Already formatted',
-        description: 'No beautify changes were needed.',
-        placement: 'bottomRight',
-        duration: 1.2,
-      })
       return
     }
     setCustomFieldBeautifyUndoById((prev) => ({
