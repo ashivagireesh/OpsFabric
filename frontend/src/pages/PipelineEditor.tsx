@@ -537,6 +537,24 @@ export default function PipelineEditor() {
       const target = event.target as HTMLElement | null
       const active = document.activeElement as HTMLElement | null
       const tag = String(target?.tagName || '').toUpperCase()
+      const withMod = event.metaKey || event.ctrlKey
+      const key = event.key.toLowerCase()
+
+      if (withMod && key === 's') {
+        event.preventDefault()
+        if (!isExecuting && !saving) {
+          setSaving(true)
+          void savePipeline()
+            .then(() => {
+              notification.success({ message: 'Saved!', placement: 'bottomRight', duration: 2 })
+            })
+            .finally(() => {
+              setSaving(false)
+            })
+        }
+        return
+      }
+
       const isMonacoActive =
         !!active?.closest('.monaco-editor')
         || active?.classList?.contains('inputarea')
@@ -549,9 +567,7 @@ export default function PipelineEditor() {
         || tag === 'SELECT'
         || isMonacoActive
       if (isTyping) return
-      const withMod = event.metaKey || event.ctrlKey
       if (!withMod) return
-      const key = event.key.toLowerCase()
       if (key === 'z') {
         event.preventDefault()
         if (event.shiftKey) {
@@ -567,13 +583,18 @@ export default function PipelineEditor() {
         if (!isExecuting && selectedNodeId) {
           duplicateNode(selectedNodeId)
         }
+      } else if (key === 'enter' && !event.shiftKey) {
+        event.preventDefault()
+        if (!isExecuting) {
+          void executePipeline()
+        }
       }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => {
       window.removeEventListener('keydown', onKeyDown)
     }
-  }, [duplicateNode, handleUndo, handleRedo, isExecuting, selectedNodeId])
+  }, [duplicateNode, executePipeline, handleUndo, handleRedo, isExecuting, savePipeline, saving, selectedNodeId])
 
   // Auto-save on dirty
   useEffect(() => {
@@ -794,7 +815,7 @@ export default function PipelineEditor() {
           height: 52,
           display: 'flex',
           alignItems: 'center',
-          justifyContent: 'space-between',
+          justifyContent: 'flex-start',
           flexShrink: 0,
           zIndex: 10,
         }}>
@@ -833,30 +854,58 @@ export default function PipelineEditor() {
               onFocus={e => (e.currentTarget.style.borderColor = '#6366f1')}
             />
 
-            {/* Save/dirty indicator */}
-            {isDirty && !saving && (
-              <Tag style={{ background: '#f59e0b15', border: '1px solid #f59e0b30', color: '#f59e0b', fontSize: 11, borderRadius: 4 }}>
-                Unsaved
-              </Tag>
-            )}
-            {saving && <LoadingOutlined style={{ color: '#6366f1', fontSize: 12 }} spin />}
-            {!isDirty && !saving && (
-              <Tag style={{ background: '#22c55e10', border: '1px solid #22c55e20', color: '#22c55e', fontSize: 11, borderRadius: 4 }}>
-                Saved
-              </Tag>
-            )}
           </Space>
 
-          {/* Right: action buttons */}
-          <Space size={8}>
-            <Tooltip title="Connector style">
-              <Select<WorkflowConnectorType>
-                value={connectorType}
-                onChange={(value) => setConnectorType(value)}
-                options={WORKFLOW_CONNECTOR_OPTIONS}
-                size="small"
-                style={{ width: 124 }}
-                dropdownStyle={{ background: 'var(--app-card-bg)' }}
+          {/* Left-aligned core actions */}
+          <Space size={8} style={{ marginLeft: 12 }}>
+            <Tooltip title={isExecuting ? (executionAbortRequested ? 'Aborting…' : 'Abort') : 'Execute (Ctrl/Cmd + Enter)'}>
+              <Button
+                icon={
+                  isExecuting
+                    ? (executionAbortRequested ? <LoadingOutlined spin /> : <StopOutlined />)
+                    : <PlayCircleOutlined />
+                }
+                onClick={isExecuting ? handleAbort : handleRun}
+                disabled={executionAbortRequested}
+                aria-label={isExecuting ? (executionAbortRequested ? 'Aborting' : 'Abort') : 'Execute'}
+                style={{
+                  background: 'var(--app-card-bg)',
+                  border: isExecuting ? '1px solid rgba(239,68,68,0.45)' : '1px solid rgba(34,197,94,0.55)',
+                  color: isExecuting ? '#ef4444' : '#22c55e',
+                  boxShadow: isExecuting ? 'none' : '0 0 0 1px rgba(34,197,94,0.12) inset',
+                }}
+              />
+            </Tooltip>
+
+            <Tooltip title="Save (Ctrl/Cmd + S)">
+              <Button
+                icon={<SaveOutlined />}
+                loading={saving}
+                onClick={handleSave}
+                aria-label="Save"
+                style={{
+                  background: 'var(--app-card-bg)',
+                  border: saving
+                    ? '1px solid rgba(99,102,241,0.55)'
+                    : isDirty
+                      ? '1px solid rgba(245,158,11,0.65)'
+                      : '1px solid rgba(34,197,94,0.55)',
+                  color: saving ? '#6366f1' : isDirty ? '#f59e0b' : '#22c55e',
+                  boxShadow: saving
+                    ? '0 0 0 1px rgba(99,102,241,0.12) inset'
+                    : isDirty
+                      ? '0 0 0 1px rgba(245,158,11,0.14) inset'
+                      : '0 0 0 1px rgba(34,197,94,0.12) inset',
+                }}
+              />
+            </Tooltip>
+
+            <Tooltip title="Duplicate selected node (Ctrl/Cmd + D)">
+              <Button
+                icon={<CopyOutlined />}
+                onClick={() => selectedNodeId && duplicateNode(selectedNodeId)}
+                disabled={!selectedNodeId || isExecuting}
+                style={{ background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)', color: 'var(--app-text-muted)' }}
               />
             </Tooltip>
             <Tooltip title="Undo (Ctrl/Cmd + Z)">
@@ -875,14 +924,28 @@ export default function PipelineEditor() {
                 style={{ background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)', color: 'var(--app-text-muted)' }}
               />
             </Tooltip>
-            <Tooltip title="Duplicate selected node (Ctrl/Cmd + D)">
-              <Button
-                icon={<CopyOutlined />}
-                onClick={() => selectedNodeId && duplicateNode(selectedNodeId)}
-                disabled={!selectedNodeId || isExecuting}
-                style={{ background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)', color: 'var(--app-text-muted)' }}
+            <Tooltip title="Connector style">
+              <Select<WorkflowConnectorType>
+                value={connectorType}
+                onChange={(value) => setConnectorType(value)}
+                options={WORKFLOW_CONNECTOR_OPTIONS}
+                size="small"
+                style={{ width: 124 }}
+                dropdownStyle={{ background: 'var(--app-card-bg)' }}
               />
             </Tooltip>
+
+            {isDirty && !saving && (
+              <Tag style={{ background: '#f59e0b15', border: '1px solid #f59e0b30', color: '#f59e0b', fontSize: 11, borderRadius: 4 }}>
+                Unsaved
+              </Tag>
+            )}
+            {saving && <LoadingOutlined style={{ color: '#6366f1', fontSize: 12 }} spin />}
+            {!isDirty && !saving && (
+              <Tag style={{ background: '#22c55e10', border: '1px solid #22c55e20', color: '#22c55e', fontSize: 11, borderRadius: 4 }}>
+                Saved
+              </Tag>
+            )}
 
             {actionTargetCount > 0 && (
               <Space
@@ -926,36 +989,10 @@ export default function PipelineEditor() {
                 {executionLogs.reduce((s, l) => s + (l.rows || 0), 0).toLocaleString()} rows
               </Tag>
             )}
+          </Space>
 
-            <Button
-              icon={<SaveOutlined />}
-              loading={saving}
-              onClick={handleSave}
-              style={{ background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)', color: 'var(--app-text-muted)' }}
-            >
-              Save
-            </Button>
-
-            <Button
-              type={isExecuting ? 'default' : 'primary'}
-              danger={isExecuting}
-              icon={
-                isExecuting
-                  ? (executionAbortRequested ? <LoadingOutlined spin /> : <StopOutlined />)
-                  : <PlayCircleOutlined />
-              }
-              onClick={isExecuting ? handleAbort : handleRun}
-              style={{
-                background: isExecuting
-                  ? 'rgba(239,68,68,0.16)'
-                  : 'linear-gradient(135deg, #6366f1, #a855f7)',
-                border: isExecuting ? '1px solid rgba(239,68,68,0.45)' : 'none',
-                minWidth: 90,
-              }}
-            >
-              {isExecuting ? (executionAbortRequested ? 'Aborting…' : 'Abort') : 'Execute'}
-            </Button>
-
+          {/* Right-side status/meta actions */}
+          <Space size={8} style={{ marginLeft: 'auto' }}>
             <Dropdown
               menu={{
                 items: moreMenuItems,
