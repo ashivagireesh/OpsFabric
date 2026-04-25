@@ -5,6 +5,7 @@ Supports: Databases, Files, APIs, Cloud Storage, Message Queues
 import asyncio
 import ast
 import base64
+import hashlib
 import json
 import math
 import os
@@ -182,6 +183,41 @@ def _run_custom_profile_partition_process_worker(payload: Dict[str, Any]) -> Dic
         }
 
 
+def _force_terminate_process_pool(executor: ProcessPoolExecutor) -> None:
+    """
+    Best-effort hard stop for ProcessPoolExecutor workers.
+    Used on abort-fast paths to avoid leaving orphan multiprocessing children.
+    """
+    processes = getattr(executor, "_processes", None)
+    if not isinstance(processes, dict):
+        return
+    proc_list = [proc for proc in processes.values() if proc is not None]
+    if not proc_list:
+        return
+
+    for proc in proc_list:
+        try:
+            if proc.is_alive():
+                proc.terminate()
+        except Exception:
+            continue
+
+    deadline = pytime.monotonic() + 1.0
+    for proc in proc_list:
+        try:
+            timeout = max(0.0, deadline - pytime.monotonic())
+            proc.join(timeout=timeout)
+        except Exception:
+            continue
+
+    for proc in proc_list:
+        try:
+            if proc.is_alive():
+                proc.kill()
+        except Exception:
+            continue
+
+
 class ETLEngine:
     def __init__(self):
         self.active_executions: Dict[str, dict] = {}
@@ -203,6 +239,8 @@ class ETLEngine:
         self._profile_redis_client = None
         self._profile_redis_url_cached: Optional[str] = None
         self._oracle_full_scan_block_until: Dict[str, float] = {}
+        self._oracle_profile_schema_lock = threading.Lock()
+        self._oracle_profile_schema_checked_tables: set = set()
         self._oracle_profile_write_queue_lock = threading.Lock()
         self._oracle_profile_write_queues: Dict[str, Dict[str, Any]] = {}
         self._oracle_destination_write_queue_lock = threading.Lock()
@@ -922,6 +960,7 @@ class ETLEngine:
     def _open_oracle_profile_session(
         self,
         profile_cfg: Optional[Dict[str, Any]] = None,
+        require_write_schema: bool = False,
     ) -> Dict[str, Any]:
         conn = None
         try:
@@ -932,6 +971,11 @@ class ETLEngine:
             )
             self._ensure_profile_oracle_table(conn, table_sql)
             column_specs = self._oracle_profile_table_column_specs(conn, table_sql)
+            if bool(require_write_schema):
+                self._validate_oracle_profile_write_schema(
+                    table_sql,
+                    column_specs=column_specs,
+                )
             return {
                 "conn": conn,
                 "cfg": cfg,
@@ -981,6 +1025,12 @@ class ETLEngine:
 
     def _ensure_profile_oracle_table(self, conn: Any, table_name: str) -> None:
         table_sql = self._sanitize_oracle_identifier(table_name, "ETL_PROFILE_STATE")
+        conn_user = str(getattr(conn, "username", "") or "").strip().upper()
+        conn_dsn = str(getattr(conn, "dsn", "") or "").strip().upper()
+        schema_cache_key = f"{conn_user}::{conn_dsn}::{table_sql}"
+        with self._oracle_profile_schema_lock:
+            if schema_cache_key in self._oracle_profile_schema_checked_tables:
+                return
         base_name = table_sql.split(".")[-1]
         pk_name = self._sanitize_oracle_identifier(f"{base_name[:24]}_PK", "ETL_PROFILE_PK")
         create_table_plsql = f"""
@@ -993,6 +1043,9 @@ BEGIN
       DOCUMENT_JSON CLOB,
       META_JSON     CLOB,
       STATS_JSON    CLOB,
+      DOC_SHA1      VARCHAR2(40),
+      META_SHA1     VARCHAR2(40),
+      STATS_SHA1    VARCHAR2(40),
       UPDATED_AT    TIMESTAMP DEFAULT SYSTIMESTAMP,
       CONSTRAINT {pk_name} PRIMARY KEY (PIPELINE_ID, NODE_ID, ENTITY_TOKEN)
     )';
@@ -1005,11 +1058,142 @@ END;"""
         cursor = conn.cursor()
         try:
             cursor.execute(create_table_plsql)
+            # Backward-compatible schema evolution for existing tables.
+            # If table already exists, add hash columns used for no-op update skip.
+            for col_name in ("DOC_SHA1", "META_SHA1", "STATS_SHA1"):
+                alter_sql = (
+                    "BEGIN "
+                    f"  EXECUTE IMMEDIATE 'ALTER TABLE {table_sql} ADD ({col_name} VARCHAR2(40))'; "
+                    "EXCEPTION "
+                    "  WHEN OTHERS THEN "
+                    "    IF SQLCODE != -1430 THEN NULL; END IF; "
+                    "END;"
+                )
+                try:
+                    cursor.execute(alter_sql)
+                except Exception:
+                    # Non-fatal: table may be immutable or privileges limited.
+                    # Upsert logic will auto-fallback to non-hash strategy.
+                    pass
         finally:
             try:
                 cursor.close()
             except Exception:
                 pass
+        with self._oracle_profile_schema_lock:
+            self._oracle_profile_schema_checked_tables.add(schema_cache_key)
+
+    def _oracle_profile_hash_columns_available(
+        self,
+        column_specs: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> bool:
+        if not isinstance(column_specs, dict) or not column_specs:
+            return False
+        required = ("DOC_SHA1", "META_SHA1", "STATS_SHA1")
+        for col in required:
+            spec = column_specs.get(col)
+            if not isinstance(spec, dict):
+                return False
+            data_type = str(spec.get("data_type") or "").strip().upper()
+            if data_type not in {"VARCHAR2", "NVARCHAR2", "CHAR", "NCHAR"}:
+                return False
+        return True
+
+    def _oracle_profile_v2_table_name(self, table_sql: str) -> str:
+        text = str(table_sql or "").strip().upper()
+        owner = ""
+        base = text
+        if "." in text:
+            owner, base = text.split(".", 1)
+        base_safe = self._sanitize_oracle_identifier(base, "ETL_PROFILE_STATE")
+        if base_safe.endswith("_V2"):
+            v2_base = base_safe
+        else:
+            v2_base = self._sanitize_oracle_identifier(f"{base_safe[:27]}_V2", "ETL_PROFILE_STATE_V2")
+        if owner:
+            owner_safe = self._sanitize_oracle_identifier(owner, "")
+            if owner_safe:
+                return f"{owner_safe}.{v2_base}"
+        return v2_base
+
+    def _oracle_profile_v2_create_sql(self, table_sql: str) -> str:
+        v2_table = self._oracle_profile_v2_table_name(table_sql)
+        base_name = v2_table.split(".")[-1]
+        pk_name = self._sanitize_oracle_identifier(f"{base_name[:24]}_PK", "ETL_PROFILE_PK")
+        return (
+            f"CREATE TABLE {v2_table} ("
+            " PIPELINE_ID VARCHAR2(128) NOT NULL,"
+            " NODE_ID VARCHAR2(128) NOT NULL,"
+            " ENTITY_TOKEN VARCHAR2(512) NOT NULL,"
+            " DOCUMENT_JSON CLOB,"
+            " META_JSON CLOB,"
+            " STATS_JSON CLOB,"
+            " DOC_SHA1 VARCHAR2(40),"
+            " META_SHA1 VARCHAR2(40),"
+            " STATS_SHA1 VARCHAR2(40),"
+            " UPDATED_AT TIMESTAMP DEFAULT SYSTIMESTAMP,"
+            f" CONSTRAINT {pk_name} PRIMARY KEY (PIPELINE_ID, NODE_ID, ENTITY_TOKEN)"
+            " )"
+        )
+
+    def _validate_oracle_profile_write_schema(
+        self,
+        table_sql: str,
+        column_specs: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> None:
+        specs = column_specs if isinstance(column_specs, dict) else {}
+        required_cols = ("DOCUMENT_JSON", "META_JSON", "STATS_JSON")
+        missing_cols: List[str] = []
+        wrong_types: List[str] = []
+        for col_name in required_cols:
+            spec = specs.get(col_name)
+            if not isinstance(spec, dict):
+                missing_cols.append(col_name)
+                continue
+            data_type = str(spec.get("data_type") or "").strip().upper()
+            if data_type not in {"CLOB", "NCLOB"}:
+                wrong_types.append(f"{col_name}={data_type or 'UNKNOWN'}")
+        if not missing_cols and not wrong_types:
+            return
+
+        details: List[str] = []
+        if missing_cols:
+            details.append(f"missing columns: {', '.join(missing_cols)}")
+        if wrong_types:
+            details.append(f"incompatible types: {', '.join(wrong_types)}")
+        detail_text = "; ".join(details)
+        create_sql = self._oracle_profile_v2_create_sql(table_sql)
+        raise RuntimeError(
+            "Oracle profile table schema is incompatible for JSON profile writes "
+            f"(table={table_sql}; {detail_text}). "
+            "Expected CLOB/NCLOB for DOCUMENT_JSON, META_JSON, STATS_JSON. "
+            "This causes ORA-01461 and slow retry/fallback behavior. "
+            "Create a CLOB-based table and set custom_profile_oracle_table to that table. "
+            f"Suggested SQL: {create_sql}"
+        )
+
+    def _oracle_hash_text(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            raw = str(value)
+            if raw == "":
+                return None
+            return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
+        except Exception:
+            return None
+
+    def _oracle_bind_subset(
+        self,
+        payload: Dict[str, Any],
+        keys: Tuple[str, ...],
+    ) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        if not isinstance(payload, dict):
+            return out
+        for key in keys:
+            out[key] = payload.get(key)
+        return out
 
     def _oracle_profile_table_column_specs(self, conn: Any, table_sql: str) -> Dict[str, Dict[str, Any]]:
         out: Dict[str, Dict[str, Any]] = {}
@@ -1089,6 +1273,16 @@ END;"""
         if not isinstance(column_specs, dict) or not column_specs:
             return dict(payload)
         out = dict(payload)
+        has_hash_columns = self._oracle_profile_hash_columns_available(column_specs)
+        # Add deterministic content hashes only when hash columns exist.
+        # This avoids extra SHA work on legacy Oracle schemas.
+        if has_hash_columns:
+            if "doc_sha1" not in out or out.get("doc_sha1") in {"", None}:
+                out["doc_sha1"] = self._oracle_hash_text(out.get("document_json"))
+            if "meta_sha1" not in out or out.get("meta_sha1") in {"", None}:
+                out["meta_sha1"] = self._oracle_hash_text(out.get("meta_json"))
+            if "stats_sha1" not in out or out.get("stats_sha1") in {"", None}:
+                out["stats_sha1"] = self._oracle_hash_text(out.get("stats_json"))
         for bind_key, col_name in (
             ("document_json", "DOCUMENT_JSON"),
             ("meta_json", "META_JSON"),
@@ -1122,67 +1316,30 @@ END;"""
         column_specs: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
         safe_payload = self._oracle_prepare_json_bind_payload(payload, column_specs)
-        update_sql = (
-            f"UPDATE {table_sql} "
-            "SET DOCUMENT_JSON = :document_json, "
-            "    META_JSON = :meta_json, "
-            "    STATS_JSON = :stats_json, "
-            "    UPDATED_AT = SYSTIMESTAMP "
-            "WHERE PIPELINE_ID = :pipeline_id "
-            "  AND NODE_ID = :node_id "
-            "  AND ENTITY_TOKEN = :entity_token"
+        has_hash_columns = self._oracle_profile_hash_columns_available(column_specs)
+        use_lob_bind = False
+        lob_column_types: Dict[str, str] = {}
+        if isinstance(column_specs, dict) and column_specs:
+            use_lob_bind = True
+            for col_name in ("DOCUMENT_JSON", "META_JSON", "STATS_JSON"):
+                spec = column_specs.get(col_name)
+                if not isinstance(spec, dict):
+                    use_lob_bind = False
+                    break
+                data_type = str(spec.get("data_type") or "").strip().upper()
+                if data_type not in {"CLOB", "NCLOB"}:
+                    use_lob_bind = False
+                    break
+                lob_column_types[col_name] = data_type
+        base_keys = (
+            "pipeline_id",
+            "node_id",
+            "entity_token",
+            "document_json",
+            "meta_json",
+            "stats_json",
         )
-        cursor.execute(update_sql, safe_payload)
-        if int(getattr(cursor, "rowcount", 0) or 0) > 0:
-            return
-        insert_sql = (
-            f"INSERT INTO {table_sql} "
-            "(PIPELINE_ID, NODE_ID, ENTITY_TOKEN, DOCUMENT_JSON, META_JSON, STATS_JSON, UPDATED_AT) "
-            "VALUES (:pipeline_id, :node_id, :entity_token, :document_json, :meta_json, :stats_json, SYSTIMESTAMP)"
-        )
-        cursor.execute(insert_sql, safe_payload)
-
-    def _oracle_profile_upsert_many(
-        self,
-        cursor: Any,
-        table_sql: str,
-        payloads: List[Dict[str, Any]],
-        *,
-        chunk_size: int = 500,
-        column_specs: Optional[Dict[str, Dict[str, Any]]] = None,
-    ) -> None:
-        rows = [
-            self._oracle_prepare_json_bind_payload(row, column_specs)
-            for row in (payloads or [])
-            if isinstance(row, dict)
-        ]
-        if not rows:
-            return
-        safe_chunk = max(1, min(int(chunk_size or 500), 2000))
-        merge_sql_clob = (
-            f"MERGE INTO {table_sql} t "
-            "USING ("
-            "  SELECT :pipeline_id AS PIPELINE_ID, "
-            "         :node_id AS NODE_ID, "
-            "         :entity_token AS ENTITY_TOKEN, "
-            "         CAST(:document_json AS CLOB) AS DOCUMENT_JSON, "
-            "         CAST(:meta_json AS CLOB) AS META_JSON, "
-            "         CAST(:stats_json AS CLOB) AS STATS_JSON "
-            "  FROM dual"
-            ") s "
-            "ON (t.PIPELINE_ID = s.PIPELINE_ID "
-            "    AND t.NODE_ID = s.NODE_ID "
-            "    AND t.ENTITY_TOKEN = s.ENTITY_TOKEN) "
-            "WHEN MATCHED THEN UPDATE SET "
-            "  t.DOCUMENT_JSON = s.DOCUMENT_JSON, "
-            "  t.META_JSON = s.META_JSON, "
-            "  t.STATS_JSON = s.STATS_JSON, "
-            "  t.UPDATED_AT = SYSTIMESTAMP "
-            "WHEN NOT MATCHED THEN INSERT "
-            "  (PIPELINE_ID, NODE_ID, ENTITY_TOKEN, DOCUMENT_JSON, META_JSON, STATS_JSON, UPDATED_AT) "
-            "VALUES "
-            "  (s.PIPELINE_ID, s.NODE_ID, s.ENTITY_TOKEN, s.DOCUMENT_JSON, s.META_JSON, s.STATS_JSON, SYSTIMESTAMP)"
-        )
+        hash_keys = base_keys + ("doc_sha1", "meta_sha1", "stats_sha1")
         merge_sql_plain = (
             f"MERGE INTO {table_sql} t "
             "USING ("
@@ -1207,49 +1364,279 @@ END;"""
             "VALUES "
             "  (s.PIPELINE_ID, s.NODE_ID, s.ENTITY_TOKEN, s.DOCUMENT_JSON, s.META_JSON, s.STATS_JSON, SYSTIMESTAMP)"
         )
-        # Use CLOB-typed merge only when we can positively confirm all JSON columns
-        # are CLOB/NCLOB. Unknown column metadata defaults to plain binds so legacy
-        # LONG/VARCHAR schemas do not fail with ORA-00932.
-        use_clob_merge = False
-        if isinstance(column_specs, dict) and column_specs:
-            use_clob_merge = True
-            for col_name in ("DOCUMENT_JSON", "META_JSON", "STATS_JSON"):
-                spec = column_specs.get(col_name)
-                if not isinstance(spec, dict):
-                    use_clob_merge = False
-                    break
-                data_type = str(spec.get("data_type") or "").strip().upper()
-                if data_type not in {"CLOB", "NCLOB"}:
-                    use_clob_merge = False
-                    break
+        merge_sql_plain_hash = (
+            f"MERGE INTO {table_sql} t "
+            "USING ("
+            "  SELECT :pipeline_id AS PIPELINE_ID, "
+            "         :node_id AS NODE_ID, "
+            "         :entity_token AS ENTITY_TOKEN, "
+            "         :document_json AS DOCUMENT_JSON, "
+            "         :meta_json AS META_JSON, "
+            "         :stats_json AS STATS_JSON, "
+            "         :doc_sha1 AS DOC_SHA1, "
+            "         :meta_sha1 AS META_SHA1, "
+            "         :stats_sha1 AS STATS_SHA1 "
+            "  FROM dual"
+            ") s "
+            "ON (t.PIPELINE_ID = s.PIPELINE_ID "
+            "    AND t.NODE_ID = s.NODE_ID "
+            "    AND t.ENTITY_TOKEN = s.ENTITY_TOKEN) "
+            "WHEN MATCHED THEN UPDATE SET "
+            "  t.DOCUMENT_JSON = s.DOCUMENT_JSON, "
+            "  t.META_JSON = s.META_JSON, "
+            "  t.STATS_JSON = s.STATS_JSON, "
+            "  t.DOC_SHA1 = s.DOC_SHA1, "
+            "  t.META_SHA1 = s.META_SHA1, "
+            "  t.STATS_SHA1 = s.STATS_SHA1, "
+            "  t.UPDATED_AT = SYSTIMESTAMP "
+            "WHERE ("
+            "  NVL(t.DOC_SHA1, '~') <> NVL(s.DOC_SHA1, '~') "
+            "  OR NVL(t.META_SHA1, '~') <> NVL(s.META_SHA1, '~') "
+            "  OR NVL(t.STATS_SHA1, '~') <> NVL(s.STATS_SHA1, '~')"
+            ") "
+            "WHEN NOT MATCHED THEN INSERT "
+            "  (PIPELINE_ID, NODE_ID, ENTITY_TOKEN, DOCUMENT_JSON, META_JSON, STATS_JSON, "
+            "   DOC_SHA1, META_SHA1, STATS_SHA1, UPDATED_AT) "
+            "VALUES "
+            "  (s.PIPELINE_ID, s.NODE_ID, s.ENTITY_TOKEN, s.DOCUMENT_JSON, s.META_JSON, s.STATS_JSON, "
+            "   s.DOC_SHA1, s.META_SHA1, s.STATS_SHA1, SYSTIMESTAMP)"
+        )
+
         try:
-            if use_clob_merge:
+            if use_lob_bind:
                 import oracledb  # type: ignore
+                doc_bind_type = (
+                    getattr(oracledb, "DB_TYPE_NCLOB", oracledb.DB_TYPE_CLOB)
+                    if lob_column_types.get("DOCUMENT_JSON") == "NCLOB"
+                    else oracledb.DB_TYPE_CLOB
+                )
+                meta_bind_type = (
+                    getattr(oracledb, "DB_TYPE_NCLOB", oracledb.DB_TYPE_CLOB)
+                    if lob_column_types.get("META_JSON") == "NCLOB"
+                    else oracledb.DB_TYPE_CLOB
+                )
+                stats_bind_type = (
+                    getattr(oracledb, "DB_TYPE_NCLOB", oracledb.DB_TYPE_CLOB)
+                    if lob_column_types.get("STATS_JSON") == "NCLOB"
+                    else oracledb.DB_TYPE_CLOB
+                )
                 cursor.setinputsizes(
                     pipeline_id=oracledb.DB_TYPE_VARCHAR,
                     node_id=oracledb.DB_TYPE_VARCHAR,
                     entity_token=oracledb.DB_TYPE_VARCHAR,
-                    document_json=oracledb.DB_TYPE_CLOB,
-                    meta_json=oracledb.DB_TYPE_CLOB,
-                    stats_json=oracledb.DB_TYPE_CLOB,
+                    document_json=doc_bind_type,
+                    meta_json=meta_bind_type,
+                    stats_json=stats_bind_type,
+                )
+        except Exception:
+            pass
+
+        if has_hash_columns:
+            try:
+                cursor.execute(
+                    merge_sql_plain_hash,
+                    self._oracle_bind_subset(safe_payload, hash_keys),
+                )
+                return
+            except Exception as exc:
+                err_text = str(exc or "")
+                # Fall back for legacy schemas where hash columns are absent/invalid.
+                if "ORA-00904" not in err_text and "ORA-00932" not in err_text and "ORA-01461" not in err_text:
+                    raise
+                # Continue to non-hash path below.
+
+        try:
+            cursor.execute(
+                merge_sql_plain,
+                self._oracle_bind_subset(safe_payload, base_keys),
+            )
+            return
+        except Exception as exc:
+            err_text = str(exc or "")
+            if "ORA-01461" in err_text and not use_lob_bind:
+                raise RuntimeError(
+                    f"Oracle profile write bind failed with ORA-01461 for table {table_sql}. "
+                    "Profile JSON payload is too large for non-CLOB binding path. "
+                    "Use CLOB columns for DOCUMENT_JSON/META_JSON/STATS_JSON."
+                ) from exc
+            raise
+
+    def _oracle_profile_upsert_many(
+        self,
+        cursor: Any,
+        table_sql: str,
+        payloads: List[Dict[str, Any]],
+        *,
+        chunk_size: int = 500,
+        column_specs: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> None:
+        prepared_rows = [
+            self._oracle_prepare_json_bind_payload(row, column_specs)
+            for row in (payloads or [])
+            if isinstance(row, dict)
+        ]
+        has_hash_columns = self._oracle_profile_hash_columns_available(column_specs)
+        base_keys = (
+            "pipeline_id",
+            "node_id",
+            "entity_token",
+            "document_json",
+            "meta_json",
+            "stats_json",
+        )
+        hash_keys = base_keys + ("doc_sha1", "meta_sha1", "stats_sha1")
+        if has_hash_columns:
+            rows = [self._oracle_bind_subset(row, hash_keys) for row in prepared_rows]
+        else:
+            rows = [self._oracle_bind_subset(row, base_keys) for row in prepared_rows]
+        if not rows:
+            return
+        safe_chunk = max(1, min(int(chunk_size or 500), 2000))
+        merge_sql_plain_hash = (
+            f"MERGE INTO {table_sql} t "
+            "USING ("
+            "  SELECT :pipeline_id AS PIPELINE_ID, "
+            "         :node_id AS NODE_ID, "
+            "         :entity_token AS ENTITY_TOKEN, "
+            "         :document_json AS DOCUMENT_JSON, "
+            "         :meta_json AS META_JSON, "
+            "         :stats_json AS STATS_JSON, "
+            "         :doc_sha1 AS DOC_SHA1, "
+            "         :meta_sha1 AS META_SHA1, "
+            "         :stats_sha1 AS STATS_SHA1 "
+            "  FROM dual"
+            ") s "
+            "ON (t.PIPELINE_ID = s.PIPELINE_ID "
+            "    AND t.NODE_ID = s.NODE_ID "
+            "    AND t.ENTITY_TOKEN = s.ENTITY_TOKEN) "
+            "WHEN MATCHED THEN UPDATE SET "
+            "  t.DOCUMENT_JSON = s.DOCUMENT_JSON, "
+            "  t.META_JSON = s.META_JSON, "
+            "  t.STATS_JSON = s.STATS_JSON, "
+            "  t.DOC_SHA1 = s.DOC_SHA1, "
+            "  t.META_SHA1 = s.META_SHA1, "
+            "  t.STATS_SHA1 = s.STATS_SHA1, "
+            "  t.UPDATED_AT = SYSTIMESTAMP "
+            "WHERE ("
+            "  NVL(t.DOC_SHA1, '~') <> NVL(s.DOC_SHA1, '~') "
+            "  OR NVL(t.META_SHA1, '~') <> NVL(s.META_SHA1, '~') "
+            "  OR NVL(t.STATS_SHA1, '~') <> NVL(s.STATS_SHA1, '~')"
+            ") "
+            "WHEN NOT MATCHED THEN INSERT "
+            "  (PIPELINE_ID, NODE_ID, ENTITY_TOKEN, DOCUMENT_JSON, META_JSON, STATS_JSON, "
+            "   DOC_SHA1, META_SHA1, STATS_SHA1, UPDATED_AT) "
+            "VALUES "
+            "  (s.PIPELINE_ID, s.NODE_ID, s.ENTITY_TOKEN, s.DOCUMENT_JSON, s.META_JSON, s.STATS_JSON, "
+            "   s.DOC_SHA1, s.META_SHA1, s.STATS_SHA1, SYSTIMESTAMP)"
+        )
+        use_lob_bind = False
+        lob_column_types: Dict[str, str] = {}
+        if isinstance(column_specs, dict) and column_specs:
+            use_lob_bind = True
+            for col_name in ("DOCUMENT_JSON", "META_JSON", "STATS_JSON"):
+                spec = column_specs.get(col_name)
+                if not isinstance(spec, dict):
+                    use_lob_bind = False
+                    break
+                data_type = str(spec.get("data_type") or "").strip().upper()
+                if data_type not in {"CLOB", "NCLOB"}:
+                    use_lob_bind = False
+                    break
+                lob_column_types[col_name] = data_type
+        merge_sql_plain = (
+            f"MERGE INTO {table_sql} t "
+            "USING ("
+            "  SELECT :pipeline_id AS PIPELINE_ID, "
+            "         :node_id AS NODE_ID, "
+            "         :entity_token AS ENTITY_TOKEN, "
+            "         :document_json AS DOCUMENT_JSON, "
+            "         :meta_json AS META_JSON, "
+            "         :stats_json AS STATS_JSON "
+            "  FROM dual"
+            ") s "
+            "ON (t.PIPELINE_ID = s.PIPELINE_ID "
+            "    AND t.NODE_ID = s.NODE_ID "
+            "    AND t.ENTITY_TOKEN = s.ENTITY_TOKEN) "
+            "WHEN MATCHED THEN UPDATE SET "
+            "  t.DOCUMENT_JSON = s.DOCUMENT_JSON, "
+            "  t.META_JSON = s.META_JSON, "
+            "  t.STATS_JSON = s.STATS_JSON, "
+            "  t.UPDATED_AT = SYSTIMESTAMP "
+            "WHEN NOT MATCHED THEN INSERT "
+            "  (PIPELINE_ID, NODE_ID, ENTITY_TOKEN, DOCUMENT_JSON, META_JSON, STATS_JSON, UPDATED_AT) "
+            "VALUES "
+            "  (s.PIPELINE_ID, s.NODE_ID, s.ENTITY_TOKEN, s.DOCUMENT_JSON, s.META_JSON, s.STATS_JSON, SYSTIMESTAMP)"
+        )
+        use_hash_merge = bool(has_hash_columns)
+        try:
+            if use_lob_bind:
+                import oracledb  # type: ignore
+                doc_bind_type = (
+                    getattr(oracledb, "DB_TYPE_NCLOB", oracledb.DB_TYPE_CLOB)
+                    if lob_column_types.get("DOCUMENT_JSON") == "NCLOB"
+                    else oracledb.DB_TYPE_CLOB
+                )
+                meta_bind_type = (
+                    getattr(oracledb, "DB_TYPE_NCLOB", oracledb.DB_TYPE_CLOB)
+                    if lob_column_types.get("META_JSON") == "NCLOB"
+                    else oracledb.DB_TYPE_CLOB
+                )
+                stats_bind_type = (
+                    getattr(oracledb, "DB_TYPE_NCLOB", oracledb.DB_TYPE_CLOB)
+                    if lob_column_types.get("STATS_JSON") == "NCLOB"
+                    else oracledb.DB_TYPE_CLOB
+                )
+                cursor.setinputsizes(
+                    pipeline_id=oracledb.DB_TYPE_VARCHAR,
+                    node_id=oracledb.DB_TYPE_VARCHAR,
+                    entity_token=oracledb.DB_TYPE_VARCHAR,
+                    document_json=doc_bind_type,
+                    meta_json=meta_bind_type,
+                    stats_json=stats_bind_type,
                 )
         except Exception:
             pass
         for start_idx in range(0, len(rows), safe_chunk):
             chunk_rows = rows[start_idx:start_idx + safe_chunk]
             try:
-                cursor.executemany(merge_sql_clob if use_clob_merge else merge_sql_plain, chunk_rows)
+                active_sql = (
+                    merge_sql_plain_hash
+                    if use_hash_merge
+                    else merge_sql_plain
+                )
+                cursor.executemany(active_sql, chunk_rows)
             except Exception as exc:
                 err_text = str(exc or "")
-                if "ORA-00932" in err_text and use_clob_merge:
+                if "ORA-00904" in err_text and use_hash_merge:
+                    # Hash columns may be unavailable in legacy schemas.
+                    use_hash_merge = False
+                    fallback_rows = [self._oracle_bind_subset(row, base_keys) for row in chunk_rows]
+                    try:
+                        cursor.executemany(merge_sql_plain, fallback_rows)
+                        continue
+                    except Exception as fallback_exc:
+                        err_text = str(fallback_exc or "")
+                if "ORA-00932" in err_text and use_lob_bind:
                     fallback_cursor = None
                     try:
                         conn_obj = getattr(cursor, "connection", None)
                         if conn_obj is not None:
                             fallback_cursor = conn_obj.cursor()
-                            fallback_cursor.executemany(merge_sql_plain, chunk_rows)
+                            fallback_rows = (
+                                chunk_rows
+                                if use_hash_merge
+                                else [self._oracle_bind_subset(row, base_keys) for row in chunk_rows]
+                            )
+                            fallback_sql = merge_sql_plain_hash if use_hash_merge else merge_sql_plain
+                            fallback_cursor.executemany(fallback_sql, fallback_rows)
                         else:
-                            cursor.executemany(merge_sql_plain, chunk_rows)
+                            fallback_rows = (
+                                chunk_rows
+                                if use_hash_merge
+                                else [self._oracle_bind_subset(row, base_keys) for row in chunk_rows]
+                            )
+                            fallback_sql = merge_sql_plain_hash if use_hash_merge else merge_sql_plain
+                            cursor.executemany(fallback_sql, fallback_rows)
                         continue
                     except Exception as fallback_exc:
                         err_text = str(fallback_exc or "")
@@ -1623,6 +2010,163 @@ END;"""
                 return out
             pytime.sleep(poll_seconds)
             last_stats = self._get_oracle_profile_write_queue_stats(pipeline_id, node_id)
+
+    def _teardown_oracle_profile_write_queue(
+        self,
+        pipeline_id: str,
+        node_id: str,
+        timeout_seconds: float = 2.0,
+        drop_pending: bool = False,
+        force_remove: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Stop and clean one Oracle profile write queue.
+        - When drop_pending=True, queued (not yet processed) batches are discarded.
+        - When force_remove=True, runtime state is removed even if worker thread is still alive.
+        """
+        self._ensure_oracle_profile_queue_runtime_state()
+        queue_key = self._oracle_profile_queue_key(pipeline_id, node_id)
+
+        with self._oracle_profile_write_queue_lock:
+            state = self._oracle_profile_write_queues.get(queue_key)
+            if not isinstance(state, dict):
+                return {
+                    "queue_key": queue_key,
+                    "found": False,
+                    "removed": False,
+                    "dropped_batches": 0,
+                    "queue_depth": 0,
+                    "pending_batches": 0,
+                    "inflight_batches": 0,
+                    "worker_alive": False,
+                }
+            queue_obj = state.get("queue")
+            stop_event = state.get("stop_event")
+            worker_thread = state.get("worker_thread")
+
+        dropped_batches = 0
+        if drop_pending and isinstance(queue_obj, _queue.Queue):
+            while True:
+                try:
+                    queue_obj.get_nowait()
+                    try:
+                        queue_obj.task_done()
+                    except Exception:
+                        pass
+                    dropped_batches += 1
+                except _queue.Empty:
+                    break
+                except Exception:
+                    break
+
+        if isinstance(stop_event, threading.Event):
+            try:
+                stop_event.set()
+            except Exception:
+                pass
+
+        join_timeout = max(0.0, min(float(timeout_seconds or 0.0), 60.0))
+        if isinstance(worker_thread, threading.Thread) and join_timeout > 0:
+            try:
+                worker_thread.join(timeout=join_timeout)
+            except Exception:
+                pass
+
+        with self._oracle_profile_write_queue_lock:
+            current = self._oracle_profile_write_queues.get(queue_key)
+            if not isinstance(current, dict):
+                return {
+                    "queue_key": queue_key,
+                    "found": True,
+                    "removed": True,
+                    "dropped_batches": int(dropped_batches),
+                    "queue_depth": 0,
+                    "pending_batches": 0,
+                    "inflight_batches": 0,
+                    "worker_alive": False,
+                }
+
+            current_queue = current.get("queue")
+            current_stats = current.get("stats") if isinstance(current.get("stats"), dict) else {}
+            queue_depth = int(current_queue.qsize()) if isinstance(current_queue, _queue.Queue) else 0
+            pending_batches = (
+                max(0, int(getattr(current_queue, "unfinished_tasks", 0) or 0))
+                if isinstance(current_queue, _queue.Queue)
+                else 0
+            )
+            inflight_batches = int(current_stats.get("inflight_batches") or 0)
+            worker_alive_flag = bool(current.get("worker_alive", False))
+            thread_alive = bool(
+                isinstance(current.get("worker_thread"), threading.Thread)
+                and current.get("worker_thread").is_alive()
+            )
+            effective_worker_alive = bool(worker_alive_flag or thread_alive)
+
+            removable = bool(force_remove)
+            if not removable:
+                removable = (
+                    queue_depth <= 0
+                    and pending_batches <= 0
+                    and inflight_batches <= 0
+                    and not effective_worker_alive
+                )
+
+            if removable:
+                self._oracle_profile_write_queues.pop(queue_key, None)
+
+            return {
+                "queue_key": queue_key,
+                "found": True,
+                "removed": bool(removable),
+                "dropped_batches": int(dropped_batches),
+                "queue_depth": int(queue_depth),
+                "pending_batches": int(pending_batches),
+                "inflight_batches": int(inflight_batches),
+                "worker_alive": bool(effective_worker_alive),
+            }
+
+    def _teardown_oracle_profile_write_queues_for_pipeline(
+        self,
+        pipeline_id: str,
+        timeout_seconds: float = 2.0,
+        drop_pending: bool = False,
+        force_remove: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Stop/cleanup all Oracle profile queues for one pipeline.
+        """
+        self._ensure_oracle_profile_queue_runtime_state()
+        prefix = f"{str(pipeline_id)}::"
+        with self._oracle_profile_write_queue_lock:
+            queue_keys = [
+                str(key)
+                for key in self._oracle_profile_write_queues.keys()
+                if str(key).startswith(prefix)
+            ]
+
+        results: List[Dict[str, Any]] = []
+        removed_count = 0
+        for queue_key in queue_keys:
+            node_id = queue_key[len(prefix):]
+            outcome = self._teardown_oracle_profile_write_queue(
+                pipeline_id=str(pipeline_id),
+                node_id=str(node_id),
+                timeout_seconds=timeout_seconds,
+                drop_pending=drop_pending,
+                force_remove=force_remove,
+            )
+            results.append(outcome)
+            if bool(outcome.get("removed")):
+                removed_count += 1
+
+        return {
+            "pipeline_id": str(pipeline_id),
+            "queue_count": len(queue_keys),
+            "removed_count": int(removed_count),
+            "drop_pending": bool(drop_pending),
+            "force_remove": bool(force_remove),
+            "results": results,
+        }
 
     def _oracle_destination_queue_key(
         self,
@@ -3406,6 +3950,10 @@ END;"""
                     if isinstance(parallel_column_specs, dict) and parallel_column_specs
                     else self._oracle_profile_table_column_specs(batch_conn, batch_table_sql)
                 )
+                self._validate_oracle_profile_write_schema(
+                    batch_table_sql,
+                    column_specs=batch_column_specs,
+                )
                 batch_cursor = batch_conn.cursor()
                 batch_payloads: List[Dict[str, Any]] = []
                 for token in batch_tokens:
@@ -3467,7 +4015,10 @@ END;"""
             stats_conn = None
             stats_cursor = None
             try:
-                stats_session = self._open_oracle_profile_session(effective_profile_cfg)
+                stats_session = self._open_oracle_profile_session(
+                    effective_profile_cfg,
+                    require_write_schema=True,
+                )
                 stats_conn = stats_session.get("conn")
                 stats_table_sql = str(stats_session.get("table_sql") or "ETL_PROFILE_STATE")
                 stats_column_specs = (
@@ -3591,10 +4142,17 @@ END;"""
                         if isinstance(oracle_session.get("column_specs"), dict)
                         else self._oracle_profile_table_column_specs(bootstrap_conn, bootstrap_table_sql)
                     )
+                    self._validate_oracle_profile_write_schema(
+                        bootstrap_table_sql,
+                        column_specs=bootstrap_specs,
+                    )
                     parallel_table_sql = str(bootstrap_table_sql or "ETL_PROFILE_STATE")
                     parallel_column_specs = bootstrap_specs if isinstance(bootstrap_specs, dict) else {}
                 else:
-                    bootstrap_session = self._open_oracle_profile_session(effective_profile_cfg)
+                    bootstrap_session = self._open_oracle_profile_session(
+                        effective_profile_cfg,
+                        require_write_schema=True,
+                    )
                     parallel_table_sql = str(bootstrap_session.get("table_sql") or "ETL_PROFILE_STATE")
                     bootstrap_specs = (
                         bootstrap_session.get("column_specs")
@@ -3688,7 +4246,10 @@ END;"""
             if isinstance(oracle_session, dict) and oracle_session.get("conn") is not None:
                 active_session = oracle_session
             else:
-                active_session = self._open_oracle_profile_session(profile_cfg)
+                active_session = self._open_oracle_profile_session(
+                    profile_cfg,
+                    require_write_schema=True,
+                )
                 own_session = True
             conn = active_session.get("conn")
             table_sql = str(active_session.get("table_sql") or "ETL_PROFILE_STATE")
@@ -3696,6 +4257,10 @@ END;"""
                 active_session.get("column_specs")
                 if isinstance(active_session.get("column_specs"), dict)
                 else None
+            )
+            self._validate_oracle_profile_write_schema(
+                table_sql,
+                column_specs=active_column_specs,
             )
             cursor = conn.cursor()
 
@@ -5155,6 +5720,8 @@ END;"""
                         upstream_data.extend(source_rows)
 
                 if not self._is_node_enabled(node):
+                    skip_started_at = datetime.utcnow()
+                    skip_started_iso = skip_started_at.isoformat()
                     output = upstream_data
                     pass_results[nid] = output
                     row_count = len(output) if isinstance(output, list) else 0
@@ -5163,7 +5730,10 @@ END;"""
                     skip_entry = {
                         "nodeId": nid,
                         "nodeLabel": label,
-                        "timestamp": datetime.utcnow().isoformat(),
+                        "timestamp": skip_started_iso,
+                        "started_at": skip_started_iso,
+                        "finished_at": skip_started_iso,
+                        "duration_ms": 0,
                         "status": "success",
                         "message": f"⏭ {label} — node disabled, skipped ({row_count:,} rows pass-through)",
                         "rows": row_count,
@@ -5181,10 +5751,13 @@ END;"""
                         on_node_done(logs)
                     continue
 
+                node_started_at_dt = datetime.utcnow()
+                node_started_at_iso = node_started_at_dt.isoformat()
                 log_entry = {
                     "nodeId": nid,
                     "nodeLabel": label,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": node_started_at_iso,
+                    "started_at": node_started_at_iso,
                     "status": "running",
                     "message": f"⟳ Running {label}…",
                     "rows": 0
@@ -5284,7 +5857,8 @@ END;"""
                     }
                     if pipeline_id:
                         node_profile_oracle_session = self._open_oracle_profile_session(
-                            node_profile_oracle_cfg
+                            node_profile_oracle_cfg,
+                            require_write_schema=True,
                         )
                     node_execution_context_base["profile_oracle_cfg"] = node_profile_oracle_cfg
                     node_execution_context_base["profile_oracle_session"] = node_profile_oracle_session
@@ -5445,8 +6019,7 @@ END;"""
                     profile_processed_hint = 0
                     profile_validated_hint = 0
                     if (
-                        row_count <= 0
-                        and node_type == "map_transform"
+                        node_type == "map_transform"
                         and bool(config.get("custom_profile_enabled", False))
                         and isinstance(profile_state_by_node, dict)
                     ):
@@ -5466,6 +6039,7 @@ END;"""
                                     )
                                 except Exception:
                                     profile_validated_hint = 0
+                    if row_count <= 0:
                         hint = profile_validated_hint or profile_processed_hint
                         if hint > 0:
                             row_count = hint
@@ -5479,11 +6053,45 @@ END;"""
                         and isinstance(oracle_async_payload, dict)
                         and str(oracle_async_payload.get("status") or "").strip().lower() == "queued"
                     )
+                    try:
+                        live_processed_rows = int(log_entry.get("processed_rows") or 0)
+                    except Exception:
+                        live_processed_rows = 0
+                    try:
+                        live_validated_rows = int(log_entry.get("validated_rows") or 0)
+                    except Exception:
+                        live_validated_rows = 0
+                    final_processed_rows = max(live_processed_rows, profile_processed_hint)
+                    final_validated_rows = max(live_validated_rows, profile_validated_hint)
+                    if final_processed_rows <= 0 and row_count > 0:
+                        final_processed_rows = int(row_count)
+                    if final_validated_rows <= 0 and row_count > 0:
+                        final_validated_rows = int(row_count)
                     log_entry["status"] = "running" if is_oracle_async_queued else "success"
                     log_entry["rows"] = row_count
-                    # Remove transient live counters from the final success payload.
-                    log_entry.pop("processed_rows", None)
-                    log_entry.pop("validated_rows", None)
+                    if is_oracle_async_queued:
+                        log_entry.pop("finished_at", None)
+                        log_entry["duration_ms"] = max(
+                            0,
+                            int((datetime.utcnow() - node_started_at_dt).total_seconds() * 1000.0),
+                        )
+                    else:
+                        node_finished_at_dt = datetime.utcnow()
+                        log_entry["finished_at"] = node_finished_at_dt.isoformat()
+                        log_entry["duration_ms"] = max(
+                            0,
+                            int((node_finished_at_dt - node_started_at_dt).total_seconds() * 1000.0),
+                        )
+                    # Keep final counters on terminal payload so end-of-node stats
+                    # are accurate even when the last progress tick happened earlier.
+                    if final_processed_rows > 0:
+                        log_entry["processed_rows"] = int(final_processed_rows)
+                    else:
+                        log_entry.pop("processed_rows", None)
+                    if final_validated_rows > 0:
+                        log_entry["validated_rows"] = int(final_validated_rows)
+                    else:
+                        log_entry.pop("validated_rows", None)
                     log_entry.pop("incremental_counter", None)
 
                     batch_note = f" | batches={chunk_batches}" if chunk_batches > 1 else ""
@@ -5587,18 +6195,29 @@ END;"""
                         )
 
                     if websocket_manager:
-                        await websocket_manager.broadcast(execution_id, {
+                        ws_payload = {
                             "type": "node_progress" if is_oracle_async_queued else "node_success",
                             "nodeId": nid,
                             "rows": row_count,
                             "log_entry": dict(log_entry),
-                        })
+                        }
+                        if final_processed_rows > 0:
+                            ws_payload["processed_rows"] = int(final_processed_rows)
+                        if final_validated_rows > 0:
+                            ws_payload["validated_rows"] = int(final_validated_rows)
+                        await websocket_manager.broadcast(execution_id, ws_payload)
                     if on_node_done:
                         on_node_done(logs)
                     node_execution_succeeded = True
 
                 except Exception as e:
                     log_entry["status"] = "error"
+                    error_finished_at_dt = datetime.utcnow()
+                    log_entry["finished_at"] = error_finished_at_dt.isoformat()
+                    log_entry["duration_ms"] = max(
+                        0,
+                        int((error_finished_at_dt - node_started_at_dt).total_seconds() * 1000.0),
+                    )
                     log_entry["message"] = f"✗ {label}: {str(e)}"
                     logger.error(f"Node {nid} ({label}) failed: {e}")
 
@@ -6121,6 +6740,8 @@ END;"""
             if isinstance(node_warnings, list) and msg not in node_warnings:
                 node_warnings.append(msg)
 
+        conn = None
+        cursor = None
         try:
             import oracledb
 
@@ -6198,8 +6819,6 @@ END;"""
                 cursor.execute(base_query)
             cols = [desc[0] for desc in (cursor.description or [])]
             rows = [dict(zip(cols, row)) for row in cursor.fetchall()]
-            cursor.close()
-            conn.close()
             return rows
         except Exception as e:
             err = str(e)
@@ -6207,6 +6826,17 @@ END;"""
             if any(code in err for code in ("ORA-12154", "ORA-12514", "ORA-12541", "DPY-6005")):
                 hint = "Oracle listener/service mismatch. Verify host, port, service_name (or sid), and listener status."
             raise RuntimeError(f"Oracle connection/query failed: {err}. {hint}")
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     async def _execute_mongodb(self, config: dict) -> list:
         try:
@@ -13085,6 +13715,8 @@ END;"""
                         )
                     except TypeError:
                         executor.shutdown(wait=not abort_shutdown_fast)
+                    if abort_shutdown_fast:
+                        _force_terminate_process_pool(executor)
             else:
                 executor = ThreadPoolExecutor(max_workers=max_workers)
                 abort_shutdown_fast = False
@@ -13932,6 +14564,7 @@ END;"""
         df,
         execution_context: Optional[Dict[str, Any]] = None,
     ) -> list:
+        engine = None
         try:
             from sqlalchemy import create_engine
             from sqlalchemy import types as sql_types
@@ -14299,7 +14932,6 @@ END;"""
                     _raise_if_aborted()
                     conn.exec_driver_sql(stmt)
 
-            engine.dispose()
             return [{
                 "status": "loaded",
                 "rows": rows_written,
@@ -14319,6 +14951,12 @@ END;"""
             raise
         except Exception as e:
             raise RuntimeError(f"Oracle write failed: {e}")
+        finally:
+            if engine is not None:
+                try:
+                    engine.dispose()
+                except Exception:
+                    pass
 
     async def _dest_oracle(
         self,

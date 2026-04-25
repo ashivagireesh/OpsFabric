@@ -1,0 +1,69 @@
+Great. Here is the exact no-code tuning preset to keep runtime flatter (especially around your 80k+ slowdown).
+
+Custom Field Node Settings (Oracle Profile)
+
+custom_profile_enabled = true
+custom_profile_storage = oracle
+custom_profile_processing_mode = incremental_batch
+custom_profile_emit_mode = changed_only
+custom_include_source_fields = false
+custom_profile_include_change_fields = false
+custom_profile_compute_strategy = parallel_by_profile_key
+custom_profile_compute_executor = process
+custom_profile_compute_workers = 6 (use 8 if machine is stable)
+custom_profile_compute_min_rows = 20000
+custom_profile_compute_global_prefetch_max_tokens = 15000
+custom_profile_backfill_candidate_prefetch_chunk_size = 900
+custom_profile_backfill_preload_max_tokens = 0
+custom_profile_append_unique_cache_mode = persistent
+custom_profile_append_unique_cache_disable_min_rows = 1000000
+custom_profile_append_unique_cache_entity_limit = 250000
+custom_profile_append_unique_cache_disable_ratio = 0.98
+custom_profile_flush_every_rows = 20000
+custom_profile_flush_interval_seconds = 2.0
+custom_profile_live_persist = true
+custom_profile_oracle_write_strategy = parallel_key
+custom_profile_oracle_parallel_workers = 8
+custom_profile_oracle_parallel_min_tokens = 10000
+custom_profile_oracle_merge_batch_size = 1000
+custom_profile_oracle_parallel_force = false
+custom_profile_oracle_queue_enabled = true
+custom_profile_oracle_queue_maxsize = 1024
+custom_profile_oracle_queue_enqueue_timeout_seconds = 0.2
+custom_profile_oracle_queue_wait_on_force_flush = false
+custom_profile_oracle_queue_wait_timeout_seconds = 30
+Backend Env (same behavior, fallback if UI field not visible)
+
+export PROFILE_COMPUTE_MIN_ROWS=20000
+export PROFILE_COMPUTE_WORKERS=6
+export PROFILE_COMPUTE_GLOBAL_PREFETCH_MAX_TOKENS=15000
+export PROFILE_BACKFILL_CANDIDATE_PREFETCH_CHUNK_SIZE=900
+export PROFILE_BACKFILL_PRELOAD_MAX_TOKENS_ORACLE=0
+
+export PROFILE_INCREMENTAL_FLUSH_EVERY_ROWS=20000
+export PROFILE_INCREMENTAL_FLUSH_INTERVAL_SECONDS=2
+
+export PROFILE_APPEND_UNIQUE_CACHE_DISABLE_MIN_ROWS=1000000
+export PROFILE_APPEND_UNIQUE_CACHE_ENTITY_LIMIT=250000
+export PROFILE_APPEND_UNIQUE_CACHE_DISABLE_RATIO=0.98
+
+export PROFILE_ORACLE_PARALLEL_WORKERS=8
+export PROFILE_ORACLE_PARALLEL_MIN_TOKENS=10000
+export PROFILE_ORACLE_MERGE_BATCH_SIZE=1000
+
+export PROFILE_ORACLE_QUEUE_ENABLED=1
+export PROFILE_ORACLE_QUEUE_MAXSIZE=1024
+export PROFILE_ORACLE_QUEUE_WAIT_ON_FORCE_FLUSH=0
+
+export EXECUTION_LOG_FLUSH_INTERVAL_SECONDS=8
+Important
+
+If your primary key is very high-cardinality (almost every row unique, like TRANSACTIONID), use custom_profile_append_unique_cache_mode = row_local instead of persistent.
+Restart backend after env changes.
+If you want, I can give a second preset specifically for LMDB/RocksDB mode too.
+
+
+
+
+
+12:38 PM

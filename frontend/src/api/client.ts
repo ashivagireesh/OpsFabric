@@ -925,6 +925,26 @@ const api = {
     return r.data
   },
 
+  getSqliteCleanupSchedule: () => safeGet(async () => {
+    const r = await http.get('/api/settings/sqlite/cleanup-schedule')
+    return r.data
+  }, {
+    enabled: false,
+    interval_minutes: 60,
+    clear_execution_runtime_payloads: true,
+    clear_mlops_run_payloads: true,
+    clear_business_run_payloads: true,
+    clear_audit_logs: false,
+    vacuum: false,
+    job_active: false,
+    next_run_at: null,
+  }),
+
+  updateSqliteCleanupSchedule: async (payload: Record<string, unknown>) => {
+    const r = await http.put('/api/settings/sqlite/cleanup-schedule', payload)
+    return r.data
+  },
+
   // ── Credentials ────────────────────────────────────────────────────────────
   listCredentials: () => safeGet(async () => {
     const r = await http.get('/api/credentials')

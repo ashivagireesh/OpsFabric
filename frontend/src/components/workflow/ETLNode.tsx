@@ -6,6 +6,10 @@ import {
   PauseCircleFilled,
 } from '@ant-design/icons'
 import type { ETLNodeData } from '../../types'
+import { useWorkflowStore } from '../../store'
+import { useBusinessWorkflowStore } from '../../store/businessStore'
+import { useMLOpsWorkflowStore } from '../../store/mlopsStore'
+import { parseTimestampMsOrNaN } from '../../utils/time'
 
 const { Text } = Typography
 
@@ -45,6 +49,7 @@ export const ETLNode = memo(({ id, data, selected }: ETLNodeProps) => {
     executionProcessedRows,
     executionValidatedRows,
     executionStartedAt,
+    executionFinishedAt,
     executionDurationMs,
   } = data
   if (!definition) return null
@@ -52,20 +57,36 @@ export const ETLNode = memo(({ id, data, selected }: ETLNodeProps) => {
   const { color, bgColor, icon, inputs, outputs, category } = definition
   const ringColor = statusRing[status]
   const isRunning = status === 'running'
+  const hasFinishedExecution = String(executionFinishedAt || '').trim().length > 0
+  const workflowExecuting = useWorkflowStore((state) => state.isExecuting)
+  const businessExecuting = useBusinessWorkflowStore((state) => state.isExecuting)
+  const mlopsExecuting = useMLOpsWorkflowStore((state) => state.isExecuting)
+  const anyExecutionActive = workflowExecuting || businessExecuting || mlopsExecuting
+  const countersIndicateDone = (
+    isRunning
+    && typeof executionRows === 'number'
+    && (
+      (typeof executionProcessedRows === 'number' && executionProcessedRows >= executionRows)
+      || (typeof executionValidatedRows === 'number' && executionValidatedRows >= executionRows)
+    )
+  )
+  const shouldTickDuration = isRunning && !hasFinishedExecution && anyExecutionActive && !countersIndicateDone
   const statusInfo = statusMeta[status] || statusMeta.idle
   const [tickNowMs, setTickNowMs] = useState<number>(() => Date.now())
 
   useEffect(() => {
-    if (!isRunning) return
+    if (!shouldTickDuration) return
+    setTickNowMs(Date.now())
     const timer = window.setInterval(() => {
       setTickNowMs(Date.now())
     }, 1000)
     return () => window.clearInterval(timer)
-  }, [isRunning])
+  }, [shouldTickDuration, executionStartedAt])
 
   const executionDurationLabel = useMemo(() => {
     const formatDuration = (ms: number): string => {
       if (!Number.isFinite(ms) || ms <= 0) return '0s'
+      if (ms < 1000) return `${Math.max(1, Math.round(ms))}ms`
       const totalSeconds = Math.floor(ms / 1000)
       const seconds = totalSeconds % 60
       const minutes = Math.floor(totalSeconds / 60) % 60
@@ -75,19 +96,48 @@ export const ETLNode = memo(({ id, data, selected }: ETLNodeProps) => {
       return `${seconds}s`
     }
 
-    if (isRunning) {
+    if (shouldTickDuration) {
       const startedAt = String(executionStartedAt || '').trim()
       if (!startedAt) return '0s'
-      const startedMs = Date.parse(startedAt)
+      const startedMs = parseTimestampMsOrNaN(startedAt)
       if (!Number.isFinite(startedMs)) return '0s'
       return formatDuration(Math.max(0, tickNowMs - Number(startedMs)))
     }
 
-    if (typeof executionDurationMs === 'number' && Number.isFinite(executionDurationMs)) {
-      return formatDuration(Math.max(0, executionDurationMs))
+    const startedAt = String(executionStartedAt || '').trim()
+    const finishedAt = String(executionFinishedAt || '').trim()
+    const startedMs = parseTimestampMsOrNaN(startedAt)
+    const finishedMs = parseTimestampMsOrNaN(finishedAt)
+    const inferredDurationMs = (
+      Number.isFinite(startedMs) && Number.isFinite(finishedMs) && Number(finishedMs) >= Number(startedMs)
+    )
+      ? Math.max(0, Number(finishedMs) - Number(startedMs))
+      : undefined
+    const directDurationMs = (
+      typeof executionDurationMs === 'number' && Number.isFinite(executionDurationMs)
+    )
+      ? Math.max(0, Number(executionDurationMs))
+      : undefined
+
+    const resolvedDurationMs = (() => {
+      if (typeof directDurationMs === 'number' && typeof inferredDurationMs === 'number') {
+        return Math.max(directDurationMs, inferredDurationMs)
+      }
+      if (typeof directDurationMs === 'number') return directDurationMs
+      if (typeof inferredDurationMs === 'number') return inferredDurationMs
+      return undefined
+    })()
+
+    if (typeof resolvedDurationMs === 'number') {
+      if (resolvedDurationMs > 0) {
+        return formatDuration(resolvedDurationMs)
+      }
+      if (status !== 'running' && (hasFinishedExecution || finishedAt)) {
+        return '<1s'
+      }
     }
-    return undefined
-  }, [executionStartedAt, executionDurationMs, isRunning, tickNowMs])
+    return status === 'running' ? '0s' : undefined
+  }, [executionStartedAt, executionFinishedAt, executionDurationMs, shouldTickDuration, status, tickNowMs, hasFinishedExecution])
   const nodeEnabled = (() => {
     const raw = (data?.config as Record<string, unknown> | undefined)?.node_enabled
     if (typeof raw === 'boolean') return raw

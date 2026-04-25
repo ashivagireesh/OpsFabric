@@ -17,6 +17,12 @@
   --app-shell-overlay: rgba(15, 15, 19, 0.5);
   --app-border-soft-a: rgba(30, 30, 46, 0.06);
   --app-border-soft-b: rgba(30, 30, 46, 0.12);
+  --app-canvas-dot: rgba(148, 163, 184, 0.38);
+  --app-ruler-bg: #11111d;
+  --app-ruler-border: #2a2a3d;
+  --app-ruler-tick: #475569;
+  --app-ruler-major: #94a3b8;
+  --app-ruler-text: #cbd5e1;
 }
 
 :root[data-app-theme='light'] {
@@ -36,6 +42,12 @@
   --app-shell-overlay: rgba(245, 247, 251, 0.72);
   --app-border-soft-a: rgba(148, 163, 184, 0.12);
   --app-border-soft-b: rgba(148, 163, 184, 0.2);
+  --app-canvas-dot: rgba(100, 116, 139, 0.44);
+  --app-ruler-bg: #f8fafc;
+  --app-ruler-border: #cbd5e1;
+  --app-ruler-tick: #94a3b8;
+  --app-ruler-major: #475569;
+  --app-ruler-text: #334155;
 }
 
 body {

@@ -79,6 +79,8 @@ export interface ExecutionSummary {
   id: string
   status: ExecutionStatus
   started_at: string
+  finished_at?: string
+  duration?: number
   rows_processed: number
 }
 

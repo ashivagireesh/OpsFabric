@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { parseTimestampMs, parseTimestampMsOrNaN } from '../utils/time'
 
 // ─── ROW COUNTS per category for realistic simulation ─────────────────────────
 const MOCK_ROW_COUNTS: Record<string, number[]> = {
@@ -22,6 +23,7 @@ function randomRows(category: string, upstream: number): number {
 
 const TERMINAL_EXECUTION_STATUSES = new Set(['success', 'failed', 'cancelled'])
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+const EXECUTION_POLL_INTERVAL_MS = 1500
 const LMDB_LAST_ENV_PATH_KEY = 'framework_lmdb_env_path'
 const ROCKSDB_LAST_ENV_PATH_KEY = 'framework_rocksdb_env_path'
 const LMDB_AUTO_METADATA_TTL_MS = 5 * 60 * 1000
@@ -54,6 +56,41 @@ function mapNodeLogStatusForExecution(
 
 function terminalFallbackNodeStatus(executionStatus: unknown): 'success' | 'error' {
   return String(executionStatus || '').trim().toLowerCase() === 'success' ? 'success' : 'error'
+}
+
+function deriveEffectiveExecutionStatus(
+  rawExecutionStatus: unknown,
+  logs: Array<Record<string, any>> | null | undefined,
+): string {
+  const statusNorm = String(rawExecutionStatus || '').trim().toLowerCase()
+  if (TERMINAL_EXECUTION_STATUSES.has(statusNorm)) return statusNorm
+  if (statusNorm !== 'running' && statusNorm !== 'cancelling') return statusNorm
+  if (!Array.isArray(logs) || logs.length === 0) return statusNorm
+
+  const latestByNode = selectLatestNodeLogByTerminalPriority(logs)
+  const latestStatusByNode = new Map<string, string>()
+  latestByNode.forEach((entry, nodeIdRaw) => {
+    const nodeId = String(nodeIdRaw || '').trim().toLowerCase()
+    // Ignore system/meta log lines; they should not keep execution in "running".
+    if (!nodeId || nodeId === '__system__' || nodeId === 'system') return
+    const entryStatus = String(entry?.status || '').trim().toLowerCase()
+    latestStatusByNode.set(nodeId, entryStatus)
+  })
+  if (latestStatusByNode.size === 0) return statusNorm
+
+  let hasRunning = false
+  let hasError = false
+  let hasSuccess = false
+  latestStatusByNode.forEach((entryStatus) => {
+    if (entryStatus === 'running') hasRunning = true
+    else if (entryStatus === 'error' || entryStatus === 'failed') hasError = true
+    else if (entryStatus === 'success') hasSuccess = true
+  })
+
+  if (hasRunning) return statusNorm
+  if (hasError) return statusNorm === 'cancelling' ? 'cancelled' : 'failed'
+  if (hasSuccess) return statusNorm === 'cancelling' ? 'cancelled' : 'success'
+  return statusNorm
 }
 
 function normalizeExecutionLogsForDisplay(
@@ -105,6 +142,196 @@ function normalizeExecutionLogsForDisplay(
     }
     return next
   })
+}
+
+function isTerminalLikeRunningLog(log: Record<string, any> | null | undefined): boolean {
+  if (!log || typeof log !== 'object') return false
+  const rawStatus = String(log.status || '').trim().toLowerCase()
+  if (rawStatus !== 'running') return false
+  const message = String(log.message || '').trim().toLowerCase()
+  if (!message) return false
+  if (message.startsWith('✓')) return true
+  const hasTerminalWord = /\b(completed|complete|done|finished|success)\b/.test(message)
+  const hasActiveWord = /\b(running|processing|queued|queue|pending|starting|in progress)\b/.test(message)
+  return hasTerminalWord && !hasActiveWord
+}
+
+function selectLatestNodeLogByTerminalPriority(
+  logs: Array<Record<string, any>>,
+): Map<string, Record<string, any>> {
+  const latestByNode = new Map<string, Record<string, any>>()
+  const latestTerminalByNode = new Map<string, Record<string, any>>()
+  logs.forEach((log) => {
+    if (!log || typeof log !== 'object') return
+    const nodeId = String(log.nodeId || '').trim()
+    if (!nodeId) return
+    latestByNode.set(nodeId, log)
+    const rawStatus = String(log.status || '').trim().toLowerCase()
+    if (rawStatus === 'success' || rawStatus === 'error' || rawStatus === 'failed' || isTerminalLikeRunningLog(log)) {
+      latestTerminalByNode.set(nodeId, log)
+    }
+  })
+
+  const merged = new Map<string, Record<string, any>>()
+  latestByNode.forEach((latestLog, nodeId) => {
+    const preferred = latestTerminalByNode.get(nodeId) || latestLog
+    if (isTerminalLikeRunningLog(preferred)) {
+      merged.set(nodeId, { ...preferred, status: 'success' })
+      return
+    }
+    merged.set(nodeId, preferred)
+  })
+  return merged
+}
+
+function collectMaxNodeCounters(
+  logs: Array<Record<string, any>>,
+): Map<string, { processed?: number; validated?: number }> {
+  const byNode = new Map<string, { processed?: number; validated?: number }>()
+  logs.forEach((log) => {
+    if (!log || typeof log !== 'object') return
+    const nodeId = String(log.nodeId || '').trim()
+    const nodeKey = nodeId.toLowerCase()
+    if (!nodeId || nodeKey === '__system__' || nodeKey === 'system') return
+    const next = { ...(byNode.get(nodeId) || {}) }
+    const processed = Number(log.processed_rows)
+    if (Number.isFinite(processed) && processed >= 0) {
+      next.processed = Math.max(Number(next.processed ?? 0), Math.floor(processed))
+    }
+    const validated = Number(log.validated_rows)
+    if (Number.isFinite(validated) && validated >= 0) {
+      next.validated = Math.max(Number(next.validated ?? 0), Math.floor(validated))
+    }
+    byNode.set(nodeId, next)
+  })
+  return byNode
+}
+
+type NodeRuntimeSnapshot = {
+  status: 'running' | 'success' | 'error'
+  rows?: number
+  processedRows?: number
+  validatedRows?: number
+  startedAt?: string
+  finishedAt?: string
+  durationMs?: number
+}
+
+function toLogTimestampMs(value: unknown): number | undefined {
+  return parseTimestampMs(value)
+}
+
+function buildNodeRuntimeSnapshotsFromLogs(
+  logs: Array<Record<string, any>>,
+  executionStatus: unknown,
+  nowMs: number = Date.now(),
+): Map<string, NodeRuntimeSnapshot> {
+  const snapshots = new Map<string, NodeRuntimeSnapshot>()
+  if (!Array.isArray(logs) || logs.length === 0) return snapshots
+
+  const statusNorm = String(executionStatus || '').trim().toLowerCase()
+  const latestByNode = selectLatestNodeLogByTerminalPriority(logs)
+  const maxCountersByNode = collectMaxNodeCounters(logs)
+
+  const firstEventMsByNode = new Map<string, number>()
+  const firstRunningMsByNode = new Map<string, number>()
+  const lastEventMsByNode = new Map<string, number>()
+  const lastTerminalMsByNode = new Map<string, number>()
+  const explicitDurationMsByNode = new Map<string, number>()
+
+  logs.forEach((log) => {
+    if (!log || typeof log !== 'object') return
+    const nodeId = String(log.nodeId || '').trim()
+    const nodeKey = nodeId.toLowerCase()
+    if (!nodeId || nodeKey === '__system__' || nodeKey === 'system') return
+
+    const eventTsMs = toLogTimestampMs(log.timestamp)
+    const startedTsMs = toLogTimestampMs((log as any).started_at) ?? eventTsMs
+    const finishedTsMs = toLogTimestampMs((log as any).finished_at)
+    const explicitDurationMs = Number((log as any).duration_ms ?? (log as any).durationMs)
+
+    if (typeof startedTsMs === 'number') {
+      if (!firstEventMsByNode.has(nodeId) || startedTsMs < Number(firstEventMsByNode.get(nodeId))) {
+        firstEventMsByNode.set(nodeId, startedTsMs)
+      }
+    }
+    if (typeof eventTsMs === 'number') {
+      if (!lastEventMsByNode.has(nodeId) || eventTsMs > Number(lastEventMsByNode.get(nodeId))) {
+        lastEventMsByNode.set(nodeId, eventTsMs)
+      }
+    }
+
+    const rawStatus = String(log.status || '').trim().toLowerCase()
+    if (rawStatus === 'running' && typeof startedTsMs === 'number') {
+      if (!firstRunningMsByNode.has(nodeId) || startedTsMs < Number(firstRunningMsByNode.get(nodeId))) {
+        firstRunningMsByNode.set(nodeId, startedTsMs)
+      }
+    }
+    if (
+      (rawStatus === 'success' || rawStatus === 'error' || rawStatus === 'failed' || isTerminalLikeRunningLog(log))
+      && (typeof finishedTsMs === 'number' || typeof eventTsMs === 'number')
+    ) {
+      const terminalTsMs = (
+        typeof finishedTsMs === 'number'
+          ? finishedTsMs
+          : Number(eventTsMs)
+      )
+      if (!lastTerminalMsByNode.has(nodeId) || terminalTsMs > Number(lastTerminalMsByNode.get(nodeId))) {
+        lastTerminalMsByNode.set(nodeId, terminalTsMs)
+      }
+    }
+    if (Number.isFinite(explicitDurationMs) && explicitDurationMs >= 0) {
+      const prev = Number(explicitDurationMsByNode.get(nodeId) ?? 0)
+      if (explicitDurationMs >= prev) {
+        explicitDurationMsByNode.set(nodeId, explicitDurationMs)
+      }
+    }
+  })
+
+  latestByNode.forEach((log, nodeId) => {
+    const mappedStatus = mapNodeLogStatusForExecution(log?.status, statusNorm)
+    const rows = typeof log?.rows === 'number' ? log.rows : undefined
+    const counters = maxCountersByNode.get(nodeId)
+    const processedRows = (
+      typeof log?.processed_rows === 'number'
+        ? Math.max(log.processed_rows, Number(counters?.processed ?? 0))
+        : counters?.processed
+    )
+    const validatedRows = (
+      typeof log?.validated_rows === 'number'
+        ? Math.max(log.validated_rows, Number(counters?.validated ?? 0))
+        : counters?.validated
+    )
+
+    const logStartedMs = toLogTimestampMs((log as any)?.started_at)
+    const logFinishedMs = toLogTimestampMs((log as any)?.finished_at)
+    const startedMs = logStartedMs ?? firstRunningMsByNode.get(nodeId) ?? firstEventMsByNode.get(nodeId)
+    const finishedMs = mappedStatus === 'running'
+      ? undefined
+      : (logFinishedMs ?? lastTerminalMsByNode.get(nodeId) ?? lastEventMsByNode.get(nodeId))
+
+    let durationMs: number | undefined
+    const explicitDurationMs = explicitDurationMsByNode.get(nodeId)
+    if (typeof explicitDurationMs === 'number' && Number.isFinite(explicitDurationMs) && explicitDurationMs >= 0) {
+      durationMs = explicitDurationMs
+    } else if (typeof startedMs === 'number' && typeof finishedMs === 'number' && finishedMs >= startedMs) {
+      durationMs = Math.max(0, finishedMs - startedMs)
+    } else if (mappedStatus === 'running' && typeof startedMs === 'number') {
+      durationMs = Math.max(0, nowMs - startedMs)
+    }
+
+    snapshots.set(nodeId, {
+      status: mappedStatus,
+      rows,
+      processedRows,
+      validatedRows,
+      startedAt: typeof startedMs === 'number' ? new Date(startedMs).toISOString() : undefined,
+      finishedAt: typeof finishedMs === 'number' ? new Date(finishedMs).toISOString() : undefined,
+      durationMs,
+    })
+  })
+
+  return snapshots
 }
 
 function buildLmdbMetadataFingerprint(config: Record<string, unknown>): string {
@@ -712,9 +939,15 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         nodes: state.nodes.map((n) => {
           if (n.id !== nodeId) return n
 
+          const previousStatusNorm = String(n.data.status || '').toLowerCase()
           const previousStart = String(n.data.executionStartedAt || '').trim()
-          const previousStartMs = previousStart ? Date.parse(previousStart) : Number.NaN
+          const previousStartMs = previousStart ? parseTimestampMsOrNaN(previousStart) : Number.NaN
           const hasValidStart = Number.isFinite(previousStartMs)
+          const hasFinalizedDuration =
+            typeof n.data.executionDurationMs === 'number'
+            && Number.isFinite(n.data.executionDurationMs)
+            && n.data.executionDurationMs >= 0
+          const hasFinishedAt = String(n.data.executionFinishedAt || '').trim().length > 0
 
           let nextStartAt = previousStart || undefined
           let nextFinishedAt = n.data.executionFinishedAt
@@ -725,12 +958,27 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
             nextFinishedAt = undefined
             nextDurationMs = undefined
           } else if (statusNorm === 'running') {
+            // Ignore stale/late running transitions after node has already finalized.
+            if (
+              previousStatusNorm === 'success'
+              || previousStatusNorm === 'error'
+              || hasFinishedAt
+            ) {
+              return n
+            }
             nextStartAt = previousStart || nowIso
             nextFinishedAt = undefined
             nextDurationMs = hasValidStart ? Math.max(0, nowMs - Number(previousStartMs)) : 0
           } else if (statusNorm === 'success' || statusNorm === 'error') {
-            nextFinishedAt = nowIso
-            nextDurationMs = hasValidStart ? Math.max(0, nowMs - Number(previousStartMs)) : n.data.executionDurationMs
+            // Only compute terminal duration from "now - start" when closing an active running node.
+            // This prevents duration inflation on page re-open/replay.
+            if (previousStatusNorm === 'running' && hasValidStart && !hasFinalizedDuration && !hasFinishedAt) {
+              nextFinishedAt = nowIso
+              nextDurationMs = Math.max(0, nowMs - Number(previousStartMs))
+            } else {
+              nextFinishedAt = n.data.executionFinishedAt || nowIso
+              nextDurationMs = hasFinalizedDuration ? n.data.executionDurationMs : 0
+            }
           }
 
           return {
@@ -739,12 +987,12 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
               ...n.data,
               status: status as ETLNode['data']['status'],
               executionRows: rows ?? n.data.executionRows,
-              executionProcessedRows: statusNorm === 'running'
-                ? (processedRows ?? n.data.executionProcessedRows)
-                : undefined,
-              executionValidatedRows: statusNorm === 'running'
-                ? (validatedRows ?? n.data.executionValidatedRows)
-                : undefined,
+              executionProcessedRows: statusNorm === 'idle'
+                ? undefined
+                : (processedRows ?? n.data.executionProcessedRows),
+              executionValidatedRows: statusNorm === 'idle'
+                ? undefined
+                : (validatedRows ?? n.data.executionValidatedRows),
               executionStartedAt: nextStartAt,
               executionFinishedAt: nextFinishedAt,
               executionDurationMs: nextDurationMs,
@@ -933,7 +1181,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
                   executionDurationMs: (() => {
                     const startedAt = String(n.data?.executionStartedAt || '').trim()
                     if (!startedAt) return n.data?.executionDurationMs
-                    const startedMs = Date.parse(startedAt)
+                    const startedMs = parseTimestampMsOrNaN(startedAt)
                     if (!Number.isFinite(startedMs)) return n.data?.executionDurationMs
                     return Math.max(0, nowMs - Number(startedMs))
                   })(),
@@ -950,22 +1198,68 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         if (!Array.isArray(logs) || logs.length === 0) return
         const statusNorm = String(executionStatus || '').trim().toLowerCase()
         const isTerminal = TERMINAL_EXECUTION_STATUSES.has(statusNorm)
-        const latestByNode = new Map<string, Record<string, any>>()
-        logs.forEach((log) => {
-          const nodeId = String(log?.nodeId || '').trim()
-          if (!nodeId) return
-          latestByNode.set(nodeId, log)
-        })
-        latestByNode.forEach((log, nodeId) => {
-          const mappedStatus = mapNodeLogStatusForExecution(log?.status, statusNorm)
-          const rows = typeof log?.rows === 'number' ? log.rows : undefined
-          const processedRows = typeof log?.processed_rows === 'number' ? log.processed_rows : undefined
-          const validatedRows = typeof log?.validated_rows === 'number' ? log.validated_rows : undefined
-          get().setNodeStatus(nodeId, mappedStatus, rows, processedRows, validatedRows)
-        })
+        const snapshots = buildNodeRuntimeSnapshotsFromLogs(logs, statusNorm)
+        set((state) => ({
+          nodes: state.nodes.map((node) => {
+            const snapshot = snapshots.get(String(node.id || '').trim())
+            if (!snapshot) return node
+            return {
+              ...node,
+              data: {
+                ...node.data,
+                status: snapshot.status,
+                executionRows: snapshot.rows ?? node.data.executionRows,
+                executionProcessedRows: snapshot.processedRows ?? node.data.executionProcessedRows,
+                executionValidatedRows: snapshot.validatedRows ?? node.data.executionValidatedRows,
+                executionStartedAt: snapshot.startedAt ?? node.data.executionStartedAt,
+                executionFinishedAt: snapshot.finishedAt ?? node.data.executionFinishedAt,
+                executionDurationMs: (
+                  typeof snapshot.durationMs === 'number'
+                    ? snapshot.durationMs
+                    : node.data.executionDurationMs
+                ),
+              },
+            }
+          }),
+        }))
         if (isTerminal) {
           forceStopRunningNodes(terminalFallbackNodeStatus(statusNorm))
         }
+      }
+      const finalizePreviousRunningNodes = (startedNodeId: string) => {
+        const targetId = String(startedNodeId || '').trim()
+        if (!targetId) return
+        const nowMs = Date.now()
+        const nowIso = new Date(nowMs).toISOString()
+        set((state) => {
+          const runningNodeIds = new Set(
+            state.nodes
+              .filter((node) => String(node.id || '').trim() !== targetId && String(node?.data?.status || '').toLowerCase() === 'running')
+              .map((node) => String(node.id || '').trim())
+              .filter(Boolean),
+          )
+          if (runningNodeIds.size === 0) return {}
+          let changed = false
+          const nextNodes = state.nodes.map((node) => {
+            if (!runningNodeIds.has(String(node.id || '').trim())) return node
+            if (node.data?.status !== 'running') return node
+            const startedAt = String(node.data?.executionStartedAt || '').trim()
+            const startedMs = startedAt ? parseTimestampMsOrNaN(startedAt) : Number.NaN
+            changed = true
+            return {
+              ...node,
+              data: {
+                ...node.data,
+                status: 'success' as const,
+                executionFinishedAt: nowIso,
+                executionDurationMs: Number.isFinite(startedMs)
+                  ? Math.max(0, nowMs - Number(startedMs))
+                  : node.data?.executionDurationMs,
+              },
+            }
+          })
+          return changed ? { nodes: nextNodes } : {}
+        })
       }
       try {
         ws = new WebSocket(`ws://localhost:8001/ws/executions/${execId}`)
@@ -992,6 +1286,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
             : (entry && typeof entry.validated_rows === 'number' ? entry.validated_rows : undefined)
 
           if (msg.type === 'node_start') {
+            finalizePreviousRunningNodes(String(msg.nodeId || ''))
             get().setNodeStatus(msg.nodeId, 'running', liveRows, liveProcessedRows, liveValidatedRows)
             // Add "running" log entry immediately
             if (entry) {
@@ -1021,6 +1316,8 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
             const currentNode = get().nodes.find((n) => n.id === msg.nodeId)
             const currentStatus = String(currentNode?.data?.status || '').toLowerCase()
             const canMoveToRunningFromProgress = currentStatus === 'idle' || currentStatus === 'running'
+            const progressLooksTerminal = isTerminalLikeRunningLog(entry as Record<string, any> | undefined)
+            const progressStatus: 'running' | 'success' = progressLooksTerminal ? 'success' : 'running'
 
             if (entry) {
               set((state) => {
@@ -1029,18 +1326,23 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
                 )
                 if (idx >= 0) {
                   const updated = [...state.executionLogs]
-                  updated[idx] = entry
+                  updated[idx] = progressLooksTerminal ? { ...entry, status: 'success' } : entry
                   return { executionLogs: updated }
                 }
                 // Do not append stale progress after node reached terminal status.
                 if (!canMoveToRunningFromProgress) {
                   return {}
                 }
-                return { executionLogs: [...state.executionLogs, entry] }
+                return {
+                  executionLogs: [
+                    ...state.executionLogs,
+                    progressLooksTerminal ? { ...entry, status: 'success' } : entry,
+                  ],
+                }
               })
             }
             if (canMoveToRunningFromProgress) {
-              get().setNodeStatus(msg.nodeId, 'running', liveRows, liveProcessedRows, liveValidatedRows)
+              get().setNodeStatus(msg.nodeId, progressStatus, liveRows, liveProcessedRows, liveValidatedRows)
             }
           }
           else if (msg.type === 'node_error') {
@@ -1113,7 +1415,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       let pollTick = 0
       while (true) {
         const startupOrNoWsSignal = !wsConnected || !wsMessageSeen
-        await sleep(startupOrNoWsSignal ? 2000 : 2000)
+        await sleep(startupOrNoWsSignal ? EXECUTION_POLL_INTERVAL_MS : EXECUTION_POLL_INTERVAL_MS)
         const state = get()
         if (!state.isExecuting || state.executionId !== execId) break
         try {
@@ -1124,47 +1426,62 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
             logTail: includeLogsInPoll ? 300 : 80,
           })
           consecutivePollErrors = 0
+          const rawExecStatus = String(exec.status || '').toLowerCase()
+          const effectiveExecStatus = includeLogsInPoll
+            ? deriveEffectiveExecutionStatus(
+              rawExecStatus,
+              Array.isArray(exec.logs) ? (exec.logs as Array<Record<string, any>>) : [],
+            )
+            : rawExecStatus
           if (includeLogsInPoll && Array.isArray(exec.logs) && exec.logs.length > 0) {
             set({
               executionLogs: normalizeExecutionLogsForDisplay(
                 exec.logs as Array<Record<string, any>>,
-                String(exec.status || ''),
+                effectiveExecStatus,
               ),
             })
-            applyLiveNodeStatusFromLogs(exec.logs as Array<Record<string, any>>, String(exec.status || ''))
+            applyLiveNodeStatusFromLogs(exec.logs as Array<Record<string, any>>, effectiveExecStatus)
           }
-          if (String(exec.status || '').toLowerCase() === 'cancelling') {
+          if (effectiveExecStatus === 'cancelling') {
             forceStopRunningNodes()
           }
-          if (TERMINAL_EXECUTION_STATUSES.has(String(exec.status || '').toLowerCase())) {
+          if (TERMINAL_EXECUTION_STATUSES.has(effectiveExecStatus)) {
             let finalExec = exec
             if (!Array.isArray(finalExec.logs) || finalExec.logs.length === 0) {
               finalExec = await api.getExecution(execId, {
                 includeLogs: true,
                 logTail: 5000,
               })
+              const finalStatusNorm = deriveEffectiveExecutionStatus(
+                String(finalExec.status || ''),
+                Array.isArray(finalExec.logs) ? (finalExec.logs as Array<Record<string, any>>) : [],
+              )
               if (Array.isArray(finalExec.logs) && finalExec.logs.length > 0) {
                 set({
                   executionLogs: normalizeExecutionLogsForDisplay(
                     finalExec.logs as Array<Record<string, any>>,
-                    String(finalExec.status || ''),
+                    finalStatusNorm,
                   ),
                 })
                 applyLiveNodeStatusFromLogs(
                   finalExec.logs as Array<Record<string, any>>,
-                  String(finalExec.status || ''),
+                  finalStatusNorm,
                 )
               }
             }
+            const finalStatusNorm = deriveEffectiveExecutionStatus(
+              String(finalExec.status || effectiveExecStatus || ''),
+              Array.isArray(finalExec.logs) ? (finalExec.logs as Array<Record<string, any>>) : [],
+            )
             applyLiveNodeStatusFromLogs(
               (finalExec.logs || []) as Array<Record<string, any>>,
-              String(finalExec.status || ''),
+              finalStatusNorm,
             )
             forceStopRunningNodes(
-              terminalFallbackNodeStatus(String(finalExec.status || exec.status || '')),
+              terminalFallbackNodeStatus(finalStatusNorm),
             )
             if (
-              String(finalExec.status || '').toLowerCase() === 'cancelled'
+              finalStatusNorm === 'cancelled'
               && !finalExec.logs?.some((log: any) => String(log?.message || '').includes('Execution cancelled'))
             ) {
               set((current) => ({
@@ -1253,7 +1570,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
                 executionDurationMs: (() => {
                   const startedAt = String(n.data?.executionStartedAt || '').trim()
                   if (!startedAt) return n.data?.executionDurationMs
-                  const startedMs = Date.parse(startedAt)
+                  const startedMs = parseTimestampMsOrNaN(startedAt)
                   if (!Number.isFinite(startedMs)) return n.data?.executionDurationMs
                   return Math.max(0, nowMs - Number(startedMs))
                 })(),
@@ -1271,19 +1588,30 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       if (!Array.isArray(logs) || logs.length === 0) return
       const statusNorm = String(executionStatus || '').trim().toLowerCase()
       const isTerminal = TERMINAL_EXECUTION_STATUSES.has(statusNorm)
-      const latestByNode = new Map<string, Record<string, any>>()
-      logs.forEach((log) => {
-        const nodeId = String(log?.nodeId || '').trim()
-        if (!nodeId) return
-        latestByNode.set(nodeId, log)
-      })
-      latestByNode.forEach((log, nodeId) => {
-        const mappedStatus = mapNodeLogStatusForExecution(log?.status, statusNorm)
-        const rows = typeof log?.rows === 'number' ? log.rows : undefined
-        const processedRows = typeof log?.processed_rows === 'number' ? log.processed_rows : undefined
-        const validatedRows = typeof log?.validated_rows === 'number' ? log.validated_rows : undefined
-        get().setNodeStatus(nodeId, mappedStatus, rows, processedRows, validatedRows)
-      })
+      const snapshots = buildNodeRuntimeSnapshotsFromLogs(logs, statusNorm)
+      set((state) => ({
+        nodes: state.nodes.map((node) => {
+          const snapshot = snapshots.get(String(node.id || '').trim())
+          if (!snapshot) return node
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              status: snapshot.status,
+              executionRows: snapshot.rows ?? node.data.executionRows,
+              executionProcessedRows: snapshot.processedRows ?? node.data.executionProcessedRows,
+              executionValidatedRows: snapshot.validatedRows ?? node.data.executionValidatedRows,
+              executionStartedAt: snapshot.startedAt ?? node.data.executionStartedAt,
+              executionFinishedAt: snapshot.finishedAt ?? node.data.executionFinishedAt,
+              executionDurationMs: (
+                typeof snapshot.durationMs === 'number'
+                  ? snapshot.durationMs
+                  : node.data.executionDurationMs
+              ),
+            },
+          }
+        }),
+      }))
       if (isTerminal) {
         forceStopRunningNodes(terminalFallbackNodeStatus(statusNorm))
       }
@@ -1291,11 +1619,43 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
 
     try {
       const executions = await api.listExecutions(targetPipelineId)
-      const activeExecution = (Array.isArray(executions) ? executions : []).find((item: any) => {
-        const status = String(item?.status || '').trim().toLowerCase()
-        return status === 'running' || status === 'cancelling'
-      })
+      const executionItems = Array.isArray(executions) ? executions : []
+      const latestExecution = executionItems[0]
+      const latestStatusNorm = String(latestExecution?.status || '').trim().toLowerCase()
+      const activeExecution = (
+        latestStatusNorm === 'running' || latestStatusNorm === 'cancelling'
+      )
+        ? latestExecution
+        : null
       if (!activeExecution?.id) {
+        if (latestExecution?.id) {
+          const latestExecutionId = String(latestExecution.id)
+          const latestSnapshot = await api.getExecution(latestExecutionId, {
+            includeLogs: true,
+            logTail: 5000,
+          })
+          const latestStatus = String(
+            latestSnapshot?.status || latestExecution.status || '',
+          ).trim().toLowerCase()
+          const latestLogs = Array.isArray(latestSnapshot?.logs) ? latestSnapshot.logs : []
+
+          set({
+            isExecuting: false,
+            executionId: null,
+            executionAbortRequested: false,
+            showLogs: true,
+            executionLogs: normalizeExecutionLogsForDisplay(
+              latestLogs as Array<Record<string, any>>,
+              latestStatus,
+            ),
+          })
+          applyLiveNodeStatusFromLogs(latestLogs as Array<Record<string, any>>, latestStatus)
+          if (!latestLogs.length) {
+            forceStopRunningNodes(terminalFallbackNodeStatus(latestStatus))
+          }
+          return true
+        }
+
         const live = get()
         const livePipelineId = live.pipeline?.id ? String(live.pipeline.id) : ''
         if (
@@ -1311,10 +1671,13 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       const executionId = String(activeExecution.id)
       const executionSnapshot = await api.getExecution(executionId, {
         includeLogs: true,
-        logTail: 300,
+        logTail: 5000,
       })
-      const snapshotStatus = String(executionSnapshot?.status || activeExecution.status || '').trim().toLowerCase()
       const logs = Array.isArray(executionSnapshot?.logs) ? executionSnapshot.logs : []
+      const snapshotStatus = deriveEffectiveExecutionStatus(
+        String(executionSnapshot?.status || activeExecution.status || '').trim().toLowerCase(),
+        logs as Array<Record<string, any>>,
+      )
 
       set({
         isExecuting: snapshotStatus === 'running' || snapshotStatus === 'cancelling',
@@ -1337,7 +1700,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       void (async () => {
         let consecutivePollErrors = 0
         while (true) {
-          await sleep(2000)
+          await sleep(EXECUTION_POLL_INTERVAL_MS)
           const state = get()
           if (!state.isExecuting || state.executionId !== executionId) break
           try {
@@ -1346,16 +1709,17 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
               logTail: 300,
             })
             consecutivePollErrors = 0
+            const logs = Array.isArray(exec.logs) ? (exec.logs as Array<Record<string, any>>) : []
+            const execStatus = deriveEffectiveExecutionStatus(String(exec.status || '').toLowerCase(), logs)
             if (Array.isArray(exec.logs) && exec.logs.length > 0) {
               set({
                 executionLogs: normalizeExecutionLogsForDisplay(
                   exec.logs as Array<Record<string, any>>,
-                  String(exec.status || ''),
+                  execStatus,
                 ),
               })
-              applyLiveNodeStatusFromLogs(exec.logs as Array<Record<string, any>>, String(exec.status || ''))
+              applyLiveNodeStatusFromLogs(exec.logs as Array<Record<string, any>>, execStatus)
             }
-            const execStatus = String(exec.status || '').toLowerCase()
             if (execStatus === 'cancelling') {
               forceStopRunningNodes()
               set({ executionAbortRequested: true })
@@ -1528,8 +1892,69 @@ export const useExecutionStore = create<ExecutionState>((set) => ({
   fetchExecutions: async (pipelineId) => {
     set({ loading: true })
     try {
-      const executions = await api.listExecutions(pipelineId)
-      set({ executions })
+      const listed = await api.listExecutions(pipelineId)
+      const baseExecutions = Array.isArray(listed) ? listed : []
+      const liveExecutions = baseExecutions
+        .filter((execution: any) => {
+          const status = String(execution?.status || '').trim().toLowerCase()
+          return (status === 'running' || status === 'cancelling') && String(execution?.id || '').trim().length > 0
+        })
+        .slice(0, 12)
+
+      if (liveExecutions.length === 0) {
+        set({ executions: baseExecutions })
+        return
+      }
+
+      const detailResults = await Promise.allSettled(
+        liveExecutions.map((execution: any) => (
+          api.getExecution(String(execution.id), { includeLogs: true, logTail: 500 })
+        )),
+      )
+
+      const detailById = new Map<string, any>()
+      detailResults.forEach((result) => {
+        if (result.status !== 'fulfilled') return
+        const execution = result.value
+        const id = String(execution?.id || '').trim()
+        if (!id) return
+        detailById.set(id, execution)
+      })
+
+      const resolvedExecutions = baseExecutions.map((execution: any) => {
+        const executionId = String(execution?.id || '').trim()
+        if (!executionId) return execution
+        const details = detailById.get(executionId)
+        if (!details) return execution
+
+        const effectiveStatus = deriveEffectiveExecutionStatus(
+          String(details?.status || execution?.status || ''),
+          Array.isArray(details?.logs) ? (details.logs as Array<Record<string, any>>) : [],
+        )
+        const baseStatus = String(execution?.status || '').trim().toLowerCase()
+        if (effectiveStatus === baseStatus) return execution
+
+        const finishedAt = details?.finished_at || execution?.finished_at
+        let duration = execution?.duration
+        if (finishedAt && execution?.started_at) {
+          const startedMs = parseTimestampMsOrNaN(String(execution.started_at))
+          const finishedMs = parseTimestampMsOrNaN(String(finishedAt))
+          if (Number.isFinite(startedMs) && Number.isFinite(finishedMs)) {
+            duration = Math.max(0, Math.floor((Number(finishedMs) - Number(startedMs)) / 1000))
+          }
+        }
+
+        return {
+          ...execution,
+          status: effectiveStatus,
+          finished_at: finishedAt,
+          duration,
+          rows_processed: Number(details?.rows_processed ?? execution?.rows_processed ?? 0),
+          error_message: details?.error_message ?? execution?.error_message,
+        }
+      })
+
+      set({ executions: resolvedExecutions })
     } finally {
       set({ loading: false })
     }

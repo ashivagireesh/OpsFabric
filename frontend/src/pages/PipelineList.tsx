@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Card, Button, Input, Tag, Space, Typography, Modal, Form, Select,
@@ -12,8 +12,9 @@ import {
 } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
-import { usePipelineStore } from '../store'
+import { useExecutionStore, usePipelineStore } from '../store'
 import type { Pipeline } from '../types'
+import { parseTimestampMsOrNaN } from '../utils/time'
 
 dayjs.extend(relativeTime)
 
@@ -29,23 +30,187 @@ const execStatusIcon: Record<string, JSX.Element> = {
   success: <CheckCircleFilled style={{ color: '#22c55e' }} />,
   failed: <CloseCircleFilled style={{ color: '#ef4444' }} />,
   running: <LoadingOutlined style={{ color: '#6366f1' }} spin />,
+  cancelling: <LoadingOutlined style={{ color: '#f59e0b' }} spin />,
   pending: <ClockCircleFilled style={{ color: '#f59e0b' }} />,
+}
+
+const WIDGET_POLL_INTERVAL_MS = 1500
+const LIVE_EXECUTION_STATUSES = new Set(['running', 'cancelling'])
+const TERMINAL_EXECUTION_STATUSES = new Set(['success', 'failed', 'error', 'cancelled'])
+
+function isExecutionActivelyRunning(execution: any): boolean {
+  const status = String(execution?.status || '').trim().toLowerCase()
+  if (!LIVE_EXECUTION_STATUSES.has(status)) return false
+  const finishedAt = String(execution?.finished_at || '').trim()
+  return finishedAt.length === 0
+}
+
+function formatElapsedTimerWithBaseline(startedAt: string | undefined, nowMs: number, baselineMs?: number): string {
+  const startedMs = parseTimestampMsOrNaN(String(startedAt || '').trim())
+  const hasStarted = Number.isFinite(startedMs)
+  const hasBaseline = Number.isFinite(Number(baselineMs))
+  if (!hasStarted && !hasBaseline) return '00:00'
+  const effectiveStartMs = hasStarted
+    ? Number(startedMs)
+    : Number(baselineMs)
+  const elapsedSec = Math.max(0, Math.floor((nowMs - effectiveStartMs) / 1000))
+  const minutes = Math.floor(elapsedSec / 60)
+  const seconds = elapsedSec % 60
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+}
+
+function formatDurationTimer(durationSeconds: number | undefined): string {
+  if (!Number.isFinite(Number(durationSeconds)) || Number(durationSeconds) <= 0) return '00:00'
+  const total = Math.max(0, Math.floor(Number(durationSeconds)))
+  const minutes = Math.floor(total / 60)
+  const seconds = total % 60
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+}
+
+function deriveDurationSeconds(execution: any): number | undefined {
+  const direct = Number(execution?.duration)
+  if (Number.isFinite(direct) && direct >= 0) return Math.floor(direct)
+  const startedMs = parseTimestampMsOrNaN(String(execution?.started_at || '').trim())
+  const finishedMs = parseTimestampMsOrNaN(String(execution?.finished_at || '').trim())
+  if (Number.isFinite(startedMs) && Number.isFinite(finishedMs) && finishedMs >= startedMs) {
+    return Math.floor((finishedMs - startedMs) / 1000)
+  }
+  return undefined
+}
+
+function getExecutionSortTimeMs(execution: any): number {
+  const startedMs = parseTimestampMsOrNaN(String(execution?.started_at || '').trim())
+  if (Number.isFinite(startedMs)) return Number(startedMs)
+  const finishedMs = parseTimestampMsOrNaN(String(execution?.finished_at || '').trim())
+  if (Number.isFinite(finishedMs)) return Number(finishedMs)
+  return 0
 }
 
 export default function PipelineList() {
   const navigate = useNavigate()
   const { pipelines, loading, fetchPipelines, createPipeline, deletePipeline, duplicatePipeline } = usePipelineStore()
+  const { executions, fetchExecutions } = useExecutionStore()
   const [search, setSearch] = useState('')
   const [modalOpen, setModalOpen] = useState(false)
   const [form] = Form.useForm()
+  const [nowMs, setNowMs] = useState<number>(() => Date.now())
+  const runningBaselineByExecutionIdRef = useRef<Map<string, number>>(new Map())
 
-  useEffect(() => { fetchPipelines() }, [])
+  useEffect(() => {
+    fetchPipelines()
+    fetchExecutions()
+  }, [fetchExecutions, fetchPipelines])
+
+  const latestExecutionByPipeline = useMemo(() => {
+    const map = new Map<string, (typeof executions)[number]>()
+    executions.forEach((execution) => {
+      const pipelineId = String(execution?.pipeline_id || '').trim()
+      if (!pipelineId) return
+      const existing = map.get(pipelineId)
+      if (!existing || getExecutionSortTimeMs(execution) >= getExecutionSortTimeMs(existing)) {
+        map.set(pipelineId, execution)
+      }
+    })
+    return map
+  }, [executions])
 
   const filtered = pipelines.filter(p =>
     p.name.toLowerCase().includes(search.toLowerCase()) ||
     p.description?.toLowerCase().includes(search.toLowerCase()) ||
     p.tags?.some(t => t.toLowerCase().includes(search.toLowerCase()))
   )
+
+  const displayedPipelines = useMemo(() => (
+    filtered.map((pipeline) => {
+      const execution = latestExecutionByPipeline.get(String(pipeline.id))
+      if (!execution) return pipeline
+      const rowsProcessed = Number(execution.rows_processed || 0)
+      return {
+        ...pipeline,
+        last_execution: {
+          id: String(execution.id),
+          status: execution.status as any,
+          started_at: String(execution.started_at || ''),
+          finished_at: String(execution.finished_at || ''),
+          duration: deriveDurationSeconds(execution),
+          rows_processed: Number.isFinite(rowsProcessed) ? rowsProcessed : 0,
+        },
+      }
+    })
+  ), [filtered, latestExecutionByPipeline])
+
+  const latestCompletedDurationByPipeline = useMemo(() => {
+    const map = new Map<string, number>()
+    executions.forEach((execution) => {
+      const pipelineId = String(execution?.pipeline_id || '').trim()
+      if (!pipelineId || map.has(pipelineId)) return
+      const status = String(execution?.status || '').trim().toLowerCase()
+      if (!TERMINAL_EXECUTION_STATUSES.has(status)) return
+      map.set(pipelineId, deriveDurationSeconds(execution) ?? 0)
+    })
+    return map
+  }, [executions])
+
+  const latestCompletedTimeByPipeline = useMemo(() => {
+    const map = new Map<string, number>()
+    executions.forEach((execution) => {
+      const pipelineId = String(execution?.pipeline_id || '').trim()
+      if (!pipelineId) return
+      const status = String(execution?.status || '').trim().toLowerCase()
+      if (!TERMINAL_EXECUTION_STATUSES.has(status)) return
+      const t = getExecutionSortTimeMs(execution)
+      const existing = Number(map.get(pipelineId) ?? 0)
+      if (t >= existing) map.set(pipelineId, t)
+    })
+    return map
+  }, [executions])
+
+  const hasLiveExecution = useMemo(() => (
+    displayedPipelines.some((pipeline) => {
+      const status = String(pipeline.last_execution?.status || '').trim().toLowerCase()
+      return LIVE_EXECUTION_STATUSES.has(status)
+    })
+  ), [displayedPipelines])
+
+  useEffect(() => {
+    const activeIds = new Set<string>()
+    const now = Date.now()
+    executions.forEach((execution) => {
+      if (!isExecutionActivelyRunning(execution)) return
+      const executionId = String(execution?.id || '').trim()
+      if (!executionId) return
+      activeIds.add(executionId)
+      if (!runningBaselineByExecutionIdRef.current.has(executionId)) {
+        runningBaselineByExecutionIdRef.current.set(executionId, now)
+      }
+    })
+    Array.from(runningBaselineByExecutionIdRef.current.keys()).forEach((executionId) => {
+      if (!activeIds.has(executionId)) {
+        runningBaselineByExecutionIdRef.current.delete(executionId)
+      }
+    })
+  }, [executions])
+
+  useEffect(() => {
+    if (!hasLiveExecution) return
+    const timer = window.setInterval(() => {
+      void fetchExecutions()
+    }, WIDGET_POLL_INTERVAL_MS)
+    return () => window.clearInterval(timer)
+  }, [fetchExecutions, hasLiveExecution])
+
+  useEffect(() => {
+    if (!hasLiveExecution) return
+    const timer = window.setInterval(() => {
+      setNowMs(Date.now())
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [hasLiveExecution])
+
+  useEffect(() => {
+    if (hasLiveExecution) return
+    setNowMs(Date.now())
+  }, [hasLiveExecution])
 
   const handleCreate = async () => {
     try {
@@ -113,7 +278,7 @@ export default function PipelineList() {
         <div style={{ textAlign: 'center', padding: 80 }}>
           <Spin size="large" />
         </div>
-      ) : filtered.length === 0 ? (
+      ) : displayedPipelines.length === 0 ? (
         <Empty
           description={<Text style={{ color: 'var(--app-text-subtle)' }}>No pipelines found</Text>}
           style={{ padding: 80 }}
@@ -129,10 +294,14 @@ export default function PipelineList() {
         </Empty>
       ) : (
         <Row gutter={[16, 16]}>
-          {filtered.map(pipeline => (
+          {displayedPipelines.map(pipeline => (
             <Col xs={24} sm={12} xl={8} key={pipeline.id}>
               <PipelineCard
                 pipeline={pipeline}
+                nowMs={nowMs}
+                latestCompletedDurationSec={latestCompletedDurationByPipeline.get(String(pipeline.id))}
+                latestCompletedTimeMs={latestCompletedTimeByPipeline.get(String(pipeline.id))}
+                runningBaselineMs={runningBaselineByExecutionIdRef.current.get(String(latestExecutionByPipeline.get(String(pipeline.id))?.id || pipeline.last_execution?.id || ''))}
                 onEdit={() => navigate(`/pipelines/${pipeline.id}/edit`)}
                 onDelete={() => handleDelete(pipeline.id, pipeline.name)}
                 onDuplicate={async () => {
@@ -176,13 +345,35 @@ export default function PipelineList() {
 
 // ─── Pipeline Card ────────────────────────────────────────────────────────────
 
-function PipelineCard({ pipeline, onEdit, onDelete, onDuplicate }: {
+function PipelineCard({ pipeline, nowMs, latestCompletedDurationSec, latestCompletedTimeMs, runningBaselineMs, onEdit, onDelete, onDuplicate }: {
   pipeline: Pipeline
+  nowMs: number
+  latestCompletedDurationSec?: number
+  latestCompletedTimeMs?: number
+  runningBaselineMs?: number
   onEdit: () => void
   onDelete: () => void
   onDuplicate: () => void
 }) {
   const lastExec = pipeline.last_execution
+  const runningCandidate = isExecutionActivelyRunning(lastExec)
+  const runStartedMs = parseTimestampMsOrNaN(String(lastExec?.started_at || '').trim())
+  const completedTimeMs = Number(latestCompletedTimeMs ?? 0)
+  const runningIsStale = Number.isFinite(runStartedMs) && completedTimeMs > 0 && completedTimeMs >= Number(runStartedMs)
+  const isLastExecLive = runningCandidate && !runningIsStale
+  const lastExecStatus = String(lastExec?.status || '').trim().toLowerCase()
+  const runTimerLabel = isLastExecLive
+    ? formatElapsedTimerWithBaseline(lastExec?.started_at, nowMs, runningBaselineMs)
+    : '00:00'
+  const lastTimerLabel = formatDurationTimer(
+    isLastExecLive
+      ? Number(latestCompletedDurationSec ?? 0)
+      : Number(lastExec?.duration ?? latestCompletedDurationSec ?? 0),
+  )
+
+  const rowsLabel = typeof lastExec?.rows_processed === 'number'
+    ? `${lastExec.rows_processed.toLocaleString()} rows`
+    : ''
 
   const menuItems = [
     { key: 'edit', icon: <EditOutlined />, label: 'Open Editor' },
@@ -285,9 +476,9 @@ function PipelineCard({ pipeline, onEdit, onDelete, onDuplicate }: {
             </Text>
             {lastExec && (
               <Space size={4}>
-                {execStatusIcon[lastExec.status]}
+                {execStatusIcon[lastExecStatus] || execStatusIcon[lastExec.status]}
                 <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
-                  {lastExec.rows_processed?.toLocaleString()} rows
+                  {`${rowsLabel} · run ${runTimerLabel} · last ${lastTimerLabel}`}
                 </Text>
               </Space>
             )}

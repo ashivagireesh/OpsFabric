@@ -65,6 +65,7 @@ async def lifespan(app: FastAPI):
     if not scheduler.running:
         scheduler.start()
     _reload_all_pipeline_schedule_jobs()
+    _sync_sqlite_cleanup_schedule_job()
     logger.info("✅ ETL Flow Platform started")
     yield
     if scheduler.running:
@@ -194,6 +195,7 @@ class WebSocketManager:
 ws_manager = WebSocketManager()
 _app_main_loop: Optional[asyncio.AbstractEventLoop] = None
 execution_abort_events: Dict[str, threading.Event] = {}
+execution_abort_requested_at: Dict[str, float] = {}
 execution_workers: Dict[str, threading.Thread] = {}
 _execution_start_lock = threading.Lock()
 _execution_log_flush_state: Dict[str, float] = {}
@@ -274,6 +276,18 @@ _EXECUTION_HISTORY_RETENTION_DAYS = _env_int("EXECUTION_HISTORY_RETENTION_DAYS",
 _EXECUTION_HISTORY_MAX_RECORDS = _env_int("EXECUTION_HISTORY_MAX_RECORDS", 300, 20, 50000)
 _EXECUTION_HISTORY_PRUNE_DELETE_LIMIT = _env_int("EXECUTION_HISTORY_PRUNE_DELETE_LIMIT", 150, 10, 5000)
 
+_SYSTEM_SETTING_SQLITE_CLEANUP_SCHEDULE_KEY = "sqlite_cleanup_schedule_v1"
+_SQLITE_CLEANUP_SCHEDULE_JOB_ID = "system:sqlite_cleanup_schedule"
+_DEFAULT_SQLITE_CLEANUP_SCHEDULE_CONFIG: Dict[str, Any] = {
+    "enabled": False,
+    "interval_minutes": 60,
+    "clear_execution_runtime_payloads": True,
+    "clear_mlops_run_payloads": True,
+    "clear_business_run_payloads": True,
+    "clear_audit_logs": False,
+    "vacuum": False,
+}
+
 
 def _schedule_job_id(pipeline_id: str) -> str:
     return f"{SCHEDULE_JOB_PREFIX}{pipeline_id}"
@@ -291,6 +305,68 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
         if text in {"0", "false", "no", "off", "n"}:
             return False
     return bool(default)
+
+
+def _normalize_sqlite_cleanup_schedule_config(raw: Any) -> Dict[str, Any]:
+    base = dict(_DEFAULT_SQLITE_CLEANUP_SCHEDULE_CONFIG)
+    if isinstance(raw, dict):
+        base.update(raw)
+
+    try:
+        interval_minutes = int(base.get("interval_minutes") or 60)
+    except Exception:
+        interval_minutes = 60
+    interval_minutes = max(5, min(interval_minutes, 10080))
+
+    normalized = {
+        "enabled": _coerce_bool(base.get("enabled"), False),
+        "interval_minutes": interval_minutes,
+        "clear_execution_runtime_payloads": _coerce_bool(
+            base.get("clear_execution_runtime_payloads"), True
+        ),
+        "clear_mlops_run_payloads": _coerce_bool(
+            base.get("clear_mlops_run_payloads"), True
+        ),
+        "clear_business_run_payloads": _coerce_bool(
+            base.get("clear_business_run_payloads"), True
+        ),
+        "clear_audit_logs": _coerce_bool(base.get("clear_audit_logs"), False),
+        "vacuum": _coerce_bool(base.get("vacuum"), False),
+    }
+    return normalized
+
+
+def _load_sqlite_cleanup_schedule_config(db: Optional[Session] = None) -> Dict[str, Any]:
+    owns_session = db is None
+    session = db or SessionLocal()
+    try:
+        row = session.query(models.SystemSetting).filter(
+            models.SystemSetting.key == _SYSTEM_SETTING_SQLITE_CLEANUP_SCHEDULE_KEY
+        ).first()
+        raw_value = row.value if row and isinstance(row.value, dict) else {}
+        return _normalize_sqlite_cleanup_schedule_config(raw_value)
+    except Exception:
+        return dict(_DEFAULT_SQLITE_CLEANUP_SCHEDULE_CONFIG)
+    finally:
+        if owns_session:
+            session.close()
+
+
+def _save_sqlite_cleanup_schedule_config(db: Session, raw_config: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = _normalize_sqlite_cleanup_schedule_config(raw_config)
+    row = db.query(models.SystemSetting).filter(
+        models.SystemSetting.key == _SYSTEM_SETTING_SQLITE_CLEANUP_SCHEDULE_KEY
+    ).first()
+    if row is None:
+        row = models.SystemSetting(
+            key=_SYSTEM_SETTING_SQLITE_CLEANUP_SCHEDULE_KEY,
+            value=normalized,
+        )
+        db.add(row)
+    else:
+        row.value = normalized
+    db.commit()
+    return normalized
 
 
 def _is_pipeline_node_enabled(node: Any) -> bool:
@@ -999,6 +1075,49 @@ def _normalize_terminal_execution_logs(logs: Any, execution_status: Any) -> Any:
     return normalized
 
 
+def _get_execution_abort_age_seconds(
+    execution: models.Execution,
+    logs: List[Any],
+) -> Optional[float]:
+    execution_id = str(getattr(execution, "id", "") or "").strip()
+    if execution_id:
+        marker = execution_abort_requested_at.get(execution_id)
+        if isinstance(marker, (int, float)):
+            try:
+                return max(0.0, _time.monotonic() - float(marker))
+            except Exception:
+                pass
+
+    latest_abort_ts: Optional[datetime] = None
+    for entry in logs:
+        if not isinstance(entry, dict):
+            continue
+        message = str(entry.get("message") or "").strip().lower()
+        if "abort requested" not in message and "cancel requested" not in message:
+            continue
+        ts_raw = str(entry.get("timestamp") or "").strip()
+        if not ts_raw:
+            continue
+        try:
+            parsed = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if latest_abort_ts is None or parsed > latest_abort_ts:
+            latest_abort_ts = parsed
+
+    if latest_abort_ts is None:
+        return None
+
+    try:
+        if getattr(latest_abort_ts, "tzinfo", None) is not None:
+            now_for_abort = datetime.now(latest_abort_ts.tzinfo)
+        else:
+            now_for_abort = datetime.utcnow()
+        return max(0.0, (now_for_abort - latest_abort_ts).total_seconds())
+    except Exception:
+        return None
+
+
 def _estimate_json_bytes(value: Any) -> int:
     try:
         text = json.dumps(_json_safe_value(value), ensure_ascii=False, default=str)
@@ -1267,6 +1386,8 @@ async def _run_pipeline_execution_task(
             pipeline_id=pipeline.id,
             should_abort=(abort_event.is_set if abort_event else None),
         )
+        if abort_event and abort_event.is_set():
+            raise ExecutionAbortedError("Execution aborted by user.")
         rows_processed = int(result.get("rows_processed") or 0)
         terminal_payload.update({
             "status": "success",
@@ -1351,9 +1472,47 @@ async def _run_pipeline_execution_task(
             pass
 
         execution_abort_events.pop(execution_id, None)
+        execution_abort_requested_at.pop(execution_id, None)
         execution_workers.pop(execution_id, None)
         with _execution_log_flush_lock:
             _execution_log_flush_state.pop(execution_id, None)
+
+        try:
+            terminal_status = str(terminal_payload.get("status") or "").strip().lower()
+            # Avoid tearing down shared queue workers while another execution of
+            # same pipeline is still active.
+            teardown_allowed = True
+            check_db = SessionLocal()
+            try:
+                other_active = check_db.query(models.Execution.id).filter(
+                    models.Execution.pipeline_id == pipeline_id,
+                    models.Execution.id != execution_id,
+                    models.Execution.status.in_(["running", "cancelling"]),
+                ).first()
+                teardown_allowed = other_active is None
+            finally:
+                check_db.close()
+
+            if teardown_allowed:
+                drop_pending = terminal_status in {"cancelled", "failed"}
+                cleanup_summary = etl_engine._teardown_oracle_profile_write_queues_for_pipeline(  # pylint: disable=protected-access
+                    pipeline_id=pipeline_id,
+                    timeout_seconds=5.0 if drop_pending else 1.0,
+                    drop_pending=drop_pending,
+                    force_remove=drop_pending,
+                )
+                queue_count = int(cleanup_summary.get("queue_count") or 0)
+                removed_count = int(cleanup_summary.get("removed_count") or 0)
+                if queue_count > 0:
+                    logger.info(
+                        f"Oracle profile queue cleanup for pipeline {pipeline_id}: "
+                        f"queues={queue_count}, removed={removed_count}, drop_pending={drop_pending}"
+                    )
+        except Exception as queue_cleanup_exc:
+            logger.warning(
+                f"Oracle profile queue cleanup failed for pipeline {pipeline_id}: {queue_cleanup_exc}"
+            )
+
         _run_execution_history_maintenance(context=f"execution:{execution_id}")
 
 
@@ -1416,6 +1575,7 @@ def _start_pipeline_execution(
     if execution_id:
         abort_event = threading.Event()
         execution_abort_events[execution_id] = abort_event
+        execution_abort_requested_at.pop(execution_id, None)
 
         def _worker_runner() -> None:
             try:
@@ -1503,6 +1663,52 @@ def _reload_all_pipeline_schedule_jobs():
             _sync_pipeline_schedule_job(pipeline)
     finally:
         db.close()
+
+
+def _sqlite_cleanup_schedule_status(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = _normalize_sqlite_cleanup_schedule_config(
+        config if isinstance(config, dict) else _load_sqlite_cleanup_schedule_config()
+    )
+    job = scheduler.get_job(_SQLITE_CLEANUP_SCHEDULE_JOB_ID) if scheduler.running else None
+    next_run_at = None
+    if job is not None:
+        try:
+            next_obj = getattr(job, "next_run_time", None)
+            if next_obj is not None:
+                next_run_at = next_obj.isoformat()
+        except Exception:
+            next_run_at = None
+    return {
+        **cfg,
+        "job_active": bool(job is not None),
+        "next_run_at": next_run_at,
+    }
+
+
+def _sync_sqlite_cleanup_schedule_job() -> Dict[str, Any]:
+    existing = scheduler.get_job(_SQLITE_CLEANUP_SCHEDULE_JOB_ID)
+    if existing is not None:
+        scheduler.remove_job(_SQLITE_CLEANUP_SCHEDULE_JOB_ID)
+
+    config = _load_sqlite_cleanup_schedule_config()
+    if not bool(config.get("enabled")):
+        return _sqlite_cleanup_schedule_status(config)
+
+    interval_minutes = max(5, min(int(config.get("interval_minutes") or 60), 10080))
+    scheduler.add_job(
+        _run_periodic_sqlite_cleanup_job,
+        trigger="interval",
+        minutes=interval_minutes,
+        id=_SQLITE_CLEANUP_SCHEDULE_JOB_ID,
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=max(60, min(interval_minutes * 60, 3600)),
+    )
+    logger.info(
+        f"Scheduled SQLite periodic cleanup every {interval_minutes} minute(s)."
+    )
+    return _sqlite_cleanup_schedule_status(config)
 
 
 # ─── PYDANTIC SCHEMAS ─────────────────────────────────────────────────────────
@@ -1734,6 +1940,16 @@ class SQLiteCleanupRequest(BaseModel):
     clear_business_run_payloads: bool = True
     clear_audit_logs: bool = False
     vacuum: bool = True
+
+
+class SQLiteCleanupScheduleUpdateRequest(BaseModel):
+    enabled: bool = False
+    interval_minutes: int = 60
+    clear_execution_runtime_payloads: bool = True
+    clear_mlops_run_payloads: bool = True
+    clear_business_run_payloads: bool = True
+    clear_audit_logs: bool = False
+    vacuum: bool = False
 
 
 def _build_pipeline_profile_state_summary(
@@ -8704,6 +8920,40 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
         )
         fast_finalize_worker_missing = (not worker_alive) and (age_s is None or age_s >= no_worker_grace_s)
 
+        if status_norm == "cancelling":
+            force_cancel_after_s = max(
+                5,
+                int(str(_os.getenv("EXECUTION_CANCEL_FORCE_FINALIZE_SECONDS", "25")).strip() or "25"),
+            )
+            abort_age_s = _get_execution_abort_age_seconds(execution, logs)
+            if abort_age_s is not None and abort_age_s >= force_cancel_after_s:
+                cancel_message = (
+                    f"Execution cancelled by user (auto-finalized after {force_cancel_after_s}s)."
+                )
+                execution.status = "cancelled"
+                execution.finished_at = execution.finished_at or datetime.utcnow()
+                if not execution.error_message:
+                    execution.error_message = cancel_message
+                has_cancel_log = any(
+                    isinstance(entry, dict)
+                    and "cancel" in str(entry.get("message") or "").strip().lower()
+                    for entry in logs
+                )
+                if not has_cancel_log:
+                    stale_log = {
+                        "nodeId": "__system__",
+                        "nodeLabel": "System",
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "status": "error",
+                        "message": f"✗ {cancel_message}",
+                        "rows": 0,
+                    }
+                    merged_logs = logs if isinstance(logs, list) else []
+                    merged_logs.append(stale_log)
+                    execution.logs = merged_logs
+                db.commit()
+                return
+
         if not logs:
             if not fast_finalize_worker_missing:
                 return
@@ -8971,6 +9221,7 @@ async def abort_execution(execution_id: str, db: Session = Depends(get_db)):
 
     status = str(execution.status or "").strip().lower()
     if status == "cancelling":
+        execution_abort_requested_at.setdefault(execution_id, _time.monotonic())
         return {
             "execution_id": execution_id,
             "status": "cancelling",
@@ -8988,6 +9239,7 @@ async def abort_execution(execution_id: str, db: Session = Depends(get_db)):
     abort_event = execution_abort_events.get(execution_id)
     if abort_event:
         abort_event.set()
+    execution_abort_requested_at[execution_id] = _time.monotonic()
 
     logs = execution.logs if isinstance(execution.logs, list) else []
     logs.append({
@@ -9094,14 +9346,15 @@ async def get_sqlite_usage(db: Session = Depends(get_db)):
     return _collect_sqlite_runtime_usage(db)
 
 
-@app.post("/api/settings/sqlite/cleanup")
-async def cleanup_sqlite_runtime_data(
+def _run_sqlite_runtime_cleanup(
+    db: Session,
     body: SQLiteCleanupRequest,
-    db: Session = Depends(get_db),
-):
+    vacuum_override: Optional[bool] = None,
+    message_text: str = "SQLite runtime cleanup completed.",
+) -> Dict[str, Any]:
     sqlite_path = _resolve_sqlite_db_file_path()
     if sqlite_path is None:
-        raise HTTPException(status_code=400, detail="SQLite database is not configured.")
+        raise RuntimeError("SQLite database is not configured.")
 
     before = _collect_sqlite_runtime_usage(db)
     updated: Dict[str, int] = {
@@ -9168,14 +9421,14 @@ async def cleanup_sqlite_runtime_data(
         db.commit()
     except Exception as exc:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"SQLite cleanup failed: {exc}")
+        raise RuntimeError(f"SQLite cleanup failed: {exc}") from exc
 
     vacuum_result = {
-        "attempted": bool(body.vacuum),
+        "attempted": bool(body.vacuum if vacuum_override is None else vacuum_override),
         "ok": False,
         "error": "",
     }
-    if body.vacuum:
+    if vacuum_result["attempted"]:
         try:
             if not sqlite_path.exists():
                 raise RuntimeError("SQLite database file not found.")
@@ -9195,14 +9448,81 @@ async def cleanup_sqlite_runtime_data(
             )
 
     after = _collect_sqlite_runtime_usage(db)
-    return {
-        "message": "SQLite runtime cleanup completed.",
+    result = {
+        "message": message_text,
         "before": before,
         "after": after,
         "updated": updated,
         "vacuum": vacuum_result,
         "warnings": warnings,
     }
+    return result
+
+
+async def _run_periodic_sqlite_cleanup_job():
+    db = SessionLocal()
+    try:
+        config = _load_sqlite_cleanup_schedule_config(db)
+        if not bool(config.get("enabled")):
+            return
+        body = SQLiteCleanupRequest(
+            clear_execution_runtime_payloads=bool(config.get("clear_execution_runtime_payloads", True)),
+            clear_mlops_run_payloads=bool(config.get("clear_mlops_run_payloads", True)),
+            clear_business_run_payloads=bool(config.get("clear_business_run_payloads", True)),
+            clear_audit_logs=bool(config.get("clear_audit_logs", False)),
+            vacuum=bool(config.get("vacuum", False)),
+        )
+        result = _run_sqlite_runtime_cleanup(
+            db,
+            body,
+            vacuum_override=bool(config.get("vacuum", False)),
+            message_text="SQLite periodic cleanup completed.",
+        )
+        updated = result.get("updated") if isinstance(result.get("updated"), dict) else {}
+        logger.info(
+            "Periodic SQLite cleanup completed "
+            f"(executions={int(updated.get('executions') or 0)}, "
+            f"mlops={int(updated.get('mlops_runs') or 0)}, "
+            f"business={int(updated.get('business_runs') or 0)}, "
+            f"audit={int(updated.get('audit_logs') or 0)})."
+        )
+    except Exception as exc:
+        logger.warning(f"Periodic SQLite cleanup failed: {exc}")
+    finally:
+        db.close()
+
+
+@app.get("/api/settings/sqlite/cleanup-schedule")
+async def get_sqlite_cleanup_schedule(db: Session = Depends(get_db)):
+    config = _load_sqlite_cleanup_schedule_config(db)
+    return _sqlite_cleanup_schedule_status(config)
+
+
+@app.put("/api/settings/sqlite/cleanup-schedule")
+async def update_sqlite_cleanup_schedule(
+    body: SQLiteCleanupScheduleUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        _save_sqlite_cleanup_schedule_config(db, body.model_dump())
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to save cleanup schedule settings: {exc}")
+    return _sync_sqlite_cleanup_schedule_job()
+
+
+@app.post("/api/settings/sqlite/cleanup")
+async def cleanup_sqlite_runtime_data(
+    body: SQLiteCleanupRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        return _run_sqlite_runtime_cleanup(db, body)
+    except RuntimeError as exc:
+        message = str(exc or "SQLite cleanup failed")
+        if "not configured" in message.lower():
+            raise HTTPException(status_code=400, detail=message)
+        raise HTTPException(status_code=500, detail=message)
 
 
 # ─── CREDENTIALS ──────────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Row, Col, Card, Statistic, Table, Tag, Button, Typography, Space,
@@ -13,6 +13,7 @@ import {
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
 import { useStatsStore, usePipelineStore, useExecutionStore } from '../store'
+import { parseTimestampMsOrNaN } from '../utils/time'
 
 dayjs.extend(relativeTime)
 
@@ -22,8 +23,61 @@ const statusConfig = {
   success: { color: '#22c55e', icon: <CheckCircleFilled />, text: 'Success' },
   failed: { color: '#ef4444', icon: <CloseCircleFilled />, text: 'Failed' },
   running: { color: '#6366f1', icon: <LoadingOutlined spin />, text: 'Running' },
+  cancelling: { color: '#f59e0b', icon: <LoadingOutlined spin />, text: 'Cancelling' },
   pending: { color: '#f59e0b', icon: <ClockCircleFilled />, text: 'Pending' },
   cancelled: { color: 'var(--app-text-muted)', icon: <CloseCircleFilled />, text: 'Cancelled' },
+}
+
+const WIDGET_POLL_INTERVAL_MS = 1500
+const LIVE_EXECUTION_STATUSES = new Set(['running', 'cancelling'])
+const TERMINAL_EXECUTION_STATUSES = new Set(['success', 'failed', 'error', 'cancelled'])
+
+function isExecutionActivelyRunning(execution: any): boolean {
+  const status = String(execution?.status || '').trim().toLowerCase()
+  if (!LIVE_EXECUTION_STATUSES.has(status)) return false
+  const finishedAt = String(execution?.finished_at || '').trim()
+  return finishedAt.length === 0
+}
+
+function formatElapsedTimerWithBaseline(startedAt: string | undefined, nowMs: number, baselineMs?: number): string {
+  const startedMs = parseTimestampMsOrNaN(String(startedAt || '').trim())
+  const hasStarted = Number.isFinite(startedMs)
+  const hasBaseline = Number.isFinite(Number(baselineMs))
+  if (!hasStarted && !hasBaseline) return '00:00'
+  const effectiveStartMs = hasStarted
+    ? Number(startedMs)
+    : Number(baselineMs)
+  const elapsedSec = Math.max(0, Math.floor((nowMs - effectiveStartMs) / 1000))
+  const minutes = Math.floor(elapsedSec / 60)
+  const seconds = elapsedSec % 60
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+}
+
+function formatDurationTimer(durationSeconds: number | undefined): string {
+  if (!Number.isFinite(Number(durationSeconds)) || Number(durationSeconds) <= 0) return '00:00'
+  const total = Math.max(0, Math.floor(Number(durationSeconds)))
+  const minutes = Math.floor(total / 60)
+  const seconds = total % 60
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+}
+
+function deriveDurationSeconds(execution: any): number | undefined {
+  const direct = Number(execution?.duration)
+  if (Number.isFinite(direct) && direct >= 0) return Math.floor(direct)
+  const startedMs = parseTimestampMsOrNaN(String(execution?.started_at || '').trim())
+  const finishedMs = parseTimestampMsOrNaN(String(execution?.finished_at || '').trim())
+  if (Number.isFinite(startedMs) && Number.isFinite(finishedMs) && finishedMs >= startedMs) {
+    return Math.floor((finishedMs - startedMs) / 1000)
+  }
+  return undefined
+}
+
+function getExecutionSortTimeMs(execution: any): number {
+  const startedMs = parseTimestampMsOrNaN(String(execution?.started_at || '').trim())
+  if (Number.isFinite(startedMs)) return Number(startedMs)
+  const finishedMs = parseTimestampMsOrNaN(String(execution?.finished_at || '').trim())
+  if (Number.isFinite(finishedMs)) return Number(finishedMs)
+  return 0
 }
 
 export default function Dashboard() {
@@ -31,12 +85,101 @@ export default function Dashboard() {
   const { stats, fetchStats } = useStatsStore()
   const { pipelines, fetchPipelines } = usePipelineStore()
   const { executions, fetchExecutions } = useExecutionStore()
+  const [nowMs, setNowMs] = useState<number>(() => Date.now())
+  const runningBaselineByExecutionIdRef = useRef<Map<string, number>>(new Map())
 
   useEffect(() => {
     fetchStats()
     fetchPipelines()
     fetchExecutions()
-  }, [])
+  }, [fetchExecutions, fetchPipelines, fetchStats])
+
+  const latestExecutionByPipeline = useMemo(() => {
+    const map = new Map<string, (typeof executions)[number]>()
+    executions.forEach((execution) => {
+      const pipelineId = String(execution?.pipeline_id || '').trim()
+      if (!pipelineId) return
+      const existing = map.get(pipelineId)
+      if (!existing || getExecutionSortTimeMs(execution) >= getExecutionSortTimeMs(existing)) {
+        map.set(pipelineId, execution)
+      }
+    })
+    return map
+  }, [executions])
+
+  const hasLiveExecution = useMemo(() => (
+    executions.some((execution) => {
+      const status = String(execution?.status || '').trim().toLowerCase()
+      return LIVE_EXECUTION_STATUSES.has(status)
+    })
+  ), [executions])
+
+  useEffect(() => {
+    const activeIds = new Set<string>()
+    const now = Date.now()
+    executions.forEach((execution) => {
+      if (!isExecutionActivelyRunning(execution)) return
+      const executionId = String(execution?.id || '').trim()
+      if (!executionId) return
+      activeIds.add(executionId)
+      if (!runningBaselineByExecutionIdRef.current.has(executionId)) {
+        runningBaselineByExecutionIdRef.current.set(executionId, now)
+      }
+    })
+    Array.from(runningBaselineByExecutionIdRef.current.keys()).forEach((executionId) => {
+      if (!activeIds.has(executionId)) {
+        runningBaselineByExecutionIdRef.current.delete(executionId)
+      }
+    })
+  }, [executions])
+
+  const latestCompletedDurationByPipeline = useMemo(() => {
+    const map = new Map<string, number>()
+    executions.forEach((execution) => {
+      const pipelineId = String(execution?.pipeline_id || '').trim()
+      if (!pipelineId || map.has(pipelineId)) return
+      const status = String(execution?.status || '').trim().toLowerCase()
+      if (!TERMINAL_EXECUTION_STATUSES.has(status)) return
+      map.set(pipelineId, deriveDurationSeconds(execution) ?? 0)
+    })
+    return map
+  }, [executions])
+
+  const latestCompletedTimeByPipeline = useMemo(() => {
+    const map = new Map<string, number>()
+    executions.forEach((execution) => {
+      const pipelineId = String(execution?.pipeline_id || '').trim()
+      if (!pipelineId) return
+      const status = String(execution?.status || '').trim().toLowerCase()
+      if (!TERMINAL_EXECUTION_STATUSES.has(status)) return
+      const t = getExecutionSortTimeMs(execution)
+      const existing = Number(map.get(pipelineId) ?? 0)
+      if (t >= existing) map.set(pipelineId, t)
+    })
+    return map
+  }, [executions])
+
+  useEffect(() => {
+    if (!hasLiveExecution) return
+    const timer = window.setInterval(() => {
+      void fetchExecutions()
+      void fetchStats()
+    }, WIDGET_POLL_INTERVAL_MS)
+    return () => window.clearInterval(timer)
+  }, [fetchExecutions, fetchStats, hasLiveExecution])
+
+  useEffect(() => {
+    if (!hasLiveExecution) return
+    const timer = window.setInterval(() => {
+      setNowMs(Date.now())
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [hasLiveExecution])
+
+  useEffect(() => {
+    if (hasLiveExecution) return
+    setNowMs(Date.now())
+  }, [hasLiveExecution])
 
   const recentExecutions = executions.slice(0, 8)
 
@@ -351,9 +494,11 @@ export default function Dashboard() {
                   title: 'Duration',
                   dataIndex: 'duration',
                   width: 80,
-                  render: (d: number) => (
+                  render: (d: number, row: any) => (
                     <Text style={{ color: 'var(--app-text-muted)', fontSize: 12 }}>
-                      {d ? `${d}s` : '-'}
+                      {LIVE_EXECUTION_STATUSES.has(String(row?.status || '').trim().toLowerCase())
+                        ? formatElapsedTimerWithBaseline(String(row?.started_at || ''), nowMs)
+                        : (d ? `${d}s` : '-')}
                     </Text>
                   ),
                 },
@@ -391,9 +536,24 @@ export default function Dashboard() {
           >
             <Space direction="vertical" style={{ width: '100%' }} size={12}>
               {pipelines.filter(p => p.status === 'active').slice(0, 5).map((pipeline) => {
-                const lastExec = pipeline.last_execution
+                const lastExec = latestExecutionByPipeline.get(String(pipeline.id)) || pipeline.last_execution
+                const lastExecStatus = String(lastExec?.status || '').trim().toLowerCase()
+                const runningCandidate = isExecutionActivelyRunning(lastExec)
+                const runStartedMs = parseTimestampMsOrNaN(String((lastExec as any)?.started_at || '').trim())
+                const completedTimeMs = Number(latestCompletedTimeByPipeline.get(String(pipeline.id)) ?? 0)
+                const runningIsStale = Number.isFinite(runStartedMs) && completedTimeMs > 0 && completedTimeMs >= Number(runStartedMs)
+                const isLastExecLive = runningCandidate && !runningIsStale
+                const runningBaselineMs = runningBaselineByExecutionIdRef.current.get(String((lastExec as any)?.id || ''))
+                const runDurationLabel = isLastExecLive
+                  ? formatElapsedTimerWithBaseline(String((lastExec as any)?.started_at || ''), nowMs, runningBaselineMs)
+                  : '00:00'
+                const lastDurationLabel = formatDurationTimer(
+                  isLastExecLive
+                    ? Number(latestCompletedDurationByPipeline.get(String(pipeline.id)) ?? 0)
+                    : Number(deriveDurationSeconds(lastExec) ?? latestCompletedDurationByPipeline.get(String(pipeline.id)) ?? 0),
+                )
                 const statusCfg = lastExec
-                  ? statusConfig[lastExec.status as keyof typeof statusConfig]
+                  ? statusConfig[lastExecStatus as keyof typeof statusConfig]
                   : null
                 return (
                   <div
@@ -418,7 +578,7 @@ export default function Dashboard() {
                         <div style={{ marginTop: 2 }}>
                           <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
                             {pipeline.nodeCount} nodes · {lastExec
-                              ? `${lastExec.rows_processed?.toLocaleString()} rows`
+                              ? `${lastExec.rows_processed?.toLocaleString()} rows · run ${runDurationLabel} · last ${lastDurationLabel}`
                               : 'Never run'}
                           </Text>
                         </div>

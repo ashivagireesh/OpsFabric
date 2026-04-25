@@ -41,6 +41,18 @@ type SQLiteCleanupResult = {
   warnings: string[]
 }
 
+type SQLiteCleanupSchedule = {
+  enabled: boolean
+  interval_minutes: number
+  clear_execution_runtime_payloads: boolean
+  clear_mlops_run_payloads: boolean
+  clear_business_run_payloads: boolean
+  clear_audit_logs: boolean
+  vacuum: boolean
+  job_active: boolean
+  next_run_at: string | null
+}
+
 export default function Settings() {
   const mode = useThemeStore((state) => state.mode)
   const setMode = useThemeStore((state) => state.setMode)
@@ -50,6 +62,19 @@ export default function Settings() {
   const [sqliteLoading, setSqliteLoading] = useState(false)
   const [cleanupRunning, setCleanupRunning] = useState(false)
   const [cleanupResult, setCleanupResult] = useState<SQLiteCleanupResult | null>(null)
+  const [cleanupScheduleLoading, setCleanupScheduleLoading] = useState(false)
+  const [cleanupScheduleSaving, setCleanupScheduleSaving] = useState(false)
+  const [cleanupSchedule, setCleanupSchedule] = useState<SQLiteCleanupSchedule>({
+    enabled: false,
+    interval_minutes: 60,
+    clear_execution_runtime_payloads: true,
+    clear_mlops_run_payloads: true,
+    clear_business_run_payloads: true,
+    clear_audit_logs: false,
+    vacuum: false,
+    job_active: false,
+    next_run_at: null,
+  })
   const [cleanupOptions, setCleanupOptions] = useState({
     clear_execution_runtime_payloads: true,
     clear_mlops_run_payloads: true,
@@ -67,6 +92,16 @@ export default function Settings() {
       || cleanupOptions.vacuum
     ),
     [cleanupOptions],
+  )
+
+  const hasAnyScheduledCleanupOption = useMemo(
+    () => (
+      cleanupSchedule.clear_execution_runtime_payloads
+      || cleanupSchedule.clear_mlops_run_payloads
+      || cleanupSchedule.clear_business_run_payloads
+      || cleanupSchedule.clear_audit_logs
+    ),
+    [cleanupSchedule],
   )
 
   const formatBytes = (bytes: number) => {
@@ -93,6 +128,65 @@ export default function Settings() {
     }
   }
 
+  const loadSqliteCleanupSchedule = async () => {
+    setCleanupScheduleLoading(true)
+    try {
+      const config = await api.getSqliteCleanupSchedule()
+      setCleanupSchedule({
+        enabled: Boolean(config?.enabled),
+        interval_minutes: Number(config?.interval_minutes || 60),
+        clear_execution_runtime_payloads: Boolean(config?.clear_execution_runtime_payloads),
+        clear_mlops_run_payloads: Boolean(config?.clear_mlops_run_payloads),
+        clear_business_run_payloads: Boolean(config?.clear_business_run_payloads),
+        clear_audit_logs: Boolean(config?.clear_audit_logs),
+        vacuum: Boolean(config?.vacuum),
+        job_active: Boolean(config?.job_active),
+        next_run_at: config?.next_run_at ? String(config.next_run_at) : null,
+      })
+    } catch (err: any) {
+      messageApi.error(err?.message || 'Failed to load periodic cleanup settings')
+    } finally {
+      setCleanupScheduleLoading(false)
+    }
+  }
+
+  const saveSqliteCleanupSchedule = async () => {
+    if (!cleanupSchedule.enabled && !hasAnyScheduledCleanupOption) {
+      messageApi.warning('Choose at least one cleanup target or disable scheduler.')
+      return
+    }
+    setCleanupScheduleSaving(true)
+    try {
+      const payload = {
+        enabled: cleanupSchedule.enabled,
+        interval_minutes: Number(cleanupSchedule.interval_minutes || 60),
+        clear_execution_runtime_payloads: cleanupSchedule.clear_execution_runtime_payloads,
+        clear_mlops_run_payloads: cleanupSchedule.clear_mlops_run_payloads,
+        clear_business_run_payloads: cleanupSchedule.clear_business_run_payloads,
+        clear_audit_logs: cleanupSchedule.clear_audit_logs,
+        vacuum: cleanupSchedule.vacuum,
+      }
+      const updated = await api.updateSqliteCleanupSchedule(payload)
+      setCleanupSchedule((prev) => ({
+        ...prev,
+        enabled: Boolean(updated?.enabled),
+        interval_minutes: Number(updated?.interval_minutes || prev.interval_minutes || 60),
+        clear_execution_runtime_payloads: Boolean(updated?.clear_execution_runtime_payloads),
+        clear_mlops_run_payloads: Boolean(updated?.clear_mlops_run_payloads),
+        clear_business_run_payloads: Boolean(updated?.clear_business_run_payloads),
+        clear_audit_logs: Boolean(updated?.clear_audit_logs),
+        vacuum: Boolean(updated?.vacuum),
+        job_active: Boolean(updated?.job_active),
+        next_run_at: updated?.next_run_at ? String(updated.next_run_at) : null,
+      }))
+      messageApi.success('Periodic cleanup settings saved')
+    } catch (err: any) {
+      messageApi.error(err?.message || 'Failed to save periodic cleanup settings')
+    } finally {
+      setCleanupScheduleSaving(false)
+    }
+  }
+
   const runSqliteCleanup = async () => {
     if (!hasAnyCleanupOption || cleanupRunning) return
     setCleanupRunning(true)
@@ -114,6 +208,7 @@ export default function Settings() {
 
   useEffect(() => {
     void loadSqliteUsage()
+    void loadSqliteCleanupSchedule()
   }, [])
 
   return (
@@ -194,7 +289,10 @@ export default function Settings() {
               </div>
               <Button
                 size="small"
-                onClick={() => void loadSqliteUsage()}
+                onClick={() => {
+                  void loadSqliteUsage()
+                  void loadSqliteCleanupSchedule()
+                }}
                 loading={sqliteLoading}
                 style={{ borderColor: 'var(--app-border-strong)', color: 'var(--app-text-muted)', background: 'var(--app-card-bg)' }}
               >
@@ -333,6 +431,105 @@ export default function Settings() {
               </div>
             </>
           ) : null}
+
+          <Divider style={{ borderColor: 'var(--app-border)', margin: '12px 0' }} />
+          <div style={{ marginBottom: 10 }}>
+            <Space style={{ justifyContent: 'space-between', width: '100%', alignItems: 'center' }}>
+              <div>
+                <Text style={{ color: 'var(--app-text)', fontWeight: 500 }}>Periodic SQLite Cleanup</Text>
+                <br />
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                  Automatically clear runtime logs/processed payloads in background on interval.
+                </Text>
+              </div>
+              <Space>
+                <Tag color={cleanupSchedule.job_active ? 'green' : 'default'}>
+                  {cleanupSchedule.job_active ? 'Active' : 'Inactive'}
+                </Tag>
+                <Switch
+                  checked={cleanupSchedule.enabled}
+                  loading={cleanupScheduleLoading}
+                  onChange={(checked) => setCleanupSchedule((prev) => ({ ...prev, enabled: checked }))}
+                  style={{ background: '#6366f1' }}
+                />
+              </Space>
+            </Space>
+          </div>
+
+          <SettingRow
+            label="Cleanup Interval"
+            description="How often periodic cleanup runs"
+          >
+            <Select
+              value={String(cleanupSchedule.interval_minutes || 60)}
+              disabled={!cleanupSchedule.enabled}
+              style={{ width: 180 }}
+              onChange={(value) => setCleanupSchedule((prev) => ({ ...prev, interval_minutes: Number(value || 60) }))}
+              options={[
+                { value: '5', label: 'Every 5 minutes' },
+                { value: '15', label: 'Every 15 minutes' },
+                { value: '30', label: 'Every 30 minutes' },
+                { value: '60', label: 'Every 1 hour' },
+                { value: '180', label: 'Every 3 hours' },
+                { value: '720', label: 'Every 12 hours' },
+                { value: '1440', label: 'Every 24 hours' },
+              ]}
+            />
+          </SettingRow>
+
+          <Divider style={{ borderColor: 'var(--app-border)', margin: '12px 0' }} />
+          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+            <Checkbox
+              checked={cleanupSchedule.clear_execution_runtime_payloads}
+              disabled={!cleanupSchedule.enabled}
+              onChange={(e) => setCleanupSchedule((prev) => ({ ...prev, clear_execution_runtime_payloads: e.target.checked }))}
+            >
+              <Text style={{ color: 'var(--app-text)' }}>Clear execution logs and node-results</Text>
+            </Checkbox>
+            <Checkbox
+              checked={cleanupSchedule.clear_mlops_run_payloads}
+              disabled={!cleanupSchedule.enabled}
+              onChange={(e) => setCleanupSchedule((prev) => ({ ...prev, clear_mlops_run_payloads: e.target.checked }))}
+            >
+              <Text style={{ color: 'var(--app-text)' }}>Clear MLOps run logs/metrics payloads</Text>
+            </Checkbox>
+            <Checkbox
+              checked={cleanupSchedule.clear_business_run_payloads}
+              disabled={!cleanupSchedule.enabled}
+              onChange={(e) => setCleanupSchedule((prev) => ({ ...prev, clear_business_run_payloads: e.target.checked }))}
+            >
+              <Text style={{ color: 'var(--app-text)' }}>Clear business workflow run payloads</Text>
+            </Checkbox>
+            <Checkbox
+              checked={cleanupSchedule.clear_audit_logs}
+              disabled={!cleanupSchedule.enabled}
+              onChange={(e) => setCleanupSchedule((prev) => ({ ...prev, clear_audit_logs: e.target.checked }))}
+            >
+              <Text style={{ color: 'var(--app-text)' }}>Clear audit logs</Text>
+            </Checkbox>
+            <Checkbox
+              checked={cleanupSchedule.vacuum}
+              disabled={!cleanupSchedule.enabled}
+              onChange={(e) => setCleanupSchedule((prev) => ({ ...prev, vacuum: e.target.checked }))}
+            >
+              <Text style={{ color: 'var(--app-text)' }}>Run VACUUM after periodic cleanup</Text>
+            </Checkbox>
+          </Space>
+
+          <div style={{ marginTop: 10, display: 'flex', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+              Next run: {cleanupSchedule.next_run_at ? new Date(cleanupSchedule.next_run_at).toLocaleString() : 'N/A'}
+            </Text>
+            <Button
+              type="primary"
+              loading={cleanupScheduleSaving}
+              disabled={cleanupSchedule.enabled && !hasAnyScheduledCleanupOption}
+              onClick={() => void saveSqliteCleanupSchedule()}
+              style={{ background: 'linear-gradient(135deg, #6366f1, #4f46e5)', border: 'none' }}
+            >
+              Save Periodic Cleanup
+            </Button>
+          </div>
 
           <Divider style={{ borderColor: 'var(--app-border)', margin: '12px 0' }} />
           <SettingRow label="Execution Log Retention" description="Automatically delete execution logs older than">

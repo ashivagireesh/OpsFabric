@@ -89,6 +89,7 @@ export default function MLWorkflowCanvas() {
         onPaneClick={onPaneClick}
         onDrop={onDrop}
         onDragOver={onDragOver}
+        deleteKeyCode={['Backspace', 'Delete']}
         fitView
         fitViewOptions={{ padding: 0.2 }}
         defaultEdgeOptions={{

@@ -785,7 +785,7 @@ export default function PipelineEditor() {
 
   return (
     <ReactFlowProvider>
-      <div style={{ height: '100vh', background: '#0a0a10', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      <div style={{ height: '100vh', background: 'var(--app-shell-bg)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         {/* ── TOP TOOLBAR ───────────────────────────────────────────────────── */}
         <div style={{
           background: 'var(--app-panel-bg)',
