@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Alert,
   Button,
@@ -18,6 +18,7 @@ import {
 import { CloseOutlined, DeleteOutlined } from '@ant-design/icons'
 import { useBusinessWorkflowStore } from '../../store/businessStore'
 import api from '../../api/client'
+import { clearDrawerInteraction, markDrawerInteraction } from '../../utils/drawerAutoHide'
 import type { ConfigField, ETLNodeData } from '../../types'
 
 const { Text } = Typography
@@ -60,9 +61,20 @@ export default function BusinessConfigDrawer({ open, onClose }: BusinessConfigDr
   const [modelsLoading, setModelsLoading] = useState(false)
   const [dashboardOptions, setDashboardOptions] = useState<{ value: string; label: string }[]>([])
   const [dashboardsLoading, setDashboardsLoading] = useState(false)
+  const touchDrawerActivity = useCallback(() => {
+    markDrawerInteraction('business')
+  }, [])
 
   const node = nodes.find((n) => n.id === selectedNodeId)
   const data: ETLNodeData | undefined = node?.data
+
+  useEffect(() => {
+    if (!open) {
+      clearDrawerInteraction('business')
+      return
+    }
+    touchDrawerActivity()
+  }, [open, selectedNodeId, touchDrawerActivity])
 
   useEffect(() => {
     if (!data) return
@@ -682,6 +694,12 @@ export default function BusinessConfigDrawer({ open, onClose }: BusinessConfigDr
         body: { background: 'var(--app-panel-bg)', padding: 0 },
       }}
     >
+      <div
+        onMouseDownCapture={touchDrawerActivity}
+        onTouchStartCapture={touchDrawerActivity}
+        onKeyDownCapture={touchDrawerActivity}
+        onWheelCapture={touchDrawerActivity}
+      >
       <Tabs
         activeKey={activeTab}
         onChange={setActiveTab}
@@ -723,7 +741,19 @@ export default function BusinessConfigDrawer({ open, onClose }: BusinessConfigDr
                     ))
                   )}
 
-                  <div style={{ marginTop: 20, paddingTop: 14, borderTop: '1px solid var(--app-border)' }}>
+                  <div
+                    style={{
+                      marginTop: 20,
+                      paddingTop: 14,
+                      borderTop: '1px solid var(--app-border)',
+                      display: 'grid',
+                      gap: 6,
+                    }}
+                  >
+                    <Text style={{ color: '#ef4444', fontSize: 11, fontWeight: 700 }}>Danger Zone</Text>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                      Delete this node from pipeline canvas.
+                    </Text>
                     <Button
                       danger
                       icon={<DeleteOutlined />}
@@ -797,6 +827,7 @@ export default function BusinessConfigDrawer({ open, onClose }: BusinessConfigDr
       >
         {renderPromptOutput(true)}
       </Modal>
+      </div>
     </Drawer>
   )
 }

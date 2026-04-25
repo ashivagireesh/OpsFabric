@@ -13,6 +13,7 @@ import { ETLNode } from '../workflow/ETLNode'
 import { useBusinessWorkflowStore } from '../../store/businessStore'
 import { getBusinessNodeDef } from '../../constants/businessNodeTypes'
 import type { ETLNodeData } from '../../types'
+import { shouldCloseDrawerOnPaneClick } from '../../utils/drawerAutoHide'
 
 const nodeTypes: NodeTypes = { etlNode: ETLNode as React.ComponentType<any> }
 
@@ -74,6 +75,7 @@ export default function BusinessWorkflowCanvas() {
   }, [setSelectedNode])
 
   const onPaneClick = useCallback(() => {
+    if (!shouldCloseDrawerOnPaneClick('business')) return
     setSelectedNode(null)
   }, [setSelectedNode])
 
@@ -112,6 +114,8 @@ export default function BusinessWorkflowCanvas() {
             const data = node.data as ETLNodeData
             return data?.definition?.color || '#f59e0b'
           }}
+          pannable
+          zoomable
           style={{
             background: 'var(--app-panel-bg)',
             border: '1px solid var(--app-border-strong)',

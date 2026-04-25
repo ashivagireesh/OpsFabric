@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Drawer, Form, Input, Select, Switch, InputNumber,
   Button, Typography, Space, Tabs, Divider, Tag, Tooltip, Table, notification, Modal, Popover, AutoComplete
@@ -25,6 +25,7 @@ import {
   type UiFieldBuilderState,
 } from './uiFieldBuilderUtils'
 import api from '../../api/client'
+import { clearDrawerInteraction, markDrawerInteraction } from '../../utils/drawerAutoHide'
 import type { ConfigField, ETLNode, ETLNodeData } from '../../types'
 
 const { Text } = Typography
@@ -4463,6 +4464,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [profileMonitorLoading, setProfileMonitorLoading] = useState(false)
   const [profileMonitorClearing, setProfileMonitorClearing] = useState(false)
   const [profileMonitorData, setProfileMonitorData] = useState<ProfileMonitorResponse | null>(null)
+  const touchDrawerActivity = useCallback(() => {
+    markDrawerInteraction('etl')
+  }, [])
+
+  useEffect(() => {
+    if (!open) {
+      clearDrawerInteraction('etl')
+      return
+    }
+    touchDrawerActivity()
+  }, [open, selectedNodeId, touchDrawerActivity])
   const [profileMonitorError, setProfileMonitorError] = useState<string | null>(null)
   const [profileDataModalOpen, setProfileDataModalOpen] = useState(false)
   const [selectedProfileEntityKey, setSelectedProfileEntityKey] = useState<string>('')
@@ -7685,7 +7697,116 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     })
   }
 
+  const collectEnabledCustomFieldSaveIssues = (items: CustomFieldSpec[]) => {
+    type SaveIssue = { fieldId: string; fieldName: string; message: string }
+    const issues: SaveIssue[] = []
+    const enabledItems = items.filter((item) => Boolean(item.enabled))
+    const seenNames = new Map<string, string>()
+
+    enabledItems.forEach((item, idx) => {
+      const fieldId = String(item.id || '').trim()
+      const rawName = String(item.name || '').trim()
+      const fallbackName = `Field #${idx + 1}`
+      const fieldName = rawName || fallbackName
+      const mode: CustomFieldMode = item.mode === 'json' ? 'json' : 'value'
+
+      if (!rawName) {
+        issues.push({
+          fieldId,
+          fieldName,
+          message: 'Field name is required for enabled custom field.',
+        })
+      } else {
+        const key = rawName.toLowerCase()
+        const existing = seenNames.get(key)
+        if (existing) {
+          issues.push({
+            fieldId,
+            fieldName,
+            message: `Duplicate enabled field name "${rawName}" (already used by "${existing}").`,
+          })
+        } else {
+          seenNames.set(key, rawName)
+        }
+      }
+
+      if (mode === 'value') {
+        const expression = String(item.expression || '').trim()
+        if (!expression) {
+          issues.push({
+            fieldId,
+            fieldName,
+            message: 'Expression is empty.',
+          })
+          return
+        }
+        const expressionIssues = validateExpressionSyntax(expression, 0, { requireEqualsPrefix: true })
+          .filter((issue) => issue.severity === 'error')
+        const seenMessages = new Set<string>()
+        expressionIssues.forEach((issue) => {
+          const message = String(issue.message || '').trim()
+          if (!message || seenMessages.has(message)) return
+          seenMessages.add(message)
+          issues.push({
+            fieldId,
+            fieldName,
+            message: message,
+          })
+        })
+        return
+      }
+
+      const template = String(item.jsonTemplate || '').trim()
+      if (!template) {
+        issues.push({
+          fieldId,
+          fieldName,
+          message: 'JSON template is empty.',
+        })
+        return
+      }
+
+      const jsonIssues = validateJsonTemplateSyntax(template).filter((issue) => issue.severity === 'error')
+      const exprIssues = extractExpressionStringRanges(template)
+        .flatMap((entry) => validateExpressionSyntax(entry.value, entry.startOffset, { requireEqualsPrefix: false }))
+        .filter((issue) => issue.severity === 'error')
+      const combined = [...jsonIssues, ...exprIssues]
+      const seenMessages = new Set<string>()
+      combined.forEach((issue) => {
+        const message = String(issue.message || '').trim()
+        if (!message || seenMessages.has(message)) return
+        seenMessages.add(message)
+        issues.push({
+          fieldId,
+          fieldName,
+          message: message,
+        })
+      })
+    })
+
+    return issues
+  }
+
   const saveCustomFieldStudio = () => {
+    const enabledFieldSaveIssues = collectEnabledCustomFieldSaveIssues(customFieldDraft)
+    if (enabledFieldSaveIssues.length > 0) {
+      const firstIssue = enabledFieldSaveIssues[0]
+      if (firstIssue?.fieldId) {
+        setCollapsedCustomFieldIds((prev) => prev.filter((id) => id !== firstIssue.fieldId))
+      }
+      const description = enabledFieldSaveIssues
+        .slice(0, 6)
+        .map((issue, idx) => `${idx + 1}. ${issue.fieldName}: ${issue.message}`)
+        .join('\n')
+      notification.error({
+        message: 'Save blocked: enabled custom fields have errors',
+        description,
+        placement: 'bottomRight',
+        duration: 5,
+      })
+      return
+    }
+
     const normalized = serializeCustomFieldSpecs(customFieldDraft)
     const normalizedIds = normalized
       .map((item) => String(item.id || '').trim())
@@ -8806,6 +8927,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         wrapper: { boxShadow: '-4px 0 20px rgba(0,0,0,0.4)' },
       }}
     >
+      <div
+        style={{ height: '100%', display: 'flex', flexDirection: 'column' }}
+        onMouseDownCapture={touchDrawerActivity}
+        onTouchStartCapture={touchDrawerActivity}
+        onKeyDownCapture={touchDrawerActivity}
+        onWheelCapture={touchDrawerActivity}
+      >
       {/* Header */}
       <div style={{
         background: 'var(--app-card-bg)',
@@ -8849,9 +8977,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         <Space>
           <Tooltip title="Duplicate node">
             <Button type="text" icon={<CopyOutlined />} size="small" style={{ color: 'var(--app-text-muted)' }} onClick={handleDuplicate} />
-          </Tooltip>
-          <Tooltip title="Delete node">
-            <Button type="text" icon={<DeleteOutlined />} size="small" style={{ color: '#ef4444' }} onClick={handleDelete} />
           </Tooltip>
           <Button type="text" icon={<CloseOutlined />} size="small" style={{ color: 'var(--app-text-subtle)' }} onClick={onClose} />
         </Space>
@@ -9187,6 +9312,31 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             )}
           </Space>
         )}
+      </div>
+
+      <div
+        style={{
+          flexShrink: 0,
+          borderTop: '1px solid var(--app-border-strong)',
+          background: 'var(--app-card-bg)',
+          padding: '10px 16px 12px',
+        }}
+      >
+        <Space direction="vertical" size={6} style={{ width: '100%' }}>
+          <Text style={{ color: '#ef4444', fontSize: 11, fontWeight: 700 }}>Danger Zone</Text>
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+            Delete this node from pipeline canvas.
+          </Text>
+          <Button
+            danger
+            icon={<DeleteOutlined />}
+            onClick={handleDelete}
+            style={{ width: '100%' }}
+          >
+            Delete Node
+          </Button>
+        </Space>
+      </div>
       </div>
     </Drawer>
     {canUseCustomFieldStudio && (

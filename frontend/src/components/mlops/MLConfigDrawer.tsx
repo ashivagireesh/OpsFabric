@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import {
   Alert,
   Button,
@@ -22,6 +22,7 @@ import { CloseOutlined, DeleteOutlined, DownloadOutlined, InfoCircleOutlined } f
 import Editor from '@monaco-editor/react'
 import { useMLOpsWorkflowStore } from '../../store/mlopsStore'
 import api from '../../api/client'
+import { clearDrawerInteraction, markDrawerInteraction } from '../../utils/drawerAutoHide'
 import type { ConfigField, ETLNodeData } from '../../types'
 
 const { Text } = Typography
@@ -52,9 +53,20 @@ export default function MLConfigDrawer({ open, onClose }: MLConfigDrawerProps) {
   const [featureOpType, setFeatureOpType] = useState('')
   const [featureOpParamsText, setFeatureOpParamsText] = useState('{}')
   const [featureOpError, setFeatureOpError] = useState('')
+  const touchDrawerActivity = useCallback(() => {
+    markDrawerInteraction('mlops')
+  }, [])
 
   const node = nodes.find((n) => n.id === selectedNodeId)
   const data: ETLNodeData | undefined = node?.data
+
+  useEffect(() => {
+    if (!open) {
+      clearDrawerInteraction('mlops')
+      return
+    }
+    touchDrawerActivity()
+  }, [open, selectedNodeId, touchDrawerActivity])
 
   useEffect(() => {
     if (!data) return
@@ -514,9 +526,6 @@ export default function MLConfigDrawer({ open, onClose }: MLConfigDrawerProps) {
           </div>
         </Space>
         <Space>
-          <Tooltip title="Delete node">
-            <Button type="text" icon={<DeleteOutlined />} size="small" style={{ color: '#ef4444' }} onClick={handleDelete} />
-          </Tooltip>
           <Button type="text" icon={<CloseOutlined />} size="small" style={{ color: 'var(--app-text-subtle)' }} onClick={onClose} />
         </Space>
       </div>
@@ -920,6 +929,30 @@ export default function MLConfigDrawer({ open, onClose }: MLConfigDrawerProps) {
           </Space>
         )}
       </div>
+
+      <div
+        style={{
+          flexShrink: 0,
+          borderTop: '1px solid var(--app-border-strong)',
+          background: 'var(--app-card-bg)',
+          padding: isFeatureOverlay ? '10px 22px 12px' : '10px 16px 12px',
+        }}
+      >
+        <Space direction="vertical" size={6} style={{ width: '100%' }}>
+          <Text style={{ color: '#ef4444', fontSize: 11, fontWeight: 700 }}>Danger Zone</Text>
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+            Delete this node from pipeline canvas.
+          </Text>
+          <Button
+            danger
+            icon={<DeleteOutlined />}
+            onClick={handleDelete}
+            style={{ width: '100%' }}
+          >
+            Delete Node
+          </Button>
+        </Space>
+      </div>
     </>
   )
 
@@ -978,7 +1011,14 @@ export default function MLConfigDrawer({ open, onClose }: MLConfigDrawerProps) {
         wrapper: { boxShadow: '-4px 0 20px rgba(0,0,0,0.4)' },
       }}
     >
+      <div
+        onMouseDownCapture={touchDrawerActivity}
+        onTouchStartCapture={touchDrawerActivity}
+        onKeyDownCapture={touchDrawerActivity}
+        onWheelCapture={touchDrawerActivity}
+      >
       {panelContent}
+      </div>
     </Drawer>
   )
 }

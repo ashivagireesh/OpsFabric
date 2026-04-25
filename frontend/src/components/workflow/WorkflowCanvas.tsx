@@ -10,6 +10,7 @@ import { getNodeDef } from '../../constants/nodeTypes'
 import { v4 as uuidv4 } from 'uuid'
 import type { ETLNodeData } from '../../types'
 import type { Connection, Edge, HandleType } from 'reactflow'
+import { shouldCloseDrawerOnPaneClick } from '../../utils/drawerAutoHide'
 
 const nodeTypes: NodeTypes = { etlNode: ETLNode as React.ComponentType<any> }
 const RULER_SIZE = 20
@@ -246,11 +247,9 @@ export default function WorkflowCanvas() {
   }, [setSelectedNode])
 
   const onPaneClick = useCallback(() => {
-    // Intentionally keep current node selection.
-    // Deselecting on pane click causes intermittent drawer unmounts while
-    // interacting with right-panel controls (including Custom Field Studio open).
-    // Node can still be closed explicitly via drawer close action.
-  }, [])
+    if (!shouldCloseDrawerOnPaneClick('etl')) return
+    setSelectedNode(null)
+  }, [setSelectedNode])
 
   const handleReconnect = useCallback((oldEdge: Edge, connection: Connection) => {
     reconnectStateRef.current.success = true
@@ -537,6 +536,8 @@ export default function WorkflowCanvas() {
             const data = node.data as ETLNodeData
             return data?.definition?.color || '#6366f1'
           }}
+          pannable
+          zoomable
           style={{
             background: 'var(--app-panel-bg)',
             border: '1px solid var(--app-border-strong)',
