@@ -935,18 +935,6 @@ export default function PipelineEditor() {
               />
             </Tooltip>
 
-            {isDirty && !saving && (
-              <Tag style={{ background: '#f59e0b15', border: '1px solid #f59e0b30', color: '#f59e0b', fontSize: 11, borderRadius: 4 }}>
-                Unsaved
-              </Tag>
-            )}
-            {saving && <LoadingOutlined style={{ color: '#6366f1', fontSize: 12 }} spin />}
-            {!isDirty && !saving && (
-              <Tag style={{ background: '#22c55e10', border: '1px solid #22c55e20', color: '#22c55e', fontSize: 11, borderRadius: 4 }}>
-                Saved
-              </Tag>
-            )}
-
             {actionTargetCount > 0 && (
               <Space
                 size={6}
@@ -987,6 +975,18 @@ export default function PipelineEditor() {
                 style={{ background: '#22c55e15', border: '1px solid #22c55e30', color: '#22c55e', borderRadius: 6 }}
               >
                 {executionLogs.reduce((s, l) => s + (l.rows || 0), 0).toLocaleString()} rows
+              </Tag>
+            )}
+
+            {isDirty && !saving && (
+              <Tag style={{ background: '#f59e0b15', border: '1px solid #f59e0b30', color: '#f59e0b', fontSize: 11, borderRadius: 4 }}>
+                Unsaved
+              </Tag>
+            )}
+            {saving && <LoadingOutlined style={{ color: '#6366f1', fontSize: 12 }} spin />}
+            {!isDirty && !saving && (
+              <Tag style={{ background: '#22c55e10', border: '1px solid #22c55e20', color: '#22c55e', fontSize: 11, borderRadius: 4 }}>
+                Saved
               </Tag>
             )}
           </Space>

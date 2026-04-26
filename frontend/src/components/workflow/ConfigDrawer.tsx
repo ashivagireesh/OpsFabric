@@ -102,6 +102,21 @@ type CustomFieldBeautifyBackup = {
   jsonTemplate: string
 }
 
+type CustomEditorViewScope = 'inline' | 'expanded'
+
+type CustomEditorSelectionSnapshot = {
+  startLineNumber: number
+  startColumn: number
+  endLineNumber: number
+  endColumn: number
+}
+
+type CustomEditorViewStateSnapshot = {
+  selection: CustomEditorSelectionSnapshot | null
+  scrollTop: number
+  scrollLeft: number
+}
+
 type UiExpressionEditorTab = 'expression' | 'ui_expression'
 
 type UiExpressionBuilderRow = {
@@ -1497,9 +1512,8 @@ function parseJsonTemplateLikeValue(jsonTemplate: string): unknown {
 }
 
 function normalizeJsonTemplateForStorage(jsonTemplate: string): string {
-  const parsed = parseJsonTemplateLikeValue(jsonTemplate)
-  if (parsed === null) return String(jsonTemplate || '').trim()
-  return JSON.stringify(parsed, null, 2)
+  // Preserve exact editor text (line breaks and spacing) as authored.
+  return String(jsonTemplate || '')
 }
 
 function parseJsonTemplateObject(jsonTemplate: string): Record<string, unknown> {
@@ -2650,31 +2664,6 @@ function toJsViewTemplateText(
     return `{\n${rows.join(',\n')}\n${indent}}`
   }
   return JSON.stringify(value)
-}
-
-function containsExpressionWithMultilineText(value: unknown): boolean {
-  if (typeof value === 'string') {
-    const text = String(value || '')
-    return text.trim().startsWith('=') && /[\r\n]/.test(text)
-  }
-  if (Array.isArray(value)) {
-    return value.some((item) => containsExpressionWithMultilineText(item))
-  }
-  if (value && typeof value === 'object') {
-    return Object.values(value as Record<string, unknown>).some((child) =>
-      containsExpressionWithMultilineText(child)
-    )
-  }
-  return false
-}
-
-function normalizeStoredJsonTemplateForEditor(jsonTemplate: string): string {
-  const source = String(jsonTemplate || '')
-  if (!source.includes('\\n')) return source
-  const parsed = parseJsonTemplateLikeValue(source)
-  if (parsed === null) return source
-  if (!containsExpressionWithMultilineText(parsed)) return source
-  return toJsViewTemplateText(parsed, 0, { beautifyExpressions: false })
 }
 
 function beautifyJsonTemplateNode(value: unknown): unknown {
@@ -3874,7 +3863,7 @@ function parseCustomFieldSpecs(value: unknown): CustomFieldSpec[] {
           rec.singleValueOutput ?? rec.single_value_output ?? rec.value_output ?? rec.output_format
         ),
         expression: String(rec.expression || rec.expr || ''),
-        jsonTemplate: mode === 'json' ? normalizeStoredJsonTemplateForEditor(rawJsonTemplate) : rawJsonTemplate,
+        jsonTemplate: rawJsonTemplate,
         enabled: parseBoolLike(rec.enabled, true),
       })
     )
@@ -3889,8 +3878,8 @@ function serializeCustomFieldSpecs(items: CustomFieldSpec[]): Array<Record<strin
       name: String(item.name || '').trim(),
       mode: item.mode,
       single_value_output: item.mode === 'value' ? item.singleValueOutput : 'json',
-      expression: item.mode === 'value' ? String(item.expression || '').trim() : '',
-      json_template: item.mode === 'json' ? normalizeJsonTemplateForStorage(String(item.jsonTemplate || '').trim()) : '',
+      expression: item.mode === 'value' ? String(item.expression || '') : '',
+      json_template: item.mode === 'json' ? normalizeJsonTemplateForStorage(String(item.jsonTemplate || '')) : '',
       enabled: Boolean(item.enabled),
     }))
     .filter((item) => item.name)
@@ -4518,6 +4507,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [validationLmdbKeyContainsDraft, setValidationLmdbKeyContainsDraft] = useState('')
   const [validationLmdbLimitDraft, setValidationLmdbLimitDraft] = useState(50)
   const [activeExpressionFieldId, setActiveExpressionFieldId] = useState<string | null>(null)
+  const customEditorViewStateRef = useRef<Record<string, CustomEditorViewStateSnapshot>>({})
   const [customEditorColorProfile, setCustomEditorColorProfile] = useState<CustomEditorColorProfile>(() => loadCustomEditorPrefs().colorProfile)
   const [customEditorFontPreset, setCustomEditorFontPreset] = useState<CustomEditorFontPreset>(() => loadCustomEditorPrefs().fontPreset)
   const [customEditorBeautifyStyle, setCustomEditorBeautifyStyle] = useState<CustomBeautifyStyle>(() => loadCustomEditorPrefs().beautifyStyle)
@@ -4572,6 +4562,84 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
   const customEditorThemeId = CUSTOM_EDITOR_THEME_IDS[customEditorColorProfile]
   const customEditorFontFamily = resolveEditorFontFamily(customEditorFontPreset)
+  const customEditorStateKey = useCallback(
+    (fieldId: string, mode: CustomFieldMode, scope: CustomEditorViewScope) => `${scope}:${fieldId}:${mode}`,
+    [],
+  )
+
+  const saveCustomEditorViewState = useCallback((
+    fieldId: string,
+    mode: CustomFieldMode,
+    scope: CustomEditorViewScope,
+    editor: any,
+  ) => {
+    if (!fieldId || !editor) return
+    const key = customEditorStateKey(fieldId, mode, scope)
+    const selection = editor.getSelection?.()
+    const snapshot: CustomEditorViewStateSnapshot = {
+      selection: selection
+        ? {
+            startLineNumber: selection.startLineNumber,
+            startColumn: selection.startColumn,
+            endLineNumber: selection.endLineNumber,
+            endColumn: selection.endColumn,
+          }
+        : null,
+      scrollTop: Number(editor.getScrollTop?.() || 0),
+      scrollLeft: Number(editor.getScrollLeft?.() || 0),
+    }
+    customEditorViewStateRef.current[key] = snapshot
+  }, [customEditorStateKey])
+
+  const restoreCustomEditorViewState = useCallback((
+    fieldId: string,
+    mode: CustomFieldMode,
+    scope: CustomEditorViewScope,
+    editor: any,
+  ) => {
+    if (!fieldId || !editor) return
+    const key = customEditorStateKey(fieldId, mode, scope)
+    const snapshot = customEditorViewStateRef.current[key]
+    if (!snapshot) return
+    try {
+      if (snapshot.selection) {
+        editor.setSelection?.(snapshot.selection as any)
+      }
+      editor.setScrollTop?.(Number(snapshot.scrollTop || 0))
+      editor.setScrollLeft?.(Number(snapshot.scrollLeft || 0))
+    } catch {
+      // no-op
+    }
+  }, [customEditorStateKey])
+
+  const attachCustomEditorViewStateTracking = useCallback((
+    fieldId: string,
+    mode: CustomFieldMode,
+    scope: CustomEditorViewScope,
+    editor: any,
+  ) => {
+    const save = () => saveCustomEditorViewState(fieldId, mode, scope, editor)
+    restoreCustomEditorViewState(fieldId, mode, scope, editor)
+    setTimeout(() => {
+      restoreCustomEditorViewState(fieldId, mode, scope, editor)
+    }, 0)
+    const disposables = [
+      editor.onDidChangeCursorSelection?.(save),
+      editor.onDidScrollChange?.(save),
+      editor.onDidBlurEditorText?.(save),
+    ].filter(Boolean)
+    editor.onDidDispose?.(() => {
+      save()
+      disposables.forEach((disposable: any) => {
+        try {
+          disposable?.dispose?.()
+        } catch {
+          // no-op
+        }
+      })
+    })
+  }, [restoreCustomEditorViewState, saveCustomEditorViewState])
+
   useEffect(() => {
     try {
       const monacoAny = customEditorLastMonaco as any
@@ -6175,6 +6243,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setUiExpressionRows([])
   }
 
+  const closeExpandedEditor = () => {
+    setUiConditionBuilderModalIndex(null)
+    setUiFieldBuilderModalIndex(null)
+    setExpandedEditorFieldId(null)
+  }
+
   const syncBreModelToEditor = (nextModel: BreModel) => {
     if (!expandedEditorField) return
     const expression = normalizeExpressionValue(buildExpressionFromBreModel(nextModel))
@@ -7430,6 +7504,22 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         : [createCustomFieldSpec()]
     )
     setCustomFieldDraft(initialDraft)
+    const allowedStateKeys = new Set<string>()
+    initialDraft.forEach((item) => {
+      const fieldId = String(item.id || '')
+      if (!fieldId) return
+      ;(['inline', 'expanded'] as const).forEach((scope) => {
+        allowedStateKeys.add(customEditorStateKey(fieldId, 'value', scope))
+        allowedStateKeys.add(customEditorStateKey(fieldId, 'json', scope))
+      })
+    })
+    const nextViewState: Record<string, CustomEditorViewStateSnapshot> = {}
+    Object.entries(customEditorViewStateRef.current).forEach(([key, snapshot]) => {
+      if (allowedStateKeys.has(key)) {
+        nextViewState[key] = snapshot
+      }
+    })
+    customEditorViewStateRef.current = nextViewState
     setCustomIncludeSourceDraft(Boolean(nodeConfig.custom_include_source_fields ?? true))
     setCustomExpressionEngineDraft(configuredExpressionEngine)
     setCustomPrimaryKeyFieldDraft(configuredPrimaryKeyField)
@@ -7655,6 +7745,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       delete next[id]
       return next
     })
+    const nextViewState = { ...customEditorViewStateRef.current }
+    delete nextViewState[customEditorStateKey(id, 'value', 'inline')]
+    delete nextViewState[customEditorStateKey(id, 'json', 'inline')]
+    delete nextViewState[customEditorStateKey(id, 'value', 'expanded')]
+    delete nextViewState[customEditorStateKey(id, 'json', 'expanded')]
+    customEditorViewStateRef.current = nextViewState
+    if (expandedEditorFieldId === id) {
+      setExpandedEditorFieldId(null)
+    }
   }
 
   const setAllCustomFieldsEnabled = (enabled: boolean) => {
@@ -9343,6 +9442,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       <Modal
         open={customFieldStudioOpen}
         onCancel={() => setCustomFieldStudioOpen(false)}
+        zIndex={2200}
         footer={null}
         closable={false}
         maskClosable={false}
@@ -10441,6 +10541,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                               onMount={(editor, monaco) => {
                                 attachExpressionValidation(editor, monaco)
                                 attachExpressionAutoSuggest(editor)
+                                attachCustomEditorViewStateTracking(item.id, 'value', 'inline', editor)
                                 editor.onDidFocusEditorText(() => {
                                   setActiveExpressionFieldId(item.id)
                                 })
@@ -10484,6 +10585,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                               onMount={(editor, monaco) => {
                                 attachJsonTemplateExpressionValidation(editor, monaco)
                                 attachExpressionAutoSuggest(editor)
+                                attachCustomEditorViewStateTracking(item.id, 'json', 'inline', editor)
                               }}
                               onChange={(value) => updateCustomFieldDraft(item.id, { jsonTemplate: value || '' })}
                               theme={customEditorThemeId}
@@ -10730,11 +10832,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     </Modal>
     <Modal
       open={Boolean(expandedEditorField)}
-      onCancel={() => {
-        setUiConditionBuilderModalIndex(null)
-        setUiFieldBuilderModalIndex(null)
-        setExpandedEditorFieldId(null)
-      }}
+      onCancel={closeExpandedEditor}
+      zIndex={2300}
+      maskClosable={false}
+      keyboard
       footer={null}
       closable={false}
       centered
@@ -10830,11 +10931,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             <Button
               shape="circle"
               icon={<CloseOutlined />}
-              onClick={() => {
-                setUiConditionBuilderModalIndex(null)
-                setUiFieldBuilderModalIndex(null)
-                setExpandedEditorFieldId(null)
-              }}
+              onClick={closeExpandedEditor}
               aria-label="Close expanded editor"
             />
           </Tooltip>
@@ -10885,6 +10982,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         attachJsonTemplateExpressionValidation(editor, monaco)
                       }
                       attachExpressionAutoSuggest(editor)
+                      if (expandedEditorField?.id) {
+                        attachCustomEditorViewStateTracking(
+                          expandedEditorField.id,
+                          expandedEditorMode,
+                          'expanded',
+                          editor,
+                        )
+                      }
                     }}
                     onChange={(value) => {
                       if (!expandedEditorField) return

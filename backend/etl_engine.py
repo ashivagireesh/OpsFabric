@@ -543,6 +543,107 @@ class ETLEngine:
             return decoded_text, "text"
         return base64.b64encode(value).decode("ascii"), "base64"
 
+    def _profile_preview_metric_finalize(self, state: Any, kind: str) -> Any:
+        item = state if isinstance(state, dict) else {}
+        metric_kind = str(kind or "count").strip().lower()
+        if metric_kind in {"count", "count_non_null", "row_count"}:
+            return int(item.get("count", 0) or 0)
+        if metric_kind == "sum":
+            total = float(item.get("value", 0.0) or 0.0)
+            return int(total) if float(total).is_integer() else total
+        if metric_kind == "mean":
+            count = int(item.get("count", 0) or 0)
+            if count <= 0:
+                return None
+            return float(item.get("sum", 0.0) or 0.0) / count
+        if metric_kind in {"min", "max", "first", "last"}:
+            if not bool(item.get("has_value", False)):
+                return None
+            return item.get("value")
+        if metric_kind == "distinct_count":
+            seen = item.get("seen")
+            return len(seen) if isinstance(seen, dict) else 0
+        if metric_kind == "distinct":
+            values_out = item.get("values")
+            return values_out if isinstance(values_out, list) else []
+        if metric_kind == "value_counts":
+            items = item.get("items")
+            order = item.get("order")
+            if not isinstance(items, dict) or not isinstance(order, list):
+                return []
+            return [
+                {
+                    "value": items[token].get("value"),
+                    "count": int(items[token].get("count", 0) or 0),
+                }
+                for token in order
+                if token in items and isinstance(items[token], dict)
+            ]
+        return int(item.get("count", 0) or 0)
+
+    def _profile_preview_materialize_group_aggregate(self, profile_meta: Any, store_key: str) -> List[Dict[str, Any]]:
+        if not isinstance(profile_meta, dict):
+            return []
+        aggregate_root = profile_meta.get("group_aggregate")
+        if not isinstance(aggregate_root, dict):
+            return []
+        state = aggregate_root.get(str(store_key or "").strip())
+        if not isinstance(state, dict):
+            return []
+
+        cached_rows = state.get("cached_rows")
+        if isinstance(cached_rows, list):
+            return self._json_safe_value(cached_rows)
+
+        groups = state.get("groups")
+        order = state.get("order")
+        if not isinstance(groups, dict) or not isinstance(order, list):
+            return []
+        metric_specs = state.get("metric_specs")
+        if not isinstance(metric_specs, list):
+            metric_specs = []
+        output_key = str(state.get("output_key_name") or "key").strip() or "key"
+
+        out: List[Dict[str, Any]] = []
+        for token in order:
+            bucket = groups.get(token)
+            if not isinstance(bucket, dict):
+                continue
+            row_out: Dict[str, Any] = {output_key: bucket.get("key")}
+            bucket_metrics = bucket.get("metrics")
+            if not isinstance(bucket_metrics, dict):
+                bucket_metrics = {}
+            for spec in metric_specs:
+                metric_name = str((spec or {}).get("name") or "").strip()
+                metric_kind = str((spec or {}).get("kind") or "count").strip().lower()
+                if not metric_name:
+                    continue
+                row_out[metric_name] = self._profile_preview_metric_finalize(
+                    bucket_metrics.get(metric_name),
+                    metric_kind,
+                )
+            out.append(row_out)
+        return self._json_safe_value(out)
+
+    def _profile_preview_resolve_group_aggregate_refs(self, value: Any, profile_meta: Any) -> Any:
+        if isinstance(value, dict):
+            if (
+                len(value) == 1
+                and "__profile_group_aggregate_ref__" in value
+                and isinstance(value.get("__profile_group_aggregate_ref__"), str)
+            ):
+                store_key = str(value.get("__profile_group_aggregate_ref__") or "").strip()
+                if not store_key:
+                    return []
+                return self._profile_preview_materialize_group_aggregate(profile_meta, store_key)
+            return {
+                k: self._profile_preview_resolve_group_aggregate_refs(v, profile_meta)
+                for k, v in value.items()
+            }
+        if isinstance(value, list):
+            return [self._profile_preview_resolve_group_aggregate_refs(v, profile_meta) for v in value]
+        return value
+
     def _expand_lmdb_profile_documents(
         self,
         lmdb_key: str,
@@ -579,9 +680,17 @@ class ETLEngine:
             # val: {"document": {...}, "meta": {...}}
             if "document" in decoded_value:
                 profile_value = decoded_value.get("document")
+                entity_meta = decoded_value.get("meta") if isinstance(decoded_value.get("meta"), dict) else {}
                 row: Dict[str, Any] = {}
                 if isinstance(profile_value, dict):
-                    row.update(profile_value)
+                    resolved_profile = self._profile_preview_resolve_group_aggregate_refs(
+                        profile_value,
+                        entity_meta,
+                    )
+                    if isinstance(resolved_profile, dict):
+                        row.update(resolved_profile)
+                    else:
+                        row["profile"] = resolved_profile
                 else:
                     row["profile"] = profile_value
 
@@ -591,7 +700,6 @@ class ETLEngine:
                     row["lmdb_entity_key"] = entity_key
                 row["_lmdb_profile_source"] = "document"
 
-                entity_meta = decoded_value.get("meta")
                 if isinstance(entity_meta, dict) and entity_meta:
                     row["_lmdb_entity_meta"] = entity_meta
                 node_stats = decoded_value.get("stats")
@@ -608,8 +716,20 @@ class ETLEngine:
 
         for entity_key, profile_value in documents.items():
             row: Dict[str, Any] = {}
+            entity_meta = None
+            if isinstance(meta, dict):
+                entity_meta = meta.get(entity_key)
+                if entity_meta is None:
+                    entity_meta = meta.get(str(entity_key))
             if isinstance(profile_value, dict):
-                row.update(profile_value)
+                resolved_profile = self._profile_preview_resolve_group_aggregate_refs(
+                    profile_value,
+                    entity_meta if isinstance(entity_meta, dict) else {},
+                )
+                if isinstance(resolved_profile, dict):
+                    row.update(resolved_profile)
+                else:
+                    row["profile"] = resolved_profile
             else:
                 row["profile"] = profile_value
 
@@ -618,9 +738,6 @@ class ETLEngine:
             row["_lmdb_profile_source"] = "documents"
 
             if isinstance(meta, dict):
-                entity_meta = meta.get(entity_key)
-                if entity_meta is None:
-                    entity_meta = meta.get(str(entity_key))
                 if entity_meta is not None:
                     row["_lmdb_entity_meta"] = entity_meta
             if isinstance(node_stats, dict):
@@ -1262,6 +1379,18 @@ END;"""
             return parsed if isinstance(parsed, dict) else {}
         except Exception:
             return {}
+
+    def _oracle_materialize_profile_document(
+        self,
+        document_value: Any,
+        meta_value: Any,
+    ) -> Dict[str, Any]:
+        document_dict = document_value if isinstance(document_value, dict) else {}
+        if not document_dict:
+            return {}
+        meta_dict = meta_value if isinstance(meta_value, dict) else {}
+        resolved = self._profile_preview_resolve_group_aggregate_refs(document_dict, meta_dict)
+        return resolved if isinstance(resolved, dict) else {}
 
     def _oracle_prepare_json_bind_payload(
         self,
@@ -3256,7 +3385,8 @@ END;"""
 
                 parsed_doc = self._oracle_json_to_dict(row[2])
                 parsed_meta = self._oracle_json_to_dict(row[3])
-                documents[entity_token] = parsed_doc if isinstance(parsed_doc, dict) else {}
+                materialized_doc = self._oracle_materialize_profile_document(parsed_doc, parsed_meta)
+                documents[entity_token] = materialized_doc if isinstance(materialized_doc, dict) else {}
                 meta[entity_token] = parsed_meta if isinstance(parsed_meta, dict) else {}
             return out
         except Exception as exc:
@@ -3337,7 +3467,8 @@ END;"""
                     continue
                 parsed_doc = self._oracle_json_to_dict(row[1] if isinstance(row, (list, tuple)) and len(row) > 1 else None)
                 parsed_meta = self._oracle_json_to_dict(row[2] if isinstance(row, (list, tuple)) and len(row) > 2 else None)
-                documents[entity_token] = parsed_doc if isinstance(parsed_doc, dict) else {}
+                materialized_doc = self._oracle_materialize_profile_document(parsed_doc, parsed_meta)
+                documents[entity_token] = materialized_doc if isinstance(materialized_doc, dict) else {}
                 meta[entity_token] = parsed_meta if isinstance(parsed_meta, dict) else {}
             return node_state
         except Exception as exc:
@@ -3401,8 +3532,9 @@ END;"""
                 return {}, {}
             doc = self._oracle_json_to_dict(row[0])
             meta = self._oracle_json_to_dict(row[1])
+            materialized = self._oracle_materialize_profile_document(doc, meta)
             return (
-                doc if isinstance(doc, dict) else {},
+                materialized if isinstance(materialized, dict) else {},
                 meta if isinstance(meta, dict) else {},
             )
         except Exception as exc:
@@ -3476,9 +3608,9 @@ END;"""
             # Small sample only.
             cursor.execute(
                 (
-                    "SELECT ENTITY_TOKEN, DOCUMENT_JSON "
+                    "SELECT ENTITY_TOKEN, DOCUMENT_JSON, META_JSON "
                     "FROM ( "
-                    f"  SELECT ENTITY_TOKEN, DOCUMENT_JSON "
+                    f"  SELECT ENTITY_TOKEN, DOCUMENT_JSON, META_JSON "
                     f"  FROM {table_sql} "
                     "  WHERE PIPELINE_ID = :pipeline_id "
                     "    AND NODE_ID = :node_id "
@@ -3502,10 +3634,12 @@ END;"""
                     continue
                 sample_entity_keys.append(token)
                 parsed_doc = self._oracle_json_to_dict(sample_row[1] if len(sample_row) > 1 else None)
+                parsed_meta = self._oracle_json_to_dict(sample_row[2] if len(sample_row) > 2 else None)
+                materialized_doc = self._oracle_materialize_profile_document(parsed_doc, parsed_meta)
                 sample_documents.append(
                     {
                         "entity_key": token,
-                        "profile": self._json_safe_value(parsed_doc if isinstance(parsed_doc, dict) else {}),
+                        "profile": self._json_safe_value(materialized_doc if isinstance(materialized_doc, dict) else {}),
                     }
                 )
 
@@ -3675,7 +3809,8 @@ END;"""
                     parsed_meta = self._oracle_json_to_dict(
                         row[2] if isinstance(row, (list, tuple)) and len(row) > 2 else None
                     )
-                    docs[token_value] = parsed_doc if isinstance(parsed_doc, dict) else {}
+                    materialized_doc = self._oracle_materialize_profile_document(parsed_doc, parsed_meta)
+                    docs[token_value] = materialized_doc if isinstance(materialized_doc, dict) else {}
                     meta[token_value] = parsed_meta if isinstance(parsed_meta, dict) else {}
             return docs, meta, existing_tokens
         except Exception as exc:
@@ -3962,12 +4097,19 @@ END;"""
                         continue
                     doc_value = docs.get(token_text)
                     meta_value = meta.get(token_text)
+                    materialized_doc = self._oracle_materialize_profile_document(doc_value, meta_value)
+                    if isinstance(materialized_doc, dict) and materialized_doc:
+                        docs[token_text] = materialized_doc
                     batch_payloads.append({
                         "pipeline_id": str(pipeline_id),
                         "node_id": str(node_id),
                         "entity_token": token_text,
                         "document_json": json.dumps(
-                            self._json_safe_value(doc_value if isinstance(doc_value, dict) else {}),
+                            self._json_safe_value(
+                                materialized_doc
+                                if isinstance(materialized_doc, dict) and materialized_doc
+                                else (doc_value if isinstance(doc_value, dict) else {})
+                            ),
                             ensure_ascii=False,
                         ),
                         "meta_json": json.dumps(
@@ -4269,11 +4411,21 @@ END;"""
                 for token in changed:
                     doc_value = docs.get(token)
                     meta_value = meta.get(token)
+                    materialized_doc = self._oracle_materialize_profile_document(doc_value, meta_value)
+                    if isinstance(materialized_doc, dict) and materialized_doc:
+                        docs[token] = materialized_doc
                     changed_payloads.append({
                         "pipeline_id": str(pipeline_id),
                         "node_id": str(node_id),
                         "entity_token": token,
-                        "document_json": json.dumps(self._json_safe_value(doc_value if isinstance(doc_value, dict) else {}), ensure_ascii=False),
+                        "document_json": json.dumps(
+                            self._json_safe_value(
+                                materialized_doc
+                                if isinstance(materialized_doc, dict) and materialized_doc
+                                else (doc_value if isinstance(doc_value, dict) else {})
+                            ),
+                            ensure_ascii=False,
+                        ),
                         "meta_json": json.dumps(self._json_safe_value(meta_value if isinstance(meta_value, dict) else {}), ensure_ascii=False),
                         "stats_json": None,
                     })
@@ -4306,11 +4458,21 @@ END;"""
                     if not token_text:
                         continue
                     meta_value = meta.get(token_text)
+                    materialized_doc = self._oracle_materialize_profile_document(doc_value, meta_value)
+                    if isinstance(materialized_doc, dict) and materialized_doc:
+                        docs[token_text] = materialized_doc
                     snapshot_payloads.append({
                         "pipeline_id": str(pipeline_id),
                         "node_id": str(node_id),
                         "entity_token": token_text,
-                        "document_json": json.dumps(self._json_safe_value(doc_value if isinstance(doc_value, dict) else {}), ensure_ascii=False),
+                        "document_json": json.dumps(
+                            self._json_safe_value(
+                                materialized_doc
+                                if isinstance(materialized_doc, dict) and materialized_doc
+                                else (doc_value if isinstance(doc_value, dict) else {})
+                            ),
+                            ensure_ascii=False,
+                        ),
                         "meta_json": json.dumps(self._json_safe_value(meta_value if isinstance(meta_value, dict) else {}), ensure_ascii=False),
                         "stats_json": None,
                     })
@@ -6818,7 +6980,42 @@ END;"""
                     base_query = f"SELECT * FROM {table} FETCH FIRST {limit} ROWS ONLY"
                 cursor.execute(base_query)
             cols = [desc[0] for desc in (cursor.description or [])]
-            rows = [dict(zip(cols, row)) for row in cursor.fetchall()]
+            flatten_json_values = bool(config.get("flatten_json_values", True))
+            expand_profile_documents = bool(config.get("expand_profile_documents", True))
+            include_profile_meta = bool(config.get("include_profile_meta", False))
+
+            rows: List[Dict[str, Any]] = []
+            for raw_row in cursor.fetchall():
+                row_dict: Dict[str, Any] = {}
+                for col_name, raw_value in zip(cols, raw_row):
+                    value = raw_value
+                    if value is not None and hasattr(value, "read") and callable(getattr(value, "read", None)):
+                        value = self._oracle_lob_to_text(value)
+                    row_dict[str(col_name)] = value
+
+                if expand_profile_documents and row_dict:
+                    key_by_upper = {str(k).upper(): str(k) for k in row_dict.keys()}
+                    doc_col = key_by_upper.get("DOCUMENT_JSON")
+                    meta_col = key_by_upper.get("META_JSON")
+                    if doc_col:
+                        parsed_doc = self._oracle_json_to_dict(row_dict.get(doc_col))
+                        parsed_meta = self._oracle_json_to_dict(row_dict.get(meta_col)) if meta_col else {}
+                        materialized_doc = self._oracle_materialize_profile_document(parsed_doc, parsed_meta)
+                        if isinstance(materialized_doc, dict) and materialized_doc:
+                            row_dict[doc_col] = materialized_doc
+                            if flatten_json_values:
+                                for field_name, field_value in materialized_doc.items():
+                                    if field_name not in row_dict:
+                                        row_dict[field_name] = field_value
+                            if include_profile_meta and isinstance(parsed_meta, dict) and parsed_meta:
+                                row_dict["_oracle_profile_meta"] = parsed_meta
+                        elif isinstance(parsed_doc, dict) and parsed_doc:
+                            # Preserve parsed JSON dict even when there are no lazy refs.
+                            row_dict[doc_col] = parsed_doc
+                            if include_profile_meta and isinstance(parsed_meta, dict) and parsed_meta:
+                                row_dict["_oracle_profile_meta"] = parsed_meta
+
+                rows.append(self._json_safe_value(row_dict))
             return rows
         except Exception as e:
             err = str(e)

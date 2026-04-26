@@ -55,6 +55,15 @@ body {
   color: var(--app-text);
 }
 
+/* Keep notifications above drawer + studio overlay modals. */
+.ant-notification,
+.ant-notification-topLeft,
+.ant-notification-topRight,
+.ant-notification-bottomLeft,
+.ant-notification-bottomRight {
+  z-index: 6000 !important;
+}
+
 .monaco-editor .opsfabric-expr-inline-error {
   background: rgba(239, 68, 68, 0.22) !important;
   border-bottom: 2px solid rgba(248, 113, 113, 0.98) !important;
