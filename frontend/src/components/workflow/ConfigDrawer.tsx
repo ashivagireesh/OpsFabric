@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Drawer, Form, Input, Select, Switch, InputNumber,
-  Button, Typography, Space, Tabs, Divider, Tag, Tooltip, Table, notification, Modal, Popover, AutoComplete
+  Button, Typography, Space, Tabs, Divider, Tag, Tooltip, Table, notification, Modal, Popover, AutoComplete, Tree
 } from 'antd'
-import { CloseOutlined, CopyOutlined, DeleteOutlined, InfoCircleOutlined } from '@ant-design/icons'
+import { ArrowDownOutlined, ArrowUpOutlined, CloseOutlined, CopyOutlined, DeleteOutlined, InfoCircleOutlined, MinusSquareOutlined, PlusSquareOutlined, ReloadOutlined, SaveOutlined } from '@ant-design/icons'
 import Editor, { type Monaco } from '@monaco-editor/react'
 import { useWorkflowStore } from '../../store'
 import { SourceFilePicker, DestinationPathPicker } from './FilePicker'
@@ -73,6 +73,10 @@ type CustomProfileProcessingMode = 'batch' | 'incremental' | 'incremental_batch'
 type CustomProfileComputeStrategy = 'single' | 'parallel_by_profile_key'
 type CustomProfileComputeExecutor = 'thread' | 'process'
 type CustomExpressionEngine = 'auto' | 'python' | 'polars'
+type CustomFnsVersion = 'v1' | 'v2'
+type CustomFnsV2OnDuplicate = 'ignore' | 'update'
+type CustomFnsV2Normalize = 'upper_trim' | 'lower_trim' | 'trim' | 'upper' | 'lower' | 'auto'
+type CustomFnsV2InvalidKey = 'skip' | 'allow' | 'raise'
 type CustomProfileStorage = 'lmdb' | 'rocksdb' | 'redis' | 'oracle'
 type CustomProfileOracleWriteStrategy = 'single' | 'parallel_key'
 type CustomEditorColorProfile =
@@ -151,6 +155,11 @@ type UiGroupAggregateMetric = {
 
 type UiConditionClauseRightMode = 'literal' | 'field' | 'values' | 'variable' | 'raw'
 type UiConditionLogicalJoin = 'and' | 'or'
+type ConditionCaseRouteMode = 'range' | 'condition'
+type ConditionCaseRouteRightMode = 'literal' | 'field'
+type ConditionCaseRouteMatchMode = 'all' | 'any'
+type DataQueryProfilePatchOpKind = 'set' | 'set_where' | 'unset' | 'inc' | 'append' | 'remove' | 'rename'
+type DataQueryProfilePatchValueMode = 'row' | 'fixed'
 
 type UiConditionCluster = {
   id: string
@@ -165,6 +174,48 @@ type UiConditionClause = {
   operator: string
   rightMode: UiConditionClauseRightMode
   rightValue: string
+}
+
+type ConditionCaseCondition = {
+  id: string
+  field: string
+  mode: ConditionCaseRouteMode
+  operator: string
+  rightMode: ConditionCaseRouteRightMode
+  rightValue: string
+  minValue: string
+  maxValue: string
+  includeMin: boolean
+  includeMax: boolean
+}
+
+type ConditionCaseRoute = {
+  id: string
+  label: string
+  handleId?: string
+  matchMode: ConditionCaseRouteMatchMode
+  conditions: ConditionCaseCondition[]
+  // Legacy mirrored fields (first condition) for compatibility and
+  // smoother incremental migration of existing logic.
+  field: string
+  mode: ConditionCaseRouteMode
+  operator: string
+  rightMode: ConditionCaseRouteRightMode
+  rightValue: string
+  minValue: string
+  maxValue: string
+  includeMin: boolean
+  includeMax: boolean
+  targetNodeIds: string[]
+}
+
+type DataQueryPreviewSummary = {
+  ran: boolean
+  inputRows: number
+  matchedRows: number
+  outputRows: number
+  matchedSamples: Array<Record<string, unknown>>
+  outputSamples: Array<Record<string, unknown>>
 }
 
 type UiConditionBuilderState = {
@@ -211,6 +262,7 @@ interface LmdbStudioDraft {
   value_format: 'auto' | 'json' | 'text' | 'base64'
   flatten_json_values: boolean
   expand_profile_documents: boolean
+  include_entity_meta: boolean
   limit: number
 }
 
@@ -266,12 +318,116 @@ interface CustomFieldValidationResult {
   sample_output: Array<Record<string, unknown>>
 }
 
-const MAX_PATH_DEPTH = 5
-const MAX_PATH_OPTIONS = 400
+interface ConditionValidationResult {
+  ok: boolean
+  validation_source?: string
+  routing_mode?: 'boolean' | 'case' | string
+  input_rows: number
+  true_rows: number
+  false_rows: number
+  case_counts?: Record<string, number>
+  sample_input?: Array<Record<string, unknown>>
+  true_samples?: Array<Record<string, unknown>>
+  false_samples?: Array<Record<string, unknown>>
+  warnings?: string[]
+  source_meta?: Record<string, unknown>
+}
+
+type DataQueryProfilePatchOperation = {
+  id: string
+  op: DataQueryProfilePatchOpKind
+  targetPath: string
+  sourcePath: string
+  valueMode: DataQueryProfilePatchValueMode
+  value: string
+  whereField: string
+  whereValueMode: DataQueryProfilePatchValueMode
+  whereSourcePath: string
+  whereValue: string
+  renameTo: string
+  mergeMode: 'merge' | 'replace'
+}
+
+const MAX_PATH_DEPTH = 10
+const MAX_PATH_OPTIONS = 6000
 const MAX_ARRAY_INDEX_OPTIONS = 3
-const MAX_OBJECT_KEYS_PER_LEVEL = 40
+const MAX_OBJECT_KEYS_PER_LEVEL = 200
+const MAX_SAMPLE_ROWS_FOR_PATH_DISCOVERY = 5000
+const MAX_PARSEABLE_OBJECTLIKE_TEXT_CHARS = 2000000
+const MAX_PREVIEW_SIGNATURE_CHARS = 4096
 const MAX_JSON_TAG_DEPTH = 8
 const MAX_JSON_TAG_MAPPINGS = 320
+const SIMPLE_PATH_SEGMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
+const PRIORITY_JSON_FIELD_NAMES = ['DOCUMENT_JSON', 'META_JSON', 'STATS_JSON']
+const CONDITION_STUDIO_SNAPSHOT_KEYS = [
+  'criteria',
+  'criteria_mode',
+  'case_sensitive',
+  'condition_routing_mode',
+  'condition_source_node_id',
+  'condition_source_node_ids',
+  'input_source_node_id',
+  'condition_true_target_node_id',
+  'condition_false_target_node_id',
+  'condition_show_route_labels',
+  'case_routes',
+  'case_else_target_node_id',
+  'case_else_target_node_ids',
+  'condition_validation_source',
+  'condition_validation_target_node_id',
+  'condition_validation_max_rows',
+] as const
+
+function pickConditionStudioSnapshot(config: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  CONDITION_STUDIO_SNAPSHOT_KEYS.forEach((key) => {
+    if (!Object.prototype.hasOwnProperty.call(config, key)) return
+    const raw = config[key]
+    if (raw === undefined) return
+    out[key] = raw
+  })
+  return out
+}
+
+const DATA_QUERY_STUDIO_SNAPSHOT_KEYS = [
+  'criteria',
+  'criteria_mode',
+  'query_mode',
+  'field',
+  'operator',
+  'value',
+  'select_fields',
+  'select_field_aliases',
+  'select_field_sorts',
+  'array_output_mode',
+  'include_original_row',
+  'array_match_mode',
+  'offset',
+  'limit',
+  'profile_patch_enabled',
+  'profile_patch_reflect_output',
+  'profile_patch_stage',
+  'profile_patch_storage',
+  'profile_patch_node_id',
+  'profile_patch_primary_key_field',
+  'profile_patch_ops',
+  'profile_patch_document_path',
+  'profile_patch_value_mode',
+  'profile_patch_value',
+  'profile_patch_target_path',
+  'profile_patch_merge_mode',
+] as const
+
+function pickDataQueryStudioSnapshot(config: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  DATA_QUERY_STUDIO_SNAPSHOT_KEYS.forEach((key) => {
+    if (!Object.prototype.hasOwnProperty.call(config, key)) return
+    const raw = config[key]
+    if (raw === undefined) return
+    out[key] = raw
+  })
+  return out
+}
 
 type ExpressionCompletionEntry = {
   label: string
@@ -2070,6 +2226,160 @@ function attachExpressionAutoSuggest(editor: any): void {
   })
 }
 
+function runEditorAction(editor: any, actionId: string): boolean {
+  try {
+    const action = editor?.getAction?.(actionId)
+    if (action?.run) {
+      void action.run()
+      return true
+    }
+    editor?.trigger?.('keyboard', actionId, {})
+    return true
+  } catch {
+    try {
+      editor?.trigger?.('keyboard', actionId, {})
+      return true
+    } catch {
+      return false
+    }
+  }
+}
+
+function toggleEditorLineCommentFallback(editor: any): boolean {
+  const model = editor?.getModel?.()
+  if (!model) return false
+  const rawSelections = editor?.getSelections?.() || [editor?.getSelection?.()].filter(Boolean)
+  if (!rawSelections?.length) return false
+
+  const lineSet = new Set<number>()
+  rawSelections.forEach((selection: any) => {
+    const startLine = Math.max(1, Number(selection?.startLineNumber || 1))
+    let endLine = Math.max(startLine, Number(selection?.endLineNumber || startLine))
+    const endColumn = Number(selection?.endColumn || 1)
+    if (endColumn === 1 && endLine > startLine) endLine -= 1
+    for (let line = startLine; line <= endLine; line += 1) {
+      lineSet.add(line)
+    }
+  })
+
+  const targetLines = Array.from(lineSet).sort((a, b) => b - a)
+  if (!targetLines.length) return false
+
+  const nonEmptyLines = targetLines.filter((line) => String(model.getLineContent(line) || '').trim().length > 0)
+  if (!nonEmptyLines.length) return false
+
+  const shouldUncomment = nonEmptyLines.every((line) => /^\s*\/\//.test(String(model.getLineContent(line) || '')))
+  const edits: Array<{
+    range: {
+      startLineNumber: number
+      startColumn: number
+      endLineNumber: number
+      endColumn: number
+    }
+    text: string
+    forceMoveMarkers: boolean
+  }> = []
+
+  targetLines.forEach((line) => {
+    const lineText = String(model.getLineContent(line) || '')
+    if (!lineText.trim()) return
+    const indent = (lineText.match(/^\s*/) || [''])[0]
+    const startColumn = indent.length + 1
+    if (shouldUncomment) {
+      const match = lineText.match(/^(\s*)\/\/ ?/)
+      if (!match) return
+      const removeLen = match[0].length - match[1].length
+      edits.push({
+        range: {
+          startLineNumber: line,
+          startColumn,
+          endLineNumber: line,
+          endColumn: startColumn + removeLen,
+        },
+        text: '',
+        forceMoveMarkers: true,
+      })
+      return
+    }
+    edits.push({
+      range: {
+        startLineNumber: line,
+        startColumn,
+        endLineNumber: line,
+        endColumn: startColumn,
+      },
+      text: '// ',
+      forceMoveMarkers: true,
+    })
+  })
+
+  if (!edits.length) return false
+  editor.pushUndoStop?.()
+  const ok = Boolean(editor.executeEdits?.('opsfabric-comment-fallback', edits))
+  editor.pushUndoStop?.()
+  return ok
+}
+
+function toggleEditorLineComment(editor: any): boolean {
+  const model = editor?.getModel?.()
+  const before = model ? String(model.getValue?.() || '') : ''
+  const ranAction = runEditorAction(editor, 'editor.action.commentLine')
+  const after = model ? String(model.getValue?.() || '') : ''
+  if (ranAction && before !== after) return true
+  return toggleEditorLineCommentFallback(editor)
+}
+
+function attachExpressionCommentShortcuts(editor: any, monaco: Monaco): void {
+  if (!editor?.addAction || !monaco?.KeyMod || !monaco?.KeyCode) return
+  const slashCandidates = [
+    (monaco.KeyCode as any).Slash,
+    (monaco.KeyCode as any).US_SLASH,
+    (monaco.KeyCode as any).OEM_2,
+  ].filter((code) => typeof code === 'number')
+  const slashKeyCodes = Array.from(new Set(slashCandidates))
+  if (slashKeyCodes.length === 0) return
+
+  editor.addAction({
+    id: 'opsfabric.toggleLineComment',
+    label: 'Toggle Line Comment',
+    keybindings: slashKeyCodes.map((code) => monaco.KeyMod.CtrlCmd | code),
+    precondition: 'editorTextFocus',
+    run: (targetEditor: any) => {
+      toggleEditorLineComment(targetEditor || editor)
+      return null
+    },
+  })
+
+  editor.addAction({
+    id: 'opsfabric.toggleBlockComment',
+    label: 'Toggle Block Comment',
+    keybindings: slashKeyCodes.map((code) => monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | code),
+    precondition: 'editorTextFocus',
+    run: (targetEditor: any) => {
+      runEditorAction(targetEditor || editor, 'editor.action.blockComment')
+      return null
+    },
+  })
+
+  const keyDownDisposable = editor.onKeyDown((event: any) => {
+    const browserEvent = event?.browserEvent
+    if (!browserEvent) return
+    const key = String(browserEvent.key || '')
+    const hasCmd = Boolean(browserEvent.metaKey || browserEvent.ctrlKey)
+    if (!hasCmd || key !== '/') return
+    if (browserEvent.shiftKey) {
+      runEditorAction(editor, 'editor.action.blockComment')
+    } else {
+      toggleEditorLineComment(editor)
+    }
+    event?.preventDefault?.()
+    event?.stopPropagation?.()
+  })
+  editor.onDidDispose(() => {
+    keyDownDisposable.dispose()
+  })
+}
+
 function ensureExpressionLanguage(monaco: Monaco): void {
   ensureCustomEditorTheme(monaco)
   if (!exprLanguageRegistered) {
@@ -2090,6 +2400,10 @@ function ensureExpressionLanguage(monaco: Monaco): void {
         { open: "'", close: "'" },
         { open: '"', close: '"' },
       ],
+      comments: {
+        lineComment: '//',
+        blockComment: ['/*', '*/'],
+      },
     })
     monaco.languages.setMonarchTokensProvider(EXPR_LANGUAGE_ID, {
       tokenizer: {
@@ -3008,6 +3322,60 @@ function validateExpressionSemantics(
     'distinct_count_if',
     'count_non_null_if',
   ])
+  const profilePathFirstArgFunctions = new Set([
+    'inc',
+    'map_inc',
+    'append_unique',
+    'rolling_update',
+    'unique_metrics',
+    'unique_group_aggregate',
+    'unique_signal',
+    'unique_count',
+    'unique_sum',
+    'unique_avg',
+    'unique_min',
+    'unique_max',
+    'unique_stats',
+    'unique_metric',
+    'unique_ratio',
+    'unique_rate',
+    'unique_flag',
+    'unique_map',
+    'top_key',
+    'unique_interval',
+    'unique_velocity',
+    'burst_flag',
+    'metric_get',
+    'entropy_update',
+    'min_update',
+    'max_update',
+    'repetition_rate',
+    'change_rate',
+    'geo_variance',
+    'geo_conflict_flag',
+    'unique_rolling',
+    'unique_window',
+    'window_sum',
+    'window_avg',
+    'trend_flag',
+    'anomaly_detection',
+    'anamoly_detection',
+    'anomaly_group_aggregate',
+    'anamoly_group_aggregate',
+    'sequence_update',
+    'loop_flag',
+    'repeated_sequence',
+    'unique_sequence',
+    'unique_geo',
+    'partition_count',
+    'partition_avg',
+    'partition_stddev',
+    'partition_percentile',
+    'partition_zscore',
+    'sigma_threshold',
+    'threshold_reason',
+    'zscore_threshold_flag',
+  ])
 
   const addIssue = (issue: ExpressionValidationIssue) => {
     const key = `${issue.startOffset}:${issue.endOffset}:${issue.message}`
@@ -3151,7 +3519,7 @@ function validateExpressionSemantics(
     })
 
     // Validate path-root for profile path helpers where first argument is a dotted path.
-    if (['inc', 'map_inc', 'append_unique', 'rolling_update'].includes(fnNameLower)) {
+    if (profilePathFirstArgFunctions.has(fnNameLower)) {
       const firstArg = args[0]
       const firstLiteral = firstArg ? extractQuotedLiteralFromSegment(firstArg) : null
       if (firstLiteral && /[.[\]]/.test(firstLiteral.value)) {
@@ -3164,6 +3532,24 @@ function validateExpressionSemantics(
         validatePathRootReference(
           firstLiteral.value,
           ref.openParenOffset + 1 + firstLiteral.startOffset,
+          `${ref.name}()`
+        )
+      }
+    }
+
+    if (fnNameLower === 'loop_flag' || fnNameLower === 'burst_flag') {
+      const secondArg = args[1]
+      const secondLiteral = secondArg ? extractQuotedLiteralFromSegment(secondArg) : null
+      if (secondLiteral && /[.[\]]/.test(secondLiteral.value)) {
+        validateFullPathReference(
+          secondLiteral.value,
+          ref.openParenOffset + 1 + secondLiteral.startOffset,
+          ref.openParenOffset + 1 + secondLiteral.endOffset,
+          `${ref.name}()`
+        )
+        validatePathRootReference(
+          secondLiteral.value,
+          ref.openParenOffset + 1 + secondLiteral.startOffset,
           `${ref.name}()`
         )
       }
@@ -3612,6 +3998,7 @@ function createLmdbStudioDraft(seed?: Partial<LmdbStudioDraft>): LmdbStudioDraft
     value_format: valueFormat,
     flatten_json_values: seed?.flatten_json_values ?? true,
     expand_profile_documents: parseBoolLike(seed?.expand_profile_documents, true),
+    include_entity_meta: parseBoolLike(seed?.include_entity_meta, false),
     limit,
   }
 }
@@ -3976,6 +4363,23 @@ function buildCustomProfilePathSuggestions(specs: CustomFieldSpec[]): string[] {
   return uniqueFieldNames(Array.from(out))
 }
 
+function buildCustomOutputFieldPaths(specs: CustomFieldSpec[]): string[] {
+  const out = new Set<string>()
+  ;(specs || []).forEach((spec) => {
+    const rootName = String(spec.name || '').trim()
+    if (!rootName) return
+    out.add(rootName)
+    if (spec.mode !== 'json') return
+    const keyPaths = extractJsonTemplateKeyPaths(spec.jsonTemplate)
+    keyPaths.forEach((path) => {
+      const normalized = String(path || '').trim()
+      if (!normalized) return
+      out.add(`${rootName}.${normalized}`)
+    })
+  })
+  return uniqueFieldNames(Array.from(out))
+}
+
 const INTERNAL_FIELD_ROOT_PREFIXES = ['_lmdb_', '__lmdb_', '_profile_', '_detected_', '_preview_']
 const INTERNAL_FIELD_ROOT_EXACT = new Set([
   '_lmdb_entity_meta',
@@ -4041,21 +4445,439 @@ function parseStringList(value: unknown): string[] {
   return []
 }
 
+function normalizeDataQueryProfilePatchOpKind(value: unknown): DataQueryProfilePatchOpKind {
+  const raw = String(value || '').trim().toLowerCase()
+  if (raw === 'set_where' || raw === 'unset' || raw === 'inc' || raw === 'append' || raw === 'remove' || raw === 'rename') {
+    return raw
+  }
+  return 'set'
+}
+
+function createDataQueryProfilePatchOperation(seed?: Partial<DataQueryProfilePatchOperation>): DataQueryProfilePatchOperation {
+  const op = normalizeDataQueryProfilePatchOpKind(seed?.op)
+  const valueMode: DataQueryProfilePatchValueMode = String(seed?.valueMode || '').trim().toLowerCase() === 'fixed' ? 'fixed' : 'row'
+  const mergeMode: 'merge' | 'replace' = String(seed?.mergeMode || '').trim().toLowerCase() === 'replace' ? 'replace' : 'merge'
+  return {
+    id: String(seed?.id || `patch_op_${Date.now()}_${Math.floor(Math.random() * 100000)}`),
+    op,
+    targetPath: String(seed?.targetPath || '').trim(),
+    sourcePath: String(seed?.sourcePath || '').trim(),
+    valueMode,
+    value: String(seed?.value ?? ''),
+    whereField: String((seed as any)?.whereField || '').trim(),
+    whereValueMode: String((seed as any)?.whereValueMode || '').trim().toLowerCase() === 'fixed' ? 'fixed' : 'row',
+    whereSourcePath: String((seed as any)?.whereSourcePath || '').trim(),
+    whereValue: String((seed as any)?.whereValue ?? ''),
+    renameTo: String(seed?.renameTo || '').trim(),
+    mergeMode,
+  }
+}
+
+function parseDataQueryProfilePatchOperations(value: unknown): DataQueryProfilePatchOperation[] {
+  let raw = value
+  if (typeof raw === 'string') {
+    const text = raw.trim()
+    if (!text) return []
+    try {
+      raw = JSON.parse(text)
+    } catch {
+      return []
+    }
+  }
+  if (!Array.isArray(raw)) return []
+  const out = raw
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null
+      const rec = item as Record<string, unknown>
+      return createDataQueryProfilePatchOperation({
+        id: String(rec.id || ''),
+        op: normalizeDataQueryProfilePatchOpKind(rec.op ?? rec.operation ?? rec.type),
+        targetPath: String(rec.target_path ?? rec.path ?? rec.target ?? ''),
+        sourcePath: String(rec.source_path ?? rec.document_path ?? ''),
+        valueMode: String(rec.value_mode ?? 'row') as DataQueryProfilePatchValueMode,
+        value: String(rec.value ?? ''),
+        whereField: String(rec.where_field ?? rec.match_field ?? ''),
+        whereValueMode: String(rec.where_value_mode ?? rec.match_value_mode ?? 'row') as DataQueryProfilePatchValueMode,
+        whereSourcePath: String(rec.where_source_path ?? rec.match_source_path ?? ''),
+        whereValue: String(rec.where_value ?? rec.match_value ?? ''),
+        renameTo: String(rec.rename_to ?? rec.new_name ?? rec.new_key ?? ''),
+        mergeMode: String(rec.merge_mode ?? 'merge') === 'replace' ? 'replace' : 'merge',
+      })
+    })
+    .filter((item): item is DataQueryProfilePatchOperation => !!item)
+  return out
+}
+
+function serializeDataQueryProfilePatchOperations(items: DataQueryProfilePatchOperation[]): Array<Record<string, unknown>> {
+  return (items || [])
+    .map((item) => ({
+      id: String(item.id || '').trim(),
+      op: normalizeDataQueryProfilePatchOpKind(item.op),
+      target_path: String(item.targetPath || '').trim(),
+      source_path: String(item.sourcePath || '').trim(),
+      value_mode: String(item.valueMode || '').trim().toLowerCase() === 'fixed' ? 'fixed' : 'row',
+      value: String(item.value ?? ''),
+      where_field: String(item.whereField || '').trim(),
+      where_value_mode: String(item.whereValueMode || '').trim().toLowerCase() === 'fixed' ? 'fixed' : 'row',
+      where_source_path: String(item.whereSourcePath || '').trim(),
+      where_value: String(item.whereValue ?? ''),
+      rename_to: String(item.renameTo || '').trim(),
+      merge_mode: String(item.mergeMode || '').trim().toLowerCase() === 'replace' ? 'replace' : 'merge',
+    }))
+    .filter((item) => {
+      const op = normalizeDataQueryProfilePatchOpKind(item.op)
+      const targetPath = String(item.target_path || '').trim()
+      if (op === 'rename') return Boolean(targetPath && String(item.rename_to || '').trim())
+      if (op === 'set_where') return Boolean(targetPath)
+      if (op === 'set' || op === 'inc' || op === 'append' || op === 'remove' || op === 'unset') return Boolean(targetPath)
+      return Boolean(targetPath)
+    })
+}
+
+function parseJsonArraySafe(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value
+  if (typeof value === 'string') {
+    const text = value.trim()
+    if (!text) return []
+    try {
+      const parsed = JSON.parse(text)
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }
+  return []
+}
+
+function normalizeConditionCaseHandleId(rawRouteId: unknown): string {
+  const raw = String(rawRouteId || '').trim().toLowerCase()
+  const safe = raw.replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || `route_${Date.now()}`
+  return `case_${safe}`
+}
+
+function resolveConditionTargetIdsForNodes(
+  nodes: ETLNode[],
+  rawTargets: unknown,
+  sourceNodeId?: string,
+): string[] {
+  const sourceId = String(sourceNodeId || '').trim()
+  const idSet = new Set<string>()
+  const labelExact = new Map<string, string>()
+  const labelLower = new Map<string, string>()
+  nodes.forEach((item) => {
+    const idText = String(item.id || '').trim()
+    if (!idText) return
+    idSet.add(idText)
+    const label = String(item.data?.label || item.data?.nodeType || item.id || '').trim()
+    if (!label) return
+    if (!labelExact.has(label)) labelExact.set(label, idText)
+    const lowerKey = label.toLowerCase()
+    if (!labelLower.has(lowerKey)) labelLower.set(lowerKey, idText)
+  })
+
+  const out: string[] = []
+  const seen = new Set<string>()
+  parseStringList(rawTargets).forEach((tokenRaw) => {
+    const token = String(tokenRaw || '').trim()
+    if (!token) return
+    let resolved = ''
+    if (idSet.has(token)) {
+      resolved = token
+    } else if (labelExact.has(token)) {
+      resolved = String(labelExact.get(token) || '').trim()
+    } else if (labelLower.has(token.toLowerCase())) {
+      resolved = String(labelLower.get(token.toLowerCase()) || '').trim()
+    } else {
+      const uuidHit = token.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)
+      const guessed = String(uuidHit?.[0] || '').trim()
+      if (guessed && idSet.has(guessed)) resolved = guessed
+    }
+    if (!resolved) return
+    if (sourceId && resolved === sourceId) return
+    if (seen.has(resolved)) return
+    seen.add(resolved)
+    out.push(resolved)
+  })
+  return out
+}
+
+function createConditionCaseCondition(seed?: Partial<ConditionCaseCondition>): ConditionCaseCondition {
+  const conditionId = String(seed?.id || `cond_${Date.now()}`).trim()
+  const rawMode = String((seed as any)?.mode || (seed as any)?.matchMode || (seed as any)?.match_mode || '').trim().toLowerCase()
+  const mode: ConditionCaseRouteMode = rawMode === 'condition' ? 'condition' : 'range'
+  const rawRightMode = String((seed as any)?.rightMode || (seed as any)?.right_mode || '').trim().toLowerCase()
+  const rightMode: ConditionCaseRouteRightMode = rawRightMode === 'field' ? 'field' : 'literal'
+  return {
+    id: conditionId,
+    field: String(seed?.field || '').trim(),
+    mode,
+    operator: String((seed as any)?.operator || 'equals').trim() || 'equals',
+    rightMode,
+    rightValue: (seed as any)?.rightValue == null
+      ? ((seed as any)?.right_value == null ? '' : String((seed as any).right_value))
+      : String((seed as any).rightValue),
+    minValue: seed?.minValue == null ? '' : String(seed.minValue),
+    maxValue: seed?.maxValue == null ? '' : String(seed.maxValue),
+    includeMin: seed?.includeMin !== false,
+    includeMax: seed?.includeMax !== false,
+  }
+}
+
+function createConditionCaseRoute(seed?: Partial<ConditionCaseRoute>): ConditionCaseRoute {
+  const routeId = String(seed?.id || `route_${Date.now()}`).trim()
+  const routeHandleId = String((seed as any)?.handleId || (seed as any)?.handle_id || normalizeConditionCaseHandleId(routeId)).trim()
+  const rawMatchMode = String((seed as any)?.matchMode || (seed as any)?.match_mode || '').trim().toLowerCase()
+  const matchMode: ConditionCaseRouteMatchMode = rawMatchMode === 'any' ? 'any' : 'all'
+  let conditions: ConditionCaseCondition[] = []
+  if (Array.isArray((seed as any)?.conditions)) {
+    conditions = ((seed as any).conditions as Array<Partial<ConditionCaseCondition>>)
+      .map((item) => createConditionCaseCondition(item))
+      .filter((item) => Boolean(String(item.id || '').trim()))
+  }
+  if (conditions.length === 0) {
+    conditions = [createConditionCaseCondition({
+      id: `cond_${Date.now()}`,
+      field: String(seed?.field || '').trim(),
+      mode: String((seed as any)?.mode || (seed as any)?.matchMode || (seed as any)?.match_mode || '').trim().toLowerCase() === 'condition'
+        ? 'condition'
+        : 'range',
+      operator: String((seed as any)?.operator || 'equals').trim() || 'equals',
+      rightMode: String((seed as any)?.rightMode || (seed as any)?.right_mode || '').trim().toLowerCase() === 'field' ? 'field' : 'literal',
+      rightValue: (seed as any)?.rightValue == null
+        ? ((seed as any)?.right_value == null ? '' : String((seed as any).right_value))
+        : String((seed as any).rightValue),
+      minValue: seed?.minValue == null ? '' : String(seed.minValue),
+      maxValue: seed?.maxValue == null ? '' : String(seed.maxValue),
+      includeMin: seed?.includeMin !== false,
+      includeMax: seed?.includeMax !== false,
+    })]
+  }
+  const first = conditions[0] || createConditionCaseCondition()
+  return {
+    id: routeId,
+    label: String(seed?.label || routeId || 'CASE').trim() || 'CASE',
+    handleId: routeHandleId || normalizeConditionCaseHandleId(routeId),
+    matchMode,
+    conditions,
+    field: String(first.field || '').trim(),
+    mode: first.mode,
+    operator: String(first.operator || 'equals').trim() || 'equals',
+    rightMode: first.rightMode,
+    rightValue: String(first.rightValue ?? ''),
+    minValue: String(first.minValue ?? ''),
+    maxValue: String(first.maxValue ?? ''),
+    includeMin: first.includeMin !== false,
+    includeMax: first.includeMax !== false,
+    targetNodeIds: parseStringList(seed?.targetNodeIds || []),
+  }
+}
+
+function parseConditionCaseRoutes(value: unknown): ConditionCaseRoute[] {
+  let raw: unknown = value
+  if (typeof raw === 'string') {
+    try {
+      raw = JSON.parse(raw)
+    } catch {
+      raw = []
+    }
+  }
+  if (!Array.isArray(raw)) return []
+  const routes: ConditionCaseRoute[] = []
+  raw.forEach((item, index) => {
+    if (!item || typeof item !== 'object') return
+    const src = item as Record<string, unknown>
+    const id = String(src.id || `route_${index + 1}`).trim() || `route_${index + 1}`
+    const parsedConditions = Array.isArray(src.conditions)
+      ? (src.conditions as Array<Record<string, unknown>>).map((cond, condIdx) => createConditionCaseCondition({
+        id: String(cond?.id || `cond_${id}_${condIdx + 1}`),
+        field: String(cond?.field || cond?.leftField || '').trim(),
+        mode: String(cond?.mode || cond?.matchMode || cond?.match_mode || '').trim().toLowerCase() === 'condition' ? 'condition' : 'range',
+        operator: String(cond?.operator || 'equals').trim(),
+        rightMode: String(cond?.rightMode || cond?.right_mode || '').trim().toLowerCase() === 'field' ? 'field' : 'literal',
+        rightValue: cond?.rightValue == null ? (cond?.right_value == null ? '' : String(cond?.right_value)) : String(cond?.rightValue),
+        minValue: cond?.minValue == null ? (cond?.min_value == null ? '' : String(cond?.min_value)) : String(cond?.minValue),
+        maxValue: cond?.maxValue == null ? (cond?.max_value == null ? '' : String(cond?.max_value)) : String(cond?.maxValue),
+        includeMin: cond?.includeMin == null ? (cond?.include_min == null ? true : Boolean(cond?.include_min)) : Boolean(cond?.includeMin),
+        includeMax: cond?.includeMax == null ? (cond?.include_max == null ? true : Boolean(cond?.include_max)) : Boolean(cond?.includeMax),
+      }))
+      : []
+    routes.push(createConditionCaseRoute({
+      id,
+      label: String(src.label || src.name || id).trim(),
+      handleId: String(src.handle_id || src.handleId || '').trim() || normalizeConditionCaseHandleId(id),
+      matchMode: String(src.matchMode || src.route_match_mode || src.match_mode || '').trim().toLowerCase() === 'any' ? 'any' : 'all',
+      conditions: parsedConditions,
+      field: String(src.field || src.leftField || '').trim(),
+      mode: String(src.mode || src.matchMode || src.match_mode || '').trim().toLowerCase() === 'condition' ? 'condition' : 'range',
+      operator: String(src.operator || 'equals').trim(),
+      rightMode: String(src.rightMode || src.right_mode || '').trim().toLowerCase() === 'field' ? 'field' : 'literal',
+      rightValue: src.rightValue == null ? (src.right_value == null ? '' : String(src.right_value)) : String(src.rightValue),
+      minValue: src.minValue == null ? (src.min_value == null ? '' : String(src.min_value)) : String(src.minValue),
+      maxValue: src.maxValue == null ? (src.max_value == null ? '' : String(src.max_value)) : String(src.maxValue),
+      includeMin: src.includeMin == null ? (src.include_min == null ? true : Boolean(src.include_min)) : Boolean(src.includeMin),
+      includeMax: src.includeMax == null ? (src.include_max == null ? true : Boolean(src.include_max)) : Boolean(src.includeMax),
+      targetNodeIds: parseStringList(src.targetNodeIds || src.target_node_ids || []),
+    }))
+  })
+  return routes
+}
+
 function parseDetectedJsonPaths(value: unknown): string[] {
   if (!Array.isArray(value)) return []
   const out: string[] = []
   value.forEach((item) => {
     if (typeof item === 'string') out.push(item)
     else if (item && typeof item === 'object') {
-      const v = String((item as any).value || '').trim()
-      if (v) out.push(v)
+      const src = item as any
+      const candidates = [
+        src.value,
+        src.path,
+        src.json_path,
+        src.field,
+        src.name,
+      ]
+      candidates.forEach((candidate) => {
+        const v = String(candidate || '').trim()
+        if (v) out.push(v)
+      })
     }
   })
   return uniqueFieldNames(out.filter((p) => p && p !== '$'))
 }
 
+function extractEmbeddedJsonCandidates(text: string): string[] {
+  const src = String(text || '').trim()
+  if (!src) return []
+  const out = new Set<string>()
+  const pushSlice = (openCh: '{' | '[', closeCh: '}' | ']') => {
+    const start = src.indexOf(openCh)
+    const end = src.lastIndexOf(closeCh)
+    if (start === -1 || end === -1 || end <= start) return
+    const slice = src.slice(start, end + 1).trim()
+    if (slice.length >= 2) out.add(slice)
+  }
+  pushSlice('{', '}')
+  pushSlice('[', ']')
+  return Array.from(out)
+}
+
+function parseObjectLikeJsonString(value: unknown): unknown {
+  if (typeof value !== 'string') return null
+  if (value.length > MAX_PARSEABLE_OBJECTLIKE_TEXT_CHARS) return null
+  const base = value.trim()
+  if (!base) return null
+  const queue: string[] = [base, ...extractEmbeddedJsonCandidates(base)]
+  const seen = new Set<string>()
+  while (queue.length > 0) {
+    const text = String(queue.shift() || '').trim()
+    if (!text || seen.has(text)) continue
+    seen.add(text)
+    const startsJson = (text.startsWith('{') && text.endsWith('}')) || (text.startsWith('[') && text.endsWith(']'))
+    const wrapped = (
+      (text.startsWith('"') && text.endsWith('"'))
+      || (text.startsWith("'") && text.endsWith("'"))
+    )
+    if (wrapped) {
+      const inner = text.slice(1, -1).trim()
+      if (inner && !seen.has(inner)) queue.push(inner)
+      const decodedInner = decodeJsonStringContent(inner).trim()
+      if (decodedInner && !seen.has(decodedInner)) queue.push(decodedInner)
+    }
+    if (!startsJson && !wrapped) continue
+    try {
+      const parsed = JSON.parse(text)
+      if (parsed && (Array.isArray(parsed) || typeof parsed === 'object')) return parsed
+      if (typeof parsed === 'string' && parsed.trim() && !seen.has(parsed.trim())) {
+        queue.push(parsed.trim())
+      }
+      continue
+    } catch {
+      const normalized = text
+        .replace(/\bNone\b/g, 'null')
+        .replace(/\bTrue\b/g, 'true')
+        .replace(/\bFalse\b/g, 'false')
+        .replace(/([{,]\s*)'([^'\\]+?)'\s*:/g, '$1"$2":')
+        .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_.\- ]*)\s*:/g, '$1"$2":')
+        .replace(/:\s*'([^'\\]*?)'(\s*[,}\]])/g, ': "$1"$2')
+        .replace(/,\s*'([^'\\]*?)'(?=\s*[,}\]])/g, ', "$1"')
+      try {
+        const parsedFallback = JSON.parse(normalized)
+        if (parsedFallback && (Array.isArray(parsedFallback) || typeof parsedFallback === 'object')) return parsedFallback
+        if (typeof parsedFallback === 'string') {
+          const parsedFallbackString = String(parsedFallback || '').trim()
+          if (parsedFallbackString && !seen.has(parsedFallbackString)) queue.push(parsedFallbackString)
+        }
+      } catch {
+        // Handle double-encoded JSON-like strings that may contain escaped braces/quotes.
+        const decodedNormalized = decodeJsonStringContent(normalized).trim()
+        if (decodedNormalized && !seen.has(decodedNormalized)) queue.push(decodedNormalized)
+      }
+      if (text.includes('\\')) {
+        const decodedText = decodeJsonStringContent(text).trim()
+        if (decodedText && !seen.has(decodedText)) queue.push(decodedText)
+      }
+    }
+  }
+  return null
+}
+
+function extractObjectLikeKeyCandidates(value: unknown, limit = MAX_OBJECT_KEYS_PER_LEVEL): string[] {
+  if (typeof value !== 'string') return []
+  const text = String(value || '').trim()
+  if (!text) return []
+  const firstBrace = text.indexOf('{')
+  const firstBracket = text.indexOf('[')
+  const firstContainerIdx = [firstBrace, firstBracket]
+    .filter((idx) => idx >= 0)
+    .sort((a, b) => a - b)[0]
+  const containerText = (
+    (text.startsWith('{') && text.endsWith('}'))
+    || (text.startsWith('[') && text.endsWith(']'))
+    || ((text.startsWith('"') || text.startsWith("'")) && (text.endsWith('"') || text.endsWith("'")))
+  )
+    ? text
+    : (firstContainerIdx !== undefined ? text.slice(firstContainerIdx) : text)
+  if (!containerText) return []
+  const out: string[] = []
+  const seen = new Set<string>()
+  const pattern = /["']([^"']{1,160})["']\s*:/g
+  let match: RegExpExecArray | null = null
+  while ((match = pattern.exec(containerText)) !== null) {
+    const key = String(match[1] || '').trim()
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    out.push(key)
+    if (out.length >= Math.max(1, limit)) break
+  }
+  if (out.length < Math.max(1, limit)) {
+    const barePattern = /(?:^|[{,]\s*)([A-Za-z_][A-Za-z0-9_.\- ]{0,120})\s*:/g
+    let bareMatch: RegExpExecArray | null = null
+    while ((bareMatch = barePattern.exec(containerText)) !== null) {
+      const key = String(bareMatch[1] || '').trim()
+      if (!key || seen.has(key)) continue
+      seen.add(key)
+      out.push(key)
+      if (out.length >= Math.max(1, limit)) break
+    }
+  }
+  return out
+}
+
 function collectFieldPathsFromValue(value: unknown, basePath: string, out: Set<string>, depth: number): void {
   if (depth > MAX_PATH_DEPTH || out.size >= MAX_PATH_OPTIONS) return
+
+  const parsedJson = parseObjectLikeJsonString(value)
+  if (parsedJson && (Array.isArray(parsedJson) || typeof parsedJson === 'object')) {
+    collectFieldPathsFromValue(parsedJson, basePath, out, depth + 1)
+    return
+  }
+  if (typeof value === 'string') {
+    const looseKeys = extractObjectLikeKeyCandidates(value, MAX_OBJECT_KEYS_PER_LEVEL)
+    looseKeys.forEach((key) => {
+      const nextPath = appendPathSegment(basePath, key)
+      if (out.size < MAX_PATH_OPTIONS) out.add(nextPath)
+    })
+  }
 
   if (Array.isArray(value)) {
     if (basePath) out.add(basePath)
@@ -4081,7 +4903,7 @@ function collectFieldPathsFromValue(value: unknown, basePath: string, out: Set<s
   if (value && typeof value === 'object') {
     const entries = Object.entries(value as Record<string, unknown>).slice(0, MAX_OBJECT_KEYS_PER_LEVEL)
     entries.forEach(([key, child]) => {
-      const nextPath = basePath ? `${basePath}.${key}` : key
+      const nextPath = appendPathSegment(basePath, key)
       if (out.size < MAX_PATH_OPTIONS) out.add(nextPath)
       collectFieldPathsFromValue(child, nextPath, out, depth + 1)
     })
@@ -4091,10 +4913,57 @@ function collectFieldPathsFromValue(value: unknown, basePath: string, out: Set<s
 function extractSampleFieldPaths(rows: unknown): string[] {
   if (!Array.isArray(rows) || rows.length === 0) return []
   const out = new Set<string>()
-  rows.slice(0, 8).forEach((row) => {
+  rows.slice(0, MAX_SAMPLE_ROWS_FOR_PATH_DISCOVERY).forEach((row) => {
     collectFieldPathsFromValue(row, '', out, 0)
   })
   return uniqueFieldNames(Array.from(out))
+}
+
+function extractPriorityJsonFieldPaths(rows: unknown): string[] {
+  if (!Array.isArray(rows) || rows.length === 0) return []
+  const out = new Set<string>()
+  const matchPriorityField = (obj: Record<string, unknown>, wanted: string): string | null => {
+    const target = wanted.toLowerCase()
+    const hit = Object.keys(obj).find((key) => String(key || '').trim().toLowerCase() === target)
+    return hit || null
+  }
+  rows.slice(0, MAX_SAMPLE_ROWS_FOR_PATH_DISCOVERY).forEach((row) => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return
+    const rowObj = row as Record<string, unknown>
+    PRIORITY_JSON_FIELD_NAMES.forEach((priorityField) => {
+      const actualKey = matchPriorityField(rowObj, priorityField)
+      if (!actualKey) return
+      const rawValue = rowObj[actualKey]
+      if (rawValue && (Array.isArray(rawValue) || typeof rawValue === 'object')) {
+        collectFieldPathsFromValue(rawValue, actualKey, out, 0)
+        return
+      }
+      const parsed = parseObjectLikeJsonString(rawValue)
+      if (parsed && (Array.isArray(parsed) || typeof parsed === 'object')) {
+        collectFieldPathsFromValue(parsed, actualKey, out, 0)
+        return
+      }
+      const looseKeys = extractObjectLikeKeyCandidates(rawValue, MAX_OBJECT_KEYS_PER_LEVEL)
+      looseKeys.forEach((key) => {
+        const nextPath = appendPathSegment(actualKey, key)
+        if (out.size < MAX_PATH_OPTIONS) out.add(nextPath)
+      })
+    })
+  })
+  return uniqueFieldNames(Array.from(out))
+}
+
+function appendPathSegment(basePath: string, segment: string): string {
+  const base = String(basePath || '').trim()
+  const token = String(segment || '').trim()
+  if (!token) return base
+  if (!base) {
+    return SIMPLE_PATH_SEGMENT_PATTERN.test(token) ? token : `["${token.replace(/"/g, '\\"')}"]`
+  }
+  if (SIMPLE_PATH_SEGMENT_PATTERN.test(token)) {
+    return `${base}.${token}`
+  }
+  return `${base}["${token.replace(/"/g, '\\"')}"]`
 }
 
 function extractDirectNodeFields(node: ETLNode | undefined): string[] {
@@ -4128,6 +4997,34 @@ function parseRenameMappings(value: unknown): Array<{ from: string; to: string }
       return { from, to }
     })
     .filter((x): x is { from: string; to: string } => !!x)
+}
+
+function parseSelectFieldAliases(value: unknown): Record<string, string> {
+  const out: Record<string, string> = {}
+  const assignFromObject = (obj: Record<string, unknown>) => {
+    Object.entries(obj).forEach(([k, v]) => {
+      const path = String(k || '').trim()
+      const alias = String(v || '').trim()
+      if (path && alias) out[path] = alias
+    })
+  }
+
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    assignFromObject(value as Record<string, unknown>)
+    return out
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        assignFromObject(parsed as Record<string, unknown>)
+      }
+    } catch {
+      return {}
+    }
+  }
+  return out
 }
 
 function normalizeCronExpr(value: unknown): string {
@@ -4173,11 +5070,34 @@ function inferNodeOutputFields(
         ...custom.map((item) => String(item.name || '').trim()).filter(Boolean),
         ...(primaryKeyField ? [primaryKeyField] : []),
       ])
+      const customOutputPaths = uniqueFieldNames([
+        ...buildCustomOutputFieldPaths(custom),
+        ...(primaryKeyField ? [primaryKeyField] : []),
+      ])
       const includeSource = Boolean(cfg.custom_include_source_fields ?? true)
-      result = includeSource ? uniqueFieldNames([...passthroughFields, ...customNames]) : customNames
+      result = includeSource
+        ? uniqueFieldNames([...passthroughFields, ...customNames, ...customOutputPaths])
+        : uniqueFieldNames([...customNames, ...customOutputPaths])
     } else {
       const selected = parseFieldList(cfg.fields)
       result = selected.length > 0 ? selected : passthroughFields
+    }
+  } else if (nodeType === 'profile_query_transform') {
+    const selected = parseFieldList(cfg.select_fields)
+    const selectAliases = parseSelectFieldAliases(cfg.select_field_aliases)
+    const aliasNames = uniqueFieldNames(
+      selected
+        .map((fieldPath) => String(selectAliases[fieldPath] || '').trim())
+        .filter(Boolean)
+    )
+    const selectedWithAliases = uniqueFieldNames([...selected, ...aliasNames])
+    const includeOriginal = parseBoolLike(cfg.include_original_row, true)
+    if (selectedWithAliases.length > 0) {
+      result = includeOriginal
+        ? uniqueFieldNames([...passthroughFields, ...selectedWithAliases])
+        : selectedWithAliases
+    } else {
+      result = passthroughFields
     }
   } else if (nodeType === 'rename_transform') {
     const mappings = parseRenameMappings(cfg.mappings)
@@ -4211,17 +5131,70 @@ function buildIncomingByTarget(edges: Array<{ source: string; target: string }>)
   return incomingByTarget
 }
 
-function inferUpstreamInputFields(targetNodeId: string, nodes: ETLNode[], edges: Array<{ source: string; target: string }>): string[] {
+function collectUpstreamNodeIds(
+  startNodeId: string,
+  incomingByTarget: Map<string, string[]>,
+  maxNodes = 1500,
+): string[] {
+  const start = String(startNodeId || '').trim()
+  if (!start) return []
+  const out: string[] = []
+  const visited = new Set<string>()
+  const queue = [start]
+  while (queue.length > 0 && out.length < maxNodes) {
+    const nodeId = String(queue.shift() || '').trim()
+    if (!nodeId || visited.has(nodeId)) continue
+    visited.add(nodeId)
+    out.push(nodeId)
+    const parents = incomingByTarget.get(nodeId) || []
+    parents.forEach((pid) => {
+      const parentId = String(pid || '').trim()
+      if (parentId && !visited.has(parentId)) queue.push(parentId)
+    })
+  }
+  return out
+}
+
+function inferUpstreamInputFields(
+  targetNodeId: string,
+  nodes: ETLNode[],
+  edges: Array<{ source: string; target: string }>,
+  preferredSourceNodeIds?: string | string[],
+  strictPreferredSource = false,
+): string[] {
   const nodesById = new Map(nodes.map((n) => [n.id, n] as const))
   const incomingByTarget = buildIncomingByTarget(edges)
 
-  const incomingIds = uniqueFieldNames((incomingByTarget.get(targetNodeId) || []).map((id) => id))
+  const allIncomingIds = uniqueFieldNames((incomingByTarget.get(targetNodeId) || []).map((id) => id))
+  const preferredIds = uniqueFieldNames(
+    parseStringList(preferredSourceNodeIds).filter((id) => nodesById.has(id))
+  )
+  if (preferredIds.length > 0) {
+    const memo = new Map<string, string[]>()
+    const fields = uniqueFieldNames(
+      preferredIds.flatMap((srcId) =>
+        uniqueFieldNames([
+          ...inferNodeOutputFields(srcId, nodesById, incomingByTarget, memo, new Set<string>()),
+          ...extractDirectNodeFields(nodesById.get(srcId)),
+        ])
+      )
+    )
+    return filterUserFacingFieldNames(fields)
+  }
+
+  if (strictPreferredSource && parseStringList(preferredSourceNodeIds).length > 0) {
+    return []
+  }
+  const incomingIds = allIncomingIds
   if (incomingIds.length === 0) return []
 
   const memo = new Map<string, string[]>()
   const fields = uniqueFieldNames(
     incomingIds.flatMap((srcId) =>
-      inferNodeOutputFields(srcId, nodesById, incomingByTarget, memo, new Set<string>())
+      uniqueFieldNames([
+        ...inferNodeOutputFields(srcId, nodesById, incomingByTarget, memo, new Set<string>()),
+        ...extractDirectNodeFields(nodesById.get(srcId)),
+      ])
     )
   )
   return filterUserFacingFieldNames(fields)
@@ -4231,40 +5204,108 @@ function inferUpstreamSources(
   targetNodeId: string,
   nodes: ETLNode[],
   edges: Array<{ source: string; target: string }>
-): Array<{ id: string; label: string; fields: string[] }> {
+): Array<{ id: string; label: string; fields: string[]; nodeType: string }> {
   const nodesById = new Map(nodes.map((n) => [n.id, n] as const))
   const incomingByTarget = buildIncomingByTarget(edges)
   const incomingIds = uniqueFieldNames((incomingByTarget.get(targetNodeId) || []).map((id) => id))
   if (incomingIds.length === 0) return []
 
   const memo = new Map<string, string[]>()
-  return incomingIds.map((srcId) => {
+  const buildSourceDescriptor = (
+    srcId: string,
+    labelOverride?: string,
+  ): { id: string; label: string; fields: string[]; nodeType: string } => {
     const srcNode = nodesById.get(srcId)
-    const label = String(srcNode?.data?.label || srcNode?.data?.definition?.label || srcId)
-    const fields = inferNodeOutputFields(srcId, nodesById, incomingByTarget, memo, new Set<string>())
-    return { id: srcId, label, fields: uniqueFieldNames(fields) }
+    const label = String(labelOverride || srcNode?.data?.label || srcNode?.data?.definition?.label || srcId)
+    const nodeType = String(srcNode?.data?.nodeType || '').trim().toLowerCase()
+    const inferredFields = inferNodeOutputFields(srcId, nodesById, incomingByTarget, memo, new Set<string>())
+    const directFields = extractDirectNodeFields(srcNode)
+    const fields = uniqueFieldNames([...inferredFields, ...directFields])
+    return { id: srcId, label, fields, nodeType }
+  }
+
+  const list: Array<{ id: string; label: string; fields: string[]; nodeType: string }> = incomingIds.map((srcId) =>
+    buildSourceDescriptor(srcId)
+  )
+  const seenIds = new Set(list.map((item) => String(item.id || '').trim()).filter(Boolean))
+  const incomingSet = new Set(incomingIds)
+
+  incomingIds.forEach((directId) => {
+    const upstreamIds = collectUpstreamNodeIds(directId, incomingByTarget, 1500)
+    upstreamIds.forEach((upId) => {
+      const nid = String(upId || '').trim()
+      if (!nid || seenIds.has(nid) || incomingSet.has(nid)) return
+      const upNode = nodesById.get(nid)
+      const upType = String(upNode?.data?.nodeType || '').trim().toLowerCase()
+      if (upType !== 'profile_query_transform') return
+      const baseLabel = String(upNode?.data?.label || upNode?.data?.definition?.label || nid)
+      list.push(buildSourceDescriptor(nid, `${baseLabel} (Data Query)`))
+      seenIds.add(nid)
+    })
   })
+
+  return list
 }
 
-function extractPreviewRowsFromNode(node: ETLNode | undefined): Array<Record<string, unknown>> {
+type PreviewExtractOptions = {
+  includeConfigPreview?: boolean
+  includeExecutionOutput?: boolean
+  includeExecutionInput?: boolean
+}
+
+function extractPreviewRowsFromNode(
+  node: ETLNode | undefined,
+  options?: PreviewExtractOptions,
+): Array<Record<string, unknown>> {
   if (!node?.data) return []
   const cfg = (node.data.config && typeof node.data.config === 'object'
     ? node.data.config
     : {}) as Record<string, unknown>
 
+  const includeConfigPreview = options?.includeConfigPreview !== false
+  const includeExecutionOutput = options?.includeExecutionOutput !== false
+  const includeExecutionInput = options?.includeExecutionInput !== false
+
   const candidateSets = [
-    cfg._preview_rows,
-    node.data.executionSampleOutput,
-    node.data.executionSampleInput,
+    ...(includeConfigPreview ? [cfg._preview_rows] : []),
+    ...(includeExecutionOutput ? [node.data.executionSampleOutput] : []),
+    ...(includeExecutionInput ? [node.data.executionSampleInput] : []),
   ]
 
   const out: Array<Record<string, unknown>> = []
+  const seen = new Set<string>()
+  const buildSignature = (rowObj: Record<string, unknown>): string | null => {
+    try {
+      const json = JSON.stringify(rowObj)
+      if (!json) return null
+      if (json.length > MAX_PREVIEW_SIGNATURE_CHARS) return json.slice(0, MAX_PREVIEW_SIGNATURE_CHARS)
+      return json
+    } catch {
+      return null
+    }
+  }
+  const addRow = (rowObj: Record<string, unknown>) => {
+    const sig = buildSignature(rowObj)
+    if (sig && seen.has(sig)) return
+    if (sig) seen.add(sig)
+    out.push(rowObj)
+  }
+  const collectCandidate = (candidate: unknown) => {
+    if (candidate == null) return
+    if (Array.isArray(candidate)) {
+      candidate.forEach((item) => collectCandidate(item))
+      return
+    }
+    if (candidate && typeof candidate === 'object') {
+      addRow(candidate as Record<string, unknown>)
+      return
+    }
+    const parsed = parseObjectLikeJsonString(candidate)
+    if (parsed == null) return
+    collectCandidate(parsed)
+  }
   candidateSets.forEach((candidate) => {
-    if (!Array.isArray(candidate)) return
-    candidate.forEach((row) => {
-      if (!row || typeof row !== 'object' || Array.isArray(row)) return
-      out.push(row as Record<string, unknown>)
-    })
+    collectCandidate(candidate)
   })
   return out
 }
@@ -4273,23 +5314,260 @@ function inferUpstreamPreviewRows(
   targetNodeId: string,
   nodes: ETLNode[],
   edges: Array<{ source: string; target: string }>,
-  maxRows = 30
+  maxRows = 30,
+  preferredSourceNodeIds?: string | string[],
+  sourceOutputOnly = false,
+  strictPreferredSource = false,
 ): Array<Record<string, unknown>> {
   const nodesById = new Map(nodes.map((n) => [n.id, n] as const))
   const incomingByTarget = buildIncomingByTarget(edges)
-  const queue = [...(incomingByTarget.get(targetNodeId) || [])]
+  const allIncomingIds = uniqueFieldNames((incomingByTarget.get(targetNodeId) || []).map((id) => id))
+  const outputOnlyOptions: PreviewExtractOptions = {
+    includeConfigPreview: false,
+    includeExecutionOutput: true,
+    includeExecutionInput: false,
+  }
+  const outputOnlyWithConfigFallbackOptions: PreviewExtractOptions = {
+    includeConfigPreview: true,
+    includeExecutionOutput: true,
+    includeExecutionInput: false,
+  }
+  const makeRowSignature = (row: Record<string, unknown>): string | null => {
+    try {
+      const json = JSON.stringify(row)
+      if (!json) return null
+      if (json.length > MAX_PREVIEW_SIGNATURE_CHARS) return json.slice(0, MAX_PREVIEW_SIGNATURE_CHARS)
+      return json
+    } catch {
+      return null
+    }
+  }
+  const seededRows: Array<Record<string, unknown>> = []
+  const seededSeen = new Set<string>()
+  const pushSeededRow = (row: Record<string, unknown>) => {
+    if (seededRows.length >= maxRows) return
+    const sig = makeRowSignature(row)
+    if (sig && seededSeen.has(sig)) return
+    if (sig) seededSeen.add(sig)
+    seededRows.push(row)
+  }
+  const preferredIdsRaw = parseStringList(preferredSourceNodeIds)
+  const preferredIds = uniqueFieldNames(preferredIdsRaw.filter((id) => nodesById.has(id)))
+  if (sourceOutputOnly && preferredIds.length === 0 && allIncomingIds.length > 1) {
+    // Field discovery mode: when multiple upstream sources are connected and no
+    // explicit source is selected, sample from each source first so JSON/doc
+    // paths from later sources are not missed.
+    const perSourceCap = Math.max(1, Math.floor(maxRows / allIncomingIds.length))
+    const merged: Array<Record<string, unknown>> = []
+    const seenRows = new Set<string>()
+    const pushMerged = (row: Record<string, unknown>) => {
+      if (merged.length >= maxRows) return
+      const sig = makeRowSignature(row)
+      if (sig && seenRows.has(sig)) return
+      if (sig) seenRows.add(sig)
+      merged.push(row)
+    }
+    allIncomingIds.forEach((sourceId) => {
+      if (merged.length >= maxRows) return
+      const sourceNode = nodesById.get(sourceId)
+      let sourceRows = extractPreviewRowsFromNode(sourceNode, outputOnlyOptions)
+      if (!sourceRows.length) {
+        sourceRows = extractPreviewRowsFromNode(sourceNode, outputOnlyWithConfigFallbackOptions)
+      }
+      if (!sourceRows.length) {
+        sourceRows = extractPreviewRowsFromNode(
+          sourceNode,
+          {
+            includeConfigPreview: false,
+            includeExecutionOutput: false,
+            includeExecutionInput: true,
+          },
+        )
+      }
+      sourceRows.slice(0, perSourceCap).forEach(pushMerged)
+    })
+    if (merged.length > 0) return merged.slice(0, maxRows)
+  }
+  if (strictPreferredSource && preferredIdsRaw.length > 0 && preferredIds.length === 0) {
+    return []
+  }
+  if (preferredIds.length > 0) {
+    // Strict mode for selected source(s): do not mix ancestor nodes outside
+    // selected source list; combine selected sources in configured order.
+    const directMerged: Array<Record<string, unknown>> = []
+    const directSeen = new Set<string>()
+    const pushDirectMerged = (row: Record<string, unknown>) => {
+      if (directMerged.length >= maxRows) return
+      const sig = makeRowSignature(row)
+      if (sig && directSeen.has(sig)) return
+      if (sig) directSeen.add(sig)
+      directMerged.push(row)
+    }
+
+    preferredIds.forEach((preferredId) => {
+      if (directMerged.length >= maxRows) return
+      const preferredNode = nodesById.get(preferredId)
+      const rows = extractPreviewRowsFromNode(
+        preferredNode,
+        sourceOutputOnly
+          ? outputOnlyOptions
+          : undefined,
+      )
+      rows.forEach(pushDirectMerged)
+    })
+    if (directMerged.length > 0) {
+      if (!sourceOutputOnly || directMerged.length >= maxRows) {
+        return directMerged.slice(0, maxRows)
+      }
+      // For source-output-only mode, enrich small output samples with config preview
+      // rows from the same selected source list (if available), then dedupe.
+      preferredIds.forEach((preferredId) => {
+        if (directMerged.length >= maxRows) return
+        const preferredNode = nodesById.get(preferredId)
+        const configRows = extractPreviewRowsFromNode(
+          preferredNode,
+          {
+            includeConfigPreview: true,
+            includeExecutionOutput: false,
+            includeExecutionInput: false,
+          },
+        )
+        configRows.forEach(pushDirectMerged)
+      })
+      directMerged.forEach(pushSeededRow)
+      if (seededRows.length >= maxRows) return seededRows.slice(0, maxRows)
+    }
+    if (sourceOutputOnly) {
+      const fallbackMerged: Array<Record<string, unknown>> = []
+      const fallbackSeen = new Set<string>()
+      const pushFallbackMerged = (row: Record<string, unknown>) => {
+        if (fallbackMerged.length >= maxRows) return
+        const sig = makeRowSignature(row)
+        if (sig && fallbackSeen.has(sig)) return
+        if (sig) fallbackSeen.add(sig)
+        fallbackMerged.push(row)
+      }
+      preferredIds.forEach((preferredId) => {
+        if (fallbackMerged.length >= maxRows) return
+        const preferredNode = nodesById.get(preferredId)
+        const fallbackRows = extractPreviewRowsFromNode(
+          preferredNode,
+          outputOnlyWithConfigFallbackOptions,
+        )
+        fallbackRows.forEach(pushFallbackMerged)
+        // Some nodes can have no output sample yet. In that case, include
+        // selected-node input sample as fallback.
+        if (fallbackMerged.length < maxRows) {
+          const inputFallbackRows = extractPreviewRowsFromNode(
+            preferredNode,
+            {
+              includeConfigPreview: false,
+              includeExecutionOutput: false,
+              includeExecutionInput: true,
+            },
+          )
+          inputFallbackRows.forEach(pushFallbackMerged)
+        }
+      })
+      if (fallbackMerged.length > 0) {
+        fallbackMerged.forEach(pushSeededRow)
+        if (seededRows.length >= maxRows) return seededRows.slice(0, maxRows)
+      }
+    }
+  }
+  const queue = preferredIds.length > 0
+    ? [...preferredIds]
+    : [...allIncomingIds]
   const visited = new Set<string>()
-  const out: Array<Record<string, unknown>> = []
+  const out: Array<Record<string, unknown>> = seededRows.slice(0, maxRows)
+  const seen = new Set<string>()
+  out.forEach((row) => {
+    const sig = makeRowSignature(row)
+    if (sig) seen.add(sig)
+  })
+  const collectRowsForNode = (nodeId: string): Array<Record<string, unknown>> => {
+    const node = nodesById.get(nodeId)
+    let rows = extractPreviewRowsFromNode(
+      node,
+      sourceOutputOnly
+        ? outputOnlyOptions
+        : undefined,
+    )
+    if (sourceOutputOnly && rows.length === 0) {
+      rows = extractPreviewRowsFromNode(node, outputOnlyWithConfigFallbackOptions)
+    }
+    if (sourceOutputOnly && rows.length === 0) {
+      rows = extractPreviewRowsFromNode(
+        node,
+        {
+          includeConfigPreview: false,
+          includeExecutionOutput: false,
+          includeExecutionInput: true,
+        },
+      )
+    }
+    return rows
+  }
+
+  if (sourceOutputOnly && out.length < maxRows) {
+    // Fair sampling across upstream graph so one node's large sample does not
+    // hide sparse JSON/doc fields from deeper/upstream nodes.
+    const orderedNodeIds: string[] = []
+    const scanQueue = [...queue]
+    const scanVisited = new Set<string>()
+    while (scanQueue.length > 0 && orderedNodeIds.length < 256) {
+      const nodeId = String(scanQueue.shift() || '')
+      if (!nodeId || scanVisited.has(nodeId)) continue
+      scanVisited.add(nodeId)
+      orderedNodeIds.push(nodeId)
+      const upstream = incomingByTarget.get(nodeId) || []
+      upstream.forEach((srcId) => {
+        if (!scanVisited.has(srcId)) scanQueue.push(srcId)
+      })
+    }
+
+    const buckets = orderedNodeIds.map((nodeId) => ({
+      nodeId,
+      idx: 0,
+      rows: collectRowsForNode(nodeId),
+    }))
+    let progressed = true
+    while (out.length < maxRows && progressed) {
+      progressed = false
+      for (const bucket of buckets) {
+        while (bucket.idx < bucket.rows.length) {
+          const row = bucket.rows[bucket.idx]
+          bucket.idx += 1
+          const sig = makeRowSignature(row)
+          if (sig && seen.has(sig)) continue
+          if (sig) seen.add(sig)
+          out.push(row)
+          progressed = true
+          break
+        }
+        if (out.length >= maxRows) break
+      }
+    }
+
+    if (out.length > 0) {
+      return out.slice(0, maxRows)
+    }
+  }
 
   while (queue.length > 0 && out.length < maxRows) {
     const nodeId = String(queue.shift() || '')
     if (!nodeId || visited.has(nodeId)) continue
     visited.add(nodeId)
 
-    const node = nodesById.get(nodeId)
-    const rows = extractPreviewRowsFromNode(node)
+    const rows = collectRowsForNode(nodeId)
     if (rows.length > 0) {
-      out.push(...rows.slice(0, Math.max(0, maxRows - out.length)))
+      for (const row of rows) {
+        if (out.length >= maxRows) break
+        const sig = makeRowSignature(row)
+        if (sig && seen.has(sig)) continue
+        if (sig) seen.add(sig)
+        out.push(row)
+      }
       if (out.length >= maxRows) break
     }
 
@@ -4303,7 +5581,11 @@ function inferUpstreamPreviewRows(
 }
 
 function splitPathSegments(path: string): string[] {
-  const text = String(path || '').trim()
+  let text = String(path || '').trim()
+  if (!text) return []
+  if (text === '$') return []
+  if (text.startsWith('$.')) text = text.slice(2)
+  else if (text.startsWith('$[')) text = text.slice(1)
   if (!text) return []
   const out: string[] = []
   let current = ''
@@ -4339,34 +5621,94 @@ function splitPathSegments(path: string): string[] {
   return out
 }
 
-function readPathValue(row: Record<string, unknown>, path: string): { found: boolean; value: unknown } {
-  const segments = splitPathSegments(path)
-  if (segments.length === 0) return { found: false, value: undefined }
-  let current: unknown = row
-  for (const seg of segments) {
-    if (current === null || current === undefined) return { found: false, value: undefined }
+function readPathValues(row: Record<string, unknown>, path: string): unknown[] {
+  const rawPath = String(path || '').trim()
+  if (!rawPath) return []
+  if (Object.prototype.hasOwnProperty.call(row, rawPath)) {
+    return [row[rawPath]]
+  }
+  const normalizedPath = rawPath.startsWith('$.') ? rawPath.slice(2) : (rawPath.startsWith('$[') ? rawPath.slice(1) : rawPath)
+  if (normalizedPath && Object.prototype.hasOwnProperty.call(row, normalizedPath)) {
+    return [row[normalizedPath]]
+  }
+
+  const segments = splitPathSegments(normalizedPath)
+  if (segments.length === 0) return []
+  const out: unknown[] = []
+
+  const walk = (current: unknown, segIndex: number, depth: number) => {
+    if (depth > 32) return
+    const parsedJson = parseObjectLikeJsonString(current)
+    if (parsedJson && (Array.isArray(parsedJson) || typeof parsedJson === 'object')) {
+      current = parsedJson
+    }
+    if (segIndex >= segments.length) {
+      out.push(current)
+      return
+    }
+    if (current === null || current === undefined) return
+    const seg = segments[segIndex]
     if (Array.isArray(current)) {
       if (seg === '*') {
-        if (current.length === 0) return { found: false, value: undefined }
-        current = current[0]
-        continue
+        current.forEach((item) => walk(item, segIndex + 1, depth + 1))
+        return
       }
       const idx = Number(seg)
-      if (!Number.isInteger(idx) || idx < 0 || idx >= current.length) {
-        return { found: false, value: undefined }
-      }
-      current = current[idx]
-      continue
+      if (!Number.isInteger(idx) || idx < 0 || idx >= current.length) return
+      walk(current[idx], segIndex + 1, depth + 1)
+      return
     }
     if (typeof current === 'object') {
       const obj = current as Record<string, unknown>
-      if (!(seg in obj)) return { found: false, value: undefined }
-      current = obj[seg]
-      continue
+      if (seg === '*') {
+        Object.values(obj).forEach((value) => walk(value, segIndex + 1, depth + 1))
+        return
+      }
+      if (seg in obj) {
+        walk(obj[seg], segIndex + 1, depth + 1)
+        return
+      }
+      const lowerSeg = String(seg || '').toLowerCase()
+      const hitKey = Object.keys(obj).find((key) => String(key || '').toLowerCase() === lowerSeg)
+      if (hitKey) {
+        walk(obj[hitKey], segIndex + 1, depth + 1)
+        return
+      }
+      // Fallback: when source row stores JSON as string in a parent column,
+      // attempt to resolve the same path inside embedded object-like payloads.
+      Object.values(obj).forEach((value) => {
+        const embedded = parseObjectLikeJsonString(value)
+        if (embedded && (Array.isArray(embedded) || typeof embedded === 'object')) {
+          walk(embedded, segIndex, depth + 1)
+        }
+      })
+      return
     }
-    return { found: false, value: undefined }
   }
-  return { found: true, value: current }
+
+  walk(row, 0, 0)
+  if (out.length <= 1) return out
+  const seen = new Set<string>()
+  const deduped: unknown[] = []
+  out.forEach((value) => {
+    let key = ''
+    try {
+      key = JSON.stringify(value)
+    } catch {
+      key = String(value)
+    }
+    if (!seen.has(key)) {
+      seen.add(key)
+      deduped.push(value)
+    }
+  })
+  return deduped
+}
+
+function readPathValue(row: Record<string, unknown>, path: string): { found: boolean; value: unknown } {
+  const values = readPathValues(row, path)
+  if (!values.length) return { found: false, value: undefined }
+  return { found: true, value: values[0] }
 }
 
 function hasMeaningfulValue(value: unknown): boolean {
@@ -4394,9 +5736,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const {
     nodes,
     edges,
+    connectorType,
     selectedNodeId,
     pipeline,
     isExecuting,
+    setEdges,
     updateNodeConfig,
     updateNodeConfigSilent,
     updateNodeLabel,
@@ -4405,6 +5749,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   } = useWorkflowStore()
   const [form] = Form.useForm()
   const [activeTab, setActiveTab] = useState('config')
+  const [businessWorkflowOptions, setBusinessWorkflowOptions] = useState<Array<{ value: string; label: string }>>([])
+  const [businessWorkflowOptionsLoading, setBusinessWorkflowOptionsLoading] = useState(false)
+  const [businessWorkflowOptionsError, setBusinessWorkflowOptionsError] = useState<string | null>(null)
   const [jsonPathDetectLoading, setJsonPathDetectLoading] = useState(false)
   const [jsonPathDetectError, setJsonPathDetectError] = useState<string | null>(null)
   const [sourceFieldDetectLoading, setSourceFieldDetectLoading] = useState(false)
@@ -4414,9 +5761,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [customFieldBeautifyUndoById, setCustomFieldBeautifyUndoById] = useState<Record<string, CustomFieldBeautifyBackup>>({})
   const [customIncludeSourceDraft, setCustomIncludeSourceDraft] = useState(true)
   const [customExpressionEngineDraft, setCustomExpressionEngineDraft] = useState<CustomExpressionEngine>('auto')
+  const [customFnsVersionDraft, setCustomFnsVersionDraft] = useState<CustomFnsVersion>('v1')
+  const [customFnsV2DedupeKeyFieldDraft, setCustomFnsV2DedupeKeyFieldDraft] = useState('')
+  const [customFnsV2OnDuplicateDraft, setCustomFnsV2OnDuplicateDraft] = useState<CustomFnsV2OnDuplicate>('ignore')
+  const [customFnsV2NormalizeDraft, setCustomFnsV2NormalizeDraft] = useState<CustomFnsV2Normalize>('upper_trim')
+  const [customFnsV2InvalidKeyDraft, setCustomFnsV2InvalidKeyDraft] = useState<CustomFnsV2InvalidKey>('skip')
+  const [customFnsV2RowGateDedupeEnabledDraft, setCustomFnsV2RowGateDedupeEnabledDraft] = useState(false)
   const [customPrimaryKeyFieldDraft, setCustomPrimaryKeyFieldDraft] = useState('')
   const [customProfileEnabledDraft, setCustomProfileEnabledDraft] = useState(false)
   const [customProfileStorageDraft, setCustomProfileStorageDraft] = useState<CustomProfileStorage>('lmdb')
+  const [customProfileLmdbEnvPathDraft, setCustomProfileLmdbEnvPathDraft] = useState('')
   const [customProfileOracleHostDraft, setCustomProfileOracleHostDraft] = useState('')
   const [customProfileOraclePortDraft, setCustomProfileOraclePortDraft] = useState(1521)
   const [customProfileOracleServiceNameDraft, setCustomProfileOracleServiceNameDraft] = useState('')
@@ -4445,6 +5799,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [customProfileAppendUniqueEntityLimitDraft, setCustomProfileAppendUniqueEntityLimitDraft] = useState(10000)
   const [customProfileAppendUniqueDisableRatioDraft, setCustomProfileAppendUniqueDisableRatioDraft] = useState(0.35)
   const [customProfileEmitModeDraft, setCustomProfileEmitModeDraft] = useState<'changed_only' | 'all_entities'>('changed_only')
+  const [customProfileEmitIncrementalRowsDraft, setCustomProfileEmitIncrementalRowsDraft] = useState<boolean | null>(null)
   const [customProfileRequiredFieldsDraft, setCustomProfileRequiredFieldsDraft] = useState<string[]>([])
   const [customProfileEventTimeFieldDraft, setCustomProfileEventTimeFieldDraft] = useState('')
   const [customProfileWindowDaysDraft, setCustomProfileWindowDaysDraft] = useState('1,7,30')
@@ -4506,8 +5861,83 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [validationLmdbEndKeyDraft, setValidationLmdbEndKeyDraft] = useState('')
   const [validationLmdbKeyContainsDraft, setValidationLmdbKeyContainsDraft] = useState('')
   const [validationLmdbLimitDraft, setValidationLmdbLimitDraft] = useState(50)
+  const [conditionStudioOpen, setConditionStudioOpen] = useState(false)
+  const [conditionFieldRefreshNonce, setConditionFieldRefreshNonce] = useState(0)
+  const [conditionProfileDocFieldHints, setConditionProfileDocFieldHints] = useState<string[]>([])
+  const [conditionRemoteFieldHints, setConditionRemoteFieldHints] = useState<string[]>([])
+  const [conditionRemotePreviewRows, setConditionRemotePreviewRows] = useState<Array<Record<string, unknown>>>([])
+  const [conditionRemoteDetectionLoading, setConditionRemoteDetectionLoading] = useState(false)
+  const [conditionRemoteDetectionError, setConditionRemoteDetectionError] = useState<string | null>(null)
+  const [conditionDragRuleId, setConditionDragRuleId] = useState<string | null>(null)
+  const [conditionActiveRuleId, setConditionActiveRuleId] = useState<string | null>(null)
+  const [conditionPickerAssignTarget, setConditionPickerAssignTarget] = useState<'field' | 'right_field' | 'right_literal'>('field')
+  const [conditionManualFieldPath, setConditionManualFieldPath] = useState('')
+  const [conditionFieldSearchQuery, setConditionFieldSearchQuery] = useState('')
+  const [conditionTreeExpandedKeys, setConditionTreeExpandedKeys] = useState<string[]>([])
+  const [conditionTreeExpansionInitialized, setConditionTreeExpansionInitialized] = useState(false)
+  const [conditionQuickPickExpanded, setConditionQuickPickExpanded] = useState(false)
+  const [conditionCriteriaDraft, setConditionCriteriaDraft] = useState<Array<Record<string, any>>>([])
+  const [conditionMatchModeDraft, setConditionMatchModeDraft] = useState<'all' | 'any'>('all')
+  const [conditionCaseSensitiveDraft, setConditionCaseSensitiveDraft] = useState(false)
+  const [conditionRoutingModeDraft, setConditionRoutingModeDraft] = useState<'boolean' | 'case'>('boolean')
+  const [conditionShowRouteLabelsDraft, setConditionShowRouteLabelsDraft] = useState(true)
+  const [conditionCaseRoutesDraft, setConditionCaseRoutesDraft] = useState<ConditionCaseRoute[]>([])
+  const [conditionCaseElseTargetNodeIdsDraft, setConditionCaseElseTargetNodeIdsDraft] = useState<string[]>([])
+  const [conditionTrueTargetNodeId, setConditionTrueTargetNodeId] = useState('')
+  const [conditionFalseTargetNodeId, setConditionFalseTargetNodeId] = useState('')
+  const [conditionCaseStudioTab, setConditionCaseStudioTab] = useState<'route_mapping' | 'preview_distribution'>('route_mapping')
+  const [conditionValidationLoading, setConditionValidationLoading] = useState(false)
+  const [conditionValidationError, setConditionValidationError] = useState<string | null>(null)
+  const [conditionValidationRemoteSummary, setConditionValidationRemoteSummary] = useState<ConditionValidationResult | null>(null)
+  const [conditionValidationSourceMode, setConditionValidationSourceMode] = useState<'upstream_preview' | 'profile_store' | 'source_scan' | 'data_query_output'>('upstream_preview')
+  const [conditionValidationTargetNodeId, setConditionValidationTargetNodeId] = useState('')
+  const [conditionValidationMaxRows, setConditionValidationMaxRows] = useState<number>(100000)
+  const conditionStudioInitialConfigRef = useRef<Record<string, unknown> | null>(null)
+  const [dataQueryStudioOpen, setDataQueryStudioOpen] = useState(false)
+  const [dataQueryCriteriaDraft, setDataQueryCriteriaDraft] = useState<Array<Record<string, any>>>([])
+  const [dataQueryModeDraft, setDataQueryModeDraft] = useState<'upstream' | 'pushdown' | 'hybrid'>('hybrid')
+  const [dataQueryMatchModeDraft, setDataQueryMatchModeDraft] = useState<'all' | 'any'>('all')
+  const [dataQuerySelectFieldsDraft, setDataQuerySelectFieldsDraft] = useState<string[]>([])
+  const [dataQuerySelectFieldSortsDraft, setDataQuerySelectFieldSortsDraft] = useState<Record<string, 'none' | 'asc' | 'desc'>>({})
+  const [dataQuerySelectFieldAliasesDraft, setDataQuerySelectFieldAliasesDraft] = useState<Record<string, string>>({})
+  const [dataQueryArrayOutputModeDraft, setDataQueryArrayOutputModeDraft] = useState<'list' | 'explode_rows'>('list')
+  const [dataQueryArrayMatchModeDraft, setDataQueryArrayMatchModeDraft] = useState<'all_elements' | 'matched_elements_only'>('all_elements')
+  const [dataQueryIncludeOriginalRowDraft, setDataQueryIncludeOriginalRowDraft] = useState(true)
+  const [dataQueryOffsetDraft, setDataQueryOffsetDraft] = useState<number>(0)
+  const [dataQueryLimitDraft, setDataQueryLimitDraft] = useState<number>(0)
+  const [dataQueryProfilePatchEnabledDraft, setDataQueryProfilePatchEnabledDraft] = useState(false)
+  const [dataQueryProfilePatchReflectOutputDraft, setDataQueryProfilePatchReflectOutputDraft] = useState(true)
+  const [dataQueryProfilePatchStageDraft, setDataQueryProfilePatchStageDraft] = useState<'pre' | 'post'>('post')
+  const [dataQueryProfilePatchStorageDraft, setDataQueryProfilePatchStorageDraft] = useState<'lmdb' | 'rocksdb' | 'redis' | 'oracle'>('lmdb')
+  const [dataQueryProfilePatchNodeIdDraft, setDataQueryProfilePatchNodeIdDraft] = useState('')
+  const [dataQueryProfilePatchPrimaryKeyFieldDraft, setDataQueryProfilePatchPrimaryKeyFieldDraft] = useState('')
+  const [dataQueryProfilePatchDocumentPathDraft, setDataQueryProfilePatchDocumentPathDraft] = useState('')
+  const [dataQueryProfilePatchValueModeDraft, setDataQueryProfilePatchValueModeDraft] = useState<'row' | 'fixed'>('row')
+  const [dataQueryProfilePatchValueDraft, setDataQueryProfilePatchValueDraft] = useState('')
+  const [dataQueryProfilePatchTargetPathDraft, setDataQueryProfilePatchTargetPathDraft] = useState('')
+  const [dataQueryProfilePatchMergeModeDraft, setDataQueryProfilePatchMergeModeDraft] = useState<'merge' | 'replace'>('merge')
+  const [dataQueryProfilePatchOpsDraft, setDataQueryProfilePatchOpsDraft] = useState<DataQueryProfilePatchOperation[]>([])
+  const [dataQueryActiveRuleId, setDataQueryActiveRuleId] = useState<string | null>(null)
+  const [dataQueryManualFieldPath, setDataQueryManualFieldPath] = useState('')
+  const [dataQueryFieldSearchQuery, setDataQueryFieldSearchQuery] = useState('')
+  const [dataQueryTreeExpandedKeys, setDataQueryTreeExpandedKeys] = useState<string[]>([])
+  const [dataQueryCompactView, setDataQueryCompactView] = useState(true)
+  const [dataQueryShowQuickPicker, setDataQueryShowQuickPicker] = useState(false)
+  const [dataQueryPreviewSummary, setDataQueryPreviewSummary] = useState<DataQueryPreviewSummary>({
+    ran: false,
+    inputRows: 0,
+    matchedRows: 0,
+    outputRows: 0,
+    matchedSamples: [],
+    outputSamples: [],
+  })
+  const dataQueryStudioInitialConfigRef = useRef<Record<string, unknown> | null>(null)
   const [activeExpressionFieldId, setActiveExpressionFieldId] = useState<string | null>(null)
+  const [activeCustomFieldEditorTarget, setActiveCustomFieldEditorTarget] = useState<{ fieldId: string; mode: CustomFieldMode } | null>(null)
   const customEditorViewStateRef = useRef<Record<string, CustomEditorViewStateSnapshot>>({})
+  const inlineExpressionEditorRef = useRef<Record<string, any>>({})
+  const expandedExpressionEditorRef = useRef<any | null>(null)
+  const lastFocusedExpressionEditorRef = useRef<any | null>(null)
   const [customEditorColorProfile, setCustomEditorColorProfile] = useState<CustomEditorColorProfile>(() => loadCustomEditorPrefs().colorProfile)
   const [customEditorFontPreset, setCustomEditorFontPreset] = useState<CustomEditorFontPreset>(() => loadCustomEditorPrefs().fontPreset)
   const [customEditorBeautifyStyle, setCustomEditorBeautifyStyle] = useState<CustomBeautifyStyle>(() => loadCustomEditorPrefs().beautifyStyle)
@@ -4761,6 +6191,40 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setLmdbJsonEditorOpen(false)
     setLmdbJsonEditorError(null)
     setLmdbJsonTagFilter('')
+    conditionStudioInitialConfigRef.current = null
+    setConditionStudioOpen(false)
+    setConditionDragRuleId(null)
+    setConditionActiveRuleId(null)
+    setConditionPickerAssignTarget('field')
+    setConditionTrueTargetNodeId('')
+    setConditionFalseTargetNodeId('')
+    dataQueryStudioInitialConfigRef.current = null
+    setDataQueryStudioOpen(false)
+    setDataQueryCriteriaDraft([])
+    setDataQueryModeDraft('hybrid')
+    setDataQueryMatchModeDraft('all')
+    setDataQuerySelectFieldsDraft([])
+    setDataQuerySelectFieldSortsDraft({})
+    setDataQuerySelectFieldAliasesDraft({})
+    setDataQueryArrayOutputModeDraft('list')
+    setDataQueryArrayMatchModeDraft('all_elements')
+    setDataQueryIncludeOriginalRowDraft(true)
+    setDataQueryOffsetDraft(0)
+    setDataQueryLimitDraft(0)
+    setDataQueryActiveRuleId(null)
+    setDataQueryManualFieldPath('')
+    setDataQueryFieldSearchQuery('')
+    setDataQueryTreeExpandedKeys([])
+    setDataQueryCompactView(true)
+    setDataQueryShowQuickPicker(false)
+    setDataQueryPreviewSummary({
+      ran: false,
+      inputRows: 0,
+      matchedRows: 0,
+      outputRows: 0,
+      matchedSamples: [],
+      outputSamples: [],
+    })
   }, [selectedNodeId])
 
   useEffect(() => {
@@ -4818,6 +6282,79 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const fileType     = getFileType(nodeType)
   const isApiJsonNode = nodeType === 'rest_api_source' || nodeType === 'graphql_source'
   const nodeConfig = (data?.config && typeof data.config === 'object' ? data.config : {}) as Record<string, unknown>
+  const conditionStudioEditingActive = conditionStudioOpen && nodeType === 'condition_node' && !!selectedNodeId
+  const refreshBusinessWorkflowOptions = useCallback(async () => {
+    if (nodeType !== 'business_workflow') return
+    setBusinessWorkflowOptionsLoading(true)
+    setBusinessWorkflowOptionsError(null)
+    try {
+      const rows = await api.listBusinessWorkflows()
+      const options = (Array.isArray(rows) ? rows : [])
+        .map((item: any) => {
+          const id = String(item?.id || '').trim()
+          if (!id) return null
+          const name = String(item?.name || id).trim() || id
+          return { value: id, label: `${name} (${id})` }
+        })
+        .filter((item): item is { value: string; label: string } => Boolean(item))
+      setBusinessWorkflowOptions(options)
+    } catch (err: any) {
+      setBusinessWorkflowOptions([])
+      setBusinessWorkflowOptionsError(String(err?.message || 'Failed to load business workflow list'))
+    } finally {
+      setBusinessWorkflowOptionsLoading(false)
+    }
+  }, [nodeType])
+  useEffect(() => {
+    if (!open || nodeType !== 'business_workflow') {
+      setBusinessWorkflowOptions([])
+      setBusinessWorkflowOptionsError(null)
+      setBusinessWorkflowOptionsLoading(false)
+      return
+    }
+    void refreshBusinessWorkflowOptions()
+  }, [open, nodeType, selectedNodeId, refreshBusinessWorkflowOptions])
+  const conditionStudioDraftSnapshot = useMemo(() => (
+    pickConditionStudioSnapshot({
+      ...nodeConfig,
+      criteria: conditionCriteriaDraft,
+      criteria_mode: conditionMatchModeDraft,
+      case_sensitive: conditionCaseSensitiveDraft,
+      condition_routing_mode: conditionRoutingModeDraft,
+      condition_true_target_node_id: conditionTrueTargetNodeId,
+      condition_false_target_node_id: conditionFalseTargetNodeId,
+      condition_show_route_labels: conditionShowRouteLabelsDraft,
+      case_routes: conditionCaseRoutesDraft,
+      case_else_target_node_ids: conditionCaseElseTargetNodeIdsDraft,
+      condition_validation_source: conditionValidationSourceMode,
+      condition_validation_target_node_id: conditionValidationTargetNodeId,
+      condition_validation_max_rows: conditionValidationMaxRows,
+    })
+  ), [
+    nodeConfig,
+    conditionCriteriaDraft,
+    conditionMatchModeDraft,
+    conditionCaseSensitiveDraft,
+    conditionRoutingModeDraft,
+    conditionTrueTargetNodeId,
+    conditionFalseTargetNodeId,
+    conditionShowRouteLabelsDraft,
+    conditionCaseRoutesDraft,
+    conditionCaseElseTargetNodeIdsDraft,
+    conditionValidationSourceMode,
+    conditionValidationTargetNodeId,
+    conditionValidationMaxRows,
+  ])
+  const conditionStudioHasUnsavedChanges = useMemo(() => {
+    if (!conditionStudioOpen || nodeType !== 'condition_node') return false
+    const initial = conditionStudioInitialConfigRef.current
+    if (!initial) return false
+    try {
+      return JSON.stringify(initial) !== JSON.stringify(conditionStudioDraftSnapshot)
+    } catch {
+      return true
+    }
+  }, [conditionStudioOpen, nodeType, conditionStudioDraftSnapshot])
   const nodeEnabled = parseBoolLike(nodeConfig.node_enabled, true)
   const configuredCustomFields = parseCustomFieldSpecs(nodeConfig.custom_fields)
   const customFieldConfiguredCount = configuredCustomFields.length
@@ -4860,6 +6397,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       value_format: String(nodeConfig.value_format || 'auto') as 'auto' | 'json' | 'text' | 'base64',
       flatten_json_values: parseBoolLike(nodeConfig.flatten_json_values, true),
       expand_profile_documents: parseBoolLike(nodeConfig.expand_profile_documents, true),
+      include_entity_meta: parseBoolLike(nodeConfig.include_entity_meta, false),
       limit: Number(nodeConfig.limit ?? 1000),
     }),
     [nodeConfig]
@@ -5246,6 +6784,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => uniqueFieldNames([
       String(lmdbStudioDraft.env_path || '').trim(),
       String(lmdbConfigured.env_path || '').trim(),
+      String(customProfileLmdbEnvPathDraft || '').trim(),
       String(validationLmdbEnvPathDraft || '').trim(),
       ...lmdbDiscoveredPaths,
       `${kvSourceRootVar}/${isRocksdbSource ? 'profile_store.rocksdb' : 'profile_store.lmdb'}`,
@@ -5257,6 +6796,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     [
       lmdbStudioDraft.env_path,
       lmdbConfigured.env_path,
+      customProfileLmdbEnvPathDraft,
       validationLmdbEnvPathDraft,
       lmdbDiscoveredPaths,
       kvSourceRootVar,
@@ -5315,7 +6855,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     : ''
   const upstreamReferenceFields = useMemo(
     () => (
-      nodeType === 'map_transform' && selectedNodeId
+      (nodeType === 'map_transform' || nodeType === 'profile_query_transform') && selectedNodeId
         ? inferUpstreamInputFields(selectedNodeId, nodes, edges)
         : []
     ),
@@ -5323,13 +6863,425 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   )
   const upstreamPreviewReferenceFields = useMemo(
     () => {
-      if (nodeType !== 'map_transform' || !selectedNodeId) return []
+      if ((nodeType !== 'map_transform' && nodeType !== 'profile_query_transform') || !selectedNodeId) return []
       const previewRows = inferUpstreamPreviewRows(selectedNodeId, nodes, edges, 300)
       if (!previewRows.length) return []
       return filterUserFacingFieldNames(extractSampleFieldPaths(previewRows))
     },
     [nodeType, selectedNodeId, nodes, edges]
   )
+  const conditionSelectedSourceNodeIds = useMemo(
+    () => {
+      const selectedMulti = parseStringList(nodeConfig.condition_source_node_ids)
+      if (selectedMulti.length > 0) return selectedMulti
+      return parseStringList(
+        nodeConfig.condition_source_node_id
+        || nodeConfig.input_source_node_id
+        || '',
+      )
+    },
+    [nodeConfig.condition_source_node_ids, nodeConfig.condition_source_node_id, nodeConfig.input_source_node_id]
+  )
+  const conditionPreviewRowsLimit = useMemo(() => {
+    const raw = Number(nodeConfig.sample_rows_limit ?? 1000)
+    if (!Number.isFinite(raw)) return 1000
+    if (raw <= 0) return 100000
+    return Math.max(1, Math.min(Math.trunc(raw), 100000))
+  }, [nodeConfig.sample_rows_limit])
+  const conditionAllUpstreamSources = useMemo(
+    () => (
+      nodeType === 'condition_node' && selectedNodeId
+        ? inferUpstreamSources(selectedNodeId, nodes, edges)
+        : []
+    ),
+    [nodeType, selectedNodeId, nodes, edges, conditionFieldRefreshNonce]
+  )
+  const conditionResolvedSourceNodeIds = useMemo(
+    () => {
+      const allIds = new Set(conditionAllUpstreamSources.map((src) => String(src.id || '').trim()).filter(Boolean))
+      const selectedValid = conditionSelectedSourceNodeIds.filter((id) => allIds.has(String(id || '').trim()))
+      if (selectedValid.length > 0) return uniqueFieldNames(selectedValid)
+      if (conditionAllUpstreamSources.length === 1) {
+        return parseStringList(String(conditionAllUpstreamSources[0]?.id || '').trim())
+      }
+      return []
+    },
+    [conditionSelectedSourceNodeIds, conditionAllUpstreamSources]
+  )
+  const conditionUpstreamCandidateNodes = useMemo(
+    () => {
+      if (nodeType !== 'condition_node' || !selectedNodeId) return [] as Array<{
+        id: string
+        label: string
+        nodeType: string
+        config: Record<string, unknown>
+      }>
+      const preferredSourceIds = conditionResolvedSourceNodeIds.map((id) => String(id || '').trim()).filter(Boolean)
+      const allSourceIds = conditionAllUpstreamSources.map((src) => String(src.id || '').trim()).filter(Boolean)
+      const sourceIds = uniqueFieldNames([...preferredSourceIds, ...allSourceIds])
+      if (sourceIds.length === 0) return []
+      const nodeMap = new Map(nodes.map((item) => [String(item.id || ''), item] as const))
+      const incomingByTarget = buildIncomingByTarget(edges)
+      const visited = new Set<string>()
+      const out: Array<{
+        id: string
+        label: string
+        nodeType: string
+        config: Record<string, unknown>
+      }> = []
+      const queue = [...sourceIds]
+      while (queue.length > 0 && out.length < 1000) {
+        const nid = String(queue.shift() || '').trim()
+        if (!nid || visited.has(nid)) continue
+        visited.add(nid)
+        const sourceNode = nodeMap.get(nid)
+        const srcType = String(sourceNode?.data?.nodeType || '').trim().toLowerCase()
+        const srcCfg = (
+          sourceNode?.data?.config && typeof sourceNode.data.config === 'object'
+            ? sourceNode.data.config
+            : {}
+        ) as Record<string, unknown>
+        out.push({
+          id: nid,
+          label: String(sourceNode?.data?.label || sourceNode?.data?.definition?.label || nid),
+          nodeType: srcType,
+          config: srcCfg,
+        })
+        const parents = incomingByTarget.get(nid) || []
+        parents.forEach((pid) => {
+          const p = String(pid || '').trim()
+          if (p && !visited.has(p)) queue.push(p)
+        })
+      }
+      return out
+    },
+    [
+      nodeType,
+      selectedNodeId,
+      nodes,
+      edges,
+      conditionAllUpstreamSources,
+      conditionResolvedSourceNodeIds,
+    ]
+  )
+  const conditionValidationSourceNodeOptions = useMemo(
+    () => conditionUpstreamCandidateNodes
+      .filter((item) => item.nodeType.endsWith('_source'))
+      .map((item) => ({
+        value: item.id,
+        label: `${item.label} (${item.nodeType})`,
+        nodeType: item.nodeType,
+        config: item.config,
+      })),
+    [conditionUpstreamCandidateNodes]
+  )
+  const conditionValidationDataQueryNodeOptions = useMemo(
+    () => conditionUpstreamCandidateNodes
+      .filter((item) => item.nodeType === 'profile_query_transform')
+      .map((item) => ({
+        value: item.id,
+        label: `${item.label} (data query)`,
+        nodeType: item.nodeType,
+        config: item.config,
+      })),
+    [conditionUpstreamCandidateNodes]
+  )
+  const conditionValidationProfileNodeOptions = useMemo(
+    () => conditionUpstreamCandidateNodes
+      .filter((item) => item.nodeType === 'map_transform' && parseBoolLike(item.config.custom_profile_enabled, false))
+      .map((item) => ({
+        value: item.id,
+        label: `${item.label} (profile)`,
+        config: item.config,
+      })),
+    [conditionUpstreamCandidateNodes]
+  )
+  const isAnyNodeDragging = useMemo(
+    () => nodes.some((item) => Boolean((item as any)?.dragging)),
+    [nodes]
+  )
+  const conditionUpstreamFieldsCacheRef = useRef<string[]>([])
+  const conditionUpstreamPathFieldsCacheRef = useRef<{ allPaths: string[]; userPaths: string[] }>({
+    allPaths: [],
+    userPaths: [],
+  })
+  const conditionPreviewRowsCacheRef = useRef<Array<Record<string, unknown>>>([])
+  const conditionFieldOptionsCacheRef = useRef<string[]>([])
+  const conditionFieldSampleRowsCacheRef = useRef<Array<Record<string, unknown>>>([])
+  const conditionFieldOptionsBySourceCacheRef = useRef<Array<{ sourceId: string; sourceLabel: string; fields: string[]; sourceType: string }>>([])
+  const conditionFieldTreeDataCacheRef = useRef<any[]>([])
+  const conditionFieldSamplesCacheRef = useRef<Map<string, string>>(new Map<string, string>())
+  const conditionIncomingInputFieldHintsCacheRef = useRef<string[]>([])
+  const conditionUpstreamFields = useMemo(
+    () => {
+      if (!conditionStudioEditingActive) return conditionUpstreamFieldsCacheRef.current
+      if (isAnyNodeDragging) return conditionUpstreamFieldsCacheRef.current
+      const computed = inferUpstreamInputFields(
+        selectedNodeId,
+        nodes,
+        edges,
+        conditionResolvedSourceNodeIds,
+        true,
+      )
+      conditionUpstreamFieldsCacheRef.current = computed
+      return computed
+    },
+    [conditionStudioEditingActive, selectedNodeId, nodes, edges, conditionResolvedSourceNodeIds, isAnyNodeDragging, conditionFieldRefreshNonce]
+  )
+  const conditionFieldDiscoveryRowsLimit = useMemo(
+    () => Math.max(1, Math.min(Number(conditionPreviewRowsLimit || 30), MAX_SAMPLE_ROWS_FOR_PATH_DISCOVERY)),
+    [conditionPreviewRowsLimit]
+  )
+  const conditionUpstreamPathFields = useMemo(
+    () => {
+      if (!conditionStudioEditingActive) {
+        return conditionUpstreamPathFieldsCacheRef.current
+      }
+      if (!selectedNodeId) {
+        return { allPaths: [] as string[], userPaths: [] as string[] }
+      }
+      if (isAnyNodeDragging) {
+        return conditionUpstreamPathFieldsCacheRef.current
+      }
+      const previewRows = inferUpstreamPreviewRows(
+        selectedNodeId,
+        nodes,
+        edges,
+        conditionFieldDiscoveryRowsLimit,
+        conditionResolvedSourceNodeIds,
+        true,
+        true,
+      )
+      const relaxedRows = previewRows.length > 0
+        ? previewRows
+        : inferUpstreamPreviewRows(
+          selectedNodeId,
+          nodes,
+          edges,
+          conditionFieldDiscoveryRowsLimit,
+          conditionResolvedSourceNodeIds,
+          false,
+          true,
+        )
+      if (!relaxedRows.length) {
+        return { allPaths: [] as string[], userPaths: [] as string[] }
+      }
+      const priorityJsonPaths = extractPriorityJsonFieldPaths(relaxedRows)
+      const allPaths = uniqueFieldNames([
+        ...priorityJsonPaths,
+        ...extractSampleFieldPaths(relaxedRows),
+      ])
+      const next = {
+        allPaths,
+        userPaths: filterUserFacingFieldNames(allPaths),
+      }
+      conditionUpstreamPathFieldsCacheRef.current = next
+      return next
+    },
+    [conditionStudioEditingActive, selectedNodeId, nodes, edges, conditionResolvedSourceNodeIds, conditionFieldDiscoveryRowsLimit, isAnyNodeDragging, conditionFieldRefreshNonce]
+  )
+  const conditionSelfPreviewFields = useMemo(
+    () => {
+      if (nodeType !== 'condition_node') return []
+      // When a specific source node is selected, avoid mixing stale condition
+      // node output into Source Node Output Fields.
+      if (conditionResolvedSourceNodeIds.length > 0) return []
+      return uniqueFieldNames([
+        ...extractSampleFieldPaths(node?.data?.executionSampleOutput),
+      ])
+    },
+    [nodeType, node?.data?.executionSampleOutput, conditionResolvedSourceNodeIds]
+  )
+  const conditionSelectedSourceFieldOptions = useMemo(
+    () => {
+      if (!conditionStudioEditingActive) return []
+      const selectedSet = new Set(conditionResolvedSourceNodeIds.map((id) => String(id || '').trim()).filter(Boolean))
+      const sourcePool = selectedSet.size > 0
+        ? conditionAllUpstreamSources.filter((src) => selectedSet.has(String(src.id || '').trim()))
+        : conditionAllUpstreamSources
+      return uniqueFieldNames(
+        sourcePool.flatMap((src) => (
+          Array.isArray(src?.fields)
+            ? src.fields.map((fieldName) => String(fieldName || '').trim()).filter(Boolean)
+            : []
+        ))
+      )
+    },
+    [conditionStudioEditingActive, conditionAllUpstreamSources, conditionResolvedSourceNodeIds]
+  )
+  const conditionIncomingInputFieldHints = useMemo(
+    () => {
+      if (!conditionStudioEditingActive || !selectedNodeId) return conditionIncomingInputFieldHintsCacheRef.current
+      if (isAnyNodeDragging) return conditionIncomingInputFieldHintsCacheRef.current
+      const candidateSourceIds = conditionResolvedSourceNodeIds.length > 0
+        ? conditionResolvedSourceNodeIds
+        : conditionAllUpstreamSources.map((src) => String(src.id || '').trim()).filter(Boolean)
+      if (!candidateSourceIds.length) return []
+      const discovered = uniqueFieldNames(
+        candidateSourceIds.flatMap((sourceId) => (
+          inferUpstreamInputFields(
+            sourceId,
+            nodes,
+            edges,
+          )
+        ))
+      )
+      const next = filterUserFacingFieldNames(discovered)
+      conditionIncomingInputFieldHintsCacheRef.current = next
+      return next
+    },
+    [conditionStudioEditingActive, selectedNodeId, nodes, edges, conditionResolvedSourceNodeIds, conditionAllUpstreamSources, isAnyNodeDragging]
+  )
+  const activePipelineId = String(pipeline?.id || '').trim()
+  const conditionFieldOptions = useMemo(
+    () => {
+      if (!conditionStudioEditingActive) return conditionFieldOptionsCacheRef.current
+      if (isAnyNodeDragging) return conditionFieldOptionsCacheRef.current
+      const outputDriven = uniqueFieldNames([
+        ...conditionUpstreamPathFields.userPaths,
+        ...conditionUpstreamPathFields.allPaths,
+        ...conditionSelfPreviewFields,
+      ])
+      const baseOptions = uniqueFieldNames([
+        ...PRIORITY_JSON_FIELD_NAMES,
+        ...outputDriven,
+        ...conditionRemoteFieldHints,
+        ...conditionSelectedSourceFieldOptions,
+        ...conditionIncomingInputFieldHints,
+        ...conditionProfileDocFieldHints,
+        ...conditionUpstreamFields,
+        ...parseFieldList(nodeConfig._detected_columns),
+        ...parseDetectedJsonPaths(nodeConfig._json_paths),
+      ])
+      if (nodeType !== 'condition_node' || !selectedNodeId || baseOptions.length === 0) {
+        conditionFieldOptionsCacheRef.current = baseOptions
+        return baseOptions
+      }
+
+      // Force-expand nested keys for JSON-carrying fields even when upstream
+      // discovery only produced top-level column names (common with Oracle JSON/CLOB).
+      const previewLimit = Math.max(1, Math.min(conditionPreviewRowsLimit, MAX_SAMPLE_ROWS_FOR_PATH_DISCOVERY))
+      const strictRows = inferUpstreamPreviewRows(
+        selectedNodeId,
+        nodes,
+        edges,
+        previewLimit,
+        conditionResolvedSourceNodeIds,
+        true,
+        true,
+      )
+      const rows = strictRows.length > 0
+        ? strictRows
+        : inferUpstreamPreviewRows(
+          selectedNodeId,
+          nodes,
+          edges,
+          previewLimit,
+          conditionResolvedSourceNodeIds,
+          false,
+          true,
+        )
+      if (!rows.length) {
+        conditionFieldOptionsCacheRef.current = baseOptions
+        return baseOptions
+      }
+
+      const seedFields = uniqueFieldNames([
+        ...PRIORITY_JSON_FIELD_NAMES,
+        ...baseOptions.filter((path) => splitPathSegments(path).length <= 1),
+      ]).slice(0, 400)
+      const extra = new Set<string>()
+      const sampleRows = rows.slice(0, 500)
+      seedFields.forEach((fieldPath) => {
+        sampleRows.forEach((row) => {
+          const hit = readPathValue(row, fieldPath)
+          if (!hit.found) return
+          const value = hit.value
+          if (value && (Array.isArray(value) || typeof value === 'object')) {
+            collectFieldPathsFromValue(value, fieldPath, extra, 0)
+            return
+          }
+          const parsed = parseObjectLikeJsonString(value)
+          if (parsed && (Array.isArray(parsed) || typeof parsed === 'object')) {
+            collectFieldPathsFromValue(parsed, fieldPath, extra, 0)
+          }
+        })
+      })
+      const next = uniqueFieldNames([...baseOptions, ...Array.from(extra)])
+      conditionFieldOptionsCacheRef.current = next
+      return next
+    },
+    [
+      conditionStudioEditingActive,
+      isAnyNodeDragging,
+      nodeType,
+      selectedNodeId,
+      nodes,
+      edges,
+      conditionPreviewRowsLimit,
+      conditionResolvedSourceNodeIds,
+      conditionFieldRefreshNonce,
+      conditionRemoteFieldHints,
+      conditionSelectedSourceFieldOptions,
+      conditionIncomingInputFieldHints,
+      conditionProfileDocFieldHints,
+      conditionUpstreamFields,
+      conditionUpstreamPathFields,
+      conditionSelfPreviewFields,
+      nodeConfig._detected_columns,
+      nodeConfig._json_paths,
+    ]
+  )
+  const loadConditionProfileDocFieldHints = useCallback(async () => {
+    if (nodeType !== 'condition_node' || !conditionStudioOpen || !activePipelineId) {
+      setConditionProfileDocFieldHints([])
+      return
+    }
+    try {
+      const summary = await api.getPipelineProfileState(activePipelineId, undefined, 30)
+      const nodeSummaries = Array.isArray((summary as any)?.nodes) ? (summary as any).nodes : []
+      const sampleProfiles: Array<Record<string, unknown>> = []
+      nodeSummaries.forEach((nodeSummary: any) => {
+        const docs = Array.isArray(nodeSummary?.sample_documents) ? nodeSummary.sample_documents : []
+        docs.forEach((doc: any) => {
+          const profile = doc?.profile
+          if (profile && typeof profile === 'object' && !Array.isArray(profile)) {
+            sampleProfiles.push(profile as Record<string, unknown>)
+          }
+        })
+      })
+      const discovered = filterUserFacingFieldNames(extractSampleFieldPaths(sampleProfiles))
+      setConditionProfileDocFieldHints(discovered)
+    } catch {
+      setConditionProfileDocFieldHints([])
+    }
+  }, [nodeType, conditionStudioOpen, activePipelineId])
+  useEffect(() => {
+    if (!conditionStudioOpen || nodeType !== 'condition_node') {
+      setConditionProfileDocFieldHints([])
+      return
+    }
+    void loadConditionProfileDocFieldHints()
+  }, [conditionStudioOpen, nodeType, activePipelineId, conditionFieldRefreshNonce, loadConditionProfileDocFieldHints])
+  useEffect(() => {
+    if (nodeType !== 'condition_node' || !selectedNodeId) return
+    const selected = parseStringList(conditionSelectedSourceNodeIds)
+    const resolved = parseStringList(conditionResolvedSourceNodeIds)
+    if (resolved.length <= 0) return
+    const selectedSig = selected.join('|')
+    const resolvedSig = resolved.join('|')
+    if (selectedSig === resolvedSig) return
+    updateNodeConfig(selectedNodeId, {
+      condition_source_node_ids: resolved,
+      condition_source_node_id: resolved[0] || '',
+    })
+  }, [
+    nodeType,
+    selectedNodeId,
+    conditionSelectedSourceNodeIds,
+    conditionResolvedSourceNodeIds,
+    updateNodeConfig,
+  ])
   const currentNodeReferenceFields = useMemo(
     () => (nodeType === 'map_transform' ? extractDirectNodeFields(node) : []),
     [nodeType, node]
@@ -5580,6 +7532,45 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       return 'auto'
     }
   )() as CustomExpressionEngine
+  const configuredFnsVersion = (
+    () => {
+      const hasExplicit = Object.prototype.hasOwnProperty.call(nodeConfig, 'custom_fns_version')
+      const raw = String(nodeConfig.custom_fns_version || '').trim().toLowerCase()
+      if (raw === 'v2') return 'v2'
+      if (raw === 'v1') return 'v1'
+      if (hasExplicit) return 'v1'
+      // Revert-safe default:
+      // - existing configured nodes stay on v1
+      // - fresh nodes can start with v2
+      return customFieldConfiguredCount > 0 ? 'v1' : 'v2'
+    }
+  )() as CustomFnsVersion
+  const configuredFnsV2DedupeKeyField = String(nodeConfig.custom_fns_v2_dedupe_key_field || '').trim()
+  const configuredFnsV2OnDuplicate = (
+    (() => {
+      const raw = String(nodeConfig.custom_fns_v2_on_duplicate || 'ignore').trim().toLowerCase()
+      if (raw === 'update' || raw === 'overwrite' || raw === 'replace' || raw === 'keep_latest') return 'update'
+      return 'ignore'
+    })()
+  ) as CustomFnsV2OnDuplicate
+  const configuredFnsV2Normalize = (
+    (() => {
+      const raw = String(nodeConfig.custom_fns_v2_normalize || 'upper_trim').trim().toLowerCase().replace('-', '_')
+      if (raw === 'trim_upper' || raw === 'upper_trim') return 'upper_trim'
+      if (raw === 'trim_lower' || raw === 'lower_trim') return 'lower_trim'
+      if (raw === 'trim' || raw === 'upper' || raw === 'lower' || raw === 'auto') return raw as CustomFnsV2Normalize
+      return 'upper_trim'
+    })()
+  ) as CustomFnsV2Normalize
+  const configuredFnsV2InvalidKey = (
+    (() => {
+      const raw = String(nodeConfig.custom_fns_v2_invalid_key || 'skip').trim().toLowerCase()
+      if (raw === 'allow' || raw === 'count' || raw === 'use_null' || raw === 'null') return 'allow'
+      if (raw === 'raise' || raw === 'error' || raw === 'strict') return 'raise'
+      return 'skip'
+    })()
+  ) as CustomFnsV2InvalidKey
+  const configuredFnsV2RowGateDedupeEnabled = Boolean(nodeConfig.custom_fns_v2_row_gate_dedupe_enabled ?? false)
   const configuredProfileEnabled = Boolean(nodeConfig.custom_profile_enabled ?? false)
   const configuredProfileStorage = (
     () => {
@@ -5653,11 +7644,26 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       ? 'all_entities'
       : 'changed_only'
   ) as 'changed_only' | 'all_entities'
+  const configuredProfileEmitIncrementalRows = (
+    () => {
+      const raw = nodeConfig.custom_profile_emit_incremental_rows
+      if (raw === null || raw === undefined) return null
+      if (typeof raw === 'boolean') return raw
+      if (typeof raw === 'number') return raw !== 0
+      if (typeof raw === 'string') {
+        const norm = raw.trim().toLowerCase()
+        if (['1', 'true', 'yes', 'on', 'y'].includes(norm)) return true
+        if (['0', 'false', 'no', 'off', 'n'].includes(norm)) return false
+      }
+      return Boolean(raw)
+    }
+  )() as boolean | null
   const configuredProfileRequiredFields = parseFieldList(nodeConfig.custom_profile_required_fields)
   const configuredProfileEventTimeField = String(nodeConfig.custom_profile_event_time_field || '').trim()
   const configuredProfileWindowDays = String(nodeConfig.custom_profile_window_days || '1,7,30').trim() || '1,7,30'
   const configuredProfileRetentionDays = Number(nodeConfig.custom_profile_retention_days ?? 45)
   const configuredProfileIncludeChangeFields = Boolean(nodeConfig.custom_profile_include_change_fields ?? false)
+  const configuredProfileLmdbEnvPath = String(nodeConfig.custom_profile_lmdb_env_path || '').trim()
   const configuredProfileOracleHost = String(nodeConfig.custom_profile_oracle_host || '').trim()
   const configuredProfileOraclePortRaw = Number(nodeConfig.custom_profile_oracle_port ?? 1521)
   const configuredProfileOraclePort = Number.isFinite(configuredProfileOraclePortRaw) && configuredProfileOraclePortRaw > 0
@@ -5726,7 +7732,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const configuredValidationLmdbEndKey = String(nodeConfig.custom_validation_lmdb_end_key || '').trim()
   const configuredValidationLmdbKeyContains = String(nodeConfig.custom_validation_lmdb_key_contains || '').trim()
   const configuredValidationLmdbLimit = Number(nodeConfig.custom_validation_lmdb_limit ?? 50)
-  const activePipelineId = String(pipeline?.id || '').trim()
   const profileMonitorPreferredKeyField = String(
     customFieldStudioOpen
       ? customPrimaryKeyFieldDraft
@@ -6026,11 +8031,3504 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     nodeType,
   ])
 
-  if (!data || !definition) return null
-
   const handleFieldChange = (name: string, value: unknown) => {
-    updateNodeConfig(selectedNodeId!, { [name]: value })
+    if (!selectedNodeId) return
+    updateNodeConfig(selectedNodeId, { [name]: value })
   }
+
+  const conditionOperatorOptions = useMemo(
+    () => ([
+      { value: 'equals', label: 'Equals' },
+      { value: 'not_equals', label: 'Not Equals' },
+      { value: 'contains', label: 'Contains' },
+      { value: 'not_contains', label: 'Not Contains' },
+      { value: 'greater_than', label: 'Greater Than' },
+      { value: 'greater_or_equal', label: 'Greater or Equal' },
+      { value: 'less_than', label: 'Less Than' },
+      { value: 'less_or_equal', label: 'Less or Equal' },
+      { value: 'starts_with', label: 'Starts With' },
+      { value: 'ends_with', label: 'Ends With' },
+      { value: 'is_null', label: 'Is Null' },
+      { value: 'is_not_null', label: 'Is Not Null' },
+      { value: 'in', label: 'In (comma list)' },
+      { value: 'not_in', label: 'Not In (comma list)' },
+    ]),
+    []
+  )
+  const dataQueryOperatorOptions = useMemo(
+    () => ([
+      { value: 'equals', label: 'Equals' },
+      { value: 'not_equals', label: 'Not Equals' },
+      { value: 'contains', label: 'Contains' },
+      { value: 'not_contains', label: 'Not Contains' },
+      { value: 'greater_than', label: 'Greater Than' },
+      { value: 'greater_or_equal', label: 'Greater or Equal' },
+      { value: 'less_than', label: 'Less Than' },
+      { value: 'less_or_equal', label: 'Less or Equal' },
+      { value: 'between', label: 'Between (min,max)' },
+      { value: 'starts_with', label: 'Starts With' },
+      { value: 'ends_with', label: 'Ends With' },
+      { value: 'is_null', label: 'Is Null' },
+      { value: 'is_not_null', label: 'Is Not Null' },
+      { value: 'in', label: 'In (comma list)' },
+      { value: 'not_in', label: 'Not In (comma list)' },
+    ]),
+    []
+  )
+  const dataQueryPatchOperationOptions = useMemo(
+    () => ([
+      { value: 'set', label: 'Set' },
+      { value: 'set_where', label: 'Set (Where)' },
+      { value: 'unset', label: 'Unset' },
+      { value: 'inc', label: 'Inc' },
+      { value: 'append', label: 'Append' },
+      { value: 'remove', label: 'Remove' },
+      { value: 'rename', label: 'Rename' },
+    ]),
+    []
+  )
+
+  const conditionCriteriaConfigured = useMemo(() => {
+    const raw = nodeConfig.criteria
+    let parsed: Array<Record<string, any>> = []
+    if (Array.isArray(raw)) {
+      parsed = raw.filter((item) => !!item && typeof item === 'object') as Array<Record<string, any>>
+    } else if (typeof raw === 'string' && String(raw).trim()) {
+      try {
+        const decoded = JSON.parse(raw)
+        if (Array.isArray(decoded)) {
+          parsed = decoded.filter((item) => !!item && typeof item === 'object') as Array<Record<string, any>>
+        }
+      } catch {
+        parsed = []
+      }
+    }
+    if (parsed.length > 0) {
+      return parsed.map((item, index) => ({
+        id: String(item.id || `rule_${index + 1}`),
+        field: String(item.field || item.leftField || ''),
+        operator: String(item.operator || 'equals'),
+        value: item.value == null
+          ? (item.rightValue == null ? '' : String(item.rightValue))
+          : String(item.value),
+        rightMode: (
+          item.rightMode === 'field'
+            || item.rightMode === 'values'
+            || item.rightMode === 'variable'
+            || item.rightMode === 'raw'
+            || item.rightMode === 'literal'
+            ? item.rightMode
+            : (item.right_mode === 'field'
+              || item.right_mode === 'values'
+              || item.right_mode === 'variable'
+              || item.right_mode === 'raw'
+              || item.right_mode === 'literal'
+              ? item.right_mode
+              : 'literal')
+        ),
+      }))
+    }
+    const legacyField = String(nodeConfig.field || '').trim()
+    if (!legacyField) return []
+    return [{
+      id: 'rule_1',
+      field: legacyField,
+      operator: String(nodeConfig.operator || 'equals'),
+      value: nodeConfig.value == null ? '' : String(nodeConfig.value),
+      rightMode: 'literal',
+    }]
+  }, [nodeConfig.criteria, nodeConfig.field, nodeConfig.operator, nodeConfig.value])
+
+  const persistConditionCriteria = useCallback((nextCriteria: Array<Record<string, any>>, nextMode?: 'all' | 'any') => {
+    const normalized = (nextCriteria || []).map((item, index) => ({
+      id: String(item.id || `rule_${index + 1}`),
+      field: String(item.field || '').trim(),
+      operator: String(item.operator || 'equals'),
+      value: item.value == null ? '' : String(item.value),
+      rightMode: (
+        item.rightMode === 'field'
+          || item.rightMode === 'values'
+          || item.rightMode === 'variable'
+          || item.rightMode === 'raw'
+          || item.rightMode === 'literal'
+          ? item.rightMode
+          : 'literal'
+      ),
+    }))
+    setConditionCriteriaDraft(normalized)
+    if (nextMode) {
+      setConditionMatchModeDraft(nextMode === 'any' ? 'any' : 'all')
+    }
+  }, [])
+  const persistConditionCaseRoutes = useCallback((routes: ConditionCaseRoute[], elseTargets?: string[]) => {
+    const normalizedRoutes = (routes || []).map((route, index) => {
+      const routeId = String(route.id || `route_${index + 1}`).trim() || `route_${index + 1}`
+      const label = String(route.label || routeId || '').trim() || routeId
+      const routeMatchMode: ConditionCaseRouteMatchMode = String(route.matchMode || '').trim().toLowerCase() === 'any' ? 'any' : 'all'
+      const routeConditions = Array.isArray(route.conditions) && route.conditions.length > 0
+        ? route.conditions
+        : [createConditionCaseCondition(route)]
+      const normalizedConditions = routeConditions.map((cond, condIndex) => {
+        const mode: ConditionCaseRouteMode = String(cond.mode || '').trim().toLowerCase() === 'condition' ? 'condition' : 'range'
+        const rightMode: ConditionCaseRouteRightMode = String(cond.rightMode || '').trim().toLowerCase() === 'field' ? 'field' : 'literal'
+        return {
+          id: String(cond.id || `cond_${routeId}_${condIndex + 1}`).trim() || `cond_${routeId}_${condIndex + 1}`,
+          field: String(cond.field || '').trim(),
+          match_mode: mode,
+          operator: String(cond.operator || 'equals').trim() || 'equals',
+          right_mode: rightMode,
+          right_value: String(cond.rightValue ?? ''),
+          min_value: String(cond.minValue ?? '').trim(),
+          max_value: String(cond.maxValue ?? '').trim(),
+          include_min: cond.includeMin !== false,
+          include_max: cond.includeMax !== false,
+        }
+      })
+      const first = normalizedConditions[0] || {
+        field: '',
+        match_mode: 'range',
+        operator: 'equals',
+        right_mode: 'literal',
+        right_value: '',
+        min_value: '',
+        max_value: '',
+        include_min: true,
+        include_max: true,
+      }
+      return {
+        id: routeId,
+        label,
+        handle_id: String(route.handleId || normalizeConditionCaseHandleId(routeId)).trim() || normalizeConditionCaseHandleId(routeId),
+        route_match_mode: routeMatchMode,
+        conditions: normalizedConditions,
+        // keep legacy single-condition mirrors for backward compatibility
+        field: String(first.field || '').trim(),
+        match_mode: String(first.match_mode || 'range'),
+        operator: String(first.operator || 'equals').trim() || 'equals',
+        right_mode: String(first.right_mode || 'literal'),
+        right_value: String(first.right_value ?? ''),
+        min_value: String(first.min_value ?? '').trim(),
+        max_value: String(first.max_value ?? '').trim(),
+        include_min: first.include_min !== false,
+        include_max: first.include_max !== false,
+        target_node_ids: resolveConditionTargetIdsForNodes(nodes, route.targetNodeIds || [], selectedNodeId || ''),
+      }
+    })
+    const nextElseTargets = uniqueFieldNames(parseStringList(
+      elseTargets == null ? conditionCaseElseTargetNodeIdsDraft : elseTargets,
+    ))
+    const resolvedElseTargets = resolveConditionTargetIdsForNodes(nodes, nextElseTargets, selectedNodeId || '')
+    setConditionRoutingModeDraft('case')
+    setConditionCaseRoutesDraft(parseConditionCaseRoutes(normalizedRoutes))
+    setConditionCaseElseTargetNodeIdsDraft(resolvedElseTargets)
+  }, [
+    selectedNodeId,
+    conditionCaseElseTargetNodeIdsDraft,
+    nodes,
+  ])
+
+  const conditionMatchModeConfigured = useMemo<'all' | 'any'>(
+    () => (String(nodeConfig.criteria_mode || 'all').toLowerCase() === 'any' ? 'any' : 'all'),
+    [nodeConfig.criteria_mode]
+  )
+  const dataQueryCriteriaConfigured = useMemo(() => {
+    const raw = nodeConfig.criteria
+    let parsed: Array<Record<string, any>> = []
+    if (Array.isArray(raw)) {
+      parsed = raw.filter((item) => !!item && typeof item === 'object') as Array<Record<string, any>>
+    } else if (typeof raw === 'string' && String(raw).trim()) {
+      try {
+        const decoded = JSON.parse(raw)
+        if (Array.isArray(decoded)) {
+          parsed = decoded.filter((item) => !!item && typeof item === 'object') as Array<Record<string, any>>
+        }
+      } catch {
+        parsed = []
+      }
+    }
+    if (parsed.length > 0) {
+      return parsed.map((item, index) => ({
+        id: String(item.id || `rule_${index + 1}`),
+        field: String(item.field || item.leftField || ''),
+        operator: String(item.operator || 'equals'),
+        value: item.value == null
+          ? (item.rightValue == null ? '' : String(item.rightValue))
+          : String(item.value),
+        rightMode: (
+          item.rightMode === 'field'
+            || item.rightMode === 'values'
+            || item.rightMode === 'variable'
+            || item.rightMode === 'raw'
+            || item.rightMode === 'literal'
+            ? item.rightMode
+            : (item.right_mode === 'field'
+              || item.right_mode === 'values'
+              || item.right_mode === 'variable'
+              || item.right_mode === 'raw'
+              || item.right_mode === 'literal'
+              ? item.right_mode
+              : 'literal')
+        ),
+      }))
+    }
+    const legacyField = String(nodeConfig.field || '').trim()
+    if (!legacyField) return []
+    return [{
+      id: 'rule_1',
+      field: legacyField,
+      operator: String(nodeConfig.operator || 'equals'),
+      value: nodeConfig.value == null ? '' : String(nodeConfig.value),
+      rightMode: 'literal',
+    }]
+  }, [nodeConfig.criteria, nodeConfig.field, nodeConfig.operator, nodeConfig.value])
+  const dataQueryMatchModeConfigured = useMemo<'all' | 'any'>(
+    () => (String(nodeConfig.criteria_mode || 'all').toLowerCase() === 'any' ? 'any' : 'all'),
+    [nodeConfig.criteria_mode]
+  )
+  const dataQueryModeConfigured = useMemo<'upstream' | 'pushdown' | 'hybrid'>(
+    () => {
+      const mode = String(nodeConfig.query_mode || 'hybrid').trim().toLowerCase()
+      if (mode === 'upstream' || mode === 'pushdown') return mode
+      return 'hybrid'
+    },
+    [nodeConfig.query_mode]
+  )
+  const dataQuerySelectFieldsConfigured = useMemo(
+    () => parseFieldList(nodeConfig.select_fields),
+    [nodeConfig.select_fields]
+  )
+  const dataQuerySelectFieldSortsConfigured = useMemo(() => {
+    const raw = nodeConfig.select_field_sorts
+    const out: Record<string, 'none' | 'asc' | 'desc'> = {}
+    const normalizeMode = (value: unknown): 'none' | 'asc' | 'desc' => {
+      const mode = String(value || '').trim().toLowerCase()
+      if (mode === 'asc' || mode === 'desc') return mode
+      return 'none'
+    }
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      Object.entries(raw as Record<string, unknown>).forEach(([fieldPath, modeValue]) => {
+        const path = String(fieldPath || '').trim()
+        if (!path) return
+        const mode = normalizeMode(modeValue)
+        if (mode !== 'none') out[path] = mode
+      })
+      return out
+    }
+    if (typeof raw === 'string' && raw.trim()) {
+      try {
+        const parsed = JSON.parse(raw)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          Object.entries(parsed as Record<string, unknown>).forEach(([fieldPath, modeValue]) => {
+            const path = String(fieldPath || '').trim()
+            if (!path) return
+            const mode = normalizeMode(modeValue)
+            if (mode !== 'none') out[path] = mode
+          })
+        }
+      } catch {
+        return {}
+      }
+    }
+    return out
+  }, [nodeConfig.select_field_sorts])
+  const dataQuerySelectFieldAliasesConfigured = useMemo(() => {
+    const raw = nodeConfig.select_field_aliases
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      const out: Record<string, string> = {}
+      Object.entries(raw as Record<string, unknown>).forEach(([k, v]) => {
+        const path = String(k || '').trim()
+        const alias = String(v || '').trim()
+        if (path && alias) out[path] = alias
+      })
+      return out
+    }
+    if (typeof raw === 'string' && raw.trim()) {
+      try {
+        const parsed = JSON.parse(raw)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          const out: Record<string, string> = {}
+          Object.entries(parsed as Record<string, unknown>).forEach(([k, v]) => {
+            const path = String(k || '').trim()
+            const alias = String(v || '').trim()
+            if (path && alias) out[path] = alias
+          })
+          return out
+        }
+      } catch {
+        return {}
+      }
+    }
+    return {}
+  }, [nodeConfig.select_field_aliases])
+  const dataQueryArrayOutputModeConfigured = useMemo<'list' | 'explode_rows'>(
+    () => (String(nodeConfig.array_output_mode || '').trim().toLowerCase() === 'explode_rows' ? 'explode_rows' : 'list'),
+    [nodeConfig.array_output_mode]
+  )
+  const dataQueryArrayMatchModeConfigured = useMemo<'all_elements' | 'matched_elements_only'>(
+    () => (String(nodeConfig.array_match_mode || '').trim().toLowerCase() === 'matched_elements_only' ? 'matched_elements_only' : 'all_elements'),
+    [nodeConfig.array_match_mode]
+  )
+  const dataQueryIncludeOriginalConfigured = useMemo(
+    () => parseBoolLike(nodeConfig.include_original_row, true),
+    [nodeConfig.include_original_row]
+  )
+  const dataQueryOffsetConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.offset ?? 0)
+      return Number.isFinite(n) ? Math.max(0, Math.trunc(n)) : 0
+    },
+    [nodeConfig.offset]
+  )
+  const dataQueryLimitConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.limit ?? 0)
+      return Number.isFinite(n) ? Math.max(0, Math.trunc(n)) : 0
+    },
+    [nodeConfig.limit]
+  )
+  const dataQueryProfilePatchEnabledConfigured = useMemo(
+    () => parseBoolLike(nodeConfig.profile_patch_enabled, false),
+    [nodeConfig.profile_patch_enabled]
+  )
+  const dataQueryProfilePatchReflectOutputConfigured = useMemo(
+    () => parseBoolLike(nodeConfig.profile_patch_reflect_output, true),
+    [nodeConfig.profile_patch_reflect_output]
+  )
+  const dataQueryProfilePatchStageConfigured = useMemo<'pre' | 'post'>(
+    () => (String(nodeConfig.profile_patch_stage || 'post').trim().toLowerCase() === 'pre' ? 'pre' : 'post'),
+    [nodeConfig.profile_patch_stage]
+  )
+  const dataQueryProfilePatchStorageConfigured = useMemo<'lmdb' | 'rocksdb' | 'redis' | 'oracle'>(
+    () => {
+      const value = String(nodeConfig.profile_patch_storage || 'lmdb').trim().toLowerCase()
+      if (value === 'rocksdb' || value === 'redis' || value === 'oracle') return value
+      return 'lmdb'
+    },
+    [nodeConfig.profile_patch_storage]
+  )
+  const dataQueryProfilePatchNodeIdConfigured = useMemo(
+    () => String(nodeConfig.profile_patch_node_id || '').trim(),
+    [nodeConfig.profile_patch_node_id]
+  )
+  const dataQueryProfilePatchPrimaryKeyFieldConfigured = useMemo(
+    () => String(nodeConfig.profile_patch_primary_key_field || '').trim(),
+    [nodeConfig.profile_patch_primary_key_field]
+  )
+  const dataQueryProfilePatchDocumentPathConfigured = useMemo(
+    () => String(nodeConfig.profile_patch_document_path || '').trim(),
+    [nodeConfig.profile_patch_document_path]
+  )
+  const dataQueryProfilePatchValueModeConfigured = useMemo<'row' | 'fixed'>(
+    () => (String(nodeConfig.profile_patch_value_mode || 'row').trim().toLowerCase() === 'fixed' ? 'fixed' : 'row'),
+    [nodeConfig.profile_patch_value_mode]
+  )
+  const dataQueryProfilePatchValueConfigured = useMemo(
+    () => String(nodeConfig.profile_patch_value ?? ''),
+    [nodeConfig.profile_patch_value]
+  )
+  const dataQueryProfilePatchTargetPathConfigured = useMemo(
+    () => String(nodeConfig.profile_patch_target_path || '').trim(),
+    [nodeConfig.profile_patch_target_path]
+  )
+  const dataQueryProfilePatchMergeModeConfigured = useMemo<'merge' | 'replace'>(
+    () => (String(nodeConfig.profile_patch_merge_mode || 'merge').trim().toLowerCase() === 'replace' ? 'replace' : 'merge'),
+    [nodeConfig.profile_patch_merge_mode]
+  )
+  const dataQueryProfilePatchOpsConfigured = useMemo(() => {
+    const parsed = parseDataQueryProfilePatchOperations(nodeConfig.profile_patch_ops)
+    if (parsed.length > 0) return parsed
+    const hasLegacySet =
+      dataQueryProfilePatchTargetPathConfigured
+      || dataQueryProfilePatchDocumentPathConfigured
+      || dataQueryProfilePatchValueModeConfigured === 'fixed'
+    if (!hasLegacySet) return []
+    return [createDataQueryProfilePatchOperation({
+      id: 'patch_op_1',
+      op: 'set',
+      targetPath: dataQueryProfilePatchTargetPathConfigured,
+      sourcePath: dataQueryProfilePatchDocumentPathConfigured,
+      valueMode: dataQueryProfilePatchValueModeConfigured,
+      value: dataQueryProfilePatchValueConfigured,
+      mergeMode: dataQueryProfilePatchMergeModeConfigured,
+    })]
+  }, [
+    nodeConfig.profile_patch_ops,
+    dataQueryProfilePatchTargetPathConfigured,
+    dataQueryProfilePatchDocumentPathConfigured,
+    dataQueryProfilePatchValueModeConfigured,
+    dataQueryProfilePatchValueConfigured,
+    dataQueryProfilePatchMergeModeConfigured,
+  ])
+  const dataQueryUpstreamCandidateNodes = useMemo(
+    () => {
+      if (nodeType !== 'profile_query_transform' || !selectedNodeId) return [] as Array<{
+        id: string
+        label: string
+        nodeType: string
+        config: Record<string, unknown>
+      }>
+      const sourceIds = inferUpstreamSources(selectedNodeId, nodes, edges)
+        .map((src) => String(src.id || '').trim())
+        .filter(Boolean)
+      if (sourceIds.length === 0) return []
+      const nodeMap = new Map(nodes.map((item) => [String(item.id || ''), item] as const))
+      const incomingByTarget = buildIncomingByTarget(edges)
+      const visited = new Set<string>()
+      const out: Array<{
+        id: string
+        label: string
+        nodeType: string
+        config: Record<string, unknown>
+      }> = []
+      const queue = [...sourceIds]
+      while (queue.length > 0 && out.length < 1000) {
+        const nid = String(queue.shift() || '').trim()
+        if (!nid || visited.has(nid)) continue
+        visited.add(nid)
+        const sourceNode = nodeMap.get(nid)
+        const srcType = String(sourceNode?.data?.nodeType || '').trim().toLowerCase()
+        const srcCfg = (
+          sourceNode?.data?.config && typeof sourceNode.data.config === 'object'
+            ? sourceNode.data.config
+            : {}
+        ) as Record<string, unknown>
+        out.push({
+          id: nid,
+          label: String(sourceNode?.data?.label || sourceNode?.data?.definition?.label || nid),
+          nodeType: srcType,
+          config: srcCfg,
+        })
+        const parents = incomingByTarget.get(nid) || []
+        parents.forEach((pid) => {
+          const p = String(pid || '').trim()
+          if (p && !visited.has(p)) queue.push(p)
+        })
+      }
+      return out
+    },
+    [nodeType, selectedNodeId, nodes, edges]
+  )
+  const dataQueryProfilePatchNodeOptions = useMemo(
+    () => dataQueryUpstreamCandidateNodes
+      .filter((item) => (
+        (item.nodeType === 'map_transform' && parseBoolLike(item.config.custom_profile_enabled, false))
+        || item.nodeType === 'lmdb_source'
+      ))
+      .map((item) => ({
+        value: item.id,
+        label: item.nodeType === 'lmdb_source'
+          ? `${item.label} (LMDB source)`
+          : `${item.label} (profile)`,
+      })),
+    [dataQueryUpstreamCandidateNodes]
+  )
+  const dataQueryProfilePatchSelectedUpstreamNode = useMemo(
+    () => dataQueryUpstreamCandidateNodes.find((item) => String(item.id || '').trim() === String(dataQueryProfilePatchNodeIdDraft || '').trim()) || null,
+    [dataQueryUpstreamCandidateNodes, dataQueryProfilePatchNodeIdDraft]
+  )
+  const dataQueryProfilePatchIsDirectLmdbSource = useMemo(
+    () => String(dataQueryProfilePatchSelectedUpstreamNode?.nodeType || '').trim().toLowerCase() === 'lmdb_source',
+    [dataQueryProfilePatchSelectedUpstreamNode]
+  )
+  const dataQueryFieldOptions = useMemo(
+    () => filterUserFacingFieldNames([
+      ...mapInputFieldOptions,
+      ...upstreamReferenceFields,
+      ...upstreamPreviewReferenceFields,
+    ]),
+    [mapInputFieldOptions, upstreamReferenceFields, upstreamPreviewReferenceFields]
+  )
+  const dataQueryFieldTreeData = useMemo(() => {
+    type TreeNode = { title: string; key: string; path?: string; children?: TreeNode[]; isLeaf?: boolean }
+    const root: TreeNode[] = []
+    const rootMap = new Map<string, TreeNode>()
+    const ensureChild = (parent: TreeNode, part: string, fullKey: string, isLeaf: boolean): TreeNode => {
+      if (!Array.isArray(parent.children)) parent.children = []
+      const existing = parent.children.find((child) => child.key === fullKey)
+      if (existing) {
+        if (isLeaf) {
+          existing.isLeaf = true
+          existing.path = fullKey
+        } else if (existing.isLeaf) {
+          // Node was previously discovered as a direct leaf path (e.g. a.b),
+          // and later appears as an object parent (e.g. a.b.c). It must stop
+          // being leaf so tree-level +/- controls render at object level.
+          existing.isLeaf = false
+        }
+        return existing
+      }
+      const created: TreeNode = { title: part, key: fullKey, path: isLeaf ? fullKey : undefined, isLeaf }
+      parent.children.push(created)
+      return created
+    }
+    dataQueryFieldOptions.forEach((path) => {
+      const text = String(path || '').trim()
+      if (!text) return
+      const parts = text.split('.').filter(Boolean)
+      if (parts.length <= 1) {
+        const existing = rootMap.get(text)
+        if (existing) {
+          // Keep direct root path selectable, but if it also has children
+          // it must render as object node with expand control.
+          existing.path = text
+          if (Array.isArray(existing.children) && existing.children.length > 0) {
+            existing.isLeaf = false
+          } else {
+            existing.isLeaf = true
+          }
+        } else {
+          const node: TreeNode = { title: text, key: text, path: text, isLeaf: true }
+          root.push(node)
+          rootMap.set(text, node)
+        }
+        return
+      }
+      const first = parts[0]
+      let current = rootMap.get(first)
+      if (!current) {
+        current = { title: first, key: first, path: first, children: [] }
+        root.push(current)
+        rootMap.set(first, current)
+      }
+      // Root path may also appear as direct field; ensure object roots always
+      // show expand controls when nested paths are present.
+      if (current.isLeaf) current.isLeaf = false
+      if (!Array.isArray(current.children)) current.children = []
+      let runningKey = first
+      for (let idx = 1; idx < parts.length; idx += 1) {
+        const part = parts[idx]
+        runningKey = `${runningKey}.${part}`
+        current = ensureChild(current, part, runningKey, idx === parts.length - 1)
+      }
+    })
+    return root
+  }, [dataQueryFieldOptions])
+  const dataQueryFieldSearchNormalized = useMemo(
+    () => String(dataQueryFieldSearchQuery || '').trim().toLowerCase(),
+    [dataQueryFieldSearchQuery]
+  )
+  const dataQueryFilteredFieldTreeData = useMemo(() => {
+    if (!dataQueryFieldSearchNormalized) return dataQueryFieldTreeData as any[]
+    const filterNodes = (nodes: any[]): any[] => {
+      const out: any[] = []
+      nodes.forEach((node) => {
+        const title = String(node?.title || '').toLowerCase()
+        const childMatches = Array.isArray(node?.children) ? filterNodes(node.children) : []
+        if (title.includes(dataQueryFieldSearchNormalized) || childMatches.length > 0) {
+          out.push({
+            ...node,
+            children: childMatches.length > 0 ? childMatches : node.children,
+          })
+        }
+      })
+      return out
+    }
+    return filterNodes(dataQueryFieldTreeData as any[])
+  }, [dataQueryFieldTreeData, dataQueryFieldSearchNormalized])
+  const dataQueryFilteredFieldTreeKeys = useMemo(() => {
+    const keys: string[] = []
+    const walk = (nodes: any[]) => {
+      nodes.forEach((node) => {
+        const key = String(node?.key || '')
+        if (key) keys.push(key)
+        if (Array.isArray(node?.children)) walk(node.children)
+      })
+    }
+    walk(dataQueryFilteredFieldTreeData as any[])
+    return uniqueFieldNames(keys)
+  }, [dataQueryFilteredFieldTreeData])
+  const dataQueryFilteredFieldOptions = useMemo(
+    () => (
+      !dataQueryFieldSearchNormalized
+        ? dataQueryFieldOptions
+        : dataQueryFieldOptions.filter((fieldName) =>
+          String(fieldName || '').toLowerCase().includes(dataQueryFieldSearchNormalized))
+    ),
+    [dataQueryFieldOptions, dataQueryFieldSearchNormalized]
+  )
+  const dataQueryFieldAutoCompleteOptions = useMemo(
+    () => dataQueryFilteredFieldOptions.slice(0, 400).map((value) => ({ value, label: value })),
+    [dataQueryFilteredFieldOptions]
+  )
+  const dataQueryQuickPickFields = useMemo(
+    () => dataQueryFilteredFieldOptions.slice(0, dataQueryShowQuickPicker ? 300 : 80),
+    [dataQueryFilteredFieldOptions, dataQueryShowQuickPicker]
+  )
+  const dataQueryPreviewRows = useMemo(() => {
+    if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform' || !selectedNodeId) return []
+    return inferUpstreamPreviewRows(selectedNodeId, nodes, edges, 300)
+      .filter((row) => row && typeof row === 'object')
+      .slice(0, 300)
+  }, [dataQueryStudioOpen, nodeType, selectedNodeId, nodes, edges])
+  const dataQueryFieldSamples = useMemo(() => {
+    const out = new Map<string, string>()
+    if (!dataQueryStudioOpen || dataQueryPreviewRows.length <= 0 || dataQueryFieldOptions.length <= 0) return out
+    dataQueryFieldOptions.forEach((path) => {
+      if (out.size >= 2000) return
+      const rawPath = String(path || '').trim()
+      if (!rawPath) return
+      let sampleValue: any = undefined
+      for (const row of dataQueryPreviewRows) {
+        if (!row || typeof row !== 'object') continue
+        const values = readPathValues(row as Record<string, unknown>, rawPath)
+        if (Array.isArray(values) && values.length > 0) {
+          sampleValue = values[0]
+          break
+        }
+        const hit = readPathValue(row as Record<string, unknown>, rawPath)
+        if (hit.found) {
+          sampleValue = hit.value
+          break
+        }
+        if (Object.prototype.hasOwnProperty.call(row, rawPath)) {
+          sampleValue = (row as Record<string, unknown>)[rawPath]
+          break
+        }
+      }
+      if (sampleValue === undefined) return
+      if (sampleValue !== null && typeof sampleValue === 'object') {
+        try {
+          out.set(rawPath, JSON.stringify(sampleValue))
+        } catch {
+          out.set(rawPath, '[object]')
+        }
+        return
+      }
+      out.set(rawPath, String(sampleValue))
+    })
+    return out
+  }, [dataQueryStudioOpen, dataQueryPreviewRows, dataQueryFieldOptions])
+  const dataQueryStudioDraftSnapshot = useMemo(() => ({
+    query_mode: dataQueryModeDraft,
+    criteria: dataQueryCriteriaDraft,
+    criteria_mode: dataQueryMatchModeDraft,
+    select_fields: dataQuerySelectFieldsDraft,
+    select_field_sorts: dataQuerySelectFieldSortsDraft,
+    select_field_aliases: dataQuerySelectFieldAliasesDraft,
+    array_output_mode: dataQueryArrayOutputModeDraft,
+    array_match_mode: dataQueryArrayMatchModeDraft,
+    include_original_row: dataQueryIncludeOriginalRowDraft,
+    offset: dataQueryOffsetDraft,
+    limit: dataQueryLimitDraft,
+    profile_patch_enabled: dataQueryProfilePatchEnabledDraft,
+    profile_patch_reflect_output: dataQueryProfilePatchReflectOutputDraft,
+    profile_patch_stage: dataQueryProfilePatchStageDraft,
+    profile_patch_storage: dataQueryProfilePatchStorageDraft,
+    profile_patch_node_id: dataQueryProfilePatchNodeIdDraft,
+    profile_patch_primary_key_field: dataQueryProfilePatchPrimaryKeyFieldDraft,
+    profile_patch_ops: serializeDataQueryProfilePatchOperations(dataQueryProfilePatchOpsDraft),
+    profile_patch_document_path: dataQueryProfilePatchDocumentPathDraft,
+    profile_patch_value_mode: dataQueryProfilePatchValueModeDraft,
+    profile_patch_value: dataQueryProfilePatchValueDraft,
+    profile_patch_target_path: dataQueryProfilePatchTargetPathDraft,
+    profile_patch_merge_mode: dataQueryProfilePatchMergeModeDraft,
+  }), [
+    dataQueryModeDraft,
+    dataQueryCriteriaDraft,
+    dataQueryMatchModeDraft,
+    dataQuerySelectFieldsDraft,
+    dataQuerySelectFieldSortsDraft,
+    dataQuerySelectFieldAliasesDraft,
+    dataQueryArrayOutputModeDraft,
+    dataQueryArrayMatchModeDraft,
+    dataQueryIncludeOriginalRowDraft,
+    dataQueryOffsetDraft,
+    dataQueryLimitDraft,
+    dataQueryProfilePatchEnabledDraft,
+    dataQueryProfilePatchReflectOutputDraft,
+    dataQueryProfilePatchStageDraft,
+    dataQueryProfilePatchStorageDraft,
+    dataQueryProfilePatchNodeIdDraft,
+    dataQueryProfilePatchPrimaryKeyFieldDraft,
+    dataQueryProfilePatchOpsDraft,
+    dataQueryProfilePatchDocumentPathDraft,
+    dataQueryProfilePatchValueModeDraft,
+    dataQueryProfilePatchValueDraft,
+    dataQueryProfilePatchTargetPathDraft,
+    dataQueryProfilePatchMergeModeDraft,
+  ])
+  const dataQueryStudioHasUnsavedChanges = useMemo(() => {
+    if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform') return false
+    const initial = dataQueryStudioInitialConfigRef.current
+    if (!initial) return false
+    try {
+      return JSON.stringify(initial) !== JSON.stringify(dataQueryStudioDraftSnapshot)
+    } catch {
+      return true
+    }
+  }, [dataQueryStudioOpen, nodeType, dataQueryStudioDraftSnapshot])
+  useEffect(() => {
+    if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform') return
+    setDataQuerySelectFieldAliasesDraft((prev) => {
+      const allowed = new Set(uniqueFieldNames(dataQuerySelectFieldsDraft))
+      const next: Record<string, string> = {}
+      Object.entries(prev || {}).forEach(([path, alias]) => {
+        const p = String(path || '').trim()
+        const a = String(alias || '').trim()
+        if (!p || !a || !allowed.has(p)) return
+        next[p] = a
+      })
+      return next
+    })
+    setDataQuerySelectFieldSortsDraft((prev) => {
+      const allowed = new Set(uniqueFieldNames(dataQuerySelectFieldsDraft))
+      const next: Record<string, 'none' | 'asc' | 'desc'> = {}
+      Object.entries(prev || {}).forEach(([path, mode]) => {
+        const p = String(path || '').trim()
+        const m = String(mode || '').trim().toLowerCase()
+        if (!p || !allowed.has(p)) return
+        if (m === 'asc' || m === 'desc') next[p] = m
+      })
+      return next
+    })
+  }, [dataQueryStudioOpen, nodeType, dataQuerySelectFieldsDraft])
+  useEffect(() => {
+    if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform') return
+    if (!dataQueryProfilePatchEnabledDraft) return
+    const selected = String(dataQueryProfilePatchNodeIdDraft || '').trim()
+    if (selected && dataQueryProfilePatchNodeOptions.some((item) => String(item.value || '') === selected)) return
+    const fallback = String(dataQueryProfilePatchNodeOptions[0]?.value || '').trim()
+    if (fallback && fallback !== selected) {
+      setDataQueryProfilePatchNodeIdDraft(fallback)
+    }
+  }, [
+    dataQueryStudioOpen,
+    nodeType,
+    dataQueryProfilePatchEnabledDraft,
+    dataQueryProfilePatchNodeIdDraft,
+    dataQueryProfilePatchNodeOptions,
+  ])
+  const conditionRoutingModeConfigured = useMemo<'boolean' | 'case'>(
+    () => (String(nodeConfig.condition_routing_mode || 'boolean').trim().toLowerCase() === 'case' ? 'case' : 'boolean'),
+    [nodeConfig.condition_routing_mode]
+  )
+  const conditionShowRouteLabelsConfigured = useMemo(
+    () => parseBoolLike(nodeConfig.condition_show_route_labels, true),
+    [nodeConfig.condition_show_route_labels]
+  )
+  const conditionCaseRoutesConfigured = useMemo(
+    () => parseConditionCaseRoutes(nodeConfig.case_routes),
+    [nodeConfig.case_routes]
+  )
+  const conditionCaseElseTargetNodeIdsConfigured = useMemo(
+    () => uniqueFieldNames(parseStringList(nodeConfig.case_else_target_node_ids || nodeConfig.case_else_target_node_id || [])),
+    [nodeConfig.case_else_target_node_ids, nodeConfig.case_else_target_node_id]
+  )
+  const conditionCriteria = useMemo(
+    () => (conditionStudioEditingActive ? conditionCriteriaDraft : conditionCriteriaConfigured),
+    [conditionStudioEditingActive, conditionCriteriaDraft, conditionCriteriaConfigured]
+  )
+  const conditionMatchMode = useMemo<'all' | 'any'>(
+    () => (conditionStudioEditingActive ? conditionMatchModeDraft : conditionMatchModeConfigured),
+    [conditionStudioEditingActive, conditionMatchModeDraft, conditionMatchModeConfigured]
+  )
+  const conditionRoutingMode = useMemo<'boolean' | 'case'>(
+    () => (conditionStudioEditingActive ? conditionRoutingModeDraft : conditionRoutingModeConfigured),
+    [conditionStudioEditingActive, conditionRoutingModeDraft, conditionRoutingModeConfigured]
+  )
+  const conditionShowRouteLabels = useMemo(
+    () => (conditionStudioEditingActive ? conditionShowRouteLabelsDraft : conditionShowRouteLabelsConfigured),
+    [conditionStudioEditingActive, conditionShowRouteLabelsDraft, conditionShowRouteLabelsConfigured]
+  )
+  const conditionCaseRoutes = useMemo(
+    () => (conditionStudioEditingActive ? conditionCaseRoutesDraft : conditionCaseRoutesConfigured),
+    [conditionStudioEditingActive, conditionCaseRoutesDraft, conditionCaseRoutesConfigured]
+  )
+  const conditionCaseElseTargetNodeIds = useMemo(
+    () => (conditionStudioEditingActive ? conditionCaseElseTargetNodeIdsDraft : conditionCaseElseTargetNodeIdsConfigured),
+    [conditionStudioEditingActive, conditionCaseElseTargetNodeIdsDraft, conditionCaseElseTargetNodeIdsConfigured]
+  )
+
+  useEffect(() => {
+    if (!conditionStudioOpen) return
+    if (conditionRoutingMode !== 'case') {
+      setConditionCaseStudioTab('route_mapping')
+    }
+  }, [conditionStudioOpen, conditionRoutingMode])
+  useEffect(() => {
+    if (!conditionStudioOpen) {
+      setConditionQuickPickExpanded(false)
+      setConditionFieldSearchQuery('')
+      setConditionTreeExpandedKeys([])
+      setConditionTreeExpansionInitialized(false)
+    }
+  }, [conditionStudioOpen])
+  useEffect(() => {
+    if (!dataQueryStudioOpen) {
+      setDataQueryManualFieldPath('')
+      setDataQueryFieldSearchQuery('')
+      setDataQueryTreeExpandedKeys([])
+      setDataQueryShowQuickPicker(false)
+    }
+  }, [dataQueryStudioOpen])
+  useEffect(() => {
+    if (nodeType !== 'condition_node' || !selectedNodeId || conditionStudioOpen) return
+    const rawMode = String(nodeConfig.condition_validation_source || 'upstream_preview').trim().toLowerCase()
+    const nextMode: 'upstream_preview' | 'profile_store' | 'source_scan' | 'data_query_output' = (
+      rawMode === 'profile_store' || rawMode === 'source_scan' || rawMode === 'data_query_output'
+        ? rawMode
+        : 'upstream_preview'
+    )
+    const rawMaxRows = Number(nodeConfig.condition_validation_max_rows ?? 100000)
+    const nextMaxRows = Number.isFinite(rawMaxRows)
+      ? Math.max(0, Math.min(Math.trunc(rawMaxRows), 500000))
+      : 100000
+    setConditionValidationSourceMode(nextMode)
+    setConditionValidationMaxRows(nextMaxRows)
+    setConditionValidationTargetNodeId(String(nodeConfig.condition_validation_target_node_id || '').trim())
+  }, [
+    nodeType,
+    selectedNodeId,
+    conditionStudioOpen,
+    nodeConfig.condition_validation_source,
+    nodeConfig.condition_validation_max_rows,
+    nodeConfig.condition_validation_target_node_id,
+  ])
+  useEffect(() => {
+    if (nodeType !== 'condition_node' || !selectedNodeId) return
+    const options = conditionValidationSourceMode === 'profile_store'
+      ? conditionValidationProfileNodeOptions
+      : conditionValidationSourceMode === 'data_query_output'
+        ? conditionValidationDataQueryNodeOptions
+        : conditionValidationSourceNodeOptions
+    const selected = String(conditionValidationTargetNodeId || '').trim()
+    const isValid = options.some((item) => String(item.value || '').trim() === selected)
+    if (isValid) return
+    const fallback = String(options[0]?.value || '').trim()
+    if (fallback === selected) return
+    setConditionValidationTargetNodeId(fallback)
+  }, [
+    nodeType,
+    selectedNodeId,
+    conditionValidationSourceMode,
+    conditionValidationTargetNodeId,
+    conditionValidationProfileNodeOptions,
+    conditionValidationDataQueryNodeOptions,
+    conditionValidationSourceNodeOptions,
+  ])
+  useEffect(() => {
+    setConditionValidationError(null)
+    setConditionValidationRemoteSummary(null)
+  }, [conditionValidationSourceMode, conditionValidationTargetNodeId, conditionValidationMaxRows, conditionFieldRefreshNonce])
+  const setConditionValidationSourceModeConfig = useCallback((value: string) => {
+    if (nodeType !== 'condition_node' || !selectedNodeId) return
+    const normalized: 'upstream_preview' | 'profile_store' | 'source_scan' | 'data_query_output' = (
+      String(value || '').trim().toLowerCase() === 'profile_store'
+        ? 'profile_store'
+        : String(value || '').trim().toLowerCase() === 'source_scan'
+          ? 'source_scan'
+          : String(value || '').trim().toLowerCase() === 'data_query_output'
+            ? 'data_query_output'
+          : 'upstream_preview'
+    )
+    setConditionValidationSourceMode(normalized)
+  }, [nodeType, selectedNodeId])
+  const setConditionValidationTargetNodeConfig = useCallback((value?: string) => {
+    if (nodeType !== 'condition_node' || !selectedNodeId) return
+    const next = String(value || '').trim()
+    setConditionValidationTargetNodeId(next)
+  }, [nodeType, selectedNodeId])
+  const setConditionValidationMaxRowsConfig = useCallback((value?: number | null) => {
+    if (nodeType !== 'condition_node' || !selectedNodeId) return
+    const numeric = Number(value ?? 100000)
+    const nextMaxRows = Number.isFinite(numeric)
+      ? Math.max(0, Math.min(Math.trunc(numeric), 500000))
+      : 100000
+    setConditionValidationMaxRows(nextMaxRows)
+  }, [nodeType, selectedNodeId])
+  const conditionPreviewRows = useMemo(
+    () => (
+      conditionStudioEditingActive && selectedNodeId
+        ? (() => {
+          if (isAnyNodeDragging) return conditionPreviewRowsCacheRef.current
+          const strictOutputRows = inferUpstreamPreviewRows(
+            selectedNodeId,
+            nodes,
+            edges,
+            conditionPreviewRowsLimit,
+            conditionResolvedSourceNodeIds,
+            true,
+            true,
+          )
+          const rows = strictOutputRows.length > 0
+            ? strictOutputRows
+            : inferUpstreamPreviewRows(
+              selectedNodeId,
+              nodes,
+              edges,
+              conditionPreviewRowsLimit,
+              conditionResolvedSourceNodeIds,
+              false,
+              true,
+            )
+          const nextRows = rows.length > 0
+            ? rows
+            : (Array.isArray(conditionRemotePreviewRows) ? conditionRemotePreviewRows : [])
+          conditionPreviewRowsCacheRef.current = nextRows
+          return nextRows
+        })()
+        : conditionPreviewRowsCacheRef.current
+    ),
+    [conditionStudioEditingActive, selectedNodeId, nodes, edges, conditionResolvedSourceNodeIds, conditionPreviewRowsLimit, conditionRemotePreviewRows, isAnyNodeDragging, conditionFieldRefreshNonce]
+  )
+  const conditionFieldSampleRows = useMemo(() => {
+    if (!conditionStudioEditingActive || !selectedNodeId) return conditionFieldSampleRowsCacheRef.current
+    if (isAnyNodeDragging) return conditionFieldSampleRowsCacheRef.current
+    const sourceIds = uniqueFieldNames(
+      (conditionResolvedSourceNodeIds.length > 0
+        ? conditionResolvedSourceNodeIds
+        : conditionAllUpstreamSources.map((src) => String(src.id || '').trim()).filter(Boolean))
+    )
+    if (sourceIds.length === 0) {
+      return Array.isArray(conditionPreviewRows) ? conditionPreviewRows : []
+    }
+
+    const perSourceLimit = Math.max(20, Math.min(200, Math.ceil(conditionPreviewRowsLimit / Math.max(1, sourceIds.length))))
+    const totalLimit = Math.max(200, Math.min(4000, conditionPreviewRowsLimit))
+    const out: Array<Record<string, unknown>> = []
+    const seen = new Set<string>()
+    const pushRow = (row: Record<string, unknown>) => {
+      if (!row || typeof row !== 'object' || Array.isArray(row) || out.length >= totalLimit) return
+      let sig = ''
+      try {
+        sig = JSON.stringify(row) || ''
+        if (sig.length > MAX_PREVIEW_SIGNATURE_CHARS) sig = sig.slice(0, MAX_PREVIEW_SIGNATURE_CHARS)
+      } catch {
+        sig = ''
+      }
+      if (sig && seen.has(sig)) return
+      if (sig) seen.add(sig)
+      out.push(row)
+    }
+
+    sourceIds.forEach((sourceId) => {
+      if (out.length >= totalLimit) return
+      const strictRows = inferUpstreamPreviewRows(
+        selectedNodeId,
+        nodes,
+        edges,
+        perSourceLimit,
+        [sourceId],
+        true,
+        true,
+      )
+      const rows = strictRows.length > 0
+        ? strictRows
+        : inferUpstreamPreviewRows(
+          selectedNodeId,
+          nodes,
+          edges,
+          perSourceLimit,
+          [sourceId],
+          false,
+          true,
+        )
+      rows.forEach(pushRow)
+    })
+
+    if (out.length < totalLimit && Array.isArray(conditionPreviewRows)) {
+      conditionPreviewRows.forEach(pushRow)
+    }
+    if (out.length < totalLimit && Array.isArray(conditionRemotePreviewRows)) {
+      conditionRemotePreviewRows.forEach(pushRow)
+    }
+    const next = out.slice(0, totalLimit)
+    conditionFieldSampleRowsCacheRef.current = next
+    return next
+  }, [
+    conditionStudioEditingActive,
+    isAnyNodeDragging,
+    nodeType,
+    selectedNodeId,
+    nodes,
+    edges,
+    conditionResolvedSourceNodeIds,
+    conditionAllUpstreamSources,
+    conditionPreviewRowsLimit,
+    conditionPreviewRows,
+    conditionRemotePreviewRows,
+  ])
+  const conditionFieldSamples = useMemo(() => {
+    if (!conditionStudioEditingActive) return conditionFieldSamplesCacheRef.current
+    if (isAnyNodeDragging) return conditionFieldSamplesCacheRef.current
+    const out = new Map<string, string>()
+    const rows = Array.isArray(conditionFieldSampleRows) ? conditionFieldSampleRows : []
+    const formatSample = (value: unknown): string => {
+      if (value === null) return 'null'
+      if (value === undefined) return 'undefined'
+      if (typeof value === 'string') return value.length > 0 ? value : '""'
+      if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value)
+      try {
+        const json = JSON.stringify(value)
+        return String(json ?? '')
+      } catch {
+        return String(value)
+      }
+    }
+    if (!rows.length) {
+      conditionFieldOptions.forEach((path) => {
+        const pathText = String(path || '').trim()
+        if (!pathText || out.has(pathText)) return
+        out.set(pathText, '(no sample)')
+      })
+      conditionFieldSamplesCacheRef.current = out
+      return out
+    }
+    conditionFieldOptions.forEach((path) => {
+      const pathText = String(path || '').trim()
+      if (!pathText || out.has(pathText)) return
+      let matched = false
+      for (const row of rows) {
+        const hit = readPathValue(row, pathText)
+        if (!hit.found) continue
+        let sampleText = formatSample(hit.value)
+        if (sampleText.length > 60) sampleText = `${sampleText.slice(0, 57)}...`
+        out.set(pathText, sampleText)
+        matched = true
+        break
+      }
+      if (!matched) out.set(pathText, '(no sample)')
+    })
+    conditionFieldSamplesCacheRef.current = out
+    return out
+  }, [conditionStudioEditingActive, isAnyNodeDragging, conditionFieldSampleRows, conditionFieldOptions])
+  const conditionFieldOptionsBySource = useMemo(() => {
+    if (!conditionStudioEditingActive || !selectedNodeId) {
+      return conditionFieldOptionsBySourceCacheRef.current
+    }
+    if (isAnyNodeDragging) {
+      return conditionFieldOptionsBySourceCacheRef.current
+    }
+    if (nodeType !== 'condition_node') {
+      return [] as Array<{ sourceId: string; sourceLabel: string; fields: string[]; sourceType: string }>
+    }
+    const selectedSet = new Set(
+      conditionResolvedSourceNodeIds.map((id) => String(id || '').trim()).filter(Boolean),
+    )
+    const candidateSources = conditionAllUpstreamSources.map((src) => ({
+      sourceId: String(src.id || '').trim(),
+      sourceLabel: String(src.label || src.id || '').trim() || String(src.id || ''),
+      baseFields: Array.isArray(src.fields) ? src.fields : [],
+    })).filter((src) => !!src.sourceId)
+      .sort((a, b) => {
+        const aSel = selectedSet.has(a.sourceId) ? 0 : 1
+        const bSel = selectedSet.has(b.sourceId) ? 0 : 1
+        if (aSel !== bSel) return aSel - bSel
+        return a.sourceLabel.localeCompare(b.sourceLabel)
+      })
+
+    if (candidateSources.length === 0) {
+      return [] as Array<{ sourceId: string; sourceLabel: string; fields: string[]; sourceType: string }>
+    }
+
+    const list = candidateSources.map((src) => {
+      const inferred = inferUpstreamInputFields(
+        selectedNodeId,
+        nodes,
+        edges,
+        [src.sourceId],
+        true,
+      )
+      const strictRows = inferUpstreamPreviewRows(
+        selectedNodeId,
+        nodes,
+        edges,
+        Math.max(1, Math.min(conditionPreviewRowsLimit, MAX_SAMPLE_ROWS_FOR_PATH_DISCOVERY)),
+        [src.sourceId],
+        true,
+        true,
+      )
+      const relaxedRows = strictRows.length > 0
+        ? strictRows
+        : inferUpstreamPreviewRows(
+          selectedNodeId,
+          nodes,
+          edges,
+          Math.max(1, Math.min(conditionPreviewRowsLimit, MAX_SAMPLE_ROWS_FOR_PATH_DISCOVERY)),
+          [src.sourceId],
+          false,
+          true,
+        )
+      const discovered = uniqueFieldNames([
+        ...extractPriorityJsonFieldPaths(relaxedRows),
+        ...extractSampleFieldPaths(relaxedRows),
+      ])
+      // Remote hints are global; if a single source is selected/connected,
+      // attribute them to that source so JSON roots can still expand.
+      const remoteHints = candidateSources.length === 1 ? conditionRemoteFieldHints : []
+      const sourceInputHints = inferUpstreamInputFields(
+        src.sourceId,
+        nodes,
+        edges,
+      )
+      const fields = uniqueFieldNames([
+        ...src.baseFields,
+        ...inferred,
+        ...discovered,
+        ...sourceInputHints,
+        ...remoteHints,
+      ])
+      const sourceType = String(
+        conditionAllUpstreamSources.find((item) => String(item.id || '').trim() === src.sourceId)?.nodeType || ''
+      ).trim().toLowerCase() || 'upstream'
+      return {
+        sourceId: src.sourceId,
+        sourceLabel: src.sourceLabel,
+        fields,
+        sourceType,
+      }
+    })
+
+    conditionFieldOptionsBySourceCacheRef.current = list
+    return list
+  }, [
+    conditionStudioEditingActive,
+    isAnyNodeDragging,
+    nodeType,
+    selectedNodeId,
+    nodes,
+    edges,
+    conditionAllUpstreamSources,
+    conditionResolvedSourceNodeIds,
+    conditionPreviewRowsLimit,
+    conditionRemoteFieldHints,
+  ])
+
+  const conditionFieldTreeData = useMemo(() => {
+    if (!conditionStudioEditingActive) return conditionFieldTreeDataCacheRef.current
+    if (isAnyNodeDragging) return conditionFieldTreeDataCacheRef.current
+    type FieldTreeNodeInternal = {
+      key: string
+      label: string
+      path: string
+      selectable: boolean
+      children: FieldTreeNodeInternal[]
+      childMap: Map<string, FieldTreeNodeInternal>
+    }
+    const rootNodes: FieldTreeNodeInternal[] = []
+    const rootMap = new Map<string, FieldTreeNodeInternal>()
+    const getOrCreateNode = (
+      map: Map<string, FieldTreeNodeInternal>,
+      list: FieldTreeNodeInternal[],
+      key: string,
+      label: string,
+      path: string,
+    ) => {
+      const existing = map.get(key)
+      if (existing) return existing
+      const created: FieldTreeNodeInternal = {
+        key,
+        label,
+        path,
+        selectable: false,
+        children: [],
+        childMap: new Map<string, FieldTreeNodeInternal>(),
+      }
+      map.set(key, created)
+      list.push(created)
+      return created
+    }
+    const fieldsCoveredBySource = new Set<string>()
+    const addPathUnderParent = (
+      parentNode: FieldTreeNodeInternal | null,
+      fullPath: string,
+    ) => {
+      const segments = splitPathSegments(fullPath)
+      if (!segments.length) return
+      let parentList = parentNode ? parentNode.children : rootNodes
+      let parentMap = parentNode ? parentNode.childMap : rootMap
+      let normalizedPath = parentNode ? parentNode.path : ''
+      segments.forEach((seg, index) => {
+        normalizedPath = appendPathSegment(normalizedPath, seg)
+        const node = getOrCreateNode(parentMap, parentList, normalizedPath, seg, normalizedPath)
+        if (index === segments.length - 1) {
+          node.selectable = true
+          node.path = fullPath
+        }
+        parentList = node.children
+        parentMap = node.childMap
+      })
+    }
+
+    if (conditionFieldOptionsBySource.length > 0) {
+      conditionFieldOptionsBySource.forEach((sourceCluster) => {
+        const sourceRootKey = `src::${sourceCluster.sourceId}`
+        const sourcePrefix = sourceCluster.sourceType === 'profile_query_transform' ? 'Data Query' : 'Upstream'
+        const sourceTitle = `${sourcePrefix} · ${sourceCluster.sourceLabel}`
+        const sourceRoot = getOrCreateNode(
+          rootMap,
+          rootNodes,
+          sourceRootKey,
+          sourceTitle,
+          sourceRootKey,
+        )
+        sourceRoot.selectable = false
+        const sourceFieldSet = new Set(
+          sourceCluster.fields.map((field) => String(field || '').trim().toLowerCase()).filter(Boolean),
+        )
+        conditionFieldOptions.forEach((rawPath) => {
+          const fullPath = String(rawPath || '').trim()
+          if (!fullPath) return
+          const segments = splitPathSegments(fullPath)
+          const rootSeg = String(segments[0] || '').trim().toLowerCase()
+          const include = sourceFieldSet.has(fullPath.toLowerCase()) || (rootSeg && sourceFieldSet.has(rootSeg))
+          if (!include) return
+          fieldsCoveredBySource.add(fullPath.toLowerCase())
+          addPathUnderParent(sourceRoot, fullPath)
+        })
+      })
+      // Keep unmatched fields visible under a shared bucket.
+      const unmatched = conditionFieldOptions.filter((path) => !fieldsCoveredBySource.has(String(path || '').trim().toLowerCase()))
+      if (unmatched.length > 0) {
+        const miscRoot = getOrCreateNode(rootMap, rootNodes, 'src::__unmatched__', 'Other Fields', 'src::__unmatched__')
+        miscRoot.selectable = false
+        unmatched.forEach((rawPath) => {
+          const fullPath = String(rawPath || '').trim()
+          if (!fullPath) return
+          addPathUnderParent(miscRoot, fullPath)
+        })
+      }
+    } else {
+      conditionFieldOptions.forEach((rawPath) => {
+        const fullPath = String(rawPath || '').trim()
+        if (!fullPath) return
+        addPathUnderParent(null, fullPath)
+      })
+    }
+    const toTreeData = (node: FieldTreeNodeInternal): any => {
+      const sample = conditionFieldSamples.get(node.path)
+      return {
+        key: node.key,
+        path: node.path,
+        selectable: node.selectable,
+        title: (
+          <span>
+            <span>{node.label}</span>
+            {sample ? (
+              <span style={{ color: 'var(--app-text-subtle)' }}> = {sample}</span>
+            ) : null}
+          </span>
+        ),
+        children: node.children.map(toTreeData),
+      }
+    }
+    const next = rootNodes.map(toTreeData)
+    conditionFieldTreeDataCacheRef.current = next
+    return next
+  }, [conditionStudioEditingActive, isAnyNodeDragging, conditionFieldOptions, conditionFieldOptionsBySource, conditionFieldSamples])
+  const conditionFieldSearchQueryNormalized = useMemo(
+    () => String(conditionFieldSearchQuery || '').trim().toLowerCase(),
+    [conditionFieldSearchQuery]
+  )
+  const conditionFilteredFieldTreeData = useMemo(() => {
+    if (!conditionFieldSearchQueryNormalized) return conditionFieldTreeData
+    const filterNodes = (nodes: any[]): any[] => (
+      nodes.reduce((acc: any[], node: any) => {
+        const nodePath = String(node?.path || '')
+        const nodeKey = String(node?.key || '')
+        const haystack = `${nodePath} ${nodeKey}`.toLowerCase()
+        const children = Array.isArray(node?.children) ? filterNodes(node.children) : []
+        const matched = haystack.includes(conditionFieldSearchQueryNormalized)
+        if (matched || children.length > 0) {
+          acc.push({
+            ...node,
+            children,
+          })
+        }
+        return acc
+      }, [])
+    )
+    return filterNodes(conditionFieldTreeData as any[])
+  }, [conditionFieldTreeData, conditionFieldSearchQueryNormalized])
+  const conditionFilteredFieldOptions = useMemo(
+    () => (
+      !conditionFieldSearchQueryNormalized
+        ? conditionFieldOptions
+        : conditionFieldOptions.filter((fieldName) =>
+          String(fieldName || '').toLowerCase().includes(conditionFieldSearchQueryNormalized))
+    ),
+    [conditionFieldOptions, conditionFieldSearchQueryNormalized]
+  )
+  const conditionFilteredFieldTreeKeys = useMemo(() => {
+    const out: string[] = []
+    const walk = (nodes: any[]) => {
+      nodes.forEach((node) => {
+        const key = String(node?.key || '').trim()
+        if (key) out.push(key)
+        if (Array.isArray(node?.children) && node.children.length > 0) {
+          walk(node.children)
+        }
+      })
+    }
+    if (Array.isArray(conditionFilteredFieldTreeData)) {
+      walk(conditionFilteredFieldTreeData as any[])
+    }
+    return uniqueFieldNames(out)
+  }, [conditionFilteredFieldTreeData])
+  useEffect(() => {
+    if (!conditionStudioOpen || nodeType !== 'condition_node') return
+    if (conditionTreeExpansionInitialized) return
+    setConditionTreeExpandedKeys(conditionFilteredFieldTreeKeys)
+    setConditionTreeExpansionInitialized(true)
+  }, [
+    conditionStudioOpen,
+    nodeType,
+    conditionFilteredFieldTreeKeys,
+    conditionTreeExpansionInitialized,
+  ])
+
+  const conditionBranchTargets = useMemo(() => {
+    const idToLabel = new Map<string, string>()
+    nodes.forEach((item) => {
+      const nid = String(item.id || '')
+      const nlabel = String(item.data?.label || item.data?.nodeType || nid)
+      if (nid) idToLabel.set(nid, nlabel)
+    })
+    const trueTargets: string[] = []
+    const falseTargets: string[] = []
+    if (!selectedNodeId) {
+      return { trueTargets, falseTargets }
+    }
+    edges.forEach((edge) => {
+      const sourceId = String(edge.source || '')
+      if (sourceId !== String(selectedNodeId)) return
+      const targetId = String(edge.target || '')
+      const targetLabel = idToLabel.get(targetId) || targetId
+      const sourceHandle = String((edge as any).sourceHandle || 'output')
+      if (sourceHandle === 'output_false') {
+        if (targetLabel && !falseTargets.includes(targetLabel)) falseTargets.push(targetLabel)
+      } else {
+        if (targetLabel && !trueTargets.includes(targetLabel)) trueTargets.push(targetLabel)
+      }
+    })
+    return { trueTargets, falseTargets }
+  }, [selectedNodeId, nodes, edges])
+
+  const conditionTargetNodeOptions = useMemo(
+    () => nodes
+      .filter((item) => String(item.id || '') !== String(selectedNodeId || ''))
+      .map((item) => ({
+        value: String(item.id || ''),
+        label: String(item.data?.label || item.data?.nodeType || item.id),
+      })),
+    [nodes, selectedNodeId]
+  )
+  useEffect(() => {
+    if (nodeType !== 'condition_node' || !selectedNodeId || conditionStudioOpen) return
+    const trueEdge = edges.find((edge) => (
+      String(edge.source || '') === String(selectedNodeId)
+      && String((edge as any).sourceHandle || 'output') !== 'output_false'
+    ))
+    const falseEdge = edges.find((edge) => (
+      String(edge.source || '') === String(selectedNodeId)
+      && String((edge as any).sourceHandle || '') === 'output_false'
+    ))
+    setConditionTrueTargetNodeId(String(trueEdge?.target || ''))
+    setConditionFalseTargetNodeId(String(falseEdge?.target || ''))
+  }, [nodeType, selectedNodeId, edges, conditionStudioOpen])
+
+  const applyConditionRoutingConnections = useCallback((overrides?: {
+    routingMode?: 'boolean' | 'case'
+    caseRoutes?: ConditionCaseRoute[]
+    elseTargetNodeIds?: string[]
+    trueTargetNodeId?: string
+    falseTargetNodeId?: string
+    showRouteLabels?: boolean
+    notify?: boolean
+  }) => {
+    if (!selectedNodeId) return
+    const sourceId = String(selectedNodeId)
+    const nextRoutingMode = (
+      overrides?.routingMode
+      || conditionRoutingMode
+    ) === 'case' ? 'case' : 'boolean'
+    const nextCaseRoutes = Array.isArray(overrides?.caseRoutes)
+      ? overrides?.caseRoutes
+      : conditionCaseRoutes
+    const nextElseTargets = uniqueFieldNames(parseStringList(
+      Array.isArray(overrides?.elseTargetNodeIds)
+        ? overrides?.elseTargetNodeIds
+        : conditionCaseElseTargetNodeIds,
+    ))
+    const nextTrueRaw = overrides?.trueTargetNodeId ?? conditionTrueTargetNodeId ?? ''
+    const nextFalseRaw = overrides?.falseTargetNodeId ?? conditionFalseTargetNodeId ?? ''
+    const nextTrue = resolveConditionTargetIdsForNodes(nodes, [nextTrueRaw], sourceId)[0] || ''
+    const nextFalse = resolveConditionTargetIdsForNodes(nodes, [nextFalseRaw], sourceId)[0] || ''
+    const showRouteLabels = typeof overrides?.showRouteLabels === 'boolean'
+      ? overrides.showRouteLabels
+      : conditionShowRouteLabels
+    const isManagedConditionHandle = (handleRaw: unknown): boolean => {
+      const handle = String(handleRaw ?? 'output').trim()
+      return handle === '' || handle === 'output' || handle === 'output_false' || handle.startsWith('case_')
+    }
+    const managedEdgePrefix = `e_${sourceId}_`
+    const isManagedRoutingEdge = (edge: any): boolean => {
+      if (!edge || typeof edge !== 'object') return false
+      if (String(edge.source || '') !== sourceId) return false
+      const data = (edge as any).data
+      if (data && typeof data === 'object' && Boolean((data as any).conditionRoutingManaged)) {
+        return true
+      }
+      const handle = String((edge as any).sourceHandle ?? 'output').trim()
+      const edgeId = String((edge as any).id || '')
+      // Backward compatibility: clean up previously auto-generated routing edges
+      // without touching user-drawn/manual connectors.
+      if (edgeId.startsWith(managedEdgePrefix) && isManagedConditionHandle(handle)) {
+        return true
+      }
+      return false
+    }
+    // Rebuild only routing edges previously managed by this action.
+    // Keep manual connectors intact.
+    const baseEdges = (edges || []).filter((edge) => {
+      if (String(edge.source || '') !== sourceId) return true
+      return !isManagedRoutingEdge(edge)
+    })
+    const makeEdge = (
+      targetId: string,
+      handle: 'output' | 'output_false',
+      opts?: { hidden?: boolean; display?: boolean; label?: string },
+    ) => {
+      const edgeLabel = showRouteLabels ? String(opts?.label || '').trim() : ''
+      return {
+        id: `e_${sourceId}_${handle}_${targetId}`,
+        source: sourceId,
+        target: targetId,
+        sourceHandle: handle,
+        targetHandle: 'input',
+        type: connectorType,
+        animated: true,
+        reconnectable: true,
+        updatable: true,
+        interactionWidth: 44,
+        hidden: Boolean(opts?.hidden),
+        data: {
+          conditionRoutingManaged: true,
+          conditionRoutingDisplay: Boolean(opts?.display),
+        },
+        label: edgeLabel || undefined,
+        ...(edgeLabel ? {
+          labelShowBg: true,
+          labelBgPadding: [6, 2] as [number, number],
+          labelBgBorderRadius: 8,
+          labelStyle: {
+            fill: 'var(--app-text)',
+            fontSize: 10,
+            fontWeight: 600,
+          },
+        } : {}),
+        style: {
+          stroke: handle === 'output_false' ? '#ef4444' : '#6366f1',
+          strokeWidth: 2,
+        },
+      }
+    }
+
+    if (nextRoutingMode === 'case' && nextCaseRoutes.length > 0) {
+      const resolvedElseTargets = resolveConditionTargetIdsForNodes(nodes, nextElseTargets || [], sourceId)
+      const configuredCaseTargets = nextCaseRoutes.reduce((count, route) => {
+        return count + resolveConditionTargetIdsForNodes(nodes, route.targetNodeIds || [], sourceId).length
+      }, 0)
+      if (configuredCaseTargets <= 0 && resolvedElseTargets.length <= 0) {
+        if (overrides?.notify !== false) {
+          notification.warning({
+            message: 'No routing targets selected',
+            description: 'Select at least one CASE or ELSE target node before applying routing.',
+            placement: 'bottomRight',
+            duration: 2,
+          })
+        }
+        return
+      }
+      const makeCaseEdge = (
+        targetId: string,
+        handleId: string,
+        color: string,
+        opts?: { hidden?: boolean; display?: boolean; label?: string },
+      ) => {
+        const edgeLabel = showRouteLabels ? String(opts?.label || '').trim() : ''
+        return {
+          id: `e_${sourceId}_${handleId}_${targetId}`,
+          source: sourceId,
+          target: targetId,
+          sourceHandle: handleId,
+          targetHandle: 'input',
+          type: connectorType,
+          animated: true,
+          reconnectable: true,
+          updatable: true,
+          interactionWidth: 44,
+          hidden: Boolean(opts?.hidden),
+          data: {
+            conditionRoutingManaged: true,
+            conditionRoutingDisplay: Boolean(opts?.display),
+          },
+          label: edgeLabel || undefined,
+          ...(edgeLabel ? {
+            labelShowBg: true,
+            labelBgPadding: [6, 2] as [number, number],
+            labelBgBorderRadius: 8,
+            labelStyle: {
+              fill: 'var(--app-text)',
+              fontSize: 10,
+              fontWeight: 600,
+            },
+          } : {}),
+          style: {
+            stroke: color,
+            strokeWidth: 2,
+          },
+        }
+      }
+      const displayTrueTargets: string[] = []
+      const seenDisplayTrueTargets = new Set<string>()
+      const displayLabelsByTarget = new Map<string, string[]>()
+      nextCaseRoutes.forEach((route, index) => {
+        const handleId = String(route.handleId || normalizeConditionCaseHandleId(route.id)).trim() || normalizeConditionCaseHandleId(route.id)
+        const caseLabel = String(route.label || route.id || `CASE_${index + 1}`).trim() || `CASE_${index + 1}`
+        const colorPalette = ['#0ea5e9', '#8b5cf6', '#22c55e', '#f97316', '#eab308', '#06b6d4']
+        const edgeColor = colorPalette[index % colorPalette.length]
+        resolveConditionTargetIdsForNodes(nodes, route.targetNodeIds || [], sourceId).forEach((targetId) => {
+          if (!targetId || targetId === sourceId) return
+          if (!seenDisplayTrueTargets.has(targetId)) {
+            seenDisplayTrueTargets.add(targetId)
+            displayTrueTargets.push(targetId)
+          }
+          const existingLabels = displayLabelsByTarget.get(targetId) || []
+          if (!existingLabels.includes(caseLabel)) existingLabels.push(caseLabel)
+          displayLabelsByTarget.set(targetId, existingLabels)
+          // Keep CASE routing edges internal; render a single TRUE display edge.
+          baseEdges.push(makeCaseEdge(targetId, handleId, edgeColor, { hidden: true }))
+        })
+      })
+      // Visual TRUE branch edges only. Backend ignores `output` in CASE mode.
+      // Draw one connector per CASE target for clear canvas mapping.
+      displayTrueTargets.forEach((targetId) => {
+        const labels = displayLabelsByTarget.get(targetId) || []
+        baseEdges.push(makeEdge(targetId, 'output', {
+          display: true,
+          label: labels.length > 0 ? labels.join(' | ') : 'CASE',
+        }))
+      })
+      resolvedElseTargets.forEach((targetId) => {
+        if (!targetId || targetId === sourceId) return
+        // Keep FALSE edges visible for selected ELSE targets.
+        baseEdges.push(makeCaseEdge(
+          targetId,
+          'output_false',
+          '#ef4444',
+          { hidden: false, display: true, label: 'ELSE' },
+        ))
+      })
+    } else {
+      if (!nextTrue && !nextFalse) {
+        if (overrides?.notify !== false) {
+          notification.warning({
+            message: 'No routing targets selected',
+            description: 'Select TRUE and/or FALSE target node before applying routing.',
+            placement: 'bottomRight',
+            duration: 2,
+          })
+        }
+        return
+      }
+      if (nextTrue) baseEdges.push(makeEdge(nextTrue, 'output'))
+      if (nextFalse) baseEdges.push(makeEdge(nextFalse, 'output_false'))
+    }
+    setEdges(baseEdges as any)
+    if (overrides?.notify !== false) {
+      const resolvedElseTargetsCount = resolveConditionTargetIdsForNodes(nodes, nextElseTargets || [], sourceId).length
+      notification.success({
+        message: 'Condition routing updated',
+        description: nextRoutingMode === 'case'
+          ? `CASE routes -> ${nextCaseRoutes.length} | ELSE -> ${resolvedElseTargetsCount}`
+          : `TRUE -> ${nextTrue || '(none)'} | FALSE -> ${nextFalse || '(none)'}`,
+        placement: 'bottomRight',
+        duration: 2,
+      })
+    }
+  }, [
+    selectedNodeId,
+    conditionTrueTargetNodeId,
+    conditionFalseTargetNodeId,
+    edges,
+    conditionRoutingMode,
+    conditionCaseRoutes,
+    conditionCaseElseTargetNodeIds,
+    conditionShowRouteLabels,
+    nodes,
+    connectorType,
+    setEdges,
+  ])
+  const detectConditionSourceFieldOptions = useCallback(async () => {
+    if (nodeType !== 'condition_node' || !selectedNodeId) {
+      setConditionRemoteFieldHints([])
+      setConditionRemotePreviewRows([])
+      setConditionRemoteDetectionError(null)
+      return
+    }
+    const sourceIds = conditionResolvedSourceNodeIds.length > 0
+      ? conditionResolvedSourceNodeIds
+      : conditionAllUpstreamSources.map((src) => String(src.id || '').trim()).filter(Boolean)
+    if (sourceIds.length === 0) {
+      setConditionRemoteFieldHints([])
+      setConditionRemotePreviewRows([])
+      setConditionRemoteDetectionError(null)
+      return
+    }
+
+    const nodeMap = new Map(nodes.map((item) => [String(item.id || ''), item] as const))
+    const incomingByTarget = buildIncomingByTarget(edges)
+    const detectNodeIds: string[] = []
+    const visitedUpstream = new Set<string>()
+    const scanQueue = [...sourceIds]
+    while (scanQueue.length > 0 && detectNodeIds.length < 500) {
+      const nid = String(scanQueue.shift() || '').trim()
+      if (!nid || visitedUpstream.has(nid)) continue
+      visitedUpstream.add(nid)
+      const sourceNode = nodeMap.get(nid)
+      const sourceType = String(sourceNode?.data?.nodeType || '').trim().toLowerCase()
+      if (sourceType.endsWith('_source')) {
+        detectNodeIds.push(nid)
+      }
+      const parents = incomingByTarget.get(nid) || []
+      parents.forEach((pid) => {
+        const p = String(pid || '').trim()
+        if (p && !visitedUpstream.has(p)) scanQueue.push(p)
+      })
+    }
+    const finalDetectNodeIds = detectNodeIds.length > 0 ? detectNodeIds : sourceIds
+    const rowsOut: Array<Record<string, unknown>> = []
+    const fieldOut = new Set<string>()
+    const seenRows = new Set<string>()
+    setConditionRemoteDetectionLoading(true)
+    setConditionRemoteDetectionError(null)
+    try {
+      for (const sourceId of finalDetectNodeIds) {
+        const sourceNode = nodeMap.get(String(sourceId || '').trim())
+        if (!sourceNode) continue
+        const sourceType = String(sourceNode.data?.nodeType || '').trim().toLowerCase()
+        if (!sourceType.endsWith('_source')) continue
+        const sourceCfg = (
+          sourceNode.data?.config && typeof sourceNode.data.config === 'object'
+            ? sourceNode.data.config
+            : {}
+        ) as Record<string, unknown>
+        let response: any = null
+        try {
+          response = await api.detectSourceFieldOptions(
+            sourceType,
+            sourceCfg,
+            5000,
+            {
+              previewRows: 300,
+              includeSchemaScan: true,
+              schemaScanLimit: 10000,
+              previewCompact: false,
+              timeoutMs: 45000,
+            },
+          )
+        } catch {
+          continue
+        }
+        const columns = parseFieldList(response?.columns)
+        columns.forEach((name) => fieldOut.add(name))
+        const previewRows = Array.isArray(response?.preview)
+          ? response.preview.filter((row: unknown) => !!row && typeof row === 'object' && !Array.isArray(row)) as Array<Record<string, unknown>>
+          : []
+        const discovered = uniqueFieldNames([
+          ...extractPriorityJsonFieldPaths(previewRows),
+          ...extractSampleFieldPaths(previewRows),
+        ])
+        discovered.forEach((name) => fieldOut.add(name))
+        for (const row of previewRows) {
+          if (rowsOut.length >= 1000) break
+          let sig = ''
+          try {
+            sig = JSON.stringify(row) || ''
+          } catch {
+            sig = ''
+          }
+          if (sig && seenRows.has(sig)) continue
+          if (sig) seenRows.add(sig)
+          rowsOut.push(row)
+        }
+      }
+      setConditionRemoteFieldHints(uniqueFieldNames(Array.from(fieldOut)))
+      setConditionRemotePreviewRows(rowsOut.slice(0, 1000))
+    } catch (err: any) {
+      setConditionRemoteDetectionError(String(err?.message || 'Failed to detect source fields from connected source node.'))
+    } finally {
+      setConditionRemoteDetectionLoading(false)
+    }
+  }, [
+    nodeType,
+    selectedNodeId,
+    nodes,
+    edges,
+    conditionResolvedSourceNodeIds,
+    conditionAllUpstreamSources,
+  ])
+  const refreshConditionStudioFields = useCallback(() => {
+    conditionUpstreamFieldsCacheRef.current = []
+    conditionUpstreamPathFieldsCacheRef.current = { allPaths: [], userPaths: [] }
+    conditionPreviewRowsCacheRef.current = []
+    setConditionRemoteFieldHints([])
+    setConditionRemotePreviewRows([])
+    setConditionRemoteDetectionError(null)
+    void loadConditionProfileDocFieldHints()
+    void detectConditionSourceFieldOptions()
+    setConditionFieldRefreshNonce((prev) => prev + 1)
+    notification.success({
+      message: 'Fields refreshed',
+      description: 'Condition field options were reloaded from selected upstream source output.',
+      placement: 'bottomRight',
+      duration: 2,
+    })
+  }, [loadConditionProfileDocFieldHints, detectConditionSourceFieldOptions])
+  useEffect(() => {
+    if (!conditionStudioOpen || nodeType !== 'condition_node') return
+    void detectConditionSourceFieldOptions()
+    // Intentionally run only when studio opens (or node type changes) to avoid
+    // auto-refreshing source fields while editing condition rules.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conditionStudioOpen, nodeType])
+  useEffect(() => {
+    if (conditionStudioOpen || nodeType !== 'condition_node') return
+    // Release heavy preview/tree caches when studio is closed to keep
+    // canvas interactions smooth during normal node movement.
+    setConditionRemotePreviewRows([])
+    conditionPreviewRowsCacheRef.current = []
+    conditionFieldSampleRowsCacheRef.current = []
+    conditionFieldSamplesCacheRef.current = new Map<string, string>()
+    conditionFieldTreeDataCacheRef.current = []
+  }, [conditionStudioOpen, nodeType])
+  const saveConditionStudioConfig = useCallback(() => {
+    if (!selectedNodeId) return
+    const normalizedCriteria = (conditionCriteria || []).map((item, index) => ({
+      id: String(item.id || `rule_${index + 1}`),
+      field: String(item.field || '').trim(),
+      operator: String(item.operator || 'equals'),
+      value: item.value == null ? '' : String(item.value),
+      rightMode: (
+        item.rightMode === 'field'
+          || item.rightMode === 'values'
+          || item.rightMode === 'variable'
+          || item.rightMode === 'raw'
+          || item.rightMode === 'literal'
+          ? item.rightMode
+          : 'literal'
+      ),
+    }))
+    const firstCriteria = normalizedCriteria[0] || null
+    const normalizedCaseRoutes = (conditionCaseRoutes || []).map((route, index) => {
+      const routeId = String(route.id || `route_${index + 1}`).trim() || `route_${index + 1}`
+      const label = String(route.label || routeId).trim() || routeId
+      const routeMatchMode: ConditionCaseRouteMatchMode = String(route.matchMode || '').trim().toLowerCase() === 'any' ? 'any' : 'all'
+      const routeConditions = Array.isArray(route.conditions) && route.conditions.length > 0
+        ? route.conditions
+        : [createConditionCaseCondition(route)]
+      const normalizedConditions = routeConditions.map((cond, condIndex) => {
+        const mode: ConditionCaseRouteMode = String(cond.mode || '').trim().toLowerCase() === 'condition' ? 'condition' : 'range'
+        const rightMode: ConditionCaseRouteRightMode = String(cond.rightMode || '').trim().toLowerCase() === 'field' ? 'field' : 'literal'
+        return {
+          id: String(cond.id || `cond_${routeId}_${condIndex + 1}`).trim() || `cond_${routeId}_${condIndex + 1}`,
+          field: String(cond.field || '').trim(),
+          match_mode: mode,
+          operator: String(cond.operator || 'equals').trim() || 'equals',
+          right_mode: rightMode,
+          right_value: String(cond.rightValue ?? ''),
+          min_value: String(cond.minValue ?? '').trim(),
+          max_value: String(cond.maxValue ?? '').trim(),
+          include_min: cond.includeMin !== false,
+          include_max: cond.includeMax !== false,
+        }
+      })
+      const firstCond = normalizedConditions[0] || {
+        field: '',
+        match_mode: 'range',
+        operator: 'equals',
+        right_mode: 'literal',
+        right_value: '',
+        min_value: '',
+        max_value: '',
+        include_min: true,
+        include_max: true,
+      }
+      return {
+        id: routeId,
+        label,
+        handle_id: String(route.handleId || normalizeConditionCaseHandleId(routeId)).trim() || normalizeConditionCaseHandleId(routeId),
+        route_match_mode: routeMatchMode,
+        conditions: normalizedConditions,
+        field: String(firstCond.field || '').trim(),
+        match_mode: String(firstCond.match_mode || 'range'),
+        operator: String(firstCond.operator || 'equals').trim() || 'equals',
+        right_mode: String(firstCond.right_mode || 'literal'),
+        right_value: String(firstCond.right_value ?? ''),
+        min_value: String(firstCond.min_value ?? '').trim(),
+        max_value: String(firstCond.max_value ?? '').trim(),
+        include_min: firstCond.include_min !== false,
+        include_max: firstCond.include_max !== false,
+        target_node_ids: resolveConditionTargetIdsForNodes(nodes, route.targetNodeIds || [], selectedNodeId),
+      }
+    })
+    const resolvedElseTargets = resolveConditionTargetIdsForNodes(nodes, conditionCaseElseTargetNodeIds || [], selectedNodeId)
+    const resolvedTrueTarget = resolveConditionTargetIdsForNodes(nodes, [conditionTrueTargetNodeId], selectedNodeId)[0] || ''
+    const resolvedFalseTarget = resolveConditionTargetIdsForNodes(nodes, [conditionFalseTargetNodeId], selectedNodeId)[0] || ''
+    updateNodeConfig(selectedNodeId, {
+      criteria: normalizedCriteria,
+      criteria_mode: conditionMatchMode,
+      field: firstCriteria?.field || '',
+      operator: firstCriteria?.operator || 'equals',
+      value: firstCriteria?.value || '',
+      right_mode: firstCriteria?.rightMode || 'literal',
+      case_sensitive: Boolean(conditionCaseSensitiveDraft),
+      condition_routing_mode: conditionRoutingMode,
+      condition_true_target_node_id: resolvedTrueTarget,
+      condition_false_target_node_id: resolvedFalseTarget,
+      condition_show_route_labels: Boolean(conditionShowRouteLabels),
+      case_routes: normalizedCaseRoutes,
+      case_else_target_node_ids: resolvedElseTargets,
+      condition_validation_source: conditionValidationSourceMode,
+      condition_validation_target_node_id: conditionValidationTargetNodeId,
+      condition_validation_max_rows: conditionValidationMaxRows,
+    })
+    if (conditionRoutingMode === 'case') {
+      applyConditionRoutingConnections({
+        routingMode: 'case',
+        caseRoutes: parseConditionCaseRoutes(normalizedCaseRoutes),
+        elseTargetNodeIds: resolvedElseTargets,
+        notify: false,
+      })
+    } else {
+      applyConditionRoutingConnections({
+        routingMode: 'boolean',
+        trueTargetNodeId: resolvedTrueTarget,
+        falseTargetNodeId: resolvedFalseTarget,
+        notify: false,
+      })
+    }
+    notification.success({
+      message: 'Condition studio saved',
+      description: 'Criteria and routing configuration saved successfully.',
+      placement: 'bottomRight',
+      duration: 2,
+    })
+    conditionStudioInitialConfigRef.current = null
+    setConditionStudioOpen(false)
+  }, [
+    selectedNodeId,
+    nodes,
+    updateNodeConfig,
+    conditionCriteria,
+    conditionMatchMode,
+    conditionCaseSensitiveDraft,
+    conditionRoutingMode,
+    conditionShowRouteLabels,
+    conditionCaseRoutes,
+    conditionCaseElseTargetNodeIds,
+    conditionTrueTargetNodeId,
+    conditionFalseTargetNodeId,
+    conditionValidationSourceMode,
+    conditionValidationTargetNodeId,
+    conditionValidationMaxRows,
+    applyConditionRoutingConnections,
+  ])
+  const openConditionStudio = useCallback(() => {
+    if (nodeType !== 'condition_node' || !selectedNodeId) return
+    const criteria = conditionCriteriaConfigured
+    const matchMode = conditionMatchModeConfigured
+    const caseSensitive = parseBoolLike(nodeConfig.case_sensitive, false)
+    const routingMode = conditionRoutingModeConfigured
+    const showRouteLabels = conditionShowRouteLabelsConfigured
+    const caseRoutes = conditionCaseRoutesConfigured
+    const caseElseTargets = conditionCaseElseTargetNodeIdsConfigured
+    const validationSource = String(nodeConfig.condition_validation_source || 'upstream_preview').trim().toLowerCase()
+    const nextValidationSource: 'upstream_preview' | 'profile_store' | 'source_scan' | 'data_query_output' = (
+      validationSource === 'profile_store' || validationSource === 'source_scan' || validationSource === 'data_query_output'
+        ? validationSource
+        : 'upstream_preview'
+    )
+    const rawValidationMax = Number(nodeConfig.condition_validation_max_rows ?? 100000)
+    const nextValidationMax = Number.isFinite(rawValidationMax)
+      ? Math.max(0, Math.min(Math.trunc(rawValidationMax), 500000))
+      : 100000
+    const validationTargetNodeId = String(nodeConfig.condition_validation_target_node_id || '').trim()
+    setConditionCriteriaDraft(criteria)
+    setConditionMatchModeDraft(matchMode)
+    setConditionCaseSensitiveDraft(caseSensitive)
+    setConditionRoutingModeDraft(routingMode)
+    setConditionShowRouteLabelsDraft(showRouteLabels)
+    setConditionCaseRoutesDraft(caseRoutes)
+    setConditionCaseElseTargetNodeIdsDraft(caseElseTargets)
+    setConditionValidationSourceMode(nextValidationSource)
+    setConditionValidationTargetNodeId(validationTargetNodeId)
+    setConditionValidationMaxRows(nextValidationMax)
+    const trueEdge = edges.find((edge) => (
+      String(edge.source || '') === String(selectedNodeId)
+      && String((edge as any).sourceHandle || 'output') !== 'output_false'
+    ))
+    const falseEdge = edges.find((edge) => (
+      String(edge.source || '') === String(selectedNodeId)
+      && String((edge as any).sourceHandle || '') === 'output_false'
+    ))
+    const nextTrue = String(trueEdge?.target || String(nodeConfig.condition_true_target_node_id || '')).trim()
+    const nextFalse = String(falseEdge?.target || String(nodeConfig.condition_false_target_node_id || '')).trim()
+    setConditionTrueTargetNodeId(nextTrue)
+    setConditionFalseTargetNodeId(nextFalse)
+    conditionStudioInitialConfigRef.current = pickConditionStudioSnapshot({
+      ...nodeConfig,
+      criteria,
+      criteria_mode: matchMode,
+      case_sensitive: caseSensitive,
+      condition_routing_mode: routingMode,
+      condition_show_route_labels: showRouteLabels,
+      case_routes: caseRoutes,
+      case_else_target_node_ids: caseElseTargets,
+      condition_true_target_node_id: nextTrue,
+      condition_false_target_node_id: nextFalse,
+      condition_validation_source: nextValidationSource,
+      condition_validation_target_node_id: validationTargetNodeId,
+      condition_validation_max_rows: nextValidationMax,
+    })
+    setConditionStudioOpen(true)
+  }, [
+    nodeType,
+    selectedNodeId,
+    nodeConfig,
+    edges,
+    conditionCriteriaConfigured,
+    conditionMatchModeConfigured,
+    conditionRoutingModeConfigured,
+    conditionShowRouteLabelsConfigured,
+    conditionCaseRoutesConfigured,
+    conditionCaseElseTargetNodeIdsConfigured,
+  ])
+  const requestCloseConditionStudio = useCallback(() => {
+    if (!conditionStudioOpen) {
+      conditionStudioInitialConfigRef.current = null
+      setConditionStudioOpen(false)
+      return
+    }
+    if (!conditionStudioHasUnsavedChanges) {
+      conditionStudioInitialConfigRef.current = null
+      setConditionStudioOpen(false)
+      return
+    }
+    Modal.confirm({
+      title: 'Unsaved changes',
+      content: 'Condition Flow Studio has unsaved changes. Save before closing?',
+      okText: 'Save & Close',
+      cancelText: 'Discard',
+      centered: true,
+      onOk: () => {
+        saveConditionStudioConfig()
+      },
+      onCancel: () => {
+        conditionStudioInitialConfigRef.current = null
+        setConditionStudioOpen(false)
+      },
+    })
+  }, [
+    conditionStudioOpen,
+    conditionStudioHasUnsavedChanges,
+    saveConditionStudioConfig,
+  ])
+
+  const persistDataQueryCriteria = useCallback((nextCriteria: Array<Record<string, any>>) => {
+    const normalized = (nextCriteria || []).map((item, index) => ({
+      id: String(item.id || `rule_${index + 1}`),
+      field: String(item.field || '').trim(),
+      operator: String(item.operator || 'equals').trim().toLowerCase() || 'equals',
+      value: item.value == null ? '' : String(item.value),
+      rightMode: (
+        item.rightMode === 'field'
+          || item.rightMode === 'values'
+          || item.rightMode === 'variable'
+          || item.rightMode === 'raw'
+          || item.rightMode === 'literal'
+          ? item.rightMode
+          : 'literal'
+      ),
+    }))
+    setDataQueryCriteriaDraft(normalized)
+    if (!dataQueryActiveRuleId || !normalized.some((rule) => String(rule.id || '') === String(dataQueryActiveRuleId || ''))) {
+      setDataQueryActiveRuleId(normalized[0] ? String(normalized[0].id || '') : null)
+    }
+  }, [dataQueryActiveRuleId])
+
+  const addDataQueryRule = useCallback(() => {
+    const nextRuleId = `rule_${Date.now()}`
+    const next = [
+      ...dataQueryCriteriaDraft,
+      {
+        id: nextRuleId,
+        field: '',
+        operator: 'equals',
+        value: '',
+        rightMode: 'literal',
+      },
+    ]
+    persistDataQueryCriteria(next)
+    setDataQueryActiveRuleId(nextRuleId)
+  }, [dataQueryCriteriaDraft, persistDataQueryCriteria])
+
+  const updateDataQueryRule = useCallback((ruleId: string, patch: Record<string, unknown>) => {
+    const targetRuleId = String(ruleId || '').trim()
+    if (!targetRuleId) return
+    const next = dataQueryCriteriaDraft.map((item) => (
+      String(item.id || '') === targetRuleId ? { ...item, ...patch } : item
+    ))
+    persistDataQueryCriteria(next)
+    setDataQueryActiveRuleId(targetRuleId)
+  }, [dataQueryCriteriaDraft, persistDataQueryCriteria])
+
+  const removeDataQueryRule = useCallback((ruleId: string) => {
+    const targetRuleId = String(ruleId || '').trim()
+    if (!targetRuleId) return
+    const next = dataQueryCriteriaDraft.filter((item) => String(item.id || '') !== targetRuleId)
+    persistDataQueryCriteria(next)
+  }, [dataQueryCriteriaDraft, persistDataQueryCriteria])
+
+  const applyDataQueryFieldFromPicker = useCallback((fieldPath: string) => {
+    const picked = String(fieldPath || '').trim()
+    if (!picked) return
+    const activeRuleId = String(dataQueryActiveRuleId || '').trim()
+    const fallbackRuleId = String(dataQueryCriteriaDraft[0]?.id || '').trim()
+    const targetRuleId = activeRuleId || fallbackRuleId
+    if (!targetRuleId) {
+      const nextRuleId = `rule_${Date.now()}`
+      const next = [{
+        id: nextRuleId,
+        field: picked,
+        operator: 'equals',
+        value: '',
+        rightMode: 'literal',
+      }]
+      persistDataQueryCriteria(next)
+      setDataQueryActiveRuleId(nextRuleId)
+      return
+    }
+    updateDataQueryRule(targetRuleId, { field: picked })
+  }, [dataQueryActiveRuleId, dataQueryCriteriaDraft, persistDataQueryCriteria, updateDataQueryRule])
+
+  const persistDataQueryPatchOps = useCallback((nextOps: DataQueryProfilePatchOperation[]) => {
+    const normalized = (nextOps || []).map((item) => createDataQueryProfilePatchOperation(item))
+    setDataQueryProfilePatchOpsDraft(normalized)
+    const first = normalized[0] || null
+    if (first) {
+      setDataQueryProfilePatchDocumentPathDraft(String(first.sourcePath || ''))
+      setDataQueryProfilePatchValueModeDraft(first.valueMode === 'fixed' ? 'fixed' : 'row')
+      setDataQueryProfilePatchValueDraft(String(first.value ?? ''))
+      setDataQueryProfilePatchTargetPathDraft(String(first.targetPath || ''))
+      setDataQueryProfilePatchMergeModeDraft(first.mergeMode === 'replace' ? 'replace' : 'merge')
+    } else {
+      setDataQueryProfilePatchDocumentPathDraft('')
+      setDataQueryProfilePatchValueModeDraft('row')
+      setDataQueryProfilePatchValueDraft('')
+      setDataQueryProfilePatchTargetPathDraft('')
+      setDataQueryProfilePatchMergeModeDraft('merge')
+    }
+  }, [])
+
+  const addDataQueryPatchOperation = useCallback(() => {
+    const next = [
+      ...dataQueryProfilePatchOpsDraft,
+      createDataQueryProfilePatchOperation({
+        op: 'set',
+        valueMode: 'row',
+        mergeMode: 'merge',
+      }),
+    ]
+    persistDataQueryPatchOps(next)
+  }, [dataQueryProfilePatchOpsDraft, persistDataQueryPatchOps])
+
+  const updateDataQueryPatchOperation = useCallback((opId: string, patch: Partial<DataQueryProfilePatchOperation>) => {
+    const targetId = String(opId || '').trim()
+    if (!targetId) return
+    const next = dataQueryProfilePatchOpsDraft.map((item) => {
+      if (String(item.id || '') !== targetId) return item
+      const merged = createDataQueryProfilePatchOperation({
+        ...item,
+        ...patch,
+        id: targetId,
+      })
+      return merged
+    })
+    persistDataQueryPatchOps(next)
+  }, [dataQueryProfilePatchOpsDraft, persistDataQueryPatchOps])
+
+  const removeDataQueryPatchOperation = useCallback((opId: string) => {
+    const targetId = String(opId || '').trim()
+    if (!targetId) return
+    const next = dataQueryProfilePatchOpsDraft.filter((item) => String(item.id || '') !== targetId)
+    persistDataQueryPatchOps(next)
+  }, [dataQueryProfilePatchOpsDraft, persistDataQueryPatchOps])
+
+  const evaluateDataQueryRuleMatch = useCallback((row: Record<string, unknown>, rule: Record<string, any>) => {
+    const fieldPath = String(rule.field || '').trim()
+    if (!fieldPath) return false
+
+    const readSingleValueByPath = (obj: Record<string, unknown>, path: string): any => {
+      const hit = readPathValue(obj, path)
+      if (hit.found) return hit.value
+      if (Object.prototype.hasOwnProperty.call(obj, path)) return obj[path]
+      const normalized = path.startsWith('$.') ? path.slice(2) : (path.startsWith('$[') ? path.slice(1) : path)
+      if (normalized && Object.prototype.hasOwnProperty.call(obj, normalized)) return obj[normalized]
+      return undefined
+    }
+    const readValuesByPath = (obj: Record<string, unknown>, path: string): any[] => readPathValues(obj, path)
+    const caseSensitive = Boolean(nodeConfig.case_sensitive)
+    const evalOperator = (leftValue: any, operatorRaw: string, rightRaw: any): boolean => {
+      const operator = String(operatorRaw || 'equals').trim().toLowerCase() || 'equals'
+      if (operator === 'is_null') return leftValue == null
+      if (operator === 'is_not_null') return leftValue != null
+      const leftText = leftValue == null ? '' : String(leftValue)
+      const rightText = rightRaw == null ? '' : String(rightRaw)
+      const leftNorm = caseSensitive ? leftText : leftText.toLowerCase()
+      const rightNorm = caseSensitive ? rightText : rightText.toLowerCase()
+      const leftNum = Number(String(leftValue ?? '').replace(/,/g, ''))
+      const rightNum = Number(String(rightRaw ?? '').replace(/,/g, ''))
+      const hasNums = Number.isFinite(leftNum) && Number.isFinite(rightNum)
+      if (operator === 'greater_than') return hasNums ? leftNum > rightNum : false
+      if (operator === 'greater_or_equal') return hasNums ? leftNum >= rightNum : false
+      if (operator === 'less_than') return hasNums ? leftNum < rightNum : false
+      if (operator === 'less_or_equal') return hasNums ? leftNum <= rightNum : false
+      if (operator === 'contains') return rightNorm.length > 0 ? leftNorm.includes(rightNorm) : false
+      if (operator === 'not_contains') return rightNorm.length > 0 ? !leftNorm.includes(rightNorm) : true
+      if (operator === 'starts_with') return leftNorm.startsWith(rightNorm)
+      if (operator === 'ends_with') return leftNorm.endsWith(rightNorm)
+      if (operator === 'in' || operator === 'not_in') {
+        const values = rightText.split(',').map((item) => item.trim()).filter(Boolean)
+        const normValues = values.map((item) => (caseSensitive ? item : item.toLowerCase()))
+        const has = normValues.includes(leftNorm)
+        return operator === 'in' ? has : !has
+      }
+      if (operator === 'between') {
+        const parts = rightText.split(',').map((item) => item.trim()).filter(Boolean)
+        if (parts.length < 2) return false
+        const a = Number(parts[0].replace(/,/g, ''))
+        const b = Number(parts[1].replace(/,/g, ''))
+        if (!Number.isFinite(leftNum) || !Number.isFinite(a) || !Number.isFinite(b)) return false
+        const min = Math.min(a, b)
+        const max = Math.max(a, b)
+        return leftNum >= min && leftNum <= max
+      }
+      if (operator === 'not_equals') return leftNorm !== rightNorm
+      return leftNorm === rightNorm
+    }
+
+    const leftValues = readValuesByPath(row, fieldPath)
+    const leftCandidates = leftValues.length > 0
+      ? leftValues
+      : [readSingleValueByPath(row, fieldPath)]
+    const op = String(rule.operator || 'equals').trim().toLowerCase() || 'equals'
+    const rightMode = String(rule.rightMode || 'literal').trim().toLowerCase()
+    const rightCandidates = rightMode === 'field'
+      ? (() => {
+        const vals = readValuesByPath(row, String(rule.value || ''))
+        if (vals.length > 0) return vals
+        return [readSingleValueByPath(row, String(rule.value || ''))]
+      })()
+      : [rule.value]
+    return leftCandidates.some((leftValue) => (
+      rightCandidates.some((rightOperand) => evalOperator(leftValue, op, rightOperand))
+    ))
+  }, [nodeConfig.case_sensitive])
+
+  const runDataQueryPreview = useCallback(() => {
+    const rows = Array.isArray(dataQueryPreviewRows)
+      ? dataQueryPreviewRows.filter((row) => row && typeof row === 'object') as Array<Record<string, unknown>>
+      : []
+    const rules = (dataQueryCriteriaDraft || []).filter((rule) => String(rule.field || '').trim())
+    const mode = dataQueryMatchModeDraft === 'any' ? 'any' : 'all'
+    const selectedFields = uniqueFieldNames(dataQuerySelectFieldsDraft)
+    const sortSpecs = selectedFields
+      .map((fieldPath) => ({
+        fieldPath,
+        mode: String(dataQuerySelectFieldSortsDraft[fieldPath] || 'none').trim().toLowerCase(),
+      }))
+      .filter((spec) => spec.mode === 'asc' || spec.mode === 'desc') as Array<{ fieldPath: string; mode: 'asc' | 'desc' }>
+    const aliasMap = dataQuerySelectFieldAliasesDraft || {}
+    const arrayOutputMode = dataQueryArrayOutputModeDraft === 'explode_rows' ? 'explode_rows' : 'list'
+    const arrayMatchMode = dataQueryArrayMatchModeDraft === 'matched_elements_only' ? 'matched_elements_only' : 'all_elements'
+    const includeOriginal = Boolean(dataQueryIncludeOriginalRowDraft)
+    const safeOffset = Number.isFinite(dataQueryOffsetDraft)
+      ? Math.max(0, Math.trunc(dataQueryOffsetDraft))
+      : 0
+    const safeLimit = Number.isFinite(dataQueryLimitDraft)
+      ? Math.max(0, Math.trunc(dataQueryLimitDraft))
+      : 0
+
+    const matched = rows.filter((row) => {
+      if (rules.length <= 0) return true
+      const outcomes = rules.map((rule) => evaluateDataQueryRuleMatch(row, rule))
+      return mode === 'any' ? outcomes.some(Boolean) : outcomes.every(Boolean)
+    })
+    const compareValues = (leftValue: unknown, rightValue: unknown): number => {
+      if (leftValue == null && rightValue == null) return 0
+      if (leftValue == null) return 1
+      if (rightValue == null) return -1
+      const leftNum = Number(String(leftValue).replace(/,/g, ''))
+      const rightNum = Number(String(rightValue).replace(/,/g, ''))
+      if (Number.isFinite(leftNum) && Number.isFinite(rightNum)) {
+        if (leftNum === rightNum) return 0
+        return leftNum < rightNum ? -1 : 1
+      }
+      const leftText = String(leftValue).toLowerCase()
+      const rightText = String(rightValue).toLowerCase()
+      if (leftText === rightText) return 0
+      return leftText < rightText ? -1 : 1
+    }
+    const readFirstComparable = (row: Record<string, unknown>, path: string): unknown => {
+      const values = readPathValues(row, path)
+      if (Array.isArray(values) && values.length > 0) return values[0]
+      const hit = readPathValue(row, path)
+      if (hit.found) return hit.value
+      if (Object.prototype.hasOwnProperty.call(row, path)) return row[path]
+      return undefined
+    }
+    const matchedOrdered = sortSpecs.length > 0
+      ? [...matched].sort((a, b) => {
+        for (const spec of sortSpecs) {
+          const leftValue = readFirstComparable(a, spec.fieldPath)
+          const rightValue = readFirstComparable(b, spec.fieldPath)
+          const cmp = compareValues(leftValue, rightValue)
+          if (cmp !== 0) return spec.mode === 'desc' ? -cmp : cmp
+        }
+        return 0
+      })
+      : matched
+
+    const pathRootAndSuffix = (fieldPath: string): { rootPath: string; suffixPath: string } | null => {
+      const segments = splitPathSegments(fieldPath)
+      const wildcardIdx = segments.findIndex((seg) => String(seg || '').trim() === '*')
+      if (wildcardIdx < 0) return null
+      const rootPath = segments.slice(0, wildcardIdx).join('.')
+      const suffixPath = segments.slice(wildcardIdx + 1).join('.')
+      if (!rootPath) return null
+      return { rootPath, suffixPath }
+    }
+    const dedupeValues = (values: unknown[]): unknown[] => {
+      if (values.length <= 1) return values
+      const seen = new Set<string>()
+      const out: unknown[] = []
+      values.forEach((value) => {
+        let token = ''
+        try {
+          token = JSON.stringify(value)
+        } catch {
+          token = String(value)
+        }
+        if (seen.has(token)) return
+        seen.add(token)
+        out.push(value)
+      })
+      return out
+    }
+    const pickObjectKey = (obj: Record<string, unknown>, segment: string): string => {
+      if (Object.prototype.hasOwnProperty.call(obj, segment)) return segment
+      const segNorm = String(segment || '').trim().toLowerCase()
+      if (!segNorm) return segment
+      const hit = Object.keys(obj).find((key) => String(key || '').trim().toLowerCase() === segNorm)
+      return hit || segment
+    }
+    const cloneRowWithArrayAtPath = (
+      row: Record<string, unknown>,
+      rootPath: string,
+      items: unknown[],
+    ): Record<string, unknown> => {
+      const segments = splitPathSegments(rootPath).filter((seg) => seg !== '*')
+      if (segments.length <= 0) return { ...row }
+      const cloneRoot: Record<string, unknown> = { ...row }
+      let cloneCursor: Record<string, unknown> = cloneRoot
+      let sourceCursor: unknown = row
+      for (let idx = 0; idx < segments.length; idx += 1) {
+        const seg = segments[idx]
+        const isLast = idx === segments.length - 1
+        const sourceObj = (sourceCursor && typeof sourceCursor === 'object' && !Array.isArray(sourceCursor))
+          ? (sourceCursor as Record<string, unknown>)
+          : null
+        const actualKey = sourceObj ? pickObjectKey(sourceObj, seg) : seg
+        if (isLast) {
+          cloneCursor[actualKey] = items
+          break
+        }
+        const sourceNext = sourceObj ? sourceObj[actualKey] : undefined
+        const nextClone = (sourceNext && typeof sourceNext === 'object' && !Array.isArray(sourceNext))
+          ? { ...(sourceNext as Record<string, unknown>) }
+          : {}
+        cloneCursor[actualKey] = nextClone
+        cloneCursor = nextClone
+        sourceCursor = sourceNext
+      }
+      return cloneRoot
+    }
+    const arrayRulesByRoot = (() => {
+      const out = new Map<string, Array<Record<string, any>>>()
+      rules.forEach((rule) => {
+        const rulePath = String(rule.field || '').trim()
+        if (!rulePath) return
+        const parsed = pathRootAndSuffix(rulePath)
+        if (!parsed || !parsed.rootPath) return
+        const arr = out.get(parsed.rootPath) || []
+        arr.push(rule)
+        out.set(parsed.rootPath, arr)
+      })
+      return out
+    })()
+    const readProjectionValues = (row: Record<string, unknown>, fieldPath: string): { values: unknown[]; handled: boolean } => {
+      if (arrayMatchMode !== 'matched_elements_only') {
+        return { values: readPathValues(row, fieldPath), handled: false }
+      }
+      const parsed = pathRootAndSuffix(fieldPath)
+      if (!parsed || !parsed.rootPath) return { values: readPathValues(row, fieldPath), handled: false }
+      const rootRules = arrayRulesByRoot.get(parsed.rootPath) || []
+      if (rootRules.length <= 0) return { values: readPathValues(row, fieldPath), handled: false }
+      const arrayItems = readPathValues(row, `${parsed.rootPath}[]`)
+      if (!Array.isArray(arrayItems) || arrayItems.length <= 0) return { values: [], handled: true }
+      const matchingItems = arrayItems.filter((item) => {
+        const probeRow = cloneRowWithArrayAtPath(row, parsed.rootPath, [item])
+        const outcomes = rootRules.map((rule) => evaluateDataQueryRuleMatch(probeRow, rule))
+        return mode === 'any' ? outcomes.some(Boolean) : outcomes.every(Boolean)
+      })
+      if (matchingItems.length <= 0) return { values: [], handled: true }
+      if (!parsed.suffixPath) return { values: dedupeValues(matchingItems), handled: true }
+      const outVals: unknown[] = []
+      matchingItems.forEach((item) => {
+        if (item && typeof item === 'object' && !Array.isArray(item)) {
+          const vals = readPathValues(item as Record<string, unknown>, parsed.suffixPath)
+          if (vals.length > 0) {
+            outVals.push(...vals)
+            return
+          }
+          const hit = readPathValue(item as Record<string, unknown>, parsed.suffixPath)
+          if (hit.found) outVals.push(hit.value)
+          return
+        }
+        if (parsed.suffixPath === 'value') outVals.push(item)
+      })
+      return { values: dedupeValues(outVals), handled: true }
+    }
+    let outputRows = matchedOrdered.slice(safeOffset)
+    if (safeLimit > 0) {
+      outputRows = outputRows.slice(0, safeLimit)
+    }
+    let projectedRows: Array<Record<string, unknown>> = outputRows
+    const explodeProjectedRows = (
+      rowsToExpand: Array<Record<string, unknown>>,
+      arrayFieldRoots: Record<string, string>,
+    ): Array<Record<string, unknown>> => {
+      const outRows: Array<Record<string, unknown>> = []
+      const coerceArray = (value: unknown): unknown[] | null => {
+        if (Array.isArray(value)) return value
+        if (typeof value !== 'string') return null
+        const text = String(value || '').trim()
+        if (!(text.startsWith('[') && text.endsWith(']'))) return null
+        const parsed = parseObjectLikeJsonString(text)
+        if (Array.isArray(parsed)) return parsed
+        return null
+      }
+      rowsToExpand.forEach((inRow) => {
+        const normalizedRow: Record<string, unknown> = { ...inRow }
+        const arrayKeys = Object.keys(normalizedRow).filter((key) => {
+          const maybe = coerceArray(normalizedRow[key])
+          if (!maybe) return false
+          normalizedRow[key] = maybe
+          return true
+        })
+        if (arrayKeys.length <= 0) {
+          outRows.push(normalizedRow)
+          return
+        }
+
+        const groupedKeys = new Map<string, string[]>()
+        arrayKeys.forEach((key) => {
+          const rootPath = String(arrayFieldRoots[key] || '').trim()
+          const groupKey = rootPath ? `root::${rootPath}` : `field::${key}`
+          const items = groupedKeys.get(groupKey) || []
+          items.push(key)
+          groupedKeys.set(groupKey, items)
+        })
+
+        let expanded: Array<Record<string, unknown>> = [normalizedRow]
+        groupedKeys.forEach((group) => {
+          const next: Array<Record<string, unknown>> = []
+          if (group.length <= 1) {
+            const key = group[0]
+            expanded.forEach((base) => {
+              const vals = (base as Record<string, unknown>)[key]
+              const items = Array.isArray(vals) && vals.length > 0 ? vals : [null]
+              items.forEach((item) => {
+                next.push({
+                  ...base,
+                  [key]: item,
+                })
+              })
+            })
+            expanded = next.slice(0, 5000)
+            return
+          }
+
+          const valueLists = new Map<string, unknown[]>()
+          let maxLen = 0
+          group.forEach((key) => {
+            const rawVals = normalizedRow[key]
+            const items = Array.isArray(rawVals) && rawVals.length > 0 ? rawVals : [null]
+            valueLists.set(key, items)
+            if (items.length > maxLen) maxLen = items.length
+          })
+          if (maxLen <= 0) maxLen = 1
+          expanded.forEach((base) => {
+            for (let idx = 0; idx < maxLen; idx += 1) {
+              const out = { ...base }
+              group.forEach((key) => {
+                const items = valueLists.get(key) || [null]
+                out[key] = idx < items.length ? items[idx] : null
+              })
+              next.push(out)
+              if (next.length >= 5000) break
+            }
+          })
+          expanded = next.slice(0, 5000)
+        })
+        outRows.push(...expanded)
+      })
+      return outRows.slice(0, 20000)
+    }
+    if (selectedFields.length > 0) {
+      const selectedFieldRoots: Record<string, string> = {}
+      selectedFields.forEach((fieldPath) => {
+        const outKey = String(aliasMap[fieldPath] || fieldPath).trim() || fieldPath
+        const parsed = pathRootAndSuffix(fieldPath)
+        if (parsed?.rootPath) selectedFieldRoots[outKey] = parsed.rootPath
+      })
+      projectedRows = outputRows.map((row) => {
+        const out: Record<string, unknown> = {}
+        if (includeOriginal) {
+          out._original = row
+        }
+        selectedFields.forEach((fieldPath) => {
+          const outKey = String(aliasMap[fieldPath] || fieldPath).trim() || fieldPath
+          const projectionRead = readProjectionValues(row, fieldPath)
+          const values = projectionRead.values
+          if (values.length > 0) {
+            out[outKey] = values.length === 1 ? values[0] : values
+            return
+          }
+          if (projectionRead.handled) {
+            out[outKey] = []
+            return
+          }
+          const hit = readPathValue(row, fieldPath)
+          if (hit.found) {
+            out[outKey] = hit.value
+          }
+        })
+        return out
+      })
+      if (arrayOutputMode === 'explode_rows') {
+        projectedRows = explodeProjectedRows(projectedRows, selectedFieldRoots)
+      }
+    }
+
+    setDataQueryPreviewSummary({
+      ran: true,
+      inputRows: rows.length,
+      matchedRows: matchedOrdered.length,
+      outputRows: projectedRows.length,
+      matchedSamples: matchedOrdered.slice(0, 5),
+      outputSamples: projectedRows.slice(0, 5),
+    })
+  }, [
+    dataQueryPreviewRows,
+    dataQueryCriteriaDraft,
+    dataQueryMatchModeDraft,
+    dataQuerySelectFieldsDraft,
+    dataQuerySelectFieldSortsDraft,
+    dataQuerySelectFieldAliasesDraft,
+    dataQueryArrayOutputModeDraft,
+    dataQueryArrayMatchModeDraft,
+    dataQueryIncludeOriginalRowDraft,
+    dataQueryOffsetDraft,
+    dataQueryLimitDraft,
+    evaluateDataQueryRuleMatch,
+  ])
+
+  const saveDataQueryStudioConfig = useCallback(() => {
+    if (!selectedNodeId) return
+    const normalizedCriteria = (dataQueryCriteriaDraft || [])
+      .map((item, index) => ({
+        id: String(item.id || `rule_${index + 1}`),
+        field: String(item.field || '').trim(),
+        operator: String(item.operator || 'equals').trim().toLowerCase() || 'equals',
+        value: item.value == null ? '' : String(item.value),
+        rightMode: (
+          item.rightMode === 'field'
+            || item.rightMode === 'values'
+            || item.rightMode === 'variable'
+            || item.rightMode === 'raw'
+            || item.rightMode === 'literal'
+            ? item.rightMode
+            : 'literal'
+        ),
+      }))
+      .filter((item) => item.field || item.operator === 'raw')
+    const firstRule = normalizedCriteria[0] || null
+    const safeOffset = Number.isFinite(dataQueryOffsetDraft)
+      ? Math.max(0, Math.trunc(dataQueryOffsetDraft))
+      : 0
+    const safeLimit = Number.isFinite(dataQueryLimitDraft)
+      ? Math.max(0, Math.trunc(dataQueryLimitDraft))
+      : 0
+    const serializedPatchOps = serializeDataQueryProfilePatchOperations(dataQueryProfilePatchOpsDraft)
+    const firstPatchOp = serializedPatchOps[0] || null
+
+    updateNodeConfig(selectedNodeId, {
+      query_mode: dataQueryModeDraft,
+      criteria: normalizedCriteria,
+      criteria_mode: dataQueryMatchModeDraft,
+      field: firstRule?.field || '',
+      operator: firstRule?.operator || 'equals',
+      value: firstRule?.value || '',
+      select_fields: uniqueFieldNames(dataQuerySelectFieldsDraft).join(', '),
+      select_field_sorts: Object.fromEntries(
+        Object.entries(dataQuerySelectFieldSortsDraft || {}).filter(([, mode]) => (
+          String(mode || '').trim().toLowerCase() === 'asc'
+          || String(mode || '').trim().toLowerCase() === 'desc'
+        ))
+      ),
+      select_field_aliases: dataQuerySelectFieldAliasesDraft,
+      array_output_mode: dataQueryArrayOutputModeDraft,
+      array_match_mode: dataQueryArrayMatchModeDraft,
+      include_original_row: Boolean(dataQueryIncludeOriginalRowDraft),
+      offset: safeOffset,
+      limit: safeLimit,
+      profile_patch_enabled: Boolean(dataQueryProfilePatchEnabledDraft),
+      profile_patch_reflect_output: Boolean(dataQueryProfilePatchReflectOutputDraft),
+      profile_patch_stage: dataQueryProfilePatchStageDraft,
+      profile_patch_storage: dataQueryProfilePatchStorageDraft,
+      profile_patch_node_id: String(dataQueryProfilePatchNodeIdDraft || '').trim(),
+      profile_patch_primary_key_field: String(dataQueryProfilePatchPrimaryKeyFieldDraft || '').trim(),
+      profile_patch_ops: serializedPatchOps,
+      profile_patch_document_path: String(firstPatchOp?.source_path || '').trim(),
+      profile_patch_value_mode: String(firstPatchOp?.value_mode || 'row').trim().toLowerCase() === 'fixed' ? 'fixed' : 'row',
+      profile_patch_value: String(firstPatchOp?.value ?? ''),
+      profile_patch_target_path: String(firstPatchOp?.target_path || '').trim(),
+      profile_patch_merge_mode: String(firstPatchOp?.merge_mode || 'merge').trim().toLowerCase() === 'replace' ? 'replace' : 'merge',
+    })
+
+    notification.success({
+      message: 'Data Query Studio saved',
+      description: 'Filter and projection settings saved successfully.',
+      placement: 'bottomRight',
+      duration: 2,
+    })
+    dataQueryStudioInitialConfigRef.current = null
+    setDataQueryStudioOpen(false)
+  }, [
+    selectedNodeId,
+    dataQueryCriteriaDraft,
+    dataQueryModeDraft,
+    dataQueryMatchModeDraft,
+    dataQuerySelectFieldsDraft,
+    dataQuerySelectFieldSortsDraft,
+    dataQuerySelectFieldAliasesDraft,
+    dataQueryArrayOutputModeDraft,
+    dataQueryArrayMatchModeDraft,
+    dataQueryIncludeOriginalRowDraft,
+    dataQueryOffsetDraft,
+    dataQueryLimitDraft,
+    dataQueryProfilePatchEnabledDraft,
+    dataQueryProfilePatchReflectOutputDraft,
+    dataQueryProfilePatchStageDraft,
+    dataQueryProfilePatchStorageDraft,
+    dataQueryProfilePatchNodeIdDraft,
+    dataQueryProfilePatchPrimaryKeyFieldDraft,
+    dataQueryProfilePatchOpsDraft,
+    dataQueryProfilePatchDocumentPathDraft,
+    dataQueryProfilePatchValueModeDraft,
+    dataQueryProfilePatchValueDraft,
+    dataQueryProfilePatchTargetPathDraft,
+    dataQueryProfilePatchMergeModeDraft,
+    updateNodeConfig,
+  ])
+
+  const openDataQueryStudio = useCallback(() => {
+    if (nodeType !== 'profile_query_transform' || !selectedNodeId) return
+    const criteria = dataQueryCriteriaConfigured.length > 0
+      ? dataQueryCriteriaConfigured
+      : [{
+        id: 'rule_1',
+        field: '',
+        operator: 'equals',
+        value: '',
+        rightMode: 'literal',
+      }]
+    const queryMode = dataQueryModeConfigured
+    const matchMode = dataQueryMatchModeConfigured
+    const selectedFields = dataQuerySelectFieldsConfigured
+    const selectedFieldSorts = dataQuerySelectFieldSortsConfigured
+    const selectedFieldAliases = dataQuerySelectFieldAliasesConfigured
+    const arrayOutputMode = dataQueryArrayOutputModeConfigured
+    const arrayMatchMode = dataQueryArrayMatchModeConfigured
+    const includeOriginal = dataQueryIncludeOriginalConfigured
+    const offset = dataQueryOffsetConfigured
+    const limit = dataQueryLimitConfigured
+    const profilePatchEnabled = dataQueryProfilePatchEnabledConfigured
+    const profilePatchReflectOutput = dataQueryProfilePatchReflectOutputConfigured
+    const profilePatchStage = dataQueryProfilePatchStageConfigured
+    const profilePatchStorage = dataQueryProfilePatchStorageConfigured
+    const profilePatchNodeId = dataQueryProfilePatchNodeIdConfigured
+    const profilePatchPrimaryKeyField = dataQueryProfilePatchPrimaryKeyFieldConfigured
+    const profilePatchOps = dataQueryProfilePatchOpsConfigured
+    const profilePatchLegacy = profilePatchOps[0] || null
+    const profilePatchDocumentPath = String(profilePatchLegacy?.sourcePath || dataQueryProfilePatchDocumentPathConfigured || '')
+    const profilePatchValueMode: 'row' | 'fixed' = String(profilePatchLegacy?.valueMode || dataQueryProfilePatchValueModeConfigured || 'row').trim().toLowerCase() === 'fixed' ? 'fixed' : 'row'
+    const profilePatchValue = String(profilePatchLegacy?.value || dataQueryProfilePatchValueConfigured || '')
+    const profilePatchTargetPath = String(profilePatchLegacy?.targetPath || dataQueryProfilePatchTargetPathConfigured || '')
+    const profilePatchMergeMode: 'merge' | 'replace' = String(profilePatchLegacy?.mergeMode || dataQueryProfilePatchMergeModeConfigured || 'merge').trim().toLowerCase() === 'replace' ? 'replace' : 'merge'
+
+    setDataQueryCriteriaDraft(criteria)
+    setDataQueryModeDraft(queryMode)
+    setDataQueryMatchModeDraft(matchMode)
+    setDataQuerySelectFieldsDraft(selectedFields)
+    setDataQuerySelectFieldSortsDraft(selectedFieldSorts)
+    setDataQuerySelectFieldAliasesDraft(selectedFieldAliases)
+    setDataQueryArrayOutputModeDraft(arrayOutputMode)
+    setDataQueryArrayMatchModeDraft(arrayMatchMode)
+    setDataQueryIncludeOriginalRowDraft(includeOriginal)
+    setDataQueryOffsetDraft(offset)
+    setDataQueryLimitDraft(limit)
+    setDataQueryProfilePatchEnabledDraft(profilePatchEnabled)
+    setDataQueryProfilePatchReflectOutputDraft(profilePatchReflectOutput)
+    setDataQueryProfilePatchStageDraft(profilePatchStage)
+    setDataQueryProfilePatchStorageDraft(profilePatchStorage)
+    setDataQueryProfilePatchNodeIdDraft(profilePatchNodeId)
+    setDataQueryProfilePatchPrimaryKeyFieldDraft(profilePatchPrimaryKeyField)
+    setDataQueryProfilePatchOpsDraft(profilePatchOps)
+    setDataQueryProfilePatchDocumentPathDraft(profilePatchDocumentPath)
+    setDataQueryProfilePatchValueModeDraft(profilePatchValueMode)
+    setDataQueryProfilePatchValueDraft(profilePatchValue)
+    setDataQueryProfilePatchTargetPathDraft(profilePatchTargetPath)
+    setDataQueryProfilePatchMergeModeDraft(profilePatchMergeMode)
+    setDataQueryActiveRuleId(String(criteria[0]?.id || ''))
+    setDataQueryManualFieldPath('')
+    setDataQueryFieldSearchQuery('')
+    setDataQueryTreeExpandedKeys([])
+    setDataQueryShowQuickPicker(false)
+    setDataQueryPreviewSummary({
+      ran: false,
+      inputRows: 0,
+      matchedRows: 0,
+      outputRows: 0,
+      matchedSamples: [],
+      outputSamples: [],
+    })
+
+    dataQueryStudioInitialConfigRef.current = pickDataQueryStudioSnapshot({
+      ...nodeConfig,
+      query_mode: queryMode,
+      criteria,
+      criteria_mode: matchMode,
+      field: String(criteria[0]?.field || ''),
+      operator: String(criteria[0]?.operator || 'equals'),
+      value: String(criteria[0]?.value || ''),
+      select_fields: selectedFields,
+      select_field_sorts: selectedFieldSorts,
+      select_field_aliases: selectedFieldAliases,
+      array_output_mode: arrayOutputMode,
+      array_match_mode: arrayMatchMode,
+      include_original_row: includeOriginal,
+      offset,
+      limit,
+      profile_patch_enabled: profilePatchEnabled,
+      profile_patch_reflect_output: profilePatchReflectOutput,
+      profile_patch_stage: profilePatchStage,
+      profile_patch_storage: profilePatchStorage,
+      profile_patch_node_id: profilePatchNodeId,
+      profile_patch_primary_key_field: profilePatchPrimaryKeyField,
+      profile_patch_ops: serializeDataQueryProfilePatchOperations(profilePatchOps),
+      profile_patch_document_path: profilePatchDocumentPath,
+      profile_patch_value_mode: profilePatchValueMode,
+      profile_patch_value: profilePatchValue,
+      profile_patch_target_path: profilePatchTargetPath,
+      profile_patch_merge_mode: profilePatchMergeMode,
+    })
+    setDataQueryStudioOpen(true)
+  }, [
+    nodeType,
+    selectedNodeId,
+    nodeConfig,
+    dataQueryCriteriaConfigured,
+    dataQueryModeConfigured,
+    dataQueryMatchModeConfigured,
+    dataQuerySelectFieldsConfigured,
+    dataQuerySelectFieldSortsConfigured,
+    dataQuerySelectFieldAliasesConfigured,
+    dataQueryArrayOutputModeConfigured,
+    dataQueryArrayMatchModeConfigured,
+    dataQueryIncludeOriginalConfigured,
+    dataQueryOffsetConfigured,
+    dataQueryLimitConfigured,
+    dataQueryProfilePatchEnabledConfigured,
+    dataQueryProfilePatchReflectOutputConfigured,
+    dataQueryProfilePatchStageConfigured,
+    dataQueryProfilePatchStorageConfigured,
+    dataQueryProfilePatchNodeIdConfigured,
+    dataQueryProfilePatchPrimaryKeyFieldConfigured,
+    dataQueryProfilePatchOpsConfigured,
+    dataQueryProfilePatchDocumentPathConfigured,
+    dataQueryProfilePatchValueModeConfigured,
+    dataQueryProfilePatchValueConfigured,
+    dataQueryProfilePatchTargetPathConfigured,
+    dataQueryProfilePatchMergeModeConfigured,
+  ])
+
+  const requestCloseDataQueryStudio = useCallback(() => {
+    if (!dataQueryStudioOpen) {
+      dataQueryStudioInitialConfigRef.current = null
+      setDataQueryStudioOpen(false)
+      return
+    }
+    if (!dataQueryStudioHasUnsavedChanges) {
+      dataQueryStudioInitialConfigRef.current = null
+      setDataQueryStudioOpen(false)
+      return
+    }
+    Modal.confirm({
+      title: 'Unsaved changes',
+      content: 'Data Query Studio has unsaved changes. Save before closing?',
+      okText: 'Save & Close',
+      cancelText: 'Discard',
+      centered: true,
+      onOk: () => {
+        saveDataQueryStudioConfig()
+      },
+      onCancel: () => {
+        dataQueryStudioInitialConfigRef.current = null
+        setDataQueryStudioOpen(false)
+      },
+    })
+  }, [
+    dataQueryStudioOpen,
+    dataQueryStudioHasUnsavedChanges,
+    saveDataQueryStudioConfig,
+  ])
+
+  const getConditionValueByPath = useCallback((row: any, fieldPath: string): any => {
+    const path = String(fieldPath || '').trim()
+    if (!path) return undefined
+    if (row == null || typeof row !== 'object') return undefined
+    const hit = readPathValue(row as Record<string, unknown>, path)
+    if (hit.found) return hit.value
+    if (Object.prototype.hasOwnProperty.call(row, path)) return row[path]
+    const normalized = path.startsWith('$.') ? path.slice(2) : (path.startsWith('$[') ? path.slice(1) : path)
+    if (normalized && Object.prototype.hasOwnProperty.call(row, normalized)) return row[normalized]
+    return undefined
+  }, [])
+  const getConditionValuesByPath = useCallback((row: any, fieldPath: string): any[] => {
+    const path = String(fieldPath || '').trim()
+    if (!path) return []
+    if (row == null || typeof row !== 'object') return []
+    return readPathValues(row as Record<string, unknown>, path)
+  }, [])
+
+  const evaluateConditionOperator = useCallback((leftValue: any, operatorRaw: string, rightRaw: any) => {
+    const operator = String(operatorRaw || 'equals').trim().toLowerCase() || 'equals'
+    if (operator === 'is_null') return leftValue == null
+    if (operator === 'is_not_null') return leftValue != null
+    const leftText = leftValue == null ? '' : String(leftValue)
+    const rightText = rightRaw == null ? '' : String(rightRaw)
+    const leftNorm = Boolean(nodeConfig.case_sensitive) ? leftText : leftText.toLowerCase()
+    const rightNorm = Boolean(nodeConfig.case_sensitive) ? rightText : rightText.toLowerCase()
+    const leftNum = Number(String(leftValue ?? '').replace(/,/g, ''))
+    const rightNum = Number(String(rightRaw ?? '').replace(/,/g, ''))
+    const hasNums = Number.isFinite(leftNum) && Number.isFinite(rightNum)
+    if (operator === 'greater_than') return hasNums ? leftNum > rightNum : false
+    if (operator === 'greater_or_equal') return hasNums ? leftNum >= rightNum : false
+    if (operator === 'less_than') return hasNums ? leftNum < rightNum : false
+    if (operator === 'less_or_equal') return hasNums ? leftNum <= rightNum : false
+    if (operator === 'contains') return rightNorm.length > 0 ? leftNorm.includes(rightNorm) : false
+    if (operator === 'not_contains') return rightNorm.length > 0 ? !leftNorm.includes(rightNorm) : true
+    if (operator === 'starts_with') return leftNorm.startsWith(rightNorm)
+    if (operator === 'ends_with') return leftNorm.endsWith(rightNorm)
+    if (operator === 'in' || operator === 'not_in') {
+      const values = rightText.split(',').map((item) => item.trim()).filter(Boolean)
+      const normValues = values.map((item) => (Boolean(nodeConfig.case_sensitive) ? item : item.toLowerCase()))
+      const has = normValues.includes(leftNorm)
+      return operator === 'in' ? has : !has
+    }
+    if (operator === 'not_equals') return leftNorm !== rightNorm
+    return leftNorm === rightNorm
+  }, [nodeConfig.case_sensitive])
+  const evaluateConditionCaseConditionMatch = useCallback((row: Record<string, unknown>, condition: ConditionCaseCondition) => {
+    const fieldPath = String(condition.field || '').trim()
+    if (!fieldPath) return false
+    const leftValues = getConditionValuesByPath(row, fieldPath)
+    const leftCandidates = leftValues.length > 0
+      ? leftValues
+      : [getConditionValueByPath(row, fieldPath)]
+    const conditionMode: ConditionCaseRouteMode = String(condition.mode || '').trim().toLowerCase() === 'condition' ? 'condition' : 'range'
+    if (conditionMode === 'condition') {
+      const rightMode: ConditionCaseRouteRightMode = String(condition.rightMode || '').trim().toLowerCase() === 'field' ? 'field' : 'literal'
+      const rightCandidates = rightMode === 'field'
+        ? (() => {
+          const vals = getConditionValuesByPath(row, String(condition.rightValue || ''))
+          if (vals.length > 0) return vals
+          return [getConditionValueByPath(row, String(condition.rightValue || ''))]
+        })()
+        : [condition.rightValue]
+      return leftCandidates.some((leftValue) => (
+        rightCandidates.some((rightOperand) => (
+          evaluateConditionOperator(leftValue, String(condition.operator || 'equals'), rightOperand)
+        ))
+      ))
+    }
+    const minText = String(condition.minValue ?? '').trim()
+    const maxText = String(condition.maxValue ?? '').trim()
+    let minNum = Number.NaN
+    let maxNum = Number.NaN
+    if (minText) minNum = Number(minText.replace(/,/g, ''))
+    if (maxText) maxNum = Number(maxText.replace(/,/g, ''))
+    if (Number.isFinite(minNum) && Number.isFinite(maxNum) && minNum > maxNum) {
+      const temp = minNum
+      minNum = maxNum
+      maxNum = temp
+    }
+    return leftCandidates.some((leftValue) => {
+      const leftNum = Number(String(leftValue ?? '').replace(/,/g, '').trim())
+      if (!Number.isFinite(leftNum)) return false
+      if (Number.isFinite(minNum)) {
+        if (condition.includeMin === false) {
+          if (!(leftNum > minNum)) return false
+        } else if (!(leftNum >= minNum)) {
+          return false
+        }
+      }
+      if (Number.isFinite(maxNum)) {
+        if (condition.includeMax === false) {
+          if (!(leftNum < maxNum)) return false
+        } else if (!(leftNum <= maxNum)) {
+          return false
+        }
+      }
+      return true
+    })
+  }, [getConditionValueByPath, getConditionValuesByPath, evaluateConditionOperator])
+
+  const evaluateConditionCaseRouteMatch = useCallback((row: Record<string, unknown>, route: ConditionCaseRoute) => {
+    const routeConditions: ConditionCaseCondition[] = Array.isArray(route.conditions) && route.conditions.length > 0
+      ? route.conditions
+      : [createConditionCaseCondition(route)]
+    const outcomes = routeConditions.map((cond) => evaluateConditionCaseConditionMatch(row, cond))
+    if (outcomes.length <= 0) return false
+    const matchMode: ConditionCaseRouteMatchMode = String(route.matchMode || '').trim().toLowerCase() === 'any' ? 'any' : 'all'
+    return matchMode === 'any' ? outcomes.some(Boolean) : outcomes.every(Boolean)
+  }, [evaluateConditionCaseConditionMatch])
+
+  const evaluateConditionRow = useCallback((row: Record<string, unknown>) => {
+    if (conditionRoutingMode === 'case' && conditionCaseRoutes.length > 0) {
+      return conditionCaseRoutes.some((route) => evaluateConditionCaseRouteMatch(row, route))
+    }
+    if (!conditionCriteria.length) return true
+    const results = conditionCriteria.map((rule) => {
+      const fieldPath = String(rule.field || '')
+      const leftValues = getConditionValuesByPath(row, fieldPath)
+      const leftCandidates = leftValues.length > 0
+        ? leftValues
+        : [getConditionValueByPath(row, fieldPath)]
+      const rightMode = String(rule.rightMode || 'literal').trim().toLowerCase()
+      const rightCandidates = rightMode === 'field'
+        ? (() => {
+          const vals = getConditionValuesByPath(row, String(rule.value || ''))
+          if (vals.length > 0) return vals
+          return [getConditionValueByPath(row, String(rule.value || ''))]
+        })()
+        : [rule.value]
+      return leftCandidates.some((leftValue) => (
+        rightCandidates.some((rightOperand) => (
+          evaluateConditionOperator(leftValue, String(rule.operator || 'equals'), rightOperand)
+        ))
+      ))
+    })
+    if (conditionMatchMode === 'any') return results.some(Boolean)
+    return results.every(Boolean)
+  }, [
+    conditionRoutingMode,
+    conditionCaseRoutes,
+    evaluateConditionCaseRouteMatch,
+    conditionCriteria,
+    conditionMatchMode,
+    evaluateConditionOperator,
+    getConditionValueByPath,
+    getConditionValuesByPath,
+  ])
+
+  const conditionValidationSummary = useMemo(() => {
+    const rows = Array.isArray(conditionPreviewRows) ? conditionPreviewRows : []
+    let trueCount = 0
+    let falseCount = 0
+    const trueSamples: Array<Record<string, unknown>> = []
+    const falseSamples: Array<Record<string, unknown>> = []
+    rows.forEach((row) => {
+      if (!row || typeof row !== 'object') return
+      const matched = evaluateConditionRow(row as Record<string, unknown>)
+      if (matched) {
+        trueCount += 1
+        if (trueSamples.length < 5) trueSamples.push(row as Record<string, unknown>)
+      } else {
+        falseCount += 1
+        if (falseSamples.length < 5) falseSamples.push(row as Record<string, unknown>)
+      }
+    })
+    return {
+      totalRows: rows.length,
+      trueCount,
+      falseCount,
+      trueSamples,
+      falseSamples,
+      inputSamples: rows.slice(0, 5),
+      caseCounts: {} as Record<string, number>,
+      sourceLabel: 'PREVIEW',
+      warnings: [] as string[],
+    }
+  }, [conditionPreviewRows, evaluateConditionRow])
+  const conditionCasePreviewCounts = useMemo(() => {
+    const countsByRouteId: Record<string, number> = {}
+    let elseCount = 0
+    const rows = Array.isArray(conditionPreviewRows) ? conditionPreviewRows : []
+    if (conditionRoutingMode !== 'case' || conditionCaseRoutes.length === 0) {
+      return { countsByRouteId, elseCount, total: rows.length }
+    }
+    conditionCaseRoutes.forEach((route) => {
+      countsByRouteId[String(route.id || '')] = 0
+    })
+    rows.forEach((row) => {
+      if (!row || typeof row !== 'object') return
+      const hitRoute = conditionCaseRoutes.find((route) => evaluateConditionCaseRouteMatch(row as Record<string, unknown>, route))
+      if (hitRoute) {
+        const rid = String(hitRoute.id || '')
+        countsByRouteId[rid] = Number(countsByRouteId[rid] || 0) + 1
+      } else {
+        elseCount += 1
+      }
+    })
+    return { countsByRouteId, elseCount, total: rows.length }
+  }, [conditionRoutingMode, conditionCaseRoutes, conditionPreviewRows, evaluateConditionCaseRouteMatch])
+  const conditionValidationTargetOptions = useMemo(
+    () => (
+      (conditionValidationSourceMode === 'profile_store'
+        ? conditionValidationProfileNodeOptions
+        : conditionValidationSourceMode === 'data_query_output'
+          ? conditionValidationDataQueryNodeOptions
+          : conditionValidationSourceNodeOptions
+      ).map((item) => ({
+        value: String(item.value || ''),
+        label: String(item.label || item.value || ''),
+      }))
+    ),
+    [conditionValidationSourceMode, conditionValidationProfileNodeOptions, conditionValidationDataQueryNodeOptions, conditionValidationSourceNodeOptions]
+  )
+  const conditionValidationDisplaySummary = useMemo(() => {
+    const remote = conditionValidationRemoteSummary
+    if (!remote || typeof remote !== 'object') {
+      return {
+        totalRows: Array.isArray(conditionPreviewRows) ? conditionPreviewRows.length : 0,
+        trueCount: 0,
+        falseCount: 0,
+        inputSamples: Array.isArray(conditionPreviewRows) ? conditionPreviewRows.slice(0, 5) : [],
+        trueSamples: [] as Array<Record<string, unknown>>,
+        falseSamples: [] as Array<Record<string, unknown>>,
+        caseCounts: {} as Record<string, number>,
+        sourceLabel: 'NOT_RUN',
+        warnings: [] as string[],
+      }
+    }
+    const inputRows = Number(remote.input_rows || 0)
+    const trueRows = Number(remote.true_rows || 0)
+    const falseRows = Number(remote.false_rows || 0)
+    const inputSamples = Array.isArray(remote.sample_input) ? remote.sample_input : []
+    const trueSamples = Array.isArray(remote.true_samples) ? remote.true_samples : []
+    const falseSamples = Array.isArray(remote.false_samples) ? remote.false_samples : []
+    const caseCounts = remote.case_counts && typeof remote.case_counts === 'object'
+      ? (remote.case_counts as Record<string, number>)
+      : {}
+    const warnings = Array.isArray(remote.warnings)
+      ? remote.warnings.map((item) => String(item))
+      : []
+    const sourceLabel = String(remote.validation_source || conditionValidationSourceMode || 'preview').toUpperCase()
+    return {
+      totalRows: inputRows,
+      trueCount: trueRows,
+      falseCount: falseRows,
+      inputSamples,
+      trueSamples,
+      falseSamples,
+      caseCounts,
+      sourceLabel,
+      warnings,
+    }
+  }, [conditionValidationRemoteSummary, conditionValidationSourceMode, conditionPreviewRows])
+  const runConditionValidation = useCallback(async () => {
+    if (nodeType !== 'condition_node' || !selectedNodeId) return
+    setConditionValidationLoading(true)
+    setConditionValidationError(null)
+    try {
+      const sourceMode = conditionValidationSourceMode
+      const safeMaxRows = Number.isFinite(conditionValidationMaxRows)
+        ? Math.max(0, Math.min(Math.trunc(conditionValidationMaxRows), 500000))
+        : 100000
+      const validationRows = Array.isArray(conditionPreviewRows)
+        ? conditionPreviewRows.slice(0, safeMaxRows > 0 ? safeMaxRows : conditionPreviewRows.length)
+        : []
+      const targetNodeId = String(conditionValidationTargetNodeId || '').trim()
+      const options = sourceMode === 'profile_store'
+        ? conditionValidationProfileNodeOptions
+        : sourceMode === 'data_query_output'
+          ? conditionValidationDataQueryNodeOptions
+          : conditionValidationSourceNodeOptions
+      const optionHit = options.find((item) => String(item.value || '').trim() === targetNodeId)
+      const targetNode = targetNodeId
+        ? nodes.find((item) => String(item.id || '').trim() === targetNodeId)
+        : undefined
+      const targetNodeConfig = (
+        targetNode?.data?.config && typeof targetNode.data.config === 'object'
+          ? targetNode.data.config
+          : optionHit?.config && typeof optionHit.config === 'object'
+            ? optionHit.config
+            : {}
+      ) as Record<string, unknown>
+      const targetNodeType = String(
+        targetNode?.data?.nodeType
+        || (optionHit as any)?.nodeType
+        || ''
+      ).trim().toLowerCase()
+
+      const normalizedCriteria = (conditionCriteria || []).map((item, index) => ({
+        id: String(item.id || `rule_${index + 1}`),
+        field: String(item.field || '').trim(),
+        operator: String(item.operator || 'equals'),
+        value: item.value == null ? '' : String(item.value),
+        rightMode: (
+          item.rightMode === 'field'
+            || item.rightMode === 'values'
+            || item.rightMode === 'variable'
+            || item.rightMode === 'raw'
+            || item.rightMode === 'literal'
+            ? item.rightMode
+            : 'literal'
+        ),
+      }))
+      const payloadConditionConfig: Record<string, unknown> = {
+        ...nodeConfig,
+        criteria: normalizedCriteria,
+        criteria_mode: conditionMatchMode,
+        case_sensitive: Boolean(conditionCaseSensitiveDraft),
+        condition_routing_mode: conditionRoutingMode,
+        condition_true_target_node_id: conditionTrueTargetNodeId,
+        condition_false_target_node_id: conditionFalseTargetNodeId,
+        condition_show_route_labels: Boolean(conditionShowRouteLabels),
+        case_routes: conditionCaseRoutes,
+        case_else_target_node_ids: conditionCaseElseTargetNodeIds,
+      }
+      const payload: Record<string, unknown> = {
+        condition_config: payloadConditionConfig,
+        validation_source: sourceMode === 'data_query_output' ? 'upstream_preview' : sourceMode,
+        max_rows: safeMaxRows,
+        sample_rows: 10,
+      }
+      if (sourceMode === 'profile_store') {
+        if (!activePipelineId) {
+          throw new Error('Save the pipeline first before profile-store validation.')
+        }
+        if (!targetNodeId) {
+          throw new Error('Select a profile node for profile-store validation.')
+        }
+        payload.pipeline_id = activePipelineId
+        payload.profile_node_id = targetNodeId
+        payload.profile_node_config = targetNodeConfig
+      } else if (sourceMode === 'source_scan') {
+        if (!targetNodeId) {
+          throw new Error('Select a source node for source-scan validation.')
+        }
+        if (!targetNodeType) {
+          throw new Error('Selected source node type is unavailable.')
+        }
+        payload.source_node_type = targetNodeType
+        payload.source_node_config = targetNodeConfig
+      } else if (sourceMode === 'data_query_output') {
+        if (!targetNodeId) {
+          throw new Error('Select a Data Query node for data-query validation.')
+        }
+        let dataQueryRows = extractPreviewRowsFromNode(
+          targetNode,
+          {
+            includeConfigPreview: false,
+            includeExecutionOutput: true,
+            includeExecutionInput: false,
+          },
+        )
+        if (!dataQueryRows.length) {
+          dataQueryRows = extractPreviewRowsFromNode(
+            targetNode,
+            {
+              includeConfigPreview: true,
+              includeExecutionOutput: true,
+              includeExecutionInput: false,
+            },
+          )
+        }
+        if (!dataQueryRows.length) {
+          dataQueryRows = extractPreviewRowsFromNode(
+            targetNode,
+            {
+              includeConfigPreview: false,
+              includeExecutionOutput: false,
+              includeExecutionInput: true,
+            },
+          )
+        }
+        payload.rows = dataQueryRows.slice(0, safeMaxRows > 0 ? safeMaxRows : dataQueryRows.length)
+      } else {
+        payload.rows = validationRows
+      }
+
+      const result = await api.validateConditionFlow(payload as any)
+      const normalized = (result || {}) as ConditionValidationResult
+      if (sourceMode === 'data_query_output') {
+        normalized.validation_source = 'data_query_output'
+      }
+      setConditionValidationRemoteSummary(normalized)
+      const warnings = Array.isArray(normalized.warnings)
+        ? normalized.warnings.filter((item) => String(item || '').trim())
+        : []
+      if (warnings.length > 0) {
+        notification.warning({
+          message: 'Condition validation completed with warnings',
+          description: warnings[0],
+          placement: 'bottomRight',
+        })
+      } else {
+        notification.success({
+          message: 'Condition validation completed',
+          description: `${String(normalized.validation_source || sourceMode).toUpperCase()} | Input ${Number(normalized.input_rows || 0).toLocaleString()} rows`,
+          placement: 'bottomRight',
+          duration: 2,
+        })
+      }
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = String(
+        detail
+        || err?.response?.data?.message
+        || err?.message
+        || 'Condition validation failed',
+      )
+      setConditionValidationError(message)
+      setConditionValidationRemoteSummary(null)
+      notification.error({
+        message: 'Condition validation failed',
+        description: message,
+        placement: 'bottomRight',
+      })
+    } finally {
+      setConditionValidationLoading(false)
+    }
+  }, [
+    nodeType,
+    selectedNodeId,
+    conditionValidationSourceMode,
+    conditionValidationMaxRows,
+    conditionValidationTargetNodeId,
+    conditionValidationProfileNodeOptions,
+    conditionValidationDataQueryNodeOptions,
+    conditionValidationSourceNodeOptions,
+    conditionPreviewRows,
+    nodes,
+    nodeConfig,
+    conditionCriteria,
+    conditionMatchMode,
+    conditionCaseSensitiveDraft,
+    conditionRoutingMode,
+    conditionTrueTargetNodeId,
+    conditionFalseTargetNodeId,
+    conditionShowRouteLabels,
+    conditionCaseRoutes,
+    conditionCaseElseTargetNodeIds,
+    activePipelineId,
+  ])
+
+  const reorderConditionRule = useCallback((fromRuleId: string, toRuleId: string) => {
+    const source = String(fromRuleId || '').trim()
+    const target = String(toRuleId || '').trim()
+    if (!source || !target || source === target) return
+    const fromIndex = conditionCriteria.findIndex((item) => String(item.id || '') === source)
+    const toIndex = conditionCriteria.findIndex((item) => String(item.id || '') === target)
+    if (fromIndex < 0 || toIndex < 0) return
+    const next = [...conditionCriteria]
+    const [moved] = next.splice(fromIndex, 1)
+    next.splice(toIndex, 0, moved)
+    persistConditionCriteria(next)
+  }, [conditionCriteria, persistConditionCriteria])
+
+  const addConditionRule = useCallback(() => {
+    const next = [...conditionCriteria, {
+      id: `rule_${Date.now()}`,
+      field: conditionFieldOptions[0] || '',
+      operator: 'equals',
+      value: '',
+      rightMode: 'literal',
+    }]
+    persistConditionCriteria(next)
+  }, [conditionCriteria, conditionFieldOptions, persistConditionCriteria])
+
+  const updateConditionRule = useCallback((ruleId: string, patch: Record<string, unknown>) => {
+    const targetRuleId = String(ruleId || '').trim()
+    if (!targetRuleId) return
+    const next = conditionCriteria.map((item) => (
+      String(item.id || '') === targetRuleId ? { ...item, ...patch } : item
+    ))
+    persistConditionCriteria(next)
+  }, [conditionCriteria, persistConditionCriteria])
+
+  const removeConditionRule = useCallback((ruleId: string) => {
+    const targetRuleId = String(ruleId || '').trim()
+    if (!targetRuleId) return
+    const next = conditionCriteria.filter((item) => String(item.id || '') !== targetRuleId)
+    persistConditionCriteria(next)
+  }, [conditionCriteria, persistConditionCriteria])
+  const setConditionRoutingModeConfig = useCallback((mode: 'boolean' | 'case') => {
+    setConditionRoutingModeDraft(mode)
+    if (mode === 'case') {
+      setConditionCaseStudioTab('route_mapping')
+      if (conditionCaseRoutes.length === 0) {
+        const initialRoute = createConditionCaseRoute({
+          id: `route_${Date.now()}`,
+          label: 'CASE_1',
+          field: conditionFieldOptions[0] || String(conditionCriteria[0]?.field || '').trim(),
+          includeMin: true,
+          includeMax: true,
+          targetNodeIds: [],
+        })
+        persistConditionCaseRoutes([initialRoute], conditionCaseElseTargetNodeIds)
+      }
+    }
+  }, [
+    conditionCaseRoutes,
+    conditionFieldOptions,
+    conditionCriteria,
+    conditionCaseElseTargetNodeIds,
+    persistConditionCaseRoutes,
+  ])
+  const setConditionRouteLabelVisibility = useCallback((enabled: boolean) => {
+    setConditionShowRouteLabelsDraft(Boolean(enabled))
+  }, [])
+  const updateConditionCaseRoute = useCallback((routeId: string, patch: Partial<ConditionCaseRoute>) => {
+    const targetRouteId = String(routeId || '').trim()
+    if (!targetRouteId) return
+    const nextRoutes = conditionCaseRoutes.map((route) => {
+      if (String(route.id || '') !== targetRouteId) return route
+      return createConditionCaseRoute({
+        ...route,
+        ...patch,
+        id: targetRouteId,
+      })
+    })
+    persistConditionCaseRoutes(nextRoutes, conditionCaseElseTargetNodeIds)
+  }, [
+    conditionCaseRoutes,
+    conditionCaseElseTargetNodeIds,
+    persistConditionCaseRoutes,
+  ])
+  const updateConditionCaseCondition = useCallback((
+    routeId: string,
+    conditionId: string,
+    patch: Partial<ConditionCaseCondition>,
+  ) => {
+    const targetRouteId = String(routeId || '').trim()
+    const targetConditionId = String(conditionId || '').trim()
+    if (!targetRouteId || !targetConditionId) return
+    const nextRoutes = conditionCaseRoutes.map((route) => {
+      if (String(route.id || '') !== targetRouteId) return route
+      const nextConditions = (Array.isArray(route.conditions) ? route.conditions : [])
+        .map((cond) => {
+          if (String(cond.id || '') !== targetConditionId) return cond
+          return createConditionCaseCondition({
+            ...cond,
+            ...patch,
+            id: targetConditionId,
+          })
+        })
+      return createConditionCaseRoute({
+        ...route,
+        conditions: nextConditions,
+      })
+    })
+    persistConditionCaseRoutes(nextRoutes, conditionCaseElseTargetNodeIds)
+  }, [
+    conditionCaseRoutes,
+    conditionCaseElseTargetNodeIds,
+    persistConditionCaseRoutes,
+  ])
+  const addConditionCaseRouteCondition = useCallback((routeId: string) => {
+    const targetRouteId = String(routeId || '').trim()
+    if (!targetRouteId) return
+    const nextRoutes = conditionCaseRoutes.map((route) => {
+      if (String(route.id || '') !== targetRouteId) return route
+      const nextConditions = Array.isArray(route.conditions) ? [...route.conditions] : []
+      nextConditions.push(createConditionCaseCondition({
+        id: `cond_${Date.now()}_${nextConditions.length + 1}`,
+        mode: 'condition',
+        operator: 'equals',
+        rightMode: 'literal',
+        field: conditionFieldOptions[0] || '',
+        rightValue: '',
+      }))
+      return createConditionCaseRoute({
+        ...route,
+        conditions: nextConditions,
+      })
+    })
+    persistConditionCaseRoutes(nextRoutes, conditionCaseElseTargetNodeIds)
+  }, [
+    conditionCaseRoutes,
+    conditionCaseElseTargetNodeIds,
+    conditionFieldOptions,
+    persistConditionCaseRoutes,
+  ])
+  const removeConditionCaseRouteCondition = useCallback((routeId: string, conditionId: string) => {
+    const targetRouteId = String(routeId || '').trim()
+    const targetConditionId = String(conditionId || '').trim()
+    if (!targetRouteId || !targetConditionId) return
+    const nextRoutes = conditionCaseRoutes.map((route) => {
+      if (String(route.id || '') !== targetRouteId) return route
+      const currentConditions = Array.isArray(route.conditions) ? route.conditions : []
+      const filtered = currentConditions.filter((cond) => String(cond.id || '') !== targetConditionId)
+      const nextConditions = filtered.length > 0
+        ? filtered
+        : [createConditionCaseCondition({
+          id: `cond_${Date.now()}_1`,
+          mode: 'condition',
+          operator: 'equals',
+          rightMode: 'literal',
+          field: conditionFieldOptions[0] || '',
+          rightValue: '',
+        })]
+      return createConditionCaseRoute({
+        ...route,
+        conditions: nextConditions,
+      })
+    })
+    persistConditionCaseRoutes(nextRoutes, conditionCaseElseTargetNodeIds)
+  }, [
+    conditionCaseRoutes,
+    conditionCaseElseTargetNodeIds,
+    conditionFieldOptions,
+    persistConditionCaseRoutes,
+  ])
+  const addConditionCaseRoute = useCallback(() => {
+    const nextIndex = (conditionCaseRoutes.length || 0) + 1
+    const nextRoute = createConditionCaseRoute({
+      id: `route_${Date.now()}_${nextIndex}`,
+      label: `CASE_${nextIndex}`,
+      field: conditionFieldOptions[0] || '',
+      includeMin: true,
+      includeMax: true,
+      targetNodeIds: [],
+    })
+    persistConditionCaseRoutes([...conditionCaseRoutes, nextRoute], conditionCaseElseTargetNodeIds)
+  }, [
+    conditionCaseRoutes,
+    conditionFieldOptions,
+    conditionCaseElseTargetNodeIds,
+    persistConditionCaseRoutes,
+  ])
+  const removeConditionCaseRoute = useCallback((routeId: string) => {
+    const targetRouteId = String(routeId || '').trim()
+    if (!targetRouteId) return
+    const nextRoutes = conditionCaseRoutes.filter((route) => String(route.id || '') !== targetRouteId)
+    persistConditionCaseRoutes(nextRoutes, conditionCaseElseTargetNodeIds)
+  }, [
+    conditionCaseRoutes,
+    conditionCaseElseTargetNodeIds,
+    persistConditionCaseRoutes,
+  ])
+  const updateConditionElseTargets = useCallback((targetIds: string[]) => {
+    const nextElseTargets = uniqueFieldNames(parseStringList(targetIds || []))
+    persistConditionCaseRoutes(conditionCaseRoutes, nextElseTargets)
+  }, [
+    conditionCaseRoutes,
+    persistConditionCaseRoutes,
+  ])
+
+  const applyConditionFieldFromPicker = useCallback((fieldPath: string) => {
+    const picked = String(fieldPath || '').trim()
+    if (!picked) return
+    if (conditionRoutingMode === 'case') {
+      if (conditionCaseRoutes.length === 0) {
+        const firstRoute = createConditionCaseRoute({
+          id: `route_${Date.now()}`,
+          label: 'CASE_1',
+          field: picked,
+          includeMin: true,
+          includeMax: true,
+          targetNodeIds: [],
+        })
+        persistConditionCaseRoutes([firstRoute], conditionCaseElseTargetNodeIds)
+      } else {
+        const targetRouteId = String(conditionCaseRoutes[0]?.id || '').trim()
+        if (targetRouteId) {
+          const firstConditionId = String(conditionCaseRoutes[0]?.conditions?.[0]?.id || '').trim()
+          if (firstConditionId) {
+            updateConditionCaseCondition(targetRouteId, firstConditionId, { field: picked })
+          } else {
+            updateConditionCaseRoute(targetRouteId, { field: picked })
+          }
+        }
+      }
+      return
+    }
+    let targetRuleId = String(conditionActiveRuleId || '').trim()
+    if (!targetRuleId) {
+      const fallbackRule = conditionCriteria[0]
+      targetRuleId = String(fallbackRule?.id || '').trim()
+    }
+    if (!targetRuleId) {
+      const newRuleId = `rule_${Date.now()}`
+      const newRule = {
+        id: newRuleId,
+        field: conditionPickerAssignTarget === 'field' ? picked : '',
+        operator: 'equals',
+        value: conditionPickerAssignTarget !== 'field' ? picked : '',
+        rightMode: conditionPickerAssignTarget === 'right_field' ? 'field' : 'literal',
+      }
+      persistConditionCriteria([...conditionCriteria, newRule])
+      setConditionActiveRuleId(newRuleId)
+      return
+    }
+    if (conditionPickerAssignTarget === 'right_field') {
+      updateConditionRule(targetRuleId, { value: picked, rightMode: 'field' })
+    } else if (conditionPickerAssignTarget === 'right_literal') {
+      updateConditionRule(targetRuleId, { value: picked, rightMode: 'literal' })
+    } else {
+      updateConditionRule(targetRuleId, { field: picked })
+    }
+    setConditionActiveRuleId(targetRuleId)
+  }, [
+    conditionRoutingMode,
+    conditionCaseRoutes,
+    updateConditionCaseCondition,
+    updateConditionCaseRoute,
+    persistConditionCaseRoutes,
+    conditionCaseElseTargetNodeIds,
+    conditionActiveRuleId,
+    conditionCriteria,
+    conditionPickerAssignTarget,
+    updateConditionRule,
+    persistConditionCriteria,
+  ])
 
   const handleLabelChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     updateNodeLabel(selectedNodeId!, e.target.value)
@@ -6246,6 +11744,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const closeExpandedEditor = () => {
     setUiConditionBuilderModalIndex(null)
     setUiFieldBuilderModalIndex(null)
+    if (lastFocusedExpressionEditorRef.current === expandedExpressionEditorRef.current) {
+      lastFocusedExpressionEditorRef.current = null
+    }
+    expandedExpressionEditorRef.current = null
     setExpandedEditorFieldId(null)
   }
 
@@ -7354,10 +12856,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       custom_fields: normalized,
       custom_include_source_fields: customIncludeSourceDraft,
       custom_expression_engine: customExpressionEngineDraft,
+      custom_fns_version: customFnsVersionDraft,
+      custom_fns_v2_dedupe_key_field: customFnsV2DedupeKeyFieldDraft,
+      custom_fns_v2_on_duplicate: customFnsV2OnDuplicateDraft,
+      custom_fns_v2_normalize: customFnsV2NormalizeDraft,
+      custom_fns_v2_invalid_key: customFnsV2InvalidKeyDraft,
+      custom_fns_v2_row_gate_dedupe_enabled: customFnsV2RowGateDedupeEnabledDraft,
       custom_primary_key_field: primaryKeyField,
       custom_group_by_field: primaryKeyField,
       custom_profile_enabled: customProfileEnabledDraft,
       custom_profile_storage: customProfileStorageDraft,
+      custom_profile_lmdb_env_path: String(customProfileLmdbEnvPathDraft || '').trim(),
       custom_profile_oracle_host: String(customProfileOracleHostDraft || '').trim(),
       custom_profile_oracle_port: customProfileOraclePortDraft,
       custom_profile_oracle_service_name: String(customProfileOracleServiceNameDraft || '').trim(),
@@ -7380,6 +12889,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       custom_profile_compute_global_prefetch_max_tokens: customProfileComputeGlobalPrefetchMaxTokensDraft,
       custom_profile_backfill_candidate_prefetch_chunk_size: customProfileBackfillCandidatePrefetchChunkSizeDraft,
       custom_profile_emit_mode: customProfileEmitModeDraft,
+      custom_profile_emit_incremental_rows: customProfileEmitIncrementalRowsDraft,
       custom_profile_required_fields: customProfileRequiredFieldsDraft.join(', '),
       custom_profile_event_time_field: customProfileEventTimeFieldDraft,
       custom_profile_window_days: profileWindowDays,
@@ -7522,11 +13032,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     customEditorViewStateRef.current = nextViewState
     setCustomIncludeSourceDraft(Boolean(nodeConfig.custom_include_source_fields ?? true))
     setCustomExpressionEngineDraft(configuredExpressionEngine)
+    setCustomFnsVersionDraft(configuredFnsVersion)
+    setCustomFnsV2DedupeKeyFieldDraft(configuredFnsV2DedupeKeyField)
+    setCustomFnsV2OnDuplicateDraft(configuredFnsV2OnDuplicate)
+    setCustomFnsV2NormalizeDraft(configuredFnsV2Normalize)
+    setCustomFnsV2InvalidKeyDraft(configuredFnsV2InvalidKey)
+    setCustomFnsV2RowGateDedupeEnabledDraft(configuredFnsV2RowGateDedupeEnabled)
     setCustomPrimaryKeyFieldDraft(configuredPrimaryKeyField)
     setCustomProfileEnabledDraft(configuredProfileEnabled)
     setCustomProfileStorageDraft(configuredProfileStorage)
     setCustomProfileProcessingModeDraft(configuredProfileProcessingMode)
     setCustomProfileEmitModeDraft(configuredProfileEmitMode)
+    setCustomProfileEmitIncrementalRowsDraft(configuredProfileEmitIncrementalRows)
     setCustomProfileRequiredFieldsDraft(configuredProfileRequiredFields)
     setCustomProfileEventTimeFieldDraft(configuredProfileEventTimeField)
     setCustomProfileWindowDaysDraft(configuredProfileWindowDays)
@@ -7536,6 +13053,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         : 45
     )
     setCustomProfileIncludeChangeFieldsDraft(configuredProfileIncludeChangeFields)
+    setCustomProfileLmdbEnvPathDraft(configuredProfileLmdbEnvPath)
     setCustomProfileOracleHostDraft(configuredProfileOracleHost)
     setCustomProfileOraclePortDraft(configuredProfileOraclePort)
     setCustomProfileOracleServiceNameDraft(configuredProfileOracleServiceName)
@@ -7556,11 +13074,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setCustomProfileComputeMinRowsDraft(configuredProfileComputeMinRows)
     setCustomProfileComputeGlobalPrefetchMaxTokensDraft(configuredProfileComputeGlobalPrefetchMaxTokens)
     setCustomProfileBackfillCandidatePrefetchChunkSizeDraft(configuredProfileBackfillCandidatePrefetchChunkSize)
-    setCustomProfileLivePersistDraft(
-      configuredProfileProcessingMode === 'incremental_batch'
-        ? true
-        : configuredProfileLivePersist
-    )
+    setCustomProfileLivePersistDraft(configuredProfileLivePersist)
     setCustomProfileFlushEveryRowsDraft(
       configuredProfileProcessingMode === 'incremental_batch'
         ? Math.max(100, Math.min(Number(configuredProfileFlushEveryRows) || 20000, 50000))
@@ -7612,6 +13126,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         : 50
     )
     setActiveExpressionFieldId(null)
+    setActiveCustomFieldEditorTarget(null)
+    inlineExpressionEditorRef.current = {}
+    expandedExpressionEditorRef.current = null
+    lastFocusedExpressionEditorRef.current = null
     setExampleRepoCategory('all')
     setExampleRepoSearch('')
     setCustomFieldBeautifyUndoById({})
@@ -7739,6 +13257,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const removeCustomFieldDraft = (id: string) => {
     setCustomFieldDraft((prev) => prev.filter((item) => item.id !== id))
     setCollapsedCustomFieldIds((prev) => prev.filter((itemId) => itemId !== id))
+    setActiveCustomFieldEditorTarget((prev) => (prev?.fieldId === id ? null : prev))
+    if (lastFocusedExpressionEditorRef.current === inlineExpressionEditorRef.current[id]) {
+      lastFocusedExpressionEditorRef.current = null
+    }
+    if (inlineExpressionEditorRef.current[id]) {
+      delete inlineExpressionEditorRef.current[id]
+    }
     setCustomFieldBeautifyUndoById((prev) => {
       if (!prev[id]) return prev
       const next = { ...prev }
@@ -7752,6 +13277,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     delete nextViewState[customEditorStateKey(id, 'json', 'expanded')]
     customEditorViewStateRef.current = nextViewState
     if (expandedEditorFieldId === id) {
+      if (lastFocusedExpressionEditorRef.current === expandedExpressionEditorRef.current) {
+        lastFocusedExpressionEditorRef.current = null
+      }
+      expandedExpressionEditorRef.current = null
       setExpandedEditorFieldId(null)
     }
   }
@@ -7772,29 +13301,91 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const clean = String(token || '').trim()
     if (!clean) return
     setCustomFieldDraft((prev) => {
-      let targetIdx = activeExpressionFieldId
-        ? prev.findIndex((item) => item.id === activeExpressionFieldId && item.mode === 'value')
-        : -1
+      const tryFindTarget = (fieldId: string | null | undefined, mode?: CustomFieldMode | null) => {
+        const normalizedId = String(fieldId || '').trim()
+        if (!normalizedId) return -1
+        if (mode) {
+          const byMode = prev.findIndex((item) => item.id === normalizedId && item.mode === mode)
+          if (byMode >= 0) return byMode
+        }
+        return prev.findIndex((item) => item.id === normalizedId)
+      }
+
+      let targetIdx = tryFindTarget(activeCustomFieldEditorTarget?.fieldId, activeCustomFieldEditorTarget?.mode)
+      if (targetIdx < 0) {
+        targetIdx = tryFindTarget(expandedEditorFieldId, expandedEditorMode)
+      }
+      if (targetIdx < 0) {
+        targetIdx = tryFindTarget(activeExpressionFieldId, 'value')
+      }
       if (targetIdx < 0) {
         targetIdx = prev.findIndex((item) => item.mode === 'value')
       }
       if (targetIdx < 0) {
+        targetIdx = prev.findIndex((item) => item.mode === 'json')
+      }
+      if (targetIdx < 0) {
         notification.warning({
-          message: 'No expression field selected',
-          description: 'Create a "Single Value Expression" custom field and focus its editor first.',
+          message: 'No custom field selected',
+          description: 'Focus an Expression or JSON template editor first.',
           placement: 'bottomRight',
           duration: 2.5,
         })
         return prev
       }
       const target = prev[targetIdx]
-      const current = String(target.expression || '')
+      const current = String(target.mode === 'json' ? target.jsonTemplate : target.expression || '')
       const nextExpr = current ? `${current} ${clean}` : clean
       const next = [...prev]
-      next[targetIdx] = { ...target, expression: nextExpr }
+      if (target.mode === 'json') {
+        next[targetIdx] = { ...target, jsonTemplate: nextExpr }
+      } else {
+        next[targetIdx] = { ...target, expression: nextExpr }
+      }
       return next
     })
   }
+
+  const toggleCommentForExpressionField = useCallback((fieldId?: string | null) => {
+    const targetFieldId = String(fieldId || '').trim()
+      || String(activeExpressionFieldId || '').trim()
+      || String(expandedEditorFieldId || '').trim()
+    if (!targetFieldId) {
+      notification.info({
+        message: 'No expression field selected',
+        description: 'Focus an expression editor and select row(s) first.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    let editor: any = null
+    if (expandedEditorFieldId === targetFieldId && expandedEditorMode === 'value' && expandedExpressionEditorRef.current) {
+      editor = expandedExpressionEditorRef.current
+    } else {
+      editor = inlineExpressionEditorRef.current[targetFieldId]
+    }
+    if (!editor && lastFocusedExpressionEditorRef.current) {
+      editor = lastFocusedExpressionEditorRef.current
+    }
+    if (!editor) {
+      notification.info({
+        message: 'Expression editor not active',
+        description: 'Open the field editor and select row(s), then use Comment or Ctrl/Cmd + /.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    const toggled = toggleEditorLineComment(editor)
+    if (!toggled) {
+      notification.warning({
+        message: 'Comment toggle unavailable',
+        description: 'Could not toggle line comments for the current selection.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    editor.focus?.()
+  }, [activeExpressionFieldId, expandedEditorFieldId, expandedEditorMode])
 
   const collectEnabledCustomFieldSaveIssues = (items: CustomFieldSpec[]) => {
     type SaveIssue = { fieldId: string; fieldName: string; message: string }
@@ -7926,10 +13517,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       custom_fields: normalized,
       custom_include_source_fields: customIncludeSourceDraft,
       custom_expression_engine: customExpressionEngineDraft,
+      custom_fns_version: customFnsVersionDraft,
+      custom_fns_v2_dedupe_key_field: customFnsV2DedupeKeyFieldDraft,
+      custom_fns_v2_on_duplicate: customFnsV2OnDuplicateDraft,
+      custom_fns_v2_normalize: customFnsV2NormalizeDraft,
+      custom_fns_v2_invalid_key: customFnsV2InvalidKeyDraft,
+      custom_fns_v2_row_gate_dedupe_enabled: customFnsV2RowGateDedupeEnabledDraft,
       custom_primary_key_field: primaryKeyField,
       custom_group_by_field: primaryKeyField,
       custom_profile_enabled: customProfileEnabledDraft,
       custom_profile_storage: customProfileStorageDraft,
+      custom_profile_lmdb_env_path: String(customProfileLmdbEnvPathDraft || '').trim(),
       custom_profile_oracle_host: String(customProfileOracleHostDraft || '').trim(),
       custom_profile_oracle_port: customProfileOraclePortDraft,
       custom_profile_oracle_service_name: String(customProfileOracleServiceNameDraft || '').trim(),
@@ -7952,6 +13550,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       custom_profile_compute_global_prefetch_max_tokens: customProfileComputeGlobalPrefetchMaxTokensDraft,
       custom_profile_backfill_candidate_prefetch_chunk_size: customProfileBackfillCandidatePrefetchChunkSizeDraft,
       custom_profile_emit_mode: customProfileEmitModeDraft,
+      custom_profile_emit_incremental_rows: customProfileEmitIncrementalRowsDraft,
       custom_profile_required_fields: customProfileRequiredFieldsDraft.join(', '),
       custom_profile_event_time_field: customProfileEventTimeFieldDraft,
       custom_profile_window_days: profileWindowDays,
@@ -8088,6 +13687,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     value_format: draft.value_format || 'auto',
     flatten_json_values: Boolean(draft.flatten_json_values),
     expand_profile_documents: Boolean(draft.expand_profile_documents),
+    include_entity_meta: Boolean(draft.include_entity_meta),
     limit: Math.max(0, Number.isFinite(Number(draft.limit)) ? Math.floor(Number(draft.limit)) : 1000),
   })
 
@@ -8138,6 +13738,47 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       setLmdbPathBrowseError(msg)
       notification.error({
         message: `${sourceLabel} browser failed`,
+        description: msg,
+        placement: 'bottomRight',
+      })
+    } finally {
+      setLmdbPathBrowseLoading(false)
+    }
+  }
+
+  const createCustomProfileLmdbEnvPath = async () => {
+    const rawPath = String(customProfileLmdbEnvPathDraft || '').trim()
+    if (!rawPath) {
+      notification.warning({
+        message: 'LMDB env path is required',
+        description: 'Enter an LMDB environment folder path first.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    setLmdbPathBrowseLoading(true)
+    setLmdbPathBrowseError(null)
+    try {
+      const response = await api.createLmdbEnvPath({
+        env_path: rawPath,
+        initialize: true,
+      })
+      const resolved = String(response?.env_path || rawPath).trim()
+      if (resolved) {
+        setCustomProfileLmdbEnvPathDraft(resolved)
+        setLmdbDiscoveredPaths((prev) => uniqueFieldNames([...prev, resolved]))
+      }
+      notification.success({
+        message: 'LMDB environment ready',
+        description: resolved || rawPath,
+        placement: 'bottomRight',
+        duration: 2,
+      })
+    } catch (err: any) {
+      const msg = String(err?.message || 'Failed to create LMDB environment')
+      setLmdbPathBrowseError(msg)
+      notification.error({
+        message: 'LMDB create failed',
         description: msg,
         placement: 'bottomRight',
       })
@@ -8755,6 +14396,32 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             </Space>
           )
         }
+        if (nodeType === 'profile_query_transform' && field.name === 'field') {
+          const options = filterUserFacingFieldNames([
+            ...mapInputFieldOptions,
+            ...upstreamPreviewReferenceFields,
+          ]).map((name) => ({ value: name }))
+          const currentValue = String(val || '')
+          return (
+            <Space direction="vertical" size={6} style={{ width: '100%' }}>
+              <AutoComplete
+                value={currentValue}
+                options={options}
+                onChange={(next) => handleFieldChange(field.name, next)}
+                placeholder={field.placeholder || 'workflowtracker.workflow[].workflow_id'}
+                filterOption={(inputValue, option) =>
+                  String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())
+                }
+                style={{ width: '100%' }}
+              >
+                <Input style={commonInputStyle} />
+              </AutoComplete>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                Supports nested JSON paths like `profile.customer.status`, `workflow[]`, `workflow[].workflow_id`.
+              </Text>
+            </Space>
+          )
+        }
         if (nodeType === 'map_transform' && field.name === 'fields') {
           const selectedFields = parseFieldList(val)
           return (
@@ -8900,6 +14567,98 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           />
         )
       case 'select':
+        if (nodeType === 'business_workflow' && field.name === 'workflow_id') {
+          const workflowId = String(val || '').trim()
+          const workflowMode = String(nodeConfig.workflow_mode || 'embedded').trim().toLowerCase() === 'external'
+            ? 'external'
+            : 'embedded'
+          const canOpenChildCanvas = Boolean(activePipelineId && selectedNodeId)
+          const embeddedNodes = parseJsonArraySafe(nodeConfig.embedded_workflow_nodes)
+          const embeddedEdges = parseJsonArraySafe(nodeConfig.embedded_workflow_edges)
+          return (
+            <Space direction="vertical" size={8} style={{ width: '100%' }}>
+              <Select
+                value={workflowMode}
+                onChange={(value) => {
+                  const mode = String(value || '').trim().toLowerCase() === 'external' ? 'external' : 'embedded'
+                  if (!selectedNodeId) return
+                  updateNodeConfig(selectedNodeId, {
+                    workflow_mode: mode,
+                    embedded_workflow_enabled: mode === 'embedded',
+                  })
+                }}
+                options={[
+                  { value: 'embedded', label: 'Embedded (Child Canvas)' },
+                  { value: 'external', label: 'External Business Workflow' },
+                ]}
+                style={{ width: '100%' }}
+              />
+              {workflowMode === 'external' ? (
+                <Select
+                  showSearch
+                  value={workflowId || undefined}
+                  onChange={(value) => handleFieldChange(field.name, value)}
+                  options={businessWorkflowOptions}
+                  placeholder="Select external workflow"
+                  loading={businessWorkflowOptionsLoading}
+                  style={{ width: '100%' }}
+                />
+              ) : (
+                <div
+                  style={{
+                    border: '1px solid var(--app-border-strong)',
+                    borderRadius: 8,
+                    padding: '8px 10px',
+                    background: 'var(--app-card-bg)',
+                    display: 'grid',
+                    gap: 3,
+                  }}
+                >
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Embedded child canvas: {embeddedNodes.length} node(s), {embeddedEdges.length} edge(s)
+                  </Text>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Save from child canvas writes back to this node configuration.
+                  </Text>
+                </div>
+              )}
+              <Space size={8} wrap>
+                <Button
+                  size="small"
+                  disabled={!canOpenChildCanvas}
+                  onClick={() => {
+                    if (!canOpenChildCanvas) return
+                    if (typeof window !== 'undefined') {
+                      window.dispatchEvent(new CustomEvent('pipeline:open-business-canvas-tab', {
+                        detail: {
+                          pipelineId: String(activePipelineId || ''),
+                          nodeId: String(selectedNodeId || ''),
+                        },
+                      }))
+                    }
+                  }}
+                >
+                  Open In Canvas Tab
+                </Button>
+                {workflowMode === 'external' ? (
+                  <Button
+                    size="small"
+                    icon={<ReloadOutlined />}
+                    loading={businessWorkflowOptionsLoading}
+                    onClick={() => { void refreshBusinessWorkflowOptions() }}
+                  >
+                    Refresh
+                  </Button>
+                ) : null}
+              </Space>
+              {businessWorkflowOptionsError ? (
+                <Text style={{ color: '#ef4444', fontSize: 11 }}>
+                  {businessWorkflowOptionsError}
+                </Text>
+              ) : null}
+            </Space>
+          )
+        }
         if (nodeType === 'join_transform' && (field.name === 'left_source_node' || field.name === 'right_source_node')) {
           const options = field.name === 'right_source_node'
             ? joinSourceOptions.filter((opt) => opt.value !== joinLeftSource)
@@ -8954,6 +14713,32 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           />
         )
       case 'textarea':
+        if (nodeType === 'profile_query_transform' && field.name === 'select_fields') {
+          const selectedFields = parseFieldList(val)
+          const suggestionOptions = filterUserFacingFieldNames([
+            ...mapInputFieldOptions,
+            ...upstreamPreviewReferenceFields,
+          ]).map((name) => ({ value: name, label: name }))
+          return (
+            <Space direction="vertical" size={6} style={{ width: '100%' }}>
+              <Select
+                mode="tags"
+                value={selectedFields}
+                onChange={(values) => {
+                  const normalized = uniqueFieldNames((values || []).map((v) => String(v || '').trim()).filter(Boolean))
+                  handleFieldChange(field.name, normalized.join(', '))
+                }}
+                options={suggestionOptions}
+                tokenSeparators={[',']}
+                placeholder={field.placeholder || 'AGENTCODE, workflowtracker.workflow[].workflow_id'}
+                style={{ width: '100%' }}
+              />
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                Leave empty to keep full row. Set fields here to project only selected output fields.
+              </Text>
+            </Space>
+          )
+        }
         return (
           <Input.TextArea
             placeholder={field.placeholder}
@@ -9004,6 +14789,29 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
   const visibleFields = definition.configFields.filter((f) => {
     if (f.name.startsWith('_')) return false
+    if (nodeType === 'condition_node' && (f.name === 'field' || f.name === 'operator' || f.name === 'value')) {
+      return false
+    }
+    if (nodeType === 'profile_query_transform' && (
+      f.name === 'query_mode'
+      ||
+      f.name === 'field'
+      || f.name === 'operator'
+      || f.name === 'value'
+      || f.name === 'criteria_mode'
+      || f.name === 'criteria'
+      || f.name === 'select_fields'
+      || f.name === 'select_fields_sort'
+      || f.name === 'select_field_sorts'
+      || f.name === 'select_field_aliases'
+      || f.name === 'array_output_mode'
+      || f.name === 'array_match_mode'
+      || f.name === 'include_original_row'
+      || f.name === 'offset'
+      || f.name === 'limit'
+    )) {
+      return false
+    }
     if (nodeType === 'oracle_destination' && (f.name === 'table' || f.name === 'if_exists')) {
       return false
     }
@@ -9055,7 +14863,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             {definition.icon}
           </div>
           <div>
-            <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 13 }}>{definition.label}</Text>
+            <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 13 }}>
+              {String(data.label || definition.label || 'Node')}
+            </Text>
+            {String(data.label || '').trim() && String(data.label || '').trim() !== String(definition.label || '').trim() && (
+              <>
+                <br />
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                  {String(definition.label || '')}
+                </Text>
+              </>
+            )}
             <br />
             <Tag style={{
               background: `${definition.color}15`, border: `1px solid ${definition.color}30`,
@@ -9101,7 +14919,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             {/* Node label */}
             <Form.Item label={<Text style={{ color: 'var(--app-text-muted)', fontSize: 12 }}>Node Label</Text>} style={{ marginBottom: 14 }}>
               <Input
-                defaultValue={data.label}
+                value={String(data.label || '')}
                 onChange={handleLabelChange}
                 style={commonInputStyle}
               />
@@ -9327,6 +15145,110 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
                   Use dropdown in <strong>JSON Path</strong> to select nested object/array quickly.
                 </Text>
+              </div>
+            ) : null}
+
+            {nodeType === 'profile_query_transform' ? (
+              <div style={{
+                background: '#a855f70f',
+                border: '1px solid #a855f730',
+                borderRadius: 10,
+                padding: '10px 12px',
+                marginBottom: 12,
+              }}>
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                    <Text style={{ color: '#a855f7', fontSize: 12, fontWeight: 700 }}>
+                      Data Query Studio
+                    </Text>
+                    <Button
+                      size="small"
+                      onClick={openDataQueryStudio}
+                      style={{
+                        background: '#a855f71a',
+                        border: '1px solid #a855f740',
+                        color: '#a855f7',
+                      }}
+                    >
+                      Open Full Screen
+                    </Button>
+                  </Space>
+                  <Space size={6} wrap>
+                    <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>
+                      rules: {dataQueryCriteriaConfigured.length}
+                    </Tag>
+                    <Tag style={{ background: '#ec489914', border: '1px solid #ec489930', color: '#ec4899' }}>
+                      query: {dataQueryModeConfigured.toUpperCase()}
+                    </Tag>
+                    <Tag style={{ background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1' }}>
+                      mode: {dataQueryMatchModeConfigured === 'any' ? 'ANY (OR)' : 'ALL (AND)'}
+                    </Tag>
+                    <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b' }}>
+                      select: {dataQuerySelectFieldsConfigured.length || 'all'}
+                    </Tag>
+                    <Tag style={{ background: '#8b5cf614', border: '1px solid #8b5cf630', color: '#8b5cf6' }}>
+                      offset: {dataQueryOffsetConfigured}
+                    </Tag>
+                    <Tag style={{ background: '#06b6d414', border: '1px solid #06b6d430', color: '#06b6d4' }}>
+                      limit: {dataQueryLimitConfigured || 'none'}
+                    </Tag>
+                  </Space>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Configure query rules, JSON path field picker, and projection in studio. Changes apply only after explicit Save.
+                  </Text>
+                </Space>
+              </div>
+            ) : null}
+
+            {nodeType === 'condition_node' ? (
+              <div style={{
+                background: '#0ea5e90f',
+                border: '1px solid #0ea5e930',
+                borderRadius: 10,
+                padding: '10px 12px',
+                marginBottom: 12,
+              }}>
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                    <Text style={{ color: '#0ea5e9', fontSize: 12, fontWeight: 700 }}>
+                      Control Flow Studio
+                    </Text>
+                    <Button
+                      size="small"
+                      onClick={openConditionStudio}
+                      style={{
+                        background: '#0ea5e91a',
+                        border: '1px solid #0ea5e940',
+                        color: '#0ea5e9',
+                      }}
+                    >
+                      Open Full Screen
+                    </Button>
+                  </Space>
+
+                  <Space size={6} wrap>
+                    <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>
+                      rules: {conditionCriteria.length}
+                    </Tag>
+                    <Tag style={{ background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1' }}>
+                      mode: {conditionRoutingMode === 'case' ? 'CASE' : (conditionMatchMode === 'any' ? 'ANY (OR)' : 'ALL (AND)')}
+                    </Tag>
+                    {conditionRoutingMode === 'case' ? (
+                      <Tag style={{ background: '#06b6d414', border: '1px solid #06b6d430', color: '#06b6d4' }}>
+                        case routes: {conditionCaseRoutes.length}
+                      </Tag>
+                    ) : null}
+                    <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b' }}>
+                      preview rows: {conditionValidationSummary.totalRows}
+                    </Tag>
+                  </Space>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    {conditionRoutingMode === 'case'
+                      ? `ELSE route: ${conditionBranchTargets.falseTargets.length > 0 ? conditionBranchTargets.falseTargets.join(', ') : '(not connected)'}`
+                      : `TRUE route: ${conditionBranchTargets.trueTargets.length > 0 ? conditionBranchTargets.trueTargets.join(', ') : '(not connected)'} | FALSE route: ${conditionBranchTargets.falseTargets.length > 0 ? conditionBranchTargets.falseTargets.join(', ') : '(not connected)'}`
+                    }
+                  </Text>
+                </Space>
               </div>
             ) : null}
 
@@ -9649,6 +15571,102 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 padding: 10,
               }}
             >
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                FNS Version
+              </Text>
+              <Select
+                value={customFnsVersionDraft}
+                onChange={(value) => setCustomFnsVersionDraft(value as CustomFnsVersion)}
+                options={[
+                  { value: 'v1', label: 'v1 (Stable)' },
+                  { value: 'v2', label: 'v2 (Dedupe-Aware Helpers)' },
+                ]}
+                style={{ width: '100%', marginTop: 6 }}
+              />
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                v1 keeps existing behavior. v2 enables dedupe-aware helper functions.
+              </Text>
+            </div>
+            {customFnsVersionDraft === 'v2' ? (
+              <div
+                style={{
+                  marginTop: 10,
+                  background: 'var(--app-card-bg)',
+                  border: '1px solid var(--app-border-strong)',
+                  borderRadius: 8,
+                  padding: 10,
+                }}
+              >
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                  Common Dedupe Control (FNS v2)
+                </Text>
+                <Select
+                  allowClear
+                  showSearch
+                  value={customFnsV2DedupeKeyFieldDraft || undefined}
+                  onChange={(value) => setCustomFnsV2DedupeKeyFieldDraft(String(value || ''))}
+                  options={referenceFieldOptions.map((field) => ({ value: field, label: field }))}
+                  placeholder="dedupe_key field (usually TRANSACTIONID)"
+                  style={{ width: '100%', marginTop: 6 }}
+                />
+                <Space size={8} style={{ width: '100%', marginTop: 8 }}>
+                  <Select
+                    value={customFnsV2OnDuplicateDraft}
+                    onChange={(value) => setCustomFnsV2OnDuplicateDraft(value as CustomFnsV2OnDuplicate)}
+                    options={[
+                      { value: 'ignore', label: "on_duplicate='ignore'" },
+                      { value: 'update', label: "on_duplicate='update'" },
+                    ]}
+                    style={{ flex: 1 }}
+                  />
+                  <Select
+                    value={customFnsV2NormalizeDraft}
+                    onChange={(value) => setCustomFnsV2NormalizeDraft(value as CustomFnsV2Normalize)}
+                    options={[
+                      { value: 'upper_trim', label: "normalize='upper_trim'" },
+                      { value: 'lower_trim', label: "normalize='lower_trim'" },
+                      { value: 'trim', label: "normalize='trim'" },
+                      { value: 'upper', label: "normalize='upper'" },
+                      { value: 'lower', label: "normalize='lower'" },
+                      { value: 'auto', label: "normalize='auto'" },
+                    ]}
+                    style={{ flex: 1 }}
+                  />
+                </Space>
+                <Select
+                  value={customFnsV2InvalidKeyDraft}
+                  onChange={(value) => setCustomFnsV2InvalidKeyDraft(value as CustomFnsV2InvalidKey)}
+                  options={[
+                    { value: 'skip', label: "invalid_key='skip'" },
+                    { value: 'allow', label: "invalid_key='allow'" },
+                    { value: 'raise', label: "invalid_key='raise'" },
+                  ]}
+                  style={{ width: '100%', marginTop: 8 }}
+                />
+                <Space style={{ justifyContent: 'space-between', width: '100%', marginTop: 8 }}>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Global Row Dedupe Gate
+                  </Text>
+                  <Switch
+                    checked={customFnsV2RowGateDedupeEnabledDraft}
+                    onChange={setCustomFnsV2RowGateDedupeEnabledDraft}
+                  />
+                </Space>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                  Applied as default opts for FNS v2 helpers. Expression-level opts override these values.
+                  Row gate runs dedupe once per input row (using dedupe_key field) for faster multi-helper expressions.
+                </Text>
+              </div>
+            ) : null}
+            <div
+              style={{
+                marginTop: 10,
+                background: 'var(--app-card-bg)',
+                border: '1px solid var(--app-border-strong)',
+                borderRadius: 8,
+                padding: 10,
+              }}
+            >
               <Space style={{ justifyContent: 'space-between', width: '100%' }}>
                 <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
                   Profile Document Mode
@@ -9686,13 +15704,56 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     ]}
                     style={{ width: '100%' }}
                   />
+                  {customProfileStorageDraft === 'lmdb' ? (
+                    <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                        LMDB Profile Environment Path
+                      </Text>
+                      <Space.Compact style={{ width: '100%' }}>
+                        <Input
+                          value={customProfileLmdbEnvPathDraft}
+                          onChange={(e) => setCustomProfileLmdbEnvPathDraft(e.target.value)}
+                          placeholder="/path/to/profile_store.lmdb"
+                          style={{ ...commonInputStyle, width: '100%' }}
+                        />
+                        <Button
+                          loading={lmdbPathBrowseLoading}
+                          onClick={() => {
+                            void loadLmdbEnvPathOptions(
+                              String(customProfileLmdbEnvPathDraft || '').trim(),
+                              'lmdb',
+                            )
+                          }}
+                        >
+                          Browse
+                        </Button>
+                        <Button
+                          loading={lmdbPathBrowseLoading}
+                          onClick={() => { void createCustomProfileLmdbEnvPath() }}
+                        >
+                          Create
+                        </Button>
+                      </Space.Compact>
+                      <Select
+                        showSearch
+                        allowClear
+                        placeholder="Choose discovered LMDB profile path"
+                        options={lmdbEnvPathPresetOptions}
+                        value={customProfileLmdbEnvPathDraft || undefined}
+                        onChange={(value) => setCustomProfileLmdbEnvPathDraft(String(value || ''))}
+                        style={{ width: '100%' }}
+                      />
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                        Optional override. If empty, backend uses `PROFILE_LMDB_DIR` or default `backend/state/profile_store.lmdb`.
+                      </Text>
+                    </Space>
+                  ) : null}
                   <Select
                     value={customProfileProcessingModeDraft}
                     onChange={(value) => {
                       const nextMode = value as CustomProfileProcessingMode
                       setCustomProfileProcessingModeDraft(nextMode)
                       if (nextMode === 'incremental_batch') {
-                        setCustomProfileLivePersistDraft(true)
                         setCustomProfileFlushEveryRowsDraft((prev) => {
                           const safe = Number.isFinite(prev) ? prev : 20000
                           return Math.max(100, Math.min(Math.floor(safe || 20000), 50000))
@@ -9719,7 +15780,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     style={{ width: '100%' }}
                   />
                   <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
-                    Batch: existing behavior. Incremental: high-speed row-wise updates. Incremental Batch: row-wise updates with chunked live persist for safer recovery.
+                    Batch: existing behavior. Incremental: high-speed row-wise updates. Incremental Batch: row-wise updates with optional live persist or compute-first terminal persist.
                   </Text>
                   <div
                     style={{
@@ -9835,7 +15896,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         {customProfileProcessingModeDraft === 'incremental_batch' ? (
                           <Space style={{ justifyContent: 'space-between', width: '100%' }}>
                             <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
-                              Live Persist
+                              Persist During Compute
                             </Text>
                             <Switch
                               checked={customProfileLivePersistDraft}
@@ -10070,6 +16131,31 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     options={[
                       { value: 'changed_only', label: 'Emit changed entities only' },
                       { value: 'all_entities', label: 'Emit all entity profiles' },
+                    ]}
+                    style={{ width: '100%' }}
+                  />
+                  <Select
+                    value={
+                      customProfileEmitIncrementalRowsDraft === null
+                        ? 'auto'
+                        : (customProfileEmitIncrementalRowsDraft ? 'enabled' : 'disabled')
+                    }
+                    onChange={(value) => {
+                      const next = String(value || 'auto').trim().toLowerCase()
+                      if (next === 'enabled') {
+                        setCustomProfileEmitIncrementalRowsDraft(true)
+                        return
+                      }
+                      if (next === 'disabled') {
+                        setCustomProfileEmitIncrementalRowsDraft(false)
+                        return
+                      }
+                      setCustomProfileEmitIncrementalRowsDraft(null)
+                    }}
+                    options={[
+                      { value: 'auto', label: 'Emit Incremental Rows: Auto' },
+                      { value: 'enabled', label: 'Emit Incremental Rows: Enabled' },
+                      { value: 'disabled', label: 'Emit Incremental Rows: Disabled (unique output)' },
                     ]}
                     style={{ width: '100%' }}
                   />
@@ -10459,6 +16545,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         >
                           Expand Editor
                         </Button>
+                        {item.mode === 'value' ? (
+                          <Tooltip title="Toggle comment on selected rows (Ctrl/Cmd + /)">
+                            <Button
+                              size="small"
+                              onClick={() => toggleCommentForExpressionField(item.id)}
+                            >
+                              Comment
+                            </Button>
+                          </Tooltip>
+                        ) : null}
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Beautify</Text>
                         <Switch
                           size="small"
@@ -10539,11 +16635,23 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                               value={item.expression}
                               beforeMount={(monaco) => ensureExpressionLanguage(monaco)}
                               onMount={(editor, monaco) => {
+                                inlineExpressionEditorRef.current[item.id] = editor
                                 attachExpressionValidation(editor, monaco)
                                 attachExpressionAutoSuggest(editor)
+                                attachExpressionCommentShortcuts(editor, monaco)
                                 attachCustomEditorViewStateTracking(item.id, 'value', 'inline', editor)
                                 editor.onDidFocusEditorText(() => {
+                                  lastFocusedExpressionEditorRef.current = editor
                                   setActiveExpressionFieldId(item.id)
+                                  setActiveCustomFieldEditorTarget({ fieldId: item.id, mode: 'value' })
+                                })
+                                editor.onDidDispose(() => {
+                                  if (lastFocusedExpressionEditorRef.current === editor) {
+                                    lastFocusedExpressionEditorRef.current = null
+                                  }
+                                  if (inlineExpressionEditorRef.current[item.id] === editor) {
+                                    delete inlineExpressionEditorRef.current[item.id]
+                                  }
                                 })
                               }}
                               onChange={(value) => updateCustomFieldDraft(item.id, { expression: value || '' })}
@@ -10586,6 +16694,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                 attachJsonTemplateExpressionValidation(editor, monaco)
                                 attachExpressionAutoSuggest(editor)
                                 attachCustomEditorViewStateTracking(item.id, 'json', 'inline', editor)
+                                editor.onDidFocusEditorText(() => {
+                                  setActiveCustomFieldEditorTarget({ fieldId: item.id, mode: 'json' })
+                                })
                               }}
                               onChange={(value) => updateCustomFieldDraft(item.id, { jsonTemplate: value || '' })}
                               theme={customEditorThemeId}
@@ -10767,6 +16878,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     <Modal
       open={profileDataModalOpen}
       onCancel={() => setProfileDataModalOpen(false)}
+      zIndex={2400}
       footer={null}
       centered
       width="90vw"
@@ -10927,6 +17039,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               }}
             />
           </Space>
+          {expandedEditorMode === 'value' ? (
+            <Tooltip title="Toggle comment on selected rows (Ctrl/Cmd + /)">
+              <Button
+                size="small"
+                disabled={!expandedEditorField}
+                onClick={() => toggleCommentForExpressionField(expandedEditorField?.id)}
+              >
+                Comment
+              </Button>
+            </Tooltip>
+          ) : null}
           <Tooltip title="Close">
             <Button
               shape="circle"
@@ -10977,9 +17100,24 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     }}
                     onMount={(editor, monaco) => {
                       if (expandedEditorMode === 'value') {
+                        expandedExpressionEditorRef.current = editor
                         attachExpressionValidation(editor, monaco)
+                        attachExpressionCommentShortcuts(editor, monaco)
+                        editor.onDidFocusEditorText(() => {
+                          lastFocusedExpressionEditorRef.current = editor
+                          if (expandedEditorField?.id) {
+                            setActiveExpressionFieldId(expandedEditorField.id)
+                            setActiveCustomFieldEditorTarget({ fieldId: expandedEditorField.id, mode: 'value' })
+                          }
+                        })
                       } else {
+                        expandedExpressionEditorRef.current = null
                         attachJsonTemplateExpressionValidation(editor, monaco)
+                        editor.onDidFocusEditorText(() => {
+                          if (expandedEditorField?.id) {
+                            setActiveCustomFieldEditorTarget({ fieldId: expandedEditorField.id, mode: 'json' })
+                          }
+                        })
                       }
                       attachExpressionAutoSuggest(editor)
                       if (expandedEditorField?.id) {
@@ -10990,6 +17128,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           editor,
                         )
                       }
+                      editor.onDidDispose(() => {
+                        if (lastFocusedExpressionEditorRef.current === editor) {
+                          lastFocusedExpressionEditorRef.current = null
+                        }
+                        if (expandedExpressionEditorRef.current === editor) {
+                          expandedExpressionEditorRef.current = null
+                        }
+                      })
                     }}
                     onChange={(value) => {
                       if (!expandedEditorField) return
@@ -11621,6 +17767,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                         } else {
                                           attachExpressionValidation(editor, monaco)
                                           attachExpressionAutoSuggest(editor)
+                                          attachExpressionCommentShortcuts(editor, monaco)
                                         }
                                       }}
                                       onChange={(value) => updateUiExpressionJsonRow(row.id, { expression: String(value || '') })}
@@ -11685,6 +17832,2078 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             )}
           </div>
         ) : null}
+      </div>
+    </Modal>
+    <Modal
+      open={dataQueryStudioOpen && nodeType === 'profile_query_transform'}
+      onCancel={requestCloseDataQueryStudio}
+      footer={null}
+      closable={false}
+      centered
+      width="96vw"
+      styles={{
+        content: {
+          padding: 0,
+          borderRadius: 12,
+          overflow: 'hidden',
+          border: '1px solid var(--app-border-strong)',
+          background: 'var(--app-panel-bg)',
+          height: '94vh',
+          display: 'flex',
+          flexDirection: 'column',
+        },
+        body: {
+          padding: 0,
+          flex: 1,
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+        },
+      }}
+    >
+      <div
+        style={{
+          borderBottom: '1px solid var(--app-border-strong)',
+          background: 'var(--app-card-bg)',
+          padding: '12px 16px',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: 12,
+        }}
+      >
+        <div>
+          <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 16 }}>
+            Data Query Studio
+          </Text>
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+            Configure rules, projection, and query mode. Save explicitly to apply changes.
+          </Text>
+        </div>
+        <Space wrap>
+          <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6', marginInlineEnd: 0 }}>
+            rules: {dataQueryCriteriaDraft.length}
+          </Tag>
+          <Tag style={{ background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1', marginInlineEnd: 0 }}>
+            mode: {dataQueryMatchModeDraft === 'any' ? 'ANY (OR)' : 'ALL (AND)'}
+          </Tag>
+          <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b', marginInlineEnd: 0 }}>
+            select: {dataQuerySelectFieldsDraft.length || 'all'}
+          </Tag>
+          <Tag style={{ background: '#ec489914', border: '1px solid #ec489930', color: '#ec4899', marginInlineEnd: 0 }}>
+            query: {String(dataQueryModeDraft || 'hybrid').toUpperCase()}
+          </Tag>
+          <Select
+            size="small"
+            value={dataQueryModeDraft}
+            onChange={(value) => {
+              const mode = String(value || '').trim().toLowerCase()
+              if (mode === 'upstream' || mode === 'pushdown') {
+                setDataQueryModeDraft(mode)
+              } else {
+                setDataQueryModeDraft('hybrid')
+              }
+            }}
+            options={[
+              { value: 'upstream', label: 'Upstream' },
+              { value: 'pushdown', label: 'Pushdown' },
+              { value: 'hybrid', label: 'Hybrid' },
+            ]}
+            style={{ minWidth: 128 }}
+          />
+          <Space size={6}>
+            <Switch
+              size="small"
+              checked={dataQueryCompactView}
+              onChange={(checked) => setDataQueryCompactView(Boolean(checked))}
+            />
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Compact</Text>
+          </Space>
+          <Button onClick={runDataQueryPreview}>Run Preview</Button>
+          <Button type="primary" icon={<SaveOutlined />} onClick={saveDataQueryStudioConfig}>
+            Save
+          </Button>
+          <Button onClick={requestCloseDataQueryStudio}>Close</Button>
+        </Space>
+      </div>
+
+      <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+        <div
+          style={{
+            width: '23%',
+            minWidth: 300,
+            borderRight: '1px solid var(--app-border-strong)',
+            padding: 12,
+            overflowY: 'auto',
+          }}
+        >
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Input Source</Text>
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+            Fields discovered from directly connected upstream output.
+          </Text>
+          <br />
+          <Space size={6} wrap style={{ marginTop: 6 }}>
+            <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9' }}>
+              fields: {dataQueryFieldOptions.length}
+            </Tag>
+            <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e' }}>
+              sample rows: {dataQueryPreviewRows.length}
+            </Tag>
+          </Space>
+
+          <Divider style={{ borderColor: 'var(--app-border)', margin: '12px 0' }} />
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Input Field Picker</Text>
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+            Click a path to assign it to the active condition field.
+          </Text>
+
+          <Space.Compact style={{ width: '100%', marginTop: 8 }}>
+            <Input
+              size="small"
+              value={dataQueryManualFieldPath}
+              onChange={(event) => setDataQueryManualFieldPath(String(event.target.value || ''))}
+              placeholder="Manual path (example: workflowtracker.workflow[].workflow_id)"
+              onPressEnter={() => {
+                const path = String(dataQueryManualFieldPath || '').trim()
+                if (!path) return
+                applyDataQueryFieldFromPicker(path)
+              }}
+            />
+            <Button
+              size="small"
+              onClick={() => {
+                const path = String(dataQueryManualFieldPath || '').trim()
+                if (!path) return
+                applyDataQueryFieldFromPicker(path)
+              }}
+            >
+              Add Path
+            </Button>
+          </Space.Compact>
+
+          <Input
+            size="small"
+            allowClear
+            value={dataQueryFieldSearchQuery}
+            onChange={(event) => setDataQueryFieldSearchQuery(String(event.target.value || ''))}
+            placeholder="Search fields (name/path)"
+            style={{ marginTop: 8 }}
+          />
+          <Space size={6} wrap style={{ justifyContent: 'flex-start', width: '100%', alignItems: 'center', marginTop: 8 }}>
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+              Tree controls
+            </Text>
+            <Button
+              size="small"
+              icon={<PlusSquareOutlined />}
+              onClick={() => setDataQueryTreeExpandedKeys(dataQueryFilteredFieldTreeKeys)}
+            >
+              Expand
+            </Button>
+            <Button
+              size="small"
+              icon={<MinusSquareOutlined />}
+              onClick={() => setDataQueryTreeExpandedKeys([])}
+            >
+              Collapse
+            </Button>
+            <Button
+              size="small"
+              onClick={() => {
+                const keys = dataQueryFilteredFieldTreeKeys.filter((key) => String(key || '').split('.').length <= 1)
+                setDataQueryTreeExpandedKeys(uniqueFieldNames(keys))
+              }}
+            >
+              L1
+            </Button>
+            <Button
+              size="small"
+              onClick={() => {
+                const keys = dataQueryFilteredFieldTreeKeys.filter((key) => String(key || '').split('.').length <= 2)
+                setDataQueryTreeExpandedKeys(uniqueFieldNames(keys))
+              }}
+            >
+              L2
+            </Button>
+            <Button
+              size="small"
+              onClick={() => {
+                const keys = dataQueryFilteredFieldTreeKeys.filter((key) => String(key || '').split('.').length <= 3)
+                setDataQueryTreeExpandedKeys(uniqueFieldNames(keys))
+              }}
+            >
+              L3
+            </Button>
+          </Space>
+          <Space size={6} style={{ justifyContent: 'space-between', width: '100%', alignItems: 'center', marginTop: 6 }}>
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+              Quick picker
+            </Text>
+            <Switch
+              size="small"
+              checked={dataQueryShowQuickPicker}
+              onChange={(checked) => setDataQueryShowQuickPicker(Boolean(checked))}
+            />
+          </Space>
+
+          <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 6, marginTop: 8 }}>
+            <Tree
+              blockNode
+              showLine={false}
+              switcherIcon={(nodeProps: any) => {
+                if (nodeProps?.isLeaf) return <span style={{ width: 16, display: 'inline-block' }} />
+                return (
+                  <span
+                    style={{
+                      width: 16,
+                      height: 16,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      border: '1px solid var(--app-border-strong)',
+                      borderRadius: 3,
+                      background: 'var(--app-input-bg)',
+                      color: 'var(--app-text)',
+                      fontSize: 12,
+                      fontWeight: 700,
+                      lineHeight: 1,
+                    }}
+                  >
+                    {nodeProps?.expanded ? '−' : '+'}
+                  </span>
+                )
+              }}
+              treeData={dataQueryFilteredFieldTreeData}
+              expandedKeys={dataQueryTreeExpandedKeys}
+              onExpand={(keys) => {
+                const normalized = (keys || []).map((key) => String(key || '')).filter(Boolean)
+                setDataQueryTreeExpandedKeys(uniqueFieldNames(normalized))
+              }}
+              expandAction="click"
+              onSelect={(_, info) => {
+                const fieldPath = String((info.node as any)?.path || '').trim()
+                if (!fieldPath) return
+                applyDataQueryFieldFromPicker(fieldPath)
+              }}
+            />
+          </div>
+
+          {dataQueryShowQuickPicker ? (
+            <div style={{ marginTop: 10, maxHeight: 260, overflowY: 'auto', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {dataQueryQuickPickFields.map((fieldName) => (
+                <Tag
+                  key={`data_query_pick_${fieldName}`}
+                  style={{
+                    marginInlineEnd: 0,
+                    cursor: 'pointer',
+                    userSelect: 'none',
+                    background: '#a855f714',
+                    border: '1px solid #a855f730',
+                    color: '#a855f7',
+                    padding: '4px 8px',
+                    whiteSpace: 'normal',
+                  }}
+                  onClick={() => applyDataQueryFieldFromPicker(fieldName)}
+                >
+                  <span>{fieldName}</span>
+                  {!dataQueryCompactView && dataQueryFieldSamples.get(fieldName) ? (
+                    <span style={{ color: 'var(--app-text-subtle)' }}> = {dataQueryFieldSamples.get(fieldName)}</span>
+                  ) : null}
+                </Tag>
+              ))}
+              {dataQueryFilteredFieldOptions.length > dataQueryQuickPickFields.length ? (
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                  Showing first {dataQueryQuickPickFields.length} of {dataQueryFilteredFieldOptions.length}.
+                </Text>
+              ) : null}
+            </div>
+          ) : (
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, marginTop: 10 }}>
+              Quick picker hidden. Enable to show clickable field tags.
+            </Text>
+          )}
+        </div>
+
+        <div style={{ flex: 1, padding: dataQueryCompactView ? 10 : 12, overflowY: 'auto', display: 'grid', gap: dataQueryCompactView ? 8 : 10 }}>
+          <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 10, padding: dataQueryCompactView ? 6 : 8, background: 'var(--app-card-bg)', display: 'grid', gap: dataQueryCompactView ? 6 : 8 }}>
+            <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+              <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Filter Rules</Text>
+              <Button size="small" onClick={addDataQueryRule}>+ Condition</Button>
+            </Space>
+            <Space size={8} wrap>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Criteria Mode</Text>
+              <Select
+                size="small"
+                value={dataQueryMatchModeDraft}
+                onChange={(value) => {
+                  const next = String(value || '').trim().toLowerCase() === 'any' ? 'any' : 'all'
+                  setDataQueryMatchModeDraft(next)
+                }}
+                options={[
+                  { value: 'all', label: 'ALL (AND)' },
+                  { value: 'any', label: 'ANY (OR)' },
+                ]}
+                style={{ minWidth: 140 }}
+              />
+            </Space>
+
+            {dataQueryCriteriaDraft.length <= 0 ? (
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                No filter rules configured. Add one condition to start filtering.
+              </Text>
+            ) : (
+              <div style={{ display: 'grid', gap: dataQueryCompactView ? 6 : 8 }}>
+                {dataQueryCriteriaDraft.map((rule, idx) => {
+                  const ruleId = String(rule.id || `rule_${idx + 1}`)
+                  const operator = String(rule.operator || 'equals')
+                  const rightMode = String(rule.rightMode || 'literal').trim().toLowerCase() === 'field' ? 'field' : 'literal'
+                  const hideValueInput = operator === 'is_null' || operator === 'is_not_null'
+                  return (
+                    <div
+                      key={`data_query_rule_${ruleId}`}
+                      style={{
+                        border: '1px solid var(--app-border)',
+                        borderRadius: 8,
+                        background: 'var(--app-bg)',
+                        padding: dataQueryCompactView ? 6 : 8,
+                        display: 'grid',
+                        gap: dataQueryCompactView ? 5 : 6,
+                      }}
+                    >
+                      <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                        <Space size={6}>
+                          <Tag
+                            style={{
+                              marginInlineEnd: 0,
+                              border: '1px solid #a855f740',
+                              background: '#a855f71a',
+                              color: '#a855f7',
+                              fontSize: 11,
+                            }}
+                          >
+                            Rule {idx + 1}
+                          </Tag>
+                        </Space>
+                        <Button
+                          size="small"
+                          danger
+                          onClick={() => removeDataQueryRule(ruleId)}
+                          disabled={dataQueryCriteriaDraft.length <= 1}
+                        >
+                          Remove
+                        </Button>
+                      </Space>
+                      <AutoComplete
+                        value={String(rule.field || '')}
+                        options={dataQueryFieldAutoCompleteOptions}
+                        onChange={(value) => updateDataQueryRule(ruleId, { field: String(value || '') })}
+                        filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                      >
+                        <Input
+                          size="small"
+                          placeholder="Field / JSON path"
+                          onFocus={() => setDataQueryActiveRuleId(ruleId)}
+                        />
+                      </AutoComplete>
+                      <Space size={8} wrap style={{ width: '100%' }}>
+                        <Select
+                          size="small"
+                          value={operator}
+                          options={dataQueryOperatorOptions}
+                          onChange={(value) => updateDataQueryRule(ruleId, { operator: String(value || 'equals') })}
+                          style={{ minWidth: dataQueryCompactView ? 150 : 180 }}
+                        />
+                        <Select
+                          size="small"
+                          value={rightMode}
+                          options={[
+                            { value: 'literal', label: 'Value' },
+                            { value: 'field', label: 'Field' },
+                          ]}
+                          onChange={(value) => updateDataQueryRule(ruleId, {
+                            rightMode: String(value || '').trim().toLowerCase() === 'field' ? 'field' : 'literal',
+                          })}
+                          style={{ minWidth: dataQueryCompactView ? 96 : 110 }}
+                        />
+                        {hideValueInput ? (
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>No value required</Text>
+                        ) : rightMode === 'field' ? (
+                          <AutoComplete
+                            value={String(rule.value || '')}
+                            options={dataQueryFieldAutoCompleteOptions}
+                            onChange={(value) => updateDataQueryRule(ruleId, { value: String(value || '') })}
+                            filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                          >
+                            <Input
+                              size="small"
+                              placeholder="Compare field path"
+                              style={{ minWidth: dataQueryCompactView ? 180 : 220 }}
+                              onFocus={() => setDataQueryActiveRuleId(ruleId)}
+                            />
+                          </AutoComplete>
+                        ) : (
+                          <Input
+                            size="small"
+                            value={String(rule.value || '')}
+                            onChange={(event) => updateDataQueryRule(ruleId, { value: event.target.value })}
+                            placeholder={operator === 'between' ? 'min,max' : 'Compare value'}
+                            style={{ minWidth: dataQueryCompactView ? 180 : 220 }}
+                            onFocus={() => setDataQueryActiveRuleId(ruleId)}
+                          />
+                        )}
+                      </Space>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+
+          <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 10, padding: dataQueryCompactView ? 6 : 8, background: 'var(--app-card-bg)', display: 'grid', gap: dataQueryCompactView ? 6 : 8 }}>
+            <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Projection & Window</Text>
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+              Keep all fields by leaving Select Fields empty, or project only selected paths.
+            </Text>
+            <Select
+              mode="tags"
+              value={dataQuerySelectFieldsDraft}
+              onChange={(values) => {
+                const next = uniqueFieldNames((values || []).map((v) => String(v || '').trim()).filter(Boolean))
+                setDataQuerySelectFieldsDraft(next)
+              }}
+              options={dataQueryFieldAutoCompleteOptions}
+              tokenSeparators={[',']}
+              placeholder="Select fields (optional)"
+              style={{ width: '100%' }}
+            />
+            <Select
+              size="small"
+              value={dataQueryArrayOutputModeDraft}
+              onChange={(value) => {
+                const mode = String(value || '').trim().toLowerCase()
+                setDataQueryArrayOutputModeDraft(mode === 'explode_rows' ? 'explode_rows' : 'list')
+              }}
+              options={[
+                { value: 'list', label: 'Array Output: Keep as list' },
+                { value: 'explode_rows', label: 'Array Output: Explode to multiple rows' },
+              ]}
+              style={{ width: '100%' }}
+            />
+            <Select
+              size="small"
+              value={dataQueryArrayMatchModeDraft}
+              onChange={(value) => {
+                const mode = String(value || '').trim().toLowerCase()
+                setDataQueryArrayMatchModeDraft(mode === 'matched_elements_only' ? 'matched_elements_only' : 'all_elements')
+              }}
+              options={[
+                { value: 'all_elements', label: 'Array Match: Keep all elements' },
+                { value: 'matched_elements_only', label: 'Array Match: Keep matched elements only' },
+              ]}
+              style={{ width: '100%' }}
+            />
+            {dataQuerySelectFieldsDraft.length > 0 ? (
+              <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, padding: 6, background: 'var(--app-bg)', display: 'grid', gap: 6 }}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                  Selected fields (reorder columns, apply row-sort priority, set aliases)
+                </Text>
+                {dataQuerySelectFieldsDraft.map((fieldPath, index) => (
+                  <div
+                    key={`dq_alias_${fieldPath}`}
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: dataQueryCompactView
+                        ? '24px minmax(150px,1fr) 92px minmax(120px,1fr) 56px'
+                        : '28px minmax(220px,1fr) 110px minmax(130px,1fr) 72px',
+                      gap: 6,
+                      alignItems: 'center',
+                    }}
+                  >
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{index + 1}</Text>
+                    <Input size="small" value={fieldPath} readOnly />
+                    <Select
+                      size="small"
+                      value={String(dataQuerySelectFieldSortsDraft[fieldPath] || 'none')}
+                      options={[
+                        { value: 'none', label: 'No sort' },
+                        { value: 'asc', label: 'ASC' },
+                        { value: 'desc', label: 'DESC' },
+                      ]}
+                      onChange={(value) => {
+                        const nextMode = String(value || '').trim().toLowerCase()
+                        setDataQuerySelectFieldSortsDraft((prev) => {
+                          const next = { ...(prev || {}) }
+                          if (nextMode === 'asc' || nextMode === 'desc') next[fieldPath] = nextMode
+                          else delete next[fieldPath]
+                          return next
+                        })
+                      }}
+                    />
+                    <Input
+                      size="small"
+                      value={String(dataQuerySelectFieldAliasesDraft[fieldPath] || '')}
+                      placeholder="alias"
+                      onChange={(event) => {
+                        const alias = String(event.target.value || '').trim()
+                        setDataQuerySelectFieldAliasesDraft((prev) => {
+                          const next = { ...(prev || {}) }
+                          if (!alias) delete next[fieldPath]
+                          else next[fieldPath] = alias
+                          return next
+                        })
+                      }}
+                    />
+                    <Space size={4}>
+                      <Button
+                        size="small"
+                        icon={<ArrowUpOutlined />}
+                        disabled={index <= 0}
+                        onClick={() => {
+                          if (index <= 0) return
+                          setDataQuerySelectFieldsDraft((prev) => {
+                            const next = [...prev]
+                            const swap = next[index - 1]
+                            next[index - 1] = next[index]
+                            next[index] = swap
+                            return next
+                          })
+                        }}
+                      />
+                      <Button
+                        size="small"
+                        icon={<ArrowDownOutlined />}
+                        disabled={index >= dataQuerySelectFieldsDraft.length - 1}
+                        onClick={() => {
+                          if (index >= dataQuerySelectFieldsDraft.length - 1) return
+                          setDataQuerySelectFieldsDraft((prev) => {
+                            const next = [...prev]
+                            const swap = next[index + 1]
+                            next[index + 1] = next[index]
+                            next[index] = swap
+                            return next
+                          })
+                        }}
+                      />
+                    </Space>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            <Space size={8} wrap>
+              <Switch
+                size="small"
+                checked={Boolean(dataQueryIncludeOriginalRowDraft)}
+                onChange={(checked) => setDataQueryIncludeOriginalRowDraft(Boolean(checked))}
+              />
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                Include original row
+              </Text>
+            </Space>
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(110px,1fr) minmax(110px,1fr)', gap: 8 }}>
+              <div>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Offset</Text>
+                <InputNumber
+                  min={0}
+                  value={dataQueryOffsetDraft}
+                  onChange={(value) => {
+                    const next = Number(value || 0)
+                    setDataQueryOffsetDraft(Number.isFinite(next) ? Math.max(0, Math.trunc(next)) : 0)
+                  }}
+                  style={{ width: '100%', marginTop: 4 }}
+                />
+              </div>
+              <div>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Limit (0 = no limit)</Text>
+                <InputNumber
+                  min={0}
+                  value={dataQueryLimitDraft}
+                  onChange={(value) => {
+                    const next = Number(value || 0)
+                    setDataQueryLimitDraft(Number.isFinite(next) ? Math.max(0, Math.trunc(next)) : 0)
+                  }}
+                  style={{ width: '100%', marginTop: 4 }}
+                />
+              </div>
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 10, padding: dataQueryCompactView ? 6 : 8, background: 'var(--app-card-bg)', display: 'grid', gap: dataQueryCompactView ? 6 : 8 }}>
+            <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+              <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Profile Patch Update</Text>
+              <Space size={8}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                  Apply filtered output
+                </Text>
+                <Switch
+                  size="small"
+                  checked={Boolean(dataQueryProfilePatchEnabledDraft)}
+                  onChange={(checked) => {
+                    const nextEnabled = Boolean(checked)
+                    setDataQueryProfilePatchEnabledDraft(nextEnabled)
+                    if (nextEnabled && dataQueryProfilePatchOpsDraft.length <= 0) {
+                      persistDataQueryPatchOps([
+                        createDataQueryProfilePatchOperation({
+                          op: 'set',
+                          valueMode: 'row',
+                          mergeMode: 'merge',
+                        }),
+                      ])
+                    }
+                  }}
+                />
+              </Space>
+            </Space>
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+              Persists only rows that pass current Data Query criteria. Use this to patch profile documents without a separate Custom Fields node.
+            </Text>
+            <Space size={8}>
+              <Switch
+                size="small"
+                checked={Boolean(dataQueryProfilePatchReflectOutputDraft)}
+                onChange={(checked) => setDataQueryProfilePatchReflectOutputDraft(Boolean(checked))}
+                disabled={!dataQueryProfilePatchEnabledDraft}
+              />
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                Reflect patch in node output rows
+              </Text>
+            </Space>
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(120px,1fr) minmax(120px,1fr)', gap: 8 }}>
+              <div>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Update stage</Text>
+                <Select
+                  size="small"
+                  value={dataQueryProfilePatchStageDraft}
+                  onChange={(value) => setDataQueryProfilePatchStageDraft(String(value || '').trim().toLowerCase() === 'pre' ? 'pre' : 'post')}
+                  options={[
+                    { value: 'post', label: 'Post projection (default)' },
+                    { value: 'pre', label: 'Pre projection' },
+                  ]}
+                  style={{ width: '100%', marginTop: 4 }}
+                  disabled={!dataQueryProfilePatchEnabledDraft}
+                />
+              </div>
+              <div>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Storage</Text>
+                <Select
+                  size="small"
+                  value={dataQueryProfilePatchStorageDraft}
+                  onChange={(value) => {
+                    const raw = String(value || '').trim().toLowerCase()
+                    if (raw === 'rocksdb' || raw === 'redis' || raw === 'oracle') {
+                      setDataQueryProfilePatchStorageDraft(raw)
+                    } else {
+                      setDataQueryProfilePatchStorageDraft('lmdb')
+                    }
+                  }}
+                  options={[
+                    { value: 'lmdb', label: 'LMDB' },
+                    { value: 'rocksdb', label: 'RocksDB' },
+                    { value: 'redis', label: 'Redis' },
+                    { value: 'oracle', label: 'Oracle' },
+                  ]}
+                  style={{ width: '100%', marginTop: 4 }}
+                  disabled={!dataQueryProfilePatchEnabledDraft}
+                />
+              </div>
+            </div>
+            <div>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Target node</Text>
+              <Select
+                size="small"
+                value={dataQueryProfilePatchNodeIdDraft || undefined}
+                onChange={(value) => {
+                  const next = String(value || '').trim()
+                  setDataQueryProfilePatchNodeIdDraft(next)
+                  const selected = dataQueryUpstreamCandidateNodes.find((item) => String(item.id || '').trim() === next)
+                  if (String(selected?.nodeType || '').trim().toLowerCase() === 'lmdb_source') {
+                    setDataQueryProfilePatchStorageDraft('lmdb')
+                  }
+                }}
+                options={dataQueryProfilePatchNodeOptions}
+                placeholder="Select upstream profile/LMDB node"
+                style={{ width: '100%', marginTop: 4 }}
+                disabled={!dataQueryProfilePatchEnabledDraft}
+                allowClear
+              />
+            </div>
+            <div>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Primary key field path</Text>
+              <AutoComplete
+                value={dataQueryProfilePatchPrimaryKeyFieldDraft}
+                options={dataQueryFieldAutoCompleteOptions}
+                onChange={(value) => setDataQueryProfilePatchPrimaryKeyFieldDraft(String(value || ''))}
+                filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+              >
+                <Input
+                  size="small"
+                  placeholder={dataQueryProfilePatchIsDirectLmdbSource ? 'optional (auto: lmdb_key)' : 'example: AGENTCODE'}
+                  style={{ marginTop: 4 }}
+                  disabled={!dataQueryProfilePatchEnabledDraft}
+                />
+              </AutoComplete>
+              {dataQueryProfilePatchIsDirectLmdbSource ? (
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10 }}>
+                  Direct LMDB patch uses `lmdb_key` automatically.
+                </Text>
+              ) : null}
+            </div>
+            <div style={{ display: 'grid', gap: 8 }}>
+              <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Patch operations</Text>
+                <Button
+                  size="small"
+                  onClick={addDataQueryPatchOperation}
+                  disabled={!dataQueryProfilePatchEnabledDraft}
+                >
+                  + Operation
+                </Button>
+              </Space>
+              {dataQueryProfilePatchOpsDraft.length <= 0 ? (
+                <div style={{ border: '1px dashed var(--app-border-strong)', borderRadius: 8, padding: 10 }}>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Add one or more operations (`set`, `set_where`, `unset`, `inc`, `append`, `remove`, `rename`).
+                  </Text>
+                </div>
+              ) : dataQueryProfilePatchOpsDraft.map((op, idx) => {
+                const opId = String(op.id || `patch_op_${idx + 1}`)
+                const opType = normalizeDataQueryProfilePatchOpKind(op.op)
+                const requiresValue = opType === 'set' || opType === 'set_where' || opType === 'inc' || opType === 'append' || opType === 'remove'
+                const requiresMergeMode = opType === 'set'
+                const requiresRename = opType === 'rename'
+                const requiresWhere = opType === 'set_where'
+                return (
+                  <div
+                    key={opId}
+                    style={{
+                      border: '1px solid var(--app-border-strong)',
+                      borderRadius: 8,
+                      padding: 8,
+                      background: 'var(--app-input-bg)',
+                      display: 'grid',
+                      gap: 8,
+                    }}
+                  >
+                    <div style={{ display: 'grid', gridTemplateColumns: '120px 1fr auto', gap: 8 }}>
+                      <Select
+                        size="small"
+                        value={opType}
+                        onChange={(value) => updateDataQueryPatchOperation(opId, { op: normalizeDataQueryProfilePatchOpKind(value) })}
+                        options={dataQueryPatchOperationOptions}
+                        disabled={!dataQueryProfilePatchEnabledDraft}
+                      />
+                      <AutoComplete
+                        value={String(op.targetPath || '')}
+                        options={dataQueryFieldAutoCompleteOptions}
+                        onChange={(value) => updateDataQueryPatchOperation(opId, { targetPath: String(value || '') })}
+                        filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                      >
+                        <Input
+                          size="small"
+                          placeholder="Target path"
+                          disabled={!dataQueryProfilePatchEnabledDraft}
+                        />
+                      </AutoComplete>
+                      <Button
+                        size="small"
+                        danger
+                        onClick={() => removeDataQueryPatchOperation(opId)}
+                        disabled={!dataQueryProfilePatchEnabledDraft}
+                      >
+                        Remove
+                      </Button>
+                    </div>
+
+                    {requiresValue ? (
+                      <div style={{ display: 'grid', gridTemplateColumns: '140px 1fr 1fr', gap: 8 }}>
+                        <Select
+                          size="small"
+                          value={op.valueMode === 'fixed' ? 'fixed' : 'row'}
+                          onChange={(value) => updateDataQueryPatchOperation(opId, { valueMode: String(value || '').trim().toLowerCase() === 'fixed' ? 'fixed' : 'row' })}
+                          options={[
+                            { value: 'row', label: 'From row field/payload' },
+                            { value: 'fixed', label: 'Fixed value' },
+                          ]}
+                          disabled={!dataQueryProfilePatchEnabledDraft}
+                        />
+                        <AutoComplete
+                          value={String(op.sourcePath || '')}
+                          options={dataQueryFieldAutoCompleteOptions}
+                          onChange={(value) => updateDataQueryPatchOperation(opId, { sourcePath: String(value || '') })}
+                          filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                        >
+                          <Input
+                            size="small"
+                            placeholder={op.valueMode === 'fixed' ? 'Source path (optional)' : 'Source path'}
+                            disabled={!dataQueryProfilePatchEnabledDraft}
+                          />
+                        </AutoComplete>
+                        <Input
+                          size="small"
+                          value={String(op.value ?? '')}
+                          onChange={(event) => updateDataQueryPatchOperation(opId, { value: String(event.target.value ?? '') })}
+                          placeholder='Fixed value (for fixed mode)'
+                          disabled={!dataQueryProfilePatchEnabledDraft || op.valueMode !== 'fixed'}
+                        />
+                      </div>
+                    ) : null}
+
+                    {requiresWhere ? (
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 180px 1fr 1fr', gap: 8 }}>
+                        <AutoComplete
+                          value={String(op.whereField || '')}
+                          options={dataQueryFieldAutoCompleteOptions}
+                          onChange={(value) => updateDataQueryPatchOperation(opId, { whereField: String(value || '') })}
+                          filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                        >
+                          <Input
+                            size="small"
+                            placeholder="Match field in array item (example: workflow_id)"
+                            disabled={!dataQueryProfilePatchEnabledDraft}
+                          />
+                        </AutoComplete>
+                        <Select
+                          size="small"
+                          value={op.whereValueMode === 'fixed' ? 'fixed' : 'row'}
+                          onChange={(value) => updateDataQueryPatchOperation(opId, { whereValueMode: String(value || '').trim().toLowerCase() === 'fixed' ? 'fixed' : 'row' })}
+                          options={[
+                            { value: 'fixed', label: 'Match fixed value' },
+                            { value: 'row', label: 'Match row value' },
+                          ]}
+                          disabled={!dataQueryProfilePatchEnabledDraft}
+                        />
+                        <AutoComplete
+                          value={String(op.whereSourcePath || '')}
+                          options={dataQueryFieldAutoCompleteOptions}
+                          onChange={(value) => updateDataQueryPatchOperation(opId, { whereSourcePath: String(value || '') })}
+                          filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                        >
+                          <Input
+                            size="small"
+                            placeholder={op.whereValueMode === 'fixed' ? 'Row field (optional)' : 'Row field path for match value'}
+                            disabled={!dataQueryProfilePatchEnabledDraft}
+                          />
+                        </AutoComplete>
+                        <Input
+                          size="small"
+                          value={String(op.whereValue ?? '')}
+                          onChange={(event) => updateDataQueryPatchOperation(opId, { whereValue: String(event.target.value ?? '') })}
+                          placeholder="Fixed match value"
+                          disabled={!dataQueryProfilePatchEnabledDraft || op.whereValueMode !== 'fixed'}
+                        />
+                      </div>
+                    ) : null}
+
+                    {requiresMergeMode ? (
+                      <div style={{ display: 'grid', gridTemplateColumns: '180px 1fr', gap: 8 }}>
+                        <Select
+                          size="small"
+                          value={op.mergeMode === 'replace' ? 'replace' : 'merge'}
+                          onChange={(value) => updateDataQueryPatchOperation(opId, { mergeMode: String(value || '').trim().toLowerCase() === 'replace' ? 'replace' : 'merge' })}
+                          options={[
+                            { value: 'merge', label: 'Merge into existing doc' },
+                            { value: 'replace', label: 'Replace existing doc' },
+                          ]}
+                          disabled={!dataQueryProfilePatchEnabledDraft}
+                        />
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, alignSelf: 'center' }}>
+                          Merge mode applies when writing object/document payloads.
+                        </Text>
+                      </div>
+                    ) : null}
+
+                    {requiresRename ? (
+                      <Input
+                        size="small"
+                        value={String(op.renameTo || '')}
+                        onChange={(event) => updateDataQueryPatchOperation(opId, { renameTo: String(event.target.value || '') })}
+                        placeholder="New key name"
+                        disabled={!dataQueryProfilePatchEnabledDraft}
+                      />
+                    ) : null}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+
+        <div
+          style={{
+            width: '31%',
+            minWidth: 360,
+            borderLeft: '1px solid var(--app-border-strong)',
+            padding: 12,
+            overflowY: 'auto',
+            display: 'grid',
+            gap: 10,
+          }}
+        >
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Validation Output</Text>
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+            Preview runs against upstream sample rows only.
+          </Text>
+
+          <Space size={8} style={{ width: '100%', justifyContent: 'space-between' }}>
+            <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9', marginInlineEnd: 0 }}>
+              input: {dataQueryPreviewSummary.ran ? dataQueryPreviewSummary.inputRows : dataQueryPreviewRows.length}
+            </Tag>
+            <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e', marginInlineEnd: 0 }}>
+              matched: {dataQueryPreviewSummary.ran ? dataQueryPreviewSummary.matchedRows : 0}
+            </Tag>
+            <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b', marginInlineEnd: 0 }}>
+              output: {dataQueryPreviewSummary.ran ? dataQueryPreviewSummary.outputRows : 0}
+            </Tag>
+          </Space>
+
+          <div style={{ display: 'grid', gap: 8 }}>
+            <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: dataQueryCompactView ? 6 : 8, background: 'var(--app-card-bg)' }}>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Current criteria payload</Text>
+              <Input.TextArea
+                readOnly
+                rows={dataQueryCompactView ? 7 : 11}
+                value={JSON.stringify({
+                  query_mode: dataQueryModeDraft,
+                  criteria_mode: dataQueryMatchModeDraft,
+                  criteria: dataQueryCriteriaDraft,
+                  select_fields: dataQuerySelectFieldsDraft,
+                  select_field_sorts: dataQuerySelectFieldSortsDraft,
+                  select_field_aliases: dataQuerySelectFieldAliasesDraft,
+                  array_output_mode: dataQueryArrayOutputModeDraft,
+                  array_match_mode: dataQueryArrayMatchModeDraft,
+                  include_original_row: dataQueryIncludeOriginalRowDraft,
+                  offset: dataQueryOffsetDraft,
+                  limit: dataQueryLimitDraft,
+                  profile_patch_enabled: dataQueryProfilePatchEnabledDraft,
+                  profile_patch_reflect_output: dataQueryProfilePatchReflectOutputDraft,
+                  profile_patch_stage: dataQueryProfilePatchStageDraft,
+                  profile_patch_storage: dataQueryProfilePatchStorageDraft,
+                  profile_patch_node_id: dataQueryProfilePatchNodeIdDraft,
+                  profile_patch_primary_key_field: dataQueryProfilePatchPrimaryKeyFieldDraft,
+                  profile_patch_ops: serializeDataQueryProfilePatchOperations(dataQueryProfilePatchOpsDraft),
+                  profile_patch_document_path: dataQueryProfilePatchDocumentPathDraft,
+                  profile_patch_value_mode: dataQueryProfilePatchValueModeDraft,
+                  profile_patch_value: dataQueryProfilePatchValueDraft,
+                  profile_patch_target_path: dataQueryProfilePatchTargetPathDraft,
+                  profile_patch_merge_mode: dataQueryProfilePatchMergeModeDraft,
+                }, null, 2)}
+                style={{
+                  marginTop: 6,
+                  background: 'var(--app-input-bg)',
+                  border: '1px solid var(--app-border-strong)',
+                  color: 'var(--app-text)',
+                  fontFamily: 'monospace',
+                  fontSize: 12,
+                }}
+              />
+            </div>
+            <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: dataQueryCompactView ? 6 : 8, background: 'var(--app-card-bg)' }}>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                Input sample ({Math.min(5, dataQueryPreviewRows.length)} rows)
+              </Text>
+              <Input.TextArea
+                readOnly
+                rows={dataQueryCompactView ? 8 : 11}
+                value={JSON.stringify(dataQueryPreviewRows.slice(0, 5), null, 2)}
+                style={{
+                  marginTop: 6,
+                  background: 'var(--app-input-bg)',
+                  border: '1px solid var(--app-border-strong)',
+                  color: 'var(--app-text)',
+                  fontFamily: 'monospace',
+                  fontSize: 12,
+                }}
+              />
+            </div>
+            <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: dataQueryCompactView ? 6 : 8, background: 'var(--app-card-bg)' }}>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                Matched sample (run preview)
+              </Text>
+              <Input.TextArea
+                readOnly
+                rows={dataQueryCompactView ? 6 : 9}
+                value={JSON.stringify(dataQueryPreviewSummary.matchedSamples || [], null, 2)}
+                style={{
+                  marginTop: 6,
+                  background: 'var(--app-input-bg)',
+                  border: '1px solid var(--app-border-strong)',
+                  color: 'var(--app-text)',
+                  fontFamily: 'monospace',
+                  fontSize: 12,
+                }}
+              />
+            </div>
+            <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: dataQueryCompactView ? 6 : 8, background: 'var(--app-card-bg)' }}>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                Output sample (run preview)
+              </Text>
+              <Input.TextArea
+                readOnly
+                rows={dataQueryCompactView ? 6 : 9}
+                value={JSON.stringify(dataQueryPreviewSummary.outputSamples || [], null, 2)}
+                style={{
+                  marginTop: 6,
+                  background: 'var(--app-input-bg)',
+                  border: '1px solid var(--app-border-strong)',
+                  color: 'var(--app-text)',
+                  fontFamily: 'monospace',
+                  fontSize: 12,
+                }}
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+    </Modal>
+    <Modal
+      open={conditionStudioOpen && nodeType === 'condition_node'}
+      onCancel={requestCloseConditionStudio}
+      footer={null}
+      closable={false}
+      centered
+      width="96vw"
+      styles={{
+        content: {
+          padding: 0,
+          borderRadius: 12,
+          overflow: 'hidden',
+          border: '1px solid var(--app-border-strong)',
+          background: 'var(--app-panel-bg)',
+          height: '94vh',
+          display: 'flex',
+          flexDirection: 'column',
+        },
+        body: {
+          padding: 0,
+          flex: 1,
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+        },
+      }}
+    >
+      <div
+        style={{
+          borderBottom: '1px solid var(--app-border-strong)',
+          background: 'var(--app-card-bg)',
+          padding: '12px 16px',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: 12,
+        }}
+      >
+        <div>
+          <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 16 }}>
+            Condition Flow Studio
+          </Text>
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+            Configure drag-drop criteria, validate route output, and direct TRUE/FALSE branches to connected nodes.
+          </Text>
+        </div>
+        <Space>
+          <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6', marginInlineEnd: 0 }}>
+            {conditionRoutingMode === 'case' ? `case routes: ${conditionCaseRoutes.length}` : `rules: ${conditionCriteria.length}`}
+          </Tag>
+          <Tag style={{ background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1', marginInlineEnd: 0 }}>
+            mode: {conditionRoutingMode === 'case' ? 'CASE' : (conditionMatchMode === 'any' ? 'ANY (OR)' : 'ALL (AND)')}
+          </Tag>
+          <Button type="primary" icon={<SaveOutlined />} onClick={saveConditionStudioConfig}>
+            Save
+          </Button>
+          <Button onClick={requestCloseConditionStudio}>Close</Button>
+        </Space>
+      </div>
+
+      <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+        <div
+          style={{
+            width: '24%',
+            minWidth: 300,
+            borderRight: '1px solid var(--app-border-strong)',
+            padding: 12,
+            overflowY: 'auto',
+          }}
+        >
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Input Source</Text>
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+            Auto-detected from connected upstream flow.
+          </Text>
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+            connected upstream nodes: {conditionAllUpstreamSources.length}
+          </Text>
+          <Divider style={{ borderColor: 'var(--app-border)', margin: '12px 0' }} />
+          <Space size={8} style={{ justifyContent: 'space-between', width: '100%' }}>
+            <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Source Node Output Fields</Text>
+            <Button size="small" icon={<ReloadOutlined />} onClick={refreshConditionStudioFields}>
+              Refresh
+            </Button>
+          </Space>
+          {conditionRemoteDetectionLoading ? (
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+              Detecting source fields...
+            </Text>
+          ) : null}
+          {conditionRemoteDetectionError ? (
+            <Text style={{ color: '#ef4444', fontSize: 11 }}>
+              {conditionRemoteDetectionError}
+            </Text>
+          ) : null}
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+            Upstream node-wise field output inferred from node config and preview.
+          </Text>
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+            Fields are auto-discovered from upstream output and JSON/document payloads.
+          </Text>
+
+          <Divider style={{ borderColor: 'var(--app-border)', margin: '12px 0' }} />
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Input Field Picker</Text>
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+            Click or drag field path into active rule. Supports JSON/meta paths.
+          </Text>
+          <Space size={6} style={{ width: '100%', marginTop: 8 }} wrap>
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Routing</Text>
+            <Select
+              size="small"
+              value={conditionRoutingMode}
+              onChange={(value) => setConditionRoutingModeConfig(String(value || '').toLowerCase() === 'case' ? 'case' : 'boolean')}
+              options={[
+                { value: 'boolean', label: 'IF / TRUE-FALSE' },
+                { value: 'case', label: 'CASE / RANGE' },
+              ]}
+              style={{ width: 180 }}
+            />
+          </Space>
+          <Space size={6} style={{ width: '100%', marginTop: 8 }} wrap>
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Assign to</Text>
+            <Select
+              size="small"
+              value={conditionPickerAssignTarget}
+              onChange={(value) => {
+                const v = String(value || '').trim().toLowerCase()
+                if (v === 'right_field' || v === 'right_literal') {
+                  setConditionPickerAssignTarget(v)
+                } else {
+                  setConditionPickerAssignTarget('field')
+                }
+              }}
+              options={[
+                { value: 'field', label: 'Rule Field' },
+                { value: 'right_field', label: 'Compare Field' },
+                { value: 'right_literal', label: 'Compare Value' },
+              ]}
+              style={{ width: 180 }}
+            />
+          </Space>
+          <Space.Compact style={{ width: '100%', marginTop: 8 }}>
+            <Input
+              size="small"
+              value={conditionManualFieldPath}
+              onChange={(event) => setConditionManualFieldPath(String(event.target.value || ''))}
+              placeholder="Manual path (example: profile.customer_info.amount)"
+              onPressEnter={() => {
+                const path = String(conditionManualFieldPath || '').trim()
+                if (!path) return
+                applyConditionFieldFromPicker(path)
+              }}
+            />
+            <Button
+              size="small"
+              onClick={() => {
+                const path = String(conditionManualFieldPath || '').trim()
+                if (!path) return
+                applyConditionFieldFromPicker(path)
+              }}
+            >
+              Add Path
+            </Button>
+          </Space.Compact>
+          <Input
+            size="small"
+            allowClear
+            value={conditionFieldSearchQuery}
+            onChange={(event) => setConditionFieldSearchQuery(String(event.target.value || ''))}
+            placeholder="Search fields (name/path)"
+            style={{ marginTop: 8 }}
+          />
+          <div style={{ marginTop: 8, display: 'grid', gap: 6 }}>
+            {conditionFieldOptions.length === 0 ? (
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                No upstream field sample found. Run source preview first.
+              </Text>
+            ) : (
+              <>
+                <Space size={6} style={{ justifyContent: 'flex-start', width: '100%', alignItems: 'center' }} wrap>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Tree controls
+                  </Text>
+                  <Button
+                    size="small"
+                    icon={<PlusSquareOutlined />}
+                    onClick={() => {
+                      setConditionTreeExpandedKeys(conditionFilteredFieldTreeKeys)
+                      setConditionTreeExpansionInitialized(true)
+                    }}
+                  >
+                    Expand
+                  </Button>
+                  <Button
+                    size="small"
+                    icon={<MinusSquareOutlined />}
+                    onClick={() => {
+                      setConditionTreeExpandedKeys([])
+                      setConditionTreeExpansionInitialized(true)
+                    }}
+                  >
+                    Collapse
+                  </Button>
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      const keys = conditionFilteredFieldTreeKeys.filter((key) => String(key || '').split('.').length <= 1)
+                      setConditionTreeExpandedKeys(uniqueFieldNames(keys))
+                      setConditionTreeExpansionInitialized(true)
+                    }}
+                  >
+                    L1
+                  </Button>
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      const keys = conditionFilteredFieldTreeKeys.filter((key) => String(key || '').split('.').length <= 2)
+                      setConditionTreeExpandedKeys(uniqueFieldNames(keys))
+                      setConditionTreeExpansionInitialized(true)
+                    }}
+                  >
+                    L2
+                  </Button>
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      const keys = conditionFilteredFieldTreeKeys.filter((key) => String(key || '').split('.').length <= 3)
+                      setConditionTreeExpandedKeys(uniqueFieldNames(keys))
+                      setConditionTreeExpansionInitialized(true)
+                    }}
+                  >
+                    L3
+                  </Button>
+                </Space>
+                <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 6 }}>
+                  <Tree
+                    blockNode
+                    showLine={false}
+                    switcherIcon={(nodeProps: any) => {
+                      if (nodeProps?.isLeaf) return <span style={{ width: 16, display: 'inline-block' }} />
+                      return (
+                        <span
+                          style={{
+                            width: 16,
+                            height: 16,
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            border: '1px solid var(--app-border-strong)',
+                            borderRadius: 3,
+                            background: 'var(--app-input-bg)',
+                            color: 'var(--app-text)',
+                            fontSize: 12,
+                            fontWeight: 700,
+                            lineHeight: 1,
+                          }}
+                        >
+                          {nodeProps?.expanded ? '−' : '+'}
+                        </span>
+                      )
+                    }}
+                    treeData={conditionFilteredFieldTreeData}
+                    expandedKeys={conditionTreeExpandedKeys}
+                    onExpand={(keys) => {
+                      const normalized = (keys || []).map((key) => String(key || '')).filter(Boolean)
+                      setConditionTreeExpandedKeys(uniqueFieldNames(normalized))
+                      setConditionTreeExpansionInitialized(true)
+                    }}
+                    expandAction="click"
+                    onSelect={(_, info) => {
+                      const fieldPath = String((info.node as any)?.path || '').trim()
+                      if (!fieldPath) return
+                      applyConditionFieldFromPicker(fieldPath)
+                    }}
+                  />
+                </div>
+                <Space size={8} style={{ justifyContent: 'space-between', width: '100%' }}>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Quick pick
+                  </Text>
+                  <Button size="small" onClick={() => setConditionQuickPickExpanded((prev) => !prev)}>
+                    {conditionQuickPickExpanded ? 'Collapse' : 'Expand'}
+                  </Button>
+                </Space>
+                {conditionQuickPickExpanded ? (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {conditionFilteredFieldOptions.map((fieldName) => (
+                      <Tag
+                        key={`cond_field_pick_${fieldName}`}
+                        style={{
+                          marginInlineEnd: 0,
+                          cursor: 'grab',
+                          userSelect: 'none',
+                          background: '#0ea5e914',
+                          border: '1px solid #0ea5e930',
+                          color: '#0ea5e9',
+                          padding: '4px 8px',
+                          whiteSpace: 'normal',
+                        }}
+                        draggable
+                        onClick={() => applyConditionFieldFromPicker(fieldName)}
+                        onDragStart={(event) => {
+                          event.dataTransfer.setData('text/plain', `field:${fieldName}`)
+                          event.dataTransfer.effectAllowed = 'copy'
+                        }}
+                      >
+                        <span>{fieldName}</span>
+                        {conditionFieldSamples.get(fieldName) ? (
+                          <span style={{ color: 'var(--app-text-subtle)' }}> = {conditionFieldSamples.get(fieldName)}</span>
+                        ) : null}
+                      </Tag>
+                    ))}
+                  </div>
+                ) : null}
+              </>
+            )}
+          </div>
+
+        </div>
+
+        <div style={{ flex: 1, padding: 12, overflowY: 'auto' }}>
+          {conditionRoutingMode === 'case' ? (
+            <div style={{ display: 'grid', gap: 8 }}>
+              <Tabs
+                size="small"
+                activeKey={conditionCaseStudioTab}
+                onChange={(key) => {
+                  const tab = String(key || '').trim().toLowerCase()
+                  setConditionCaseStudioTab(tab === 'preview_distribution' ? 'preview_distribution' : 'route_mapping')
+                }}
+                items={[
+                  { key: 'route_mapping', label: 'Route Mapping' },
+                  { key: 'preview_distribution', label: 'CASE Preview Distribution' },
+                ]}
+              />
+              {conditionCaseStudioTab === 'route_mapping' ? (
+                <div style={{ display: 'grid', gap: 8 }}>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 10, padding: 8, background: 'var(--app-card-bg)' }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Case-wise Routing</Text>
+                    <br />
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                      First matched CASE wins; unmatched rows go to ELSE.
+                    </Text>
+                  </div>
+                  {conditionCaseRoutes.map((route, idx) => {
+                    const routeConditions = Array.isArray(route.conditions) && route.conditions.length > 0
+                      ? route.conditions
+                      : [createConditionCaseCondition(route)]
+                    return (
+                      <div
+                        key={`cond_case_route_center_${route.id}`}
+                        style={{
+                          border: '1px solid var(--app-border-strong)',
+                          borderRadius: 10,
+                          background: 'var(--app-card-bg)',
+                          padding: 8,
+                          display: 'grid',
+                          gap: 6,
+                        }}
+                      >
+                        <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                          <Space size={6}>
+                            <Tag
+                              style={{
+                                marginInlineEnd: 0,
+                                border: '1px solid #0ea5e940',
+                                background: '#0ea5e91a',
+                                color: '#0ea5e9',
+                                fontSize: 11,
+                              }}
+                            >
+                              CASE {idx + 1}
+                            </Tag>
+                            <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>
+                              {String(route.label || `CASE_${idx + 1}`)}
+                            </Text>
+                          </Space>
+                          <Button size="small" danger onClick={() => removeConditionCaseRoute(route.id)}>Delete</Button>
+                        </Space>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(150px,1fr) 120px 120px', gap: 6 }}>
+                          <Input
+                            size="small"
+                            value={String(route.label || '')}
+                            onChange={(event) => updateConditionCaseRoute(route.id, { label: event.target.value })}
+                            placeholder="Case label"
+                          />
+                          <Select
+                            size="small"
+                            value={String(route.matchMode || 'all')}
+                            options={[
+                              { value: 'all', label: 'AND (ALL)' },
+                              { value: 'any', label: 'OR (ANY)' },
+                            ]}
+                            onChange={(value) => updateConditionCaseRoute(route.id, { matchMode: String(value || '').toLowerCase() === 'any' ? 'any' : 'all' })}
+                          />
+                          <Button size="small" onClick={() => addConditionCaseRouteCondition(route.id)}>
+                            + Condition
+                          </Button>
+                        </div>
+
+                        {routeConditions.map((condition, condIdx) => {
+                          const condMode: ConditionCaseRouteMode = String(condition.mode || 'range').trim().toLowerCase() === 'condition' ? 'condition' : 'range'
+                          const condRightMode: ConditionCaseRouteRightMode = String(condition.rightMode || 'literal').trim().toLowerCase() === 'field' ? 'field' : 'literal'
+                          return (
+                            <div
+                              key={`cond_case_route_cond_${route.id}_${condition.id}`}
+                              style={{
+                                border: '1px solid var(--app-border)',
+                                borderRadius: 6,
+                                background: 'var(--app-bg)',
+                                padding: 6,
+                                display: 'grid',
+                                gap: 5,
+                              }}
+                            >
+                              <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                                  Condition {condIdx + 1}
+                                </Text>
+                                <Space size={6}>
+                                  <Select
+                                    size="small"
+                                    value={condMode}
+                                    options={[
+                                      { value: 'range', label: 'Range' },
+                                      { value: 'condition', label: 'Direct' },
+                                    ]}
+                                    onChange={(value) => updateConditionCaseCondition(
+                                      route.id,
+                                      condition.id,
+                                      { mode: String(value || '').trim().toLowerCase() === 'condition' ? 'condition' : 'range' },
+                                    )}
+                                    style={{ width: 94 }}
+                                  />
+                                  <Button size="small" danger onClick={() => removeConditionCaseRouteCondition(route.id, condition.id)}>
+                                    Remove
+                                  </Button>
+                                </Space>
+                              </Space>
+                              <AutoComplete
+                                value={String(condition.field || '')}
+                                options={conditionFieldOptions.map((value) => ({ value, label: value }))}
+                                onChange={(value) => updateConditionCaseCondition(route.id, condition.id, { field: String(value || '') })}
+                                filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                              >
+                                <Input size="small" placeholder="Field path" />
+                              </AutoComplete>
+                              {condMode === 'condition' ? (
+                                <Space size={8} style={{ width: '100%' }} wrap>
+                                  <Select
+                                    size="small"
+                                    value={String(condition.operator || 'equals')}
+                                    options={conditionOperatorOptions}
+                                    style={{ minWidth: 160 }}
+                                    onChange={(value) => updateConditionCaseCondition(route.id, condition.id, { operator: String(value || 'equals') })}
+                                  />
+                                  <Select
+                                    size="small"
+                                    value={condRightMode}
+                                    options={[
+                                      { value: 'literal', label: 'Value' },
+                                      { value: 'field', label: 'Field' },
+                                    ]}
+                                    style={{ minWidth: 110 }}
+                                    onChange={(value) => updateConditionCaseCondition(
+                                      route.id,
+                                      condition.id,
+                                      { rightMode: String(value || '').trim().toLowerCase() === 'field' ? 'field' : 'literal' },
+                                    )}
+                                  />
+                                  {String(condition.operator || '').toLowerCase() === 'is_null' || String(condition.operator || '').toLowerCase() === 'is_not_null' ? null : (
+                                    condRightMode === 'field' ? (
+                                      <AutoComplete
+                                        value={String(condition.rightValue || '')}
+                                        options={conditionFieldOptions.map((value) => ({ value, label: value }))}
+                                        onChange={(value) => updateConditionCaseCondition(route.id, condition.id, { rightValue: String(value || '') })}
+                                        filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                                      >
+                                        <Input size="small" placeholder="Compare field path" style={{ minWidth: 180 }} />
+                                      </AutoComplete>
+                                    ) : (
+                                      <Input
+                                        size="small"
+                                        value={String(condition.rightValue || '')}
+                                        onChange={(event) => updateConditionCaseCondition(route.id, condition.id, { rightValue: event.target.value })}
+                                        placeholder="Compare value"
+                                        style={{ minWidth: 180 }}
+                                      />
+                                    )
+                                  )}
+                                </Space>
+                              ) : (
+                                <>
+                                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                                    <Input
+                                      size="small"
+                                      value={String(condition.minValue || '')}
+                                      onChange={(event) => updateConditionCaseCondition(route.id, condition.id, { minValue: event.target.value })}
+                                      placeholder="Min value"
+                                    />
+                                    <Input
+                                      size="small"
+                                      value={String(condition.maxValue || '')}
+                                      onChange={(event) => updateConditionCaseCondition(route.id, condition.id, { maxValue: event.target.value })}
+                                      placeholder="Max value"
+                                    />
+                                  </div>
+                                  <Space size={8} wrap>
+                                    <Switch
+                                      size="small"
+                                      checked={condition.includeMin !== false}
+                                      onChange={(checked) => updateConditionCaseCondition(route.id, condition.id, { includeMin: checked })}
+                                    />
+                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Incl Min</Text>
+                                    <Switch
+                                      size="small"
+                                      checked={condition.includeMax !== false}
+                                      onChange={(checked) => updateConditionCaseCondition(route.id, condition.id, { includeMax: checked })}
+                                    />
+                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Incl Max</Text>
+                                  </Space>
+                                </>
+                              )}
+                            </div>
+                          )
+                        })}
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Target node(s) for this CASE</Text>
+                          <Select
+                            size="small"
+                            mode="multiple"
+                            allowClear
+                            showSearch
+                            value={parseStringList(route.targetNodeIds || [])}
+                            onChange={(value) => updateConditionCaseRoute(route.id, { targetNodeIds: parseStringList(value as unknown[]) })}
+                            options={conditionTargetNodeOptions}
+                            style={{ width: '100%', marginTop: 4 }}
+                            placeholder={conditionTargetNodeOptions.length === 0 ? 'No target nodes available' : 'Select case target node(s)'}
+                          />
+                        </div>
+                      </div>
+                    )
+                  })}
+                  <Space size={8}>
+                    <Button size="small" onClick={addConditionCaseRoute}>
+                      Add CASE
+                    </Button>
+                    <Button
+                      size="small"
+                      onClick={() => applyConditionRoutingConnections()}
+                      style={{ background: '#0ea5e91a', border: '1px solid #0ea5e940', color: '#0ea5e9' }}
+                    >
+                      Apply Routing
+                    </Button>
+                  </Space>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 10, padding: 8, background: 'var(--app-card-bg)' }}>
+                    <Space size={8} align="center" style={{ justifyContent: 'space-between', width: '100%' }}>
+                      <div>
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>
+                          Show Route Labels On Connectors
+                        </Text>
+                        <br />
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                          Shows CASE / ELSE labels on routing lines.
+                        </Text>
+                      </div>
+                      <Switch
+                        size="small"
+                        checked={conditionShowRouteLabels}
+                        onChange={(checked) => setConditionRouteLabelVisibility(Boolean(checked))}
+                      />
+                    </Space>
+                  </div>
+                  <div style={{ border: '1px solid #ef444440', borderRadius: 10, padding: 8, background: '#ef444414' }}>
+                    <Text style={{ color: '#ef4444', fontWeight: 600, fontSize: 12 }}>ELSE Route (`output_false`)</Text>
+                    <Select
+                      size="small"
+                      mode="multiple"
+                      allowClear
+                      showSearch
+                      value={conditionCaseElseTargetNodeIds}
+                      onChange={(value) => updateConditionElseTargets(parseStringList(value as unknown[]))}
+                      options={conditionTargetNodeOptions}
+                      style={{ width: '100%', marginTop: 6 }}
+                      placeholder={conditionTargetNodeOptions.length === 0 ? 'No target nodes available' : 'Select ELSE target node(s)'}
+                    />
+                  </div>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 10, padding: 8, background: 'var(--app-card-bg)' }}>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                      Visible outputs stay simple: `output` (TRUE) and `output_false` (FALSE). CASE routing is applied internally.
+                    </Text>
+                  </div>
+                </div>
+              ) : (
+                <div style={{ display: 'grid', gap: 8 }}>
+                  <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>CASE Preview Distribution</Text>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 10, background: 'var(--app-card-bg)', padding: 8 }}>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                      Matched rows are routed to the first CASE that matches. Non-matching rows go to ELSE.
+                    </Text>
+                  </div>
+                  {conditionCaseRoutes.length === 0 ? (
+                    <div style={{ border: '1px dashed var(--app-border-strong)', borderRadius: 10, padding: 16 }}>
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                        No CASE route defined.
+                      </Text>
+                    </div>
+                  ) : (
+                    <div style={{ display: 'grid', gap: 8 }}>
+                      {conditionCaseRoutes.map((route, index) => {
+                        const count = Number(conditionCasePreviewCounts.countsByRouteId[String(route.id || '')] || 0)
+                        const routeConditions = Array.isArray(route.conditions) && route.conditions.length > 0
+                          ? route.conditions
+                          : [createConditionCaseCondition(route)]
+                        const firstCond = routeConditions[0]
+                        const isDirectCondition = String(firstCond?.mode || '').trim().toLowerCase() === 'condition'
+                        return (
+                          <div
+                            key={`case_preview_${route.id}`}
+                            style={{
+                              border: '1px solid var(--app-border-strong)',
+                              borderRadius: 10,
+                              background: 'var(--app-card-bg)',
+                              padding: 8,
+                            }}
+                          >
+                            <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>
+                              CASE {index + 1}: {String(route.label || `CASE_${index + 1}`)}
+                            </Text>
+                            <br />
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                              {isDirectCondition
+                                ? `conds=${routeConditions.length} (${String(route.matchMode || 'all').toUpperCase()}) | first: field=${String(firstCond?.field || '(empty)')} op=${String(firstCond?.operator || 'equals')}`
+                                : `conds=${routeConditions.length} (${String(route.matchMode || 'all').toUpperCase()}) | first: field=${String(firstCond?.field || '(empty)')} min=${String(firstCond?.minValue || '-')} max=${String(firstCond?.maxValue || '-')}`}
+                            </Text>
+                            <br />
+                            <Text style={{ color: '#0ea5e9', fontWeight: 600, fontSize: 12 }}>
+                              matched preview rows: {count.toLocaleString()}
+                            </Text>
+                          </div>
+                        )
+                      })}
+                      <div style={{ border: '1px solid #ef444440', borderRadius: 8, padding: 8, background: '#ef444414' }}>
+                        <Text style={{ color: '#ef4444', fontWeight: 600, fontSize: 12 }}>
+                          ELSE preview rows: {Number(conditionCasePreviewCounts.elseCount || 0).toLocaleString()}
+                        </Text>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          ) : (
+            <>
+              <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 8, background: 'var(--app-card-bg)', marginBottom: 8 }}>
+                <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Branch Targets</Text>
+                <div style={{ marginTop: 8, display: 'grid', gap: 8 }}>
+                  <div>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>TRUE target node (`output`)</Text>
+                    <Select
+                      size="small"
+                      showSearch
+                      allowClear
+                      value={conditionTrueTargetNodeId || undefined}
+                      onChange={(value) => setConditionTrueTargetNodeId(String(value || ''))}
+                      options={conditionTargetNodeOptions}
+                      style={{ width: '100%', marginTop: 4 }}
+                      placeholder={conditionTargetNodeOptions.length === 0 ? 'No target nodes available' : 'Select TRUE target'}
+                    />
+                  </div>
+                  <div>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>FALSE target node (`output_false`)</Text>
+                    <Select
+                      size="small"
+                      showSearch
+                      allowClear
+                      value={conditionFalseTargetNodeId || undefined}
+                      onChange={(value) => setConditionFalseTargetNodeId(String(value || ''))}
+                      options={conditionTargetNodeOptions}
+                      style={{ width: '100%', marginTop: 4 }}
+                      placeholder={conditionTargetNodeOptions.length === 0 ? 'No target nodes available' : 'Select FALSE target'}
+                    />
+                  </div>
+                  <Button
+                    size="small"
+                    onClick={() => applyConditionRoutingConnections()}
+                    style={{ background: '#0ea5e91a', border: '1px solid #0ea5e940', color: '#0ea5e9' }}
+                  >
+                    Apply Routing
+                  </Button>
+                </div>
+              </div>
+              <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Rule Builder (Drag to reorder)</Text>
+                <Space size={6}>
+                  <Select
+                    size="small"
+                    value={conditionMatchMode}
+                    onChange={(v) => persistConditionCriteria(conditionCriteria, v === 'any' ? 'any' : 'all')}
+                    options={[
+                      { value: 'all', label: 'All Rules (AND)' },
+                      { value: 'any', label: 'Any Rule (OR)' },
+                    ]}
+                    style={{ width: 170 }}
+                  />
+                  <Switch
+                    size="small"
+                    checked={Boolean(conditionCaseSensitiveDraft)}
+                    onChange={(checked) => setConditionCaseSensitiveDraft(Boolean(checked))}
+                  />
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Case Sensitive</Text>
+                  <Button size="small" onClick={addConditionRule}>Add Rule</Button>
+                </Space>
+              </Space>
+
+              <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>
+                {conditionCriteria.length === 0 ? (
+                  <div style={{ border: '1px dashed var(--app-border-strong)', borderRadius: 10, padding: 16 }}>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                      No rule defined. All rows will go to TRUE branch.
+                    </Text>
+                  </div>
+                ) : (
+                  conditionCriteria.map((rule, index) => (
+                    <div
+                      key={`cond_rule_full_${rule.id}`}
+                      draggable
+                      onClick={() => setConditionActiveRuleId(String(rule.id))}
+                      onDragStart={(event) => {
+                        setConditionDragRuleId(String(rule.id))
+                        event.dataTransfer.setData('text/plain', `rule:${String(rule.id)}`)
+                        event.dataTransfer.effectAllowed = 'move'
+                      }}
+                      onDragEnd={() => setConditionDragRuleId(null)}
+                      onDragOver={(event) => {
+                        event.preventDefault()
+                        event.dataTransfer.dropEffect = 'move'
+                      }}
+                      onDrop={(event) => {
+                        event.preventDefault()
+                        const payload = String(event.dataTransfer.getData('text/plain') || '').trim()
+                        if (!payload) return
+                        if (payload.startsWith('rule:')) {
+                          const fromRuleId = payload.slice(5)
+                          reorderConditionRule(fromRuleId, String(rule.id))
+                          return
+                        }
+                        if (payload.startsWith('field:')) {
+                          const draggedField = payload.slice(6)
+                          updateConditionRule(String(rule.id), { field: draggedField })
+                        }
+                      }}
+                      style={{
+                        border: (conditionDragRuleId === String(rule.id) || conditionActiveRuleId === String(rule.id))
+                          ? '1px solid #0ea5e9'
+                          : '1px solid var(--app-border-strong)',
+                        borderRadius: 10,
+                        background: conditionActiveRuleId === String(rule.id)
+                          ? 'color-mix(in srgb, var(--app-card-bg) 88%, #0ea5e9 12%)'
+                          : 'var(--app-card-bg)',
+                        padding: 10,
+                      }}
+                    >
+                      <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                        <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                          <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>
+                            Rule {index + 1}
+                          </Text>
+                          <Button size="small" danger onClick={() => removeConditionRule(String(rule.id))}>
+                            Remove
+                          </Button>
+                        </Space>
+                        <AutoComplete
+                          value={String(rule.field || '')}
+                          options={conditionFieldOptions.map((value) => ({ value, label: value }))}
+                          onChange={(value) => updateConditionRule(String(rule.id), { field: String(value || '') })}
+                          filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                        >
+                          <Input
+                            size="small"
+                            placeholder="Drop/select source field path"
+                            onDragOver={(event) => event.preventDefault()}
+                            onDrop={(event) => {
+                              event.preventDefault()
+                              const payload = String(event.dataTransfer.getData('text/plain') || '').trim()
+                              if (payload.startsWith('field:')) {
+                                updateConditionRule(String(rule.id), { field: payload.slice(6) })
+                              }
+                            }}
+                          />
+                        </AutoComplete>
+                        <Space size={8} style={{ width: '100%' }} wrap>
+                          <Select
+                            size="small"
+                            value={String(rule.operator || 'equals')}
+                            options={conditionOperatorOptions}
+                            style={{ minWidth: 170 }}
+                            onChange={(value) => updateConditionRule(String(rule.id), { operator: String(value || 'equals') })}
+                          />
+                          <Select
+                            size="small"
+                            value={String(rule.rightMode || 'literal')}
+                            options={[
+                              { value: 'literal', label: 'Compare Value' },
+                              { value: 'field', label: 'Compare Field' },
+                            ]}
+                            style={{ minWidth: 140 }}
+                            onChange={(value) => {
+                              const mode = String(value || '').trim().toLowerCase() === 'field' ? 'field' : 'literal'
+                              updateConditionRule(String(rule.id), { rightMode: mode })
+                            }}
+                          />
+                          {String(rule.operator || '').toLowerCase() === 'is_null' || String(rule.operator || '').toLowerCase() === 'is_not_null' ? null : (
+                            String(rule.rightMode || 'literal').toLowerCase() === 'field' ? (
+                              <AutoComplete
+                                value={String(rule.value || '')}
+                                options={conditionFieldOptions.map((value) => ({ value, label: value }))}
+                                onChange={(value) => updateConditionRule(String(rule.id), { value: String(value || ''), rightMode: 'field' })}
+                                filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                                style={{ minWidth: 180, flex: 1 }}
+                              >
+                                <Input
+                                  size="small"
+                                  placeholder="Select compare field path"
+                                  onDragOver={(event) => event.preventDefault()}
+                                  onDrop={(event) => {
+                                    event.preventDefault()
+                                    const payload = String(event.dataTransfer.getData('text/plain') || '').trim()
+                                    if (payload.startsWith('field:')) {
+                                      updateConditionRule(String(rule.id), { value: payload.slice(6), rightMode: 'field' })
+                                    }
+                                  }}
+                                />
+                              </AutoComplete>
+                            ) : (
+                              <Input
+                                size="small"
+                                value={String(rule.value || '')}
+                                onChange={(event) => updateConditionRule(String(rule.id), { value: String(event.target.value || ''), rightMode: 'literal' })}
+                                placeholder="Compare literal value"
+                                style={{ minWidth: 180, flex: 1 }}
+                                onDragOver={(event) => event.preventDefault()}
+                                onDrop={(event) => {
+                                  event.preventDefault()
+                                  const payload = String(event.dataTransfer.getData('text/plain') || '').trim()
+                                  if (payload.startsWith('field:')) {
+                                    updateConditionRule(String(rule.id), { value: payload.slice(6), rightMode: 'field' })
+                                  }
+                                }}
+                              />
+                            )
+                          )}
+                        </Space>
+                      </Space>
+                    </div>
+                  ))
+                )}
+              </div>
+            </>
+          )}
+        </div>
+
+        <div
+          style={{
+            width: '30%',
+            minWidth: 360,
+            borderLeft: '1px solid var(--app-border-strong)',
+            padding: 12,
+            overflowY: 'auto',
+          }}
+        >
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Validation Output</Text>
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+            Validate condition logic against preview rows, profile store, or direct source scan.
+          </Text>
+
+          <div style={{ marginTop: 8, border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 8, background: 'var(--app-card-bg)', display: 'grid', gap: 8 }}>
+            <div>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Validation Source</Text>
+              <Select
+                size="small"
+                value={conditionValidationSourceMode}
+                onChange={(value) => setConditionValidationSourceModeConfig(String(value || 'upstream_preview'))}
+                options={[
+                  { value: 'upstream_preview', label: 'Upstream Preview Rows' },
+                  { value: 'data_query_output', label: 'Data Query Output' },
+                  { value: 'profile_store', label: 'Profile Store (LMDB/RocksDB/Redis/Oracle)' },
+                  { value: 'source_scan', label: 'Direct Source Scan' },
+                ]}
+                style={{ width: '100%', marginTop: 4 }}
+              />
+            </div>
+            {conditionValidationSourceMode !== 'upstream_preview' ? (
+              <div>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                  {conditionValidationSourceMode === 'profile_store'
+                    ? 'Profile node'
+                    : conditionValidationSourceMode === 'data_query_output'
+                      ? 'Data Query node'
+                      : 'Source node'}
+                </Text>
+                <Select
+                  size="small"
+                  showSearch
+                  allowClear
+                  value={conditionValidationTargetNodeId || undefined}
+                  onChange={(value) => setConditionValidationTargetNodeConfig(value)}
+                  options={conditionValidationTargetOptions}
+                  style={{ width: '100%', marginTop: 4 }}
+                  placeholder={conditionValidationTargetOptions.length === 0 ? 'No eligible node found' : 'Select node'}
+                />
+              </div>
+            ) : null}
+            <div>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Max rows (0 = capped unlimited)</Text>
+              <InputNumber
+                size="small"
+                min={0}
+                max={500000}
+                step={1000}
+                value={conditionValidationMaxRows}
+                onChange={(value) => setConditionValidationMaxRowsConfig(value)}
+                style={{ width: '100%', marginTop: 4 }}
+              />
+            </div>
+            <Button
+              size="small"
+              loading={conditionValidationLoading}
+              onClick={() => {
+                void runConditionValidation()
+              }}
+              style={{ background: '#0ea5e91a', border: '1px solid #0ea5e940', color: '#0ea5e9' }}
+            >
+              Run Full Validation
+            </Button>
+          </div>
+          {conditionValidationError ? (
+            <div style={{ marginTop: 8, border: '1px solid #ef444440', borderRadius: 8, padding: 8, background: '#ef444414' }}>
+              <Text style={{ color: '#ef4444', fontSize: 11 }}>
+                {conditionValidationError}
+              </Text>
+            </div>
+          ) : null}
+          {(conditionValidationDisplaySummary.warnings || []).length > 0 ? (
+            <div style={{ marginTop: 8, border: '1px solid #f59e0b40', borderRadius: 8, padding: 8, background: '#f59e0b14' }}>
+              <Text style={{ color: '#f59e0b', fontSize: 11 }}>
+                {String(conditionValidationDisplaySummary.warnings[0] || '')}
+              </Text>
+            </div>
+          ) : null}
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, marginTop: 8, display: 'block' }}>
+            Source: {conditionValidationDisplaySummary.sourceLabel}
+          </Text>
+
+          <div style={{ marginTop: 8, display: 'grid', gap: 8 }}>
+            <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 8, background: 'var(--app-shell-bg)' }}>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Total input rows</Text>
+              <br />
+              <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 16 }}>
+                {conditionValidationDisplaySummary.totalRows.toLocaleString()}
+              </Text>
+            </div>
+            <div style={{ border: '1px solid #22c55e40', borderRadius: 8, padding: 8, background: '#22c55e14' }}>
+              <Text style={{ color: '#22c55e', fontSize: 11 }}>TRUE output rows</Text>
+              <br />
+              <Text style={{ color: '#22c55e', fontWeight: 700, fontSize: 16 }}>
+                {conditionValidationDisplaySummary.trueCount.toLocaleString()}
+              </Text>
+            </div>
+            <div style={{ border: '1px solid #ef444440', borderRadius: 8, padding: 8, background: '#ef444414' }}>
+              <Text style={{ color: '#ef4444', fontSize: 11 }}>FALSE output rows</Text>
+              <br />
+              <Text style={{ color: '#ef4444', fontWeight: 700, fontSize: 16 }}>
+                {conditionValidationDisplaySummary.falseCount.toLocaleString()}
+              </Text>
+            </div>
+          </div>
+          {conditionRoutingMode === 'case' && Object.keys(conditionValidationDisplaySummary.caseCounts || {}).length > 0 ? (
+            <>
+              <Divider style={{ borderColor: 'var(--app-border)', margin: '12px 0' }} />
+              <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>CASE distribution</Text>
+              <Input.TextArea
+                readOnly
+                rows={5}
+                value={JSON.stringify(conditionValidationDisplaySummary.caseCounts || {}, null, 2)}
+                style={{
+                  marginTop: 6,
+                  background: 'var(--app-input-bg)',
+                  border: '1px solid var(--app-border-strong)',
+                  color: 'var(--app-text)',
+                  fontFamily: 'monospace',
+                  fontSize: 11,
+                }}
+              />
+            </>
+          ) : null}
+
+          <Divider style={{ borderColor: 'var(--app-border)', margin: '12px 0' }} />
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Input Source Sample Records</Text>
+          <Input.TextArea
+            readOnly
+            rows={8}
+            value={JSON.stringify(conditionValidationDisplaySummary.inputSamples, null, 2)}
+            style={{
+              marginTop: 6,
+              background: 'var(--app-input-bg)',
+              border: '1px solid var(--app-border-strong)',
+              color: 'var(--app-text)',
+              fontFamily: 'monospace',
+              fontSize: 11,
+            }}
+          />
+          <Divider style={{ borderColor: 'var(--app-border)', margin: '12px 0' }} />
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>TRUE sample</Text>
+          <Input.TextArea
+            readOnly
+            rows={8}
+            value={JSON.stringify(conditionValidationDisplaySummary.trueSamples, null, 2)}
+            style={{
+              marginTop: 6,
+              background: 'var(--app-input-bg)',
+              border: '1px solid var(--app-border-strong)',
+              color: 'var(--app-text)',
+              fontFamily: 'monospace',
+              fontSize: 11,
+            }}
+          />
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600, marginTop: 10, display: 'block' }}>FALSE sample</Text>
+          <Input.TextArea
+            readOnly
+            rows={8}
+            value={JSON.stringify(conditionValidationDisplaySummary.falseSamples, null, 2)}
+            style={{
+              marginTop: 6,
+              background: 'var(--app-input-bg)',
+              border: '1px solid var(--app-border-strong)',
+              color: 'var(--app-text)',
+              fontFamily: 'monospace',
+              fontSize: 11,
+            }}
+          />
+        </div>
       </div>
     </Modal>
     <Modal
@@ -12149,6 +20368,27 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   size="small"
                   checked={lmdbStudioDraft.expand_profile_documents}
                   onChange={(checked) => setLmdbStudioDraft((prev) => ({ ...prev, expand_profile_documents: checked }))}
+                />
+              </div>
+
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  background: 'var(--app-shell-bg)',
+                  border: '1px solid var(--app-border)',
+                  borderRadius: 6,
+                  padding: '6px 8px',
+                }}
+              >
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                  Include entity meta (`_lmdb_entity_meta`)
+                </Text>
+                <Switch
+                  size="small"
+                  checked={lmdbStudioDraft.include_entity_meta}
+                  onChange={(checked) => setLmdbStudioDraft((prev) => ({ ...prev, include_entity_meta: checked }))}
                 />
               </div>
             </div>

@@ -5,18 +5,23 @@ Supports: Databases, Files, APIs, Cloud Storage, Message Queues
 import asyncio
 import ast
 import base64
+import csv
 import hashlib
 import json
 import math
 import os
 import queue as _queue
+import random
 import re
+import smtplib
+import ssl
 import threading
 import tempfile
 import time as pytime
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
 from datetime import date, datetime, time, timedelta
+from email.message import EmailMessage
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 from loguru import logger
@@ -36,10 +41,18 @@ try:
     import polars as _pl  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
     _pl = None
+try:
+    from fns_v2 import build_fns_v2_registry as _build_fns_v2_registry
+except Exception:  # pragma: no cover - optional dependency fallback
+    _build_fns_v2_registry = None
 
 
 class ExecutionAbortedError(Exception):
     """Raised when an execution is aborted by user request."""
+
+
+class NodeDisabledDuringExecutionError(Exception):
+    """Raised when a node is disabled while execution is in-flight."""
 
 
 def _run_custom_profile_partition_process_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -156,10 +169,14 @@ def _run_custom_profile_partition_process_worker(payload: Dict[str, Any]) -> Dic
             local_processed = int(local_stats.get("custom_fields_incremental_processed_rows") or 0)
         except Exception:
             local_processed = len(partition_rows)
+        if local_processed <= 0 and len(partition_rows) > 0:
+            local_processed = len(partition_rows)
         try:
             local_validated = int(local_stats.get("custom_fields_incremental_validated_rows") or 0)
         except Exception:
             local_validated = 0
+        if local_validated <= 0 and local_processed > 0:
+            local_validated = local_processed
         try:
             local_flush_count = int(local_stats.get("custom_fields_incremental_flush_count") or 0)
         except Exception:
@@ -229,6 +246,8 @@ class ETLEngine:
         self._profile_event_time_cache: Dict[Any, Optional[datetime]] = {}
         self._profile_fractional_seconds_re = re.compile(r"\.(\d{1,9})")
         self._profile_lmdb_env = None
+        self._profile_lmdb_env_path: Optional[str] = None
+        self._runtime_profile_lmdb_dir_override: Optional[str] = None
         self._profile_lmdb_enabled = lmdb is not None
         self._profile_rocksdb = None
         self._profile_rocksdb_path: Optional[str] = None
@@ -245,6 +264,10 @@ class ETLEngine:
         self._oracle_profile_write_queues: Dict[str, Dict[str, Any]] = {}
         self._oracle_destination_write_queue_lock = threading.Lock()
         self._oracle_destination_write_queues: Dict[str, Dict[str, Any]] = {}
+        self._oracle_destination_engine_lock = threading.Lock()
+        self._oracle_destination_engines: Dict[str, Dict[str, Any]] = {}
+        raw_fns_v2 = str(os.getenv("FNS_V2_ENABLED", "0")).strip().lower()
+        self._fns_v2_enabled = raw_fns_v2 in {"1", "true", "yes", "on", "y"}
 
     def _uploads_dir(self) -> str:
         return os.path.join(os.path.dirname(__file__), "uploads")
@@ -543,111 +566,11 @@ class ETLEngine:
             return decoded_text, "text"
         return base64.b64encode(value).decode("ascii"), "base64"
 
-    def _profile_preview_metric_finalize(self, state: Any, kind: str) -> Any:
-        item = state if isinstance(state, dict) else {}
-        metric_kind = str(kind or "count").strip().lower()
-        if metric_kind in {"count", "count_non_null", "row_count"}:
-            return int(item.get("count", 0) or 0)
-        if metric_kind == "sum":
-            total = float(item.get("value", 0.0) or 0.0)
-            return int(total) if float(total).is_integer() else total
-        if metric_kind == "mean":
-            count = int(item.get("count", 0) or 0)
-            if count <= 0:
-                return None
-            return float(item.get("sum", 0.0) or 0.0) / count
-        if metric_kind in {"min", "max", "first", "last"}:
-            if not bool(item.get("has_value", False)):
-                return None
-            return item.get("value")
-        if metric_kind == "distinct_count":
-            seen = item.get("seen")
-            return len(seen) if isinstance(seen, dict) else 0
-        if metric_kind == "distinct":
-            values_out = item.get("values")
-            return values_out if isinstance(values_out, list) else []
-        if metric_kind == "value_counts":
-            items = item.get("items")
-            order = item.get("order")
-            if not isinstance(items, dict) or not isinstance(order, list):
-                return []
-            return [
-                {
-                    "value": items[token].get("value"),
-                    "count": int(items[token].get("count", 0) or 0),
-                }
-                for token in order
-                if token in items and isinstance(items[token], dict)
-            ]
-        return int(item.get("count", 0) or 0)
-
-    def _profile_preview_materialize_group_aggregate(self, profile_meta: Any, store_key: str) -> List[Dict[str, Any]]:
-        if not isinstance(profile_meta, dict):
-            return []
-        aggregate_root = profile_meta.get("group_aggregate")
-        if not isinstance(aggregate_root, dict):
-            return []
-        state = aggregate_root.get(str(store_key or "").strip())
-        if not isinstance(state, dict):
-            return []
-
-        cached_rows = state.get("cached_rows")
-        if isinstance(cached_rows, list):
-            return self._json_safe_value(cached_rows)
-
-        groups = state.get("groups")
-        order = state.get("order")
-        if not isinstance(groups, dict) or not isinstance(order, list):
-            return []
-        metric_specs = state.get("metric_specs")
-        if not isinstance(metric_specs, list):
-            metric_specs = []
-        output_key = str(state.get("output_key_name") or "key").strip() or "key"
-
-        out: List[Dict[str, Any]] = []
-        for token in order:
-            bucket = groups.get(token)
-            if not isinstance(bucket, dict):
-                continue
-            row_out: Dict[str, Any] = {output_key: bucket.get("key")}
-            bucket_metrics = bucket.get("metrics")
-            if not isinstance(bucket_metrics, dict):
-                bucket_metrics = {}
-            for spec in metric_specs:
-                metric_name = str((spec or {}).get("name") or "").strip()
-                metric_kind = str((spec or {}).get("kind") or "count").strip().lower()
-                if not metric_name:
-                    continue
-                row_out[metric_name] = self._profile_preview_metric_finalize(
-                    bucket_metrics.get(metric_name),
-                    metric_kind,
-                )
-            out.append(row_out)
-        return self._json_safe_value(out)
-
-    def _profile_preview_resolve_group_aggregate_refs(self, value: Any, profile_meta: Any) -> Any:
-        if isinstance(value, dict):
-            if (
-                len(value) == 1
-                and "__profile_group_aggregate_ref__" in value
-                and isinstance(value.get("__profile_group_aggregate_ref__"), str)
-            ):
-                store_key = str(value.get("__profile_group_aggregate_ref__") or "").strip()
-                if not store_key:
-                    return []
-                return self._profile_preview_materialize_group_aggregate(profile_meta, store_key)
-            return {
-                k: self._profile_preview_resolve_group_aggregate_refs(v, profile_meta)
-                for k, v in value.items()
-            }
-        if isinstance(value, list):
-            return [self._profile_preview_resolve_group_aggregate_refs(v, profile_meta) for v in value]
-        return value
-
     def _expand_lmdb_profile_documents(
         self,
         lmdb_key: str,
         decoded_value: Any,
+        include_entity_meta: bool,
         include_value_kind: bool,
         value_kind: str,
     ) -> List[Dict[str, Any]]:
@@ -680,17 +603,9 @@ class ETLEngine:
             # val: {"document": {...}, "meta": {...}}
             if "document" in decoded_value:
                 profile_value = decoded_value.get("document")
-                entity_meta = decoded_value.get("meta") if isinstance(decoded_value.get("meta"), dict) else {}
                 row: Dict[str, Any] = {}
                 if isinstance(profile_value, dict):
-                    resolved_profile = self._profile_preview_resolve_group_aggregate_refs(
-                        profile_value,
-                        entity_meta,
-                    )
-                    if isinstance(resolved_profile, dict):
-                        row.update(resolved_profile)
-                    else:
-                        row["profile"] = resolved_profile
+                    row.update(profile_value)
                 else:
                     row["profile"] = profile_value
 
@@ -700,7 +615,8 @@ class ETLEngine:
                     row["lmdb_entity_key"] = entity_key
                 row["_lmdb_profile_source"] = "document"
 
-                if isinstance(entity_meta, dict) and entity_meta:
+                entity_meta = decoded_value.get("meta")
+                if include_entity_meta and isinstance(entity_meta, dict) and entity_meta:
                     row["_lmdb_entity_meta"] = entity_meta
                 node_stats = decoded_value.get("stats")
                 if isinstance(node_stats, dict):
@@ -716,20 +632,8 @@ class ETLEngine:
 
         for entity_key, profile_value in documents.items():
             row: Dict[str, Any] = {}
-            entity_meta = None
-            if isinstance(meta, dict):
-                entity_meta = meta.get(entity_key)
-                if entity_meta is None:
-                    entity_meta = meta.get(str(entity_key))
             if isinstance(profile_value, dict):
-                resolved_profile = self._profile_preview_resolve_group_aggregate_refs(
-                    profile_value,
-                    entity_meta if isinstance(entity_meta, dict) else {},
-                )
-                if isinstance(resolved_profile, dict):
-                    row.update(resolved_profile)
-                else:
-                    row["profile"] = resolved_profile
+                row.update(profile_value)
             else:
                 row["profile"] = profile_value
 
@@ -737,7 +641,10 @@ class ETLEngine:
             row["lmdb_entity_key"] = str(entity_key)
             row["_lmdb_profile_source"] = "documents"
 
-            if isinstance(meta, dict):
+            if include_entity_meta and isinstance(meta, dict):
+                entity_meta = meta.get(entity_key)
+                if entity_meta is None:
+                    entity_meta = meta.get(str(entity_key))
                 if entity_meta is not None:
                     row["_lmdb_entity_meta"] = entity_meta
             if isinstance(node_stats, dict):
@@ -834,6 +741,31 @@ class ETLEngine:
                     pass
 
     def _profile_lmdb_dir(self) -> str:
+        runtime_override = str(getattr(self, "_runtime_profile_lmdb_dir_override", "") or "").strip()
+        if runtime_override:
+            resolved = os.path.expandvars(os.path.expanduser(runtime_override))
+            if not os.path.isabs(resolved):
+                resolved = os.path.abspath(os.path.join(os.path.dirname(__file__), resolved))
+            os.makedirs(resolved, exist_ok=True)
+            return resolved
+
+        configured_dir = str(os.getenv("PROFILE_LMDB_DIR", "") or "").strip()
+        if configured_dir:
+            resolved = os.path.expandvars(os.path.expanduser(configured_dir))
+            if not os.path.isabs(resolved):
+                resolved = os.path.abspath(os.path.join(os.path.dirname(__file__), resolved))
+            os.makedirs(resolved, exist_ok=True)
+            return resolved
+
+        lmdb_root = str(os.getenv("LMDB_ROOT", "") or "").strip()
+        if lmdb_root:
+            resolved_root = os.path.expandvars(os.path.expanduser(lmdb_root))
+            if not os.path.isabs(resolved_root):
+                resolved_root = os.path.abspath(os.path.join(os.path.dirname(__file__), resolved_root))
+            resolved = os.path.join(resolved_root, "profile_store.lmdb")
+            os.makedirs(resolved, exist_ok=True)
+            return resolved
+
         state_dir = os.path.join(os.path.dirname(__file__), "state")
         os.makedirs(state_dir, exist_ok=True)
         return os.path.join(state_dir, "profile_store.lmdb")
@@ -853,9 +785,17 @@ class ETLEngine:
     def _get_profile_lmdb_env(self):
         if not self._profile_lmdb_enabled or lmdb is None:
             return None
-        if self._profile_lmdb_env is not None:
-            return self._profile_lmdb_env
         lmdb_dir = self._profile_lmdb_dir()
+        lmdb_dir_norm = self._normalize_path_for_compare(lmdb_dir)
+        if self._profile_lmdb_env is not None:
+            if self._profile_lmdb_env_path == lmdb_dir_norm:
+                return self._profile_lmdb_env
+            try:
+                self._profile_lmdb_env.close()
+            except Exception:
+                pass
+            self._profile_lmdb_env = None
+            self._profile_lmdb_env_path = None
         os.makedirs(lmdb_dir, exist_ok=True)
         try:
             self._profile_lmdb_env = lmdb.open(
@@ -873,7 +813,9 @@ class ETLEngine:
             logger.warning(f"LMDB profile store init failed; falling back to JSON runtime state: {exc}")
             self._profile_lmdb_enabled = False
             self._profile_lmdb_env = None
+            self._profile_lmdb_env_path = None
             return None
+        self._profile_lmdb_env_path = lmdb_dir_norm
         return self._profile_lmdb_env
 
     def _get_profile_rocksdb_store(self):
@@ -1379,18 +1321,6 @@ END;"""
             return parsed if isinstance(parsed, dict) else {}
         except Exception:
             return {}
-
-    def _oracle_materialize_profile_document(
-        self,
-        document_value: Any,
-        meta_value: Any,
-    ) -> Dict[str, Any]:
-        document_dict = document_value if isinstance(document_value, dict) else {}
-        if not document_dict:
-            return {}
-        meta_dict = meta_value if isinstance(meta_value, dict) else {}
-        resolved = self._profile_preview_resolve_group_aggregate_refs(document_dict, meta_dict)
-        return resolved if isinstance(resolved, dict) else {}
 
     def _oracle_prepare_json_bind_payload(
         self,
@@ -2572,9 +2502,18 @@ END;"""
             queue_depth = int(last_stats.get("queue_depth") or 0)
             pending_jobs = int(last_stats.get("pending_jobs") or 0)
             inflight_jobs = int(last_stats.get("inflight_jobs") or 0)
+            worker_alive = bool(last_stats.get("worker_alive", False))
             if queue_depth <= 0 and pending_jobs <= 0 and inflight_jobs <= 0:
                 out = dict(last_stats)
                 out["timed_out"] = False
+                return out
+            if not worker_alive and (queue_depth > 0 or pending_jobs > 0 or inflight_jobs > 0):
+                out = dict(last_stats)
+                out["timed_out"] = True
+                if not str(out.get("last_error") or "").strip():
+                    out["last_error"] = (
+                        "oracle destination async worker not alive while jobs are still pending"
+                    )
                 return out
             if pytime.monotonic() >= deadline:
                 out = dict(last_stats)
@@ -2622,6 +2561,89 @@ END;"""
             )
             if pending_jobs <= 0:
                 self._oracle_destination_write_queues.pop(queue_key, None)
+
+    def _get_oracle_destination_engine(
+        self,
+        url: str,
+        execution_context: Optional[Dict[str, Any]] = None,
+        reuse_connection: bool = True,
+    ) -> Tuple[Any, Optional[str]]:
+        """
+        Return SQLAlchemy engine for Oracle destination.
+        In reuse mode, cache engine per execution+node+URL to avoid reconnect cost
+        during row fan-out writes.
+        """
+        from sqlalchemy import create_engine
+
+        if not reuse_connection:
+            return create_engine(
+                url,
+                pool_pre_ping=True,
+                pool_recycle=1800,
+            ), None
+
+        exec_ctx = execution_context if isinstance(execution_context, dict) else {}
+        execution_id = str(exec_ctx.get("execution_id") or "").strip()
+        node_id = str(exec_ctx.get("node_id") or "").strip()
+        if not execution_id or not node_id:
+            return create_engine(
+                url,
+                pool_pre_ping=True,
+                pool_recycle=1800,
+            ), None
+
+        key = f"{execution_id}::{node_id}::{url}"
+        with self._oracle_destination_engine_lock:
+            state = self._oracle_destination_engines.get(key)
+            if isinstance(state, dict) and state.get("engine") is not None:
+                state["last_used_at"] = datetime.utcnow().isoformat()
+                return state.get("engine"), key
+
+            engine = create_engine(
+                url,
+                pool_pre_ping=True,
+                pool_recycle=1800,
+            )
+            self._oracle_destination_engines[key] = {
+                "engine": engine,
+                "execution_id": execution_id,
+                "node_id": node_id,
+                "url": url,
+                "created_at": datetime.utcnow().isoformat(),
+                "last_used_at": datetime.utcnow().isoformat(),
+            }
+            return engine, key
+
+    def _teardown_oracle_destination_engines_for_execution(
+        self,
+        execution_id: str,
+    ) -> Dict[str, Any]:
+        execution_id_norm = str(execution_id or "").strip()
+        if not execution_id_norm:
+            return {"execution_id": "", "removed": 0}
+
+        to_dispose: List[Any] = []
+        removed = 0
+        with self._oracle_destination_engine_lock:
+            keys_to_remove = [
+                key
+                for key, state in self._oracle_destination_engines.items()
+                if isinstance(state, dict)
+                and str(state.get("execution_id") or "").strip() == execution_id_norm
+            ]
+            for key in keys_to_remove:
+                state = self._oracle_destination_engines.pop(key, None)
+                if isinstance(state, dict) and state.get("engine") is not None:
+                    to_dispose.append(state.get("engine"))
+                    removed += 1
+
+        for engine in to_dispose:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+
+        return {"execution_id": execution_id_norm, "removed": int(removed)}
 
     def _load_runtime_profile_state_by_node(self, pipeline_id: str) -> Dict[str, Any]:
         runtime_state = self._load_runtime_state()
@@ -3385,8 +3407,7 @@ END;"""
 
                 parsed_doc = self._oracle_json_to_dict(row[2])
                 parsed_meta = self._oracle_json_to_dict(row[3])
-                materialized_doc = self._oracle_materialize_profile_document(parsed_doc, parsed_meta)
-                documents[entity_token] = materialized_doc if isinstance(materialized_doc, dict) else {}
+                documents[entity_token] = parsed_doc if isinstance(parsed_doc, dict) else {}
                 meta[entity_token] = parsed_meta if isinstance(parsed_meta, dict) else {}
             return out
         except Exception as exc:
@@ -3467,8 +3488,7 @@ END;"""
                     continue
                 parsed_doc = self._oracle_json_to_dict(row[1] if isinstance(row, (list, tuple)) and len(row) > 1 else None)
                 parsed_meta = self._oracle_json_to_dict(row[2] if isinstance(row, (list, tuple)) and len(row) > 2 else None)
-                materialized_doc = self._oracle_materialize_profile_document(parsed_doc, parsed_meta)
-                documents[entity_token] = materialized_doc if isinstance(materialized_doc, dict) else {}
+                documents[entity_token] = parsed_doc if isinstance(parsed_doc, dict) else {}
                 meta[entity_token] = parsed_meta if isinstance(parsed_meta, dict) else {}
             return node_state
         except Exception as exc:
@@ -3532,9 +3552,8 @@ END;"""
                 return {}, {}
             doc = self._oracle_json_to_dict(row[0])
             meta = self._oracle_json_to_dict(row[1])
-            materialized = self._oracle_materialize_profile_document(doc, meta)
             return (
-                materialized if isinstance(materialized, dict) else {},
+                doc if isinstance(doc, dict) else {},
                 meta if isinstance(meta, dict) else {},
             )
         except Exception as exc:
@@ -3608,9 +3627,9 @@ END;"""
             # Small sample only.
             cursor.execute(
                 (
-                    "SELECT ENTITY_TOKEN, DOCUMENT_JSON, META_JSON "
+                    "SELECT ENTITY_TOKEN, DOCUMENT_JSON "
                     "FROM ( "
-                    f"  SELECT ENTITY_TOKEN, DOCUMENT_JSON, META_JSON "
+                    f"  SELECT ENTITY_TOKEN, DOCUMENT_JSON "
                     f"  FROM {table_sql} "
                     "  WHERE PIPELINE_ID = :pipeline_id "
                     "    AND NODE_ID = :node_id "
@@ -3634,12 +3653,10 @@ END;"""
                     continue
                 sample_entity_keys.append(token)
                 parsed_doc = self._oracle_json_to_dict(sample_row[1] if len(sample_row) > 1 else None)
-                parsed_meta = self._oracle_json_to_dict(sample_row[2] if len(sample_row) > 2 else None)
-                materialized_doc = self._oracle_materialize_profile_document(parsed_doc, parsed_meta)
                 sample_documents.append(
                     {
                         "entity_key": token,
-                        "profile": self._json_safe_value(materialized_doc if isinstance(materialized_doc, dict) else {}),
+                        "profile": self._json_safe_value(parsed_doc if isinstance(parsed_doc, dict) else {}),
                     }
                 )
 
@@ -3809,8 +3826,7 @@ END;"""
                     parsed_meta = self._oracle_json_to_dict(
                         row[2] if isinstance(row, (list, tuple)) and len(row) > 2 else None
                     )
-                    materialized_doc = self._oracle_materialize_profile_document(parsed_doc, parsed_meta)
-                    docs[token_value] = materialized_doc if isinstance(materialized_doc, dict) else {}
+                    docs[token_value] = parsed_doc if isinstance(parsed_doc, dict) else {}
                     meta[token_value] = parsed_meta if isinstance(parsed_meta, dict) else {}
             return docs, meta, existing_tokens
         except Exception as exc:
@@ -4097,19 +4113,12 @@ END;"""
                         continue
                     doc_value = docs.get(token_text)
                     meta_value = meta.get(token_text)
-                    materialized_doc = self._oracle_materialize_profile_document(doc_value, meta_value)
-                    if isinstance(materialized_doc, dict) and materialized_doc:
-                        docs[token_text] = materialized_doc
                     batch_payloads.append({
                         "pipeline_id": str(pipeline_id),
                         "node_id": str(node_id),
                         "entity_token": token_text,
                         "document_json": json.dumps(
-                            self._json_safe_value(
-                                materialized_doc
-                                if isinstance(materialized_doc, dict) and materialized_doc
-                                else (doc_value if isinstance(doc_value, dict) else {})
-                            ),
+                            self._json_safe_value(doc_value if isinstance(doc_value, dict) else {}),
                             ensure_ascii=False,
                         ),
                         "meta_json": json.dumps(
@@ -4411,21 +4420,11 @@ END;"""
                 for token in changed:
                     doc_value = docs.get(token)
                     meta_value = meta.get(token)
-                    materialized_doc = self._oracle_materialize_profile_document(doc_value, meta_value)
-                    if isinstance(materialized_doc, dict) and materialized_doc:
-                        docs[token] = materialized_doc
                     changed_payloads.append({
                         "pipeline_id": str(pipeline_id),
                         "node_id": str(node_id),
                         "entity_token": token,
-                        "document_json": json.dumps(
-                            self._json_safe_value(
-                                materialized_doc
-                                if isinstance(materialized_doc, dict) and materialized_doc
-                                else (doc_value if isinstance(doc_value, dict) else {})
-                            ),
-                            ensure_ascii=False,
-                        ),
+                        "document_json": json.dumps(self._json_safe_value(doc_value if isinstance(doc_value, dict) else {}), ensure_ascii=False),
                         "meta_json": json.dumps(self._json_safe_value(meta_value if isinstance(meta_value, dict) else {}), ensure_ascii=False),
                         "stats_json": None,
                     })
@@ -4458,21 +4457,11 @@ END;"""
                     if not token_text:
                         continue
                     meta_value = meta.get(token_text)
-                    materialized_doc = self._oracle_materialize_profile_document(doc_value, meta_value)
-                    if isinstance(materialized_doc, dict) and materialized_doc:
-                        docs[token_text] = materialized_doc
                     snapshot_payloads.append({
                         "pipeline_id": str(pipeline_id),
                         "node_id": str(node_id),
                         "entity_token": token_text,
-                        "document_json": json.dumps(
-                            self._json_safe_value(
-                                materialized_doc
-                                if isinstance(materialized_doc, dict) and materialized_doc
-                                else (doc_value if isinstance(doc_value, dict) else {})
-                            ),
-                            ensure_ascii=False,
-                        ),
+                        "document_json": json.dumps(self._json_safe_value(doc_value if isinstance(doc_value, dict) else {}), ensure_ascii=False),
                         "meta_json": json.dumps(self._json_safe_value(meta_value if isinstance(meta_value, dict) else {}), ensure_ascii=False),
                         "stats_json": None,
                     })
@@ -5193,7 +5182,7 @@ END;"""
         return node_type.endswith("_source")
 
     def _is_chunkable_transform(self, node_type: str, config: Dict[str, Any]) -> bool:
-        if node_type in {"filter_transform", "rename_transform", "type_convert_transform", "flatten_transform"}:
+        if node_type in {"filter_transform", "profile_query_transform", "rename_transform", "type_convert_transform", "flatten_transform"}:
             return True
         if node_type == "map_transform":
             # Grouped custom fields require full group scope.
@@ -5409,6 +5398,349 @@ END;"""
             f"ORDER BY src_q.{field} ASC"
         )
 
+    def _normalize_profile_query_mode(self, value: Any) -> str:
+        mode = str(value or "hybrid").strip().lower()
+        if mode not in {"upstream", "pushdown", "hybrid"}:
+            return "hybrid"
+        return mode
+
+    def _normalize_profile_query_rules(self, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        raw_rules = config.get("criteria")
+        if isinstance(raw_rules, str):
+            try:
+                parsed_rules = json.loads(raw_rules)
+                raw_rules = parsed_rules
+            except Exception:
+                raw_rules = []
+        if not isinstance(raw_rules, list):
+            raw_rules = []
+
+        rules: List[Dict[str, Any]] = []
+        for item in raw_rules:
+            if not isinstance(item, dict):
+                continue
+            field_name = str(item.get("field") or item.get("leftField") or "").strip()
+            operator = str(item.get("operator") or "equals").strip().lower() or "equals"
+            right_mode = str(item.get("rightMode") or item.get("right_mode") or "literal").strip().lower() or "literal"
+            right_raw = item.get("value")
+            if right_raw is None:
+                right_raw = item.get("rightValue")
+            if right_raw is None:
+                right_raw = item.get("right_value")
+            if not field_name and operator != "raw":
+                continue
+            rules.append({
+                "field": field_name,
+                "operator": operator,
+                "right_mode": right_mode,
+                "right_value": right_raw,
+            })
+
+        if not rules:
+            legacy_field = str(config.get("field") or "").strip()
+            if legacy_field:
+                rules = [{
+                    "field": legacy_field,
+                    "operator": str(config.get("operator") or "equals").strip().lower() or "equals",
+                    "right_mode": "literal",
+                    "right_value": config.get("value"),
+                }]
+
+        return rules
+
+    def _profile_query_parse_list_literal(self, value: Any) -> List[str]:
+        if isinstance(value, (list, tuple, set)):
+            raw = [str(v).strip() for v in value]
+            return [item for item in raw if item != ""]
+        text = str(value if value is not None else "")
+        return [item.strip() for item in text.split(",") if item.strip() != ""]
+
+    def _profile_query_rule_to_sql(
+        self,
+        rule: Dict[str, Any],
+        dialect: str,
+        param_counter: List[int],
+        oracle_params: Dict[str, Any],
+        std_params: List[Any],
+    ) -> Optional[str]:
+        field_name = str(rule.get("field") or "").strip()
+        op = str(rule.get("operator") or "equals").strip().lower() or "equals"
+        right_mode = str(rule.get("right_mode") or "literal").strip().lower() or "literal"
+        right_value = rule.get("right_value")
+
+        if not field_name or not self._can_pushdown_incremental_field(field_name):
+            return None
+        if right_mode != "literal" and op not in {"is_null", "is_not_null"}:
+            return None
+        if op == "raw":
+            return None
+
+        def _add_param(v: Any) -> str:
+            param_counter[0] += 1
+            if dialect == "oracle":
+                pname = f"pq_{param_counter[0]}"
+                oracle_params[pname] = v
+                return f":{pname}"
+            std_params.append(v)
+            return "%s"
+
+        if op == "is_null":
+            return f"{field_name} IS NULL"
+        if op == "is_not_null":
+            return f"{field_name} IS NOT NULL"
+        if op in {"equals", "not_equals", "greater_than", "greater_or_equal", "less_than", "less_or_equal"}:
+            op_map = {
+                "equals": "=",
+                "not_equals": "!=",
+                "greater_than": ">",
+                "greater_or_equal": ">=",
+                "less_than": "<",
+                "less_or_equal": "<=",
+            }
+            return f"{field_name} {op_map[op]} {_add_param(right_value)}"
+        if op in {"contains", "not_contains", "starts_with", "ends_with"}:
+            base = str(right_value if right_value is not None else "")
+            if op == "contains":
+                like_value = f"%{base}%"
+                return f"{field_name} LIKE {_add_param(like_value)}"
+            if op == "not_contains":
+                like_value = f"%{base}%"
+                return f"{field_name} NOT LIKE {_add_param(like_value)}"
+            if op == "starts_with":
+                like_value = f"{base}%"
+                return f"{field_name} LIKE {_add_param(like_value)}"
+            like_value = f"%{base}"
+            return f"{field_name} LIKE {_add_param(like_value)}"
+        if op in {"in", "not_in"}:
+            tokens = self._profile_query_parse_list_literal(right_value)
+            if not tokens:
+                return None
+            placeholders = [_add_param(item) for item in tokens]
+            in_sql = ", ".join(placeholders)
+            if op == "in":
+                return f"{field_name} IN ({in_sql})"
+            return f"{field_name} NOT IN ({in_sql})"
+        if op == "between":
+            tokens = self._profile_query_parse_list_literal(right_value)
+            if len(tokens) < 2:
+                return None
+            return f"{field_name} BETWEEN {_add_param(tokens[0])} AND {_add_param(tokens[1])}"
+        return None
+
+    def _build_profile_query_pushdown_query(
+        self,
+        base_query: str,
+        rules: List[Dict[str, Any]],
+        criteria_mode: str,
+        dialect: str,
+        select_fields: List[str],
+        offset: int,
+        limit: int,
+    ) -> Optional[Tuple[str, Any, List[Dict[str, Any]], List[Dict[str, Any]], bool]]:
+        query = str(base_query or "").strip().rstrip(";")
+        if not query:
+            return None
+        if dialect not in {"oracle", "postgres", "mysql"}:
+            return None
+
+        pushable_rules: List[Dict[str, Any]] = []
+        engine_only_rules: List[Dict[str, Any]] = []
+        where_clauses: List[str] = []
+        oracle_params: Dict[str, Any] = {}
+        std_params: List[Any] = []
+        param_counter = [0]
+
+        for rule in rules:
+            rule_sql = self._profile_query_rule_to_sql(
+                rule,
+                dialect=dialect,
+                param_counter=param_counter,
+                oracle_params=oracle_params,
+                std_params=std_params,
+            )
+            if rule_sql:
+                pushable_rules.append(rule)
+                where_clauses.append(rule_sql)
+            else:
+                engine_only_rules.append(rule)
+
+        if not where_clauses:
+            return None
+
+        projection = "*"
+        if select_fields:
+            safe_fields = [
+                field
+                for field in select_fields
+                if self._can_pushdown_incremental_field(field)
+            ]
+            if safe_fields:
+                projection = ", ".join(safe_fields)
+
+        joiner = " OR " if str(criteria_mode or "all").strip().lower() == "any" else " AND "
+        where_sql = joiner.join(f"({clause})" for clause in where_clauses)
+
+        sql = f"SELECT {projection} FROM ({query}) pq_src WHERE {where_sql}"
+        apply_window_in_pushdown = len(engine_only_rules) == 0
+        if dialect in {"postgres", "mysql"} and apply_window_in_pushdown:
+            if limit > 0:
+                sql += f" LIMIT {int(limit)}"
+            if offset > 0:
+                sql += f" OFFSET {int(offset)}"
+        elif dialect == "oracle" and apply_window_in_pushdown:
+            if offset > 0 and limit > 0:
+                sql = (
+                    "SELECT * FROM ("
+                    "SELECT pq_pag.*, ROW_NUMBER() OVER (ORDER BY 1) rn FROM ("
+                    f"{sql}"
+                    ") pq_pag) WHERE rn > :pq_off AND rn <= :pq_end"
+                )
+                oracle_params["pq_off"] = int(offset)
+                oracle_params["pq_end"] = int(offset + limit)
+            elif offset > 0:
+                sql = (
+                    "SELECT * FROM ("
+                    "SELECT pq_pag.*, ROW_NUMBER() OVER (ORDER BY 1) rn FROM ("
+                    f"{sql}"
+                    ") pq_pag) WHERE rn > :pq_off"
+                )
+                oracle_params["pq_off"] = int(offset)
+            elif limit > 0:
+                sql = f"{sql} FETCH FIRST {int(limit)} ROWS ONLY"
+
+        params: Any = oracle_params if dialect == "oracle" else std_params
+        return sql, params, pushable_rules, engine_only_rules, apply_window_in_pushdown
+
+    def _profile_query_get_source_context(
+        self,
+        incoming_order: List[str],
+        execution_context: Optional[Dict[str, Any]],
+    ) -> Tuple[str, Dict[str, Any], str]:
+        source_ids = [str(item or "").strip() for item in (incoming_order or []) if str(item or "").strip()]
+        if len(source_ids) != 1:
+            return "", {}, ""
+        source_id = source_ids[0]
+        nodes = {}
+        if isinstance(execution_context, dict):
+            candidate = execution_context.get("pipeline_nodes")
+            if isinstance(candidate, dict):
+                nodes = candidate
+        node_payload = nodes.get(source_id) if isinstance(nodes, dict) else None
+        if not isinstance(node_payload, dict):
+            return "", {}, source_id
+        data = node_payload.get("data")
+        if not isinstance(data, dict):
+            return "", {}, source_id
+        source_type = str(data.get("nodeType") or "").strip().lower()
+        source_cfg = data.get("config")
+        if not isinstance(source_cfg, dict):
+            source_cfg = {}
+        return source_type, dict(source_cfg), source_id
+
+    async def _profile_query_run_pushdown_sql(
+        self,
+        source_type: str,
+        source_cfg: Dict[str, Any],
+        sql: str,
+        params: Any,
+    ) -> List[Dict[str, Any]]:
+        source_type = str(source_type or "").strip().lower()
+        if source_type == "postgres_source":
+            try:
+                import psycopg2
+
+                conn = psycopg2.connect(
+                    host=source_cfg.get("host", "localhost"),
+                    port=int(source_cfg.get("port", 5432)),
+                    database=source_cfg.get("database", ""),
+                    user=source_cfg.get("user", ""),
+                    password=source_cfg.get("password", "")
+                )
+                cursor = conn.cursor()
+                if params:
+                    cursor.execute(sql, params)
+                else:
+                    cursor.execute(sql)
+                cols = [desc[0] for desc in (cursor.description or [])]
+                out_rows = [dict(zip(cols, row)) for row in cursor.fetchall()]
+                cursor.close()
+                conn.close()
+                return out_rows
+            except Exception as exc:
+                raise RuntimeError(f"PostgreSQL pushdown query failed: {exc}")
+
+        if source_type == "mysql_source":
+            try:
+                import pymysql
+
+                conn = pymysql.connect(
+                    host=source_cfg.get("host", "localhost"),
+                    port=int(source_cfg.get("port", 3306)),
+                    database=source_cfg.get("database", ""),
+                    user=source_cfg.get("user", ""),
+                    password=source_cfg.get("password", ""),
+                    cursorclass=pymysql.cursors.DictCursor,
+                )
+                cursor = conn.cursor()
+                if params:
+                    cursor.execute(sql, params)
+                else:
+                    cursor.execute(sql)
+                out_rows = list(cursor.fetchall() or [])
+                cursor.close()
+                conn.close()
+                return out_rows
+            except Exception as exc:
+                raise RuntimeError(f"MySQL pushdown query failed: {exc}")
+
+        if source_type == "oracle_source":
+            try:
+                import oracledb
+
+                dsn = self._build_oracle_dsn(source_cfg)
+                conn = oracledb.connect(
+                    user=str(source_cfg.get("user", "") or "").strip(),
+                    password=str(source_cfg.get("password", "") or ""),
+                    dsn=dsn,
+                )
+                cursor = conn.cursor()
+                if params:
+                    cursor.execute(sql, params)
+                else:
+                    cursor.execute(sql)
+                cols = [desc[0] for desc in (cursor.description or [])]
+                raw_rows = cursor.fetchall()
+
+                def _materialize_oracle_value(value: Any) -> Any:
+                    if value is None:
+                        return None
+                    if hasattr(value, "read") and callable(getattr(value, "read", None)):
+                        try:
+                            return value.read()
+                        except Exception:
+                            return str(value)
+                    if isinstance(value, (bytes, bytearray, memoryview)):
+                        payload = bytes(value)
+                        try:
+                            return payload.decode("utf-8")
+                        except Exception:
+                            return f"base64:{base64.b64encode(payload).decode('ascii')}"
+                    return value
+
+                out_rows: List[Dict[str, Any]] = []
+                for row in raw_rows or []:
+                    out_rows.append({
+                        str(col): _materialize_oracle_value(row[idx] if idx < len(row) else None)
+                        for idx, col in enumerate(cols)
+                    })
+                cursor.close()
+                conn.close()
+                return out_rows
+            except Exception as exc:
+                raise RuntimeError(f"Oracle pushdown query failed: {exc}")
+
+        raise RuntimeError(f"Pushdown is not supported for source type '{source_type}'.")
+
     def _extract_series_from_rows(self, rows: Any, field_path: str) -> List[Any]:
         if not isinstance(rows, list):
             return []
@@ -5438,6 +5770,7 @@ END;"""
 
     def _extract_json_path_value(self, payload: Any, path: Optional[str]) -> Any:
         import re
+        import json as _json
 
         expr = self._normalize_json_path_expr(path)
         if not expr:
@@ -5449,6 +5782,38 @@ END;"""
 
         current: Any = payload
         for tok in tokens:
+            if isinstance(current, str):
+                text_value = current.strip()
+                if text_value:
+                    parsed_obj: Any = None
+                    queue: List[str] = [text_value]
+                    seen: set = set()
+                    while queue:
+                        candidate = str(queue.pop(0) or "").strip()
+                        if not candidate or candidate in seen:
+                            continue
+                        seen.add(candidate)
+                        wrapped = (
+                            (candidate.startswith('"') and candidate.endswith('"'))
+                            or (candidate.startswith("'") and candidate.endswith("'"))
+                        )
+                        if wrapped:
+                            inner = candidate[1:-1].strip()
+                            if inner and inner not in seen:
+                                queue.append(inner)
+                        try:
+                            parsed = _json.loads(candidate)
+                            if isinstance(parsed, (dict, list)):
+                                parsed_obj = parsed
+                                break
+                            if isinstance(parsed, str):
+                                parsed_text = parsed.strip()
+                                if parsed_text and parsed_text not in seen:
+                                    queue.append(parsed_text)
+                        except Exception:
+                            continue
+                    if isinstance(parsed_obj, (dict, list)):
+                        current = parsed_obj
             if tok.startswith("#"):
                 if tok == "#all":
                     if isinstance(current, list):
@@ -5617,6 +5982,7 @@ END;"""
         runtime_config: Optional[Dict[str, Any]] = None,
         pipeline_id: Optional[str] = None,
         should_abort: Optional[Callable[[], bool]] = None,
+        get_runtime_node_enabled: Optional[Callable[[str], Optional[bool]]] = None,
     ) -> dict:
         """Execute a full ETL pipeline by topologically sorting nodes."""
         def _raise_if_aborted() -> None:
@@ -5630,18 +5996,86 @@ END;"""
             except Exception:
                 return
 
+        def _runtime_node_enabled_override(node_id: str) -> Optional[bool]:
+            if not callable(get_runtime_node_enabled):
+                return None
+            try:
+                raw = get_runtime_node_enabled(node_id)
+            except Exception:
+                return None
+            if isinstance(raw, bool):
+                return raw
+            if isinstance(raw, (int, float)):
+                return raw != 0
+            if isinstance(raw, str):
+                text = raw.strip().lower()
+                if text in {"1", "true", "yes", "on", "enabled", "enable"}:
+                    return True
+                if text in {"0", "false", "no", "off", "disabled", "disable"}:
+                    return False
+            return None
+
+        def _is_node_enabled_effective(node_payload: Dict[str, Any]) -> bool:
+            base_enabled = self._is_node_enabled(node_payload if isinstance(node_payload, dict) else {})
+            if not isinstance(node_payload, dict):
+                return base_enabled
+            node_id = str(node_payload.get("id") or "").strip()
+            if not node_id:
+                return base_enabled
+            runtime_override = _runtime_node_enabled_override(node_id)
+            if runtime_override is None:
+                return base_enabled
+            return bool(runtime_override)
+
+        def _raise_if_node_disabled(node_id: str) -> None:
+            if not node_id:
+                return
+            runtime_override = _runtime_node_enabled_override(node_id)
+            if runtime_override is False:
+                raise NodeDisabledDuringExecutionError(f"Node `{node_id}` disabled during execution")
+
         nodes = {n["id"]: n for n in pipeline.get("nodes", [])}
         edges = pipeline.get("edges", [])
         runtime = self._normalize_runtime_config(runtime_config)
         mode = runtime["mode"]
+        logs: List[dict] = []
+        # Reset per-run LMDB profile override unless a profile node config sets it.
+        self._runtime_profile_lmdb_dir_override = None
+
+        async def _emit_system_progress(message: str, status: str = "running") -> None:
+            entry = {
+                "nodeId": "__system__",
+                "nodeLabel": "System",
+                "timestamp": datetime.utcnow().isoformat(),
+                "status": str(status or "running").strip().lower() or "running",
+                "message": str(message or "").strip() or "⟳ Working…",
+                "rows": 0,
+            }
+            logs.append(entry)
+            if on_node_done:
+                try:
+                    on_node_done(logs)
+                except Exception:
+                    pass
+            if websocket_manager:
+                try:
+                    await websocket_manager.broadcast(execution_id, {
+                        "type": "log",
+                        "log_entry": dict(entry),
+                    })
+                except Exception:
+                    pass
+
+        await _emit_system_progress("⟳ Preparing execution context…")
         profile_mode_requested = False
         profile_requires_full_snapshot = False
         profile_node_storage_by_id: Dict[str, str] = {}
         profile_node_processing_mode_by_id: Dict[str, str] = {}
         profile_node_oracle_cfg_by_id: Dict[str, Dict[str, Any]] = {}
         profile_storage_types_requested: set = set()
+        profile_lmdb_override_candidates: set = set()
         for node in pipeline.get("nodes", []):
-            if not self._is_node_enabled(node if isinstance(node, dict) else {}):
+            if not _is_node_enabled_effective(node if isinstance(node, dict) else {}):
                 continue
             node_id = str(node.get("id") or "").strip() if isinstance(node, dict) else ""
             if not node_id:
@@ -5657,6 +6091,12 @@ END;"""
                 )
                 profile_node_storage_by_id[node_id] = storage_type
                 profile_storage_types_requested.add(storage_type)
+                if storage_type == "lmdb":
+                    lmdb_override_path = str(
+                        node_config.get("custom_profile_lmdb_env_path") or ""
+                    ).strip()
+                    if lmdb_override_path:
+                        profile_lmdb_override_candidates.add(lmdb_override_path)
                 processing_mode = str(
                     node_config.get("custom_profile_processing_mode") or "batch"
                 ).strip().lower()
@@ -5684,7 +6124,15 @@ END;"""
         profile_lazy_incremental_mode = bool(
             profile_mode_requested and not profile_requires_full_snapshot
         )
+        if len(profile_lmdb_override_candidates) == 1:
+            self._runtime_profile_lmdb_dir_override = next(iter(profile_lmdb_override_candidates))
+        elif len(profile_lmdb_override_candidates) > 1:
+            logger.warning(
+                "Multiple custom LMDB profile env paths detected in same execution. "
+                "A shared prefetch path cannot be selected safely; per-node runtime override will be used."
+            )
         if profile_mode_requested:
+            await _emit_system_progress("⟳ Validating profile store connectivity…")
             if "lmdb" in profile_storage_types_requested and self._get_profile_lmdb_env() is None:
                 raise RuntimeError(
                     "LMDB profile store is required for custom profile mode. "
@@ -5767,6 +6215,7 @@ END;"""
         if pipeline_id:
             pipeline_state = pipelines_state.setdefault(pipeline_id, {})
             if profile_mode_requested and not profile_lazy_incremental_mode:
+                await _emit_system_progress("⟳ Loading profile state snapshot…")
                 lmdb_loaded = self._load_lmdb_profile_state_by_node(pipeline_id)
                 rocks_loaded = self._load_rocks_profile_state_by_node(pipeline_id)
                 redis_loaded = self._load_redis_profile_state_by_node(pipeline_id)
@@ -5825,7 +6274,6 @@ END;"""
         incremental_checkpoints = pipeline_state.setdefault("incremental_checkpoints", {})
 
         results: Dict[str, Any] = {}
-        logs: List[dict] = []
         total_rows = 0
         pending_oracle_destination_jobs: Dict[str, Dict[str, Any]] = {}
         stream_iterations = runtime["streaming_max_batches"] if mode == "streaming" else 1
@@ -5862,30 +6310,218 @@ END;"""
                     })
 
             pass_results: Dict[str, Any] = {}
+            pass_results_by_handle: Dict[str, Dict[str, Any]] = {}
+            pass_row_fanout: Dict[str, bool] = {}
             pass_rows = 0
+
+            def _sample_rows_for_log(rows: Any, limit: int = 5) -> List[Dict[str, Any]]:
+                if limit <= 0 or not isinstance(rows, list) or not rows:
+                    return []
+                sample: List[Dict[str, Any]] = []
+                for item in rows:
+                    if len(sample) >= limit:
+                        break
+                    safe_value = self._json_safe_value(item)
+                    if isinstance(safe_value, dict):
+                        sample.append(safe_value)
+                    elif safe_value is not None:
+                        sample.append({"value": safe_value})
+                return sample
+
+            def _resolve_node_sample_rows_limit(node_cfg: Any, default_limit: int = 1000) -> int:
+                cfg = node_cfg if isinstance(node_cfg, dict) else {}
+                raw_limit = cfg.get("sample_rows_limit", default_limit)
+                try:
+                    parsed = int(raw_limit)
+                except Exception:
+                    parsed = int(default_limit)
+                # 0 (or negative) means "unlimited" from UI, capped here for safety.
+                if parsed <= 0:
+                    return 100000
+                return max(1, min(parsed, 100000))
+
             for nid in order:
                 _raise_if_aborted()
                 node = nodes[nid]
                 node_type = node.get("data", {}).get("nodeType", "")
                 config = node.get("data", {}).get("config", {})
+                node_sample_rows_limit = _resolve_node_sample_rows_limit(config, default_limit=1000)
                 label = node.get("data", {}).get("label", node_type)
 
                 upstream_data = []
                 incoming_by_source: Dict[str, list] = {}
                 incoming_order: List[str] = []
+                seen_incoming_bindings: set[tuple[str, str]] = set()
+                incoming_handles_by_source: Dict[str, set[str]] = {}
+                for edge in edges:
+                    if edge["target"] != nid or edge["source"] not in pass_results:
+                        continue
+                    src = str(edge["source"] or "").strip()
+                    if not src:
+                        continue
+                    handle = str(edge.get("sourceHandle") or "output").strip() or "output"
+                    handle_set = incoming_handles_by_source.get(src)
+                    if handle_set is None:
+                        handle_set = set()
+                        incoming_handles_by_source[src] = handle_set
+                    handle_set.add(handle)
                 for edge in edges:
                     if edge["target"] == nid and edge["source"] in pass_results:
                         source_id = edge["source"]
-                        source_rows = pass_results[source_id] or []
-                        incoming_by_source[source_id] = source_rows
-                        incoming_order.append(source_id)
+                        source_handle = str(edge.get("sourceHandle") or "output").strip() or "output"
+                        source_node = nodes.get(source_id) if isinstance(nodes, dict) else None
+                        source_node_type = str(
+                            (source_node or {}).get("data", {}).get("nodeType", "")
+                        ).strip()
+                        source_node_cfg = (
+                            (source_node or {}).get("data", {}).get("config", {})
+                            if isinstance((source_node or {}).get("data", {}).get("config", {}), dict)
+                            else {}
+                        )
+                        source_routing_mode = str(
+                            source_node_cfg.get("condition_routing_mode") or ""
+                        ).strip().lower()
+                        if (
+                            source_handle == "output"
+                            and source_node_type == "condition_node"
+                            and source_routing_mode == "case"
+                        ):
+                            # CASE routing should consume explicit case_* / output_false
+                            # handles only. Ignore generic output handle to prevent
+                            # matched-union rows from leaking into every case target.
+                            continue
+                        binding_key = (str(source_id), str(source_handle))
+                        # Defensive dedupe: identical source-handle connector pairs
+                        # should be consumed once per target node. This avoids
+                        # accidental duplicate edge wiring causing repeated rows.
+                        if binding_key in seen_incoming_bindings:
+                            continue
+                        seen_incoming_bindings.add(binding_key)
+                        source_bundle = pass_results_by_handle.get(source_id) or {}
+                        source_rows = source_bundle.get(source_handle)
+                        if source_rows is None and source_handle == "output":
+                            source_rows = pass_results[source_id]
+                        if source_rows is None:
+                            source_rows = []
+                        if not isinstance(source_rows, list):
+                            source_rows = [source_rows] if source_rows is not None else []
+                        existing_rows = incoming_by_source.get(source_id) or []
+                        if not isinstance(existing_rows, list):
+                            existing_rows = [existing_rows]
+                        existing_rows.extend(source_rows)
+                        incoming_by_source[source_id] = existing_rows
+                        if source_id not in incoming_order:
+                            incoming_order.append(source_id)
                         upstream_data.extend(source_rows)
+                if node_type == "condition_node" and isinstance(config, dict):
+                    preferred_source_ids_raw = config.get("condition_source_node_ids")
+                    preferred_source_ids: List[str] = []
+                    if isinstance(preferred_source_ids_raw, list):
+                        seen_ids: set[str] = set()
+                        for item in preferred_source_ids_raw:
+                            text = str(item or "").strip()
+                            if not text or text in seen_ids:
+                                continue
+                            seen_ids.add(text)
+                            preferred_source_ids.append(text)
+                    elif isinstance(preferred_source_ids_raw, str):
+                        seen_ids: set[str] = set()
+                        for item in re.split(r"[,\n]", preferred_source_ids_raw):
+                            text = str(item or "").strip()
+                            if not text or text in seen_ids:
+                                continue
+                            seen_ids.add(text)
+                            preferred_source_ids.append(text)
 
-                if not self._is_node_enabled(node):
+                    if not preferred_source_ids:
+                        legacy_preferred_source_id = str(
+                            config.get("condition_source_node_id")
+                            or config.get("input_source_node_id")
+                            or ""
+                        ).strip()
+                        if legacy_preferred_source_id:
+                            preferred_source_ids = [legacy_preferred_source_id]
+
+                    if preferred_source_ids:
+                        valid_source_ids = [
+                            source_id
+                            for source_id in preferred_source_ids
+                            if source_id in incoming_by_source
+                        ]
+                        if valid_source_ids:
+                            filtered_by_source: Dict[str, list] = {}
+                            filtered_order: List[str] = []
+                            filtered_upstream: List[Any] = []
+                            for source_id in valid_source_ids:
+                                source_rows = incoming_by_source.get(source_id)
+                                if isinstance(source_rows, list):
+                                    rows_list = list(source_rows)
+                                elif source_rows is not None:
+                                    rows_list = [source_rows]
+                                else:
+                                    rows_list = []
+                                filtered_by_source[source_id] = rows_list
+                                filtered_order.append(source_id)
+                                filtered_upstream.extend(rows_list)
+                            upstream_data = filtered_upstream
+                            incoming_by_source = filtered_by_source
+                            incoming_order = filtered_order
+                        else:
+                            # Stale selected source id(s) can happen after rewiring.
+                            # If there is exactly one actual incoming source, use it.
+                            # Otherwise stay strict and avoid mixed-source fallback.
+                            if len(incoming_order) == 1:
+                                fallback_source_id = str(incoming_order[0] or "").strip()
+                                fallback_rows = incoming_by_source.get(fallback_source_id)
+                                if isinstance(fallback_rows, list):
+                                    upstream_data = list(fallback_rows)
+                                    incoming_by_source = {fallback_source_id: list(fallback_rows)}
+                                    incoming_order = [fallback_source_id]
+                                elif fallback_rows is not None:
+                                    upstream_data = [fallback_rows]
+                                    incoming_by_source = {fallback_source_id: [fallback_rows]}
+                                    incoming_order = [fallback_source_id]
+                                else:
+                                    upstream_data = []
+                                    incoming_by_source = {}
+                                    incoming_order = []
+                            else:
+                                upstream_data = []
+                                incoming_by_source = {}
+                                incoming_order = []
+                row_fanout_input = False
+                fanout_source_id = ""
+                if len(incoming_order) == 1:
+                    candidate_source_id = str(incoming_order[0] or "").strip()
+                    if candidate_source_id and bool(pass_row_fanout.get(candidate_source_id, False)):
+                        row_fanout_input = True
+                        fanout_source_id = candidate_source_id
+                effective_row_fanout_input = bool(row_fanout_input)
+                if (
+                    effective_row_fanout_input
+                    and node_type in {"business_mail_writer", "business_whatsapp_sender"}
+                ):
+                    invoke_mode = str(
+                        config.get("invoke_mode")
+                        or config.get("dispatch_mode")
+                        or "once_per_batch"
+                    ).strip().lower()
+                    # Action nodes default to single dispatch per batch for performance.
+                    if invoke_mode in {"once_per_batch", "batch", "single", "once"}:
+                        effective_row_fanout_input = False
+
+                input_sample_rows = _sample_rows_for_log(upstream_data, limit=node_sample_rows_limit)
+
+                if not _is_node_enabled_effective(node):
                     skip_started_at = datetime.utcnow()
                     skip_started_iso = skip_started_at.isoformat()
                     output = upstream_data
                     pass_results[nid] = output
+                    pass_results_by_handle[nid] = {
+                        "output": output if isinstance(output, list) else [],
+                        "output_false": [],
+                    }
+                    pass_row_fanout[nid] = bool(effective_row_fanout_input)
                     row_count = len(output) if isinstance(output, list) else 0
                     total_rows += row_count
                     pass_rows += row_count
@@ -5900,6 +6536,8 @@ END;"""
                         "message": f"⏭ {label} — node disabled, skipped ({row_count:,} rows pass-through)",
                         "rows": row_count,
                         "skipped": True,
+                        "input_sample": input_sample_rows,
+                        "output_sample": _sample_rows_for_log(output, limit=node_sample_rows_limit),
                     }
                     logs.append(skip_entry)
                     if websocket_manager:
@@ -5907,6 +6545,55 @@ END;"""
                             "type": "node_success",
                             "nodeId": nid,
                             "rows": row_count,
+                            "log_entry": dict(skip_entry),
+                        })
+                    if on_node_done:
+                        on_node_done(logs)
+                    continue
+
+                # Guardrail: skip orphan file sources with no configured file path.
+                # This avoids aborting the full pipeline when an unused JSON/CSV/Excel/XML/Parquet
+                # source node was left on canvas without configuration.
+                if (
+                    node_type in {"csv_source", "json_source", "excel_source", "xml_source", "parquet_source"}
+                    and not str(config.get("file_path") or "").strip()
+                    and len(adj.get(nid, []) or []) == 0
+                ):
+                    skip_started_at = datetime.utcnow()
+                    skip_started_iso = skip_started_at.isoformat()
+                    output: List[Dict[str, Any]] = []
+                    pass_results[nid] = output
+                    pass_results_by_handle[nid] = {
+                        "output": [],
+                        "output_false": [],
+                    }
+                    pass_row_fanout[nid] = False
+                    skip_entry = {
+                        "nodeId": nid,
+                        "nodeLabel": label,
+                        "timestamp": skip_started_iso,
+                        "started_at": skip_started_iso,
+                        "finished_at": skip_started_iso,
+                        "duration_ms": 0,
+                        "status": "success",
+                        "message": (
+                            f"⏭ {label} — skipped (orphan file source with empty file path)"
+                        ),
+                        "rows": 0,
+                        "skipped": True,
+                        "warning_count": 1,
+                        "warnings": [
+                            "Node is an unconnected file source and file path is empty; skipped.",
+                        ],
+                        "input_sample": input_sample_rows,
+                        "output_sample": [],
+                    }
+                    logs.append(skip_entry)
+                    if websocket_manager:
+                        await websocket_manager.broadcast(execution_id, {
+                            "type": "node_success",
+                            "nodeId": nid,
+                            "rows": 0,
                             "log_entry": dict(skip_entry),
                         })
                     if on_node_done:
@@ -5922,7 +6609,9 @@ END;"""
                     "started_at": node_started_at_iso,
                     "status": "running",
                     "message": f"⟳ Running {label}…",
-                    "rows": 0
+                    "rows": 0,
+                    "input_sample": input_sample_rows,
+                    "output_sample": [],
                 }
                 logs.append(log_entry)
 
@@ -5977,6 +6666,100 @@ END;"""
                         except Exception:
                             pass
 
+                async def _emit_embedded_node_event(event_payload: Dict[str, Any]) -> None:
+                    if not isinstance(event_payload, dict):
+                        return
+                    event_type = str(event_payload.get("type") or "node_progress").strip().lower()
+                    if event_type not in {"node_start", "node_progress", "node_success", "node_error"}:
+                        event_type = "node_progress"
+                    child_node_id = str(event_payload.get("node_id") or "").strip()
+                    if not child_node_id:
+                        return
+                    child_label = str(
+                        event_payload.get("node_label")
+                        or child_node_id
+                    ).strip() or child_node_id
+                    status = str(event_payload.get("status") or "").strip().lower()
+                    if status not in {"running", "success", "error"}:
+                        status = (
+                            "success" if event_type == "node_success"
+                            else "error" if event_type == "node_error"
+                            else "running"
+                        )
+                    try:
+                        child_rows = int(event_payload.get("rows") or 0)
+                    except Exception:
+                        child_rows = 0
+                    try:
+                        child_processed = int(event_payload.get("processed_rows") or 0)
+                    except Exception:
+                        child_processed = 0
+                    try:
+                        child_validated = int(event_payload.get("validated_rows") or 0)
+                    except Exception:
+                        child_validated = 0
+                    child_message = str(event_payload.get("message") or "").strip()
+                    if not child_message:
+                        if status == "running":
+                            child_message = f"⟳ Running {child_label}…"
+                        elif status == "success":
+                            child_message = f"✓ {child_label} completed"
+                        else:
+                            child_message = f"✗ {child_label} failed"
+
+                    log_payload = {
+                        "nodeId": child_node_id,
+                        "nodeLabel": child_label,
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "status": status,
+                        "message": child_message,
+                        "rows": child_rows,
+                        "processed_rows": child_processed,
+                        "validated_rows": child_validated,
+                        "input_sample": event_payload.get("input_sample", []),
+                        "output_sample": event_payload.get("output_sample", []),
+                    }
+
+                    if event_type in {"node_progress", "node_success", "node_error"}:
+                        replaced = False
+                        for idx in range(len(logs) - 1, -1, -1):
+                            item = logs[idx] if isinstance(logs[idx], dict) else None
+                            if not isinstance(item, dict):
+                                continue
+                            if (
+                                str(item.get("nodeId") or "").strip() == child_node_id
+                                and str(item.get("status") or "").strip().lower() == "running"
+                            ):
+                                logs[idx] = dict(log_payload)
+                                replaced = True
+                                break
+                        if not replaced:
+                            logs.append(dict(log_payload))
+                    else:
+                        logs.append(dict(log_payload))
+
+                    if websocket_manager:
+                        try:
+                            await websocket_manager.broadcast(execution_id, {
+                                "type": event_type,
+                                "nodeId": child_node_id,
+                                "rows": child_rows,
+                                "processed_rows": child_processed,
+                                "validated_rows": child_validated,
+                                "log_entry": dict(log_payload),
+                            })
+                        except Exception:
+                            pass
+                    if on_node_done:
+                        try:
+                            on_node_done(logs)
+                        except Exception:
+                            pass
+
+                def _raise_if_aborted_or_disabled() -> None:
+                    _raise_if_aborted()
+                    _raise_if_node_disabled(str(nid))
+
                 node_execution_context_base: Dict[str, Any] = {
                     "execution_id": execution_id,
                     "pipeline_id": pipeline_id,
@@ -5986,15 +6769,43 @@ END;"""
                     "stream_iteration": stream_idx,
                     "runtime": runtime,
                     "pipeline_state": pipeline_state,
+                    "pipeline_nodes": nodes,
                     "profile_state_by_node": profile_state_by_node,
                     "node_warnings": None,  # injected below
                     "emit_node_progress": _emit_live_node_progress,
+                    "emit_embedded_node_event": _emit_embedded_node_event,
                     "node_progress_every": progress_every,
                     "should_abort": should_abort,
-                    "raise_if_aborted": _raise_if_aborted,
+                    "raise_if_aborted": _raise_if_aborted_or_disabled,
                 }
                 node_profile_oracle_cfg: Optional[Dict[str, Any]] = None
                 node_profile_oracle_session: Optional[Dict[str, Any]] = None
+                cursor_processing_mode_raw = str(config.get("processing_mode") or "batch").strip().lower()
+                cursor_processing_mode = (
+                    "row_by_row" if cursor_processing_mode_raw == "one_by_one" else cursor_processing_mode_raw
+                )
+                downstream_invoke_mode_raw = str(
+                    config.get("downstream_invoke_mode")
+                    or config.get("downstream_mode")
+                    or "batch"
+                ).strip().lower()
+                cursor_explicit_row_fanout = bool(
+                    node_type == "cursor_processor_transform"
+                    and cursor_processing_mode == "row_by_row"
+                    and downstream_invoke_mode_raw in {"row_by_row", "per_row", "one_by_one"}
+                )
+                delay_scope_raw = str(config.get("delay_scope") or "batch").strip().lower()
+                delay_downstream_mode_raw = str(
+                    config.get("downstream_invoke_mode")
+                    or config.get("downstream_mode")
+                    or "row_by_row"
+                ).strip().lower()
+                delay_explicit_row_fanout = bool(
+                    node_type == "delay_transform"
+                    and delay_scope_raw == "message"
+                    and not bool(config.get("passthrough_on_receive", False))
+                    and delay_downstream_mode_raw in {"row_by_row", "per_row", "one_by_one"}
+                )
                 if (
                     node_type == "map_transform"
                     and bool(config.get("custom_profile_enabled", False))
@@ -6029,9 +6840,84 @@ END;"""
                     node_warnings: List[str] = []
                     node_execution_context_base["node_warnings"] = node_warnings
                     node_execution_succeeded = False
+                    _raise_if_node_disabled(str(nid))
 
                     chunk_batches = 1
-                    if (
+                    if effective_row_fanout_input and isinstance(upstream_data, list):
+                        output = []
+                        fanout_total = len(upstream_data)
+                        fanout_csv_resolved_path = None
+                        if node_type == "csv_destination" and isinstance(config, dict):
+                            raw_csv_path = str(config.get("file_path", "") or "").strip()
+                            if not raw_csv_path:
+                                try:
+                                    # Reuse one concrete path for all row fan-out writes in this node run.
+                                    fanout_csv_resolved_path = self._resolve_output_path("", ".csv")
+                                except Exception:
+                                    fanout_csv_resolved_path = None
+                        for row_idx, row_item in enumerate(upstream_data, start=1):
+                            _raise_if_aborted()
+                            _raise_if_node_disabled(str(nid))
+                            single_input_rows = [row_item]
+                            single_incoming = (
+                                {fanout_source_id: single_input_rows}
+                                if fanout_source_id
+                                else {}
+                            )
+                            fanout_config = config
+                            if node_type == "csv_destination" and isinstance(config, dict):
+                                fanout_config = dict(config)
+                                if fanout_csv_resolved_path and not str(config.get("file_path", "") or "").strip():
+                                    fanout_config["file_path"] = fanout_csv_resolved_path
+                                write_mode_raw = str(config.get("write_mode", "")).strip().lower()
+                                if write_mode_raw not in {"replace", "append"}:
+                                    write_mode_raw = "append"
+                                # In row fan-out, "replace" should only apply on first row.
+                                if row_idx > 1 and write_mode_raw == "replace":
+                                    fanout_config["write_mode"] = "append"
+                                else:
+                                    fanout_config["write_mode"] = write_mode_raw
+                                if str(config.get("flush_mode", "")).strip() == "":
+                                    fanout_config["flush_mode"] = "row"
+                            row_output = await self._execute_node(
+                                node_type,
+                                fanout_config,
+                                single_input_rows,
+                                incoming_by_source=single_incoming,
+                                incoming_order=[fanout_source_id] if fanout_source_id else [],
+                                execution_context=dict(node_execution_context_base),
+                            )
+                            if isinstance(row_output, list):
+                                output.extend(row_output)
+                            elif row_output is not None:
+                                output.append(row_output)
+                            if (
+                                websocket_manager
+                                and ((row_idx % progress_every) == 0 or row_idx == fanout_total)
+                            ):
+                                progress_entry = {
+                                    "nodeId": nid,
+                                    "nodeLabel": label,
+                                    "timestamp": datetime.utcnow().isoformat(),
+                                    "status": "running",
+                                    "message": (
+                                        f"⟳ Running {label}… row fan-out "
+                                        f"{row_idx:,}/{fanout_total:,}"
+                                    ),
+                                    "rows": len(output),
+                                }
+                                await websocket_manager.broadcast(execution_id, {
+                                    "type": "node_progress",
+                                    "nodeId": nid,
+                                    "rows": len(output),
+                                    "row_index": row_idx,
+                                    "row_total": fanout_total,
+                                    "log_entry": progress_entry,
+                                })
+                            _raise_if_aborted()
+                    elif (
+                        (not effective_row_fanout_input)
+                        and
                         mode in {"batch", "streaming"}
                         and isinstance(upstream_data, list)
                         and len(upstream_data) > runtime["batch_size"]
@@ -6043,6 +6929,7 @@ END;"""
                         live_processed_rows = 0
                         for chunk_idx, chunk in enumerate(chunks):
                             _raise_if_aborted()
+                            _raise_if_node_disabled(str(nid))
                             chunk_output = await self._execute_node(
                                 node_type,
                                 config,
@@ -6090,6 +6977,7 @@ END;"""
                             _raise_if_aborted()
                     else:
                         _raise_if_aborted()
+                        _raise_if_node_disabled(str(nid))
                         output = await self._execute_node(
                             node_type,
                             config,
@@ -6100,6 +6988,7 @@ END;"""
                         )
                         _raise_if_aborted()
 
+                    _raise_if_node_disabled(str(nid))
                     incremental_note = ""
                     if (
                         mode in {"incremental", "streaming"}
@@ -6168,7 +7057,55 @@ END;"""
                         if scanned > 0 or dropped > 0:
                             incremental_note = f" | incremental field={runtime['incremental_field']} kept={len(filtered):,} dropped={dropped:,}"
 
+                    if node_type == "condition_node":
+                        condition_input_rows = upstream_data if isinstance(upstream_data, list) else []
+                        routing_mode = str(config.get("condition_routing_mode") or "").strip().lower()
+                        if routing_mode == "case":
+                            case_split = self._flow_condition_case_routes_split(condition_input_rows, config)
+                            output_rows = case_split.get("output")
+                            output = output_rows if isinstance(output_rows, list) else []
+                            else_rows = case_split.get("output_false")
+                            else_count = len(else_rows) if isinstance(else_rows, list) else 0
+                            case_matched_count = len(output)
+                            log_entry["routing_summary"] = {
+                                "mode": "case",
+                                "matched_rows": case_matched_count,
+                                "else_rows": else_count,
+                                "input_rows": len(condition_input_rows),
+                            }
+                            log_entry["message"] = (
+                                f"⟳ Running {label}… CASE matched={case_matched_count:,} "
+                                f"ELSE={else_count:,} input={len(condition_input_rows):,}"
+                            )
+                            pass_results_by_handle[nid] = case_split
+                        else:
+                            true_rows, false_rows = self._flow_condition_split(condition_input_rows, config)
+                            output = true_rows
+                            log_entry["routing_summary"] = {
+                                "mode": "boolean",
+                                "true_rows": len(true_rows),
+                                "false_rows": len(false_rows),
+                                "input_rows": len(condition_input_rows),
+                            }
+                            log_entry["message"] = (
+                                f"⟳ Running {label}… TRUE={len(true_rows):,} "
+                                f"FALSE={len(false_rows):,} input={len(condition_input_rows):,}"
+                            )
+                            pass_results_by_handle[nid] = {
+                                "output": true_rows,
+                                "output_false": false_rows,
+                            }
+                    else:
+                        pass_results_by_handle[nid] = {
+                            "output": output if isinstance(output, list) else [],
+                            "output_false": [],
+                        }
                     pass_results[nid] = output
+                    pass_row_fanout[nid] = bool(
+                        cursor_explicit_row_fanout
+                        or delay_explicit_row_fanout
+                        or effective_row_fanout_input
+                    )
                     emitted_row_count = len(output) if isinstance(output, list) else 0
                     row_count = len(output) if isinstance(output, list) else 0
                     if (
@@ -6205,6 +7142,7 @@ END;"""
                         hint = profile_validated_hint or profile_processed_hint
                         if hint > 0:
                             row_count = hint
+                    output_sample_rows = _sample_rows_for_log(output, limit=node_sample_rows_limit)
                     total_rows += row_count
                     pass_rows += row_count
                     oracle_async_payload: Dict[str, Any] = {}
@@ -6231,6 +7169,7 @@ END;"""
                         final_validated_rows = int(row_count)
                     log_entry["status"] = "running" if is_oracle_async_queued else "success"
                     log_entry["rows"] = row_count
+                    log_entry["output_sample"] = output_sample_rows
                     if is_oracle_async_queued:
                         log_entry.pop("finished_at", None)
                         log_entry["duration_ms"] = max(
@@ -6342,14 +7281,22 @@ END;"""
                     elif (
                         node_type == "map_transform"
                         and bool(config.get("custom_profile_enabled", False))
-                        and emitted_row_count == 0
-                        and row_count > 0
                     ):
-                        log_entry["message"] = (
-                            f"✓ {label} — processed {row_count:,} rows "
-                            f"(profile emit output={emitted_row_count:,})"
-                            f"{batch_note}{incremental_note}{warning_note}{info_note}"
-                        )
+                        output_rows_display = max(0, int(emitted_row_count or 0))
+                        processed_rows_display = max(0, int(final_processed_rows or 0))
+                        validated_rows_display = max(0, int(final_validated_rows or 0))
+                        if processed_rows_display > 0 and processed_rows_display != output_rows_display:
+                            log_entry["message"] = (
+                                f"✓ {label} — output={output_rows_display:,} "
+                                f"| processed={processed_rows_display:,} "
+                                f"| validated={validated_rows_display:,}"
+                                f"{batch_note}{incremental_note}{warning_note}{info_note}"
+                            )
+                        else:
+                            log_entry["message"] = (
+                                f"✓ {label} — {row_count:,} rows"
+                                f"{batch_note}{incremental_note}{warning_note}{info_note}"
+                            )
                     else:
                         log_entry["message"] = (
                             f"✓ {label} — {row_count:,} rows"
@@ -6372,6 +7319,35 @@ END;"""
                         on_node_done(logs)
                     node_execution_succeeded = True
 
+                except NodeDisabledDuringExecutionError:
+                    output = upstream_data
+                    pass_results[nid] = output
+                    pass_row_fanout[nid] = bool(effective_row_fanout_input)
+                    row_count = len(output) if isinstance(output, list) else 0
+                    total_rows += row_count
+                    pass_rows += row_count
+                    disabled_finished_at_dt = datetime.utcnow()
+                    log_entry["status"] = "success"
+                    log_entry["rows"] = row_count
+                    log_entry["finished_at"] = disabled_finished_at_dt.isoformat()
+                    log_entry["duration_ms"] = max(
+                        0,
+                        int((disabled_finished_at_dt - node_started_at_dt).total_seconds() * 1000.0),
+                    )
+                    log_entry["message"] = (
+                        f"⏭ {label} — disabled during run, skipped ({row_count:,} rows pass-through)"
+                    )
+                    log_entry["skipped"] = True
+                    if websocket_manager:
+                        await websocket_manager.broadcast(execution_id, {
+                            "type": "node_success",
+                            "nodeId": nid,
+                            "rows": row_count,
+                            "log_entry": dict(log_entry),
+                        })
+                    if on_node_done:
+                        on_node_done(logs)
+                    node_execution_succeeded = True
                 except Exception as e:
                     log_entry["status"] = "error"
                     error_finished_at_dt = datetime.utcnow()
@@ -6680,6 +7656,8 @@ END;"""
         # ─── SOURCES ───────────────────────────────────────────
         elif node_type == "postgres_source":
             return await self._execute_postgres(config, execution_context=execution_context)
+        elif node_type == "workflow_input_source":
+            return self._execute_workflow_input_source(upstream, execution_context=execution_context)
         elif node_type == "mysql_source":
             return await self._execute_mysql(config, execution_context=execution_context)
         elif node_type == "oracle_source":
@@ -6716,6 +7694,14 @@ END;"""
         # ─── TRANSFORMS ────────────────────────────────────────
         elif node_type == "filter_transform":
             return self._transform_filter(upstream, config)
+        elif node_type == "profile_query_transform":
+            return await self._transform_profile_query(
+                upstream,
+                config,
+                incoming_by_source=incoming_by_source or {},
+                incoming_order=incoming_order or [],
+                execution_context=execution_context,
+            )
         elif node_type == "map_transform":
             return self._transform_map(upstream, config, execution_context=execution_context)
         elif node_type == "rename_transform":
@@ -6733,6 +7719,18 @@ END;"""
             return self._transform_sort(upstream, config)
         elif node_type == "deduplicate_transform":
             return self._transform_deduplicate(upstream, config)
+        elif node_type == "delay_transform":
+            return await self._transform_delay(
+                upstream,
+                config,
+                execution_context=execution_context,
+            )
+        elif node_type == "cursor_processor_transform":
+            return self._transform_cursor_processor(
+                upstream,
+                config,
+                execution_context=execution_context,
+            )
         elif node_type == "python_script_transform":
             return await self._transform_python(upstream, config)
         elif node_type == "sql_transform":
@@ -6744,13 +7742,23 @@ END;"""
             return upstream[:n]
         elif node_type == "flatten_transform":
             return self._transform_flatten(upstream, config)
+        elif node_type == "business_workflow":
+            return await self._transform_business_workflow(
+                upstream,
+                config,
+                incoming_by_source=incoming_by_source or {},
+                incoming_order=incoming_order or [],
+                execution_context=execution_context,
+            )
+        elif node_type == "business_analytics":
+            return self._transform_business_analytics(upstream, config)
 
         # ─── DESTINATIONS ──────────────────────────────────────
         elif node_type in (
             "postgres_destination", "mysql_destination", "oracle_destination", "mongodb_destination",
             "s3_destination", "csv_destination", "json_destination",
             "excel_destination", "elasticsearch_destination", "redis_destination",
-            "rest_api_destination"
+            "rest_api_destination", "business_mail_writer", "business_whatsapp_sender"
         ):
             return await self._execute_destination(node_type, config, upstream, execution_context=execution_context)
 
@@ -6763,6 +7771,29 @@ END;"""
         return upstream
 
     # ─── SOURCE IMPLEMENTATIONS ────────────────────────────────────────────────
+
+    def _execute_workflow_input_source(
+        self,
+        upstream: list,
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> list:
+        """
+        Child-canvas source node for Business Logic Workflow.
+        It simply emits the upstream payload rows passed by the parent workflow.
+        """
+        rows = upstream if isinstance(upstream, list) else []
+        output: List[Dict[str, Any]] = []
+        for raw in rows:
+            if isinstance(raw, dict):
+                output.append(dict(raw))
+            else:
+                output.append({"value": raw})
+
+        node_stats = execution_context.get("node_stats") if isinstance(execution_context, dict) else None
+        if isinstance(node_stats, dict):
+            node_stats["workflow_input_rows"] = int(len(output))
+            node_stats["workflow_input_active"] = True
+        return output
 
     async def _execute_postgres(
         self,
@@ -6902,8 +7933,6 @@ END;"""
             if isinstance(node_warnings, list) and msg not in node_warnings:
                 node_warnings.append(msg)
 
-        conn = None
-        cursor = None
         try:
             import oracledb
 
@@ -6920,14 +7949,8 @@ END;"""
                 if oracle_password_raw is not None
                 else ""
             )
-            conn = oracledb.connect(
-                user=oracle_user,
-                password=oracle_password,
-                dsn=dsn,
-            )
-            cursor = conn.cursor()
-            query = str(config.get("query", "") or "").strip()
-            if not query:
+            base_query_input = str(config.get("query", "") or "").strip()
+            if not base_query_input:
                 table = str(config.get("table", "") or "").strip()
                 limit_raw = config.get("limit", 1000)
                 try:
@@ -6935,105 +7958,138 @@ END;"""
                 except Exception:
                     limit = 1000
                 if table:
-                    query = f"SELECT * FROM {table} FETCH FIRST {limit} ROWS ONLY"
+                    base_query_input = f"SELECT * FROM {table} FETCH FIRST {limit} ROWS ONLY"
                 else:
                     raise RuntimeError("Oracle source requires SQL query (or table name).")
-            query = query.rstrip(";").strip()
-            params = None
+            base_query_input = base_query_input.rstrip(";").strip()
             inc_ctx = self._get_incremental_source_context(execution_context)
-            pushdown_attempted = False
-            if inc_ctx and inc_ctx.get("last_checkpoint") is not None:
-                pushdown_query = self._build_incremental_pushdown_query(
-                    query,
-                    str(inc_ctx.get("field_path") or ""),
-                    dialect="oracle",
-                )
-                if pushdown_query:
-                    query = pushdown_query
-                    params = {"checkpoint": inc_ctx.get("last_checkpoint")}
-                    pushdown_attempted = True
-                else:
-                    _warn(
-                        f"Incremental pushdown skipped for Oracle: "
-                        f"unsupported incremental field '{inc_ctx.get('field_path')}'. "
-                        f"Using post-fetch filtering."
+
+            def _is_oracle_reconnectable_error(exc: Exception) -> bool:
+                text = str(exc or "")
+                return any(
+                    code in text
+                    for code in (
+                        "DPY-1001",  # not connected to database
+                        "DPY-4011",  # database/network closed the connection
+                        "DPI-1080",  # connection closed by ORA-xxxx
+                        "not connected to database",
                     )
-            try:
-                if params is None:
-                    cursor.execute(query)
-                else:
-                    cursor.execute(query, params)
-            except Exception:
-                if not pushdown_attempted:
-                    raise
-                base_query = str(config.get("query", "") or "").strip().rstrip(";")
-                _warn("Incremental pushdown failed for Oracle query; fell back to full-source fetch + filter.")
-                if not base_query:
-                    table = str(config.get("table", "") or "").strip()
-                    if not table:
-                        raise
-                    limit_raw = config.get("limit", 1000)
+                )
+
+            def _run_query_once() -> list:
+                conn = None
+                cursor = None
+                try:
+                    conn = oracledb.connect(
+                        user=oracle_user,
+                        password=oracle_password,
+                        dsn=dsn,
+                    )
+                    cursor = conn.cursor()
+                    query = base_query_input
+                    params = None
+                    pushdown_attempted = False
+                    if inc_ctx and inc_ctx.get("last_checkpoint") is not None:
+                        pushdown_query = self._build_incremental_pushdown_query(
+                            query,
+                            str(inc_ctx.get("field_path") or ""),
+                            dialect="oracle",
+                        )
+                        if pushdown_query:
+                            query = pushdown_query
+                            params = {"checkpoint": inc_ctx.get("last_checkpoint")}
+                            pushdown_attempted = True
+                        else:
+                            _warn(
+                                f"Incremental pushdown skipped for Oracle: "
+                                f"unsupported incremental field '{inc_ctx.get('field_path')}'. "
+                                f"Using post-fetch filtering."
+                            )
                     try:
-                        limit = max(1, min(int(limit_raw), 50000))
+                        if params is None:
+                            cursor.execute(query)
+                        else:
+                            cursor.execute(query, params)
                     except Exception:
-                        limit = 1000
-                    base_query = f"SELECT * FROM {table} FETCH FIRST {limit} ROWS ONLY"
-                cursor.execute(base_query)
-            cols = [desc[0] for desc in (cursor.description or [])]
-            flatten_json_values = bool(config.get("flatten_json_values", True))
-            expand_profile_documents = bool(config.get("expand_profile_documents", True))
-            include_profile_meta = bool(config.get("include_profile_meta", False))
+                        if not pushdown_attempted:
+                            raise
+                        _warn("Incremental pushdown failed for Oracle query; fell back to full-source fetch + filter.")
+                        cursor.execute(base_query_input)
+                    cols = [desc[0] for desc in (cursor.description or [])]
+                    raw_rows = cursor.fetchall()
 
-            rows: List[Dict[str, Any]] = []
-            for raw_row in cursor.fetchall():
-                row_dict: Dict[str, Any] = {}
-                for col_name, raw_value in zip(cols, raw_row):
-                    value = raw_value
-                    if value is not None and hasattr(value, "read") and callable(getattr(value, "read", None)):
-                        value = self._oracle_lob_to_text(value)
-                    row_dict[str(col_name)] = value
+                    def _materialize_oracle_value(col_name: str, value: Any) -> Any:
+                        if value is None:
+                            return None
+                        if hasattr(value, "read") and callable(getattr(value, "read", None)):
+                            try:
+                                value = value.read()
+                            except Exception:
+                                try:
+                                    return str(value)
+                                except Exception:
+                                    return None
+                        if isinstance(value, (bytes, bytearray, memoryview)):
+                            payload = bytes(value)
+                            try:
+                                return payload.decode("utf-8")
+                            except Exception:
+                                return f"base64:{base64.b64encode(payload).decode('ascii')}"
+                        # Oracle JSON-bearing columns should become objects so
+                        # downstream field discovery can expand nested keys.
+                        if isinstance(value, str):
+                            text = value.strip()
+                            normalized_col = str(col_name or "").strip().upper()
+                            if normalized_col.endswith("_JSON") or normalized_col in {
+                                "DOCUMENT_JSON",
+                                "META_JSON",
+                                "STATS_JSON",
+                            }:
+                                if (text.startswith("{") and text.endswith("}")) or (
+                                    text.startswith("[") and text.endswith("]")
+                                ):
+                                    try:
+                                        return json.loads(text)
+                                    except Exception:
+                                        return value
+                        return value
 
-                if expand_profile_documents and row_dict:
-                    key_by_upper = {str(k).upper(): str(k) for k in row_dict.keys()}
-                    doc_col = key_by_upper.get("DOCUMENT_JSON")
-                    meta_col = key_by_upper.get("META_JSON")
-                    if doc_col:
-                        parsed_doc = self._oracle_json_to_dict(row_dict.get(doc_col))
-                        parsed_meta = self._oracle_json_to_dict(row_dict.get(meta_col)) if meta_col else {}
-                        materialized_doc = self._oracle_materialize_profile_document(parsed_doc, parsed_meta)
-                        if isinstance(materialized_doc, dict) and materialized_doc:
-                            row_dict[doc_col] = materialized_doc
-                            if flatten_json_values:
-                                for field_name, field_value in materialized_doc.items():
-                                    if field_name not in row_dict:
-                                        row_dict[field_name] = field_value
-                            if include_profile_meta and isinstance(parsed_meta, dict) and parsed_meta:
-                                row_dict["_oracle_profile_meta"] = parsed_meta
-                        elif isinstance(parsed_doc, dict) and parsed_doc:
-                            # Preserve parsed JSON dict even when there are no lazy refs.
-                            row_dict[doc_col] = parsed_doc
-                            if include_profile_meta and isinstance(parsed_meta, dict) and parsed_meta:
-                                row_dict["_oracle_profile_meta"] = parsed_meta
+                    out_rows: List[Dict[str, Any]] = []
+                    for row in raw_rows or []:
+                        out_rows.append(
+                            {
+                                str(col): _materialize_oracle_value(str(col), row[idx] if idx < len(row) else None)
+                                for idx, col in enumerate(cols)
+                            }
+                        )
+                    return out_rows
+                finally:
+                    if cursor is not None:
+                        try:
+                            cursor.close()
+                        except Exception:
+                            pass
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
 
-                rows.append(self._json_safe_value(row_dict))
-            return rows
+            try:
+                return _run_query_once()
+            except Exception as first_exc:
+                if not _is_oracle_reconnectable_error(first_exc):
+                    raise
+                logger.warning(
+                    "Oracle source connection dropped ({}). Retrying once.".format(str(first_exc or "").strip())
+                )
+                return _run_query_once()
         except Exception as e:
             err = str(e)
             hint = "Check host/port/service_name(or SID), username/password, and SQL query."
             if any(code in err for code in ("ORA-12154", "ORA-12514", "ORA-12541", "DPY-6005")):
                 hint = "Oracle listener/service mismatch. Verify host, port, service_name (or sid), and listener status."
             raise RuntimeError(f"Oracle connection/query failed: {err}. {hint}")
-        finally:
-            if cursor is not None:
-                try:
-                    cursor.close()
-                except Exception:
-                    pass
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
 
     async def _execute_mongodb(self, config: dict) -> list:
         try:
@@ -7260,6 +8316,7 @@ END;"""
         value_format = str(config.get("value_format", "auto") or "auto").strip().lower() or "auto"
         flatten_json_values = bool(config.get("flatten_json_values", True))
         expand_profile_documents = bool(config.get("expand_profile_documents", True))
+        include_entity_meta = bool(config.get("include_entity_meta", False))
         include_value_kind = bool(config.get("include_value_kind", True))
         key_contains = str(config.get("key_contains", "") or "").strip()
         value_contains = str(config.get("value_contains", "") or "").strip().lower()
@@ -7495,6 +8552,7 @@ END;"""
                         expanded_rows = self._expand_lmdb_profile_documents(
                             key_text,
                             decoded_value,
+                            include_entity_meta=include_entity_meta,
                             include_value_kind=include_value_kind,
                             value_kind=value_kind,
                         )
@@ -7594,6 +8652,7 @@ END;"""
         value_format = str(config.get("value_format", "auto") or "auto").strip().lower() or "auto"
         flatten_json_values = bool(config.get("flatten_json_values", True))
         expand_profile_documents = bool(config.get("expand_profile_documents", True))
+        include_entity_meta = bool(config.get("include_entity_meta", False))
         include_value_kind = bool(config.get("include_value_kind", True))
         key_contains = str(config.get("key_contains", "") or "").strip()
         value_contains = str(config.get("value_contains", "") or "").strip().lower()
@@ -7804,6 +8863,7 @@ END;"""
                     expanded_rows = self._expand_lmdb_profile_documents(
                         key_text,
                         decoded_value,
+                        include_entity_meta=include_entity_meta,
                         include_value_kind=include_value_kind,
                         value_kind=value_kind,
                     )
@@ -7865,6 +8925,7 @@ END;"""
         value_format = str(config.get("value_format", "auto") or "auto").strip().lower() or "auto"
         flatten_json_values = bool(config.get("flatten_json_values", True))
         expand_profile_documents = bool(config.get("expand_profile_documents", True))
+        include_entity_meta = bool(config.get("include_entity_meta", False))
         include_value_kind = bool(config.get("include_value_kind", True))
         key_contains = str(config.get("key_contains", "") or "").strip()
         value_contains = str(config.get("value_contains", "") or "").strip().lower()
@@ -8277,6 +9338,7 @@ END;"""
                         expanded_rows = self._expand_lmdb_profile_documents(
                             key_text,
                             decoded_value,
+                            include_entity_meta=include_entity_meta,
                             include_value_kind=include_value_kind,
                             value_kind=value_kind,
                         )
@@ -8386,6 +9448,7 @@ END;"""
         value_format = str(config.get("value_format", "auto") or "auto").strip().lower() or "auto"
         flatten_json_values = bool(config.get("flatten_json_values", True))
         expand_profile_documents = bool(config.get("expand_profile_documents", True))
+        include_entity_meta = bool(config.get("include_entity_meta", False))
         include_value_kind = bool(config.get("include_value_kind", True))
         key_contains = str(config.get("key_contains", "") or "").strip()
         value_contains = str(config.get("value_contains", "") or "").strip().lower()
@@ -8769,6 +9832,7 @@ END;"""
                     expanded_rows = self._expand_lmdb_profile_documents(
                         key_text,
                         decoded_value,
+                        include_entity_meta=include_entity_meta,
                         include_value_kind=include_value_kind,
                         value_kind=value_kind,
                     )
@@ -8965,32 +10029,1938 @@ END;"""
     # ─── TRANSFORM IMPLEMENTATIONS ─────────────────────────────────────────────
 
     def _transform_filter(self, data: list, config: dict) -> list:
-        field = config.get("field", "")
-        operator = config.get("operator", "equals")
-        value = config.get("value", "")
-        if not field:
-            return data
-        result = []
-        for row in data:
-            v = row.get(field)
-            try:
-                if operator == "equals" and str(v) == str(value):
-                    result.append(row)
-                elif operator == "not_equals" and str(v) != str(value):
-                    result.append(row)
-                elif operator == "contains" and str(value).lower() in str(v).lower():
-                    result.append(row)
-                elif operator == "greater_than" and float(v) > float(value):
-                    result.append(row)
-                elif operator == "less_than" and float(v) < float(value):
-                    result.append(row)
-                elif operator == "is_null" and v is None:
-                    result.append(row)
-                elif operator == "is_not_null" and v is not None:
-                    result.append(row)
-            except (TypeError, ValueError):
+        if isinstance(config, dict) and str(config.get("condition_routing_mode") or "").strip().lower() == "case":
+            split = self._flow_condition_case_routes_split(data, config)
+            return split.get("output") if isinstance(split.get("output"), list) else []
+        passed_rows, _ = self._flow_condition_split(data, config)
+        return passed_rows
+
+    async def _transform_profile_query(
+        self,
+        data: list,
+        config: dict,
+        incoming_by_source: Optional[Dict[str, list]] = None,
+        incoming_order: Optional[List[str]] = None,
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> list:
+        rows = data if isinstance(data, list) else []
+        incoming_by_source = incoming_by_source or {}
+        incoming_order = incoming_order or []
+
+        should_abort_cb = (
+            execution_context.get("should_abort")
+            if isinstance(execution_context, dict) and callable(execution_context.get("should_abort"))
+            else None
+        )
+        raise_if_aborted_cb = (
+            execution_context.get("raise_if_aborted")
+            if isinstance(execution_context, dict) and callable(execution_context.get("raise_if_aborted"))
+            else None
+        )
+
+        def _raise_if_aborted() -> None:
+            if callable(raise_if_aborted_cb):
+                raise_if_aborted_cb()
+                return
+            if callable(should_abort_cb):
+                try:
+                    if bool(should_abort_cb()):
+                        raise ExecutionAbortedError("Execution aborted by user.")
+                except ExecutionAbortedError:
+                    raise
+                except Exception:
                     pass
+
+        node_warnings = execution_context.get("node_warnings") if isinstance(execution_context, dict) else None
+
+        def _warn(msg: str) -> None:
+            logger.warning(msg)
+            if isinstance(node_warnings, list) and msg not in node_warnings:
+                node_warnings.append(msg)
+
+        safe_config = dict(config) if isinstance(config, dict) else {}
+        query_mode = self._normalize_profile_query_mode(safe_config.get("query_mode", "hybrid"))
+        rules = self._normalize_profile_query_rules(safe_config)
+        if rules:
+            safe_config["criteria"] = rules
+
+        criteria_mode = str(safe_config.get("criteria_mode") or "all").strip().lower()
+        if criteria_mode not in {"all", "any"}:
+            criteria_mode = "all"
+        safe_config["criteria_mode"] = criteria_mode
+
+        try:
+            offset = max(0, int(safe_config.get("offset", 0) or 0))
+        except Exception:
+            offset = 0
+        try:
+            limit = int(safe_config.get("limit", 0) or 0)
+        except Exception:
+            limit = 0
+        if limit < 0:
+            limit = 0
+
+        selected_fields = self._parse_selected_fields(safe_config.get("select_fields", ""))
+        select_fields_sort = str(safe_config.get("select_fields_sort") or "none").strip().lower()
+        if select_fields_sort == "asc":
+            selected_fields = sorted(selected_fields, key=lambda x: str(x or "").lower())
+        elif select_fields_sort == "desc":
+            selected_fields = sorted(selected_fields, key=lambda x: str(x or "").lower(), reverse=True)
+        select_field_sorts = self._parse_select_field_sorts(
+            safe_config.get("select_field_sorts"),
+            selected_fields,
+        )
+        select_field_aliases = self._parse_select_field_aliases(safe_config.get("select_field_aliases"))
+        array_output_mode = self._normalize_profile_query_array_output_mode(
+            safe_config.get("array_output_mode", "list")
+        )
+        array_match_mode = self._normalize_profile_query_array_match_mode(
+            safe_config.get("array_match_mode", "all_elements")
+        )
+        case_sensitive = bool(safe_config.get("case_sensitive", False))
+        include_original_row = self._parse_bool_like(safe_config.get("include_original_row", True), True)
+        array_rules_by_root = self._group_profile_query_rules_by_array_root(rules)
+        profile_patch_enabled = self._parse_bool_like(safe_config.get("profile_patch_enabled"), False)
+        profile_patch_stage = str(safe_config.get("profile_patch_stage") or "post").strip().lower()
+        profile_patch_reflect_output = self._parse_bool_like(
+            safe_config.get("profile_patch_reflect_output"),
+            True,
+        )
+        profile_patch_ops_for_output = (
+            self._normalize_profile_query_patch_operations(safe_config)
+            if profile_patch_enabled and profile_patch_reflect_output
+            else []
+        )
+
+        # Default path: use upstream rows.
+        candidate_rows = rows
+        pushdown_used = False
+        pushdown_window_applied = False
+        if query_mode in {"pushdown", "hybrid"}:
+            source_type, source_cfg, source_id = self._profile_query_get_source_context(
+                incoming_order,
+                execution_context,
+            )
+            dialect = ""
+            if source_type == "oracle_source":
+                dialect = "oracle"
+            elif source_type == "postgres_source":
+                dialect = "postgres"
+            elif source_type == "mysql_source":
+                dialect = "mysql"
+            if source_type and dialect:
+                base_query = str(source_cfg.get("query", "") or "").strip().rstrip(";")
+                if not base_query and source_type == "oracle_source":
+                    table = str(source_cfg.get("table", "") or "").strip()
+                    if table:
+                        base_query = f"SELECT * FROM {table}"
+                if base_query:
+                    plan = self._build_profile_query_pushdown_query(
+                        base_query=base_query,
+                        rules=rules,
+                        criteria_mode=criteria_mode,
+                        dialect=dialect,
+                        select_fields=selected_fields,
+                        offset=offset,
+                        limit=limit,
+                    )
+                    if plan:
+                        sql, params, pushable_rules, engine_only_rules, pushdown_window_applied = plan
+                        try:
+                            pushed_rows = await self._profile_query_run_pushdown_sql(
+                                source_type=source_type,
+                                source_cfg=source_cfg,
+                                sql=sql,
+                                params=params,
+                            )
+                            candidate_rows = pushed_rows
+                            pushdown_used = True
+                            if query_mode == "pushdown" and engine_only_rules:
+                                _warn(
+                                    "Profile Query pushdown mode: some rules were not pushdown-safe; "
+                                    "final in-engine refinement was applied for correctness."
+                                )
+                            if query_mode == "hybrid":
+                                safe_config["criteria"] = rules
+                        except Exception as exc:
+                            _warn(
+                                f"Profile Query pushdown failed for upstream source '{source_type}'"
+                                f" (node={source_id or 'unknown'}): {exc}. Falling back to upstream rows."
+                            )
+                    else:
+                        if query_mode == "pushdown":
+                            _warn(
+                                "Profile Query pushdown mode: no pushdown-safe criteria detected; "
+                                "fallback to in-engine filtering."
+                            )
+                else:
+                    _warn(
+                        f"Profile Query pushdown skipped: upstream source '{source_type}' has no query/table configured."
+                    )
+            elif query_mode == "pushdown":
+                _warn(
+                    "Profile Query pushdown mode is supported only when directly connected to "
+                    "PostgreSQL/MySQL/Oracle source node. Falling back to in-engine filtering."
+                )
+
+        _raise_if_aborted()
+        filtered_rows: List[Any] = []
+        for idx, row in enumerate(candidate_rows):
+            if idx == 0 or idx % 500 == 0:
+                _raise_if_aborted()
+            try:
+                matched = self._flow_condition_match_row(row, safe_config)
+            except Exception:
+                matched = False
+            if matched:
+                filtered_rows.append(row)
+
+        if select_field_sorts and filtered_rows:
+            filtered_rows = self._profile_query_sort_rows(filtered_rows, select_field_sorts)
+
+        if not pushdown_used or not pushdown_window_applied:
+            sliced_rows = filtered_rows[offset:] if offset > 0 else filtered_rows
+            if limit > 0:
+                sliced_rows = sliced_rows[:limit]
+        else:
+            sliced_rows = filtered_rows
+
+        projection_input_rows = sliced_rows
+        if profile_patch_ops_for_output and profile_patch_stage == "pre":
+            reflected_rows: List[Any] = []
+            for row in sliced_rows:
+                if not isinstance(row, dict):
+                    reflected_rows.append(row)
+                    continue
+                row_copy = self._json_safe_value(row)
+                if not isinstance(row_copy, dict):
+                    reflected_rows.append(row)
+                    continue
+                next_row, applied_ops, _ = self._profile_query_apply_patch_operations_to_doc(
+                    row_copy,
+                    row_copy,
+                    profile_patch_ops_for_output,
+                )
+                reflected_rows.append(next_row if applied_ops > 0 else row_copy)
+            projection_input_rows = reflected_rows
+
+        if not selected_fields:
+            result_rows = projection_input_rows
+            try:
+                self._apply_profile_query_patch_updates(
+                    pre_rows=sliced_rows,
+                    post_rows=result_rows,
+                    config=safe_config,
+                    execution_context=execution_context if isinstance(execution_context, dict) else {},
+                    warn_cb=_warn,
+                )
+            except Exception as exc:
+                _warn(f"Profile Query patch update failed: {exc}")
+            if profile_patch_ops_for_output and profile_patch_stage != "pre":
+                reflected_rows: List[Any] = []
+                for row in result_rows:
+                    if not isinstance(row, dict):
+                        reflected_rows.append(row)
+                        continue
+                    row_copy = self._json_safe_value(row)
+                    if not isinstance(row_copy, dict):
+                        reflected_rows.append(row)
+                        continue
+                    next_row, applied_ops, _ = self._profile_query_apply_patch_operations_to_doc(
+                        row_copy,
+                        row_copy,
+                        profile_patch_ops_for_output,
+                    )
+                    reflected_rows.append(next_row if applied_ops > 0 else row_copy)
+                result_rows = reflected_rows
+            return result_rows
+
+        selected_field_array_roots: Dict[str, str] = {}
+        for field_path in selected_fields:
+            out_key = str(select_field_aliases.get(field_path) or field_path).strip() or field_path
+            parsed_root = self._profile_query_array_root_and_suffix(field_path)
+            if parsed_root and parsed_root[0]:
+                selected_field_array_roots[out_key] = parsed_root[0]
+
+        projected_rows: List[Dict[str, Any]] = []
+        matched_projection_count = 0
+        for idx, row in enumerate(projection_input_rows):
+            if idx == 0 or idx % 500 == 0:
+                _raise_if_aborted()
+            out_row: Dict[str, Any] = {}
+            if include_original_row:
+                if isinstance(row, dict):
+                    out_row.update(dict(row))
+                else:
+                    out_row["value"] = row
+            for field_path in selected_fields:
+                if array_match_mode == "matched_elements_only":
+                    value, found = self._extract_profile_query_projection_value_matched_arrays(
+                        row,
+                        field_path,
+                        array_rules_by_root,
+                        criteria_mode,
+                        case_sensitive,
+                    )
+                else:
+                    value, found = self._extract_row_value_by_path(row, field_path)
+                if found:
+                    out_key = str(select_field_aliases.get(field_path) or field_path).strip() or field_path
+                    out_row[out_key] = value
+                    matched_projection_count += 1
+            if array_output_mode == "explode_rows":
+                projected_rows.extend(
+                    self._explode_projected_row_arrays(
+                        out_row,
+                        array_field_roots=selected_field_array_roots,
+                        max_combinations=5000,
+                    )
+                )
+            else:
+                projected_rows.append(out_row)
+
+        if matched_projection_count == 0 and sliced_rows:
+            logger.warning("Data Query select_fields matched zero fields; returning filtered rows unchanged")
+            result_rows = sliced_rows if include_original_row else []
+        else:
+            result_rows = projected_rows
+
+        try:
+            self._apply_profile_query_patch_updates(
+                pre_rows=sliced_rows,
+                post_rows=result_rows,
+                config=safe_config,
+                execution_context=execution_context if isinstance(execution_context, dict) else {},
+                warn_cb=_warn,
+            )
+        except Exception as exc:
+            _warn(f"Profile Query patch update failed: {exc}")
+
+        if profile_patch_ops_for_output and profile_patch_stage != "pre":
+            reflected_rows: List[Any] = []
+            for row in result_rows:
+                if not isinstance(row, dict):
+                    reflected_rows.append(row)
+                    continue
+                row_copy = self._json_safe_value(row)
+                if not isinstance(row_copy, dict):
+                    reflected_rows.append(row)
+                    continue
+                next_row, applied_ops, _ = self._profile_query_apply_patch_operations_to_doc(
+                    row_copy,
+                    row_copy,
+                    profile_patch_ops_for_output,
+                )
+                reflected_rows.append(next_row if applied_ops > 0 else row_copy)
+            result_rows = reflected_rows
+
+        return result_rows
+
+    def _profile_query_deep_merge_docs(self, base_doc: Dict[str, Any], patch_doc: Dict[str, Any]) -> Dict[str, Any]:
+        base = dict(base_doc) if isinstance(base_doc, dict) else {}
+        for key, raw_value in (patch_doc or {}).items():
+            if isinstance(raw_value, dict) and isinstance(base.get(key), dict):
+                base[key] = self._profile_query_deep_merge_docs(
+                    base.get(key) if isinstance(base.get(key), dict) else {},
+                    raw_value,
+                )
+            else:
+                base[key] = self._json_safe_value(raw_value)
+        return base
+
+    def _profile_query_get_pipeline_node_payload(
+        self,
+        execution_context: Optional[Dict[str, Any]],
+        node_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(execution_context, dict):
+            return None
+        node_key = str(node_id or "").strip()
+        if not node_key:
+            return None
+        pipeline_nodes = execution_context.get("pipeline_nodes")
+        if isinstance(pipeline_nodes, dict):
+            node_payload = pipeline_nodes.get(node_key)
+            if isinstance(node_payload, dict):
+                return node_payload
+            return None
+        if isinstance(pipeline_nodes, list):
+            for raw_node in pipeline_nodes:
+                if not isinstance(raw_node, dict):
+                    continue
+                raw_id = str(raw_node.get("id") or "").strip()
+                if raw_id and raw_id == node_key:
+                    return raw_node
+        return None
+
+    def _profile_query_default_patch_payload(self, row_obj: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(row_obj, dict):
+            return {}
+        out: Dict[str, Any] = {}
+        for raw_key, raw_value in row_obj.items():
+            key = str(raw_key or "").strip()
+            if not key:
+                continue
+            key_lower = key.lower()
+            if key_lower in {"lmdb_key", "lmdb_value"}:
+                continue
+            if key_lower.startswith("_lmdb_"):
+                continue
+            out[key] = self._json_safe_value(raw_value)
+        return out
+
+    def _profile_query_coerce_patch_value_literal(self, raw_value: Any) -> Any:
+        if raw_value is None:
+            return None
+        if isinstance(raw_value, (bool, int, float, dict, list)):
+            return self._json_safe_value(raw_value)
+        text = str(raw_value).strip()
+        if text == "":
+            return ""
+        lowered = text.lower()
+        if lowered in {"null", "none"}:
+            return None
+        if lowered in {"true", "false"}:
+            return lowered == "true"
+        try:
+            if re.fullmatch(r"-?\d+", text):
+                return int(text)
+            if re.fullmatch(r"-?\d+\.\d+", text):
+                return float(text)
+        except Exception:
+            pass
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return self._json_safe_value(json.loads(text))
+            except Exception:
+                pass
+        return text
+
+    def _profile_query_resolve_patch_value_from_row_target(
+        self,
+        row_obj: Dict[str, Any],
+        patch_target_path: str,
+    ) -> Tuple[Any, bool]:
+        if not isinstance(row_obj, dict):
+            return None, False
+        tokens = self._split_profile_path(patch_target_path)
+        leaf = None
+        for token in reversed(tokens):
+            if isinstance(token, str) and str(token).strip():
+                leaf = str(token).strip()
+                break
+        if leaf:
+            direct_val, direct_found = self._extract_row_value_by_path(row_obj, leaf)
+            if direct_found:
+                return self._json_safe_value(direct_val), True
+            if leaf in row_obj:
+                return self._json_safe_value(row_obj.get(leaf)), True
+
+        candidates: List[Any] = []
+        for raw_key, raw_val in row_obj.items():
+            key = str(raw_key or "").strip()
+            if not key:
+                continue
+            key_lower = key.lower()
+            if key_lower in {"lmdb_key", "lmdb_value"} or key_lower.startswith("_lmdb_"):
+                continue
+            candidates.append(raw_val)
+        if len(candidates) == 1:
+            return self._json_safe_value(candidates[0]), True
+        return None, False
+
+    def _profile_query_pick_patch_value(
+        self,
+        row_obj: Dict[str, Any],
+        patch_source_path: str,
+        patch_target_path: str,
+        patch_value_mode: str,
+        patch_value_literal: Any,
+    ) -> Tuple[Any, bool]:
+        mode = str(patch_value_mode or "row").strip().lower()
+        if mode == "fixed":
+            return self._profile_query_coerce_patch_value_literal(patch_value_literal), True
+
+        if patch_source_path:
+            patch_value, patch_found = self._extract_row_value_by_path(row_obj, patch_source_path)
+            if not patch_found and patch_source_path in row_obj:
+                patch_value = row_obj.get(patch_source_path)
+                patch_found = True
+            if patch_found:
+                return patch_value, True
+            return None, False
+
+        if patch_target_path:
+            target_value, target_found = self._profile_query_resolve_patch_value_from_row_target(
+                row_obj,
+                patch_target_path,
+            )
+            if target_found:
+                return target_value, True
+
+        if "lmdb_value" in row_obj:
+            return row_obj.get("lmdb_value"), True
+
+        default_patch = self._profile_query_default_patch_payload(row_obj)
+        if default_patch:
+            return default_patch, True
+        return row_obj, True
+
+    def _normalize_profile_query_patch_operations(self, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        safe_cfg = dict(config) if isinstance(config, dict) else {}
+        raw_ops = safe_cfg.get("profile_patch_ops")
+        if isinstance(raw_ops, str):
+            text = raw_ops.strip()
+            if text:
+                try:
+                    raw_ops = json.loads(text)
+                except Exception:
+                    raw_ops = []
+            else:
+                raw_ops = []
+
+        out: List[Dict[str, Any]] = []
+        if isinstance(raw_ops, list):
+            for idx, raw in enumerate(raw_ops):
+                if not isinstance(raw, dict):
+                    continue
+                op_raw = str(raw.get("op") or raw.get("operation") or raw.get("type") or "set").strip().lower()
+                if op_raw not in {"set", "set_where", "unset", "inc", "append", "remove", "rename"}:
+                    op_raw = "set"
+
+                target_path = str(raw.get("target_path") or raw.get("path") or raw.get("target") or "").strip()
+                source_path = str(raw.get("source_path") or raw.get("document_path") or "").strip()
+                value_mode = str(raw.get("value_mode") or "row").strip().lower()
+                if value_mode not in {"row", "fixed"}:
+                    value_mode = "row"
+                merge_mode = str(raw.get("merge_mode") or safe_cfg.get("profile_patch_merge_mode") or "merge").strip().lower()
+                if merge_mode not in {"merge", "replace"}:
+                    merge_mode = "merge"
+                rename_to = str(raw.get("rename_to") or raw.get("new_name") or raw.get("new_key") or "").strip()
+                where_field = str(raw.get("where_field") or raw.get("match_field") or "").strip()
+                where_value_mode = str(raw.get("where_value_mode") or raw.get("match_value_mode") or "row").strip().lower()
+                if where_value_mode not in {"row", "fixed"}:
+                    where_value_mode = "row"
+                where_source_path = str(raw.get("where_source_path") or raw.get("match_source_path") or "").strip()
+
+                out.append({
+                    "id": str(raw.get("id") or f"op_{idx + 1}"),
+                    "op": op_raw,
+                    "target_path": target_path,
+                    "source_path": source_path,
+                    "value_mode": value_mode,
+                    "value": raw.get("value"),
+                    "where_field": where_field,
+                    "where_value_mode": where_value_mode,
+                    "where_source_path": where_source_path,
+                    "where_value": raw.get("where_value", raw.get("match_value")),
+                    "rename_to": rename_to,
+                    "merge_mode": merge_mode,
+                })
+
+        if out:
+            return out
+
+        # Backward compatibility with legacy single-patch configuration.
+        patch_source_path = str(safe_cfg.get("profile_patch_document_path") or "").strip()
+        patch_target_path = str(safe_cfg.get("profile_patch_target_path") or "").strip()
+        patch_value_mode = str(safe_cfg.get("profile_patch_value_mode") or "row").strip().lower()
+        if patch_value_mode not in {"row", "fixed"}:
+            patch_value_mode = "row"
+        patch_value = safe_cfg.get("profile_patch_value")
+        merge_mode = str(safe_cfg.get("profile_patch_merge_mode") or "merge").strip().lower()
+        if merge_mode not in {"merge", "replace"}:
+            merge_mode = "merge"
+        if patch_target_path or patch_source_path or patch_value_mode == "fixed":
+            return [{
+                "id": "op_1",
+                "op": "set",
+                "target_path": patch_target_path,
+                "source_path": patch_source_path,
+                "value_mode": patch_value_mode,
+                "value": patch_value,
+                "rename_to": "",
+                "merge_mode": merge_mode,
+            }]
+        return []
+
+    def _profile_query_collect_patch_targets_with_wildcards(
+        self,
+        data: Any,
+        path: Any,
+        create_missing: bool = False,
+    ) -> List[Tuple[Any, Any]]:
+        tokens = self._split_profile_path_with_wildcards(path)
+        if not tokens:
+            return []
+        targets: List[Tuple[Any, Any]] = []
+
+        def _walk(current: Any, idx: int) -> None:
+            token = tokens[idx]
+            is_last = idx == len(tokens) - 1
+            next_token = tokens[idx + 1] if not is_last else None
+
+            if token == "*":
+                if not isinstance(current, list):
+                    return
+                if is_last:
+                    for i in range(len(current)):
+                        targets.append((current, i))
+                    return
+                for i in range(len(current)):
+                    child = current[i]
+                    if create_missing:
+                        if next_token == "*" or isinstance(next_token, int):
+                            if not isinstance(child, list):
+                                child = []
+                                current[i] = child
+                        else:
+                            if not isinstance(child, dict):
+                                child = {}
+                                current[i] = child
+                    if isinstance(child, (dict, list)):
+                        _walk(child, idx + 1)
+                return
+
+            if isinstance(token, int):
+                if not isinstance(current, list):
+                    return
+                if create_missing:
+                    while len(current) <= token:
+                        current.append({} if not (next_token == "*" or isinstance(next_token, int)) else [])
+                if token < 0 or token >= len(current):
+                    return
+                if is_last:
+                    targets.append((current, token))
+                    return
+                child = current[token]
+                if create_missing:
+                    if next_token == "*" or isinstance(next_token, int):
+                        if not isinstance(child, list):
+                            child = []
+                            current[token] = child
+                    else:
+                        if not isinstance(child, dict):
+                            child = {}
+                            current[token] = child
+                if isinstance(child, (dict, list)):
+                    _walk(child, idx + 1)
+                return
+
+            key = str(token)
+            if not isinstance(current, dict):
+                return
+            if is_last:
+                targets.append((current, key))
+                return
+            child = current.get(key)
+            if create_missing:
+                if next_token == "*" or isinstance(next_token, int):
+                    if not isinstance(child, list):
+                        child = []
+                        current[key] = child
+                else:
+                    if not isinstance(child, dict):
+                        child = {}
+                        current[key] = child
+            if isinstance(child, (dict, list)):
+                _walk(child, idx + 1)
+
+        _walk(data, 0)
+        return targets
+
+    def _profile_query_coerce_numeric_value(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return float(int(value))
+        if isinstance(value, (int, float)):
+            try:
+                return float(value)
+            except Exception:
+                return None
+        text = str(value).strip().replace(",", "")
+        if not text:
+            return None
+        try:
+            return float(text)
+        except Exception:
+            return None
+
+    def _profile_query_apply_single_patch_operation_to_doc(
+        self,
+        base_doc: Any,
+        row_obj: Dict[str, Any],
+        op_cfg: Dict[str, Any],
+    ) -> Tuple[Any, bool]:
+        current_doc = dict(base_doc) if isinstance(base_doc, dict) else {}
+        op_type = str(op_cfg.get("op") or "set").strip().lower()
+        target_path = str(op_cfg.get("target_path") or "").strip()
+        source_path = str(op_cfg.get("source_path") or "").strip()
+        value_mode = str(op_cfg.get("value_mode") or "row").strip().lower()
+        value_literal = op_cfg.get("value")
+        where_field = str(op_cfg.get("where_field") or "").strip()
+        where_value_mode = str(op_cfg.get("where_value_mode") or "row").strip().lower()
+        if where_value_mode not in {"row", "fixed"}:
+            where_value_mode = "row"
+        where_source_path = str(op_cfg.get("where_source_path") or "").strip()
+        where_value_literal = op_cfg.get("where_value")
+        rename_to = str(op_cfg.get("rename_to") or "").strip()
+        merge_mode = str(op_cfg.get("merge_mode") or "merge").strip().lower()
+        if merge_mode not in {"merge", "replace"}:
+            merge_mode = "merge"
+
+        if op_type == "set_where":
+            if not target_path or not where_field:
+                return current_doc, False
+            patch_value, patch_found = self._profile_query_pick_patch_value(
+                row_obj=row_obj,
+                patch_source_path=source_path,
+                patch_target_path=target_path,
+                patch_value_mode=value_mode,
+                patch_value_literal=value_literal,
+            )
+            if not patch_found:
+                return current_doc, False
+
+            if where_value_mode == "fixed":
+                where_value = self._profile_query_coerce_patch_value_literal(where_value_literal)
+                where_found = True
+            else:
+                where_value = None
+                where_found = False
+                where_row_path = str(where_source_path or where_field).strip()
+                if where_row_path:
+                    where_value, where_found = self._extract_row_value_by_path(row_obj, where_row_path)
+                    if not where_found and where_row_path in row_obj:
+                        where_value = row_obj.get(where_row_path)
+                        where_found = True
+            if not where_found:
+                return current_doc, False
+
+            targets = self._profile_query_collect_patch_targets_with_wildcards(current_doc, target_path, create_missing=True)
+            if not targets:
+                return current_doc, False
+
+            changed = False
+            for parent, key in targets:
+                left_value: Any = None
+                left_found = False
+
+                if isinstance(parent, dict):
+                    left_value, left_found = self._extract_row_value_by_path(parent, where_field)
+                elif isinstance(parent, list) and isinstance(key, int) and 0 <= key < len(parent):
+                    element = parent[key]
+                    if isinstance(element, (dict, list)):
+                        left_value, left_found = self._extract_row_value_by_path(element, where_field)
+
+                if not left_found and isinstance(row_obj, dict):
+                    left_value, left_found = self._extract_row_value_by_path(row_obj, where_field)
+                    if not left_found and where_field in row_obj:
+                        left_value = row_obj.get(where_field)
+                        left_found = True
+
+                if not left_found:
+                    continue
+                if not self._flow_condition_eval_operator(left_value, "equals", where_value, False):
+                    continue
+
+                value_to_set = self._json_safe_value(patch_value)
+                if isinstance(parent, dict):
+                    parent[key] = value_to_set
+                    changed = True
+                elif isinstance(parent, list) and isinstance(key, int):
+                    while len(parent) <= key:
+                        parent.append(None)
+                    parent[key] = value_to_set
+                    changed = True
+            return current_doc, changed
+
+        if op_type == "set":
+            patch_value, patch_found = self._profile_query_pick_patch_value(
+                row_obj=row_obj,
+                patch_source_path=source_path,
+                patch_target_path=target_path,
+                patch_value_mode=value_mode,
+                patch_value_literal=value_literal,
+            )
+            if not patch_found:
+                return current_doc, False
+            next_doc = self._profile_query_apply_patch_to_doc(
+                current_doc,
+                patch_value,
+                target_path,
+                merge_mode,
+            )
+            if isinstance(next_doc, dict):
+                return next_doc, True
+            return current_doc, False
+
+        if op_type == "unset":
+            if not target_path:
+                return current_doc, False
+            targets = self._profile_query_collect_patch_targets_with_wildcards(current_doc, target_path, create_missing=False)
+            if not targets:
+                return current_doc, False
+            changed = False
+            list_targets: Dict[int, Tuple[List[Any], set[int]]] = {}
+            for parent, key in targets:
+                if isinstance(parent, dict):
+                    if key in parent:
+                        del parent[key]
+                        changed = True
+                elif isinstance(parent, list) and isinstance(key, int) and 0 <= key < len(parent):
+                    entry = list_targets.get(id(parent))
+                    if entry is None:
+                        entry = (parent, set())
+                        list_targets[id(parent)] = entry
+                    entry[1].add(key)
+            for parent, idxs in list_targets.values():
+                for idx in sorted(idxs, reverse=True):
+                    if 0 <= idx < len(parent):
+                        parent.pop(idx)
+                        changed = True
+            return current_doc, changed
+
+        if op_type == "inc":
+            if not target_path:
+                return current_doc, False
+            delta_value, delta_found = self._profile_query_pick_patch_value(
+                row_obj=row_obj,
+                patch_source_path=source_path,
+                patch_target_path=target_path,
+                patch_value_mode=value_mode,
+                patch_value_literal=value_literal,
+            )
+            if not delta_found:
+                return current_doc, False
+            delta = self._profile_query_coerce_numeric_value(delta_value)
+            if delta is None:
+                return current_doc, False
+            targets = self._profile_query_collect_patch_targets_with_wildcards(current_doc, target_path, create_missing=True)
+            if not targets:
+                return current_doc, False
+            changed = False
+            for parent, key in targets:
+                current_val: Any = None
+                found_existing = False
+                if isinstance(parent, dict):
+                    if key in parent:
+                        current_val = parent.get(key)
+                        found_existing = True
+                elif isinstance(parent, list) and isinstance(key, int) and 0 <= key < len(parent):
+                    current_val = parent[key]
+                    found_existing = True
+                base_num = self._profile_query_coerce_numeric_value(current_val) if found_existing else 0.0
+                if base_num is None:
+                    base_num = 0.0
+                next_num = base_num + delta
+                if float(next_num).is_integer():
+                    next_value: Any = int(next_num)
+                else:
+                    next_value = float(next_num)
+                if isinstance(parent, dict):
+                    parent[key] = self._json_safe_value(next_value)
+                    changed = True
+                elif isinstance(parent, list) and isinstance(key, int):
+                    while len(parent) <= key:
+                        parent.append(None)
+                    parent[key] = self._json_safe_value(next_value)
+                    changed = True
+            return current_doc, changed
+
+        if op_type == "append":
+            if not target_path:
+                return current_doc, False
+            append_value, append_found = self._profile_query_pick_patch_value(
+                row_obj=row_obj,
+                patch_source_path=source_path,
+                patch_target_path=target_path,
+                patch_value_mode=value_mode,
+                patch_value_literal=value_literal,
+            )
+            if not append_found:
+                return current_doc, False
+            append_safe = self._json_safe_value(append_value)
+            targets = self._profile_query_collect_patch_targets_with_wildcards(current_doc, target_path, create_missing=True)
+            if not targets:
+                return current_doc, False
+            changed = False
+            for parent, key in targets:
+                exists = False
+                existing: Any = None
+                if isinstance(parent, dict):
+                    if key in parent:
+                        existing = parent.get(key)
+                        exists = True
+                elif isinstance(parent, list) and isinstance(key, int) and 0 <= key < len(parent):
+                    existing = parent[key]
+                    exists = True
+                if not exists or existing is None:
+                    next_list = [append_safe]
+                elif isinstance(existing, list):
+                    next_list = list(existing)
+                    next_list.append(append_safe)
+                else:
+                    next_list = [self._json_safe_value(existing), append_safe]
+                if isinstance(parent, dict):
+                    parent[key] = next_list
+                    changed = True
+                elif isinstance(parent, list) and isinstance(key, int):
+                    while len(parent) <= key:
+                        parent.append(None)
+                    parent[key] = next_list
+                    changed = True
+            return current_doc, changed
+
+        if op_type == "remove":
+            if not target_path:
+                return current_doc, False
+            remove_value, remove_found = self._profile_query_pick_patch_value(
+                row_obj=row_obj,
+                patch_source_path=source_path,
+                patch_target_path=target_path,
+                patch_value_mode=value_mode,
+                patch_value_literal=value_literal,
+            )
+            targets = self._profile_query_collect_patch_targets_with_wildcards(current_doc, target_path, create_missing=False)
+            if not targets:
+                return current_doc, False
+            changed = False
+            if not remove_found:
+                # No compare value means remove target node itself.
+                return self._profile_query_apply_single_patch_operation_to_doc(
+                    current_doc,
+                    row_obj,
+                    {
+                        "op": "unset",
+                        "target_path": target_path,
+                    },
+                )
+            remove_safe = self._json_safe_value(remove_value)
+            for parent, key in targets:
+                exists = False
+                current_val: Any = None
+                if isinstance(parent, dict):
+                    if key in parent:
+                        current_val = parent.get(key)
+                        exists = True
+                elif isinstance(parent, list) and isinstance(key, int) and 0 <= key < len(parent):
+                    current_val = parent[key]
+                    exists = True
+                if not exists:
+                    continue
+                if isinstance(current_val, list):
+                    filtered = [item for item in current_val if item != remove_safe]
+                    if len(filtered) != len(current_val):
+                        if isinstance(parent, dict):
+                            parent[key] = filtered
+                        elif isinstance(parent, list) and isinstance(key, int):
+                            parent[key] = filtered
+                        changed = True
+                    continue
+                if isinstance(current_val, dict):
+                    rm_key = str(remove_safe).strip()
+                    if rm_key and rm_key in current_val:
+                        next_dict = dict(current_val)
+                        next_dict.pop(rm_key, None)
+                        if isinstance(parent, dict):
+                            parent[key] = next_dict
+                        elif isinstance(parent, list) and isinstance(key, int):
+                            parent[key] = next_dict
+                        changed = True
+                    continue
+                if current_val == remove_safe:
+                    _, unset_changed = self._profile_query_apply_single_patch_operation_to_doc(
+                        current_doc,
+                        row_obj,
+                        {
+                            "op": "unset",
+                            "target_path": target_path,
+                        },
+                    )
+                    changed = changed or unset_changed
+            return current_doc, changed
+
+        if op_type == "rename":
+            if not target_path or not rename_to:
+                return current_doc, False
+            targets = self._profile_query_collect_patch_targets_with_wildcards(current_doc, target_path, create_missing=False)
+            if not targets:
+                return current_doc, False
+            changed = False
+            for parent, key in targets:
+                if not isinstance(parent, dict):
+                    continue
+                src_key = str(key)
+                if src_key not in parent:
+                    continue
+                if src_key == rename_to:
+                    continue
+                parent[rename_to] = parent.pop(src_key)
+                changed = True
+            return current_doc, changed
+
+        return current_doc, False
+
+    def _profile_query_apply_patch_operations_to_doc(
+        self,
+        base_doc: Any,
+        row_obj: Dict[str, Any],
+        patch_ops: List[Dict[str, Any]],
+    ) -> Tuple[Any, int, int]:
+        current_doc = dict(base_doc) if isinstance(base_doc, dict) else {}
+        applied = 0
+        invalid = 0
+        for op_cfg in patch_ops or []:
+            if not isinstance(op_cfg, dict):
+                invalid += 1
+                continue
+            next_doc, changed = self._profile_query_apply_single_patch_operation_to_doc(
+                current_doc,
+                row_obj,
+                op_cfg,
+            )
+            if not changed:
+                invalid += 1
+                continue
+            current_doc = next_doc if isinstance(next_doc, dict) else current_doc
+            applied += 1
+        return current_doc, applied, invalid
+
+    def _profile_query_apply_patch_operations_to_lmdb_payload(
+        self,
+        current_value: Any,
+        row_obj: Dict[str, Any],
+        patch_ops: List[Dict[str, Any]],
+    ) -> Tuple[Any, int, int]:
+        profile_source = str(row_obj.get("_lmdb_profile_source") or "").strip().lower()
+        entity_key = str(row_obj.get("lmdb_entity_key") or "").strip()
+
+        if isinstance(current_value, dict):
+            if profile_source == "document" and "document" in current_value:
+                wrapper = dict(current_value)
+                base_doc = wrapper.get("document")
+                next_doc, applied, invalid = self._profile_query_apply_patch_operations_to_doc(
+                    base_doc if isinstance(base_doc, dict) else {},
+                    row_obj,
+                    patch_ops,
+                )
+                if applied <= 0:
+                    return current_value, 0, invalid
+                wrapper["document"] = next_doc
+                return wrapper, applied, invalid
+
+            docs_obj = current_value.get("documents")
+            if profile_source == "documents" and isinstance(docs_obj, dict) and entity_key:
+                wrapper = dict(current_value)
+                docs_copy = dict(docs_obj)
+                base_doc = docs_copy.get(entity_key)
+                next_doc, applied, invalid = self._profile_query_apply_patch_operations_to_doc(
+                    base_doc if isinstance(base_doc, dict) else {},
+                    row_obj,
+                    patch_ops,
+                )
+                if applied <= 0:
+                    return current_value, 0, invalid
+                docs_copy[entity_key] = next_doc
+                wrapper["documents"] = docs_copy
+                return wrapper, applied, invalid
+
+        next_doc, applied, invalid = self._profile_query_apply_patch_operations_to_doc(
+            current_value if isinstance(current_value, dict) else {},
+            row_obj,
+            patch_ops,
+        )
+        if applied <= 0:
+            return current_value, 0, invalid
+        return next_doc, applied, invalid
+
+    def _profile_query_apply_patch_to_doc(
+        self,
+        base_doc: Any,
+        patch_value: Any,
+        patch_target_path: str,
+        merge_mode: str,
+    ) -> Any:
+        mode = str(merge_mode or "merge").strip().lower()
+        if mode not in {"merge", "replace"}:
+            mode = "merge"
+
+        if mode == "replace":
+            if patch_target_path:
+                next_doc = dict(base_doc) if isinstance(base_doc, dict) else {}
+                self._set_profile_path_value_with_wildcards(
+                    next_doc,
+                    patch_target_path,
+                    self._json_safe_value(patch_value),
+                )
+                return next_doc
+            if isinstance(patch_value, dict):
+                return self._json_safe_value(dict(patch_value))
+            return self._json_safe_value(patch_value)
+
+        if patch_target_path:
+            next_doc = dict(base_doc) if isinstance(base_doc, dict) else {}
+            self._set_profile_path_value_with_wildcards(
+                next_doc,
+                patch_target_path,
+                self._json_safe_value(patch_value),
+            )
+            return next_doc
+        if isinstance(patch_value, dict):
+            return self._profile_query_deep_merge_docs(
+                dict(base_doc) if isinstance(base_doc, dict) else {},
+                patch_value,
+            )
+        return self._json_safe_value(patch_value)
+
+    def _profile_query_apply_patch_to_lmdb_payload(
+        self,
+        current_value: Any,
+        row_obj: Dict[str, Any],
+        patch_value: Any,
+        patch_target_path: str,
+        merge_mode: str,
+    ) -> Any:
+        profile_source = str(row_obj.get("_lmdb_profile_source") or "").strip().lower()
+        entity_key = str(row_obj.get("lmdb_entity_key") or "").strip()
+
+        if isinstance(current_value, dict):
+            if profile_source == "document" and "document" in current_value:
+                wrapper = dict(current_value)
+                base_doc = wrapper.get("document")
+                wrapper["document"] = self._profile_query_apply_patch_to_doc(
+                    base_doc if isinstance(base_doc, dict) else {},
+                    patch_value,
+                    patch_target_path,
+                    merge_mode,
+                )
+                return wrapper
+
+            docs_obj = current_value.get("documents")
+            if (
+                profile_source == "documents"
+                and isinstance(docs_obj, dict)
+                and entity_key
+            ):
+                wrapper = dict(current_value)
+                docs_copy = dict(docs_obj)
+                base_doc = docs_copy.get(entity_key)
+                if base_doc is None and entity_key in docs_obj:
+                    base_doc = docs_obj.get(entity_key)
+                docs_copy[entity_key] = self._profile_query_apply_patch_to_doc(
+                    base_doc if isinstance(base_doc, dict) else {},
+                    patch_value,
+                    patch_target_path,
+                    merge_mode,
+                )
+                wrapper["documents"] = docs_copy
+                return wrapper
+
+        return self._profile_query_apply_patch_to_doc(
+            current_value if isinstance(current_value, dict) else {},
+            patch_value,
+            patch_target_path,
+            merge_mode,
+        )
+
+    def _encode_lmdb_value_for_patch(self, value: Any, preferred_kind: str) -> bytes:
+        kind = str(preferred_kind or "json").strip().lower() or "json"
+        if kind == "base64":
+            if isinstance(value, (bytes, bytearray)):
+                return bytes(value)
+            if isinstance(value, str):
+                return base64.b64decode(value.encode("ascii"), validate=True)
+            raise ValueError("Base64 LMDB value requires bytes or base64 string.")
+        if kind == "text":
+            if isinstance(value, (dict, list)):
+                return json.dumps(self._json_safe_value(value), ensure_ascii=False).encode("utf-8")
+            if value is None:
+                return b""
+            return str(value).encode("utf-8", errors="replace")
+        return json.dumps(self._json_safe_value(value), ensure_ascii=False).encode("utf-8")
+
+    def _apply_profile_query_patch_updates_lmdb_source(
+        self,
+        rows: List[Any],
+        config: Dict[str, Any],
+        lmdb_source_config: Dict[str, Any],
+        pipeline_id: str = "",
+        target_node_id: str = "",
+        warn_cb: Optional[Any] = None,
+    ) -> Tuple[int, int, int]:
+        if lmdb is None:
+            if callable(warn_cb):
+                warn_cb("Profile Query patch skipped: LMDB dependency is unavailable.")
+            return 0, 0, 0
+        if not isinstance(rows, list) or not rows:
+            return 0, 0, 0
+
+        raw_path = (
+            lmdb_source_config.get("env_path")
+            or lmdb_source_config.get("file_path")
+            or lmdb_source_config.get("path")
+            or ""
+        )
+        env_path = self._resolve_lmdb_env_path(str(raw_path))
+        db_name = str(lmdb_source_config.get("db_name", "") or "").strip()
+        value_format = str(lmdb_source_config.get("value_format", "auto") or "auto").strip().lower() or "auto"
+        try:
+            max_dbs = int(lmdb_source_config.get("max_dbs", 16) or 16)
+        except Exception:
+            max_dbs = 16
+        max_dbs = max(1, min(max_dbs, 256))
+
+        patch_ops = self._normalize_profile_query_patch_operations(config)
+        if not patch_ops:
+            if callable(warn_cb):
+                warn_cb("Profile Query direct LMDB patch skipped: patch operations are empty.")
+            return 0, 0, 0
+        primary_key_field = str(config.get("profile_patch_primary_key_field") or "").strip()
+
+        updated_rows = 0
+        skipped_missing_key = 0
+        skipped_invalid_patch = 0
+        env = None
+        try:
+            env = lmdb.open(
+                env_path,
+                readonly=False,
+                lock=True,
+                readahead=False,
+                max_dbs=max_dbs,
+                subdir=True,
+            )
+            dbi = None
+            if db_name:
+                dbi = env.open_db(db_name.encode("utf-8"), create=False)
+            with env.begin(write=True, db=dbi) as txn:
+                for raw_row in rows:
+                    row_obj = raw_row if isinstance(raw_row, dict) else {"value": raw_row}
+                    key_text = str(row_obj.get("lmdb_key") or "").strip()
+                    if not key_text and primary_key_field:
+                        pk_value, pk_found = self._extract_row_value_by_path(row_obj, primary_key_field)
+                        if not pk_found:
+                            pk_value = row_obj.get(primary_key_field)
+                        key_text = str(pk_value).strip() if pk_value is not None else ""
+                    if not key_text:
+                        entity_key = str(row_obj.get("lmdb_entity_key") or "").strip()
+                        pipeline_key = str(pipeline_id or "").strip()
+                        node_key = str(target_node_id or "").strip()
+                        if entity_key and pipeline_key and node_key:
+                            key_text = self._profile_lmdb_entity_key(
+                                pipeline_key,
+                                node_key,
+                                entity_key,
+                            ).decode("utf-8", errors="replace")
+                    if not key_text:
+                        skipped_missing_key += 1
+                        continue
+
+                    key_bytes = key_text.encode("utf-8", errors="replace")
+                    current_bytes = txn.get(key_bytes)
+                    if current_bytes is None:
+                        skipped_missing_key += 1
+                        continue
+
+                    current_value, current_kind = self._decode_lmdb_value(current_bytes, value_format)
+                    next_value, applied_ops, invalid_ops = self._profile_query_apply_patch_operations_to_lmdb_payload(
+                        current_value=current_value,
+                        row_obj=row_obj,
+                        patch_ops=patch_ops,
+                    )
+                    if applied_ops <= 0:
+                        skipped_invalid_patch += 1
+                        continue
+                    if invalid_ops > 0:
+                        skipped_invalid_patch += invalid_ops
+
+                    preferred_kind = str(row_obj.get("_lmdb_value_kind") or current_kind or "json").strip().lower() or "json"
+                    try:
+                        encoded = self._encode_lmdb_value_for_patch(next_value, preferred_kind)
+                    except Exception:
+                        skipped_invalid_patch += 1
+                        continue
+                    txn.put(key_bytes, encoded)
+                    updated_rows += 1
+        finally:
+            if env is not None:
+                try:
+                    env.close()
+                except Exception:
+                    pass
+        return updated_rows, skipped_missing_key, skipped_invalid_patch
+
+    def _apply_profile_query_patch_updates(
+        self,
+        pre_rows: List[Any],
+        post_rows: List[Any],
+        config: Dict[str, Any],
+        execution_context: Dict[str, Any],
+        warn_cb: Optional[Any] = None,
+    ) -> None:
+        safe_cfg = dict(config) if isinstance(config, dict) else {}
+        enabled = self._parse_bool_like(safe_cfg.get("profile_patch_enabled"), False)
+        if not enabled:
+            return
+
+        pipeline_id = str(execution_context.get("pipeline_id") or "").strip() if isinstance(execution_context, dict) else ""
+        if not pipeline_id:
+            if callable(warn_cb):
+                warn_cb("Profile Query patch skipped: missing pipeline context.")
+            return
+
+        patch_stage = str(safe_cfg.get("profile_patch_stage") or "post").strip().lower()
+        source_rows = pre_rows if patch_stage == "pre" else post_rows
+        if not isinstance(source_rows, list) or len(source_rows) <= 0:
+            return
+
+        storage = self._normalize_profile_storage(safe_cfg.get("profile_patch_storage", "lmdb"))
+        target_node_id = str(
+            safe_cfg.get("profile_patch_node_id")
+            or execution_context.get("node_id")
+            or ""
+        ).strip()
+        if not target_node_id:
+            if callable(warn_cb):
+                warn_cb("Profile Query patch skipped: target profile node is empty.")
+            return
+
+        target_node = self._profile_query_get_pipeline_node_payload(execution_context, target_node_id)
+        target_node_data = target_node.get("data") if isinstance(target_node, dict) else None
+        target_node_type = str(
+            target_node_data.get("nodeType")
+            if isinstance(target_node_data, dict)
+            else ""
+        ).strip().lower()
+        target_node_config = (
+            target_node_data.get("config")
+            if isinstance(target_node_data, dict) and isinstance(target_node_data.get("config"), dict)
+            else {}
+        )
+        if not isinstance(target_node_config, dict):
+            target_node_config = {}
+
+        if target_node_type == "lmdb_source":
+            updated_count, skipped_missing_key, skipped_invalid_patch = self._apply_profile_query_patch_updates_lmdb_source(
+                source_rows,
+                safe_cfg,
+                target_node_config,
+                pipeline_id=pipeline_id,
+                target_node_id=target_node_id,
+                warn_cb=warn_cb,
+            )
+            if (
+                updated_count <= 0
+                and patch_stage == "post"
+                and isinstance(pre_rows, list)
+                and len(pre_rows) > 0
+                and pre_rows is not source_rows
+            ):
+                updated_count, skipped_missing_key, skipped_invalid_patch = self._apply_profile_query_patch_updates_lmdb_source(
+                    pre_rows,
+                    safe_cfg,
+                    target_node_config,
+                    pipeline_id=pipeline_id,
+                    target_node_id=target_node_id,
+                    warn_cb=warn_cb,
+                )
+            if updated_count <= 0:
+                if callable(warn_cb):
+                    warn_cb(
+                        "Profile Query direct LMDB patch skipped: "
+                        f"updated=0, missing_key={skipped_missing_key}, invalid_patch={skipped_invalid_patch}."
+                    )
+                return
+            if callable(warn_cb) and (skipped_missing_key > 0 or skipped_invalid_patch > 0):
+                warn_cb(
+                    "Profile Query direct LMDB patch completed with skips: "
+                    f"updated={updated_count}, missing_key={skipped_missing_key}, invalid_patch={skipped_invalid_patch}."
+                )
+            return
+
+        primary_key_field = str(safe_cfg.get("profile_patch_primary_key_field") or "").strip()
+        if not primary_key_field:
+            if callable(warn_cb):
+                warn_cb("Profile Query patch skipped: primary key field is empty.")
+            return
+
+        patch_ops = self._normalize_profile_query_patch_operations(safe_cfg)
+        if not patch_ops:
+            if callable(warn_cb):
+                warn_cb("Profile Query patch skipped: patch operations are empty.")
+            return
+
+        profile_cfg: Optional[Dict[str, Any]] = None
+        if storage == "oracle":
+            node_config = target_node_config if isinstance(target_node_config, dict) else {}
+            profile_cfg = {
+                "custom_profile_oracle_host": node_config.get("custom_profile_oracle_host"),
+                "custom_profile_oracle_port": node_config.get("custom_profile_oracle_port"),
+                "custom_profile_oracle_service_name": node_config.get("custom_profile_oracle_service_name"),
+                "custom_profile_oracle_sid": node_config.get("custom_profile_oracle_sid"),
+                "custom_profile_oracle_user": node_config.get("custom_profile_oracle_user"),
+                "custom_profile_oracle_password": node_config.get("custom_profile_oracle_password"),
+                "custom_profile_oracle_dsn": node_config.get("custom_profile_oracle_dsn"),
+                "custom_profile_oracle_table": node_config.get("custom_profile_oracle_table"),
+                "custom_profile_oracle_write_strategy": node_config.get("custom_profile_oracle_write_strategy"),
+                "custom_profile_oracle_parallel_workers": node_config.get("custom_profile_oracle_parallel_workers"),
+                "custom_profile_oracle_parallel_min_tokens": node_config.get("custom_profile_oracle_parallel_min_tokens"),
+                "custom_profile_oracle_merge_batch_size": node_config.get("custom_profile_oracle_merge_batch_size"),
+                "custom_profile_oracle_parallel_force": node_config.get("custom_profile_oracle_parallel_force"),
+            }
+
+        docs_store: Dict[str, Dict[str, Any]] = {}
+        meta_store: Dict[str, Dict[str, Any]] = {}
+        changed_tokens: List[str] = []
+        skipped_missing_key = 0
+        skipped_invalid_patch = 0
+
+        for idx, row in enumerate(source_rows):
+            if idx == 0 or idx % 500 == 0:
+                # no-op cancel check guard by caller context; keep loop lightweight.
+                pass
+            row_obj = row if isinstance(row, dict) else {"value": row}
+            pk_value, pk_found = self._extract_row_value_by_path(row_obj, primary_key_field)
+            if not pk_found:
+                pk_value = row_obj.get(primary_key_field)
+            token = str(pk_value).strip() if pk_value is not None else ""
+            if not token:
+                skipped_missing_key += 1
+                continue
+
+            if token in docs_store:
+                base_doc = docs_store.get(token) if isinstance(docs_store.get(token), dict) else {}
+                base_meta = meta_store.get(token) if isinstance(meta_store.get(token), dict) else {}
+            else:
+                base_doc_loaded, base_meta_loaded = self._load_profile_state_single_entity(
+                    pipeline_id,
+                    target_node_id,
+                    token,
+                    storage=storage,
+                    profile_cfg=profile_cfg,
+                )
+                base_doc = base_doc_loaded if isinstance(base_doc_loaded, dict) else {}
+                base_meta = base_meta_loaded if isinstance(base_meta_loaded, dict) else {}
+
+            next_doc, applied_ops, invalid_ops = self._profile_query_apply_patch_operations_to_doc(
+                base_doc,
+                row_obj,
+                patch_ops,
+            )
+            if applied_ops <= 0:
+                skipped_invalid_patch += 1
+                continue
+            if invalid_ops > 0:
+                skipped_invalid_patch += invalid_ops
+
+            current_pk, current_pk_found = self._extract_row_value_by_path(next_doc, primary_key_field)
+            if (not current_pk_found) or current_pk is None or str(current_pk).strip() == "":
+                self._set_profile_path_value(next_doc, primary_key_field, self._json_safe_value(pk_value))
+
+            docs_store[token] = next_doc if isinstance(next_doc, dict) else {}
+            meta_store[token] = base_meta if isinstance(base_meta, dict) else {}
+            if token not in changed_tokens:
+                changed_tokens.append(token)
+
+        if not changed_tokens:
+            if skipped_missing_key > 0 and callable(warn_cb):
+                warn_cb(
+                    "Profile Query patch skipped all rows: missing key value for "
+                    f"'{primary_key_field}' (rows={skipped_missing_key})."
+                )
+            return
+
+        node_state = {
+            "documents": docs_store,
+            "meta": meta_store,
+            "stats": {
+                "profile_query_patch_updated_at": datetime.utcnow().isoformat(),
+                "profile_query_patch_updated_count": len(changed_tokens),
+            },
+        }
+        persisted = self._save_profile_state_single_node_by_storage(
+            pipeline_id,
+            target_node_id,
+            node_state,
+            changed_tokens=changed_tokens,
+            storage=storage,
+            profile_cfg=profile_cfg,
+        )
+        if not persisted and callable(warn_cb):
+            warn_cb(
+                "Profile Query patch failed to persist updates to "
+                f"{storage} (node={target_node_id}, updated={len(changed_tokens)})."
+            )
+        elif callable(warn_cb) and skipped_invalid_patch > 0:
+            warn_cb(
+                "Profile Query patch completed with skipped rows: "
+                f"invalid patch payload rows={skipped_invalid_patch}."
+            )
+
+    def _flow_condition_split(self, data: list, config: dict) -> tuple[list, list]:
+        rows = data if isinstance(data, list) else []
+        if not rows:
+            return [], []
+        true_rows: list = []
+        false_rows: list = []
+        for row in rows:
+            try:
+                matched = self._flow_condition_match_row(row, config)
+            except Exception:
+                matched = False
+            if matched:
+                true_rows.append(row)
+            else:
+                false_rows.append(row)
+        return true_rows, false_rows
+
+    def _normalize_condition_case_handle_id(self, route_id: Any) -> str:
+        import re
+        raw = str(route_id or "").strip().lower()
+        safe = re.sub(r"[^a-z0-9_]+", "_", raw).strip("_")
+        if not safe:
+            safe = "route"
+        return f"case_{safe}"
+
+    def _flow_condition_case_routes_split(self, data: list, config: dict) -> Dict[str, list]:
+        rows = data if isinstance(data, list) else []
+        result: Dict[str, list] = {
+            "output": [],
+            "output_false": [],
+        }
+        if not rows or not isinstance(config, dict):
+            return result
+
+        raw_routes = config.get("case_routes")
+        if isinstance(raw_routes, str):
+            try:
+                raw_routes = json.loads(raw_routes)
+            except Exception:
+                raw_routes = []
+        if not isinstance(raw_routes, list):
+            raw_routes = []
+
+        def _to_num(v: Any) -> Optional[float]:
+            try:
+                if v is None:
+                    return None
+                if isinstance(v, bool):
+                    return float(int(v))
+                if isinstance(v, (int, float)):
+                    return float(v)
+                txt = str(v).strip().replace(",", "")
+                if txt == "":
+                    return None
+                return float(txt)
+            except Exception:
+                return None
+
+        def _normalize_case_condition(raw_condition: Any, fallback_id: str) -> Optional[Dict[str, Any]]:
+            if not isinstance(raw_condition, dict):
+                return None
+            field_name = str(raw_condition.get("field") or raw_condition.get("leftField") or "").strip()
+            if not field_name:
+                return None
+            condition_mode = str(
+                raw_condition.get("match_mode")
+                or raw_condition.get("matchMode")
+                or raw_condition.get("mode")
+                or "range"
+            ).strip().lower()
+            if condition_mode not in {"range", "condition"}:
+                condition_mode = "range"
+            operator = str(raw_condition.get("operator") or "equals").strip().lower() or "equals"
+            right_mode = str(raw_condition.get("right_mode") or raw_condition.get("rightMode") or "literal").strip().lower()
+            if right_mode not in {"literal", "field"}:
+                right_mode = "literal"
+            right_value = raw_condition.get("right_value")
+            if right_value is None:
+                right_value = raw_condition.get("rightValue")
+            min_raw = raw_condition.get("min_value")
+            if min_raw is None:
+                min_raw = raw_condition.get("minValue")
+            max_raw = raw_condition.get("max_value")
+            if max_raw is None:
+                max_raw = raw_condition.get("maxValue")
+            include_min = raw_condition.get("include_min")
+            if include_min is None:
+                include_min = raw_condition.get("includeMin")
+            include_max = raw_condition.get("include_max")
+            if include_max is None:
+                include_max = raw_condition.get("includeMax")
+
+            min_num = _to_num(min_raw)
+            max_num = _to_num(max_raw)
+            if min_num is not None and max_num is not None and min_num > max_num:
+                min_num, max_num = max_num, min_num
+
+            return {
+                "id": str(raw_condition.get("id") or fallback_id).strip() or fallback_id,
+                "field": field_name,
+                "match_mode": condition_mode,
+                "operator": operator,
+                "right_mode": right_mode,
+                "right_value": right_value,
+                "min_num": min_num,
+                "max_num": max_num,
+                "include_min": bool(True if include_min is None else include_min),
+                "include_max": bool(True if include_max is None else include_max),
+            }
+
+        normalized_routes: List[Dict[str, Any]] = []
+        for index, item in enumerate(raw_routes):
+            if not isinstance(item, dict):
+                continue
+            route_id = str(item.get("id") or f"route_{index + 1}").strip() or f"route_{index + 1}"
+            handle_id = str(item.get("handle_id") or self._normalize_condition_case_handle_id(route_id)).strip()
+            if not handle_id:
+                handle_id = self._normalize_condition_case_handle_id(route_id)
+            route_match_mode = str(
+                item.get("route_match_mode")
+                or item.get("criteria_mode")
+                or item.get("logic")
+                or item.get("join")
+                or "all"
+            ).strip().lower()
+            if route_match_mode not in {"all", "any"}:
+                route_match_mode = "all"
+
+            raw_conditions = item.get("conditions")
+            if isinstance(raw_conditions, str):
+                try:
+                    raw_conditions = json.loads(raw_conditions)
+                except Exception:
+                    raw_conditions = []
+            conditions: List[Dict[str, Any]] = []
+            if isinstance(raw_conditions, list):
+                for cond_idx, raw_cond in enumerate(raw_conditions):
+                    normalized_cond = _normalize_case_condition(raw_cond, f"cond_{route_id}_{cond_idx + 1}")
+                    if normalized_cond:
+                        conditions.append(normalized_cond)
+            if not conditions:
+                # Backward compatibility: single-condition route stored at root level.
+                legacy_cond = _normalize_case_condition(item, f"cond_{route_id}_1")
+                if legacy_cond:
+                    conditions.append(legacy_cond)
+            if not conditions:
+                continue
+
+            normalized_routes.append({
+                "id": route_id,
+                "handle_id": handle_id,
+                "route_match_mode": route_match_mode,
+                "conditions": conditions,
+            })
+            result.setdefault(handle_id, [])
+
+        if not normalized_routes:
+            result["output_false"] = list(rows)
+            return result
+
+        for row in rows:
+            row_obj = row if isinstance(row, dict) else {"value": row}
+            matched = False
+            for route in normalized_routes:
+                route_conditions = route.get("conditions") if isinstance(route.get("conditions"), list) else []
+                if not route_conditions:
+                    continue
+                condition_outcomes: List[bool] = []
+                for cond in route_conditions:
+                    if not isinstance(cond, dict):
+                        continue
+                    field_name = str(cond.get("field") or "").strip()
+                    if not field_name:
+                        condition_outcomes.append(False)
+                        continue
+                    left_value, found = self._extract_row_value_by_path(row_obj, field_name)
+                    if not found:
+                        left_value = row_obj.get(field_name)
+                    cond_mode = str(cond.get("match_mode") or "range").strip().lower()
+                    matched_condition = False
+                    if cond_mode == "condition":
+                        right_mode = str(cond.get("right_mode") or "literal").strip().lower()
+                        right_value = cond.get("right_value")
+                        if right_mode == "field":
+                            ref_path = str(right_value or "").strip()
+                            if ref_path:
+                                ref_value, ref_found = self._extract_row_value_by_path(row_obj, ref_path)
+                                if ref_found:
+                                    right_value = ref_value
+                                else:
+                                    right_value = row_obj.get(ref_path)
+                        case_sensitive = bool(config.get("case_sensitive", False))
+                        matched_condition = self._flow_condition_eval_operator(
+                            left_value,
+                            str(cond.get("operator") or "equals"),
+                            right_value,
+                            case_sensitive,
+                        )
+                    else:
+                        left_candidates = list(left_value) if isinstance(left_value, (list, tuple, set)) else [left_value]
+                        min_num = cond.get("min_num")
+                        max_num = cond.get("max_num")
+                        include_min = bool(cond.get("include_min", True))
+                        include_max = bool(cond.get("include_max", True))
+                        matched_condition = False
+                        for candidate in left_candidates:
+                            try:
+                                left_num = float(str(candidate).strip().replace(",", ""))
+                            except Exception:
+                                left_num = None
+                            if left_num is None:
+                                continue
+                            within = True
+                            if min_num is not None:
+                                if include_min:
+                                    if left_num < float(min_num):
+                                        within = False
+                                elif left_num <= float(min_num):
+                                    within = False
+                            if within and max_num is not None:
+                                if include_max:
+                                    if left_num > float(max_num):
+                                        within = False
+                                elif left_num >= float(max_num):
+                                    within = False
+                            if within:
+                                matched_condition = True
+                                break
+                    condition_outcomes.append(bool(matched_condition))
+
+                if not condition_outcomes:
+                    continue
+                route_logic = str(route.get("route_match_mode") or "all").strip().lower()
+                matched_route = any(condition_outcomes) if route_logic == "any" else all(condition_outcomes)
+                if not matched_route:
+                    continue
+
+                handle_id = str(route.get("handle_id") or "").strip() or "output"
+                result.setdefault(handle_id, []).append(row)
+                result.setdefault("output", []).append(row)
+                matched = True
+                break
+
+            if not matched:
+                result.setdefault("output_false", []).append(row)
+
         return result
+
+    def _flow_condition_match_row(self, row: Any, config: dict) -> bool:
+        if not isinstance(config, dict):
+            return True
+
+        raw_rules = config.get("criteria")
+        if raw_rules is None:
+            raw_rules = config.get("conditions")
+        if isinstance(raw_rules, str):
+            try:
+                parsed_rules = json.loads(raw_rules)
+                raw_rules = parsed_rules
+            except Exception:
+                raw_rules = []
+        if not isinstance(raw_rules, list):
+            raw_rules = []
+
+        rules: List[Dict[str, Any]] = []
+        for item in raw_rules:
+            if not isinstance(item, dict):
+                continue
+            field_name = str(item.get("field") or item.get("leftField") or "").strip()
+            operator = str(item.get("operator") or "equals").strip().lower() or "equals"
+            right_mode = str(item.get("rightMode") or item.get("right_mode") or "literal").strip().lower() or "literal"
+            right_raw = item.get("value")
+            if right_raw is None:
+                right_raw = item.get("rightValue")
+            if right_raw is None:
+                right_raw = item.get("right_value")
+            if not field_name and operator != "raw":
+                continue
+            rules.append({
+                "field": field_name,
+                "operator": operator,
+                "right_mode": right_mode,
+                "right_value": right_raw,
+            })
+
+        if not rules:
+            legacy_field = str(config.get("field") or "").strip()
+            if not legacy_field:
+                return True
+            rules = [{
+                "field": legacy_field,
+                "operator": str(config.get("operator") or "equals").strip().lower() or "equals",
+                "right_mode": "literal",
+                "right_value": config.get("value"),
+            }]
+
+        match_mode = str(config.get("criteria_mode") or config.get("match_mode") or "all").strip().lower()
+        if match_mode not in {"all", "any"}:
+            match_mode = "all"
+        case_sensitive = bool(config.get("case_sensitive", False))
+
+        outcomes: List[bool] = []
+        for rule in rules:
+            field_name = str(rule.get("field") or "").strip()
+            operator = str(rule.get("operator") or "equals").strip().lower() or "equals"
+            right_mode = str(rule.get("right_mode") or "literal").strip().lower() or "literal"
+            right_value = rule.get("right_value")
+            left_value: Any = None
+            left_found = False
+            if isinstance(row, dict):
+                if field_name in row:
+                    left_value = row.get(field_name)
+                    left_found = True
+                elif field_name:
+                    left_value, left_found = self._extract_row_value_by_path(row, field_name)
+            if not left_found:
+                left_value = None
+
+            if operator == "raw":
+                outcomes.append(bool(right_value))
+                continue
+
+            if right_mode == "field":
+                ref_path = str(right_value or "").strip()
+                if isinstance(row, dict) and ref_path:
+                    ref_value, ref_found = self._extract_row_value_by_path(row, ref_path)
+                    if ref_found:
+                        right_value = ref_value
+                    else:
+                        right_value = row.get(ref_path)
+
+            outcomes.append(self._flow_condition_eval_operator(left_value, operator, right_value, case_sensitive))
+
+        if not outcomes:
+            return True
+        if match_mode == "any":
+            return any(outcomes)
+        return all(outcomes)
+
+    def _flow_condition_eval_operator(
+        self,
+        left_value: Any,
+        operator: str,
+        right_value: Any,
+        case_sensitive: bool = False,
+    ) -> bool:
+        op = str(operator or "equals").strip().lower() or "equals"
+        if op in {"eq", "=="}:
+            op = "equals"
+        elif op in {"ne", "!="}:
+            op = "not_equals"
+        elif op in {"gt", ">"}:
+            op = "greater_than"
+        elif op in {"gte", ">="}:
+            op = "greater_or_equal"
+        elif op in {"lt", "<"}:
+            op = "less_than"
+        elif op in {"lte", "<="}:
+            op = "less_or_equal"
+
+        def _is_collection(v: Any) -> bool:
+            return isinstance(v, (list, tuple, set))
+
+        if _is_collection(left_value) or _is_collection(right_value):
+            left_items = list(left_value) if _is_collection(left_value) else [left_value]
+            right_items = list(right_value) if _is_collection(right_value) else [right_value]
+            if op == "is_null":
+                return any(item is None for item in left_items)
+            if op == "is_not_null":
+                return any(item is not None for item in left_items)
+            negative_ops = {"not_equals", "not_contains", "not_in", "not_in_list"}
+            if op in negative_ops:
+                for lv in left_items:
+                    for rv in right_items:
+                        if self._flow_condition_eval_operator(lv, op.replace("not_", "", 1), rv, case_sensitive):
+                            return False
+                return True
+            for lv in left_items:
+                for rv in right_items:
+                    if self._flow_condition_eval_operator(lv, op, rv, case_sensitive):
+                        return True
+            return False
+
+        if op == "is_null":
+            return left_value is None
+        if op == "is_not_null":
+            return left_value is not None
+
+        def _num(v: Any) -> Optional[float]:
+            try:
+                if v is None:
+                    return None
+                if isinstance(v, bool):
+                    return float(int(v))
+                if isinstance(v, (int, float)):
+                    return float(v)
+                txt = str(v).strip().replace(",", "")
+                if txt == "":
+                    return None
+                return float(txt)
+            except Exception:
+                return None
+
+        left_num = _num(left_value)
+        right_num = _num(right_value)
+        if op in {"greater_than", "greater_or_equal", "less_than", "less_or_equal"}:
+            if left_num is None or right_num is None:
+                return False
+            if op == "greater_than":
+                return left_num > right_num
+            if op == "greater_or_equal":
+                return left_num >= right_num
+            if op == "less_than":
+                return left_num < right_num
+            return left_num <= right_num
+        if op == "between":
+            if left_num is None:
+                return False
+            min_num: Optional[float] = None
+            max_num: Optional[float] = None
+            if isinstance(right_value, (list, tuple)) and len(right_value) >= 2:
+                min_num = _num(right_value[0])
+                max_num = _num(right_value[1])
+            else:
+                raw = "" if right_value is None else str(right_value)
+                parts = [p.strip() for p in raw.split(",") if p.strip()]
+                if len(parts) >= 2:
+                    min_num = _num(parts[0])
+                    max_num = _num(parts[1])
+            if min_num is None or max_num is None:
+                return False
+            if min_num > max_num:
+                min_num, max_num = max_num, min_num
+            return min_num <= left_num <= max_num
+
+        left_text = "" if left_value is None else str(left_value)
+        right_text = "" if right_value is None else str(right_value)
+        left_cmp = left_text if case_sensitive else left_text.lower()
+        right_cmp = right_text if case_sensitive else right_text.lower()
+
+        if op == "equals":
+            return left_cmp == right_cmp
+        if op == "not_equals":
+            return left_cmp != right_cmp
+        if op == "contains":
+            return right_cmp in left_cmp
+        if op in {"not_contains"}:
+            return right_cmp not in left_cmp
+        if op in {"starts_with", "startswith"}:
+            return left_cmp.startswith(right_cmp)
+        if op in {"ends_with", "endswith"}:
+            return left_cmp.endswith(right_cmp)
+        if op in {"in", "in_list"}:
+            tokens = [t.strip() for t in right_text.split(",") if t.strip()]
+            token_cmp = [t if case_sensitive else t.lower() for t in tokens]
+            return left_cmp in token_cmp
+        if op in {"not_in", "not_in_list"}:
+            tokens = [t.strip() for t in right_text.split(",") if t.strip()]
+            token_cmp = [t if case_sensitive else t.lower() for t in tokens]
+            return left_cmp not in token_cmp
+
+        return left_cmp == right_cmp
 
     def _parse_selected_fields(self, value: Any) -> List[str]:
         if isinstance(value, list):
@@ -9009,6 +11979,469 @@ END;"""
             seen.add(key)
             out.append(part)
         return out
+
+    def _parse_select_field_sorts(
+        self,
+        value: Any,
+        selected_fields: Optional[List[str]] = None,
+    ) -> List[Tuple[str, str]]:
+        raw = value
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                return []
+            try:
+                raw = json.loads(text)
+            except Exception:
+                return []
+
+        sort_map: Dict[str, str] = {}
+
+        def _normalize_mode(mode_value: Any) -> str:
+            mode = str(mode_value or "").strip().lower()
+            if mode in {"asc", "desc"}:
+                return mode
+            return "none"
+
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                path = str(k or "").strip()
+                if not path:
+                    continue
+                mode = _normalize_mode(v)
+                if mode in {"asc", "desc"}:
+                    sort_map[path] = mode
+        elif isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                path = str(
+                    item.get("field")
+                    or item.get("path")
+                    or item.get("name")
+                    or ""
+                ).strip()
+                if not path:
+                    continue
+                mode = _normalize_mode(
+                    item.get("order")
+                    or item.get("mode")
+                    or item.get("direction")
+                    or "none"
+                )
+                if mode in {"asc", "desc"}:
+                    sort_map[path] = mode
+        else:
+            return []
+
+        if not sort_map:
+            return []
+
+        out: List[Tuple[str, str]] = []
+        seen = set()
+        for field in selected_fields or []:
+            path = str(field or "").strip()
+            if not path or path in seen:
+                continue
+            mode = sort_map.get(path)
+            if mode in {"asc", "desc"}:
+                out.append((path, mode))
+                seen.add(path)
+        for path, mode in sort_map.items():
+            if path in seen:
+                continue
+            out.append((path, mode))
+            seen.add(path)
+        return out
+
+    def _parse_select_field_aliases(self, value: Any) -> Dict[str, str]:
+        raw = value
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                return {}
+            try:
+                raw = json.loads(text)
+            except Exception:
+                return {}
+        if not isinstance(raw, dict):
+            return {}
+        out: Dict[str, str] = {}
+        for k, v in raw.items():
+            path = str(k or "").strip()
+            alias = str(v or "").strip()
+            if not path or not alias:
+                continue
+            out[path] = alias
+        return out
+
+    def _normalize_profile_query_array_output_mode(self, value: Any) -> str:
+        mode = str(value or "list").strip().lower()
+        if mode in {"explode", "explode_rows", "row", "rows"}:
+            return "explode_rows"
+        return "list"
+
+    def _normalize_profile_query_array_match_mode(self, value: Any) -> str:
+        mode = str(value or "all_elements").strip().lower()
+        if mode in {"matched_elements_only", "matched_only", "match_only"}:
+            return "matched_elements_only"
+        return "all_elements"
+
+    def _profile_query_split_path_segments(self, path: Any) -> List[str]:
+        expr = self._normalize_json_path_expr(str(path or ""))
+        if not expr:
+            return []
+        tokenized = re.sub(r"\[(\d+)\]", lambda m: f".#{m.group(1)}", expr)
+        tokenized = tokenized.replace("[]", ".#all")
+        return [t for t in str(tokenized or "").split(".") if t]
+
+    def _profile_query_tokens_to_path(self, tokens: List[str]) -> str:
+        parts: List[str] = []
+        for tok in tokens:
+            text = str(tok or "").strip()
+            if not text:
+                continue
+            if text.startswith("#"):
+                if not parts:
+                    continue
+                if text == "#all":
+                    parts[-1] = f"{parts[-1]}[]"
+                else:
+                    parts[-1] = f"{parts[-1]}[{text[1:]}]"
+                continue
+            parts.append(text)
+        return ".".join(parts)
+
+    def _profile_query_array_root_and_suffix(self, path: Any) -> Optional[Tuple[str, str]]:
+        segments = self._profile_query_split_path_segments(path)
+        if not segments:
+            return None
+        try:
+            idx = segments.index("#all")
+        except ValueError:
+            return None
+        root_tokens = segments[:idx]
+        if not root_tokens:
+            return None
+        suffix_tokens = segments[idx + 1 :]
+        root_path = self._profile_query_tokens_to_path(root_tokens)
+        suffix_path = self._profile_query_tokens_to_path(suffix_tokens)
+        if not root_path:
+            return None
+        return root_path, suffix_path
+
+    def _group_profile_query_rules_by_array_root(self, rules: Any) -> Dict[str, List[Dict[str, Any]]]:
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        if not isinstance(rules, list):
+            return out
+        for raw_rule in rules:
+            if not isinstance(raw_rule, dict):
+                continue
+            field_name = str(raw_rule.get("field") or "").strip()
+            if not field_name:
+                continue
+            parsed = self._profile_query_array_root_and_suffix(field_name)
+            if not parsed:
+                continue
+            root_path, _ = parsed
+            out.setdefault(root_path, []).append(raw_rule)
+        return out
+
+    def _profile_query_pick_object_key(self, obj: Dict[str, Any], segment: str) -> str:
+        seg = str(segment or "").strip()
+        if seg in obj:
+            return seg
+        seg_norm = seg.lower()
+        for key in obj.keys():
+            if str(key or "").strip().lower() == seg_norm:
+                return key
+        return seg
+
+    def _profile_query_clone_row_with_array_root(
+        self,
+        row: Dict[str, Any],
+        root_path: str,
+        items: List[Any],
+    ) -> Dict[str, Any]:
+        if not isinstance(row, dict):
+            return {}
+        segments = [seg for seg in self._profile_query_split_path_segments(root_path) if not str(seg).startswith("#")]
+        if not segments:
+            return dict(row)
+
+        cloned_root: Dict[str, Any] = dict(row)
+        clone_cursor: Dict[str, Any] = cloned_root
+        source_cursor: Any = row
+        for idx, seg in enumerate(segments):
+            is_last = idx == len(segments) - 1
+            source_obj = source_cursor if isinstance(source_cursor, dict) else {}
+            actual_key = self._profile_query_pick_object_key(source_obj, seg)
+            if is_last:
+                clone_cursor[actual_key] = list(items)
+                break
+            source_next = source_obj.get(actual_key)
+            next_clone: Dict[str, Any]
+            if isinstance(source_next, dict):
+                next_clone = dict(source_next)
+            else:
+                next_clone = {}
+            clone_cursor[actual_key] = next_clone
+            clone_cursor = next_clone
+            source_cursor = source_next
+
+        return cloned_root
+
+    def _extract_profile_query_projection_value_matched_arrays(
+        self,
+        row: Any,
+        field_path: str,
+        array_rules_by_root: Dict[str, List[Dict[str, Any]]],
+        criteria_mode: str,
+        case_sensitive: bool,
+    ) -> Tuple[Any, bool]:
+        if not isinstance(row, dict):
+            return self._extract_row_value_by_path(row, field_path)
+        parsed = self._profile_query_array_root_and_suffix(field_path)
+        if not parsed:
+            return self._extract_row_value_by_path(row, field_path)
+        root_path, suffix_path = parsed
+        root_rules = array_rules_by_root.get(root_path) or []
+        if not root_rules:
+            return self._extract_row_value_by_path(row, field_path)
+
+        root_items = self._extract_json_path_value(row, f"{root_path}[]")
+        if not isinstance(root_items, list):
+            return None, False
+        if not root_items:
+            return None, False
+
+        mode = str(criteria_mode or "all").strip().lower()
+        if mode not in {"all", "any"}:
+            mode = "all"
+
+        matched_items: List[Any] = []
+        for item in root_items:
+            probe_row = self._profile_query_clone_row_with_array_root(row, root_path, [item])
+            outcomes: List[bool] = []
+            for rule in root_rules:
+                operator = str(rule.get("operator") or "equals").strip().lower() or "equals"
+                right_mode = str(rule.get("right_mode") or "literal").strip().lower() or "literal"
+                right_value = rule.get("right_value")
+                field_name = str(rule.get("field") or "").strip()
+                left_value: Any = None
+                left_found = False
+                if field_name:
+                    left_value, left_found = self._extract_row_value_by_path(probe_row, field_name)
+                if not left_found:
+                    left_value = None
+                if right_mode == "field":
+                    ref_path = str(right_value or "").strip()
+                    if ref_path:
+                        ref_value, ref_found = self._extract_row_value_by_path(probe_row, ref_path)
+                        if ref_found:
+                            right_value = ref_value
+                        else:
+                            right_value = probe_row.get(ref_path)
+                outcomes.append(self._flow_condition_eval_operator(left_value, operator, right_value, case_sensitive))
+
+            if not outcomes:
+                continue
+            item_ok = any(outcomes) if mode == "any" else all(outcomes)
+            if item_ok:
+                matched_items.append(item)
+
+        if not matched_items:
+            return None, False
+
+        if not suffix_path:
+            return matched_items, True
+
+        out_values: List[Any] = []
+        for item in matched_items:
+            extracted = self._extract_json_path_value(item, suffix_path)
+            if isinstance(extracted, list):
+                out_values.extend(extracted)
+            elif extracted is not None:
+                out_values.append(extracted)
+
+        if not out_values:
+            return None, False
+
+        deduped: List[Any] = []
+        seen = set()
+        for value in out_values:
+            token = self._stable_json_token(value)
+            if token in seen:
+                continue
+            seen.add(token)
+            deduped.append(value)
+        return deduped, True
+
+    def _profile_query_sort_scalar(self, value: Any) -> Any:
+        if isinstance(value, list):
+            if not value:
+                return None
+            return self._profile_query_sort_scalar(value[0])
+        if isinstance(value, tuple):
+            if not value:
+                return None
+            return self._profile_query_sort_scalar(value[0])
+        if isinstance(value, dict):
+            try:
+                return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+            except Exception:
+                return str(value)
+        return value
+
+    def _profile_query_compare_values(self, left: Any, right: Any) -> int:
+        if left is None and right is None:
+            return 0
+        if left is None:
+            return 1
+        if right is None:
+            return -1
+
+        left_num = self._to_number(left)
+        right_num = self._to_number(right)
+        if left_num is not None and right_num is not None:
+            if left_num == right_num:
+                return 0
+            return -1 if left_num < right_num else 1
+
+        left_text = str(left).lower()
+        right_text = str(right).lower()
+        if left_text == right_text:
+            return 0
+        return -1 if left_text < right_text else 1
+
+    def _profile_query_sort_rows(
+        self,
+        rows: List[Any],
+        sort_specs: List[Tuple[str, str]],
+    ) -> List[Any]:
+        if not rows or not sort_specs:
+            return rows
+
+        from functools import cmp_to_key
+
+        def _cmp(left_row: Any, right_row: Any) -> int:
+            for field_path, mode in sort_specs:
+                left_val, left_found = self._extract_row_value_by_path(left_row, field_path)
+                right_val, right_found = self._extract_row_value_by_path(right_row, field_path)
+                left_scalar = self._profile_query_sort_scalar(left_val if left_found else None)
+                right_scalar = self._profile_query_sort_scalar(right_val if right_found else None)
+                result = self._profile_query_compare_values(left_scalar, right_scalar)
+                if result == 0:
+                    continue
+                return result if mode == "asc" else -result
+            return 0
+
+        try:
+            return sorted(rows, key=cmp_to_key(_cmp))
+        except Exception:
+            return rows
+
+    def _explode_projected_row_arrays(
+        self,
+        row: Dict[str, Any],
+        *,
+        array_field_roots: Optional[Dict[str, str]] = None,
+        max_combinations: int = 5000,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(row, dict):
+            return [row]
+
+        def _coerce_list(value: Any) -> Optional[List[Any]]:
+            if isinstance(value, list):
+                return value
+            if isinstance(value, tuple):
+                return list(value)
+            if isinstance(value, str):
+                text = str(value or "").strip()
+                if not (text.startswith("[") and text.endswith("]")):
+                    return None
+                try:
+                    parsed_json = json.loads(text)
+                    if isinstance(parsed_json, list):
+                        return parsed_json
+                except Exception:
+                    pass
+                try:
+                    parsed_literal = ast.literal_eval(text)
+                    if isinstance(parsed_literal, (list, tuple)):
+                        return list(parsed_literal)
+                except Exception:
+                    return None
+            return None
+
+        normalized_row: Dict[str, Any] = dict(row)
+        array_fields: List[str] = []
+        for key, val in list(normalized_row.items()):
+            coerced = _coerce_list(val)
+            if coerced is None:
+                continue
+            normalized_row[key] = coerced
+            array_fields.append(key)
+        if not array_fields:
+            return [row]
+
+        root_map = array_field_roots if isinstance(array_field_roots, dict) else {}
+        grouped_fields: Dict[str, List[str]] = {}
+        for field_name in array_fields:
+            root_path = str(root_map.get(field_name) or "").strip()
+            group_key = f"root::{root_path}" if root_path else f"field::{field_name}"
+            grouped_fields.setdefault(group_key, []).append(field_name)
+
+        expanded: List[Dict[str, Any]] = [dict(normalized_row)]
+        for _, group in grouped_fields.items():
+            if len(group) <= 0:
+                continue
+
+            next_rows: List[Dict[str, Any]] = []
+            if len(group) == 1:
+                field_name = group[0]
+                values = normalized_row.get(field_name)
+                if not isinstance(values, list):
+                    continue
+                normalized = values if values else [None]
+                for base in expanded:
+                    for item in normalized:
+                        out = dict(base)
+                        out[field_name] = item
+                        next_rows.append(out)
+                        if len(next_rows) >= max_combinations:
+                            break
+                    if len(next_rows) >= max_combinations:
+                        break
+            else:
+                value_lists: Dict[str, List[Any]] = {}
+                max_len = 0
+                for field_name in group:
+                    vals = normalized_row.get(field_name)
+                    arr = list(vals) if isinstance(vals, list) else []
+                    if not arr:
+                        arr = [None]
+                    value_lists[field_name] = arr
+                    if len(arr) > max_len:
+                        max_len = len(arr)
+                if max_len <= 0:
+                    max_len = 1
+                for base in expanded:
+                    for idx in range(max_len):
+                        out = dict(base)
+                        for field_name in group:
+                            arr = value_lists.get(field_name) or [None]
+                            out[field_name] = arr[idx] if idx < len(arr) else None
+                        next_rows.append(out)
+                        if len(next_rows) >= max_combinations:
+                            break
+                    if len(next_rows) >= max_combinations:
+                        break
+
+            expanded = next_rows
+            if len(expanded) >= max_combinations:
+                break
+        return expanded
 
     def _path_variants(self, field_path: str) -> List[str]:
         import re
@@ -9240,12 +12673,31 @@ END;"""
         except Exception:
             return str(value)
 
-    def _json_safe_value(self, value: Any) -> Any:
+    def _json_safe_value(self, value: Any, _depth: int = 0) -> Any:
+        if _depth > 8:
+            try:
+                text = str(value)
+            except Exception:
+                return None
+            return text[:20000] + ("..." if len(text) > 20000 else "")
         if value is None:
             return None
         if isinstance(value, float) and math.isnan(value):
             return None
-        if isinstance(value, (str, int, float, bool)):
+        if isinstance(value, str):
+            text = value
+            stripped = text.strip()
+            # Preserve large JSON-like payloads for downstream field discovery.
+            if (stripped.startswith("{") and stripped.endswith("}")) or (
+                stripped.startswith("[") and stripped.endswith("]")
+            ):
+                if len(text) > 2_000_000:
+                    return text[:2_000_000]
+                return text
+            if len(text) > 200000:
+                return text[:200000]
+            return text
+        if isinstance(value, (int, float, bool)):
             return value
 
         to_py = getattr(value, "to_pydatetime", None)
@@ -9254,6 +12706,35 @@ END;"""
                 value = to_py()
             except Exception:
                 pass
+
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            try:
+                text = bytes(value).decode("utf-8")
+                if len(text) > 20000:
+                    return text[:20000] + "..."
+                return text
+            except Exception:
+                try:
+                    encoded = base64.b64encode(bytes(value)).decode("ascii")
+                    if len(encoded) > 20000:
+                        encoded = encoded[:20000] + "..."
+                    return f"base64:{encoded}"
+                except Exception:
+                    try:
+                        return str(value)
+                    except Exception:
+                        return None
+
+        # Oracle LOB / stream-like objects
+        if hasattr(value, "read"):
+            try:
+                return self._json_safe_value(value.read(), _depth + 1)
+            except Exception:
+                try:
+                    text = str(value)
+                except Exception:
+                    return None
+                return text[:20000] + ("..." if len(text) > 20000 else "")
 
         if isinstance(value, datetime):
             if (
@@ -9269,10 +12750,14 @@ END;"""
         if isinstance(value, time):
             return value.isoformat()
         if isinstance(value, dict):
-            return {str(k): self._json_safe_value(v) for k, v in value.items()}
+            return {str(k): self._json_safe_value(v, _depth + 1) for k, v in value.items()}
         if isinstance(value, (list, tuple, set)):
-            return [self._json_safe_value(v) for v in value]
-        return str(value)
+            return [self._json_safe_value(v, _depth + 1) for v in value]
+        try:
+            text = str(value)
+        except Exception:
+            return None
+        return text[:20000] + ("..." if len(text) > 20000 else "")
 
     def _split_profile_path(self, path: Any) -> List[Any]:
         import re
@@ -9382,6 +12867,102 @@ END;"""
                     nxt = {}
                     current[key] = nxt
             current = nxt
+
+    def _split_profile_path_with_wildcards(self, path: Any) -> List[Any]:
+        text = str(path or "").strip()
+        if not text:
+            return []
+        out: List[Any] = []
+        for part in text.split("."):
+            token = part.strip()
+            if not token:
+                continue
+            pieces = re.findall(r"([^\[\]]+)|\[(\d*|\*)\]", token)
+            if not pieces:
+                out.append(token)
+                continue
+            for name, idx in pieces:
+                if name:
+                    out.append(name)
+                elif idx == "*" or idx == "":
+                    out.append("*")
+                elif idx:
+                    try:
+                        out.append(int(idx))
+                    except Exception:
+                        out.append(idx)
+        return out
+
+    def _set_profile_path_value_with_wildcards(self, data: Dict[str, Any], path: Any, value: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        tokens = self._split_profile_path_with_wildcards(path)
+        if not tokens:
+            return
+
+        def _walk(current: Any, idx: int) -> None:
+            token = tokens[idx]
+            is_last = idx == len(tokens) - 1
+            next_token = tokens[idx + 1] if not is_last else None
+
+            if token == "*":
+                if not isinstance(current, list):
+                    return
+                if is_last:
+                    for i in range(len(current)):
+                        current[i] = self._json_safe_value(value)
+                    return
+                for i, item in enumerate(list(current)):
+                    child = item
+                    if isinstance(next_token, (int, str)) and (next_token == "*" or isinstance(next_token, int)):
+                        if not isinstance(child, list):
+                            child = []
+                            current[i] = child
+                    else:
+                        if not isinstance(child, dict):
+                            child = {}
+                            current[i] = child
+                    _walk(child, idx + 1)
+                return
+
+            if isinstance(token, int):
+                if not isinstance(current, list):
+                    return
+                while len(current) <= token:
+                    current.append({} if not (next_token == "*" or isinstance(next_token, int)) else [])
+                if is_last:
+                    current[token] = self._json_safe_value(value)
+                    return
+                child = current[token]
+                if next_token == "*" or isinstance(next_token, int):
+                    if not isinstance(child, list):
+                        child = []
+                        current[token] = child
+                else:
+                    if not isinstance(child, dict):
+                        child = {}
+                        current[token] = child
+                _walk(child, idx + 1)
+                return
+
+            key = str(token)
+            if not isinstance(current, dict):
+                return
+            if is_last:
+                current[key] = self._json_safe_value(value)
+                return
+            child = current.get(key)
+            if next_token == "*" or isinstance(next_token, int):
+                if not isinstance(child, list):
+                    child = []
+                    current[key] = child
+            else:
+                if not isinstance(child, dict):
+                    child = {}
+                    current[key] = child
+            _walk(child, idx + 1)
+
+        _walk(data, 0)
 
     def _parse_profile_event_time(self, value: Any) -> Optional[datetime]:
         if value is None:
@@ -10931,6 +14512,26 @@ END;"""
                 return False
             return str(needle or "") in str(haystack)
 
+        def _random() -> float:
+            return random.random()
+
+        def _randint(*args: Any) -> int:
+            # randint()          -> 0..2147483647
+            # randint(max)       -> 0..max
+            # randint(min, max)  -> min..max
+            if len(args) <= 0:
+                lo = 0
+                hi = 2147483647
+            elif len(args) == 1:
+                lo = 0
+                hi = int(_to_float(args[0], 0.0))
+            else:
+                lo = int(_to_float(args[0], 0.0))
+                hi = int(_to_float(args[1], 0.0))
+            if lo > hi:
+                lo, hi = hi, lo
+            return random.randint(lo, hi)
+
         context: Dict[str, Any] = {
             "field": _field,
             "get": _field,
@@ -10950,6 +14551,9 @@ END;"""
             "bool": lambda v: bool(v),
             "round": round,
             "abs": abs,
+            "random": _random,
+            "rand": _random,
+            "randint": _randint,
             "min": _min_value,
             "max": _max_value,
             "sum": _sum,
@@ -10993,14 +14597,14 @@ END;"""
             "cumulative_sum": _running_sum,
             "cumulative_mean": _running_mean,
             "pow": pow,
-            "sqrt": lambda v: math.sqrt(self._to_float(v, 0.0)),
-            "log": lambda v, base=math.e: math.log(max(self._to_float(v, 0.0), 1e-12), base),
-            "exp": lambda v: math.exp(self._to_float(v, 0.0)),
-            "ceil": lambda v: math.ceil(self._to_float(v, 0.0)),
-            "floor": lambda v: math.floor(self._to_float(v, 0.0)),
-            "sin": lambda v: math.sin(self._to_float(v, 0.0)),
-            "cos": lambda v: math.cos(self._to_float(v, 0.0)),
-            "tan": lambda v: math.tan(self._to_float(v, 0.0)),
+            "sqrt": lambda v: math.sqrt(_to_float(v, 0.0)),
+            "log": lambda v, base=math.e: math.log(max(_to_float(v, 0.0), 1e-12), base),
+            "exp": lambda v: math.exp(_to_float(v, 0.0)),
+            "ceil": lambda v: math.ceil(_to_float(v, 0.0)),
+            "floor": lambda v: math.floor(_to_float(v, 0.0)),
+            "sin": lambda v: math.sin(_to_float(v, 0.0)),
+            "cos": lambda v: math.cos(_to_float(v, 0.0)),
+            "tan": lambda v: math.tan(_to_float(v, 0.0)),
             "pi": math.pi,
             "e": math.e,
             "array": lambda *args: list(args),
@@ -11316,6 +14920,16 @@ END;"""
             or ""
         ).strip()
         profile_enabled = bool(config.get("custom_profile_enabled", False))
+        profile_storage_for_override = self._normalize_profile_storage(
+            config.get("custom_profile_storage", "lmdb")
+        )
+        profile_lmdb_env_path_override = str(
+            config.get("custom_profile_lmdb_env_path") or ""
+        ).strip()
+        if profile_enabled and profile_storage_for_override == "lmdb" and profile_lmdb_env_path_override:
+            self._runtime_profile_lmdb_dir_override = profile_lmdb_env_path_override
+        else:
+            self._runtime_profile_lmdb_dir_override = None
         profile_processing_mode = str(config.get("custom_profile_processing_mode") or "batch").strip().lower()
         if profile_processing_mode not in {"batch", "incremental", "incremental_batch"}:
             profile_processing_mode = "batch"
@@ -11338,6 +14952,39 @@ END;"""
         if expression_engine_requested not in {"auto", "python", "polars"}:
             expression_engine_requested = "auto"
         expression_engine_active = "python"
+        custom_fns_version_requested = str(config.get("custom_fns_version") or "v1").strip().lower()
+        if custom_fns_version_requested not in {"v1", "v2"}:
+            custom_fns_version_requested = "v1"
+        raw_fns_v2_enabled = str(os.getenv("FNS_V2_ENABLED", "0")).strip().lower()
+        fns_v2_enabled_global = bool(getattr(self, "_fns_v2_enabled", False)) or raw_fns_v2_enabled in {
+            "1", "true", "yes", "on", "y",
+        }
+        custom_fns_version_active = (
+            "v2"
+            if custom_fns_version_requested == "v2" and fns_v2_enabled_global
+            else "v1"
+        )
+        raw_fns_v2_row_gate_env = str(
+            os.getenv("FNS_V2_ROW_GATE_DEDUPE_ENABLED", "0")
+        ).strip().lower()
+        fns_v2_row_gate_enabled_global = raw_fns_v2_row_gate_env in {
+            "1", "true", "yes", "on", "y",
+        }
+        row_gate_cfg_raw = config.get("custom_fns_v2_row_gate_dedupe_enabled")
+        if row_gate_cfg_raw is None:
+            custom_fns_v2_row_gate_dedupe_enabled = fns_v2_row_gate_enabled_global
+        elif isinstance(row_gate_cfg_raw, bool):
+            custom_fns_v2_row_gate_dedupe_enabled = row_gate_cfg_raw
+        elif isinstance(row_gate_cfg_raw, (int, float)):
+            custom_fns_v2_row_gate_dedupe_enabled = row_gate_cfg_raw != 0
+        elif isinstance(row_gate_cfg_raw, str):
+            custom_fns_v2_row_gate_dedupe_enabled = row_gate_cfg_raw.strip().lower() in {
+                "1", "true", "yes", "on", "y",
+            }
+        else:
+            custom_fns_v2_row_gate_dedupe_enabled = fns_v2_row_gate_enabled_global
+        if custom_fns_version_active != "v2":
+            custom_fns_v2_row_gate_dedupe_enabled = False
 
         result: list = []
         warning_count = 0
@@ -11397,6 +15044,11 @@ END;"""
             if warning_count < 5:
                 logger.warning(text)
             warning_count += 1
+
+        if custom_fns_version_requested == "v2" and not fns_v2_enabled_global:
+            _record_custom_field_warning(
+                "Custom FNS version requested as v2, but FNS_V2_ENABLED is false. Falling back to v1."
+            )
 
         if expression_engine_requested == "polars":
             if _pl is None:
@@ -11692,6 +15344,32 @@ END;"""
                 node_profile_store["stats"] = stats_store
             stats_store["custom_fields_expression_engine_requested"] = expression_engine_requested
             stats_store["custom_fields_expression_engine_active"] = expression_engine_active
+            stats_store["custom_fields_fns_version_requested"] = custom_fns_version_requested
+            stats_store["custom_fields_fns_version_active"] = custom_fns_version_active
+            stats_store["custom_fields_fns_v2_dedupe_key_field"] = str(
+                config.get("custom_fns_v2_dedupe_key_field") or ""
+            ).strip()
+            stats_store["custom_fields_fns_v2_on_duplicate"] = str(
+                config.get("custom_fns_v2_on_duplicate") or "ignore"
+            ).strip().lower()
+            stats_store["custom_fields_fns_v2_normalize"] = str(
+                config.get("custom_fns_v2_normalize") or "upper_trim"
+            ).strip().lower()
+            stats_store["custom_fields_fns_v2_invalid_key"] = str(
+                config.get("custom_fns_v2_invalid_key") or "skip"
+            ).strip().lower()
+            stats_store["custom_fields_fns_v2_row_gate_dedupe_enabled"] = bool(
+                custom_fns_v2_row_gate_dedupe_enabled
+            )
+            if (
+                custom_fns_v2_row_gate_dedupe_enabled
+                and custom_fns_version_active == "v2"
+                and not str(config.get("custom_fns_v2_dedupe_key_field") or "").strip()
+            ):
+                _record_custom_field_warning(
+                    "FNS v2 row-level dedupe gate is enabled, but dedupe key field is empty. "
+                    "Falling back to per-function dedupe."
+                )
             stats_store["custom_fields_append_unique_cache_mode"] = (
                 "persistent" if append_unique_persistent_cache_enabled else "row_local"
             )
@@ -11752,7 +15430,12 @@ END;"""
                 incremental_flush_interval_seconds = default_flush_interval_seconds
             if is_profile_incremental_batch_mode:
                 incremental_flush_interval_seconds = max(0.5, min(incremental_flush_interval_seconds, 10.0))
-                live_persist_enabled = bool(config.get("custom_profile_live_persist", True))
+                # For KV stores, default to compute-first + terminal persist (faster and
+                # similar to deferred persist behavior). Keep Oracle live by default.
+                default_live_persist = bool(profile_storage == "oracle")
+                live_persist_enabled = bool(
+                    config.get("custom_profile_live_persist", default_live_persist)
+                )
             else:
                 incremental_flush_interval_seconds = max(0.1, min(incremental_flush_interval_seconds, 30.0))
                 live_persist_enabled = bool(total_input_rows <= 10000)
@@ -12679,6 +16362,12 @@ END;"""
                         ]
                     return int(item.get("count", 0))
 
+                # Performance: compile and reconcile group_aggregate metric definitions
+                # once per aggregate signature (store_key) per run, instead of per row.
+                # This preserves edit-detection across runs while avoiding heavy
+                # recompilation/signature work on large incremental profile streams.
+                group_aggregate_defs_checked: set = set()
+
                 def _profile_compile_group_metrics(raw_metrics: Any) -> List[Dict[str, Any]]:
                     raw = raw_metrics
                     if isinstance(raw, str):
@@ -12832,38 +16521,40 @@ END;"""
                     # editing an existing group_aggregate expression (e.g. adding
                     # `sum_amount`) keeps using stale metric defs from persisted
                     # profile meta and new metrics never materialize.
-                    compiled_metric_defs = _profile_compile_group_metrics(metrics)
                     metric_defs_current = state.get("metric_defs")
                     metric_defs_changed = False
                     if not isinstance(metric_defs_current, list):
                         metric_defs_current = []
                         metric_defs_changed = True
-                    try:
-                        prev_signature = json.dumps(
-                            metric_defs_current,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            default=str,
-                        )
-                    except Exception:
-                        prev_signature = str(metric_defs_current)
-                    try:
-                        next_signature = json.dumps(
-                            compiled_metric_defs,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            default=str,
-                        )
-                    except Exception:
-                        next_signature = str(compiled_metric_defs)
-                    if prev_signature != next_signature:
-                        metric_defs_changed = True
-                        metric_defs_current = compiled_metric_defs
-                        state["metric_defs"] = metric_defs_current
-                        state["dirty"] = True
-                        state["cached_rows"] = []
-                        state["row_index"] = {}
-                        profile_meta_touched = True
+                    if store_key not in group_aggregate_defs_checked:
+                        compiled_metric_defs = _profile_compile_group_metrics(metrics)
+                        try:
+                            prev_signature = json.dumps(
+                                metric_defs_current,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                default=str,
+                            )
+                        except Exception:
+                            prev_signature = str(metric_defs_current)
+                        try:
+                            next_signature = json.dumps(
+                                compiled_metric_defs,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                default=str,
+                            )
+                        except Exception:
+                            next_signature = str(compiled_metric_defs)
+                        if prev_signature != next_signature:
+                            metric_defs_changed = True
+                            metric_defs_current = compiled_metric_defs
+                            state["metric_defs"] = metric_defs_current
+                            state["dirty"] = True
+                            state["cached_rows"] = []
+                            state["row_index"] = {}
+                            profile_meta_touched = True
+                        group_aggregate_defs_checked.add(store_key)
 
                     metric_specs = _profile_bind_group_metrics(metric_defs_current)
                     if metric_defs_current:
@@ -13033,6 +16724,90 @@ END;"""
                         return [_resolve_profile_dynamic_value(v, profile_meta) for v in value]
                     return value
 
+                fns_v2_extra_context: Dict[str, Any] = {}
+                if custom_fns_version_active == "v2":
+                    if _build_fns_v2_registry is None:
+                        _record_custom_field_warning(
+                            "FNS v2 registry module is unavailable. Falling back to v1 helpers."
+                        )
+                    else:
+                        try:
+                            fns_v2_default_dedupe_options: Dict[str, Any] = {}
+                            dedupe_key_field = str(
+                                config.get("custom_fns_v2_dedupe_key_field") or ""
+                            ).strip()
+                            if dedupe_key_field:
+                                dedupe_value, dedupe_found = self._extract_row_value_by_path(
+                                    row_obj,
+                                    dedupe_key_field,
+                                )
+                                if not dedupe_found and isinstance(row_obj, dict):
+                                    dedupe_value = row_obj.get(dedupe_key_field)
+                                    dedupe_found = dedupe_key_field in row_obj
+                                if dedupe_found and dedupe_value is not None and str(dedupe_value).strip() != "":
+                                    fns_v2_default_dedupe_options["dedupe_key"] = dedupe_value
+
+                            on_duplicate_default = str(
+                                config.get("custom_fns_v2_on_duplicate") or "ignore"
+                            ).strip().lower()
+                            if on_duplicate_default in {"ignore", "skip", "drop"}:
+                                fns_v2_default_dedupe_options["on_duplicate"] = "ignore"
+                            elif on_duplicate_default in {"update", "overwrite", "replace", "keep_latest"}:
+                                fns_v2_default_dedupe_options["on_duplicate"] = "update"
+                            else:
+                                fns_v2_default_dedupe_options["on_duplicate"] = "ignore"
+
+                            normalize_default = str(
+                                config.get("custom_fns_v2_normalize") or "upper_trim"
+                            ).strip().lower()
+                            if normalize_default in {"upper_trim", "trim_upper"}:
+                                fns_v2_default_dedupe_options["normalize"] = "upper_trim"
+                            elif normalize_default in {"lower_trim", "trim_lower"}:
+                                fns_v2_default_dedupe_options["normalize"] = "lower_trim"
+                            elif normalize_default in {"trim", "upper", "lower", "auto"}:
+                                fns_v2_default_dedupe_options["normalize"] = normalize_default
+                            else:
+                                fns_v2_default_dedupe_options["normalize"] = "upper_trim"
+
+                            invalid_key_default = str(
+                                config.get("custom_fns_v2_invalid_key") or "skip"
+                            ).strip().lower()
+                            if invalid_key_default in {"skip", "drop", "ignore"}:
+                                fns_v2_default_dedupe_options["invalid_key"] = "skip"
+                            elif invalid_key_default in {"allow", "count", "use_null", "null"}:
+                                fns_v2_default_dedupe_options["invalid_key"] = "allow"
+                            elif invalid_key_default in {"raise", "error", "strict"}:
+                                fns_v2_default_dedupe_options["invalid_key"] = "raise"
+                            else:
+                                fns_v2_default_dedupe_options["invalid_key"] = "skip"
+
+                            fns_v2_extra_context = _build_fns_v2_registry(
+                                profile_root=active_profile_field.get("name") or "",
+                                working_doc=working_doc,
+                                working_meta=working_meta,
+                                custom_values=custom_values,
+                                resolve_profile_path=_resolve_profile_path,
+                                profile_prev=_profile_prev,
+                                stable_json_token=self._stable_json_token,
+                                to_number=self._to_number,
+                                parse_event_time=self._parse_profile_event_time,
+                                current_event_dt=current_event_dt,
+                                current_event_time=current_event_time,
+                                entity_key=pk_value,
+                                json_safe_value=self._json_safe_value,
+                                v1_inc=_inc,
+                                v1_map_inc=_map_inc,
+                                v1_append_unique=_append_unique,
+                                v1_rolling_update=_rolling_update,
+                                default_dedupe_options=fns_v2_default_dedupe_options,
+                                row_dedupe_gate_enabled=custom_fns_v2_row_gate_dedupe_enabled,
+                            )
+                        except Exception as exc:
+                            fns_v2_extra_context = {}
+                            _record_custom_field_warning(
+                                f"FNS v2 initialization failed. Falling back to v1 helpers: {exc}"
+                            )
+
                 extra_context = {
                     "prev": _profile_prev,
                     "profile_prev": _profile_prev,
@@ -13054,7 +16829,10 @@ END;"""
                     "entity_key": pk_value,
                     "entity_id": pk_value,
                     "event_time": current_event_time,
+                    "custom_fns_version": custom_fns_version_active,
                 }
+                if fns_v2_extra_context:
+                    extra_context.update(fns_v2_extra_context)
                 eval_context = self._build_expression_context(
                     row_obj,
                     custom_values,
@@ -13416,6 +17194,16 @@ END;"""
         execution_context: Optional[Dict[str, Any]] = None,
     ) -> list:
         profile_enabled = bool(config.get("custom_profile_enabled", False))
+        profile_storage_hint = self._normalize_profile_storage(
+            config.get("custom_profile_storage", "lmdb")
+        )
+        profile_lmdb_env_path_override = str(
+            config.get("custom_profile_lmdb_env_path") or ""
+        ).strip()
+        if profile_enabled and profile_storage_hint == "lmdb" and profile_lmdb_env_path_override:
+            self._runtime_profile_lmdb_dir_override = profile_lmdb_env_path_override
+        else:
+            self._runtime_profile_lmdb_dir_override = None
         if not profile_enabled or not custom_specs:
             return self._transform_custom_fields(
                 data,
@@ -13428,9 +17216,7 @@ END;"""
         )
         is_profile_incremental_mode = profile_processing_mode in {"incremental", "incremental_batch"}
 
-        profile_storage = self._normalize_profile_storage(
-            config.get("custom_profile_storage", "lmdb")
-        )
+        profile_storage = profile_storage_hint
 
         primary_key_field = str(
             config.get("custom_primary_key_field")
@@ -13802,10 +17588,14 @@ END;"""
                 local_processed = int(local_stats.get("custom_fields_incremental_processed_rows") or 0)
             except Exception:
                 local_processed = len(partition_rows)
+            if local_processed <= 0 and len(partition_rows) > 0:
+                local_processed = len(partition_rows)
             try:
                 local_validated = int(local_stats.get("custom_fields_incremental_validated_rows") or 0)
             except Exception:
                 local_validated = 0
+            if local_validated <= 0 and local_processed > 0:
+                local_validated = local_processed
             try:
                 local_flush_count = int(local_stats.get("custom_fields_incremental_flush_count") or 0)
             except Exception:
@@ -14103,7 +17893,9 @@ END;"""
                     queue_failed_batches = int(queue_stats_after_enqueue.get("failed_batches") or 0)
                     queue_worker_alive = bool(queue_stats_after_enqueue.get("worker_alive", False))
                     queue_failed_after_enqueue = queue_failed_batches > failed_batches_before
-                    if queue_timed_out or queue_failed_after_enqueue or not queue_worker_alive:
+                    queue_fatal = bool(queue_failed_after_enqueue or not queue_worker_alive)
+                    queue_timeout_only = bool(queue_timed_out and not queue_fatal)
+                    if queue_fatal:
                         logger.warning(
                             f"Oracle profile queue durability fallback for pipeline {pipeline_id}, node {node_id}: "
                             f"timed_out={queue_timed_out}, worker_alive={queue_worker_alive}, "
@@ -14111,6 +17903,12 @@ END;"""
                             "Applying synchronous persist fallback."
                         )
                         persisted = False
+                    elif queue_timeout_only:
+                        logger.warning(
+                            f"Oracle profile queue wait timed out for pipeline {pipeline_id}, node {node_id}: "
+                            f"worker_alive={queue_worker_alive}, failed_batches={queue_failed_batches}. "
+                            "Continuing async persist without sync fallback."
+                        )
                     if isinstance(profile_state_by_node, dict):
                         node_stats = profile_state_by_node.get(node_id, {}).get("stats")
                         if isinstance(node_stats, dict):
@@ -14147,6 +17945,12 @@ END;"""
                             )
                             node_stats["custom_fields_oracle_queue_wait_timed_out"] = bool(
                                 queue_timed_out
+                            )
+                            node_stats["custom_fields_oracle_queue_timeout_only"] = bool(
+                                queue_timeout_only
+                            )
+                            node_stats["custom_fields_oracle_queue_sync_fallback_applied"] = bool(
+                                queue_fatal
                             )
                 else:
                     logger.warning(
@@ -14378,6 +18182,418 @@ END;"""
                 result.append(row)
         return result
 
+    def _parse_duration_seconds(self, raw: Any) -> float:
+        text = str(raw or "").strip().lower()
+        if not text:
+            return 0.0
+        try:
+            return max(0.0, float(text))
+        except Exception:
+            pass
+        normalized_text = text.replace(" ", "")
+        m = re.fullmatch(
+            r"(\d+(?:\.\d+)?)(us|µs|microsecond|microseconds|micro|micros|ms|millisecond|milliseconds|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)",
+            normalized_text,
+        )
+        if not m:
+            return 0.0
+        value = float(m.group(1))
+        unit = m.group(2)
+        if unit in {"us", "µs", "microsecond", "microseconds", "micro", "micros"}:
+            return max(0.0, value / 1_000_000.0)
+        if unit in {"ms", "millisecond", "milliseconds"}:
+            return max(0.0, value / 1000.0)
+        if unit in {"s", "sec", "secs", "second", "seconds"}:
+            return max(0.0, value)
+        if unit in {"m", "min", "mins", "minute", "minutes"}:
+            return max(0.0, value * 60.0)
+        if unit in {"h", "hr", "hrs", "hour", "hours"}:
+            return max(0.0, value * 3600.0)
+        if unit in {"d", "day", "days"}:
+            return max(0.0, value * 86400.0)
+        return 0.0
+
+    def _resolve_delay_seconds(self, config: Dict[str, Any]) -> float:
+        if not isinstance(config, dict):
+            return 0.0
+
+        raw_text = str(config.get("delay") or config.get("delay_text") or "").strip()
+        if raw_text:
+            parsed = self._parse_duration_seconds(raw_text)
+            if parsed > 0:
+                return parsed
+
+        raw_value = config.get("delay_value", config.get("delay_amount", 0))
+        try:
+            value_num = float(raw_value)
+        except Exception:
+            value_num = 0.0
+        value_num = max(0.0, value_num)
+
+        unit = str(config.get("delay_unit", "s") or "s").strip().lower()
+        multipliers = {
+            "us": 1.0 / 1_000_000.0,
+            "µs": 1.0 / 1_000_000.0,
+            "micro": 1.0 / 1_000_000.0,
+            "micros": 1.0 / 1_000_000.0,
+            "ms": 1.0 / 1000.0,
+            "s": 1.0,
+            "sec": 1.0,
+            "secs": 1.0,
+            "m": 60.0,
+            "min": 60.0,
+            "mins": 60.0,
+            "h": 3600.0,
+            "hr": 3600.0,
+            "hrs": 3600.0,
+            "d": 86400.0,
+            "day": 86400.0,
+            "days": 86400.0,
+        }
+        factor = multipliers.get(unit, 1.0)
+        return max(0.0, value_num * factor)
+
+    async def _sleep_abortable(
+        self,
+        delay_seconds: float,
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        delay_seconds = max(0.0, float(delay_seconds))
+        if delay_seconds <= 0:
+            return
+
+        should_abort_cb = (
+            execution_context.get("should_abort")
+            if isinstance(execution_context, dict) and callable(execution_context.get("should_abort"))
+            else None
+        )
+        raise_if_aborted_cb = (
+            execution_context.get("raise_if_aborted")
+            if isinstance(execution_context, dict) and callable(execution_context.get("raise_if_aborted"))
+            else None
+        )
+
+        def _raise_if_aborted() -> None:
+            if callable(raise_if_aborted_cb):
+                raise_if_aborted_cb()
+                return
+            if callable(should_abort_cb):
+                try:
+                    if bool(should_abort_cb()):
+                        raise ExecutionAbortedError("Execution aborted by user.")
+                except ExecutionAbortedError:
+                    raise
+                except Exception:
+                    pass
+
+        remaining = float(delay_seconds)
+        tick = 0.2
+        while remaining > 0:
+            _raise_if_aborted()
+            sleep_for = min(tick, remaining)
+            await asyncio.sleep(sleep_for)
+            remaining -= sleep_for
+        _raise_if_aborted()
+
+    async def _transform_delay(
+        self,
+        data: list,
+        config: Dict[str, Any],
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> list:
+        if not isinstance(data, list):
+            return data
+
+        emit_node_progress = None
+        progress_every = 500
+        if isinstance(execution_context, dict):
+            if callable(execution_context.get("emit_node_progress")):
+                emit_node_progress = execution_context.get("emit_node_progress")
+            try:
+                progress_every = int(execution_context.get("node_progress_every") or progress_every)
+            except Exception:
+                progress_every = 500
+        progress_every = max(1, min(progress_every, 50000))
+
+        def _emit(message: str, processed: int, validated: int, output_rows: int) -> None:
+            if not callable(emit_node_progress):
+                return
+            try:
+                emit_node_progress({
+                    "message": message,
+                    "processed_rows": int(processed),
+                    "validated_rows": int(validated),
+                    "output_rows": int(output_rows),
+                })
+            except Exception:
+                pass
+
+        if bool(config.get("passthrough_on_receive", False)):
+            _emit(
+                "⟳ Delay Transform… passthrough enabled, forwarding immediately",
+                len(data),
+                len(data),
+                len(data),
+            )
+            return data
+
+        delay_scope = str(config.get("delay_scope") or "batch").strip().lower()
+        if delay_scope not in {"batch", "message"}:
+            delay_scope = "batch"
+
+        delay_seconds = self._resolve_delay_seconds(config)
+        max_delay_seconds = 7.0 * 86400.0
+        delay_seconds = max(0.0, min(float(delay_seconds), max_delay_seconds))
+        if delay_seconds <= 0:
+            _emit(
+                "⟳ Delay Transform… delay=0, forwarding immediately",
+                len(data),
+                len(data),
+                len(data),
+            )
+            return data
+
+        if delay_scope == "message":
+            output: List[Any] = []
+            total_rows = len(data)
+            _emit(
+                f"⟳ Delay Transform… delaying each message by {delay_seconds:.6f}s",
+                0,
+                0,
+                0,
+            )
+            for idx, row in enumerate(data, start=1):
+                await self._sleep_abortable(delay_seconds, execution_context=execution_context)
+                output.append(row)
+                if (idx % progress_every) == 0 or idx == total_rows:
+                    _emit(
+                        f"⟳ Delay Transform… processed {idx:,}/{total_rows:,} delayed messages",
+                        idx,
+                        idx,
+                        len(output),
+                    )
+            return output
+
+        _emit(
+            f"⟳ Delay Transform… waiting {delay_seconds:.6f}s before forwarding batch",
+            0,
+            0,
+            0,
+        )
+        await self._sleep_abortable(delay_seconds, execution_context=execution_context)
+        _emit(
+            f"✓ Delay Transform — forwarded {len(data):,} rows after {delay_seconds:.6f}s",
+            len(data),
+            len(data),
+            len(data),
+        )
+        return data
+
+    def _transform_cursor_processor(
+        self,
+        data: list,
+        config: dict,
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> list:
+        if not isinstance(data, list) or not data:
+            return data
+
+        cursor_field = str(config.get("cursor_field") or "").strip()
+        if not cursor_field:
+            return data
+
+        dedupe_field = str(config.get("dedupe_field") or "").strip()
+        processing_mode_raw = str(config.get("processing_mode") or "batch").strip().lower()
+        # Backward compatible alias: one_by_one -> row_by_row.
+        processing_mode = "row_by_row" if processing_mode_raw == "one_by_one" else processing_mode_raw
+        if processing_mode not in {"batch", "row_by_row"}:
+            processing_mode = "batch"
+        row_by_row_mode = processing_mode == "row_by_row"
+        on_duplicate = str(config.get("on_duplicate") or "drop").strip().lower()
+        on_late = str(config.get("on_late") or "drop").strip().lower()
+        on_missing_cursor = str(config.get("on_missing_cursor") or "keep").strip().lower()
+        status_field = str(config.get("status_field") or "_cursor_status").strip() or "_cursor_status"
+        enforce_monotonic = bool(config.get("enforce_monotonic", True))
+        allow_equal_cursor = bool(config.get("allow_equal_cursor", False))
+        allowed_lateness_seconds = self._parse_duration_seconds(config.get("allowed_lateness", "0s"))
+        try:
+            dedupe_cache_size = int(config.get("dedupe_cache_size", 10000) or 10000)
+        except Exception:
+            dedupe_cache_size = 10000
+        dedupe_cache_size = max(100, min(dedupe_cache_size, 500000))
+
+        node_id = ""
+        pipeline_state: Dict[str, Any] = {}
+        if isinstance(execution_context, dict):
+            node_id = str(execution_context.get("node_id") or "").strip()
+            candidate_state = execution_context.get("pipeline_state")
+            if isinstance(candidate_state, dict):
+                pipeline_state = candidate_state
+
+        if not node_id or not pipeline_state:
+            # Stateless fallback keeps behavior deterministic even outside pipeline execution.
+            node_id = "__stateless__"
+            pipeline_state = {}
+
+        cursor_state_root = pipeline_state.setdefault("cursor_processor_state", {})
+        if not isinstance(cursor_state_root, dict):
+            cursor_state_root = {}
+            pipeline_state["cursor_processor_state"] = cursor_state_root
+        node_state = cursor_state_root.setdefault(node_id, {})
+        if not isinstance(node_state, dict):
+            node_state = {}
+            cursor_state_root[node_id] = node_state
+
+        last_cursor = node_state.get("last_cursor")
+        max_seen_dt = node_state.get("max_seen_dt")
+        if not isinstance(max_seen_dt, (int, float)):
+            max_seen_dt = None
+
+        dedupe_map = node_state.get("dedupe_map")
+        if not isinstance(dedupe_map, dict):
+            dedupe_map = {}
+
+        emit_node_progress = None
+        progress_every = 500
+        if isinstance(execution_context, dict):
+            if callable(execution_context.get("emit_node_progress")):
+                emit_node_progress = execution_context.get("emit_node_progress")
+            try:
+                progress_every = int(execution_context.get("node_progress_every") or progress_every)
+            except Exception:
+                progress_every = 500
+        progress_every = max(1, min(progress_every, 50000))
+        total_input_rows = int(len(data))
+
+        result: List[Any] = []
+        accepted = 0
+        dropped_old = 0
+        dropped_late = 0
+        dropped_dup = 0
+        missing_cursor = 0
+        late_kept = 0
+
+        def _emit_progress_if_needed(processed_rows: int) -> None:
+            if (not row_by_row_mode) or (not callable(emit_node_progress)):
+                return
+            if processed_rows <= 0:
+                return
+            if (processed_rows % progress_every) != 0 and processed_rows != total_input_rows:
+                return
+            try:
+                emit_node_progress({
+                    "processed_rows": int(processed_rows),
+                    "validated_rows": int(accepted),
+                    "message": (
+                        f"⟳ Cursor Processor… processed={processed_rows:,} "
+                        f"accepted={accepted:,} dropped={max(0, processed_rows - accepted):,}"
+                    ),
+                })
+            except Exception:
+                pass
+
+        for idx, row in enumerate(data, start=1):
+            if not isinstance(row, dict):
+                result.append(row)
+                _emit_progress_if_needed(idx)
+                continue
+
+            cursor_value, cursor_found = self._extract_row_value_by_path(row, cursor_field)
+            if (not cursor_found) or cursor_value is None:
+                missing_cursor += 1
+                if on_missing_cursor == "drop":
+                    _emit_progress_if_needed(idx)
+                    continue
+                if on_missing_cursor == "tag":
+                    tagged = dict(row)
+                    tagged[status_field] = "missing_cursor"
+                    result.append(tagged)
+                else:
+                    result.append(row)
+                _emit_progress_if_needed(idx)
+                continue
+
+            token_type, token_value = self._comparison_token(cursor_value)
+            if token_type == "dt" and isinstance(token_value, (int, float)):
+                max_seen_dt = token_value if max_seen_dt is None else max(float(max_seen_dt), float(token_value))
+
+            is_late = False
+            if (
+                allowed_lateness_seconds > 0
+                and token_type == "dt"
+                and isinstance(token_value, (int, float))
+                and isinstance(max_seen_dt, (int, float))
+            ):
+                watermark = float(max_seen_dt) - float(allowed_lateness_seconds)
+                if float(token_value) < watermark:
+                    is_late = True
+
+            if is_late:
+                if on_late == "drop":
+                    dropped_late += 1
+                    _emit_progress_if_needed(idx)
+                    continue
+                if on_late == "tag":
+                    tagged = dict(row)
+                    tagged[status_field] = "late"
+                    row = tagged
+                late_kept += 1
+
+            if dedupe_field:
+                dedupe_value, dedupe_found = self._extract_row_value_by_path(row, dedupe_field)
+                if dedupe_found and dedupe_value is not None:
+                    dedupe_key = str(dedupe_value)
+                    prev_cursor_for_key = dedupe_map.get(dedupe_key)
+                    if prev_cursor_for_key is not None and self._compare_values(cursor_value, prev_cursor_for_key) == 0:
+                        if on_duplicate == "drop":
+                            dropped_dup += 1
+                            _emit_progress_if_needed(idx)
+                            continue
+                        tagged = dict(row)
+                        tagged[status_field] = "duplicate"
+                        row = tagged
+                    dedupe_map[dedupe_key] = cursor_value
+                    while len(dedupe_map) > dedupe_cache_size:
+                        try:
+                            oldest = next(iter(dedupe_map))
+                        except Exception:
+                            break
+                        dedupe_map.pop(oldest, None)
+
+            if enforce_monotonic and last_cursor is not None:
+                cmp = self._compare_values(cursor_value, last_cursor)
+                older_than_checkpoint = cmp < 0 or (cmp == 0 and not allow_equal_cursor)
+                if older_than_checkpoint:
+                    dropped_old += 1
+                    _emit_progress_if_needed(idx)
+                    continue
+
+            last_cursor = self._max_value(last_cursor, cursor_value)
+            accepted += 1
+            result.append(row)
+            _emit_progress_if_needed(idx)
+
+        node_state["last_cursor"] = last_cursor
+        if isinstance(max_seen_dt, (int, float)):
+            node_state["max_seen_dt"] = float(max_seen_dt)
+        node_state["dedupe_map"] = dedupe_map
+        node_state["stats"] = {
+            "accepted": int(accepted),
+            "dropped_old": int(dropped_old),
+            "dropped_late": int(dropped_late),
+            "dropped_duplicate": int(dropped_dup),
+            "missing_cursor": int(missing_cursor),
+            "late_kept": int(late_kept),
+            "input_rows": int(len(data)),
+            "output_rows": int(len(result)),
+            "cursor_field": cursor_field,
+            "dedupe_field": dedupe_field,
+            "allowed_lateness_seconds": float(allowed_lateness_seconds),
+            "processing_mode": processing_mode,
+        }
+
+        return result
+
     async def _transform_python(self, data: list, config: dict) -> list:
         script = config.get("script", "output = input_data")
         local_vars = {"input_data": data, "output": data}
@@ -14422,6 +18638,895 @@ END;"""
                     items.append((new_key, v))
             return dict(items)
         return [flatten(row) for row in data]
+
+    def _parse_business_workflow_array_config(self, raw_value: Any) -> List[Any]:
+        if isinstance(raw_value, list):
+            return raw_value
+        if isinstance(raw_value, str):
+            text = raw_value.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+                return parsed if isinstance(parsed, list) else []
+            except Exception:
+                return []
+        return []
+
+    def _normalize_business_workflow_nodes(self, raw_nodes: Any) -> List[Dict[str, Any]]:
+        rows = self._parse_business_workflow_array_config(raw_nodes)
+        normalized: List[Dict[str, Any]] = []
+        for idx, item in enumerate(rows):
+            if not isinstance(item, dict):
+                continue
+            node_id = str(item.get("id") or f"bw_node_{idx + 1}").strip()
+            if not node_id:
+                continue
+            node_data = item.get("data") if isinstance(item.get("data"), dict) else {}
+            node_type = str(
+                node_data.get("nodeType")
+                or item.get("nodeType")
+                or item.get("type")
+                or ""
+            ).strip()
+            if not node_type:
+                continue
+            label = str(
+                node_data.get("label")
+                or item.get("label")
+                or node_type
+            ).strip() or node_type
+            node_cfg = node_data.get("config")
+            if not isinstance(node_cfg, dict):
+                node_cfg = item.get("config") if isinstance(item.get("config"), dict) else {}
+            normalized.append({
+                "id": node_id,
+                "node_type": node_type,
+                "label": label,
+                "config": dict(node_cfg),
+            })
+        return normalized
+
+    def _normalize_business_workflow_edges(self, raw_edges: Any) -> List[Dict[str, str]]:
+        rows = self._parse_business_workflow_array_config(raw_edges)
+        normalized: List[Dict[str, str]] = []
+        seen: set[str] = set()
+        for idx, item in enumerate(rows):
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("source") or "").strip()
+            target = str(item.get("target") or "").strip()
+            if not source or not target:
+                continue
+            source_handle = str(item.get("sourceHandle") or "output").strip() or "output"
+            target_handle = str(item.get("targetHandle") or "input").strip() or "input"
+            uniq = f"{source}|{source_handle}|{target}|{target_handle}"
+            if uniq in seen:
+                continue
+            seen.add(uniq)
+            normalized.append({
+                "id": str(item.get("id") or f"bw_edge_{idx + 1}_{source}_{target}").strip(),
+                "source": source,
+                "target": target,
+                "source_handle": source_handle,
+                "target_handle": target_handle,
+            })
+        return normalized
+
+    async def _transform_business_workflow(
+        self,
+        data: list,
+        config: dict,
+        incoming_by_source: Optional[Dict[str, list]] = None,
+        incoming_order: Optional[List[str]] = None,
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> list:
+        rows = data if isinstance(data, list) else []
+        node_cfg = config if isinstance(config, dict) else {}
+        workflow_mode = str(node_cfg.get("workflow_mode") or "embedded").strip().lower()
+        embedded_enabled = self._parse_bool_like(
+            node_cfg.get("embedded_workflow_enabled", True),
+            True,
+        )
+
+        node_warnings = execution_context.get("node_warnings") if isinstance(execution_context, dict) else None
+
+        def _warn(msg: str) -> None:
+            logger.warning(msg)
+            if isinstance(node_warnings, list) and msg not in node_warnings:
+                node_warnings.append(msg)
+
+        if workflow_mode == "external":
+            workflow_id = str(node_cfg.get("workflow_id") or "").strip()
+            _warn(
+                f"Business workflow node external mode is not executed inline by ETL engine. "
+                f"Workflow '{workflow_id or 'N/A'}' passed through upstream rows."
+            )
+            return rows
+
+        if not embedded_enabled:
+            return rows
+
+        child_nodes = self._normalize_business_workflow_nodes(node_cfg.get("embedded_workflow_nodes"))
+        child_edges = self._normalize_business_workflow_edges(node_cfg.get("embedded_workflow_edges"))
+        if not child_nodes:
+            return rows
+
+        include_input_payload = self._parse_bool_like(
+            node_cfg.get("include_input_payload", True),
+            True,
+        )
+        invoke_mode = str(node_cfg.get("invoke_mode") or "once_per_batch").strip().lower()
+        per_row_mode = invoke_mode in {"per_row", "row_by_row", "one_by_one"}
+        try:
+            max_instances = int(node_cfg.get("max_instances", 10000) or 10000)
+        except Exception:
+            max_instances = 10000
+        max_instances = max(1, min(max_instances, 100000))
+
+        custom_vars_raw = node_cfg.get("custom_variables_json")
+        custom_vars: Dict[str, Any] = {}
+        if isinstance(custom_vars_raw, dict):
+            custom_vars = dict(custom_vars_raw)
+        elif isinstance(custom_vars_raw, str):
+            text = custom_vars_raw.strip()
+            if text:
+                try:
+                    parsed_vars = json.loads(text)
+                    if isinstance(parsed_vars, dict):
+                        custom_vars = parsed_vars
+                except Exception:
+                    _warn("Business workflow custom variables JSON is invalid; ignored.")
+
+        parent_node_id = ""
+        parent_node_label = "Business Workflow"
+        if isinstance(execution_context, dict):
+            parent_node_id = str(execution_context.get("node_id") or "").strip()
+            parent_node_label = str(
+                execution_context.get("node_label")
+                or execution_context.get("node_id")
+                or parent_node_label
+            ).strip() or parent_node_label
+
+        emit_node_progress = (
+            execution_context.get("emit_node_progress")
+            if isinstance(execution_context, dict) and callable(execution_context.get("emit_node_progress"))
+            else None
+        )
+        raise_if_aborted = (
+            execution_context.get("raise_if_aborted")
+            if isinstance(execution_context, dict) and callable(execution_context.get("raise_if_aborted"))
+            else None
+        )
+
+        def _build_input_rows(base_rows: List[Any], instance_index: int, instance_total: int) -> List[Any]:
+            prepared: List[Any] = []
+            for raw in base_rows:
+                if isinstance(raw, dict):
+                    row_obj = dict(raw)
+                else:
+                    row_obj = {"value": raw}
+                if custom_vars:
+                    row_obj.setdefault("_workflow_vars", self._json_safe_value(custom_vars))
+                prepared.append(row_obj)
+            return prepared
+
+        if per_row_mode:
+            iterable_rows = rows if include_input_payload else ([{} for _ in rows] if rows else [])
+            total_instances = min(len(iterable_rows), max_instances)
+            if len(iterable_rows) > total_instances:
+                _warn(
+                    f"Business workflow invoke_mode=per_row hit max_instances={max_instances}. "
+                    f"Processed {total_instances} row instance(s), skipped {len(iterable_rows) - total_instances}."
+                )
+            out_rows: List[Any] = []
+            for idx in range(total_instances):
+                if callable(raise_if_aborted):
+                    raise_if_aborted()
+                input_rows = _build_input_rows([iterable_rows[idx]], idx + 1, total_instances)
+                node_id_prefix = (
+                    f"{parent_node_id or 'business_workflow'}::i{idx + 1}"
+                )
+                child_output = await self._run_business_workflow_embedded(
+                    input_rows=input_rows,
+                    child_nodes=child_nodes,
+                    child_edges=child_edges,
+                    execution_context=execution_context,
+                    node_id_prefix=node_id_prefix,
+                )
+                if isinstance(child_output, list):
+                    out_rows.extend(child_output)
+                elif child_output is not None:
+                    out_rows.append(child_output)
+                if callable(emit_node_progress):
+                    try:
+                        emit_node_progress({
+                            "processed_rows": idx + 1,
+                            "validated_rows": idx + 1,
+                            "output_rows": len(out_rows),
+                            "message": (
+                                f"⟳ Running {parent_node_label}… child instances "
+                                f"{idx + 1:,}/{total_instances:,}"
+                            ),
+                        })
+                    except Exception:
+                        pass
+            return out_rows
+
+        if include_input_payload:
+            base_rows = rows
+        else:
+            # Keep one synthetic row so child logic can still run via _workflow_vars.
+            base_rows = [{}]
+        input_rows = _build_input_rows(base_rows, 1, 1)
+        node_id_prefix = parent_node_id or "business_workflow"
+        return await self._run_business_workflow_embedded(
+            input_rows=input_rows,
+            child_nodes=child_nodes,
+            child_edges=child_edges,
+            execution_context=execution_context,
+            node_id_prefix=node_id_prefix,
+        )
+
+    async def _run_business_workflow_embedded(
+        self,
+        input_rows: List[Any],
+        child_nodes: List[Dict[str, Any]],
+        child_edges: List[Dict[str, str]],
+        execution_context: Optional[Dict[str, Any]] = None,
+        node_id_prefix: str = "business_workflow",
+    ) -> list:
+        if not child_nodes:
+            return input_rows if isinstance(input_rows, list) else []
+
+        depth = 0
+        if isinstance(execution_context, dict):
+            try:
+                depth = int(execution_context.get("business_workflow_depth") or 0)
+            except Exception:
+                depth = 0
+        if depth >= 8:
+            raise ValueError("Nested business workflow depth limit reached (max 8).")
+
+        child_nodes_by_id: Dict[str, Dict[str, Any]] = {}
+        for item in child_nodes:
+            if not isinstance(item, dict):
+                continue
+            node_id = str(item.get("id") or "").strip()
+            if not node_id:
+                continue
+            child_nodes_by_id[node_id] = item
+        if not child_nodes_by_id:
+            return input_rows if isinstance(input_rows, list) else []
+
+        in_degree: Dict[str, int] = {node_id: 0 for node_id in child_nodes_by_id.keys()}
+        outgoing_edges: Dict[str, List[Dict[str, str]]] = {node_id: [] for node_id in child_nodes_by_id.keys()}
+        incoming_edges: Dict[str, List[Dict[str, str]]] = {node_id: [] for node_id in child_nodes_by_id.keys()}
+        filtered_edges: List[Dict[str, str]] = []
+        for edge in child_edges:
+            if not isinstance(edge, dict):
+                continue
+            source = str(edge.get("source") or "").strip()
+            target = str(edge.get("target") or "").strip()
+            if source not in child_nodes_by_id or target not in child_nodes_by_id:
+                continue
+            filtered_edge = {
+                "id": str(edge.get("id") or "").strip(),
+                "source": source,
+                "target": target,
+                "source_handle": str(edge.get("source_handle") or "output").strip() or "output",
+                "target_handle": str(edge.get("target_handle") or "input").strip() or "input",
+            }
+            filtered_edges.append(filtered_edge)
+            outgoing_edges[source].append(filtered_edge)
+            incoming_edges[target].append(filtered_edge)
+            in_degree[target] = int(in_degree.get(target, 0)) + 1
+
+        queue: List[str] = [node_id for node_id, deg in in_degree.items() if deg == 0]
+        topo_order: List[str] = []
+        while queue:
+            node_id = queue.pop(0)
+            topo_order.append(node_id)
+            for edge in outgoing_edges.get(node_id, []):
+                target = str(edge.get("target") or "").strip()
+                if target not in in_degree:
+                    continue
+                in_degree[target] = int(in_degree.get(target, 0)) - 1
+                if in_degree[target] == 0:
+                    queue.append(target)
+        if len(topo_order) != len(child_nodes_by_id):
+            seen = set(topo_order)
+            for node in child_nodes:
+                node_id = str(node.get("id") or "").strip()
+                if node_id and node_id not in seen:
+                    topo_order.append(node_id)
+
+        child_results: Dict[str, list] = {}
+        child_results_by_handle: Dict[str, Dict[str, list]] = {}
+        emit_embedded_node_event = (
+            execution_context.get("emit_embedded_node_event")
+            if isinstance(execution_context, dict) and callable(execution_context.get("emit_embedded_node_event"))
+            else None
+        )
+
+        raise_if_aborted = (
+            execution_context.get("raise_if_aborted")
+            if isinstance(execution_context, dict) and callable(execution_context.get("raise_if_aborted"))
+            else None
+        )
+
+        def _sample_rows(rows: Any, limit: int = 5) -> List[Dict[str, Any]]:
+            if limit <= 0 or not isinstance(rows, list) or not rows:
+                return []
+            sample: List[Dict[str, Any]] = []
+            for item in rows:
+                if len(sample) >= limit:
+                    break
+                safe = self._json_safe_value(item)
+                if isinstance(safe, dict):
+                    sample.append(safe)
+                elif safe is not None:
+                    sample.append({"value": safe})
+            return sample
+
+        for node_id in topo_order:
+            if callable(raise_if_aborted):
+                raise_if_aborted()
+            node_payload = child_nodes_by_id.get(node_id) or {}
+            node_type = str(node_payload.get("node_type") or "").strip()
+            node_label = str(node_payload.get("label") or node_id).strip() or node_id
+            node_cfg = node_payload.get("config") if isinstance(node_payload.get("config"), dict) else {}
+
+            upstream_data: List[Any] = []
+            incoming_by_source: Dict[str, list] = {}
+            incoming_order: List[str] = []
+            seen_bindings: set[tuple[str, str]] = set()
+            target_incoming = incoming_edges.get(node_id, [])
+            for edge in target_incoming:
+                source_id = str(edge.get("source") or "").strip()
+                source_handle = str(edge.get("source_handle") or "output").strip() or "output"
+                if source_id not in child_results:
+                    continue
+                source_node_payload = child_nodes_by_id.get(source_id) or {}
+                source_node_type = str(source_node_payload.get("node_type") or "").strip()
+                source_node_cfg = (
+                    source_node_payload.get("config")
+                    if isinstance(source_node_payload.get("config"), dict)
+                    else {}
+                )
+                source_routing_mode = str(
+                    source_node_cfg.get("condition_routing_mode") or ""
+                ).strip().lower()
+                if (
+                    source_handle == "output"
+                    and source_node_type == "condition_node"
+                    and source_routing_mode == "case"
+                ):
+                    # CASE routes should use explicit case_* handles only.
+                    continue
+                binding = (source_id, source_handle)
+                if binding in seen_bindings:
+                    continue
+                seen_bindings.add(binding)
+                source_bundle = child_results_by_handle.get(source_id) or {}
+                source_rows = source_bundle.get(source_handle)
+                if source_rows is None and source_handle == "output":
+                    source_rows = child_results.get(source_id)
+                if source_rows is None:
+                    source_rows = []
+                if not isinstance(source_rows, list):
+                    source_rows = [source_rows] if source_rows is not None else []
+                existing_rows = incoming_by_source.get(source_id, [])
+                existing_rows.extend(source_rows)
+                incoming_by_source[source_id] = existing_rows
+                if source_id not in incoming_order:
+                    incoming_order.append(source_id)
+                upstream_data.extend(source_rows)
+
+            if not target_incoming:
+                parent_rows = input_rows if isinstance(input_rows, list) else []
+                upstream_data = list(parent_rows)
+                incoming_by_source = {"__parent__": list(parent_rows)}
+                incoming_order = ["__parent__"]
+
+            child_exec_ctx = dict(execution_context or {})
+            child_exec_ctx["node_id"] = f"{node_id_prefix}::{node_id}"
+            child_exec_ctx["node_label"] = node_label
+            child_exec_ctx["business_workflow_depth"] = depth + 1
+            child_exec_ctx["business_workflow_parent_node_id"] = node_id_prefix
+            child_runtime_node_id = str(child_exec_ctx.get("node_id") or "").strip() or f"{node_id_prefix}::{node_id}"
+
+            if callable(emit_embedded_node_event):
+                maybe_coro = emit_embedded_node_event({
+                    "type": "node_start",
+                    "node_id": child_runtime_node_id,
+                    "node_label": node_label,
+                    "status": "running",
+                    "rows": len(upstream_data) if isinstance(upstream_data, list) else 0,
+                    "message": f"⟳ Running {node_label}…",
+                    "input_sample": _sample_rows(upstream_data),
+                    "output_sample": [],
+                })
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
+
+            try:
+                output = await self._execute_node(
+                    node_type,
+                    node_cfg,
+                    upstream_data,
+                    incoming_by_source=incoming_by_source,
+                    incoming_order=incoming_order,
+                    execution_context=child_exec_ctx,
+                )
+            except Exception as child_exc:
+                if callable(emit_embedded_node_event):
+                    maybe_coro = emit_embedded_node_event({
+                        "type": "node_error",
+                        "node_id": child_runtime_node_id,
+                        "node_label": node_label,
+                        "status": "error",
+                        "rows": 0,
+                        "message": f"✗ {node_label} failed: {child_exc}",
+                        "input_sample": _sample_rows(upstream_data),
+                        "output_sample": [],
+                    })
+                    if asyncio.iscoroutine(maybe_coro):
+                        await maybe_coro
+                raise
+
+            if node_type == "condition_node":
+                routing_mode = str(node_cfg.get("condition_routing_mode") or "").strip().lower()
+                condition_input_rows = upstream_data if isinstance(upstream_data, list) else []
+                if routing_mode == "case":
+                    case_split = self._flow_condition_case_routes_split(condition_input_rows, node_cfg)
+                    output_rows = case_split.get("output")
+                    output = output_rows if isinstance(output_rows, list) else []
+                    child_results_by_handle[node_id] = case_split
+                else:
+                    true_rows, false_rows = self._flow_condition_split(condition_input_rows, node_cfg)
+                    output = true_rows
+                    child_results_by_handle[node_id] = {
+                        "output": true_rows,
+                        "output_false": false_rows,
+                    }
+            else:
+                child_results_by_handle[node_id] = {
+                    "output": output if isinstance(output, list) else [],
+                    "output_false": [],
+                }
+            child_results[node_id] = output if isinstance(output, list) else []
+
+            if callable(emit_embedded_node_event):
+                output_rows = output if isinstance(output, list) else []
+                maybe_coro = emit_embedded_node_event({
+                    "type": "node_success",
+                    "node_id": child_runtime_node_id,
+                    "node_label": node_label,
+                    "status": "success",
+                    "rows": len(output_rows),
+                    "message": (
+                        f"✓ {node_label} — {len(output_rows):,} rows"
+                        if output_rows
+                        else f"✓ {node_label} completed"
+                    ),
+                    "input_sample": _sample_rows(upstream_data),
+                    "output_sample": _sample_rows(output_rows),
+                })
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
+
+        sink_ids = [
+            node_id
+            for node_id in topo_order
+            if len(outgoing_edges.get(node_id, [])) == 0
+        ]
+        if not sink_ids and topo_order:
+            sink_ids = [topo_order[-1]]
+
+        final_rows: List[Any] = []
+        for sink_id in sink_ids:
+            sink_rows = child_results.get(sink_id)
+            if isinstance(sink_rows, list):
+                final_rows.extend(sink_rows)
+        return final_rows
+
+    def _business_to_number(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return float(int(value))
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip().replace(",", "")
+        if not text:
+            return None
+        try:
+            return float(text)
+        except Exception:
+            return None
+
+    def _business_parse_recipient_list(self, raw_value: str) -> List[str]:
+        text = str(raw_value or "").strip()
+        if not text:
+            return []
+        parts = re.split(r"[;,]", text)
+        unique: List[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            email = str(part or "").strip()
+            if not email:
+                continue
+            lowered = email.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            unique.append(email)
+        return unique
+
+    def _business_parse_subject_body(self, text: str) -> Tuple[Optional[str], str]:
+        raw = str(text or "").strip()
+        if not raw:
+            return None, ""
+
+        subject: Optional[str] = None
+        body = raw
+        subject_match = re.search(r"(?im)^\s*subject\s*:\s*(.+)$", raw)
+        if subject_match:
+            subject = str(subject_match.group(1) or "").strip() or None
+
+        body_match = re.search(r"(?is)^\s*(?:subject\s*:.*\n)?\s*body\s*:\s*(.+)$", raw)
+        if body_match:
+            body = str(body_match.group(1) or "").strip()
+        elif subject_match:
+            trimmed = re.sub(r"(?im)^\s*subject\s*:.+\n?", "", raw, count=1).strip()
+            body = re.sub(r"(?im)^\s*body\s*:\s*", "", trimmed, count=1).strip() or trimmed
+        return subject, body
+
+    def _business_compose_upstream_text(self, rows: List[dict]) -> str:
+        clean_rows = [r for r in rows if isinstance(r, dict)]
+        for row in clean_rows:
+            for key in ("response", "body", "summary", "text", "message"):
+                value = row.get(key)
+                if value is None:
+                    continue
+                rendered = str(value).strip()
+                if rendered:
+                    return rendered
+        if clean_rows:
+            try:
+                sample = json.dumps(clean_rows[:1], ensure_ascii=False, default=str)
+            except Exception:
+                sample = str(clean_rows[0])
+            return sample[:4000]
+        return ""
+
+    def _business_config_value(
+        self,
+        config: Dict[str, Any],
+        key: str,
+        env_names: List[str],
+        default: Any = "",
+    ) -> Any:
+        value = config.get(key) if isinstance(config, dict) else None
+        if value not in (None, ""):
+            return value
+        for env_name in env_names:
+            env_value = os.getenv(env_name)
+            if env_value not in (None, ""):
+                return env_value
+        return default
+
+    def _business_prepare_whatsapp_text(self, content: str) -> str:
+        text = str(content or "").strip()
+        if not text:
+            return ""
+        # Strip markdown fence when present.
+        fenced = re.match(r"(?is)^```(?:html?)?\s*(.*?)\s*```$", text)
+        if fenced:
+            text = str(fenced.group(1) or "").strip()
+        # Basic HTML tag strip for text mode.
+        text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", text)
+        text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+        text = re.sub(r"(?is)<[^>]+>", "", text)
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        return text.strip()
+
+    def _business_lookup_template_value(self, context: Dict[str, Any], token: str) -> Any:
+        current: Any = context
+        for part in [p for p in str(token or "").split(".") if p]:
+            if not isinstance(current, dict):
+                return ""
+            current = current.get(part)
+        return current
+
+    def _business_render_whatsapp_placeholders(self, value: Any, context: Dict[str, Any]) -> Any:
+        if isinstance(value, str):
+            template = str(value)
+
+            def _replace(match: re.Match[str]) -> str:
+                token = str(match.group(1) or "").strip()
+                replacement = self._business_lookup_template_value(context, token)
+                if isinstance(replacement, (dict, list)):
+                    try:
+                        return json.dumps(replacement, ensure_ascii=False)
+                    except Exception:
+                        return str(replacement)
+                return "" if replacement is None else str(replacement)
+
+            return re.sub(r"\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}", _replace, template)
+        if isinstance(value, list):
+            return [self._business_render_whatsapp_placeholders(item, context) for item in value]
+        if isinstance(value, dict):
+            return {str(k): self._business_render_whatsapp_placeholders(v, context) for k, v in value.items()}
+        return value
+
+    def _transform_business_analytics(self, data: list, _config: dict) -> list:
+        clean_rows = [r for r in data if isinstance(r, dict)]
+        if not clean_rows:
+            return [{
+                "summary": "No rows available for analytics.",
+                "row_count": 0,
+                "column_count": 0,
+                "numeric_column_count": 0,
+            }]
+
+        columns = list(clean_rows[0].keys())
+        numeric_columns: Dict[str, List[float]] = {}
+        for col in columns:
+            vals: List[float] = []
+            for row in clean_rows:
+                val = self._business_to_number(row.get(col))
+                if val is not None:
+                    vals.append(val)
+            if vals:
+                numeric_columns[col] = vals
+
+        summary = {
+            "summary": (
+                f"Processed {len(clean_rows)} rows across {len(columns)} columns; "
+                f"{len(numeric_columns)} numeric columns profiled."
+            ),
+            "row_count": len(clean_rows),
+            "column_count": len(columns),
+            "numeric_column_count": len(numeric_columns),
+        }
+        analytics_rows: List[Dict[str, Any]] = [summary]
+        for col, values in list(numeric_columns.items())[:12]:
+            col_sum = float(sum(values))
+            col_avg = col_sum / max(len(values), 1)
+            analytics_rows.append({
+                "metric": col,
+                "count": len(values),
+                "min": round(min(values), 6),
+                "max": round(max(values), 6),
+                "avg": round(col_avg, 6),
+                "sum": round(col_sum, 6),
+            })
+        return analytics_rows
+
+    def _dest_business_mail_writer(self, config: dict, data: list) -> list:
+        to_email_raw = str(config.get("to_email") or "").strip()
+        recipients = self._business_parse_recipient_list(to_email_raw)
+        if not recipients:
+            raise ValueError("Mail Writer requires at least one recipient in 'To'.")
+
+        configured_subject = str(config.get("subject") or "").strip()
+        body_template = str(config.get("body_template") or "").strip()
+        upstream_text = self._business_compose_upstream_text([row for row in data if isinstance(row, dict)])
+        body_source = body_template or upstream_text or "No upstream content available."
+        parsed_subject, parsed_body = self._business_parse_subject_body(body_source)
+        subject = configured_subject or parsed_subject or "Business workflow recommendation"
+        body_text = parsed_body or body_source
+
+        send_mode = str(config.get("send_mode") or "draft").strip().lower() or "draft"
+        should_send = send_mode in {"send", "enabled", "on"}
+        generated_at = datetime.utcnow().isoformat()
+
+        if should_send:
+            smtp_host = str(self._business_config_value(config, "smtp_host", ["BUSINESS_SMTP_HOST", "SMTP_HOST"], "")).strip()
+            smtp_user = str(self._business_config_value(config, "smtp_username", ["BUSINESS_SMTP_USERNAME", "SMTP_USERNAME"], "")).strip()
+            smtp_password = str(self._business_config_value(config, "smtp_password", ["BUSINESS_SMTP_PASSWORD", "SMTP_PASSWORD"], "")).strip()
+            from_email = str(
+                self._business_config_value(
+                    config,
+                    "from_email",
+                    ["BUSINESS_SMTP_FROM_EMAIL", "SMTP_FROM_EMAIL", "BUSINESS_MAIL_FROM_EMAIL"],
+                    smtp_user,
+                )
+            ).strip()
+            smtp_security = str(
+                self._business_config_value(config, "smtp_security", ["BUSINESS_SMTP_SECURITY", "SMTP_SECURITY"], "tls")
+            ).strip().lower() or "tls"
+            if smtp_security not in {"tls", "ssl", "none"}:
+                smtp_security = "tls"
+            port_default = 465 if smtp_security == "ssl" else 587
+            smtp_port_num = self._business_to_number(
+                self._business_config_value(config, "smtp_port", ["BUSINESS_SMTP_PORT", "SMTP_PORT"], port_default)
+            )
+            smtp_port = int(smtp_port_num) if smtp_port_num else int(port_default)
+
+            if not smtp_host:
+                raise ValueError("SMTP host is not configured.")
+            if not from_email:
+                raise ValueError("Sender email is not configured.")
+            if smtp_user and not smtp_password:
+                raise ValueError("SMTP password is required when SMTP username is provided.")
+            if smtp_host.lower() == "smtp.gmail.com" and smtp_password:
+                smtp_password = re.sub(r"\s+", "", smtp_password)
+
+            message = EmailMessage()
+            message["From"] = from_email
+            message["To"] = ", ".join(recipients)
+            message["Subject"] = subject
+            message.set_content(body_text)
+
+            if smtp_security == "ssl":
+                with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30, context=ssl.create_default_context()) as server:
+                    if smtp_user:
+                        server.login(smtp_user, smtp_password)
+                    server.send_message(message)
+            else:
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+                    server.ehlo()
+                    if smtp_security == "tls":
+                        server.starttls(context=ssl.create_default_context())
+                        server.ehlo()
+                    if smtp_user:
+                        server.login(smtp_user, smtp_password)
+                    server.send_message(message)
+            status = "sent"
+        else:
+            status = "draft"
+
+        return [{
+            "to": ", ".join(recipients),
+            "subject": subject,
+            "body": body_text,
+            "status": status,
+            "generated_at": generated_at,
+            "source_rows": len([row for row in data if isinstance(row, dict)]),
+        }]
+
+    async def _dest_business_whatsapp_sender(self, config: dict, data: list) -> list:
+        to_phone = re.sub(r"\D+", "", str(config.get("to_phone") or config.get("to") or "").strip())
+        if not to_phone:
+            raise ValueError("WhatsApp Sender requires a recipient phone number in 'To Phone Number'.")
+
+        send_mode = str(config.get("send_mode") or "draft").strip().lower() or "draft"
+        message_type = str(config.get("message_type") or "template").strip().lower() or "template"
+        if message_type not in {"template", "text"}:
+            message_type = "template"
+        template_name = str(config.get("template_name") or "hello_world").strip() or "hello_world"
+        template_language = str(config.get("template_language") or "en_US").strip() or "en_US"
+        preview_url = bool(config.get("preview_url", False))
+        request_payload_json = str(config.get("request_payload_json") or "").strip()
+
+        upstream_text = self._business_compose_upstream_text([row for row in data if isinstance(row, dict)])
+        text_body = self._business_prepare_whatsapp_text(
+            str(config.get("text_body") or "").strip() or upstream_text or "No upstream content available."
+        )
+        generated_at = datetime.utcnow().isoformat()
+
+        context = {
+            "to_phone": to_phone,
+            "message_type": message_type,
+            "template_name": template_name,
+            "template_language": template_language,
+            "text_body": text_body,
+            "upstream_text": upstream_text,
+            "generated_at": generated_at,
+        }
+
+        payload: Dict[str, Any]
+        if request_payload_json:
+            try:
+                parsed_payload = json.loads(request_payload_json)
+            except Exception as exc:
+                raise ValueError(f"Request JSON Payload is invalid JSON: {exc}") from exc
+            if not isinstance(parsed_payload, dict):
+                raise ValueError("Request JSON Payload must be a JSON object.")
+            rendered_payload = self._business_render_whatsapp_placeholders(parsed_payload, context)
+            payload = rendered_payload if isinstance(rendered_payload, dict) else {}
+            payload.setdefault("messaging_product", "whatsapp")
+            payload.setdefault("to", to_phone)
+            payload.setdefault("type", message_type)
+        else:
+            payload = {"messaging_product": "whatsapp", "to": to_phone}
+            if message_type == "template":
+                payload["type"] = "template"
+                payload["template"] = {
+                    "name": template_name,
+                    "language": {"code": template_language},
+                }
+            else:
+                payload["type"] = "text"
+                payload["text"] = {"preview_url": preview_url, "body": text_body}
+
+        if send_mode not in {"send", "enabled", "on"}:
+            return [{
+                "to": to_phone,
+                "status": "draft",
+                "message_type": str(payload.get("type") or message_type),
+                "request_payload": payload,
+                "generated_at": generated_at,
+                "source_rows": len([row for row in data if isinstance(row, dict)]),
+            }]
+
+        phone_number_id = str(
+            self._business_config_value(
+                config,
+                "phone_number_id",
+                ["BUSINESS_WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_PHONE_NUMBER_ID"],
+                "",
+            )
+        ).strip()
+        access_token = str(
+            self._business_config_value(
+                config,
+                "access_token",
+                ["BUSINESS_WHATSAPP_ACCESS_TOKEN", "WHATSAPP_ACCESS_TOKEN", "META_WHATSAPP_ACCESS_TOKEN"],
+                "",
+            )
+        ).strip()
+        api_version = str(
+            self._business_config_value(
+                config,
+                "api_version",
+                ["BUSINESS_WHATSAPP_API_VERSION", "WHATSAPP_API_VERSION"],
+                "v25.0",
+            )
+        ).strip().strip("/") or "v25.0"
+        base_url = str(
+            self._business_config_value(
+                config,
+                "base_url",
+                ["BUSINESS_WHATSAPP_BASE_URL", "WHATSAPP_BASE_URL"],
+                "https://graph.facebook.com",
+            )
+        ).strip().rstrip("/")
+
+        if not phone_number_id:
+            raise ValueError("WhatsApp phone number id is missing.")
+        if not access_token:
+            raise ValueError("WhatsApp access token is missing.")
+
+        endpoint = f"{base_url}/{api_version}/{phone_number_id}/messages"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+        import httpx
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(endpoint, headers=headers, json=payload)
+
+        response_text = str(response.text or "").strip()
+        if response.status_code >= 400:
+            compact_detail = response_text if len(response_text) <= 500 else f"{response_text[:500]}..."
+            raise ValueError(f"WhatsApp send failed ({response.status_code}): {compact_detail}")
+
+        try:
+            response_json = response.json()
+        except Exception:
+            response_json = {}
+
+        message_id: Optional[str] = None
+        messages = response_json.get("messages") if isinstance(response_json, dict) else None
+        if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+            message_id = str(messages[0].get("id") or "").strip() or None
+
+        return [{
+            "to": str(payload.get("to") or to_phone),
+            "status": "sent",
+            "message_type": str(payload.get("type") or message_type),
+            "request_payload": payload,
+            "whatsapp_response": response_json if isinstance(response_json, dict) else {},
+            "generated_at": generated_at,
+            "endpoint": endpoint,
+            "api_status_code": int(response.status_code),
+            "message_id": message_id,
+            "source_rows": len([row for row in data if isinstance(row, dict)]),
+        }]
 
     def _flow_condition(self, data: list, config: dict) -> list:
         return self._transform_filter(data, config)
@@ -14529,9 +19634,64 @@ END;"""
         if node_type == "csv_destination":
             out_path = self._resolve_output_path(config.get("file_path", ""), ".csv")
             delimiter = config.get("delimiter", ",") or ","
-            df.to_csv(out_path, index=False, sep=delimiter)
+            encoding = str(config.get("encoding", "utf-8") or "utf-8").strip() or "utf-8"
+            include_header = bool(config.get("include_header", True))
+            write_mode = str(config.get("write_mode", "replace") or "replace").strip().lower()
+            flush_mode = str(config.get("flush_mode", "batch") or "batch").strip().lower()
+            if write_mode not in {"replace", "append"}:
+                write_mode = "replace"
+            if flush_mode not in {"batch", "row"}:
+                flush_mode = "batch"
+
+            file_exists = os.path.exists(out_path)
+            file_non_empty = False
+            if file_exists:
+                try:
+                    file_non_empty = os.path.getsize(out_path) > 0
+                except Exception:
+                    file_non_empty = False
+
+            append_mode = write_mode == "append"
+            open_mode = "a" if append_mode else "w"
+            write_header = include_header and (not append_mode or not file_non_empty)
+
+            if flush_mode == "row":
+                columns = [str(col) for col in df.columns]
+                records = df.to_dict(orient="records")
+                with open(out_path, open_mode, encoding=encoding, newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=columns, delimiter=delimiter, extrasaction="ignore")
+                    if write_header:
+                        writer.writeheader()
+                    for row in records:
+                        _raise_if_aborted()
+                        if isinstance(row, dict):
+                            normalized_row: Dict[str, Any] = {}
+                            for col in columns:
+                                value = row.get(col)
+                                try:
+                                    normalized_row[col] = "" if pd.isna(value) else value
+                                except Exception:
+                                    normalized_row[col] = value
+                            writer.writerow(normalized_row)
+                        else:
+                            writer.writerow({col: "" for col in columns})
+            else:
+                df.to_csv(
+                    out_path,
+                    index=False,
+                    sep=delimiter,
+                    mode=open_mode,
+                    header=write_header,
+                    encoding=encoding,
+                )
             logger.info(f"✅ CSV written: {out_path} ({len(df)} rows)")
-            return [{"status": "written", "rows": len(df), "path": out_path}]
+            return [{
+                "status": "written",
+                "rows": len(df),
+                "path": out_path,
+                "write_mode": write_mode,
+                "flush_mode": flush_mode,
+            }]
 
         elif node_type == "json_destination":
             out_path = self._resolve_output_path(config.get("file_path", ""), ".json")
@@ -14660,6 +19820,12 @@ END;"""
         elif node_type == "rest_api_destination":
             return await self._dest_rest_api(config, data)
 
+        elif node_type == "business_mail_writer":
+            return self._dest_business_mail_writer(config, data)
+
+        elif node_type == "business_whatsapp_sender":
+            return await self._dest_business_whatsapp_sender(config, data)
+
         # Fallback
         logger.warning(f"No handler for destination {node_type}, skipping write")
         return [{"status": "skipped", "rows": len(data), "destination": node_type}]
@@ -14762,8 +19928,8 @@ END;"""
         execution_context: Optional[Dict[str, Any]] = None,
     ) -> list:
         engine = None
+        engine_cache_key: Optional[str] = None
         try:
-            from sqlalchemy import create_engine
             from sqlalchemy import types as sql_types
             from sqlalchemy.dialects import oracle as oracle_types
             import pandas as pd
@@ -14960,8 +20126,32 @@ END;"""
                     pass
                 return value
 
+            def _is_missing_key_value(value: Any) -> bool:
+                normalized = _normalize_value(value)
+                if normalized is None:
+                    return True
+                if isinstance(normalized, str) and normalized.strip() == "":
+                    return True
+                return False
+
+            def _is_oracle_unique_violation(exc: Exception) -> bool:
+                text = str(exc or "")
+                if "ORA-00001" in text:
+                    return True
+                lower = text.lower()
+                return "unique constraint" in lower and "violated" in lower
+
             url = self._build_sqlalchemy_oracle_url(config)
-            engine = create_engine(url)
+            reuse_connection_cfg = config.get(
+                "oracle_reuse_connection",
+                os.getenv("ORACLE_DESTINATION_REUSE_CONNECTION", "1"),
+            )
+            reuse_connection = _parse_bool_like(reuse_connection_cfg, True)
+            engine, engine_cache_key = self._get_oracle_destination_engine(
+                url,
+                execution_context=execution_context,
+                reuse_connection=reuse_connection,
+            )
             table = config.get("table", "ETL_OUTPUT")
             schema = config.get("schema") or None
             if_exists = (config.get("if_exists", "append") or "append").lower()
@@ -14970,6 +20160,11 @@ END;"""
             operation = str(config.get("oracle_operation", "insert") or "insert").strip().lower()
             if operation not in {"insert", "update", "upsert"}:
                 operation = "insert"
+            skip_null_key_rows_cfg = config.get(
+                "oracle_skip_null_key_rows",
+                os.getenv("ORACLE_DESTINATION_SKIP_NULL_KEY_ROWS", "1"),
+            )
+            skip_null_key_rows = _parse_bool_like(skip_null_key_rows_cfg, True)
 
             df_to_write = df.copy()
             mappings = _parse_oracle_mappings(config.get("oracle_column_mappings"))
@@ -14991,21 +20186,37 @@ END;"""
                 )
 
             rename_map: Dict[str, str] = {}
+            rename_map_by_source_name: Dict[str, str] = {}
             mapped_sources: List[str] = []
+            input_columns = [str(col) for col in df_to_write.columns]
+            input_columns_by_lower: Dict[str, str] = {}
+            for col in input_columns:
+                key = str(col or "").strip().lower()
+                if key and key not in input_columns_by_lower:
+                    input_columns_by_lower[key] = col
             for row in enabled_mappings:
                 src = str(row.get("source") or "").strip()
                 dst = str(row.get("destination") or "").strip()
-                if not src or not dst or src not in df_to_write.columns:
+                if not src or not dst:
                     continue
-                rename_map[src] = dst
-                mapped_sources.append(src)
+                src_resolved = src if src in df_to_write.columns else input_columns_by_lower.get(src.lower())
+                if not src_resolved or src_resolved not in df_to_write.columns:
+                    continue
+                rename_map[src_resolved] = dst
+                rename_map_by_source_name[src] = dst
+                mapped_sources.append(src_resolved)
 
             mapped_sources = list(dict.fromkeys(mapped_sources))
             has_mapping_config = len(mappings) > 0
             if has_mapping_config:
                 if not mapped_sources:
+                    incoming_cols_preview = ", ".join(input_columns[:25])
+                    if len(input_columns) > 25:
+                        incoming_cols_preview += ", ..."
                     raise RuntimeError(
-                        "Oracle mapping is configured, but no enabled source->destination mapping matched input columns."
+                        "Oracle mapping is configured, but no enabled source->destination mapping matched input columns. "
+                        f"Mapped sources={ [str(m.get('source') or '').strip() for m in enabled_mappings] } | "
+                        f"Incoming columns={incoming_cols_preview}"
                     )
                 # When mapping is configured, treat it as explicit selection:
                 # only mapped columns are inserted to avoid accidental writes.
@@ -15019,7 +20230,10 @@ END;"""
             key_columns = _parse_key_columns(config.get("oracle_key_columns"))
             if rename_map and key_columns:
                 # Allow key columns configured with original source names.
-                key_columns = [rename_map.get(col, col) for col in key_columns]
+                key_columns = [
+                    rename_map_by_source_name.get(col, rename_map.get(col, col))
+                    for col in key_columns
+                ]
                 key_columns = _parse_key_columns(key_columns)
 
             dtype_map = {}
@@ -15040,6 +20254,41 @@ END;"""
             rows_written = 0
             updated_rows = 0
             inserted_rows = 0
+            skipped_null_key_rows = 0
+            df_to_write_prepared = df_to_write.copy()
+            # Oracle driver cannot bind raw Python dict/list/set values.
+            # Normalize all values once so INSERT path (to_sql) remains robust.
+            for col in list(df_to_write_prepared.columns):
+                series = df_to_write_prepared[col]
+                if (
+                    pd.api.types.is_object_dtype(series)
+                    or pd.api.types.is_string_dtype(series)
+                    or pd.api.types.is_datetime64_any_dtype(series)
+                ):
+                    df_to_write_prepared[col] = series.map(_normalize_value)
+
+            # Optional guard for insert mode:
+            # if key columns are configured, skip rows having null/blank key values
+            # instead of failing the whole batch with ORA-01400.
+            if operation == "insert" and key_columns:
+                missing_insert_keys = [col for col in key_columns if col not in df_to_write_prepared.columns]
+                if missing_insert_keys:
+                    raise RuntimeError(
+                        "Key columns not found in mapped output: " + ", ".join(missing_insert_keys[:20])
+                    )
+                keep_mask = pd.Series([True] * len(df_to_write_prepared), index=df_to_write_prepared.index)
+                for col in key_columns:
+                    series = df_to_write_prepared[col]
+                    col_mask = series.notna()
+                    if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+                        col_mask = col_mask & series.map(
+                            lambda v: not (isinstance(v, str) and v.strip() == "")
+                        )
+                    keep_mask = keep_mask & col_mask
+                original_len = int(len(df_to_write_prepared))
+                if original_len > 0:
+                    df_to_write_prepared = df_to_write_prepared.loc[keep_mask].copy()
+                    skipped_null_key_rows = max(0, original_len - int(len(df_to_write_prepared)))
 
             with engine.begin() as conn:
                 _raise_if_aborted()
@@ -15048,7 +20297,7 @@ END;"""
                     conn.exec_driver_sql(stmt)
 
                 if operation == "insert":
-                    df_to_write.to_sql(
+                    df_to_write_prepared.to_sql(
                         table,
                         conn,
                         if_exists=if_exists,
@@ -15056,7 +20305,7 @@ END;"""
                         schema=schema,
                         dtype=dtype_map,
                     )
-                    rows_written = len(df_to_write)
+                    rows_written = len(df_to_write_prepared)
                     inserted_rows = rows_written
                 else:
                     if not key_columns:
@@ -15069,7 +20318,7 @@ END;"""
                             "Key columns not found in mapped output: " + ", ".join(missing_keys[:20])
                         )
                     set_columns = [col for col in df_to_write.columns if col not in key_columns]
-                    if not set_columns:
+                    if not set_columns and operation == "update":
                         raise RuntimeError(
                             f"Oracle operation '{operation}' requires at least one non-key column to update."
                         )
@@ -15078,13 +20327,15 @@ END;"""
                     if schema:
                         table_expr = f"{_quote_ident(schema)}.{table_expr}"
 
-                    set_pairs = [f"{_quote_ident(col)} = :s_{idx}" for idx, col in enumerate(set_columns)]
-                    where_pairs = [f"{_quote_ident(col)} = :k_{idx}" for idx, col in enumerate(key_columns)]
-                    update_sql = (
-                        f"UPDATE {table_expr} "
-                        f"SET {', '.join(set_pairs)} "
-                        f"WHERE {' AND '.join(where_pairs)}"
-                    )
+                    update_sql = None
+                    if set_columns:
+                        set_pairs = [f"{_quote_ident(col)} = :s_{idx}" for idx, col in enumerate(set_columns)]
+                        where_pairs = [f"{_quote_ident(col)} = :k_{idx}" for idx, col in enumerate(key_columns)]
+                        update_sql = (
+                            f"UPDATE {table_expr} "
+                            f"SET {', '.join(set_pairs)} "
+                            f"WHERE {' AND '.join(where_pairs)}"
+                        )
 
                     insert_cols = list(df_to_write.columns)
                     insert_col_expr = ", ".join(_quote_ident(col) for col in insert_cols)
@@ -15092,8 +20343,8 @@ END;"""
                     insert_sql = f"INSERT INTO {table_expr} ({insert_col_expr}) VALUES ({insert_bind_expr})"
 
                     normalized_rows = (
-                        df_to_write
-                        .where(pd.notnull(df_to_write), None)
+                        df_to_write_prepared
+                        .where(pd.notnull(df_to_write_prepared), None)
                         .to_dict(orient="records")
                     )
                     for row_idx, rec in enumerate(normalized_rows):
@@ -15101,36 +20352,53 @@ END;"""
                             _raise_if_aborted()
                         null_keys = [k for k in key_columns if _normalize_value(rec.get(k)) is None]
                         if null_keys:
+                            if skip_null_key_rows:
+                                skipped_null_key_rows += 1
+                                continue
                             raise RuntimeError(
                                 f"Row {row_idx + 1} has null key values for {', '.join(null_keys)}; cannot {operation}."
                             )
 
-                        update_params: Dict[str, Any] = {}
-                        for idx, col in enumerate(set_columns):
-                            update_params[f"s_{idx}"] = _normalize_value(rec.get(col))
-                        for idx, col in enumerate(key_columns):
-                            update_params[f"k_{idx}"] = _normalize_value(rec.get(col))
+                        if update_sql is not None:
+                            update_params: Dict[str, Any] = {}
+                            for idx, col in enumerate(set_columns):
+                                update_params[f"s_{idx}"] = _normalize_value(rec.get(col))
+                            for idx, col in enumerate(key_columns):
+                                update_params[f"k_{idx}"] = _normalize_value(rec.get(col))
 
-                        result = conn.exec_driver_sql(update_sql, update_params)
-                        affected = int(result.rowcount or 0)
-                        if affected > 0:
-                            updated_rows += affected
-                            rows_written += affected
-                        elif operation == "upsert":
+                            result = conn.exec_driver_sql(update_sql, update_params)
+                            affected = int(result.rowcount or 0)
+                            if affected > 0:
+                                updated_rows += affected
+                                rows_written += affected
+                                continue
+
+                        if operation == "upsert":
                             insert_params = {
                                 f"i_{idx}": _normalize_value(rec.get(col))
                                 for idx, col in enumerate(insert_cols)
                             }
-                            conn.exec_driver_sql(insert_sql, insert_params)
-                            inserted_rows += 1
-                            rows_written += 1
+                            try:
+                                conn.exec_driver_sql(insert_sql, insert_params)
+                                inserted_rows += 1
+                                rows_written += 1
+                            except Exception as insert_exc:
+                                if _is_oracle_unique_violation(insert_exc):
+                                    continue
+                                raise
 
                 for stmt in post_statements:
                     _raise_if_aborted()
                     conn.exec_driver_sql(stmt)
 
+            status = "loaded"
+            note = ""
+            if skipped_null_key_rows > 0:
+                note = f"Skipped {int(skipped_null_key_rows)} row(s) with null key values."
+                if rows_written <= 0:
+                    status = "loaded_with_warnings"
             return [{
-                "status": "loaded",
+                "status": status,
                 "rows": rows_written,
                 "table": table,
                 "schema": schema,
@@ -15141,15 +20409,17 @@ END;"""
                 "mapped_only": mapped_only,
                 "updated_rows": updated_rows,
                 "inserted_rows": inserted_rows,
+                "skipped_null_key_rows": int(skipped_null_key_rows),
                 "pre_sql_statements": len(pre_statements),
                 "post_sql_statements": len(post_statements),
+                "note": note,
             }]
         except ExecutionAbortedError:
             raise
         except Exception as e:
             raise RuntimeError(f"Oracle write failed: {e}")
         finally:
-            if engine is not None:
+            if engine is not None and engine_cache_key is None:
                 try:
                     engine.dispose()
                 except Exception:
@@ -15163,11 +20433,18 @@ END;"""
     ) -> list:
         exec_ctx = execution_context if isinstance(execution_context, dict) else {}
         queue_worker_mode = bool(exec_ctx.get("oracle_destination_queue_worker", False))
+        force_sync_cfg = config.get(
+            "oracle_destination_force_sync",
+            config.get("oracle_force_sync", os.getenv("ORACLE_DESTINATION_FORCE_SYNC", "1")),
+        )
+        force_sync = bool(self._parse_bool_like(force_sync_cfg, True))
         async_enabled_cfg = config.get(
             "oracle_destination_async_enabled",
-            config.get("oracle_async_enabled", os.getenv("ORACLE_DESTINATION_ASYNC_ENABLED", "1")),
+            config.get("oracle_async_enabled", os.getenv("ORACLE_DESTINATION_ASYNC_ENABLED", "0")),
         )
-        async_enabled = bool(self._parse_bool_like(async_enabled_cfg, True))
+        async_enabled = bool(self._parse_bool_like(async_enabled_cfg, False))
+        if force_sync:
+            async_enabled = False
 
         if async_enabled and not queue_worker_mode:
             pipeline_id = str(exec_ctx.get("pipeline_id") or "").strip() or "__pipeline__"

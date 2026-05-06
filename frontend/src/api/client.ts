@@ -297,9 +297,24 @@ const api = {
     return r.data
   },
 
-  executePipeline: async (id: string) => {
+  executePipeline: async (
+    id: string,
+    payload?: {
+      nodes?: Array<Record<string, unknown>>
+      edges?: Array<Record<string, unknown>>
+    },
+  ) => {
     try {
-      const r = await http.post(`/api/pipelines/${id}/execute`)
+      const body = (
+        payload
+        && (Array.isArray(payload.nodes) || Array.isArray(payload.edges))
+      )
+        ? {
+          nodes: Array.isArray(payload.nodes) ? payload.nodes : undefined,
+          edges: Array.isArray(payload.edges) ? payload.edges : undefined,
+        }
+        : undefined
+      const r = await http.post(`/api/pipelines/${id}/execute`, body)
       return r.data
     } catch (err: any) {
       const status = Number(err?.response?.status || 0)
@@ -373,6 +388,22 @@ const api = {
         : String(err?.message || 'Failed to detect source fields')
       throw new Error(message)
     }
+  },
+
+  validateConditionFlow: async (payload: {
+    condition_config: Record<string, unknown>
+    rows?: Array<Record<string, unknown>>
+    validation_source?: 'upstream_preview' | 'profile_store' | 'source_scan' | 'rows'
+    max_rows?: number
+    sample_rows?: number
+    pipeline_id?: string
+    profile_node_id?: string
+    profile_node_config?: Record<string, unknown>
+    source_node_type?: string
+    source_node_config?: Record<string, unknown>
+  }) => {
+    const r = await http.post('/api/condition/validate', payload)
+    return r.data
   },
 
   uploadLmdbEnv: async (files: File[]) => {
@@ -460,6 +491,25 @@ const api = {
       const message = typeof detail === 'string'
         ? detail
         : String(err?.message || 'Failed to fetch LMDB path options')
+      throw new Error(message)
+    }
+  },
+
+  createLmdbEnvPath: async (payload: {
+    env_path: string
+    initialize?: boolean
+  }) => {
+    try {
+      const r = await http.post('/api/lmdb/env-path-create', {
+        env_path: String(payload?.env_path || '').trim(),
+        initialize: payload?.initialize !== false,
+      })
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to create LMDB environment path')
       throw new Error(message)
     }
   },
@@ -869,6 +919,8 @@ const api = {
     options?: {
       includeLogs?: boolean
       logTail?: number
+      logAfter?: number
+      includeLogSamples?: boolean
     },
   ) => {
     try {
@@ -877,6 +929,8 @@ const api = {
           include_node_results: false,
           include_logs: options?.includeLogs ?? true,
           log_tail: options?.logTail ?? 300,
+          log_after: typeof options?.logAfter === 'number' ? options.logAfter : -1,
+          include_log_samples: options?.includeLogSamples ?? false,
         },
       })
       return r.data
@@ -893,6 +947,21 @@ const api = {
     } catch (error) {
       if (!isOfflineError(error)) throw error
       return { execution_id: id, status: 'cancelled', aborted: true, offline: true }
+    }
+  },
+
+  setExecutionNodeEnabled: async (executionId: string, nodeId: string, nodeEnabled: boolean) => {
+    const exec = String(executionId || '').trim()
+    const nid = String(nodeId || '').trim()
+    if (!exec || !nid) return { execution_id: exec, node_id: nid, node_enabled: nodeEnabled, applied: false }
+    try {
+      const r = await http.post(`/api/executions/${exec}/nodes/${encodeURIComponent(nid)}/enabled`, {
+        node_enabled: Boolean(nodeEnabled),
+      })
+      return r.data
+    } catch (error) {
+      if (!isOfflineError(error)) throw error
+      return { execution_id: exec, node_id: nid, node_enabled: nodeEnabled, applied: false, offline: true }
     }
   },
 
@@ -919,6 +988,18 @@ const api = {
     audit_logs_total: 0,
     generated_at: new Date().toISOString(),
   }),
+
+  getAppFeatureFlags: () => safeGet(async () => {
+    const r = await http.get('/api/settings/app/feature-flags')
+    return r.data
+  }, {
+    fns_v2_enabled: false,
+  }),
+
+  updateAppFeatureFlags: async (payload: Record<string, unknown>) => {
+    const r = await http.put('/api/settings/app/feature-flags', payload)
+    return r.data
+  },
 
   cleanupSqliteData: async (payload: Record<string, unknown>) => {
     const r = await http.post('/api/settings/sqlite/cleanup', payload)

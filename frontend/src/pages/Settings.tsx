@@ -1,8 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Card, Typography, Space, Switch, Select, Input, Button, Divider, Tag, Row, Col, Checkbox, Popconfirm, message } from 'antd'
+import { Card, Typography, Space, Switch, Select, Input, InputNumber, Button, Divider, Tag, Row, Col, Checkbox, Popconfirm, message } from 'antd'
 import { SettingOutlined, BellOutlined, SecurityScanOutlined, DatabaseOutlined, ApiOutlined } from '@ant-design/icons'
 import { useThemeStore } from '../store/themeStore'
 import api from '../api/client'
+import {
+  EDITOR_AUTOSAVE_MAX_INTERVAL_MS,
+  EDITOR_AUTOSAVE_MIN_INTERVAL_MS,
+  getPersistedEditorAutoSaveSettings,
+  persistEditorAutoSaveSettings,
+  type EditorAutoSaveSettings,
+} from '../utils/editorAutoSaveSettings'
 
 const { Title, Text } = Typography
 
@@ -53,6 +60,10 @@ type SQLiteCleanupSchedule = {
   next_run_at: string | null
 }
 
+type AppFeatureFlags = {
+  fns_v2_enabled: boolean
+}
+
 export default function Settings() {
   const mode = useThemeStore((state) => state.mode)
   const setMode = useThemeStore((state) => state.setMode)
@@ -64,6 +75,11 @@ export default function Settings() {
   const [cleanupResult, setCleanupResult] = useState<SQLiteCleanupResult | null>(null)
   const [cleanupScheduleLoading, setCleanupScheduleLoading] = useState(false)
   const [cleanupScheduleSaving, setCleanupScheduleSaving] = useState(false)
+  const [featureFlagsLoading, setFeatureFlagsLoading] = useState(false)
+  const [featureFlagsSaving, setFeatureFlagsSaving] = useState(false)
+  const [featureFlags, setFeatureFlags] = useState<AppFeatureFlags>({
+    fns_v2_enabled: false,
+  })
   const [cleanupSchedule, setCleanupSchedule] = useState<SQLiteCleanupSchedule>({
     enabled: false,
     interval_minutes: 60,
@@ -82,6 +98,9 @@ export default function Settings() {
     clear_audit_logs: false,
     vacuum: true,
   })
+  const [editorAutoSaveSettings, setEditorAutoSaveSettings] = useState<EditorAutoSaveSettings>(() => (
+    getPersistedEditorAutoSaveSettings()
+  ))
 
   const hasAnyCleanupOption = useMemo(
     () => (
@@ -150,6 +169,38 @@ export default function Settings() {
     }
   }
 
+  const loadAppFeatureFlags = async () => {
+    setFeatureFlagsLoading(true)
+    try {
+      const config = await api.getAppFeatureFlags()
+      setFeatureFlags({
+        fns_v2_enabled: Boolean(config?.fns_v2_enabled),
+      })
+    } catch (err: any) {
+      messageApi.error(err?.message || 'Failed to load app feature flags')
+    } finally {
+      setFeatureFlagsLoading(false)
+    }
+  }
+
+  const updateFnsV2Enabled = async (enabled: boolean) => {
+    const previous = featureFlags.fns_v2_enabled
+    setFeatureFlags((prev) => ({ ...prev, fns_v2_enabled: enabled }))
+    setFeatureFlagsSaving(true)
+    try {
+      const updated = await api.updateAppFeatureFlags({ fns_v2_enabled: enabled })
+      setFeatureFlags({
+        fns_v2_enabled: Boolean(updated?.fns_v2_enabled),
+      })
+      messageApi.success(`FNS V2 ${Boolean(updated?.fns_v2_enabled) ? 'enabled' : 'disabled'}`)
+    } catch (err: any) {
+      setFeatureFlags((prev) => ({ ...prev, fns_v2_enabled: previous }))
+      messageApi.error(err?.message || 'Failed to save app feature flags')
+    } finally {
+      setFeatureFlagsSaving(false)
+    }
+  }
+
   const saveSqliteCleanupSchedule = async () => {
     if (!cleanupSchedule.enabled && !hasAnyScheduledCleanupOption) {
       messageApi.warning('Choose at least one cleanup target or disable scheduler.')
@@ -209,7 +260,20 @@ export default function Settings() {
   useEffect(() => {
     void loadSqliteUsage()
     void loadSqliteCleanupSchedule()
+    void loadAppFeatureFlags()
   }, [])
+
+  const updateEditorAutoSaveEnabled = (enabled: boolean) => {
+    const next = persistEditorAutoSaveSettings({ enabled })
+    setEditorAutoSaveSettings(next)
+    messageApi.success(`Editor auto-save ${next.enabled ? 'enabled' : 'disabled'}`)
+  }
+
+  const updateEditorAutoSaveIntervalMs = (value: number | null) => {
+    if (value == null || !Number.isFinite(Number(value))) return
+    const next = persistEditorAutoSaveSettings({ intervalMs: Number(value) })
+    setEditorAutoSaveSettings(next)
+  }
 
   return (
     <div style={{ padding: '24px', maxWidth: 900 }}>
@@ -235,6 +299,18 @@ export default function Settings() {
             />
           </SettingRow>
           <Divider style={{ borderColor: 'var(--app-border)', margin: '12px 0' }} />
+          <SettingRow
+            label="FNS V2 Enabled"
+            description="Enable Function Suite V2 for custom expression helpers (safe to keep OFF for current behavior)."
+          >
+            <Switch
+              checked={featureFlags.fns_v2_enabled}
+              loading={featureFlagsLoading || featureFlagsSaving}
+              onChange={(checked) => { void updateFnsV2Enabled(checked) }}
+              style={{ background: featureFlags.fns_v2_enabled ? '#22c55e' : '#6366f1' }}
+            />
+          </SettingRow>
+          <Divider style={{ borderColor: 'var(--app-border)', margin: '12px 0' }} />
           <SettingRow label="Default Execution Timeout" description="Maximum time (seconds) a pipeline can run">
             <Input defaultValue="3600" style={{ width: 120, background: 'var(--app-input-bg)', border: '1px solid var(--app-border-strong)', color: 'var(--app-text)' }} suffix={<Text style={{ color: 'var(--app-text-subtle)' }}>sec</Text>} />
           </SettingRow>
@@ -248,7 +324,24 @@ export default function Settings() {
           </SettingRow>
           <Divider style={{ borderColor: 'var(--app-border)', margin: '12px 0' }} />
           <SettingRow label="Auto-save Editor" description="Automatically save pipeline while editing">
-            <Switch defaultChecked style={{ background: '#6366f1' }} />
+            <Space size={8} align="center">
+              <Switch
+                checked={editorAutoSaveSettings.enabled}
+                onChange={updateEditorAutoSaveEnabled}
+                style={{ background: '#6366f1' }}
+              />
+              <InputNumber
+                min={EDITOR_AUTOSAVE_MIN_INTERVAL_MS}
+                max={EDITOR_AUTOSAVE_MAX_INTERVAL_MS}
+                step={100}
+                value={editorAutoSaveSettings.intervalMs}
+                disabled={!editorAutoSaveSettings.enabled}
+                onChange={updateEditorAutoSaveIntervalMs}
+                style={{ width: 140 }}
+                controls
+              />
+              <Text style={{ color: 'var(--app-text-subtle)' }}>ms</Text>
+            </Space>
           </SettingRow>
         </SettingsSection>
 

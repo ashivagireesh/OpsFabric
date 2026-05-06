@@ -25,7 +25,7 @@ export default function ExecutionPanel() {
   const [localWriteStatus, setLocalWriteStatus] = useState<Record<string, 'writing' | 'done' | 'error'>>({})
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    bottomRef.current?.scrollIntoView({ behavior: executionLogs.length > 180 ? 'auto' : 'smooth' })
   }, [executionLogs])
 
   const hasError       = executionLogs.some(l => l.status === 'error')

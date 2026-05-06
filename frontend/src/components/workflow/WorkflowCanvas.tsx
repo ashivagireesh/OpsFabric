@@ -19,8 +19,12 @@ const RULER_MINOR_STEP = 25
 const NODE_ALIGN_THRESHOLD = 10
 const NODE_FALLBACK_WIDTH = 220
 const NODE_FALLBACK_HEIGHT = 110
+const MAX_ALIGN_GUIDE_NODES = 180
 
 function getNodeRect(node: any) {
+  if (!node || typeof node !== 'object') {
+    return { x: 0, y: 0, width: NODE_FALLBACK_WIDTH, height: NODE_FALLBACK_HEIGHT }
+  }
   const width =
     typeof node?.measured?.width === 'number'
       ? node.measured.width
@@ -33,8 +37,8 @@ function getNodeRect(node: any) {
       : typeof node?.height === 'number'
         ? node.height
         : NODE_FALLBACK_HEIGHT
-  const x = typeof node?.positionAbsolute?.x === 'number' ? node.positionAbsolute.x : node.position?.x || 0
-  const y = typeof node?.positionAbsolute?.y === 'number' ? node.positionAbsolute.y : node.position?.y || 0
+  const x = typeof node?.positionAbsolute?.x === 'number' ? node.positionAbsolute.x : node?.position?.x || 0
+  const y = typeof node?.positionAbsolute?.y === 'number' ? node.positionAbsolute.y : node?.position?.y || 0
   return { x, y, width, height }
 }
 
@@ -42,8 +46,38 @@ export default function WorkflowCanvas() {
   const {
     nodes, edges,
     onNodesChange, onEdgesChange, onConnect, onReconnect,
-    setSelectedNode, connectorType,
+    setSelectedNode, connectorType, canvasWidgetStyle,
   } = useWorkflowStore()
+  const isNinStyle = canvasWidgetStyle === 'nin'
+  const activeConnectorType = connectorType
+  const activeConnectionLineType = useMemo(
+    () => (activeConnectorType === 'default' ? 'bezier' : activeConnectorType),
+    [activeConnectorType],
+  )
+  const connectorTypeStrokeAdjust = useMemo(() => {
+    if (activeConnectorType === 'step') {
+      return { strokeWidth: isNinStyle ? 2.3 : 2.2, strokeDasharray: '7 4' }
+    }
+    if (activeConnectorType === 'straight') {
+      return { strokeWidth: isNinStyle ? 1.7 : 1.6, strokeDasharray: undefined as string | undefined }
+    }
+    if (activeConnectorType === 'smoothstep') {
+      return { strokeWidth: isNinStyle ? 2.1 : 2, strokeDasharray: undefined as string | undefined }
+    }
+    return { strokeWidth: isNinStyle ? 2.2 : 2.1, strokeDasharray: undefined as string | undefined }
+  }, [activeConnectorType, isNinStyle])
+  const connectorPathOptions = useMemo(() => {
+    if (activeConnectorType === 'step') {
+      return { borderRadius: 0, offset: isNinStyle ? 26 : 22 }
+    }
+    if (activeConnectorType === 'smoothstep') {
+      return { borderRadius: isNinStyle ? 14 : 10, offset: isNinStyle ? 24 : 20 }
+    }
+    if (activeConnectorType === 'default') {
+      return { curvature: isNinStyle ? 0.36 : 0.28 }
+    }
+    return undefined
+  }, [activeConnectorType, isNinStyle])
 
   const { screenToFlowPosition } = useReactFlow()
   const canvasRef = useRef<HTMLDivElement>(null)
@@ -56,13 +90,28 @@ export default function WorkflowCanvas() {
     active: false,
   })
 
+  const nodeRuntimeSignature = useMemo(
+    () => nodes.map((node) => {
+      const data = (node.data || {}) as ETLNodeData
+      return [
+        node.id,
+        String(data.status || 'idle'),
+        String(typeof data.executionRows === 'number' ? data.executionRows : ''),
+        String(typeof data.executionProcessedRows === 'number' ? data.executionProcessedRows : ''),
+        String(typeof data.executionValidatedRows === 'number' ? data.executionValidatedRows : ''),
+        String(data.executionError || ''),
+      ].join('|')
+    }).join('~'),
+    [nodes],
+  )
+
   const nodeRuntimeById = useMemo(() => {
     const map = new Map<string, ETLNodeData>()
     for (const node of nodes) {
       map.set(node.id, node.data as ETLNodeData)
     }
     return map
-  }, [nodes])
+  }, [nodeRuntimeSignature])
 
   const runtimeEdges = useMemo(() => {
     const edgeLabelPadding: [number, number] = [6, 3]
@@ -90,16 +139,19 @@ export default function WorkflowCanvas() {
           ? '#ef4444'
           : flowStatus === 'success'
             ? '#22c55e'
-            : '#64748b'
+            : isNinStyle
+              ? '#9aa7b7'
+              : '#64748b'
 
       const selectedStroke =
         flowStatus === 'error'
           ? '#fb7185'
           : flowStatus === 'running'
-            ? '#a78bfa'
-            : '#38bdf8'
+            ? (isNinStyle ? '#3b82f6' : '#a78bfa')
+            : (isNinStyle ? '#3b82f6' : '#38bdf8')
 
-      let label = ''
+      const configuredLabel = String((edge as any)?.label || '').trim()
+      let label = configuredLabel
       if (isRunningEdge) {
         const runningRows =
           targetStatus === 'running' && typeof target?.executionRows === 'number'
@@ -107,27 +159,38 @@ export default function WorkflowCanvas() {
             : sourceStatus === 'running' && typeof source?.executionRows === 'number'
               ? source.executionRows
               : undefined
-        label = typeof runningRows === 'number'
+        const runningLabel = typeof runningRows === 'number'
           ? `${runningRows.toLocaleString()} processing`
           : 'Running...'
+        label = configuredLabel ? `${configuredLabel} • ${runningLabel}` : runningLabel
       } else if (isErrorEdge) {
-        label = 'Error'
+        label = configuredLabel ? `${configuredLabel} • Error` : 'Error'
       }
 
       return {
         ...edge,
+        type: activeConnectorType,
         animated: isRunningEdge,
         reconnectable: true,
         updatable: true,
         interactionWidth: typeof edge.interactionWidth === 'number' ? edge.interactionWidth : 44,
+        pathOptions: connectorPathOptions as any,
         style: {
           ...(edge.style || {}),
           stroke: isSelectedEdge
             ? selectedStroke
-            : (isRunningEdge || isErrorEdge ? strokeColor : '#334155'),
-          strokeWidth: isSelectedEdge ? 3.4 : isRunningEdge ? 2.6 : isErrorEdge ? 2.2 : 1.6,
+            : (isRunningEdge || isErrorEdge ? strokeColor : (isNinStyle ? '#9aa7b7' : '#334155')),
+          strokeWidth: isSelectedEdge
+            ? Math.max((isNinStyle ? 2.6 : 3.4), Number(connectorTypeStrokeAdjust.strokeWidth || 0))
+            : isRunningEdge
+              ? (isNinStyle ? 2.2 : 2.6)
+              : isErrorEdge
+                ? 2.2
+                : Number(connectorTypeStrokeAdjust.strokeWidth || (isNinStyle ? 2 : 1.6)),
+          strokeDasharray: connectorTypeStrokeAdjust.strokeDasharray,
           opacity: isSelectedEdge || isRunningEdge || isErrorEdge ? 1 : 0.6,
-          filter: isSelectedEdge ? `drop-shadow(0 0 6px ${selectedStroke}88)` : undefined,
+          filter: isSelectedEdge ? `drop-shadow(0 0 4px ${selectedStroke}66)` : undefined,
+          ...(isNinStyle ? { strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const } : {}),
         },
         label,
         labelShowBg: !!label,
@@ -149,7 +212,7 @@ export default function WorkflowCanvas() {
           : undefined,
       }
     })
-  }, [edges, nodeRuntimeById])
+  }, [activeConnectorType, connectorPathOptions, connectorTypeStrokeAdjust.strokeDasharray, connectorTypeStrokeAdjust.strokeWidth, edges, nodeRuntimeById, isNinStyle])
 
   useEffect(() => {
     const element = canvasRef.current
@@ -283,6 +346,12 @@ export default function WorkflowCanvas() {
   }, [])
 
   const onNodeDrag = useCallback((_: React.MouseEvent, draggingNode: any) => {
+    if (!draggingNode || typeof draggingNode !== 'object') return
+    if ((nodes?.length || 0) > MAX_ALIGN_GUIDE_NODES) {
+      // Keep dragging smooth on very large canvases.
+      setAlignGuide({ x: null, y: null, active: false })
+      return
+    }
     const movingRect = getNodeRect(draggingNode)
     const movingX = [movingRect.x, movingRect.x + movingRect.width / 2, movingRect.x + movingRect.width]
     const movingY = [movingRect.y, movingRect.y + movingRect.height / 2, movingRect.y + movingRect.height]
@@ -314,22 +383,11 @@ export default function WorkflowCanvas() {
       }
     }
 
-    const offsetX = bestX ? bestX.target - bestX.moving : 0
-    const offsetY = bestY ? bestY.target - bestY.moving : 0
-    if (offsetX !== 0 || offsetY !== 0) {
-      useWorkflowStore.setState((state) => ({
-        nodes: state.nodes.map((node) => (
-          node.id === draggingNode.id
-            ? { ...node, position: { x: node.position.x + offsetX, y: node.position.y + offsetY } }
-            : node
-        )),
-      }))
-    }
-
-    setAlignGuide({
-      x: bestX ? bestX.target : null,
-      y: bestY ? bestY.target : null,
-      active: true,
+    const nextX = bestX ? bestX.target : null
+    const nextY = bestY ? bestY.target : null
+    setAlignGuide((prev) => {
+      if (prev.active && prev.x === nextX && prev.y === nextY) return prev
+      return { x: nextX, y: nextY, active: true }
     })
   }, [nodes])
 
@@ -510,23 +568,38 @@ export default function WorkflowCanvas() {
         fitView
         fitViewOptions={{ padding: 0.2 }}
         defaultEdgeOptions={{
-          type: connectorType,
+          type: activeConnectorType,
           animated: true,
           reconnectable: true,
           updatable: true,
           interactionWidth: 44,
-          style: { stroke: '#6366f1', strokeWidth: 2 },
+          style: {
+            stroke: isNinStyle ? '#9aa7b7' : '#6366f1',
+            strokeWidth: Number(connectorTypeStrokeAdjust.strokeWidth || (isNinStyle ? 2 : 2)),
+            strokeDasharray: connectorTypeStrokeAdjust.strokeDasharray,
+            ...(isNinStyle ? { strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const } : {}),
+          },
         }}
-        connectionLineStyle={{ stroke: '#6366f1', strokeWidth: 2 }}
+        connectionLineStyle={{
+          stroke: isNinStyle ? '#3b82f6' : '#6366f1',
+          strokeWidth: Number(connectorTypeStrokeAdjust.strokeWidth || (isNinStyle ? 2.2 : 2)),
+          strokeDasharray: connectorTypeStrokeAdjust.strokeDasharray,
+          ...(isNinStyle ? { strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const } : {}),
+        }}
+        connectionLineType={activeConnectionLineType as any}
         snapToGrid
         snapGrid={[16, 16]}
-        style={{ background: 'var(--app-panel-bg)' }}
+        style={{
+          background: isNinStyle
+            ? 'var(--app-panel-bg)'
+            : 'var(--app-panel-bg)',
+        }}
       >
         <Background
           variant={BackgroundVariant.Dots}
-          gap={24}
-          size={1.2}
-          color="var(--app-canvas-dot)"
+          gap={isNinStyle ? 20 : 24}
+          size={isNinStyle ? 1 : 1.2}
+          color={isNinStyle ? 'color-mix(in srgb, var(--app-canvas-dot) 88%, #ffffff 12%)' : 'var(--app-canvas-dot)'}
         />
         <Controls
           style={{ background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)', borderRadius: 8 }}
@@ -543,7 +616,7 @@ export default function WorkflowCanvas() {
             border: '1px solid var(--app-border-strong)',
             borderRadius: 8,
           }}
-          maskColor="rgba(0,0,0,0.7)"
+          maskColor={isNinStyle ? 'rgba(0,0,0,0.62)' : 'rgba(0,0,0,0.7)'}
         />
 
         {/* Empty state overlay */}

@@ -10,10 +10,12 @@ import {
   CloseCircleFilled, EllipsisOutlined, ScheduleOutlined,
   StopOutlined,
   HistoryOutlined, CodeOutlined, CopyOutlined,
-  UndoOutlined, RedoOutlined, UploadOutlined
+  UndoOutlined, RedoOutlined, UploadOutlined, ClearOutlined, CloseOutlined
 } from '@ant-design/icons'
 import { ReactFlowProvider } from 'reactflow'
 import { useWorkflowStore } from '../store'
+import type { PipelineCanvasWidgetStyle } from '../store'
+import type { ETLNode, ETLEdge } from '../types'
 import {
   applyConnectorTypeToEdges,
   resolveConnectorTypeFromEdges,
@@ -26,6 +28,11 @@ import WorkflowCanvas from '../components/workflow/WorkflowCanvas'
 import ConfigDrawer from '../components/workflow/ConfigDrawer'
 import ExecutionPanel from '../components/workflow/ExecutionPanel'
 import { getNodeDef } from '../constants/nodeTypes'
+import {
+  EDITOR_AUTOSAVE_SETTINGS_CHANGED_EVENT,
+  getPersistedEditorAutoSaveSettings,
+  type EditorAutoSaveSettings,
+} from '../utils/editorAutoSaveSettings'
 
 const { Text } = Typography
 const CUSTOM_SCHEDULE_VALUE = 'custom'
@@ -37,12 +44,480 @@ const EXECUTION_MODE_OPTIONS = [
   { value: 'incremental', label: 'Incremental Update' },
   { value: 'streaming', label: 'Streaming Incremental' },
 ]
+const PIPELINE_CANVAS_WIDGET_STYLE_OPTIONS: Array<{ value: PipelineCanvasWidgetStyle; label: string }> = [
+  { value: 'default', label: 'Default' },
+  { value: 'nin', label: 'nin' },
+]
+const MAIN_CANVAS_TAB_KEY = 'main'
 
 type CanvasHistorySnapshot = {
   pipelineId: string | null
   nodes: any[]
   edges: any[]
   key: string
+}
+
+type WorkflowCanvasTab = {
+  key: string
+  kind: 'main' | 'business'
+  label: string
+  nodeId?: string
+}
+
+type WorkflowCanvasSnapshot = {
+  nodes: any[]
+  edges: any[]
+  selectedNodeId: string | null
+  connectorType: WorkflowConnectorType
+  isDirty: boolean
+}
+
+type OpenBusinessCanvasTabDetail = {
+  pipelineId?: string
+  nodeId?: string
+}
+
+type EmbeddedNodeRuntimeStatus = 'idle' | 'running' | 'success' | 'error'
+type EmbeddedNodeRuntime = {
+  status: EmbeddedNodeRuntimeStatus
+  rows?: number
+  inputSample?: Array<Record<string, unknown>>
+  outputSample?: Array<Record<string, unknown>>
+}
+type PipelineNodeRuntime = {
+  status: EmbeddedNodeRuntimeStatus
+  rows?: number
+  processedRows?: number
+  validatedRows?: number
+}
+
+function toRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return value as Record<string, unknown>
+}
+
+function parseJsonArraySafe(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value
+  if (typeof value === 'string') {
+    const text = value.trim()
+    if (!text) return []
+    try {
+      const parsed = JSON.parse(text)
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }
+  return []
+}
+
+function parseObjectLikeJsonValue(value: unknown): unknown {
+  if (value && typeof value === 'object') return value
+  if (typeof value !== 'string') return value
+  let text = value.trim()
+  if (!text) return value
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (
+      (text.startsWith('"') && text.endsWith('"'))
+      || (text.startsWith("'") && text.endsWith("'"))
+    ) {
+      const inner = text.slice(1, -1).trim()
+      if (
+        (inner.startsWith('{') && inner.endsWith('}'))
+        || (inner.startsWith('[') && inner.endsWith(']'))
+      ) {
+        text = inner
+      }
+    }
+    try {
+      const parsed = JSON.parse(text)
+      if (typeof parsed === 'string') {
+        text = parsed.trim()
+        continue
+      }
+      return parsed
+    } catch {
+      const normalized = text
+        .replace(/\bNone\b/g, 'null')
+        .replace(/\bTrue\b/g, 'true')
+        .replace(/\bFalse\b/g, 'false')
+        .replace(/([{,]\s*)'([^'\\]+?)'\s*:/g, '$1"$2":')
+        .replace(/:\s*'([^'\\]*?)'(\s*[,}\]])/g, ': "$1"$2')
+        .replace(/,\s*'([^'\\]*?)'(?=\s*[,}\]])/g, ', "$1"')
+      try {
+        return JSON.parse(normalized)
+      } catch {
+        return value
+      }
+    }
+  }
+  return value
+}
+
+function normalizeSampleRowsForCanvas(value: unknown, maxRows = 80): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = []
+  const seen = new Set<string>()
+  const addRow = (rowObj: Record<string, unknown>) => {
+    if (out.length >= maxRows) return
+    try {
+      const sig = JSON.stringify(rowObj)
+      if (sig && seen.has(sig)) return
+      if (sig) seen.add(sig)
+    } catch {
+      // best-effort dedupe only
+    }
+    out.push(cloneStructured(rowObj))
+  }
+  const collect = (candidate: unknown) => {
+    if (candidate == null || out.length >= maxRows) return
+    const parsed = parseObjectLikeJsonValue(candidate)
+    if (Array.isArray(parsed)) {
+      parsed.forEach((item) => collect(item))
+      return
+    }
+    if (parsed && typeof parsed === 'object') {
+      addRow(parsed as Record<string, unknown>)
+      return
+    }
+  }
+  collect(value)
+  return out
+}
+
+function collectBusinessNodeParentSampleRows(node: ETLNode | undefined): Array<Record<string, unknown>> {
+  if (!node?.data) return []
+  const cfg = toRecord(node.data.config)
+  const candidateSets = [
+    node.data.executionSampleInput,
+    node.data.executionSampleOutput,
+    cfg._preview_rows,
+  ]
+  const merged: Array<Record<string, unknown>> = []
+  candidateSets.forEach((candidate) => {
+    const rows = normalizeSampleRowsForCanvas(candidate, 80)
+    rows.forEach((rowObj) => {
+      if (merged.length < 80) merged.push(rowObj)
+    })
+  })
+  return normalizeSampleRowsForCanvas(merged, 80)
+}
+
+function collectUpstreamSampleRowsForNode(
+  targetNodeId: string,
+  nodes: ETLNode[],
+  edges: ETLEdge[],
+): Array<Record<string, unknown>> {
+  const targetId = String(targetNodeId || '').trim()
+  if (!targetId || !Array.isArray(nodes) || !Array.isArray(edges)) return []
+  const nodeById = new Map(nodes.map((node) => [String(node?.id || '').trim(), node] as const))
+  const sourceIds = Array.from(new Set(
+    edges
+      .filter((edge) => String(edge?.target || '').trim() === targetId)
+      .map((edge) => String(edge?.source || '').trim())
+      .filter(Boolean),
+  ))
+  if (sourceIds.length === 0) return []
+  const merged: Array<Record<string, unknown>> = []
+  sourceIds.forEach((sourceId) => {
+    const sourceNode = nodeById.get(sourceId)
+    if (!sourceNode?.data) return
+    const sourceCfg = toRecord(sourceNode.data.config)
+    const candidateSets = [
+      sourceNode.data.executionSampleOutput,
+      sourceNode.data.executionSampleInput,
+      sourceCfg._preview_rows,
+    ]
+    candidateSets.forEach((candidate) => {
+      const rows = normalizeSampleRowsForCanvas(candidate, 80)
+      rows.forEach((rowObj) => {
+        if (merged.length < 80) merged.push(rowObj)
+      })
+    })
+  })
+  return normalizeSampleRowsForCanvas(merged, 80)
+}
+
+function hydrateRootEmbeddedNodesWithParentSamples(
+  nodes: ETLNode[],
+  edges: ETLEdge[],
+  parentRows: Array<Record<string, unknown>>,
+): ETLNode[] {
+  if (!Array.isArray(nodes) || nodes.length === 0 || !Array.isArray(parentRows) || parentRows.length === 0) {
+    return nodes
+  }
+  const incomingTargets = new Set((Array.isArray(edges) ? edges : []).map((edge) => String(edge?.target || '').trim()))
+  return nodes.map((node) => {
+    const nodeId = String(node?.id || '').trim()
+    if (!nodeId || incomingTargets.has(nodeId)) return node
+    const prevData = (node?.data || {}) as any
+    const nodeType = String(prevData.nodeType || node?.type || '').trim()
+    const existingOutput = normalizeSampleRowsForCanvas(prevData.executionSampleOutput, 5)
+    const shouldMirrorParentToOutput = nodeType === 'workflow_input_source'
+    if (
+      normalizeSampleRowsForCanvas(prevData.executionSampleInput, 5).length > 0
+      && (!shouldMirrorParentToOutput || existingOutput.length > 0)
+    ) {
+      const inputSig = JSON.stringify(normalizeSampleRowsForCanvas(prevData.executionSampleInput, 5))
+      const parentSig = JSON.stringify(normalizeSampleRowsForCanvas(parentRows, 5))
+      if (inputSig === parentSig && (!shouldMirrorParentToOutput || JSON.stringify(existingOutput) === parentSig)) {
+        return node
+      }
+    }
+    return {
+      ...node,
+      data: {
+        ...prevData,
+        executionSampleInput: cloneStructured(parentRows),
+        executionSampleOutput: shouldMirrorParentToOutput || existingOutput.length === 0
+          ? cloneStructured(parentRows)
+          : prevData.executionSampleOutput,
+      },
+    } as ETLNode
+  })
+}
+
+function normalizeEmbeddedSampleRows(value: unknown, maxRows = 25): Array<Record<string, unknown>> {
+  return normalizeSampleRowsForCanvas(value, maxRows)
+}
+
+function normalizeEmbeddedRuntimeStatus(raw: unknown): EmbeddedNodeRuntimeStatus {
+  const norm = String(raw || '').trim().toLowerCase()
+  if (norm === 'running') return 'running'
+  if (norm === 'success') return 'success'
+  if (norm === 'error' || norm === 'failed') return 'error'
+  return 'idle'
+}
+
+function parseEmbeddedChildRuntimeRef(
+  rawNodeId: unknown,
+  parentNodeId: string,
+): { childNodeId: string; isPerRowInstance: boolean } | null {
+  const nodeId = String(rawNodeId || '').trim()
+  const parent = String(parentNodeId || '').trim()
+  if (!nodeId || !parent) return null
+  const prefix = `${parent}::`
+  if (!nodeId.startsWith(prefix)) return null
+  const suffix = nodeId.slice(prefix.length)
+  if (!suffix) return null
+  const parts = suffix.split('::').filter(Boolean)
+  if (parts.length === 1) return { childNodeId: parts[0], isPerRowInstance: false }
+  if (parts.length === 2 && /^i\d+$/i.test(parts[0])) {
+    return { childNodeId: parts[1], isPerRowInstance: true }
+  }
+  // Nested child workflow levels are intentionally ignored at this top-level child canvas.
+  return null
+}
+
+function deriveEmbeddedRuntimeFromLogs(
+  logs: Array<{ nodeId?: string; status?: string; rows?: number; input_sample?: unknown; output_sample?: unknown; sample_input?: unknown; sample_output?: unknown }> | undefined,
+  parentNodeId: string,
+): Map<string, EmbeddedNodeRuntime> {
+  const out = new Map<string, EmbeddedNodeRuntime>()
+  const list = Array.isArray(logs) ? logs : []
+  for (const log of list) {
+    const ref = parseEmbeddedChildRuntimeRef(log?.nodeId, parentNodeId)
+    if (!ref) continue
+    const nextStatus = normalizeEmbeddedRuntimeStatus(log?.status)
+    const nextRows = Number.isFinite(Number(log?.rows)) ? Number(log?.rows) : undefined
+    const nextInputSample = normalizeEmbeddedSampleRows((log as any)?.input_sample ?? (log as any)?.sample_input)
+    const nextOutputSample = normalizeEmbeddedSampleRows((log as any)?.output_sample ?? (log as any)?.sample_output)
+    const prev = out.get(ref.childNodeId)
+    if (!prev) {
+      out.set(ref.childNodeId, {
+        status: nextStatus,
+        rows: nextRows,
+        inputSample: nextInputSample.length > 0 ? nextInputSample : undefined,
+        outputSample: nextOutputSample.length > 0 ? nextOutputSample : undefined,
+      })
+      continue
+    }
+    // In per-row child invocation, success->running is expected for later row instances.
+    // For non per-row, keep terminal state if a stale running event arrives later.
+    const mergedStatus: EmbeddedNodeRuntimeStatus = (
+      prev.status === 'error'
+        ? 'error'
+        : nextStatus === 'error'
+          ? 'error'
+          : (prev.status === 'success' && nextStatus === 'running' && !ref.isPerRowInstance)
+            ? 'success'
+            : nextStatus
+    )
+    out.set(ref.childNodeId, {
+      status: mergedStatus,
+      rows: nextRows ?? prev.rows,
+      inputSample: nextInputSample.length > 0 ? nextInputSample : prev.inputSample,
+      outputSample: nextOutputSample.length > 0 ? nextOutputSample : prev.outputSample,
+    })
+  }
+  return out
+}
+
+function applyEmbeddedRuntimeToNodes(nodes: ETLNode[], runtimeByNodeId: Map<string, EmbeddedNodeRuntime>): ETLNode[] {
+  if (!Array.isArray(nodes) || runtimeByNodeId.size === 0) return nodes
+  return nodes.map((node) => {
+    const runtime = runtimeByNodeId.get(String(node?.id || '').trim())
+    if (!runtime) return node
+    const prevData = (node?.data || {}) as any
+    return {
+      ...node,
+      data: {
+        ...prevData,
+        status: runtime.status,
+        executionRows: runtime.rows ?? prevData.executionRows,
+        executionSampleInput: runtime.inputSample ?? prevData.executionSampleInput,
+        executionSampleOutput: runtime.outputSample ?? prevData.executionSampleOutput,
+      },
+    } as ETLNode
+  })
+}
+
+function derivePipelineRuntimeFromLogs(
+  logs: Array<{ nodeId?: string; status?: string; rows?: number; processed_rows?: number; validated_rows?: number }> | undefined,
+): Map<string, PipelineNodeRuntime> {
+  const out = new Map<string, PipelineNodeRuntime>()
+  const list = Array.isArray(logs) ? logs : []
+  for (const log of list) {
+    const nodeId = String(log?.nodeId || '').trim()
+    if (!nodeId) continue
+    if (nodeId === '__system__' || nodeId === 'system') continue
+    // Embedded child workflow runtime IDs are handled separately.
+    if (nodeId.includes('::')) continue
+    const status = normalizeEmbeddedRuntimeStatus(log?.status)
+    const rows = Number.isFinite(Number(log?.rows)) ? Number(log?.rows) : undefined
+    const processedRows = Number.isFinite(Number(log?.processed_rows))
+      ? Number(log?.processed_rows)
+      : undefined
+    const validatedRows = Number.isFinite(Number(log?.validated_rows))
+      ? Number(log?.validated_rows)
+      : undefined
+    out.set(nodeId, {
+      status,
+      rows,
+      processedRows,
+      validatedRows,
+    })
+  }
+  return out
+}
+
+function applyPipelineRuntimeToNodes(
+  nodes: ETLNode[],
+  runtimeByNodeId: Map<string, PipelineNodeRuntime>,
+): ETLNode[] {
+  if (!Array.isArray(nodes) || runtimeByNodeId.size === 0) return nodes
+  return nodes.map((node) => {
+    const runtime = runtimeByNodeId.get(String(node?.id || '').trim())
+    if (!runtime) return node
+    const prevData = (node?.data || {}) as any
+    return {
+      ...node,
+      data: {
+        ...prevData,
+        status: runtime.status,
+        executionRows: runtime.rows ?? prevData.executionRows,
+        executionProcessedRows: runtime.processedRows ?? prevData.executionProcessedRows,
+        executionValidatedRows: runtime.validatedRows ?? prevData.executionValidatedRows,
+      },
+    } as ETLNode
+  })
+}
+
+function normalizeEmbeddedNodes(rawNodes: unknown): ETLNode[] {
+  const list = parseJsonArraySafe(rawNodes)
+  const out: ETLNode[] = []
+  list.forEach((item, idx) => {
+    const row = toRecord(item)
+    const id = String(row.id || `bw_node_${idx + 1}`).trim()
+    if (!id) return
+    const rawData = toRecord(row.data)
+    const nodeType = String(rawData.nodeType || row.nodeType || row.type || '').trim()
+    if (!nodeType || nodeType === 'etlNode') return
+    const def = getNodeDef(nodeType)
+    if (!def) return
+    const label = String(rawData.label || row.label || def.label || nodeType).trim() || nodeType
+    const rawConfig = rawData.config
+    const config = toRecord(rawConfig || row.config)
+    const rawPos = toRecord(row.position)
+    const x = Number(rawPos.x)
+    const y = Number(rawPos.y)
+    out.push({
+      id,
+      type: 'etlNode',
+      position: {
+        x: Number.isFinite(x) ? x : 120 + (idx % 4) * 260,
+        y: Number.isFinite(y) ? y : 100 + Math.floor(idx / 4) * 160,
+      },
+      data: {
+        nodeType,
+        label,
+        definition: def,
+        config,
+        status: 'idle',
+      },
+    } as ETLNode)
+  })
+  return out
+}
+
+function normalizeEmbeddedEdges(rawEdges: unknown, nodes: ETLNode[], connectorType: WorkflowConnectorType): ETLEdge[] {
+  const list = parseJsonArraySafe(rawEdges)
+  const nodeIds = new Set(nodes.map((n) => String(n.id || '').trim()))
+  const base: ETLEdge[] = []
+  const seen = new Set<string>()
+  list.forEach((item, idx) => {
+    const row = toRecord(item)
+    const source = String(row.source || '').trim()
+    const target = String(row.target || '').trim()
+    if (!source || !target) return
+    if (!nodeIds.has(source) || !nodeIds.has(target)) return
+    const sourceHandle = String(row.sourceHandle || 'output').trim() || 'output'
+    const targetHandle = String(row.targetHandle || 'input').trim() || 'input'
+    const uniq = `${source}|${sourceHandle}|${target}|${targetHandle}`
+    if (seen.has(uniq)) return
+    seen.add(uniq)
+    base.push({
+      id: String(row.id || `bw_edge_${idx + 1}_${source}_${target}`).trim() || `bw_edge_${idx + 1}_${source}_${target}`,
+      source,
+      target,
+      sourceHandle,
+      targetHandle,
+      type: connectorType,
+      reconnectable: true,
+      updatable: true,
+      animated: true,
+      interactionWidth: 44,
+      style: { stroke: '#6366f1', strokeWidth: 2 },
+    } as ETLEdge)
+  })
+  return applyConnectorTypeToEdges(base, connectorType) as ETLEdge[]
+}
+
+function serializeEmbeddedNodes(nodes: any[]): Array<Record<string, unknown>> {
+  return (Array.isArray(nodes) ? nodes : []).map((node) => {
+    const cfg = toRecord(node?.data?.config)
+    return {
+      id: String(node?.id || ''),
+      position: {
+        x: Number(node?.position?.x || 0),
+        y: Number(node?.position?.y || 0),
+      },
+      data: {
+        nodeType: String(node?.data?.nodeType || ''),
+        label: String(node?.data?.label || ''),
+        config: cfg,
+      },
+    }
+  }).filter((node) => String(node.id || '').trim().length > 0)
+}
+
+function serializeEmbeddedEdges(edges: any[]): Array<Record<string, unknown>> {
+  return (Array.isArray(edges) ? edges : []).map((edge) => ({
+    id: String(edge?.id || ''),
+    source: String(edge?.source || ''),
+    target: String(edge?.target || ''),
+    sourceHandle: edge?.sourceHandle ? String(edge.sourceHandle) : undefined,
+    targetHandle: edge?.targetHandle ? String(edge.targetHandle) : undefined,
+  })).filter((edge) => String(edge.source || '').trim() && String(edge.target || '').trim())
 }
 
 type ConfigDrawerErrorBoundaryProps = {
@@ -128,6 +603,40 @@ function normalizeNodeForHistory(node: any): any {
     cleaned.data = { ...cleaned.data }
     delete cleaned.data.status
     delete cleaned.data.executionRows
+    delete cleaned.data.executionProcessedRows
+    delete cleaned.data.executionValidatedRows
+    delete cleaned.data.executionSampleInput
+    delete cleaned.data.executionSampleOutput
+    delete cleaned.data.executionError
+    delete cleaned.data.executionStartedAt
+    delete cleaned.data.executionFinishedAt
+    delete cleaned.data.executionDurationMs
+    if (cleaned.data.config && typeof cleaned.data.config === 'object') {
+      const cfg: Record<string, unknown> = { ...(cleaned.data.config as Record<string, unknown>) }
+      const dropExact = new Set([
+        '_preview_rows',
+        '_preview_columns',
+        '_detected_columns',
+        '_row_count',
+      ])
+      Object.keys(cfg).forEach((key) => {
+        const name = String(key || '')
+        if (!name) return
+        if (dropExact.has(name)) {
+          delete cfg[name]
+          return
+        }
+        if (
+          name.startsWith('_preview_')
+          || name.startsWith('__preview_')
+          || name.startsWith('_detected_')
+          || name.startsWith('__detected_')
+        ) {
+          delete cfg[name]
+        }
+      })
+      cleaned.data.config = cfg
+    }
   }
   return cleaned
 }
@@ -146,12 +655,52 @@ function createCanvasHistorySnapshot(
 ): CanvasHistorySnapshot {
   const safeNodes = cloneStructured((Array.isArray(nodes) ? nodes : []).map(normalizeNodeForHistory))
   const safeEdges = cloneStructured((Array.isArray(edges) ? edges : []).map(normalizeEdgeForHistory))
+  const compactNodeKey = safeNodes
+    .map((node: any) => {
+      const id = String(node?.id || '')
+      const pos = node?.position || {}
+      const x = Number(pos?.x || 0)
+      const y = Number(pos?.y || 0)
+      const nodeType = String(node?.data?.nodeType || '')
+      let configKey = ''
+      try {
+        configKey = JSON.stringify(node?.data?.config || {})
+      } catch {
+        configKey = ''
+      }
+      if (configKey.length > 4000) configKey = configKey.slice(0, 4000)
+      return `${id}@${Math.round(x)}:${Math.round(y)}:${nodeType}:${configKey}`
+    })
+    .join('~')
+  const compactEdgeKey = safeEdges
+    .map((edge: any) => `${String(edge?.source || '')}:${String(edge?.sourceHandle || '')}->${String(edge?.target || '')}:${String(edge?.targetHandle || '')}`)
+    .join('~')
   return {
     pipelineId,
     nodes: safeNodes,
     edges: safeEdges,
-    key: JSON.stringify({ pipelineId, nodes: safeNodes, edges: safeEdges }),
+    key: `${pipelineId || ''}|${compactNodeKey}|${compactEdgeKey}`,
   }
+}
+
+function clearNodeRuntimeState(nodes: any[] | undefined): any[] {
+  if (!Array.isArray(nodes)) return []
+  return nodes.map((node: any) => ({
+    ...node,
+    data: {
+      ...(node?.data || {}),
+      status: 'idle',
+      executionRows: undefined,
+      executionProcessedRows: undefined,
+      executionValidatedRows: undefined,
+      executionSampleInput: undefined,
+      executionSampleOutput: undefined,
+      executionError: undefined,
+      executionStartedAt: undefined,
+      executionFinishedAt: undefined,
+      executionDurationMs: undefined,
+    },
+  }))
 }
 
 const SCHEDULE_PRESETS = [
@@ -270,10 +819,14 @@ export default function PipelineEditor() {
     pipeline, loadPipeline, savePipeline, executePipeline,
     abortExecution, executionAbortRequested, resumeExecutionForPipeline,
     isDirty, isExecuting, selectedNodeId, setSelectedNode,
-    resetCanvas, executionLogs, connectorType, setConnectorType, duplicateNode,
+    resetCanvas, executionLogs, connectorType, setConnectorType,
+    canvasWidgetStyle, setCanvasWidgetStyle, duplicateNode,
   } = useWorkflowStore()
 
   const [saving, setSaving] = useState(false)
+  const [editorAutoSaveSettings, setEditorAutoSaveSettings] = useState<EditorAutoSaveSettings>(() => (
+    getPersistedEditorAutoSaveSettings()
+  ))
   const [scheduleModal, setScheduleModal] = useState(false)
   const [pipelineName, setPipelineName] = useState('')
   const [form] = Form.useForm()
@@ -287,6 +840,355 @@ export default function PipelineEditor() {
   const applyingHistoryRef = useRef(false)
   const activeHistoryPipelineRef = useRef<string | null>(null)
   const importFileInputRef = useRef<HTMLInputElement | null>(null)
+  const [canvasTabs, setCanvasTabs] = useState<WorkflowCanvasTab[]>([
+    { key: MAIN_CANVAS_TAB_KEY, kind: 'main', label: 'Main Canvas' },
+  ])
+  const [activeCanvasTabKey, setActiveCanvasTabKey] = useState<string>(MAIN_CANVAS_TAB_KEY)
+  const canvasSnapshotsRef = useRef<Record<string, WorkflowCanvasSnapshot>>({})
+  const activeCanvasTabKeyRef = useRef<string>(MAIN_CANVAS_TAB_KEY)
+
+  useEffect(() => {
+    const syncEditorAutoSaveSettings = () => {
+      setEditorAutoSaveSettings(getPersistedEditorAutoSaveSettings())
+    }
+    window.addEventListener('storage', syncEditorAutoSaveSettings)
+    window.addEventListener(EDITOR_AUTOSAVE_SETTINGS_CHANGED_EVENT, syncEditorAutoSaveSettings as EventListener)
+    return () => {
+      window.removeEventListener('storage', syncEditorAutoSaveSettings)
+      window.removeEventListener(EDITOR_AUTOSAVE_SETTINGS_CHANGED_EVENT, syncEditorAutoSaveSettings as EventListener)
+    }
+  }, [])
+
+  const captureActiveCanvasSnapshot = useCallback((): WorkflowCanvasSnapshot => {
+    const state = useWorkflowStore.getState()
+    return {
+      nodes: cloneStructured(Array.isArray(state.nodes) ? state.nodes : []),
+      edges: cloneStructured(Array.isArray(state.edges) ? state.edges : []),
+      selectedNodeId: state.selectedNodeId ? String(state.selectedNodeId) : null,
+      connectorType: (state.connectorType || 'smooth') as WorkflowConnectorType,
+      isDirty: Boolean(state.isDirty),
+    }
+  }, [])
+
+  const applyCanvasSnapshot = useCallback((snapshot: WorkflowCanvasSnapshot) => {
+    const nextSelected = snapshot.selectedNodeId ? String(snapshot.selectedNodeId) : null
+    useWorkflowStore.setState((state) => ({
+      ...state,
+      nodes: cloneStructured(Array.isArray(snapshot.nodes) ? snapshot.nodes : []),
+      edges: cloneStructured(Array.isArray(snapshot.edges) ? snapshot.edges : []),
+      connectorType: (snapshot.connectorType || state.connectorType || 'smooth') as WorkflowConnectorType,
+      selectedNodeId: nextSelected,
+      isDirty: Boolean(snapshot.isDirty),
+    }))
+    setSelectedNode(nextSelected)
+  }, [setSelectedNode])
+
+  const ensureMainSnapshot = useCallback(() => {
+    if (canvasSnapshotsRef.current[MAIN_CANVAS_TAB_KEY]) return
+    canvasSnapshotsRef.current[MAIN_CANVAS_TAB_KEY] = captureActiveCanvasSnapshot()
+  }, [captureActiveCanvasSnapshot])
+
+  const buildBusinessCanvasSnapshotFromMain = useCallback((nodeId: string): { snapshot: WorkflowCanvasSnapshot; label: string } => {
+    ensureMainSnapshot()
+    const mainSnapshot = canvasSnapshotsRef.current[MAIN_CANVAS_TAB_KEY] || captureActiveCanvasSnapshot()
+    const mainNodes = Array.isArray(mainSnapshot.nodes) ? mainSnapshot.nodes : []
+    const hit = mainNodes.find((node: any) => String(node?.id || '') === String(nodeId || ''))
+    if (!hit) {
+      throw new Error('Business workflow node not found in main canvas.')
+    }
+    const nodeType = String(hit?.data?.nodeType || hit?.type || '')
+    if (nodeType !== 'business_workflow') {
+      throw new Error('Selected node is not a Business Logic Workflow node.')
+    }
+    const config = toRecord(hit?.data?.config)
+    const embeddedNodes = normalizeEmbeddedNodes(config.embedded_workflow_nodes)
+    const inferredConnector = resolveConnectorTypeFromEdges(
+      Array.isArray(config.embedded_workflow_edges) ? (config.embedded_workflow_edges as any[]) : []
+    )
+    const nextConnector = (inferredConnector || mainSnapshot.connectorType || 'smooth') as WorkflowConnectorType
+    const embeddedEdges = normalizeEmbeddedEdges(config.embedded_workflow_edges, embeddedNodes, nextConnector)
+    const runtimeByChildNode = deriveEmbeddedRuntimeFromLogs(executionLogs as any[], String(nodeId))
+    const runtimeNodes = applyEmbeddedRuntimeToNodes(embeddedNodes, runtimeByChildNode)
+    const parentInputSamples = normalizeSampleRowsForCanvas([
+      ...collectBusinessNodeParentSampleRows(hit as ETLNode),
+      ...collectUpstreamSampleRowsForNode(String(nodeId), mainNodes as ETLNode[], (mainSnapshot.edges || []) as ETLEdge[]),
+    ], 80)
+    const hydratedNodes = hydrateRootEmbeddedNodesWithParentSamples(runtimeNodes, embeddedEdges, parentInputSamples)
+    return {
+      snapshot: {
+        nodes: hydratedNodes,
+        edges: embeddedEdges,
+        selectedNodeId: null,
+        connectorType: nextConnector,
+        isDirty: false,
+      },
+      label: String(hit?.data?.label || 'Business Workflow'),
+    }
+  }, [captureActiveCanvasSnapshot, ensureMainSnapshot, executionLogs])
+
+  useEffect(() => {
+    const businessTabs = canvasTabs.filter((tab) => tab.kind === 'business' && Boolean(tab.nodeId))
+
+    let activeNodesPatch: ETLNode[] | null = null
+    const statusRowsChanged = (prevNodes: ETLNode[], nextNodes: ETLNode[]): boolean => {
+      if (nextNodes.length !== prevNodes.length) return true
+      for (let idx = 0; idx < nextNodes.length; idx += 1) {
+        const prevStatus = String((prevNodes[idx] as any)?.data?.status || 'idle')
+        const nextStatus = String((nextNodes[idx] as any)?.data?.status || 'idle')
+        const prevRows = (prevNodes[idx] as any)?.data?.executionRows
+        const nextRows = (nextNodes[idx] as any)?.data?.executionRows
+        const prevProcessed = (prevNodes[idx] as any)?.data?.executionProcessedRows
+        const nextProcessed = (nextNodes[idx] as any)?.data?.executionProcessedRows
+        const prevValidated = (prevNodes[idx] as any)?.data?.executionValidatedRows
+        const nextValidated = (nextNodes[idx] as any)?.data?.executionValidatedRows
+        const prevSampleIn = (prevNodes[idx] as any)?.data?.executionSampleInput
+        const nextSampleIn = (nextNodes[idx] as any)?.data?.executionSampleInput
+        const prevSampleOut = (prevNodes[idx] as any)?.data?.executionSampleOutput
+        const nextSampleOut = (nextNodes[idx] as any)?.data?.executionSampleOutput
+        if (
+          prevStatus !== nextStatus
+          || prevRows !== nextRows
+          || prevProcessed !== nextProcessed
+          || prevValidated !== nextValidated
+          || prevSampleIn !== nextSampleIn
+          || prevSampleOut !== nextSampleOut
+        ) {
+          return true
+        }
+      }
+      return false
+    }
+
+    let mainSnapshot = canvasSnapshotsRef.current[MAIN_CANVAS_TAB_KEY]
+    if (activeCanvasTabKeyRef.current === MAIN_CANVAS_TAB_KEY) {
+      const liveMainSnapshot = captureActiveCanvasSnapshot()
+      canvasSnapshotsRef.current[MAIN_CANVAS_TAB_KEY] = liveMainSnapshot
+      mainSnapshot = liveMainSnapshot
+    }
+    if (mainSnapshot && Array.isArray(mainSnapshot.nodes) && mainSnapshot.nodes.length > 0) {
+      const runtimeByMainNode = derivePipelineRuntimeFromLogs(executionLogs as any[])
+      if (runtimeByMainNode.size > 0) {
+        const nextMainNodes = applyPipelineRuntimeToNodes(mainSnapshot.nodes as ETLNode[], runtimeByMainNode)
+        if (statusRowsChanged(mainSnapshot.nodes as ETLNode[], nextMainNodes)) {
+          canvasSnapshotsRef.current[MAIN_CANVAS_TAB_KEY] = {
+            ...mainSnapshot,
+            nodes: cloneStructured(nextMainNodes),
+          }
+          if (activeCanvasTabKeyRef.current === MAIN_CANVAS_TAB_KEY) {
+            activeNodesPatch = nextMainNodes
+          }
+        }
+      }
+    }
+
+    if (businessTabs.length === 0) {
+      if (activeNodesPatch) {
+        useWorkflowStore.setState((state) => ({
+          ...state,
+          nodes: cloneStructured(activeNodesPatch as ETLNode[]),
+        }))
+      }
+      return
+    }
+
+    businessTabs.forEach((tab) => {
+      const tabKey = String(tab.key || '').trim()
+      const parentNodeId = String(tab.nodeId || '').trim()
+      if (!tabKey || !parentNodeId) return
+      const snapshot = canvasSnapshotsRef.current[tabKey]
+      if (!snapshot || !Array.isArray(snapshot.nodes) || snapshot.nodes.length === 0) return
+      const latestMainSnapshot = canvasSnapshotsRef.current[MAIN_CANVAS_TAB_KEY]
+      const parentNode = (Array.isArray(latestMainSnapshot?.nodes) ? latestMainSnapshot.nodes : [])
+        .find((node: any) => String(node?.id || '') === parentNodeId) as ETLNode | undefined
+      const parentInputSamples = collectBusinessNodeParentSampleRows(parentNode)
+      const parentHydratedNodes = hydrateRootEmbeddedNodesWithParentSamples(
+        snapshot.nodes as ETLNode[],
+        Array.isArray(snapshot.edges) ? snapshot.edges : [],
+        parentInputSamples,
+      )
+      const runtimeByChildNode = deriveEmbeddedRuntimeFromLogs(executionLogs as any[], parentNodeId)
+      const nextNodes = runtimeByChildNode.size > 0
+        ? applyEmbeddedRuntimeToNodes(parentHydratedNodes, runtimeByChildNode)
+        : parentHydratedNodes
+
+      if (!statusRowsChanged(snapshot.nodes as ETLNode[], nextNodes)) return
+
+      canvasSnapshotsRef.current[tabKey] = {
+        ...snapshot,
+        nodes: cloneStructured(nextNodes),
+      }
+
+      if (activeCanvasTabKeyRef.current === tabKey) {
+        activeNodesPatch = nextNodes
+      }
+    })
+
+    if (activeNodesPatch) {
+      useWorkflowStore.setState((state) => ({
+        ...state,
+        nodes: cloneStructured(activeNodesPatch as ETLNode[]),
+      }))
+    }
+  }, [canvasTabs, executionLogs])
+
+  const switchCanvasTab = useCallback((nextTabKey: string) => {
+    const target = String(nextTabKey || '').trim()
+    if (!target || target === activeCanvasTabKeyRef.current) return
+    canvasSnapshotsRef.current[activeCanvasTabKeyRef.current] = captureActiveCanvasSnapshot()
+    const nextSnapshot = canvasSnapshotsRef.current[target]
+    if (!nextSnapshot) return
+    applyCanvasSnapshot(nextSnapshot)
+    activeCanvasTabKeyRef.current = target
+    setActiveCanvasTabKey(target)
+  }, [applyCanvasSnapshot, captureActiveCanvasSnapshot])
+
+  const openBusinessCanvasTab = useCallback((nodeIdRaw: string) => {
+    const nodeId = String(nodeIdRaw || '').trim()
+    if (!nodeId) return
+    const tabKey = `business:${nodeId}`
+    canvasSnapshotsRef.current[activeCanvasTabKeyRef.current] = captureActiveCanvasSnapshot()
+    try {
+      if (!canvasSnapshotsRef.current[tabKey]) {
+        const built = buildBusinessCanvasSnapshotFromMain(nodeId)
+        canvasSnapshotsRef.current[tabKey] = built.snapshot
+        setCanvasTabs((prev) => {
+          const exists = prev.some((tab) => tab.key === tabKey)
+          if (exists) {
+            return prev.map((tab) => (tab.key === tabKey ? { ...tab, label: built.label } : tab))
+          }
+          return [...prev, { key: tabKey, kind: 'business', label: built.label, nodeId }]
+        })
+      } else {
+        const mainSnapshot = canvasSnapshotsRef.current[MAIN_CANVAS_TAB_KEY] || captureActiveCanvasSnapshot()
+        const parentNode = (Array.isArray(mainSnapshot.nodes) ? mainSnapshot.nodes : [])
+          .find((node: any) => String(node?.id || '') === nodeId) as ETLNode | undefined
+        const parentInputSamples = collectBusinessNodeParentSampleRows(parentNode)
+        const existingSnapshot = canvasSnapshotsRef.current[tabKey]
+        canvasSnapshotsRef.current[tabKey] = {
+          ...existingSnapshot,
+          nodes: hydrateRootEmbeddedNodesWithParentSamples(
+            (existingSnapshot?.nodes || []) as ETLNode[],
+            (existingSnapshot?.edges || []) as ETLEdge[],
+            parentInputSamples,
+          ),
+        }
+        setCanvasTabs((prev) => prev.map((tab) => (tab.key === tabKey ? { ...tab, nodeId } : tab)))
+      }
+      switchCanvasTab(tabKey)
+    } catch (error: any) {
+      notification.error({
+        message: 'Unable to open child canvas',
+        description: String(error?.message || 'Invalid business workflow node configuration'),
+        placement: 'bottomRight',
+        duration: 3,
+      })
+    }
+  }, [buildBusinessCanvasSnapshotFromMain, captureActiveCanvasSnapshot, switchCanvasTab])
+
+  const closeCanvasTab = useCallback((tabKeyRaw: string) => {
+    const tabKey = String(tabKeyRaw || '').trim()
+    if (!tabKey || tabKey === MAIN_CANVAS_TAB_KEY) return
+    if (isExecuting) {
+      notification.warning({
+        message: 'Abort running pipeline before closing canvas tab.',
+        placement: 'bottomRight',
+        duration: 2.5,
+      })
+      return
+    }
+    delete canvasSnapshotsRef.current[tabKey]
+    setCanvasTabs((prev) => prev.filter((tab) => tab.key !== tabKey))
+    if (activeCanvasTabKeyRef.current === tabKey) {
+      const fallback = canvasSnapshotsRef.current[MAIN_CANVAS_TAB_KEY] || captureActiveCanvasSnapshot()
+      applyCanvasSnapshot(fallback)
+      activeCanvasTabKeyRef.current = MAIN_CANVAS_TAB_KEY
+      setActiveCanvasTabKey(MAIN_CANVAS_TAB_KEY)
+    }
+  }, [applyCanvasSnapshot, captureActiveCanvasSnapshot, isExecuting])
+
+  const resetRuntimeStateAcrossCanvases = useCallback(() => {
+    const currentSnapshots = canvasSnapshotsRef.current || {}
+    const nextSnapshots: Record<string, WorkflowCanvasSnapshot> = {}
+    Object.entries(currentSnapshots).forEach(([tabKey, snapshot]) => {
+      if (!snapshot || !Array.isArray(snapshot.nodes)) {
+        return
+      }
+      nextSnapshots[tabKey] = {
+        ...snapshot,
+        nodes: clearNodeRuntimeState(snapshot.nodes),
+      }
+    })
+    canvasSnapshotsRef.current = nextSnapshots
+    useWorkflowStore.setState((state) => ({
+      ...state,
+      nodes: clearNodeRuntimeState(state.nodes),
+      executionLogs: [],
+    }))
+  }, [])
+
+  const saveActiveCanvas = useCallback(async (options?: { silent?: boolean }) => {
+    const silent = Boolean(options?.silent)
+    if (activeCanvasTabKeyRef.current === MAIN_CANVAS_TAB_KEY) {
+      setSaving(true)
+      try {
+        await savePipeline()
+        if (!silent) {
+          notification.success({ message: 'Saved!', placement: 'bottomRight', duration: 2 })
+        }
+      } finally {
+        setSaving(false)
+      }
+      return
+    }
+    const activeTab = canvasTabs.find((tab) => tab.key === activeCanvasTabKeyRef.current)
+    if (!activeTab || activeTab.kind !== 'business' || !activeTab.nodeId) return
+    if (!id) return
+    setSaving(true)
+    try {
+      canvasSnapshotsRef.current[activeCanvasTabKeyRef.current] = captureActiveCanvasSnapshot()
+      ensureMainSnapshot()
+      const mainSnapshot = canvasSnapshotsRef.current[MAIN_CANVAS_TAB_KEY]
+      const childSnapshot = canvasSnapshotsRef.current[activeCanvasTabKeyRef.current]
+      if (!mainSnapshot || !childSnapshot) return
+      const updatedMainNodes = (Array.isArray(mainSnapshot.nodes) ? mainSnapshot.nodes : []).map((node: any) => {
+        if (String(node?.id || '') !== String(activeTab.nodeId)) return node
+        const data = toRecord(node?.data)
+        const cfg = toRecord(data.config)
+        return {
+          ...node,
+          data: {
+            ...data,
+            config: {
+              ...cfg,
+              workflow_mode: 'embedded',
+              embedded_workflow_enabled: true,
+              embedded_workflow_nodes: serializeEmbeddedNodes(childSnapshot.nodes),
+              embedded_workflow_edges: serializeEmbeddedEdges(childSnapshot.edges),
+            },
+          },
+        }
+      })
+      await api.updatePipeline(String(id), {
+        nodes: updatedMainNodes,
+        edges: Array.isArray(mainSnapshot.edges) ? mainSnapshot.edges : [],
+      })
+      canvasSnapshotsRef.current[MAIN_CANVAS_TAB_KEY] = {
+        ...mainSnapshot,
+        nodes: cloneStructured(updatedMainNodes),
+        isDirty: false,
+      }
+      canvasSnapshotsRef.current[activeCanvasTabKeyRef.current] = {
+        ...childSnapshot,
+        isDirty: false,
+      }
+      useWorkflowStore.setState((state) => ({ ...state, isDirty: false }))
+      if (!silent) {
+        notification.success({ message: 'Child workflow saved to Business Logic node', placement: 'bottomRight', duration: 2.5 })
+      }
+    } finally {
+      setSaving(false)
+    }
+  }, [canvasTabs, captureActiveCanvasSnapshot, ensureMainSnapshot, id, savePipeline])
 
   const selectedNodeIds = useMemo(() => {
     const explicitlySelected = nodes
@@ -297,6 +1199,15 @@ export default function PipelineEditor() {
   }, [nodes, selectedNodeId])
   const actionTargetNodeIds = selectedNodeIds
   const actionTargetCount = actionTargetNodeIds.length
+  const activeCanvasTab = useMemo(
+    () => canvasTabs.find((tab) => tab.key === activeCanvasTabKey) || { key: MAIN_CANVAS_TAB_KEY, kind: 'main', label: 'Main Canvas' } as WorkflowCanvasTab,
+    [activeCanvasTabKey, canvasTabs]
+  )
+  const isChildCanvasTabActive = activeCanvasTab.kind === 'business'
+  const isAnyNodeDragging = useMemo(
+    () => nodes.some((node) => Boolean((node as any)?.dragging) || Boolean((node as any)?.resizing)),
+    [nodes]
+  )
   const actionTargetStats = useMemo(() => {
     const targetSet = new Set(actionTargetNodeIds)
     let enabledCount = 0
@@ -387,7 +1298,7 @@ export default function PipelineEditor() {
     }
     const base = historyRef.current.slice(0, historyIndexRef.current + 1)
     base.push(snapshot)
-    const maxSnapshots = 120
+    const maxSnapshots = 60
     if (base.length > maxSnapshots) {
       base.splice(0, base.length - maxSnapshots)
     }
@@ -397,6 +1308,7 @@ export default function PipelineEditor() {
   }, [updateHistoryFlags])
 
   const handleUndo = useCallback(() => {
+    if (activeCanvasTabKeyRef.current !== MAIN_CANVAS_TAB_KEY) return
     if (isExecuting || !historyReady) return
     const nextIndex = historyIndexRef.current - 1
     if (nextIndex < 0) return
@@ -410,6 +1322,7 @@ export default function PipelineEditor() {
   }, [applyHistorySnapshot, historyReady, id, isExecuting, updateHistoryFlags])
 
   const handleRedo = useCallback(() => {
+    if (activeCanvasTabKeyRef.current !== MAIN_CANVAS_TAB_KEY) return
     if (isExecuting || !historyReady) return
     const nextIndex = historyIndexRef.current + 1
     if (nextIndex >= historyRef.current.length) return
@@ -428,6 +1341,10 @@ export default function PipelineEditor() {
     historyRef.current = []
     historyIndexRef.current = -1
     activeHistoryPipelineRef.current = null
+    canvasSnapshotsRef.current = {}
+    setCanvasTabs([{ key: MAIN_CANVAS_TAB_KEY, kind: 'main', label: 'Main Canvas' }])
+    setActiveCanvasTabKey(MAIN_CANVAS_TAB_KEY)
+    activeCanvasTabKeyRef.current = MAIN_CANVAS_TAB_KEY
     updateHistoryFlags()
 
     if (id) {
@@ -450,6 +1367,13 @@ export default function PipelineEditor() {
         historyRef.current = [initialSnapshot]
         historyIndexRef.current = 0
         activeHistoryPipelineRef.current = routePipelineId
+        canvasSnapshotsRef.current[MAIN_CANVAS_TAB_KEY] = {
+          nodes: cloneStructured(currentState.nodes || []),
+          edges: cloneStructured(currentState.edges || []),
+          selectedNodeId: currentState.selectedNodeId ? String(currentState.selectedNodeId) : null,
+          connectorType: (currentState.connectorType || 'smooth') as WorkflowConnectorType,
+          isDirty: Boolean(currentState.isDirty),
+        }
         updateHistoryFlags()
         setHistoryReady(true)
         void resumeExecutionForPipeline(routePipelineId)
@@ -470,6 +1394,13 @@ export default function PipelineEditor() {
             historyRef.current = [initialSnapshot]
             historyIndexRef.current = 0
             activeHistoryPipelineRef.current = loadedPipelineId
+            canvasSnapshotsRef.current[MAIN_CANVAS_TAB_KEY] = {
+              nodes: cloneStructured(state.nodes || []),
+              edges: cloneStructured(state.edges || []),
+              selectedNodeId: state.selectedNodeId ? String(state.selectedNodeId) : null,
+              connectorType: (state.connectorType || 'smooth') as WorkflowConnectorType,
+              isDirty: Boolean(state.isDirty),
+            }
             updateHistoryFlags()
             setHistoryReady(true)
           } else {
@@ -491,6 +1422,27 @@ export default function PipelineEditor() {
   useEffect(() => {
     if (pipeline?.name) setPipelineName(pipeline.name)
   }, [pipeline?.name])
+
+  useEffect(() => {
+    activeCanvasTabKeyRef.current = activeCanvasTabKey
+  }, [activeCanvasTabKey])
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const customEvent = event as CustomEvent<OpenBusinessCanvasTabDetail>
+      const detail = customEvent?.detail || {}
+      const detailPipelineId = String(detail.pipelineId || '').trim()
+      const detailNodeId = String(detail.nodeId || '').trim()
+      const routePipelineId = String(id || '').trim()
+      if (!detailNodeId) return
+      if (detailPipelineId && routePipelineId && detailPipelineId !== routePipelineId) return
+      openBusinessCanvasTab(detailNodeId)
+    }
+    window.addEventListener('pipeline:open-business-canvas-tab', handler as EventListener)
+    return () => {
+      window.removeEventListener('pipeline:open-business-canvas-tab', handler as EventListener)
+    }
+  }, [id, openBusinessCanvasTab])
 
   useEffect(() => {
     if (!scheduleModal) return
@@ -518,19 +1470,24 @@ export default function PipelineEditor() {
 
   useEffect(() => {
     if (!historyReady || isExecuting || applyingHistoryRef.current) return
+    if (activeCanvasTabKey !== MAIN_CANVAS_TAB_KEY) return
+    if (isAnyNodeDragging) return
     const routePipelineId = id ? String(id) : null
     const pipelineId = pipeline?.id ? String(pipeline.id) : null
     if (!routePipelineId || pipelineId !== routePipelineId) return
-    const snapshot = createCanvasHistorySnapshot(pipelineId, nodes, edges)
-    if (activeHistoryPipelineRef.current !== pipelineId) {
-      activeHistoryPipelineRef.current = pipelineId
-      historyRef.current = [snapshot]
-      historyIndexRef.current = 0
-      updateHistoryFlags()
-      return
-    }
-    pushHistorySnapshot(snapshot)
-  }, [edges, historyReady, id, isExecuting, nodes, pipeline?.id, pushHistorySnapshot, updateHistoryFlags])
+    const timer = window.setTimeout(() => {
+      const snapshot = createCanvasHistorySnapshot(pipelineId, nodes, edges)
+      if (activeHistoryPipelineRef.current !== pipelineId) {
+        activeHistoryPipelineRef.current = pipelineId
+        historyRef.current = [snapshot]
+        historyIndexRef.current = 0
+        updateHistoryFlags()
+        return
+      }
+      pushHistorySnapshot(snapshot)
+    }, 120)
+    return () => window.clearTimeout(timer)
+  }, [activeCanvasTabKey, edges, historyReady, id, isExecuting, isAnyNodeDragging, nodes, pipeline?.id, pushHistorySnapshot, updateHistoryFlags])
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -543,14 +1500,7 @@ export default function PipelineEditor() {
       if (withMod && key === 's') {
         event.preventDefault()
         if (!isExecuting && !saving) {
-          setSaving(true)
-          void savePipeline()
-            .then(() => {
-              notification.success({ message: 'Saved!', placement: 'bottomRight', duration: 2 })
-            })
-            .finally(() => {
-              setSaving(false)
-            })
+          void saveActiveCanvas()
         }
         return
       }
@@ -585,7 +1535,12 @@ export default function PipelineEditor() {
         }
       } else if (key === 'enter' && !event.shiftKey) {
         event.preventDefault()
+        if (event.repeat) return
         if (!isExecuting) {
+          if (activeCanvasTabKeyRef.current !== MAIN_CANVAS_TAB_KEY) {
+            switchCanvasTab(MAIN_CANVAS_TAB_KEY)
+          }
+          resetRuntimeStateAcrossCanvases()
           void executePipeline()
         }
       }
@@ -594,29 +1549,37 @@ export default function PipelineEditor() {
     return () => {
       window.removeEventListener('keydown', onKeyDown)
     }
-  }, [duplicateNode, executePipeline, handleUndo, handleRedo, isExecuting, savePipeline, saving, selectedNodeId])
+  }, [duplicateNode, executePipeline, handleUndo, handleRedo, isExecuting, resetRuntimeStateAcrossCanvases, saveActiveCanvas, saving, selectedNodeId, switchCanvasTab])
 
-  // Auto-save on dirty
+  // Auto-save on dirty (main + child canvas)
   useEffect(() => {
+    if (!editorAutoSaveSettings.enabled) return
+    if (isExecuting || saving) return
     if (!isDirty) return
     const timer = setTimeout(async () => {
-      await savePipeline()
-    }, 2500)
+      await saveActiveCanvas({ silent: true })
+    }, editorAutoSaveSettings.intervalMs)
     return () => clearTimeout(timer)
-  }, [isDirty])
+  }, [
+    activeCanvasTabKey,
+    editorAutoSaveSettings.enabled,
+    editorAutoSaveSettings.intervalMs,
+    isDirty,
+    isExecuting,
+    saveActiveCanvas,
+    saving,
+  ])
 
   const handleSave = async () => {
-    setSaving(true)
-    try {
-      await savePipeline()
-      notification.success({ message: 'Saved!', placement: 'bottomRight', duration: 2 })
-    } finally {
-      setSaving(false)
-    }
+    await saveActiveCanvas()
   }
 
   const handleRun = async () => {
     if (isExecuting) return
+    if (activeCanvasTabKeyRef.current !== MAIN_CANVAS_TAB_KEY) {
+      switchCanvasTab(MAIN_CANVAS_TAB_KEY)
+    }
+    resetRuntimeStateAcrossCanvases()
     await executePipeline()
   }
 
@@ -624,6 +1587,122 @@ export default function PipelineEditor() {
     if (!isExecuting) return
     await abortExecution()
   }
+
+  const handleResetCanvasTop = useCallback(() => {
+    if (isExecuting) return
+    if (activeCanvasTabKeyRef.current !== MAIN_CANVAS_TAB_KEY) {
+      switchCanvasTab(MAIN_CANVAS_TAB_KEY)
+    }
+    Modal.confirm({
+      title: 'Reset pipeline to default state?',
+      content: 'This will discard unsaved changes and restore the last saved pipeline state in non-run mode.',
+      okText: 'Reset',
+      okButtonProps: { danger: true },
+      cancelText: 'Cancel',
+      onOk: async () => {
+        const routePipelineId = String(id || '').trim()
+        const isLocalOnly = routePipelineId.startsWith('p_')
+
+        if (!routePipelineId || isLocalOnly) {
+          const state = useWorkflowStore.getState()
+          const runtimeClearedNodes = clearNodeRuntimeState(state.nodes)
+          useWorkflowStore.setState((state) => ({
+            ...state,
+            nodes: runtimeClearedNodes,
+            selectedNodeId: null,
+            isExecuting: false,
+            executionId: null,
+            executionAbortRequested: false,
+            executionLogs: [],
+            showLogs: false,
+            isDirty: false,
+          }))
+          setSelectedNode(null)
+          const localSnapshot = createCanvasHistorySnapshot(
+            routePipelineId || null,
+            runtimeClearedNodes,
+            state.edges || [],
+          )
+          historyRef.current = [localSnapshot]
+          historyIndexRef.current = 0
+          activeHistoryPipelineRef.current = routePipelineId || null
+          canvasSnapshotsRef.current = {
+            [MAIN_CANVAS_TAB_KEY]: {
+              nodes: cloneStructured(runtimeClearedNodes),
+              edges: cloneStructured(state.edges || []),
+              selectedNodeId: null,
+              connectorType: (state.connectorType || 'smooth') as WorkflowConnectorType,
+              isDirty: false,
+            },
+          }
+          setCanvasTabs([{ key: MAIN_CANVAS_TAB_KEY, kind: 'main', label: 'Main Canvas' }])
+          setActiveCanvasTabKey(MAIN_CANVAS_TAB_KEY)
+          activeCanvasTabKeyRef.current = MAIN_CANVAS_TAB_KEY
+          setHistoryReady(Boolean(routePipelineId))
+          updateHistoryFlags()
+          notification.success({
+            message: 'Pipeline reset to initial non-run state.',
+            placement: 'bottomRight',
+            duration: 2,
+          })
+          return
+        }
+
+        await loadPipeline(routePipelineId)
+        const state = useWorkflowStore.getState()
+        const loadedPipelineId = String(state.pipeline?.id || '').trim()
+        if (!loadedPipelineId || loadedPipelineId !== routePipelineId) {
+          notification.error({
+            message: 'Reset failed',
+            description: 'Could not restore saved pipeline state.',
+            placement: 'bottomRight',
+            duration: 3,
+          })
+          return
+        }
+        const runtimeClearedNodes = clearNodeRuntimeState(state.nodes)
+        useWorkflowStore.setState((s) => ({
+          ...s,
+          nodes: runtimeClearedNodes,
+          selectedNodeId: null,
+          isExecuting: false,
+          executionId: null,
+          executionAbortRequested: false,
+          executionLogs: [],
+          showLogs: false,
+          isDirty: false,
+        }))
+        setSelectedNode(null)
+        const baselineSnapshot = createCanvasHistorySnapshot(
+          loadedPipelineId,
+          runtimeClearedNodes,
+          state.edges || [],
+        )
+        historyRef.current = [baselineSnapshot]
+        historyIndexRef.current = 0
+        activeHistoryPipelineRef.current = loadedPipelineId
+        canvasSnapshotsRef.current = {
+          [MAIN_CANVAS_TAB_KEY]: {
+            nodes: cloneStructured(runtimeClearedNodes),
+            edges: cloneStructured(state.edges || []),
+            selectedNodeId: null,
+            connectorType: (state.connectorType || 'smooth') as WorkflowConnectorType,
+            isDirty: false,
+          },
+        }
+        setCanvasTabs([{ key: MAIN_CANVAS_TAB_KEY, kind: 'main', label: 'Main Canvas' }])
+        setActiveCanvasTabKey(MAIN_CANVAS_TAB_KEY)
+        activeCanvasTabKeyRef.current = MAIN_CANVAS_TAB_KEY
+        setHistoryReady(true)
+        updateHistoryFlags()
+        notification.success({
+          message: 'Pipeline reset to saved default state.',
+          placement: 'bottomRight',
+          duration: 2,
+        })
+      },
+    })
+  }, [id, isExecuting, loadPipeline, setSelectedNode, switchCanvasTab, updateHistoryFlags])
 
   const applyImportedGraph = useCallback((payload: any, fallbackName: string) => {
     const source = payload?.pipeline && typeof payload.pipeline === 'object' ? payload.pipeline : payload
@@ -714,6 +1793,18 @@ export default function PipelineEditor() {
       selectedNodeId: null,
       isDirty: true,
     }))
+    canvasSnapshotsRef.current = {
+      [MAIN_CANVAS_TAB_KEY]: {
+        nodes: cloneStructured(normalizedNodes),
+        edges: cloneStructured(importedEdges),
+        connectorType: importedConnectorType,
+        selectedNodeId: null,
+        isDirty: true,
+      },
+    }
+    setCanvasTabs([{ key: MAIN_CANVAS_TAB_KEY, kind: 'main', label: 'Main Canvas' }])
+    setActiveCanvasTabKey(MAIN_CANVAS_TAB_KEY)
+    activeCanvasTabKeyRef.current = MAIN_CANVAS_TAB_KEY
 
     if (importedName) {
       setPipelineName(importedName)
@@ -788,9 +1879,17 @@ export default function PipelineEditor() {
   }, [applyImportedGraph, isExecuting, pipelineName])
 
   const triggerImportPicker = useCallback(() => {
+    if (activeCanvasTabKey !== MAIN_CANVAS_TAB_KEY) {
+      notification.info({
+        message: 'Switch to Main Canvas to import pipeline JSON.',
+        placement: 'bottomRight',
+        duration: 2,
+      })
+      return
+    }
     if (isExecuting) return
     importFileInputRef.current?.click()
-  }, [isExecuting])
+  }, [activeCanvasTabKey, isExecuting])
 
   const hasError = executionLogs.some(l => l.status === 'error')
   const hasSuccess = !isExecuting && executionLogs.length > 0 && !hasError
@@ -858,7 +1957,7 @@ export default function PipelineEditor() {
 
           {/* Left-aligned core actions */}
           <Space size={8} style={{ marginLeft: 12 }}>
-            <Tooltip title={isExecuting ? (executionAbortRequested ? 'Aborting…' : 'Abort') : 'Execute (Ctrl/Cmd + Enter)'}>
+            <Tooltip title={isExecuting ? (executionAbortRequested ? 'Aborting…' : 'Abort') : 'Execute (Ctrl/Cmd + Enter) — runs from Main Canvas'}>
               <Button
                 icon={
                   isExecuting
@@ -877,7 +1976,7 @@ export default function PipelineEditor() {
               />
             </Tooltip>
 
-            <Tooltip title="Save (Ctrl/Cmd + S)">
+            <Tooltip title={isChildCanvasTabActive ? 'Save Child Workflow (Ctrl/Cmd + S)' : 'Save (Ctrl/Cmd + S)'}>
               <Button
                 icon={<SaveOutlined />}
                 loading={saving}
@@ -912,7 +2011,7 @@ export default function PipelineEditor() {
               <Button
                 icon={<UndoOutlined />}
                 onClick={handleUndo}
-                disabled={!canUndo || isExecuting}
+                disabled={!canUndo || isExecuting || isChildCanvasTabActive}
                 style={{ background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)', color: 'var(--app-text-muted)' }}
               />
             </Tooltip>
@@ -920,8 +2019,16 @@ export default function PipelineEditor() {
               <Button
                 icon={<RedoOutlined />}
                 onClick={handleRedo}
-                disabled={!canRedo || isExecuting}
+                disabled={!canRedo || isExecuting || isChildCanvasTabActive}
                 style={{ background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)', color: 'var(--app-text-muted)' }}
+              />
+            </Tooltip>
+            <Tooltip title="Reset Canvas">
+              <Button
+                icon={<ClearOutlined />}
+                onClick={handleResetCanvasTop}
+                disabled={isExecuting}
+                style={{ background: 'var(--app-card-bg)', border: '1px solid rgba(239,68,68,0.45)', color: '#ef4444' }}
               />
             </Tooltip>
             <Tooltip title="Connector style">
@@ -931,6 +2038,16 @@ export default function PipelineEditor() {
                 options={WORKFLOW_CONNECTOR_OPTIONS}
                 size="small"
                 style={{ width: 124 }}
+                dropdownStyle={{ background: 'var(--app-card-bg)' }}
+              />
+            </Tooltip>
+            <Tooltip title="Canvas widget style">
+              <Select<PipelineCanvasWidgetStyle>
+                value={canvasWidgetStyle}
+                onChange={(value) => setCanvasWidgetStyle(value)}
+                options={PIPELINE_CANVAS_WIDGET_STYLE_OPTIONS}
+                size="small"
+                style={{ width: 122 }}
                 dropdownStyle={{ background: 'var(--app-card-bg)' }}
               />
             </Tooltip>
@@ -997,7 +2114,17 @@ export default function PipelineEditor() {
               menu={{
                 items: moreMenuItems,
                 onClick: ({ key }) => {
-                  if (key === 'schedule') setScheduleModal(true)
+                  if (key === 'schedule') {
+                    if (isChildCanvasTabActive) {
+                      notification.info({
+                        message: 'Switch to Main Canvas to configure schedule.',
+                        placement: 'bottomRight',
+                        duration: 2,
+                      })
+                    } else {
+                      setScheduleModal(true)
+                    }
+                  }
                   else if (key === 'history') navigate('/executions')
                   else if (key === 'import') triggerImportPicker()
                   else if (key === 'export') {
@@ -1021,6 +2148,78 @@ export default function PipelineEditor() {
               />
             </Dropdown>
           </Space>
+        </div>
+
+        <div
+          style={{
+            height: 40,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            padding: '0 12px',
+            background: 'var(--app-panel-bg)',
+            borderBottom: '1px solid var(--app-border)',
+            flexShrink: 0,
+          }}
+        >
+          {canvasTabs.map((tab) => {
+            const active = tab.key === activeCanvasTabKey
+            return (
+              <div
+                key={tab.key}
+                role="button"
+                tabIndex={0}
+                onClick={() => switchCanvasTab(tab.key)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault()
+                    switchCanvasTab(tab.key)
+                  }
+                }}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  height: 28,
+                  padding: '0 10px',
+                  borderRadius: 8,
+                  border: active ? '1px solid #6366f1aa' : '1px solid var(--app-border-strong)',
+                  background: active ? '#6366f11a' : 'var(--app-card-bg)',
+                  color: active ? '#c4b5fd' : 'var(--app-text-muted)',
+                  cursor: 'pointer',
+                  userSelect: 'none',
+                  maxWidth: 280,
+                }}
+              >
+                <span style={{ fontSize: 12, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {tab.kind === 'main' ? tab.label : `${tab.label}`}
+                </span>
+                {tab.kind === 'business' ? (
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<CloseOutlined />}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      closeCanvasTab(tab.key)
+                    }}
+                    style={{
+                      minWidth: 16,
+                      width: 16,
+                      height: 16,
+                      padding: 0,
+                      color: active ? '#ddd6fe' : 'var(--app-text-subtle)',
+                    }}
+                  />
+                ) : null}
+              </div>
+            )
+          })}
+          {isChildCanvasTabActive ? (
+            <Tag style={{ marginInlineStart: 4, marginInlineEnd: 0, borderRadius: 6, background: '#6366f112', border: '1px solid #6366f155', color: '#a5b4fc' }}>
+              Child Workflow Canvas
+            </Tag>
+          ) : null}
         </div>
 
         {/* ── MAIN EDITOR AREA ──────────────────────────────────────────────── */}

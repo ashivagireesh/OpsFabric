@@ -1,0 +1,11 @@
+Use these commands on macOS (Homebrew):
+
+Start Redis:
+brew services start redis
+Stop Redis:
+brew services stop redis
+Restart Redis:
+brew services restart redis
+Check status:
+brew services list | grep redis
+redis-cli ping

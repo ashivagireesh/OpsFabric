@@ -1,9 +1,10 @@
 import type { ETLEdge } from '../types'
 
-export const WORKFLOW_CONNECTOR_VALUES = ['smoothstep', 'step', 'straight'] as const
+export const WORKFLOW_CONNECTOR_VALUES = ['default', 'smoothstep', 'step', 'straight'] as const
 export type WorkflowConnectorType = (typeof WORKFLOW_CONNECTOR_VALUES)[number]
 
 export const WORKFLOW_CONNECTOR_OPTIONS: Array<{ value: WorkflowConnectorType; label: string }> = [
+  { value: 'default', label: 'Bezier' },
   { value: 'smoothstep', label: 'Smooth' },
   { value: 'step', label: 'Stepped' },
   { value: 'straight', label: 'Straight' },

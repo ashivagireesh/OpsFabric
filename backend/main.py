@@ -4,6 +4,7 @@ Full ETL operation platform with support for databases, files, APIs, cloud stora
 """
 import uuid
 import json
+import copy
 import asyncio
 import threading
 import time as _time
@@ -58,6 +59,7 @@ async def lifespan(app: FastAPI):
     global _app_main_loop
     _app_main_loop = asyncio.get_running_loop()
     Base.metadata.create_all(bind=engine)
+    _apply_runtime_feature_flags()
     recovered = _recover_stale_running_executions()
     if recovered:
         logger.warning(f"Recovered {recovered} stale running execution(s) on startup")
@@ -197,13 +199,54 @@ _app_main_loop: Optional[asyncio.AbstractEventLoop] = None
 execution_abort_events: Dict[str, threading.Event] = {}
 execution_abort_requested_at: Dict[str, float] = {}
 execution_workers: Dict[str, threading.Thread] = {}
+execution_runtime_node_enabled_overrides: Dict[str, Dict[str, bool]] = {}
+execution_pipeline_overrides: Dict[str, Dict[str, Any]] = {}
 _execution_start_lock = threading.Lock()
+_execution_runtime_node_enabled_lock = threading.Lock()
+_execution_pipeline_overrides_lock = threading.Lock()
 _execution_log_flush_state: Dict[str, float] = {}
 _execution_log_flush_lock = threading.Lock()
 _EXECUTION_LOG_FLUSH_INTERVAL_SECONDS = max(
     0.1,
     float(str(_os.getenv("EXECUTION_LOG_FLUSH_INTERVAL_SECONDS", "5.0")).strip() or "5.0"),
 )
+
+
+def _set_execution_runtime_node_enabled(
+    execution_id: str,
+    node_id: str,
+    enabled: bool,
+) -> None:
+    exec_key = str(execution_id or "").strip()
+    node_key = str(node_id or "").strip()
+    if not exec_key or not node_key:
+        return
+    with _execution_runtime_node_enabled_lock:
+        node_map = execution_runtime_node_enabled_overrides.setdefault(exec_key, {})
+        node_map[node_key] = bool(enabled)
+
+
+def _get_execution_runtime_node_enabled(
+    execution_id: str,
+    node_id: str,
+) -> Optional[bool]:
+    exec_key = str(execution_id or "").strip()
+    node_key = str(node_id or "").strip()
+    if not exec_key or not node_key:
+        return None
+    with _execution_runtime_node_enabled_lock:
+        node_map = execution_runtime_node_enabled_overrides.get(exec_key) or {}
+        if node_key not in node_map:
+            return None
+        return bool(node_map.get(node_key))
+
+
+def _clear_execution_runtime_node_enabled(execution_id: str) -> None:
+    exec_key = str(execution_id or "").strip()
+    if not exec_key:
+        return
+    with _execution_runtime_node_enabled_lock:
+        execution_runtime_node_enabled_overrides.pop(exec_key, None)
 
 
 class ThreadSafeWebSocketProxy:
@@ -277,6 +320,7 @@ _EXECUTION_HISTORY_MAX_RECORDS = _env_int("EXECUTION_HISTORY_MAX_RECORDS", 300, 
 _EXECUTION_HISTORY_PRUNE_DELETE_LIMIT = _env_int("EXECUTION_HISTORY_PRUNE_DELETE_LIMIT", 150, 10, 5000)
 
 _SYSTEM_SETTING_SQLITE_CLEANUP_SCHEDULE_KEY = "sqlite_cleanup_schedule_v1"
+_SYSTEM_SETTING_APP_FEATURE_FLAGS_KEY = "app_feature_flags_v1"
 _SQLITE_CLEANUP_SCHEDULE_JOB_ID = "system:sqlite_cleanup_schedule"
 _DEFAULT_SQLITE_CLEANUP_SCHEDULE_CONFIG: Dict[str, Any] = {
     "enabled": False,
@@ -286,6 +330,9 @@ _DEFAULT_SQLITE_CLEANUP_SCHEDULE_CONFIG: Dict[str, Any] = {
     "clear_business_run_payloads": True,
     "clear_audit_logs": False,
     "vacuum": False,
+}
+_DEFAULT_APP_FEATURE_FLAGS_CONFIG: Dict[str, Any] = {
+    "fns_v2_enabled": _env_bool("FNS_V2_ENABLED", False),
 }
 
 
@@ -334,6 +381,66 @@ def _normalize_sqlite_cleanup_schedule_config(raw: Any) -> Dict[str, Any]:
         "vacuum": _coerce_bool(base.get("vacuum"), False),
     }
     return normalized
+
+
+def _normalize_app_feature_flags_config(raw: Any) -> Dict[str, Any]:
+    base = dict(_DEFAULT_APP_FEATURE_FLAGS_CONFIG)
+    if isinstance(raw, dict):
+        base.update(raw)
+    return {
+        "fns_v2_enabled": _coerce_bool(
+            base.get("fns_v2_enabled"),
+            bool(_DEFAULT_APP_FEATURE_FLAGS_CONFIG.get("fns_v2_enabled", False)),
+        ),
+    }
+
+
+def _load_app_feature_flags_config(db: Optional[Session] = None) -> Dict[str, Any]:
+    owns_session = db is None
+    session = db or SessionLocal()
+    try:
+        row = session.query(models.SystemSetting).filter(
+            models.SystemSetting.key == _SYSTEM_SETTING_APP_FEATURE_FLAGS_KEY
+        ).first()
+        raw_value = row.value if row and isinstance(row.value, dict) else {}
+        return _normalize_app_feature_flags_config(raw_value)
+    except Exception:
+        return dict(_DEFAULT_APP_FEATURE_FLAGS_CONFIG)
+    finally:
+        if owns_session:
+            session.close()
+
+
+def _save_app_feature_flags_config(db: Session, raw_config: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = _normalize_app_feature_flags_config(raw_config)
+    row = db.query(models.SystemSetting).filter(
+        models.SystemSetting.key == _SYSTEM_SETTING_APP_FEATURE_FLAGS_KEY
+    ).first()
+    if row is None:
+        row = models.SystemSetting(
+            key=_SYSTEM_SETTING_APP_FEATURE_FLAGS_KEY,
+            value=normalized,
+        )
+        db.add(row)
+    else:
+        row.value = normalized
+    db.commit()
+    return normalized
+
+
+def _apply_runtime_feature_flags(
+    config: Optional[Dict[str, Any]] = None,
+    db: Optional[Session] = None,
+) -> Dict[str, Any]:
+    cfg = _normalize_app_feature_flags_config(
+        config if isinstance(config, dict) else _load_app_feature_flags_config(db)
+    )
+    _os.environ["FNS_V2_ENABLED"] = "1" if bool(cfg.get("fns_v2_enabled")) else "0"
+    try:
+        setattr(etl_engine, "_fns_v2_enabled", bool(cfg.get("fns_v2_enabled")))
+    except Exception:
+        pass
+    return cfg
 
 
 def _load_sqlite_cleanup_schedule_config(db: Optional[Session] = None) -> Dict[str, Any]:
@@ -481,9 +588,21 @@ def _collect_pipeline_lmdb_resources(nodes: Any) -> Dict[str, str]:
                 except Exception:
                     _add_resource("oracle", "unknown", str(cfg.get("custom_profile_oracle_table") or "ETL_PROFILE_STATE"))
             else:
+                profile_lmdb_env_path_raw = str(
+                    cfg.get("custom_profile_lmdb_env_path") or ""
+                ).strip()
+                if profile_lmdb_env_path_raw:
+                    try:
+                        profile_lmdb_env_effective = etl_engine._resolve_lmdb_env_path(  # pylint: disable=protected-access
+                            profile_lmdb_env_path_raw
+                        )
+                    except Exception:
+                        profile_lmdb_env_effective = _os.path.abspath(profile_lmdb_env_path_raw)
+                else:
+                    profile_lmdb_env_effective = profile_env
                 _add_resource(
                     "lmdb",
-                    profile_env,
+                    profile_lmdb_env_effective,
                     str(cfg.get("custom_profile_lmdb_db_name") or "").strip(),
                 )
 
@@ -572,6 +691,20 @@ def _find_running_lmdb_conflict(
     target_resources = _collect_pipeline_lmdb_resources(pipeline_nodes)
     if not target_resources:
         return None
+
+    running_execs = db.query(models.Execution).filter(
+        models.Execution.status.in_(["running", "cancelling"]),
+    ).all()
+    if not running_execs:
+        return None
+
+    # Best-effort stale execution reconciliation before conflict detection.
+    # This prevents zombie `running` rows from blocking new runs forever.
+    try:
+        for run in list(running_execs):
+            _try_finalize_stale_running_execution(run, db)
+    except Exception:
+        pass
 
     running_execs = db.query(models.Execution).filter(
         models.Execution.status.in_(["running", "cancelling"]),
@@ -1014,10 +1147,6 @@ def _compact_execution_logs_for_history(logs: Any) -> Any:
             if isinstance(warnings, list) and len(warnings) > 8:
                 entry["warnings"] = warnings[:8]
                 entry["warning_count"] = int(entry.get("warning_count") or len(warnings))
-            output_sample = entry.get("output_sample")
-            if isinstance(output_sample, list) and len(output_sample) > 5:
-                entry["output_sample"] = output_sample[:5]
-                entry["output_sample_truncated"] = True
             compact_logs.append(_json_safe_value(entry))
             continue
         text = str(item)
@@ -1363,7 +1492,17 @@ async def _run_pipeline_execution_task(
             })
             return
 
-        pipeline_data = {"nodes": pipeline.nodes or [], "edges": pipeline.edges or []}
+        with _execution_pipeline_overrides_lock:
+            override_payload = execution_pipeline_overrides.get(str(execution_id or "").strip())
+        if isinstance(override_payload, dict):
+            override_nodes = override_payload.get("nodes")
+            override_edges = override_payload.get("edges")
+            pipeline_data = {
+                "nodes": override_nodes if isinstance(override_nodes, list) else (pipeline.nodes or []),
+                "edges": override_edges if isinstance(override_edges, list) else (pipeline.edges or []),
+            }
+        else:
+            pipeline_data = {"nodes": pipeline.nodes or [], "edges": pipeline.edges or []}
         runtime_config = _extract_execution_runtime_from_nodes(
             pipeline.nodes or [],
             triggered_by=getattr(bg_exec, "triggered_by", None),
@@ -1385,6 +1524,10 @@ async def _run_pipeline_execution_task(
             runtime_config=runtime_config,
             pipeline_id=pipeline.id,
             should_abort=(abort_event.is_set if abort_event else None),
+            get_runtime_node_enabled=lambda node_id: _get_execution_runtime_node_enabled(
+                execution_id,
+                str(node_id or ""),
+            ),
         )
         if abort_event and abort_event.is_set():
             raise ExecutionAbortedError("Execution aborted by user.")
@@ -1474,8 +1617,17 @@ async def _run_pipeline_execution_task(
         execution_abort_events.pop(execution_id, None)
         execution_abort_requested_at.pop(execution_id, None)
         execution_workers.pop(execution_id, None)
+        with _execution_pipeline_overrides_lock:
+            execution_pipeline_overrides.pop(str(execution_id or "").strip(), None)
+        _clear_execution_runtime_node_enabled(execution_id)
         with _execution_log_flush_lock:
             _execution_log_flush_state.pop(execution_id, None)
+        try:
+            etl_engine._teardown_oracle_destination_engines_for_execution(execution_id)  # pylint: disable=protected-access
+        except Exception as oracle_engine_cleanup_exc:
+            logger.warning(
+                f"Oracle destination engine cleanup failed for execution {execution_id}: {oracle_engine_cleanup_exc}"
+            )
 
         try:
             terminal_status = str(terminal_payload.get("status") or "").strip().lower()
@@ -1520,6 +1672,7 @@ def _start_pipeline_execution(
     pipeline_id: str,
     triggered_by: str = "manual",
     skip_if_running: bool = False,
+    pipeline_override: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     db = SessionLocal()
     execution_id: Optional[str] = None
@@ -1541,10 +1694,15 @@ def _start_pipeline_execution(
                     )
                     return None
 
+            override_nodes = None
+            if isinstance(pipeline_override, dict):
+                raw_nodes = pipeline_override.get("nodes")
+                if isinstance(raw_nodes, list):
+                    override_nodes = raw_nodes
             lmdb_conflict = _find_running_lmdb_conflict(
                 db,
                 pipeline_id=pipeline_id,
-                pipeline_nodes=pipeline.nodes or [],
+                pipeline_nodes=override_nodes if isinstance(override_nodes, list) else (pipeline.nodes or []),
             )
             if lmdb_conflict:
                 conflict_msg = (
@@ -1561,14 +1719,39 @@ def _start_pipeline_execution(
                 raise RuntimeError(conflict_msg)
 
             execution_id = str(uuid.uuid4())
+            queued_at = datetime.utcnow().isoformat()
+            initial_logs = [{
+                "nodeId": "__system__",
+                "nodeLabel": "System",
+                "timestamp": queued_at,
+                "started_at": queued_at,
+                "status": "running",
+                "message": "⟳ Execution queued. Initializing ETL engine…",
+                "rows": 0,
+            }]
             execution = models.Execution(
                 id=execution_id,
                 pipeline_id=pipeline_id,
                 status="running",
                 triggered_by=triggered_by,
+                logs=initial_logs,
             )
             db.add(execution)
             db.commit()
+            if isinstance(pipeline_override, dict):
+                with _execution_pipeline_overrides_lock:
+                    execution_pipeline_overrides[execution_id] = {
+                        "nodes": (
+                            pipeline_override.get("nodes")
+                            if isinstance(pipeline_override.get("nodes"), list)
+                            else None
+                        ),
+                        "edges": (
+                            pipeline_override.get("edges")
+                            if isinstance(pipeline_override.get("edges"), list)
+                            else None
+                        ),
+                    }
     finally:
         db.close()
 
@@ -1731,6 +1914,11 @@ class PipelineUpdate(BaseModel):
     schedule_cron: Optional[str] = None
     schedule_enabled: Optional[bool] = None
 
+
+class PipelineExecuteRequest(BaseModel):
+    nodes: Optional[List[Dict[str, Any]]] = None
+    edges: Optional[List[Dict[str, Any]]] = None
+
 class MLOpsWorkflowCreate(BaseModel):
     name: str
     description: Optional[str] = ""
@@ -1879,6 +2067,11 @@ class LmdbEnvPathOptionsRequest(BaseModel):
     limit: int = 500
 
 
+class LmdbEnvPathCreateRequest(BaseModel):
+    env_path: str
+    initialize: bool = True
+
+
 class LmdbDeleteRequest(BaseModel):
     env_path: str
     db_name: Optional[str] = None
@@ -1924,6 +2117,19 @@ class CustomFieldValidationRequest(BaseModel):
     lmdb_config: Dict[str, Any] = Field(default_factory=dict)
     rocksdb_config: Dict[str, Any] = Field(default_factory=dict)
 
+
+class ConditionValidationRequest(BaseModel):
+    condition_config: Dict[str, Any] = Field(default_factory=dict)
+    rows: List[Dict[str, Any]] = Field(default_factory=list)
+    validation_source: str = "upstream_preview"  # upstream_preview|profile_store|source_scan|rows
+    max_rows: int = 100000
+    sample_rows: int = 10
+    pipeline_id: Optional[str] = None
+    profile_node_id: Optional[str] = None
+    profile_node_config: Dict[str, Any] = Field(default_factory=dict)
+    source_node_type: Optional[str] = None
+    source_node_config: Dict[str, Any] = Field(default_factory=dict)
+
 class CredentialCreate(BaseModel):
     name: str
     type: str
@@ -1952,6 +2158,10 @@ class SQLiteCleanupScheduleUpdateRequest(BaseModel):
     vacuum: bool = False
 
 
+class AppFeatureFlagsUpdateRequest(BaseModel):
+    fns_v2_enabled: bool = False
+
+
 def _build_pipeline_profile_state_summary(
     pipeline_id: str,
     node_id: Optional[str] = None,
@@ -1959,13 +2169,39 @@ def _build_pipeline_profile_state_summary(
     primary_key_field: Optional[str] = None,
     pipeline_nodes: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    summary = etl_engine.get_profile_state_summary(
-        pipeline_id=pipeline_id,
-        node_id=node_id,
-        limit=limit,
-        preferred_primary_key_field=primary_key_field,
-        include_oracle=False,
-    )
+    previous_lmdb_override = getattr(etl_engine, "_runtime_profile_lmdb_dir_override", None)
+    selected_lmdb_override: Optional[str] = None
+    if isinstance(pipeline_nodes, list):
+        for raw_node in pipeline_nodes:
+            if not isinstance(raw_node, dict):
+                continue
+            raw_node_id = str(raw_node.get("id") or "").strip()
+            if node_id and raw_node_id != str(node_id):
+                continue
+            raw_data = raw_node.get("data")
+            raw_cfg = raw_data.get("config") if isinstance(raw_data, dict) else {}
+            if not isinstance(raw_cfg, dict):
+                continue
+            if not bool(raw_cfg.get("custom_profile_enabled", False)):
+                continue
+            storage = str(raw_cfg.get("custom_profile_storage", "lmdb")).strip().lower()
+            if storage not in {"", "lmdb"}:
+                continue
+            candidate = str(raw_cfg.get("custom_profile_lmdb_env_path") or "").strip()
+            if candidate:
+                selected_lmdb_override = candidate
+                break
+    setattr(etl_engine, "_runtime_profile_lmdb_dir_override", selected_lmdb_override)
+    try:
+        summary = etl_engine.get_profile_state_summary(
+            pipeline_id=pipeline_id,
+            node_id=node_id,
+            limit=limit,
+            preferred_primary_key_field=primary_key_field,
+            include_oracle=False,
+        )
+    finally:
+        setattr(etl_engine, "_runtime_profile_lmdb_dir_override", previous_lmdb_override)
     oracle_cfg_by_node = _collect_pipeline_oracle_profile_configs(
         pipeline_nodes,
         node_id=node_id,
@@ -2107,6 +2343,37 @@ def _clear_pipeline_profile_state(
 
 # ─── PIPELINES ────────────────────────────────────────────────────────────────
 
+_PIPELINE_TRANSIENT_DATA_KEYS = {
+    "executionSampleOutput",
+    "executionSampleInput",
+    "executionSampleMeta",
+    "executionSampleError",
+}
+_PIPELINE_TRANSIENT_CONFIG_KEYS = {
+    "_preview_rows",
+}
+
+
+def _sanitize_pipeline_nodes_for_persistence(nodes: Any) -> List[Dict[str, Any]]:
+    if not isinstance(nodes, list):
+        return []
+    sanitized: List[Dict[str, Any]] = []
+    for raw_node in nodes:
+        if not isinstance(raw_node, dict):
+            continue
+        node = copy.deepcopy(raw_node)
+        data = node.get("data")
+        if isinstance(data, dict):
+            for key in _PIPELINE_TRANSIENT_DATA_KEYS:
+                data.pop(key, None)
+            cfg = data.get("config")
+            if isinstance(cfg, dict):
+                for key in _PIPELINE_TRANSIENT_CONFIG_KEYS:
+                    cfg.pop(key, None)
+        sanitized.append(node)
+    return sanitized
+
+
 @app.get("/api/pipelines")
 async def list_pipelines(db: Session = Depends(get_db)):
     pipelines = db.query(models.Pipeline).order_by(models.Pipeline.updated_at.desc()).all()
@@ -2159,12 +2426,13 @@ async def list_pipelines(db: Session = Depends(get_db)):
 
 @app.post("/api/pipelines", status_code=201)
 async def create_pipeline(body: PipelineCreate, db: Session = Depends(get_db)):
-    schedule_fields = _extract_schedule_from_nodes(body.nodes)
+    sanitized_nodes = _sanitize_pipeline_nodes_for_persistence(body.nodes)
+    schedule_fields = _extract_schedule_from_nodes(sanitized_nodes)
     pipeline = models.Pipeline(
         id=str(uuid.uuid4()),
         name=body.name,
         description=body.description,
-        nodes=body.nodes,
+        nodes=sanitized_nodes,
         edges=body.edges,
         tags=body.tags,
         status=body.status,
@@ -2182,10 +2450,11 @@ async def get_pipeline(pipeline_id: str, db: Session = Depends(get_db)):
     p = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Pipeline not found")
-    runtime = _extract_execution_runtime_from_nodes(p.nodes or [])
+    sanitized_nodes = _sanitize_pipeline_nodes_for_persistence(p.nodes or [])
+    runtime = _extract_execution_runtime_from_nodes(sanitized_nodes)
     return {
         "id": p.id, "name": p.name, "description": p.description,
-        "nodes": p.nodes or [], "edges": p.edges or [],
+        "nodes": sanitized_nodes, "edges": p.edges or [],
         "status": p.status, "tags": p.tags or [],
         "schedule_cron": p.schedule_cron,
         "schedule_enabled": p.schedule_enabled,
@@ -2206,6 +2475,8 @@ async def update_pipeline(pipeline_id: str, body: PipelineUpdate, db: Session = 
         raise HTTPException(status_code=404, detail="Pipeline not found")
 
     update_data = body.model_dump(exclude_none=True)
+    if "nodes" in update_data:
+        update_data["nodes"] = _sanitize_pipeline_nodes_for_persistence(update_data.get("nodes"))
     if (
         "nodes" in update_data
         and "schedule_enabled" not in update_data
@@ -2259,7 +2530,7 @@ async def duplicate_pipeline(pipeline_id: str, db: Session = Depends(get_db)):
         id=str(uuid.uuid4()),
         name=f"{p.name} (Copy)",
         description=p.description,
-        nodes=p.nodes,
+        nodes=_sanitize_pipeline_nodes_for_persistence(p.nodes),
         edges=p.edges,
         tags=p.tags,
         status="draft"
@@ -8812,15 +9083,30 @@ async def get_business_run(run_id: str, db: Session = Depends(get_db)):
 # ─── EXECUTIONS ───────────────────────────────────────────────────────────────
 
 @app.post("/api/pipelines/{pipeline_id}/execute")
-async def execute_pipeline(pipeline_id: str, db: Session = Depends(get_db)):
+async def execute_pipeline(
+    pipeline_id: str,
+    body: Optional[PipelineExecuteRequest] = None,
+    db: Session = Depends(get_db),
+):
     p = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Pipeline not found")
     try:
+        pipeline_override: Optional[Dict[str, Any]] = None
+        if body is not None:
+            payload = body.model_dump()
+            nodes = payload.get("nodes")
+            edges = payload.get("edges")
+            if isinstance(nodes, list) or isinstance(edges, list):
+                pipeline_override = {
+                    "nodes": nodes if isinstance(nodes, list) else None,
+                    "edges": edges if isinstance(edges, list) else None,
+                }
         execution_id = _start_pipeline_execution(
             pipeline_id=pipeline_id,
             triggered_by="manual",
             skip_if_running=False,
+            pipeline_override=pipeline_override,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
@@ -9140,6 +9426,8 @@ async def get_execution(
     include_node_results: bool = False,
     include_logs: bool = True,
     log_tail: int = 300,
+    log_after: int = -1,
+    include_log_samples: bool = False,
     db: Session = Depends(get_db),
 ):
     query = db.query(models.Execution)
@@ -9186,15 +9474,44 @@ async def get_execution(
             node_result_keys = []
 
     logs_payload: List[Any] = []
+    logs_total = 0
     if include_logs:
         loaded_logs = e.logs or []
         if isinstance(loaded_logs, list):
+            logs_total = len(loaded_logs)
             tail = max(10, min(int(log_tail), 5000))
-            logs_payload = loaded_logs[-tail:] if len(loaded_logs) > tail else loaded_logs
+            after_idx = int(log_after) if isinstance(log_after, int) else -1
+            if after_idx >= 0:
+                start_idx = min(max(after_idx + 1, 0), logs_total)
+                logs_payload = loaded_logs[start_idx:]
+                # Keep response bounded even with stale cursors.
+                if len(logs_payload) > tail:
+                    logs_payload = logs_payload[-tail:]
+            else:
+                logs_payload = loaded_logs[-tail:] if len(loaded_logs) > tail else loaded_logs
             logs_payload = _normalize_terminal_execution_logs(
                 logs_payload,
                 e.status,
             )
+            if not include_log_samples:
+                stripped_logs: List[Any] = []
+                for item in logs_payload:
+                    if not isinstance(item, dict):
+                        stripped_logs.append(item)
+                        continue
+                    entry = dict(item)
+                    for key in (
+                        "input_sample",
+                        "output_sample",
+                        "sample_input",
+                        "sample_output",
+                        "preview_rows",
+                        "rows_sample",
+                    ):
+                        if key in entry:
+                            entry.pop(key, None)
+                    stripped_logs.append(entry)
+                logs_payload = stripped_logs
         else:
             logs_payload = []
 
@@ -9207,9 +9524,76 @@ async def get_execution(
         "node_results": node_results,
         "node_result_keys": node_result_keys,
         "logs": logs_payload,
+        "log_count": int(logs_total),
         "error_message": e.error_message,
         "rows_processed": e.rows_processed,
         "triggered_by": e.triggered_by,
+    }
+
+
+class ExecutionNodeEnabledRequest(BaseModel):
+    node_enabled: bool = True
+
+
+@app.post("/api/executions/{execution_id}/nodes/{node_id}/enabled")
+async def set_execution_node_enabled(
+    execution_id: str,
+    node_id: str,
+    body: ExecutionNodeEnabledRequest,
+    db: Session = Depends(get_db),
+):
+    exec_key = str(execution_id or "").strip()
+    node_key = str(node_id or "").strip()
+    if not exec_key:
+        raise HTTPException(status_code=400, detail="execution_id is required")
+    if not node_key:
+        raise HTTPException(status_code=400, detail="node_id is required")
+
+    execution = db.query(models.Execution).filter(models.Execution.id == exec_key).first()
+    if not execution:
+        raise HTTPException(status_code=404, detail="Execution not found")
+
+    status = str(execution.status or "").strip().lower()
+    if status not in {"running", "cancelling"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Execution is not active (status={execution.status}). Runtime node toggle only works during running/cancelling.",
+        )
+
+    enabled = bool(body.node_enabled)
+    _set_execution_runtime_node_enabled(exec_key, node_key, enabled)
+
+    logs = execution.logs if isinstance(execution.logs, list) else []
+    logs.append({
+        "nodeId": node_key,
+        "nodeLabel": node_key,
+        "timestamp": datetime.utcnow().isoformat(),
+        "status": "running",
+        "message": (
+            f"⟳ Runtime node toggle applied: "
+            f"{'enabled' if enabled else 'disabled'} for node `{node_key}`"
+        ),
+        "rows": 0,
+    })
+    execution.logs = _json_safe_value(logs)
+    db.commit()
+
+    try:
+        await threadsafe_ws_manager.broadcast(exec_key, {
+            "type": "node_runtime_toggle",
+            "execution_id": exec_key,
+            "nodeId": node_key,
+            "node_enabled": enabled,
+            "log_entry": logs[-1],
+        })
+    except Exception:
+        pass
+
+    return {
+        "execution_id": exec_key,
+        "node_id": node_key,
+        "node_enabled": enabled,
+        "applied": True,
     }
 
 
@@ -9339,6 +9723,24 @@ def _collect_sqlite_runtime_usage(db: Session) -> Dict[str, Any]:
         "audit_logs_total": int(audit_logs_total),
         "generated_at": datetime.utcnow().isoformat(),
     }
+
+
+@app.get("/api/settings/app/feature-flags")
+async def get_app_feature_flags(db: Session = Depends(get_db)):
+    return _normalize_app_feature_flags_config(_load_app_feature_flags_config(db))
+
+
+@app.put("/api/settings/app/feature-flags")
+async def update_app_feature_flags(
+    body: AppFeatureFlagsUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        saved = _save_app_feature_flags_config(db, body.model_dump())
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to save app feature flags: {exc}")
+    return _apply_runtime_feature_flags(saved)
 
 
 @app.get("/api/settings/sqlite/usage")
@@ -9803,13 +10205,75 @@ def _build_limited_sql_query(query: str, limit: int, dialect: str) -> str:
     return f"SELECT * FROM ({q}) src_q LIMIT {int(limit)}"
 
 
+def _clip_preview_text(value: str, max_chars: int = 20000) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "..."
+
+
+def _to_json_safe_value(value: Any, depth: int = 0) -> Any:
+    if depth > 8:
+        return _clip_preview_text(value, 2000)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        if isinstance(value, str):
+            return _clip_preview_text(value)
+        return value
+    if isinstance(value, (datetime, date, time)):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    if isinstance(value, Decimal):
+        try:
+            return float(value)
+        except Exception:
+            return str(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        try:
+            return _clip_preview_text(bytes(value).decode("utf-8"))
+        except Exception:
+            try:
+                encoded = base64.b64encode(bytes(value)).decode("ascii")
+                return f"base64:{_clip_preview_text(encoded)}"
+            except Exception:
+                return str(value)
+
+    # Oracle LOB objects (CLOB/BLOB/NCLOB) are not JSON serializable.
+    # Read once and recursively normalize the resulting payload.
+    if hasattr(value, "read"):
+        value_type = str(type(value)).lower()
+        value_module = str(getattr(type(value), "__module__", "")).lower()
+        if "lob" in value_type or "oracledb" in value_module:
+            try:
+                return _to_json_safe_value(value.read(), depth + 1)
+            except Exception:
+                try:
+                    return _clip_preview_text(str(value))
+                except Exception:
+                    return None
+
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for k, v in value.items():
+            out[str(k)] = _to_json_safe_value(v, depth + 1)
+        return out
+    if isinstance(value, (list, tuple, set)):
+        return [_to_json_safe_value(v, depth + 1) for v in list(value)[:500]]
+
+    try:
+        return _clip_preview_text(str(value))
+    except Exception:
+        return None
+
+
 def _normalize_source_rows(rows: list, max_rows: int) -> list:
     out: list = []
     for item in rows[:max_rows]:
         if isinstance(item, dict):
-            out.append(item)
+            out.append(_to_json_safe_value(item))
         else:
-            out.append({"value": item})
+            out.append({"value": _to_json_safe_value(item)})
     return out
 
 
@@ -9938,10 +10402,16 @@ async def _load_rocksdb_rows_for_preview(
     }
 
 
-async def _load_tabular_rows_for_source(node_type: str, config: dict, max_rows: int) -> list:
+async def _load_tabular_rows_for_source(
+    node_type: str,
+    config: dict,
+    max_rows: int,
+    hard_cap: int = 2000,
+) -> list:
     ntype = (node_type or "").strip().lower()
     cfg = config or {}
-    limit = max(1, min(int(max_rows or 200), 2000))
+    safe_cap = max(1, min(int(hard_cap or 2000), 1_000_000))
+    limit = max(1, min(int(max_rows or 200), safe_cap))
 
     if ntype == "postgres_source":
         import psycopg2
@@ -10041,7 +10511,48 @@ async def _load_tabular_rows_for_source(node_type: str, config: dict, max_rows: 
             cursor = conn.cursor()
             cursor.execute(limited_query)
             cols = [desc[0] for desc in (cursor.description or [])]
-            rows = [dict(zip(cols, row)) for row in cursor.fetchall()]
+            raw_rows = cursor.fetchall()
+
+            def _materialize_oracle_preview_value(col_name: str, value: Any) -> Any:
+                if value is None:
+                    return None
+                if hasattr(value, "read") and callable(getattr(value, "read", None)):
+                    try:
+                        value = value.read()
+                    except Exception:
+                        try:
+                            return str(value)
+                        except Exception:
+                            return None
+                if isinstance(value, (bytes, bytearray, memoryview)):
+                    payload = bytes(value)
+                    try:
+                        value = payload.decode("utf-8")
+                    except Exception:
+                        return f"base64:{base64.b64encode(payload).decode('ascii')}"
+                if isinstance(value, str):
+                    text = value.strip()
+                    normalized_col = str(col_name or "").strip().upper()
+                    if normalized_col.endswith("_JSON") or normalized_col in {
+                        "DOCUMENT_JSON",
+                        "META_JSON",
+                        "STATS_JSON",
+                    }:
+                        if (text.startswith("{") and text.endswith("}")) or (
+                            text.startswith("[") and text.endswith("]")
+                        ):
+                            try:
+                                return json.loads(text)
+                            except Exception:
+                                return value
+                return value
+
+            rows = []
+            for row in raw_rows or []:
+                rows.append({
+                    str(col): _materialize_oracle_preview_value(str(col), row[idx] if idx < len(row) else None)
+                    for idx, col in enumerate(cols)
+                })
             cursor.close()
             return rows
         except HTTPException:
@@ -10580,6 +11091,64 @@ async def lmdb_env_path_options(body: LmdbEnvPathOptionsRequest):
     }
 
 
+@app.post("/api/lmdb/env-path-create")
+async def lmdb_env_path_create(body: LmdbEnvPathCreateRequest):
+    raw_path = str(body.env_path or "").strip()
+    if not raw_path:
+        raise HTTPException(400, "LMDB environment path is empty.")
+
+    expanded = _os.path.expandvars(_os.path.expanduser(raw_path))
+    if expanded.lower().endswith("data.mdb"):
+        expanded = _os.path.dirname(expanded)
+    expanded = _os.path.abspath(expanded)
+
+    if _os.path.isfile(expanded):
+        raise HTTPException(400, f"LMDB environment path must be a directory: {expanded}")
+
+    try:
+        _os.makedirs(expanded, exist_ok=True)
+    except Exception as exc:
+        raise HTTPException(400, f"Failed to create LMDB environment directory: {exc}")
+
+    initialized = False
+    if bool(body.initialize):
+        if _lmdb is None:
+            raise HTTPException(400, "LMDB dependency is not installed in backend environment.")
+        try:
+            tmp_env = _lmdb.open(
+                expanded,
+                map_size=64 * 1024 * 1024,
+                max_dbs=1,
+                subdir=True,
+                create=True,
+                lock=True,
+                sync=False,
+                metasync=False,
+                readahead=True,
+            )
+            try:
+                with tmp_env.begin(write=True):
+                    pass
+                tmp_env.sync()
+            finally:
+                try:
+                    tmp_env.close()
+                except Exception:
+                    pass
+            initialized = True
+        except Exception as exc:
+            raise HTTPException(400, f"Failed to initialize LMDB environment: {exc}")
+
+    data_mdb_exists = _os.path.isfile(_os.path.join(expanded, "data.mdb"))
+    lock_mdb_exists = _os.path.isfile(_os.path.join(expanded, "lock.mdb"))
+    return {
+        "env_path": expanded,
+        "initialized": initialized,
+        "data_mdb_exists": data_mdb_exists,
+        "lock_mdb_exists": lock_mdb_exists,
+    }
+
+
 @app.post("/api/rocksdb/env-path-options")
 async def rocksdb_env_path_options(body: RocksdbEnvPathOptionsRequest):
     roots: List[str] = []
@@ -11055,6 +11624,11 @@ async def validate_custom_fields(body: CustomFieldValidationRequest):
                 if ("flatten_json_values" in rocks_cfg_in if is_rocks_validation else "flatten_json_values" in lmdb_cfg_in)
                 else config.get("custom_validation_lmdb_flatten_json_values", True)
             ),
+            "include_entity_meta": bool(
+                (rocks_cfg_in.get("include_entity_meta") if is_rocks_validation else lmdb_cfg_in.get("include_entity_meta"))
+                if ("include_entity_meta" in rocks_cfg_in if is_rocks_validation else "include_entity_meta" in lmdb_cfg_in)
+                else config.get("custom_validation_lmdb_include_entity_meta", False)
+            ),
             "limit": max_rows,
         }
         if not lmdb_cfg["env_path"]:
@@ -11232,6 +11806,206 @@ async def validate_custom_fields(body: CustomFieldValidationRequest):
         "warnings": warnings,
         "sample_input": _json_safe_value(normalized_rows[:10]),
         "sample_output": _json_safe_value((result_rows or [])[:20] if isinstance(result_rows, list) else []),
+    }
+
+
+def _normalize_condition_validation_source(value: Any) -> str:
+    text = str(value or "upstream_preview").strip().lower()
+    if text in {"rows", "sample", "upstream_preview", "preview"}:
+        return "upstream_preview"
+    if text in {"profile_store", "profile", "profile_state", "lmdb", "rocksdb", "redis", "oracle"}:
+        return "profile_store"
+    if text in {"source_scan", "source", "direct_source"}:
+        return "source_scan"
+    return "upstream_preview"
+
+
+def _normalize_condition_validation_rows(rows: Any, max_rows: int) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not isinstance(rows, list):
+        return out
+    for item in rows:
+        if len(out) >= max_rows:
+            break
+        if isinstance(item, dict):
+            out.append(_to_json_safe_value(item))
+        else:
+            out.append({"value": _to_json_safe_value(item)})
+    return out
+
+
+def _load_profile_rows_for_condition_validation(
+    pipeline_id: str,
+    profile_node_id: str,
+    profile_node_config: Dict[str, Any],
+    max_rows: int,
+) -> Tuple[List[Dict[str, Any]], int, str]:
+    storage = str(
+        (profile_node_config or {}).get("custom_profile_storage")
+        or (profile_node_config or {}).get("profile_storage")
+        or "lmdb"
+    ).strip().lower()
+    if storage in {"rocks", "rocks_db"}:
+        storage = "rocksdb"
+    if storage not in {"lmdb", "rocksdb", "redis", "oracle"}:
+        storage = "lmdb"
+
+    node_state: Dict[str, Any] = {}
+    if storage == "oracle":
+        node_state = etl_engine._load_oracle_profile_state_for_node(
+            str(pipeline_id),
+            str(profile_node_id),
+            profile_cfg=profile_node_config,
+        ) or {}
+    elif storage == "rocksdb":
+        state_by_node = etl_engine._load_rocks_profile_state_by_node(str(pipeline_id))
+        node_state = state_by_node.get(str(profile_node_id)) if isinstance(state_by_node, dict) else {}
+    elif storage == "redis":
+        state_by_node = etl_engine._load_redis_profile_state_by_node(str(pipeline_id))
+        node_state = state_by_node.get(str(profile_node_id)) if isinstance(state_by_node, dict) else {}
+    else:
+        state_by_node = etl_engine._load_lmdb_profile_state_by_node(str(pipeline_id))
+        node_state = state_by_node.get(str(profile_node_id)) if isinstance(state_by_node, dict) else {}
+
+    docs = node_state.get("documents") if isinstance(node_state, dict) else {}
+    if not isinstance(docs, dict):
+        docs = {}
+    total_entities = len(docs)
+
+    out_rows: List[Dict[str, Any]] = []
+    for entity_token, doc in docs.items():
+        if len(out_rows) >= max_rows:
+            break
+        row_value = _to_json_safe_value(doc)
+        if isinstance(row_value, dict):
+            if "_entity_token" not in row_value:
+                row_value["_entity_token"] = str(entity_token or "")
+            out_rows.append(row_value)
+        else:
+            out_rows.append({
+                "_entity_token": str(entity_token or ""),
+                "value": row_value,
+            })
+    return out_rows, total_entities, storage
+
+
+@app.post("/api/condition/validate")
+async def validate_condition_flow(body: ConditionValidationRequest):
+    warnings: List[str] = []
+    source_mode = _normalize_condition_validation_source(body.validation_source)
+    condition_cfg = body.condition_config if isinstance(body.condition_config, dict) else {}
+
+    try:
+        raw_max_rows = int(body.max_rows if body.max_rows is not None else 100000)
+    except Exception:
+        raw_max_rows = 100000
+    # Safety cap for UI-triggered validation runs.
+    safe_cap = 500000
+    if raw_max_rows <= 0:
+        max_rows = safe_cap
+        warnings.append(f"max_rows<=0 interpreted as unlimited, capped to {safe_cap:,} rows for safety.")
+    else:
+        max_rows = max(1, min(raw_max_rows, safe_cap))
+        if raw_max_rows > safe_cap:
+            warnings.append(f"max_rows capped to {safe_cap:,} rows.")
+
+    try:
+        sample_rows = int(body.sample_rows if body.sample_rows is not None else 10)
+    except Exception:
+        sample_rows = 10
+    sample_rows = max(1, min(sample_rows, 100))
+
+    normalized_rows: List[Dict[str, Any]] = []
+    source_meta: Dict[str, Any] = {
+        "validation_source": source_mode,
+        "max_rows": max_rows,
+        "sample_rows": sample_rows,
+    }
+
+    if source_mode == "profile_store":
+        pipeline_id = str(body.pipeline_id or "").strip()
+        profile_node_id = str(body.profile_node_id or "").strip()
+        if not pipeline_id or not profile_node_id:
+            raise HTTPException(
+                400,
+                "profile_store validation requires pipeline_id and profile_node_id.",
+            )
+        profile_node_config = body.profile_node_config if isinstance(body.profile_node_config, dict) else {}
+        normalized_rows, total_entities, storage = _load_profile_rows_for_condition_validation(
+            pipeline_id=pipeline_id,
+            profile_node_id=profile_node_id,
+            profile_node_config=profile_node_config,
+            max_rows=max_rows,
+        )
+        source_meta.update({
+            "profile_storage": storage,
+            "pipeline_id": pipeline_id,
+            "profile_node_id": profile_node_id,
+            "total_entities": total_entities,
+            "loaded_rows": len(normalized_rows),
+        })
+        if total_entities > len(normalized_rows):
+            warnings.append(
+                f"Loaded {len(normalized_rows):,} of {total_entities:,} profile entities due to max_rows limit."
+            )
+    elif source_mode == "source_scan":
+        source_node_type = str(body.source_node_type or "").strip().lower()
+        source_node_config = body.source_node_config if isinstance(body.source_node_config, dict) else {}
+        if not source_node_type:
+            raise HTTPException(
+                400,
+                "source_scan validation requires source_node_type.",
+            )
+        source_rows = await _load_tabular_rows_for_source(
+            source_node_type,
+            source_node_config,
+            max_rows=max_rows,
+            hard_cap=max_rows,
+        )
+        normalized_rows = _normalize_source_rows(source_rows, max_rows)
+        source_meta.update({
+            "source_node_type": source_node_type,
+            "loaded_rows": len(normalized_rows),
+        })
+        if len(normalized_rows) >= max_rows:
+            warnings.append("Source scan reached max_rows limit; counts may be truncated.")
+    else:
+        normalized_rows = _normalize_condition_validation_rows(body.rows, max_rows)
+        source_meta.update({
+            "loaded_rows": len(normalized_rows),
+        })
+
+    if not normalized_rows:
+        normalized_rows = [{}]
+        warnings.append("No rows available for validation; evaluated against a single empty row.")
+
+    routing_mode = str(condition_cfg.get("condition_routing_mode") or "").strip().lower()
+    case_counts: Dict[str, int] = {}
+    if routing_mode == "case":
+        split = etl_engine._flow_condition_case_routes_split(normalized_rows, condition_cfg)
+        true_rows = split.get("output") if isinstance(split.get("output"), list) else []
+        false_rows = split.get("output_false") if isinstance(split.get("output_false"), list) else []
+        for handle_id, rows in (split.items() if isinstance(split, dict) else []):
+            if handle_id in {"output", "output_false"}:
+                continue
+            if isinstance(rows, list):
+                case_counts[str(handle_id)] = len(rows)
+    else:
+        true_rows, false_rows = etl_engine._flow_condition_split(normalized_rows, condition_cfg)
+
+    return {
+        "ok": True,
+        "validation_source": source_mode,
+        "routing_mode": "case" if routing_mode == "case" else "boolean",
+        "input_rows": len(normalized_rows),
+        "true_rows": len(true_rows),
+        "false_rows": len(false_rows),
+        "case_counts": case_counts,
+        "sample_input": _json_safe_value(normalized_rows[:sample_rows]),
+        "true_samples": _json_safe_value(true_rows[:sample_rows]),
+        "false_samples": _json_safe_value(false_rows[:sample_rows]),
+        "warnings": warnings,
+        "source_meta": source_meta,
     }
 
 

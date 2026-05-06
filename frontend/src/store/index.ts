@@ -24,9 +24,39 @@ function randomRows(category: string, upstream: number): number {
 const TERMINAL_EXECUTION_STATUSES = new Set(['success', 'failed', 'cancelled'])
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 const EXECUTION_POLL_INTERVAL_MS = 1500
+const MAX_UI_EXECUTION_LOG_ENTRIES = 1200
+const MAX_RUNTIME_SNAPSHOT_LOG_SCAN = 2500
+const EXECUTION_FINAL_LOG_TAIL = 1200
 const LMDB_LAST_ENV_PATH_KEY = 'framework_lmdb_env_path'
 const ROCKSDB_LAST_ENV_PATH_KEY = 'framework_rocksdb_env_path'
 const LMDB_AUTO_METADATA_TTL_MS = 5 * 60 * 1000
+const PIPELINE_CANVAS_WIDGET_STYLE_KEY = 'framework_pipeline_canvas_widget_style'
+
+export type PipelineCanvasWidgetStyle = 'default' | 'nin'
+
+function normalizeCanvasWidgetStyle(value: unknown): PipelineCanvasWidgetStyle {
+  const raw = String(value || '').trim().toLowerCase()
+  if (raw === 'nin' || raw === 'nin-like' || raw === 'nin_like') return 'nin'
+  return 'default'
+}
+
+function getPersistedCanvasWidgetStyle(): PipelineCanvasWidgetStyle {
+  if (typeof window === 'undefined') return 'default'
+  try {
+    return normalizeCanvasWidgetStyle(window.localStorage.getItem(PIPELINE_CANVAS_WIDGET_STYLE_KEY))
+  } catch {
+    return 'default'
+  }
+}
+
+function persistCanvasWidgetStyle(style: PipelineCanvasWidgetStyle): void {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(PIPELINE_CANVAS_WIDGET_STYLE_KEY, normalizeCanvasWidgetStyle(style))
+  } catch {
+    // best-effort persistence only
+  }
+}
 
 type ExecutionLogEntry = {
   nodeId: string
@@ -36,6 +66,70 @@ type ExecutionLogEntry = {
   message: string
   rows: number
   output_path?: string
+  input_sample?: Array<Record<string, unknown>>
+  output_sample?: Array<Record<string, unknown>>
+}
+
+function trimExecutionLogsForUi<T>(logs: T[]): T[] {
+  if (!Array.isArray(logs) || logs.length === 0) return []
+  if (logs.length <= MAX_UI_EXECUTION_LOG_ENTRIES) return logs
+  return logs.slice(-MAX_UI_EXECUTION_LOG_ENTRIES)
+}
+
+function normalizeExecutionLogEntryForDisplay(
+  log: Record<string, any> | null | undefined,
+  executionStatus: unknown,
+): ExecutionLogEntry {
+  const statusNorm = String(executionStatus || '').trim().toLowerCase()
+  if (!log || typeof log !== 'object') {
+    return {
+      nodeId: '',
+      nodeLabel: 'Node',
+      timestamp: new Date().toISOString(),
+      status: mapNodeLogStatusForExecution('error', statusNorm),
+      message: '',
+      rows: 0,
+    }
+  }
+  const mappedStatus = mapNodeLogStatusForExecution(log.status, statusNorm)
+  const rows = typeof log.rows === 'number' ? log.rows : Number(log.rows || 0) || 0
+  const next: ExecutionLogEntry = {
+    nodeId: String(log.nodeId || ''),
+    nodeLabel: String(log.nodeLabel || log.nodeId || 'Node'),
+    timestamp: String(log.timestamp || new Date().toISOString()),
+    status: mappedStatus,
+    message: String(log.message || ''),
+    rows,
+    output_path: typeof log.output_path === 'string' ? log.output_path : undefined,
+  }
+  const inputSample = normalizeSampleRows(
+    (log as any)?.input_sample ?? (log as any)?.sample_input,
+  )
+  const outputSample = normalizeSampleRows(
+    (log as any)?.output_sample ?? (log as any)?.sample_output,
+  )
+  if (inputSample.length > 0) next.input_sample = inputSample
+  if (outputSample.length > 0) next.output_sample = outputSample
+  const rawStatus = String(log.status || '').trim().toLowerCase()
+  const message = String(log.message || '').trim()
+  const nodeLabel = String(log.nodeLabel || log.nodeId || 'Node').trim() || 'Node'
+  if (rawStatus === 'running' && mappedStatus === 'success' && (!message || message.startsWith('⟳ Running '))) {
+    next.message = rows > 0 ? `✓ ${nodeLabel} — ${rows.toLocaleString()} rows` : `✓ ${nodeLabel}`
+  } else if (
+    rawStatus === 'running'
+    && mappedStatus === 'error'
+    && (!message || message.startsWith('⟳ Running '))
+    && statusNorm === 'cancelled'
+  ) {
+    next.message = `✗ ${nodeLabel} cancelled`
+  } else if (
+    rawStatus === 'running'
+    && mappedStatus === 'error'
+    && (!message || message.startsWith('⟳ Running '))
+  ) {
+    next.message = `✗ ${nodeLabel} failed`
+  }
+  return next
 }
 
 function mapNodeLogStatusForExecution(
@@ -67,29 +161,31 @@ function deriveEffectiveExecutionStatus(
   if (statusNorm !== 'running' && statusNorm !== 'cancelling') return statusNorm
   if (!Array.isArray(logs) || logs.length === 0) return statusNorm
 
-  const latestByNode = selectLatestNodeLogByTerminalPriority(logs)
-  const latestStatusByNode = new Map<string, string>()
-  latestByNode.forEach((entry, nodeIdRaw) => {
-    const nodeId = String(nodeIdRaw || '').trim().toLowerCase()
-    // Ignore system/meta log lines; they should not keep execution in "running".
-    if (!nodeId || nodeId === '__system__' || nodeId === 'system') return
-    const entryStatus = String(entry?.status || '').trim().toLowerCase()
-    latestStatusByNode.set(nodeId, entryStatus)
+  // Keep authoritative backend status while execution is active.
+  // Only promote to terminal if backend already emitted an explicit
+  // execution-level system terminal line.
+  const latestSystemTerminal = [...logs].reverse().find((entry) => {
+    if (!entry || typeof entry !== 'object') return false
+    const nodeId = String(entry.nodeId || '').trim().toLowerCase()
+    if (nodeId !== '__system__' && nodeId !== 'system') return false
+    const message = String(entry.message || '').trim().toLowerCase()
+    if (!message) return false
+    return (
+      message.includes('execution ')
+      && (
+        message.includes(' completed')
+        || message.includes(' failed')
+        || message.includes(' cancelled')
+        || message.includes(' canceled')
+      )
+    )
   })
-  if (latestStatusByNode.size === 0) return statusNorm
-
-  let hasRunning = false
-  let hasError = false
-  let hasSuccess = false
-  latestStatusByNode.forEach((entryStatus) => {
-    if (entryStatus === 'running') hasRunning = true
-    else if (entryStatus === 'error' || entryStatus === 'failed') hasError = true
-    else if (entryStatus === 'success') hasSuccess = true
-  })
-
-  if (hasRunning) return statusNorm
-  if (hasError) return statusNorm === 'cancelling' ? 'cancelled' : 'failed'
-  if (hasSuccess) return statusNorm === 'cancelling' ? 'cancelled' : 'success'
+  if (latestSystemTerminal && typeof latestSystemTerminal === 'object') {
+    const msg = String(latestSystemTerminal.message || '').trim().toLowerCase()
+    if (msg.includes(' cancelled') || msg.includes(' canceled')) return 'cancelled'
+    if (msg.includes(' failed')) return 'failed'
+    if (msg.includes(' completed')) return 'success'
+  }
   return statusNorm
 }
 
@@ -98,50 +194,39 @@ function normalizeExecutionLogsForDisplay(
   executionStatus: unknown,
 ): ExecutionLogEntry[] {
   if (!Array.isArray(logs) || logs.length === 0) return []
-  const statusNorm = String(executionStatus || '').trim().toLowerCase()
-  return logs.map((log): ExecutionLogEntry => {
-    if (!log || typeof log !== 'object') {
-      return {
-        nodeId: '',
-        nodeLabel: 'Node',
-        timestamp: new Date().toISOString(),
-        status: mapNodeLogStatusForExecution('error', statusNorm),
-        message: '',
-        rows: 0,
-      }
-    }
-    const mappedStatus = mapNodeLogStatusForExecution(log.status, statusNorm)
-    const rows = typeof log.rows === 'number' ? log.rows : Number(log.rows || 0) || 0
-    const next: ExecutionLogEntry = {
-      nodeId: String(log.nodeId || ''),
-      nodeLabel: String(log.nodeLabel || log.nodeId || 'Node'),
-      timestamp: String(log.timestamp || new Date().toISOString()),
-      status: mappedStatus,
-      message: String(log.message || ''),
-      rows,
-      output_path: typeof log.output_path === 'string' ? log.output_path : undefined,
-    }
-    const rawStatus = String(log.status || '').trim().toLowerCase()
-    const message = String(log.message || '').trim()
-    const nodeLabel = String(log.nodeLabel || log.nodeId || 'Node').trim() || 'Node'
-    if (rawStatus === 'running' && mappedStatus === 'success' && (!message || message.startsWith('⟳ Running '))) {
-      next.message = rows > 0 ? `✓ ${nodeLabel} — ${rows.toLocaleString()} rows` : `✓ ${nodeLabel}`
-    } else if (
-      rawStatus === 'running'
-      && mappedStatus === 'error'
-      && (!message || message.startsWith('⟳ Running '))
-      && statusNorm === 'cancelled'
+  const sliced = trimExecutionLogsForUi(logs)
+  return sliced.map((log) => normalizeExecutionLogEntryForDisplay(log, executionStatus))
+}
+
+function executionLogsShallowEqual(
+  left: ExecutionLogEntry[] | null | undefined,
+  right: ExecutionLogEntry[] | null | undefined,
+): boolean {
+  const a = Array.isArray(left) ? left : []
+  const b = Array.isArray(right) ? right : []
+  if (a === b) return true
+  if (a.length !== b.length) return false
+  if (a.length === 0) return true
+  // Compare tail window to avoid full scan on large arrays.
+  const start = Math.max(0, a.length - 24)
+  for (let idx = start; idx < a.length; idx += 1) {
+    const x = a[idx]
+    const y = b[idx]
+    if (!x || !y) return false
+    if (
+      x.nodeId !== y.nodeId
+      || x.timestamp !== y.timestamp
+      || x.status !== y.status
+      || x.message !== y.message
+      || x.rows !== y.rows
+      || x.output_path !== y.output_path
+      || x.input_sample !== y.input_sample
+      || x.output_sample !== y.output_sample
     ) {
-      next.message = `✗ ${nodeLabel} cancelled`
-    } else if (
-      rawStatus === 'running'
-      && mappedStatus === 'error'
-      && (!message || message.startsWith('⟳ Running '))
-    ) {
-      next.message = `✗ ${nodeLabel} failed`
+      return false
     }
-    return next
-  })
+  }
+  return true
 }
 
 function isTerminalLikeRunningLog(log: Record<string, any> | null | undefined): boolean {
@@ -150,10 +235,11 @@ function isTerminalLikeRunningLog(log: Record<string, any> | null | undefined): 
   if (rawStatus !== 'running') return false
   const message = String(log.message || '').trim().toLowerCase()
   if (!message) return false
-  if (message.startsWith('✓')) return true
-  const hasTerminalWord = /\b(completed|complete|done|finished|success)\b/.test(message)
-  const hasActiveWord = /\b(running|processing|queued|queue|pending|starting|in progress)\b/.test(message)
-  return hasTerminalWord && !hasActiveWord
+  // Be strict: a running log is treated as terminal only when backend already
+  // emitted a checkmark-style terminal message.
+  // Broad keyword heuristics ("complete", "done", etc.) can prematurely close
+  // long-running nodes whose progress text contains those words.
+  return message.startsWith('✓')
 }
 
 function selectLatestNodeLogByTerminalPriority(
@@ -212,9 +298,149 @@ type NodeRuntimeSnapshot = {
   rows?: number
   processedRows?: number
   validatedRows?: number
+  inputSample?: Array<Record<string, unknown>>
+  outputSample?: Array<Record<string, unknown>>
   startedAt?: string
   finishedAt?: string
   durationMs?: number
+}
+
+const MAX_RUNTIME_SAMPLE_ROWS = 50
+const MAX_RUNTIME_SAMPLE_STR_CHARS = 12000
+const MAX_RUNTIME_SAMPLE_VALUE_CHARS = 2000
+const MAX_RUNTIME_SAMPLE_KEYS = 80
+const MAX_RUNTIME_SAMPLE_DEPTH = 6
+const MAX_RUNTIME_SAMPLE_ARRAY_ITEMS = 16
+
+function clipRuntimeSampleText(value: string, maxChars = MAX_RUNTIME_SAMPLE_VALUE_CHARS): string {
+  if (value.length <= maxChars) return value
+  return `${value.slice(0, maxChars)}...`
+}
+
+function compactRuntimeSampleValue(value: unknown, depth = 0): unknown {
+  if (value === null || value === undefined) return value
+  if (typeof value === 'string') {
+    const parsedObject = parseObjectLikeSampleRow(value)
+    if (parsedObject) return parsedObject
+    return clipRuntimeSampleText(value)
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return value
+  if (Array.isArray(value)) {
+    if (depth >= MAX_RUNTIME_SAMPLE_DEPTH) return `[Array(${value.length})]`
+    const trimmed = value.slice(0, MAX_RUNTIME_SAMPLE_ARRAY_ITEMS).map((item) => compactRuntimeSampleValue(item, depth + 1))
+    if (value.length > MAX_RUNTIME_SAMPLE_ARRAY_ITEMS) {
+      trimmed.push(`... +${value.length - MAX_RUNTIME_SAMPLE_ARRAY_ITEMS} items`)
+    }
+    return trimmed
+  }
+  if (typeof value === 'object') {
+    if (depth >= MAX_RUNTIME_SAMPLE_DEPTH) {
+      const keyCount = Object.keys(value as Record<string, unknown>).length
+      return `[Object(${keyCount})]`
+    }
+    const obj = value as Record<string, unknown>
+    const keys = Object.keys(obj).slice(0, MAX_RUNTIME_SAMPLE_KEYS)
+    const out: Record<string, unknown> = {}
+    keys.forEach((key) => {
+      out[key] = compactRuntimeSampleValue(obj[key], depth + 1)
+    })
+    if (Object.keys(obj).length > keys.length) {
+      out.__trimmed__ = `+${Object.keys(obj).length - keys.length} keys`
+    }
+    return out
+  }
+  return clipRuntimeSampleText(String(value))
+}
+
+function compactRuntimeSampleRow(row: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  const keys = Object.keys(row || {}).slice(0, MAX_RUNTIME_SAMPLE_KEYS)
+  keys.forEach((key) => {
+    out[key] = compactRuntimeSampleValue(row[key], 0)
+  })
+  if (Object.keys(row || {}).length > keys.length) {
+    out.__trimmed__ = `+${Object.keys(row || {}).length - keys.length} keys`
+  }
+  return out
+}
+
+function parseObjectLikeSampleRow(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return compactRuntimeSampleRow(value as Record<string, unknown>)
+  }
+  if (typeof value !== 'string') return null
+  let text = value.trim()
+  if (!text) return null
+  if (text.length > MAX_RUNTIME_SAMPLE_STR_CHARS) return null
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (
+      (text.startsWith('"') && text.endsWith('"'))
+      || (text.startsWith("'") && text.endsWith("'"))
+    ) {
+      const inner = text.slice(1, -1).trim()
+      if (
+        (inner.startsWith('{') && inner.endsWith('}'))
+        || (inner.startsWith('[') && inner.endsWith(']'))
+      ) {
+        text = inner
+      }
+    }
+    try {
+      const parsed = JSON.parse(text)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return compactRuntimeSampleRow(parsed as Record<string, unknown>)
+      }
+      if (typeof parsed === 'string') {
+        text = parsed.trim()
+        continue
+      }
+      return null
+    } catch {
+      const normalized = text
+        .replace(/\bNone\b/g, 'null')
+        .replace(/\bTrue\b/g, 'true')
+        .replace(/\bFalse\b/g, 'false')
+        .replace(/([{,]\s*)'([^'\\]+?)'\s*:/g, '$1"$2":')
+        .replace(/:\s*'([^'\\]*?)'(\s*[,}\]])/g, ': "$1"$2')
+        .replace(/,\s*'([^'\\]*?)'(?=\s*[,}\]])/g, ', "$1"')
+      try {
+        const fallback = JSON.parse(normalized)
+        if (fallback && typeof fallback === 'object' && !Array.isArray(fallback)) {
+          return compactRuntimeSampleRow(fallback as Record<string, unknown>)
+        }
+      } catch {
+        return null
+      }
+      return null
+    }
+  }
+  return null
+}
+
+function normalizeSampleRows(rows: unknown, maxRows = MAX_RUNTIME_SAMPLE_ROWS): Array<Record<string, unknown>> {
+  if (!Array.isArray(rows) || rows.length === 0) return []
+  const out: Array<Record<string, unknown>> = []
+  for (let idx = 0; idx < rows.length && out.length < maxRows; idx += 1) {
+    const item = rows[idx]
+    if (item && typeof item === 'object' && !Array.isArray(item)) {
+      out.push(compactRuntimeSampleRow(item as Record<string, unknown>))
+      continue
+    }
+    const parsed = parseObjectLikeSampleRow(item)
+    if (parsed) {
+      out.push(parsed)
+      continue
+    }
+    if (item !== null && item !== undefined) {
+      if (typeof item === 'string') {
+        out.push({ value: clipRuntimeSampleText(item) })
+      } else {
+        out.push({ value: compactRuntimeSampleValue(item, 0) })
+      }
+    }
+  }
+  return out
 }
 
 function toLogTimestampMs(value: unknown): number | undefined {
@@ -228,10 +454,13 @@ function buildNodeRuntimeSnapshotsFromLogs(
 ): Map<string, NodeRuntimeSnapshot> {
   const snapshots = new Map<string, NodeRuntimeSnapshot>()
   if (!Array.isArray(logs) || logs.length === 0) return snapshots
+  const candidateLogs = logs.length > MAX_RUNTIME_SNAPSHOT_LOG_SCAN
+    ? logs.slice(-MAX_RUNTIME_SNAPSHOT_LOG_SCAN)
+    : logs
 
   const statusNorm = String(executionStatus || '').trim().toLowerCase()
-  const latestByNode = selectLatestNodeLogByTerminalPriority(logs)
-  const maxCountersByNode = collectMaxNodeCounters(logs)
+  const latestByNode = selectLatestNodeLogByTerminalPriority(candidateLogs)
+  const maxCountersByNode = collectMaxNodeCounters(candidateLogs)
 
   const firstEventMsByNode = new Map<string, number>()
   const firstRunningMsByNode = new Map<string, number>()
@@ -239,7 +468,7 @@ function buildNodeRuntimeSnapshotsFromLogs(
   const lastTerminalMsByNode = new Map<string, number>()
   const explicitDurationMsByNode = new Map<string, number>()
 
-  logs.forEach((log) => {
+  candidateLogs.forEach((log) => {
     if (!log || typeof log !== 'object') return
     const nodeId = String(log.nodeId || '').trim()
     const nodeKey = nodeId.toLowerCase()
@@ -302,6 +531,12 @@ function buildNodeRuntimeSnapshotsFromLogs(
         ? Math.max(log.validated_rows, Number(counters?.validated ?? 0))
         : counters?.validated
     )
+    const inputSample = normalizeSampleRows(
+      (log as any)?.input_sample ?? (log as any)?.sample_input,
+    )
+    const outputSample = normalizeSampleRows(
+      (log as any)?.output_sample ?? (log as any)?.sample_output,
+    )
 
     const logStartedMs = toLogTimestampMs((log as any)?.started_at)
     const logFinishedMs = toLogTimestampMs((log as any)?.finished_at)
@@ -325,6 +560,8 @@ function buildNodeRuntimeSnapshotsFromLogs(
       rows,
       processedRows,
       validatedRows,
+      inputSample: inputSample.length > 0 ? inputSample : undefined,
+      outputSample: outputSample.length > 0 ? outputSample : undefined,
       startedAt: typeof startedMs === 'number' ? new Date(startedMs).toISOString() : undefined,
       finishedAt: typeof finishedMs === 'number' ? new Date(finishedMs).toISOString() : undefined,
       durationMs,
@@ -341,6 +578,7 @@ function buildLmdbMetadataFingerprint(config: Record<string, unknown>): string {
     value_format: String(config.value_format || 'auto').trim(),
     flatten_json_values: Boolean(config.flatten_json_values ?? true),
     expand_profile_documents: Boolean(config.expand_profile_documents ?? true),
+    include_entity_meta: Boolean(config.include_entity_meta ?? false),
     include_value_kind: Boolean(config.include_value_kind ?? true),
     key_prefix: String(config.key_prefix || '').trim(),
     key_contains: String(config.key_contains || '').trim(),
@@ -649,6 +887,7 @@ interface WorkflowState {
   nodes: ETLNode[]
   edges: ETLEdge[]
   connectorType: WorkflowConnectorType
+  canvasWidgetStyle: PipelineCanvasWidgetStyle
   selectedNodeId: string | null
   pipeline: Pipeline | null
   isDirty: boolean
@@ -661,6 +900,7 @@ interface WorkflowState {
   setNodes: (nodes: ETLNode[]) => void
   setEdges: (edges: ETLEdge[]) => void
   setConnectorType: (connectorType: WorkflowConnectorType) => void
+  setCanvasWidgetStyle: (style: PipelineCanvasWidgetStyle) => void
   onNodesChange: (changes: NodeChange[]) => void
   onEdgesChange: (changes: EdgeChange[]) => void
   onConnect: (connection: Connection) => void
@@ -677,7 +917,9 @@ interface WorkflowState {
     status: string,
     rows?: number,
     processedRows?: number,
-    validatedRows?: number
+    validatedRows?: number,
+    inputSample?: Array<Record<string, unknown>>,
+    outputSample?: Array<Record<string, unknown>>,
   ) => void
 
   loadPipeline: (pipelineId: string) => Promise<void>
@@ -693,6 +935,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   nodes: [],
   edges: [],
   connectorType: DEFAULT_WORKFLOW_CONNECTOR_TYPE,
+  canvasWidgetStyle: getPersistedCanvasWidgetStyle(),
   selectedNodeId: null,
   pipeline: null,
   isDirty: false,
@@ -711,6 +954,11 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     edges: applyConnectorTypeToEdges(state.edges, connectorType),
     isDirty: true,
   })),
+  setCanvasWidgetStyle: (style) => {
+    const normalized = normalizeCanvasWidgetStyle(style)
+    persistCanvasWidgetStyle(normalized)
+    set({ canvasWidgetStyle: normalized })
+  },
 
   onNodesChange: (changes) =>
     set((state) => ({ nodes: applyNodeChanges(changes, state.nodes) as ETLNode[], isDirty: true })),
@@ -719,21 +967,37 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     set((state) => ({ edges: applyEdgeChanges(changes, state.edges) as ETLEdge[], isDirty: true })),
 
   onConnect: (connection) =>
-    set((state) => ({
-      edges: addEdge(
-        {
-          ...connection,
-          animated: true,
-          type: state.connectorType,
-          reconnectable: true,
-          updatable: true,
-          interactionWidth: 44,
-          style: { stroke: '#6366f1', strokeWidth: 2 },
-        },
-        state.edges,
-      ) as ETLEdge[],
-      isDirty: true,
-    })),
+    set((state) => {
+      const nextSource = String(connection?.source || '').trim()
+      const nextTarget = String(connection?.target || '').trim()
+      const nextSourceHandle = String(connection?.sourceHandle || 'output').trim() || 'output'
+      const nextTargetHandle = String(connection?.targetHandle || '').trim()
+      if (!nextSource || !nextTarget) return {}
+
+      const duplicateExists = state.edges.some((edge) => (
+        String(edge.source || '').trim() === nextSource
+        && String(edge.target || '').trim() === nextTarget
+        && (String((edge as any).sourceHandle || 'output').trim() || 'output') === nextSourceHandle
+        && String((edge as any).targetHandle || '').trim() === nextTargetHandle
+      ))
+      if (duplicateExists) return {}
+
+      return {
+        edges: addEdge(
+          {
+            ...connection,
+            animated: true,
+            type: state.connectorType,
+            reconnectable: true,
+            updatable: true,
+            interactionWidth: 44,
+            style: { stroke: '#6366f1', strokeWidth: 2 },
+          },
+          state.edges,
+        ) as ETLEdge[],
+        isDirty: true,
+      }
+    }),
 
   onReconnect: (oldEdge, connection) =>
     set((state) => {
@@ -849,7 +1113,13 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       }
     }),
 
-  updateNodeConfig: (nodeId, config) =>
+  updateNodeConfig: (nodeId, config) => {
+    const runtimeExecId = get().executionId
+    const runtimeExecuting = get().isExecuting
+    const hasRuntimeNodeEnabledPatch = Boolean(
+      config
+      && Object.prototype.hasOwnProperty.call(config, 'node_enabled')
+    )
     set((state) => {
       if (!config || Object.keys(config).length === 0) return {}
       const targetNode = state.nodes.find((n) => n.id === nodeId)
@@ -879,7 +1149,14 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         ),
         isDirty: true,
       }
-    }),
+    })
+    if (hasRuntimeNodeEnabledPatch && runtimeExecuting && runtimeExecId) {
+      const nextEnabled = Boolean((config as Record<string, unknown>).node_enabled)
+      void api.setExecutionNodeEnabled(runtimeExecId, nodeId, nextEnabled).catch((err) => {
+        console.warn('Failed to apply runtime node toggle', err)
+      })
+    }
+  },
 
   updateNodeConfigSilent: (nodeId, config) =>
     set((state) => {
@@ -930,7 +1207,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
 
   setSelectedNode: (nodeId) => set({ selectedNodeId: nodeId }),
 
-  setNodeStatus: (nodeId, status, rows, processedRows, validatedRows) =>
+  setNodeStatus: (nodeId, status, rows, processedRows, validatedRows, inputSample, outputSample) =>
     set((state) => {
       const statusNorm = String(status || '').toLowerCase()
       const nowMs = Date.now()
@@ -993,6 +1270,12 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
               executionValidatedRows: statusNorm === 'idle'
                 ? undefined
                 : (validatedRows ?? n.data.executionValidatedRows),
+              executionSampleInput: statusNorm === 'idle'
+                ? undefined
+                : (inputSample ?? n.data.executionSampleInput),
+              executionSampleOutput: statusNorm === 'idle'
+                ? undefined
+                : (outputSample ?? n.data.executionSampleOutput),
               executionStartedAt: nextStartAt,
               executionFinishedAt: nextFinishedAt,
               executionDurationMs: nextDurationMs,
@@ -1006,11 +1289,107 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     try {
       const pipeline = await api.getPipeline(pipelineId)
       const loadedEdges = (pipeline.edges || []) as ETLEdge[]
-      const connectorType = resolveConnectorTypeFromEdges(loadedEdges)
       const normalizedNodes = (pipeline.nodes || []).map((n: ETLNode) => {
         const def = getNodeDef(n.data?.nodeType)
         return { ...n, type: 'etlNode', data: { ...n.data, definition: def || n.data.definition } }
       })
+      const normalizeConditionCaseHandleId = (rawRouteId: unknown): string => {
+        const raw = String(rawRouteId || '').trim().toLowerCase()
+        const safe = raw.replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || 'route_unknown'
+        return `case_${safe}`
+      }
+      const nodeById = new Map<string, ETLNode>()
+      normalizedNodes.forEach((node: ETLNode) => {
+        const nodeId = String(node?.id || '').trim()
+        if (nodeId) nodeById.set(nodeId, node)
+      })
+      const conditionCaseHandlesByNode = new Map<string, Set<string>>()
+      const conditionCaseModeByNode = new Map<string, boolean>()
+      normalizedNodes.forEach((node: ETLNode) => {
+        const nodeId = String(node?.id || '').trim()
+        if (!nodeId) return
+        const nodeType = String(node?.data?.nodeType || '').trim().toLowerCase()
+        if (nodeType !== 'condition_node') return
+        const cfg = (node?.data?.config && typeof node.data.config === 'object')
+          ? (node.data.config as Record<string, unknown>)
+          : {}
+        const handles = new Set<string>(['output', 'output_false'])
+        const routingMode = String(cfg.condition_routing_mode || '').trim().toLowerCase()
+        const isCaseMode = routingMode === 'case'
+        conditionCaseModeByNode.set(nodeId, isCaseMode)
+        if (isCaseMode) {
+          let rawRoutes: unknown = cfg.case_routes
+          if (typeof rawRoutes === 'string') {
+            try {
+              rawRoutes = JSON.parse(rawRoutes)
+            } catch {
+              rawRoutes = []
+            }
+          }
+          if (Array.isArray(rawRoutes)) {
+            rawRoutes.forEach((route) => {
+              if (!route || typeof route !== 'object') return
+              const src = route as Record<string, unknown>
+              const routeId = String(src.id || '').trim()
+              const explicitHandle = String(src.handle_id || src.handleId || '').trim()
+              const handleId = explicitHandle || normalizeConditionCaseHandleId(routeId)
+              if (!handleId) return
+              handles.add(handleId)
+            })
+          }
+        }
+        conditionCaseHandlesByNode.set(nodeId, handles)
+      })
+      const edgeUniq = new Set<string>()
+      const sanitizedEdges: ETLEdge[] = []
+      loadedEdges.forEach((rawEdge, edgeIndex) => {
+        const sourceId = String((rawEdge as any)?.source || '').trim()
+        const targetId = String((rawEdge as any)?.target || '').trim()
+        if (!sourceId || !targetId) return
+        if (!nodeById.has(sourceId) || !nodeById.has(targetId)) return
+
+        const sourceNode = nodeById.get(sourceId)
+        const sourceType = String(sourceNode?.data?.nodeType || '').trim().toLowerCase()
+        const sourceHandleRaw = String((rawEdge as any)?.sourceHandle ?? 'output').trim() || 'output'
+        let sourceHandle = sourceHandleRaw
+        if (sourceType === 'condition_node') {
+          const isCaseMode = Boolean(conditionCaseModeByNode.get(sourceId))
+          // CASE mode routes via explicit case_* handles + output_false.
+          // Generic output edges are ignored by backend and create duplicate visuals.
+          if (isCaseMode && sourceHandle === 'output') {
+            const rawData = ((rawEdge as any)?.data && typeof (rawEdge as any).data === 'object')
+              ? ((rawEdge as any).data as Record<string, unknown>)
+              : {}
+            if (!Boolean(rawData.conditionRoutingDisplay)) return
+          }
+          const allowed = conditionCaseHandlesByNode.get(sourceId) || new Set<string>(['output', 'output_false'])
+          if (!allowed.has(sourceHandle)) return
+        } else {
+          // Non-condition nodes expose a single logical output handle.
+          if (sourceHandle === 'output_false' || sourceHandle.startsWith('case_')) return
+          sourceHandle = 'output'
+        }
+
+        // ETLNode currently exposes a single target input handle.
+        const targetHandle = 'input'
+        const edgeKey = `${sourceId}|${sourceHandle}|${targetId}|${targetHandle}`
+        if (edgeUniq.has(edgeKey)) return
+        edgeUniq.add(edgeKey)
+
+        const edgeId = String((rawEdge as any)?.id || `e_${sourceId}_${sourceHandle}_${targetId}_${edgeIndex + 1}`).trim()
+        sanitizedEdges.push({
+          ...(rawEdge as any),
+          id: edgeId,
+          source: sourceId,
+          target: targetId,
+          sourceHandle,
+          targetHandle,
+          reconnectable: (rawEdge as any)?.reconnectable ?? true,
+          updatable: (rawEdge as any)?.updatable ?? true,
+          interactionWidth: Number((rawEdge as any)?.interactionWidth || 44),
+        } as ETLEdge)
+      })
+      const connectorType = resolveConnectorTypeFromEdges(sanitizedEdges)
       const lmdbPathFromPipeline = normalizedNodes
         .map((node: ETLNode) => {
           const nodeType = String(node.data?.nodeType || '')
@@ -1032,7 +1411,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       set({
         pipeline,
         nodes: normalizedNodes,
-        edges: applyConnectorTypeToEdges(loadedEdges, connectorType),
+        edges: applyConnectorTypeToEdges(sanitizedEdges, connectorType),
         connectorType,
         isDirty: false,
       })
@@ -1053,7 +1432,8 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   },
 
   executePipeline: async () => {
-    const { pipeline } = get()
+    const { pipeline, isExecuting } = get()
+    if (isExecuting) return
     if (!pipeline?.id) return
 
     // Reset all node statuses
@@ -1073,11 +1453,65 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       })),
       isExecuting: true,
       executionAbortRequested: false,
-      executionLogs: [],
+      executionLogs: [{
+        nodeId: '__system__',
+        nodeLabel: 'System',
+        timestamp: new Date().toISOString(),
+        status: 'running',
+        message: '⟳ Preparing pipeline execution…',
+        rows: 0,
+      }],
       showLogs: true,
     }))
 
     try {
+      const appendLocalExecutionLog = (
+        message: string,
+        status: 'running' | 'success' | 'error' = 'running',
+      ) => {
+        const nextEntry: ExecutionLogEntry = {
+          nodeId: '__system__',
+          nodeLabel: 'System',
+          timestamp: new Date().toISOString(),
+          status,
+          message,
+          rows: 0,
+        }
+        set((state) => ({
+          executionLogs: trimExecutionLogsForUi([
+            ...state.executionLogs,
+            nextEntry,
+          ]),
+        }))
+      }
+
+      const buildExecutionSnapshotNodes = (nodesForRun: ETLNode[]): Array<Record<string, unknown>> => (
+        (Array.isArray(nodesForRun) ? nodesForRun : []).map((node) => {
+          const nodeData = (node?.data && typeof node.data === 'object')
+            ? (node.data as unknown as Record<string, unknown>)
+            : {}
+          const rawConfig = (nodeData.config && typeof nodeData.config === 'object')
+            ? (nodeData.config as Record<string, unknown>)
+            : {}
+          const compactConfig: Record<string, unknown> = { ...rawConfig }
+          // Large preview/schema hints are not needed for runtime execution.
+          delete compactConfig._preview_rows
+          delete compactConfig._detected_columns
+          delete compactConfig._json_paths
+          delete compactConfig._row_count
+          delete compactConfig._source_schema_fields
+          delete compactConfig._lmdb_schema_fingerprint
+          delete compactConfig._lmdb_schema_hydrated_at
+          return {
+            ...node,
+            data: {
+              ...nodeData,
+              config: compactConfig,
+            },
+          } as Record<string, unknown>
+        })
+      )
+
       let executionNodes = get().nodes
       const executionEdges = get().edges
       let shouldPersistBeforeRun = Boolean(get().isDirty)
@@ -1089,6 +1523,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         return nodeType === 'lmdb_source' || nodeType === 'rocksdb_source'
       })
       if (hasKvSourceNodes) {
+        appendLocalExecutionLog('⟳ Refreshing source metadata (fast precheck)…')
         const lmdbHydrationBudgetMs = 800
         const lmdbHydrated = await Promise.race<
           { nodes: ETLNode[]; changed: boolean } | null
@@ -1101,6 +1536,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
           if (lmdbHydrated.changed) {
             set({ nodes: executionNodes })
             shouldPersistBeforeRun = true
+            appendLocalExecutionLog('✓ Source metadata refreshed', 'success')
           }
         }
       }
@@ -1110,36 +1546,26 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       let activePipelineId = pipeline.id
       const isLocalOnly = pipeline.id.startsWith('p_')
       if (isLocalOnly) {
+        appendLocalExecutionLog('⟳ Registering local pipeline in backend…')
         try {
           const created = await api.createPipeline({
             name: pipeline.name || 'Untitled Pipeline',
             description: (pipeline as any).description || '',
           })
-          // Push current canvas to the new backend record
-          try {
-            await api.updatePipeline(created.id, { nodes: executionNodes, edges: executionEdges })
-            set({ isDirty: false })
-          } catch (saveErr) {
-            console.error('Failed to persist pipeline before execution:', saveErr)
-          }
           activePipelineId = created.id
           // Upgrade the store so future saves go to the real backend record
           set({ pipeline: { ...pipeline, id: created.id } })
+          appendLocalExecutionLog('✓ Local pipeline registered', 'success')
         } catch {
           // backend truly unreachable — will be caught below as offline
         }
-      } else {
-        if (shouldPersistBeforeRun) {
-          try {
-            await api.updatePipeline(activePipelineId, { nodes: executionNodes, edges: executionEdges })
-            set({ isDirty: false })
-          } catch (saveErr) {
-            console.error('Failed to persist pipeline before execution:', saveErr)
-          }
-        }
       }
 
-      const result = await api.executePipeline(activePipelineId)
+      appendLocalExecutionLog('⟳ Requesting execution slot…')
+      const result = await api.executePipeline(activePipelineId, {
+        nodes: buildExecutionSnapshotNodes(executionNodes),
+        edges: executionEdges as unknown as Array<Record<string, unknown>>,
+      })
       const execId = result.execution_id
 
       // ── OFFLINE: backend not running ─────────────────────────────────────
@@ -1162,10 +1588,25 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
 
       // ── ONLINE: real backend ───────────────────────────────────────────────
       set({ executionId: execId, executionAbortRequested: false })
+      appendLocalExecutionLog('✓ Execution started', 'success')
+
+      // Save latest canvas in background so execution start is not blocked by
+      // pipeline persistence for large graphs.
+      if (shouldPersistBeforeRun || isLocalOnly) {
+        void (async () => {
+          try {
+            await api.updatePipeline(activePipelineId, { nodes: executionNodes, edges: executionEdges })
+            set({ isDirty: false })
+          } catch (saveErr) {
+            console.error('Background pipeline save failed:', saveErr)
+          }
+        })()
+      }
 
       let ws: WebSocket | null = null
       let wsConnected = false
       let wsMessageSeen = false
+      let pollIteration = 0
       const forceStopRunningNodes = (fallbackStatus: 'success' | 'error' = 'error') => {
         const nowMs = Date.now()
         const nowIso = new Date(nowMs).toISOString()
@@ -1199,67 +1640,79 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         const statusNorm = String(executionStatus || '').trim().toLowerCase()
         const isTerminal = TERMINAL_EXECUTION_STATUSES.has(statusNorm)
         const snapshots = buildNodeRuntimeSnapshotsFromLogs(logs, statusNorm)
-        set((state) => ({
-          nodes: state.nodes.map((node) => {
+        set((state) => {
+          let changed = false
+          const nextNodes = state.nodes.map((node) => {
             const snapshot = snapshots.get(String(node.id || '').trim())
             if (!snapshot) return node
+            const nextData = {
+              ...node.data,
+              status: snapshot.status,
+              executionRows: snapshot.rows ?? node.data.executionRows,
+              executionProcessedRows: snapshot.processedRows ?? node.data.executionProcessedRows,
+              executionValidatedRows: snapshot.validatedRows ?? node.data.executionValidatedRows,
+              executionSampleInput: snapshot.inputSample ?? node.data.executionSampleInput,
+              executionSampleOutput: snapshot.outputSample ?? node.data.executionSampleOutput,
+              executionStartedAt: snapshot.startedAt ?? node.data.executionStartedAt,
+              executionFinishedAt: snapshot.finishedAt ?? node.data.executionFinishedAt,
+              executionDurationMs: (
+                typeof snapshot.durationMs === 'number'
+                  ? snapshot.durationMs
+                  : node.data.executionDurationMs
+              ),
+            }
+            const unchanged = (
+              nextData.status === node.data.status
+              && nextData.executionRows === node.data.executionRows
+              && nextData.executionProcessedRows === node.data.executionProcessedRows
+              && nextData.executionValidatedRows === node.data.executionValidatedRows
+              && nextData.executionStartedAt === node.data.executionStartedAt
+              && nextData.executionFinishedAt === node.data.executionFinishedAt
+              && nextData.executionDurationMs === node.data.executionDurationMs
+              && nextData.executionSampleInput === node.data.executionSampleInput
+              && nextData.executionSampleOutput === node.data.executionSampleOutput
+            )
+            if (unchanged) return node
+            changed = true
             return {
               ...node,
-              data: {
-                ...node.data,
-                status: snapshot.status,
-                executionRows: snapshot.rows ?? node.data.executionRows,
-                executionProcessedRows: snapshot.processedRows ?? node.data.executionProcessedRows,
-                executionValidatedRows: snapshot.validatedRows ?? node.data.executionValidatedRows,
-                executionStartedAt: snapshot.startedAt ?? node.data.executionStartedAt,
-                executionFinishedAt: snapshot.finishedAt ?? node.data.executionFinishedAt,
-                executionDurationMs: (
-                  typeof snapshot.durationMs === 'number'
-                    ? snapshot.durationMs
-                    : node.data.executionDurationMs
-                ),
-              },
+              data: nextData,
             }
-          }),
-        }))
+          })
+          if (!changed) return {}
+          return { nodes: nextNodes }
+        })
         if (isTerminal) {
           forceStopRunningNodes(terminalFallbackNodeStatus(statusNorm))
         }
       }
-      const finalizePreviousRunningNodes = (startedNodeId: string) => {
-        const targetId = String(startedNodeId || '').trim()
-        if (!targetId) return
-        const nowMs = Date.now()
-        const nowIso = new Date(nowMs).toISOString()
-        set((state) => {
-          const runningNodeIds = new Set(
-            state.nodes
-              .filter((node) => String(node.id || '').trim() !== targetId && String(node?.data?.status || '').toLowerCase() === 'running')
-              .map((node) => String(node.id || '').trim())
-              .filter(Boolean),
-          )
-          if (runningNodeIds.size === 0) return {}
-          let changed = false
-          const nextNodes = state.nodes.map((node) => {
-            if (!runningNodeIds.has(String(node.id || '').trim())) return node
-            if (node.data?.status !== 'running') return node
-            const startedAt = String(node.data?.executionStartedAt || '').trim()
-            const startedMs = startedAt ? parseTimestampMsOrNaN(startedAt) : Number.NaN
-            changed = true
-            return {
-              ...node,
-              data: {
-                ...node.data,
-                status: 'success' as const,
-                executionFinishedAt: nowIso,
-                executionDurationMs: Number.isFinite(startedMs)
-                  ? Math.max(0, nowMs - Number(startedMs))
-                  : node.data?.executionDurationMs,
-              },
-            }
-          })
-          return changed ? { nodes: nextNodes } : {}
+
+      // Pull initial backend logs immediately so UI does not stay in
+      // "Connecting to ETL engine…" while startup validation is running.
+      try {
+        const boot = await api.getExecution(execId, {
+          includeLogs: true,
+          logTail: 120,
+          includeLogSamples: false,
         })
+        if (Array.isArray(boot.logs) && boot.logs.length > 0) {
+          const bootStatus = String(boot.status || '').trim().toLowerCase()
+          const nextLogs = normalizeExecutionLogsForDisplay(
+            boot.logs as Array<Record<string, any>>,
+            bootStatus,
+          )
+          set((state) => (
+            executionLogsShallowEqual(state.executionLogs, nextLogs)
+              ? {}
+              : { executionLogs: nextLogs }
+          ))
+          applyLiveNodeStatusFromLogs(
+            boot.logs as Array<Record<string, any>>,
+            bootStatus,
+          )
+        }
+      } catch {
+        // best-effort bootstrap fetch
       }
       try {
         ws = new WebSocket(`ws://localhost:8001/ws/executions/${execId}`)
@@ -1275,6 +1728,9 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
           }
           const msg = JSON.parse(event.data)
           const entry = msg.log_entry  // full log entry streamed from backend
+          const entryForUi = entry
+            ? normalizeExecutionLogEntryForDisplay(entry as Record<string, any>, msg.status || 'running')
+            : null
           const liveRows = typeof msg.rows === 'number'
             ? msg.rows
             : (entry && typeof entry.rows === 'number' ? entry.rows : undefined)
@@ -1284,31 +1740,42 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
           const liveValidatedRows = typeof msg.validated_rows === 'number'
             ? msg.validated_rows
             : (entry && typeof entry.validated_rows === 'number' ? entry.validated_rows : undefined)
+          const liveInputSample = normalizeSampleRows(
+            (entryForUi as any)?.input_sample
+            ?? (entry as any)?.input_sample
+            ?? (entry as any)?.sample_input,
+          )
+          const liveOutputSample = normalizeSampleRows(
+            (entryForUi as any)?.output_sample
+            ?? (entry as any)?.output_sample
+            ?? (entry as any)?.sample_output,
+          )
+          const nextInputSample = liveInputSample.length > 0 ? liveInputSample : undefined
+          const nextOutputSample = liveOutputSample.length > 0 ? liveOutputSample : undefined
 
           if (msg.type === 'node_start') {
-            finalizePreviousRunningNodes(String(msg.nodeId || ''))
-            get().setNodeStatus(msg.nodeId, 'running', liveRows, liveProcessedRows, liveValidatedRows)
+            get().setNodeStatus(msg.nodeId, 'running', liveRows, liveProcessedRows, liveValidatedRows, nextInputSample, nextOutputSample)
             // Add "running" log entry immediately
-            if (entry) {
+            if (entryForUi) {
               set((state) => ({
-                executionLogs: [...state.executionLogs, entry]
+                executionLogs: trimExecutionLogsForUi([...state.executionLogs, entryForUi]),
               }))
             }
           }
           else if (msg.type === 'node_success') {
-            get().setNodeStatus(msg.nodeId, 'success', liveRows, liveProcessedRows, liveValidatedRows)
+            get().setNodeStatus(msg.nodeId, 'success', liveRows, liveProcessedRows, liveValidatedRows, nextInputSample, nextOutputSample)
             // Replace the running entry with the success entry
-            if (entry) {
+            if (entryForUi) {
               set((state) => {
                 const idx = state.executionLogs.findLastIndex(
                   (l) => l.nodeId === msg.nodeId && l.status === 'running'
                 )
                 if (idx >= 0) {
                   const updated = [...state.executionLogs]
-                  updated[idx] = entry
+                  updated[idx] = entryForUi
                   return { executionLogs: updated }
                 }
-                return { executionLogs: [...state.executionLogs, entry] }
+                return { executionLogs: trimExecutionLogsForUi([...state.executionLogs, entryForUi]) }
               })
             }
           }
@@ -1316,17 +1783,16 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
             const currentNode = get().nodes.find((n) => n.id === msg.nodeId)
             const currentStatus = String(currentNode?.data?.status || '').toLowerCase()
             const canMoveToRunningFromProgress = currentStatus === 'idle' || currentStatus === 'running'
-            const progressLooksTerminal = isTerminalLikeRunningLog(entry as Record<string, any> | undefined)
-            const progressStatus: 'running' | 'success' = progressLooksTerminal ? 'success' : 'running'
+            const progressStatus: 'running' = 'running'
 
-            if (entry) {
+            if (entryForUi) {
               set((state) => {
                 const idx = state.executionLogs.findLastIndex(
                   (l) => l.nodeId === msg.nodeId && l.status === 'running'
                 )
                 if (idx >= 0) {
                   const updated = [...state.executionLogs]
-                  updated[idx] = progressLooksTerminal ? { ...entry, status: 'success' } : entry
+                  updated[idx] = entryForUi
                   return { executionLogs: updated }
                 }
                 // Do not append stale progress after node reached terminal status.
@@ -1334,38 +1800,46 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
                   return {}
                 }
                 return {
-                  executionLogs: [
+                  executionLogs: trimExecutionLogsForUi([
                     ...state.executionLogs,
-                    progressLooksTerminal ? { ...entry, status: 'success' } : entry,
-                  ],
+                    entryForUi,
+                  ]),
                 }
               })
             }
             if (canMoveToRunningFromProgress) {
-              get().setNodeStatus(msg.nodeId, progressStatus, liveRows, liveProcessedRows, liveValidatedRows)
+              get().setNodeStatus(
+                msg.nodeId,
+                progressStatus,
+                liveRows,
+                liveProcessedRows,
+                liveValidatedRows,
+                nextInputSample,
+                nextOutputSample,
+              )
             }
           }
           else if (msg.type === 'node_error') {
-            get().setNodeStatus(msg.nodeId, 'error', liveRows, liveProcessedRows, liveValidatedRows)
+            get().setNodeStatus(msg.nodeId, 'error', liveRows, liveProcessedRows, liveValidatedRows, nextInputSample, nextOutputSample)
             // Replace the running entry with the error entry
-            if (entry) {
+            if (entryForUi) {
               set((state) => {
                 const idx = state.executionLogs.findLastIndex(
                   (l) => l.nodeId === msg.nodeId && l.status === 'running'
                 )
                 if (idx >= 0) {
                   const updated = [...state.executionLogs]
-                  updated[idx] = entry
+                  updated[idx] = entryForUi
                   return { executionLogs: updated }
                 }
-                return { executionLogs: [...state.executionLogs, entry] }
+                return { executionLogs: trimExecutionLogsForUi([...state.executionLogs, entryForUi]) }
               })
             }
           }
-          else if (msg.type === 'execution_cancelled' && entry) {
+          else if (msg.type === 'execution_cancelled' && entryForUi) {
             forceStopRunningNodes()
             set((state) => ({
-              executionLogs: [...state.executionLogs, entry],
+              executionLogs: trimExecutionLogsForUi([...state.executionLogs, entryForUi]),
             }))
           }
           else if (msg.type === 'execution_terminal') {
@@ -1374,15 +1848,19 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
               try {
                 const finalExec = await api.getExecution(execId, {
                   includeLogs: true,
-                  logTail: 5000,
+                  logTail: EXECUTION_FINAL_LOG_TAIL,
+                  includeLogSamples: false,
                 })
                 if (Array.isArray(finalExec.logs) && finalExec.logs.length > 0) {
-                  set({
-                    executionLogs: normalizeExecutionLogsForDisplay(
-                      finalExec.logs as Array<Record<string, any>>,
-                      String(finalExec.status || msg.status || ''),
-                    ),
-                  })
+                  const nextLogs = normalizeExecutionLogsForDisplay(
+                    finalExec.logs as Array<Record<string, any>>,
+                    String(finalExec.status || msg.status || ''),
+                  )
+                  set((state) => (
+                    executionLogsShallowEqual(state.executionLogs, nextLogs)
+                      ? {}
+                      : { executionLogs: nextLogs }
+                  ))
                   applyLiveNodeStatusFromLogs(
                     finalExec.logs as Array<Record<string, any>>,
                     String(finalExec.status || ''),
@@ -1390,10 +1868,10 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
                 }
               } catch {
                 const status = terminalStatus
-                if (status === 'cancelled' && entry) {
+                if (status === 'cancelled' && entryForUi) {
                   forceStopRunningNodes()
                   set((state) => ({
-                    executionLogs: [...state.executionLogs, entry],
+                    executionLogs: trimExecutionLogsForUi([...state.executionLogs, entryForUi]),
                   }))
                 }
               } finally {
@@ -1412,18 +1890,22 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       } catch { /* WS unavailable */ }
 
       let consecutivePollErrors = 0
-      let pollTick = 0
       while (true) {
+        pollIteration += 1
         const startupOrNoWsSignal = !wsConnected || !wsMessageSeen
-        await sleep(startupOrNoWsSignal ? EXECUTION_POLL_INTERVAL_MS : EXECUTION_POLL_INTERVAL_MS)
+        await sleep(
+          startupOrNoWsSignal
+            ? Math.max(250, Math.floor(EXECUTION_POLL_INTERVAL_MS / 4))
+            : EXECUTION_POLL_INTERVAL_MS,
+        )
         const state = get()
         if (!state.isExecuting || state.executionId !== execId) break
         try {
-          pollTick += 1
-          const includeLogsInPoll = startupOrNoWsSignal || (pollTick % 4 === 0)
+          const includeLogsInPoll = startupOrNoWsSignal || (pollIteration % 8 === 0)
           const exec = await api.getExecution(execId, {
             includeLogs: includeLogsInPoll,
-            logTail: includeLogsInPoll ? 300 : 80,
+            logTail: includeLogsInPoll ? 120 : 80,
+            includeLogSamples: false,
           })
           consecutivePollErrors = 0
           const rawExecStatus = String(exec.status || '').toLowerCase()
@@ -1434,35 +1916,42 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
             )
             : rawExecStatus
           if (includeLogsInPoll && Array.isArray(exec.logs) && exec.logs.length > 0) {
-            set({
-              executionLogs: normalizeExecutionLogsForDisplay(
-                exec.logs as Array<Record<string, any>>,
-                effectiveExecStatus,
-              ),
-            })
+            const nextLogs = normalizeExecutionLogsForDisplay(
+              exec.logs as Array<Record<string, any>>,
+              effectiveExecStatus,
+            )
+            set((state) => (
+              executionLogsShallowEqual(state.executionLogs, nextLogs)
+                ? {}
+                : { executionLogs: nextLogs }
+            ))
             applyLiveNodeStatusFromLogs(exec.logs as Array<Record<string, any>>, effectiveExecStatus)
           }
           if (effectiveExecStatus === 'cancelling') {
             forceStopRunningNodes()
           }
-          if (TERMINAL_EXECUTION_STATUSES.has(effectiveExecStatus)) {
-            let finalExec = exec
-            if (!Array.isArray(finalExec.logs) || finalExec.logs.length === 0) {
-              finalExec = await api.getExecution(execId, {
-                includeLogs: true,
-                logTail: 5000,
-              })
+            if (TERMINAL_EXECUTION_STATUSES.has(effectiveExecStatus)) {
+              let finalExec = exec
+              if (!Array.isArray(finalExec.logs) || finalExec.logs.length === 0) {
+                finalExec = await api.getExecution(execId, {
+                  includeLogs: true,
+                  logTail: EXECUTION_FINAL_LOG_TAIL,
+                  includeLogSamples: false,
+                })
               const finalStatusNorm = deriveEffectiveExecutionStatus(
                 String(finalExec.status || ''),
                 Array.isArray(finalExec.logs) ? (finalExec.logs as Array<Record<string, any>>) : [],
               )
               if (Array.isArray(finalExec.logs) && finalExec.logs.length > 0) {
-                set({
-                  executionLogs: normalizeExecutionLogsForDisplay(
-                    finalExec.logs as Array<Record<string, any>>,
-                    finalStatusNorm,
-                  ),
-                })
+                const nextLogs = normalizeExecutionLogsForDisplay(
+                  finalExec.logs as Array<Record<string, any>>,
+                  finalStatusNorm,
+                )
+                set((state) => (
+                  executionLogsShallowEqual(state.executionLogs, nextLogs)
+                    ? {}
+                    : { executionLogs: nextLogs }
+                ))
                 applyLiveNodeStatusFromLogs(
                   finalExec.logs as Array<Record<string, any>>,
                   finalStatusNorm,
@@ -1589,29 +2078,48 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       const statusNorm = String(executionStatus || '').trim().toLowerCase()
       const isTerminal = TERMINAL_EXECUTION_STATUSES.has(statusNorm)
       const snapshots = buildNodeRuntimeSnapshotsFromLogs(logs, statusNorm)
-      set((state) => ({
-        nodes: state.nodes.map((node) => {
+      set((state) => {
+        let changed = false
+        const nextNodes = state.nodes.map((node) => {
           const snapshot = snapshots.get(String(node.id || '').trim())
           if (!snapshot) return node
+          const nextData = {
+            ...node.data,
+            status: snapshot.status,
+            executionRows: snapshot.rows ?? node.data.executionRows,
+            executionProcessedRows: snapshot.processedRows ?? node.data.executionProcessedRows,
+            executionValidatedRows: snapshot.validatedRows ?? node.data.executionValidatedRows,
+            executionSampleInput: snapshot.inputSample ?? node.data.executionSampleInput,
+            executionSampleOutput: snapshot.outputSample ?? node.data.executionSampleOutput,
+            executionStartedAt: snapshot.startedAt ?? node.data.executionStartedAt,
+            executionFinishedAt: snapshot.finishedAt ?? node.data.executionFinishedAt,
+            executionDurationMs: (
+              typeof snapshot.durationMs === 'number'
+                ? snapshot.durationMs
+                : node.data.executionDurationMs
+            ),
+          }
+          const unchanged = (
+            nextData.status === node.data.status
+            && nextData.executionRows === node.data.executionRows
+            && nextData.executionProcessedRows === node.data.executionProcessedRows
+            && nextData.executionValidatedRows === node.data.executionValidatedRows
+            && nextData.executionStartedAt === node.data.executionStartedAt
+            && nextData.executionFinishedAt === node.data.executionFinishedAt
+            && nextData.executionDurationMs === node.data.executionDurationMs
+            && nextData.executionSampleInput === node.data.executionSampleInput
+            && nextData.executionSampleOutput === node.data.executionSampleOutput
+          )
+          if (unchanged) return node
+          changed = true
           return {
             ...node,
-            data: {
-              ...node.data,
-              status: snapshot.status,
-              executionRows: snapshot.rows ?? node.data.executionRows,
-              executionProcessedRows: snapshot.processedRows ?? node.data.executionProcessedRows,
-              executionValidatedRows: snapshot.validatedRows ?? node.data.executionValidatedRows,
-              executionStartedAt: snapshot.startedAt ?? node.data.executionStartedAt,
-              executionFinishedAt: snapshot.finishedAt ?? node.data.executionFinishedAt,
-              executionDurationMs: (
-                typeof snapshot.durationMs === 'number'
-                  ? snapshot.durationMs
-                  : node.data.executionDurationMs
-              ),
-            },
+            data: nextData,
           }
-        }),
-      }))
+        })
+        if (!changed) return {}
+        return { nodes: nextNodes }
+      })
       if (isTerminal) {
         forceStopRunningNodes(terminalFallbackNodeStatus(statusNorm))
       }
@@ -1632,7 +2140,8 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
           const latestExecutionId = String(latestExecution.id)
           const latestSnapshot = await api.getExecution(latestExecutionId, {
             includeLogs: true,
-            logTail: 5000,
+            logTail: EXECUTION_FINAL_LOG_TAIL,
+            includeLogSamples: false,
           })
           const latestStatus = String(
             latestSnapshot?.status || latestExecution.status || '',
@@ -1671,7 +2180,8 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       const executionId = String(activeExecution.id)
       const executionSnapshot = await api.getExecution(executionId, {
         includeLogs: true,
-        logTail: 5000,
+        logTail: EXECUTION_FINAL_LOG_TAIL,
+        includeLogSamples: false,
       })
       const logs = Array.isArray(executionSnapshot?.logs) ? executionSnapshot.logs : []
       const snapshotStatus = deriveEffectiveExecutionStatus(
@@ -1699,25 +2209,34 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
 
       void (async () => {
         let consecutivePollErrors = 0
+        let pollIteration = 0
         while (true) {
+          pollIteration += 1
           await sleep(EXECUTION_POLL_INTERVAL_MS)
           const state = get()
           if (!state.isExecuting || state.executionId !== executionId) break
           try {
+            const includeLogsInPoll = pollIteration % 4 === 0
             const exec = await api.getExecution(executionId, {
-              includeLogs: true,
-              logTail: 300,
+              includeLogs: includeLogsInPoll,
+              logTail: includeLogsInPoll ? 120 : 80,
+              includeLogSamples: false,
             })
             consecutivePollErrors = 0
             const logs = Array.isArray(exec.logs) ? (exec.logs as Array<Record<string, any>>) : []
-            const execStatus = deriveEffectiveExecutionStatus(String(exec.status || '').toLowerCase(), logs)
-            if (Array.isArray(exec.logs) && exec.logs.length > 0) {
-              set({
-                executionLogs: normalizeExecutionLogsForDisplay(
-                  exec.logs as Array<Record<string, any>>,
-                  execStatus,
-                ),
-              })
+            const execStatus = includeLogsInPoll
+              ? deriveEffectiveExecutionStatus(String(exec.status || '').toLowerCase(), logs)
+              : String(exec.status || '').toLowerCase()
+            if (includeLogsInPoll && Array.isArray(exec.logs) && exec.logs.length > 0) {
+              const nextLogs = normalizeExecutionLogsForDisplay(
+                exec.logs as Array<Record<string, any>>,
+                execStatus,
+              )
+              set((state) => (
+                executionLogsShallowEqual(state.executionLogs, nextLogs)
+                  ? {}
+                  : { executionLogs: nextLogs }
+              ))
               applyLiveNodeStatusFromLogs(exec.logs as Array<Record<string, any>>, execStatus)
             }
             if (execStatus === 'cancelling') {

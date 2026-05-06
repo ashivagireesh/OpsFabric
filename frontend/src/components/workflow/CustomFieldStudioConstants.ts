@@ -353,6 +353,9 @@ export const EXPRESSION_FUNCTION_SNIPPETS: Array<{ label: string; snippet: strin
   { label: 'lower(text)', snippet: 'lower(${1:text})' },
   { label: 'trim(text)', snippet: 'trim(${1:text})' },
   { label: 'contains(text,needle)', snippet: 'contains(${1:text}, ${2:needle})' },
+  { label: 'now()', snippet: 'now()' },
+  { label: 'random()', snippet: 'random()' },
+  { label: 'randint(min,max)', snippet: 'randint(${1:100000000000000}, ${2:999999999999999})' },
   { label: 'array(...)', snippet: 'array(${1:value1}, ${2:value2})' },
   { label: 'obj(...)', snippet: "obj(${1:key}=${2:value})" },
   { label: 'prev(path,default)', snippet: "prev('${1:field_name}', ${2:0})" },
@@ -370,6 +373,52 @@ export const EXPRESSION_FUNCTION_SNIPPETS: Array<{ label: string; snippet: strin
   { label: 'combo append_unique(profile_key,value_field)', snippet: "append_unique('${1:profile_key}', field('${2:value_field}'))" },
   { label: 'combo map_inc(datewise_txn_count)', snippet: "map_inc('${1:profile_key}', coalesce(str(field('${2:key_field}')), '${3:UNKNOWN}'), if_(field('${4:txn_id_field}') == null, 0, 1))" },
   { label: 'combo map_inc(datewise_service_name)', snippet: "map_inc('${1:profile_key}', coalesce(str(field('${2:key_field}')), '${3:UNKNOWN}') + '|' + coalesce(str(field('${4:service_field}')), '${3:UNKNOWN}'), ${5:1})" },
+  { label: 'unique_metrics(path,key,metric,value,opts)', snippet: "unique_metrics('${1:metric_path}', ${2:field('TRANSACTIONID')}, '${3:count}', ${4:1}, obj(dedupe_key=${5:field('TRANSACTIONID')},on_duplicate='ignore',normalize='upper_trim',invalid_key='skip'))" },
+  { label: 'unique_group_aggregate(path,key,partition,metric,value,opts)', snippet: "unique_group_aggregate('${1:group_path}', ${2:field('TRANSACTIONID')}, ${3:field('SERVICENAME')}, '${4:count}', ${5:1}, obj(dedupe_key=${6:field('TRANSACTIONID')},on_duplicate='ignore',normalize='upper_trim',invalid_key='skip'))" },
+  { label: 'unique_signal(path,key,signal,payload,opts)', snippet: "unique_signal('${1:signal_path}', ${2:field('TRANSACTIONID')}, '${3:trend}', ${4:obj(value=num(field('AMOUNT'),0),time=field('MIS_TXNDATE'))}, obj(dedupe_key=${5:field('TRANSACTIONID')},on_duplicate='ignore',normalize='upper_trim',invalid_key='skip'))" },
+  { label: 'unique_count(path,key)', snippet: "unique_count('${1:total_txn_count}', ${2:field('TRANSACTIONID')})" },
+  { label: 'unique_sum(path,key,value)', snippet: "unique_sum('${1:total_amount}', ${2:field('TRANSACTIONID')}, ${3:num(field('AMOUNT'),0)})" },
+  { label: 'unique_avg(path,key,value)', snippet: "unique_avg('${1:avg_amount}', ${2:field('TRANSACTIONID')}, ${3:num(field('AMOUNT'),0)})" },
+  { label: 'unique_min(path,key,value)', snippet: "unique_min('${1:min_amount}', ${2:field('TRANSACTIONID')}, ${3:num(field('AMOUNT'),0)})" },
+  { label: 'unique_max(path,key,value)', snippet: "unique_max('${1:max_amount}', ${2:field('TRANSACTIONID')}, ${3:num(field('AMOUNT'),0)})" },
+  { label: 'unique_stats(path,key,value)', snippet: "unique_stats('${1:amount_stats}', ${2:field('TRANSACTIONID')}, ${3:num(field('AMOUNT'),0)})" },
+  { label: 'unique_ratio(path,key,num,den)', snippet: "unique_ratio('${1:ratio_metric}', ${2:field('TRANSACTIONID')}, ${3:1}, ${4:1})" },
+  { label: 'unique_rate(path,key,flag)', snippet: "unique_rate('${1:success_rate}', ${2:field('TRANSACTIONID')}, ${3:if_(field('STATUS')=='SUCCESS',1,0)})" },
+  { label: 'unique_flag(path,key,flag)', snippet: "unique_flag('${1:flag_metric}', ${2:field('TRANSACTIONID')}, ${3:if_(field('STATUS')=='FAILED',1,0)})" },
+  { label: 'unique_map(path,key,bucket)', snippet: "unique_map('${1:txn_per_day}', ${2:field('TRANSACTIONID')}, ${3:field('TXNDATE')})" },
+  { label: 'top_key(path)', snippet: "top_key('${1:txn_per_day}')" },
+  { label: 'unique_interval(path,key,time)', snippet: "unique_interval('${1:avg_txn_interval}', ${2:field('TRANSACTIONID')}, ${3:field('MIS_TXNDATE')})" },
+  { label: 'unique_velocity(path,key,obj)', snippet: "unique_velocity('${1:txn_velocity}', ${2:field('TRANSACTIONID')}, obj(time=${3:field('MIS_TXNDATE')},window_min=${4:5}))" },
+  { label: 'burst_flag(path,obj)', snippet: "burst_flag('${1:burst_flag}', obj(curr='${2:txn_velocity.per_min}',base='${3:rolling_txn_count.w_1d.avg}',factor=${4:2}))" },
+  { label: 'metric_get(path,metric)', snippet: "metric_get('${1:amount_stats}', '${2:sum}')" },
+  { label: 'unique_metric(path,key,metric,value)', snippet: "unique_metric('${1:metric_path}', ${2:field('TRANSACTIONID')}, '${3:count}', ${4:1})" },
+  { label: 'entropy_update(path,key,value)', snippet: "entropy_update('${1:service_entropy}', ${2:field('TRANSACTIONID')}, ${3:field('SERVICENAME')})" },
+  { label: 'min_update(path,value)', snippet: "min_update('${1:first_txn_time}', ${2:field('MIS_TXNDATE')})" },
+  { label: 'max_update(path,value)', snippet: "max_update('${1:last_txn_time}', ${2:field('MIS_TXNDATE')})" },
+  { label: 'repetition_rate(path,key,value)', snippet: "repetition_rate('${1:same_amount_repetition}', ${2:field('TRANSACTIONID')}, ${3:num(field('AMOUNT'),0)})" },
+  { label: 'change_rate(path,key,value)', snippet: "change_rate('${1:device_change_rate}', ${2:field('TRANSACTIONID')}, ${3:field('DEVICE_ID')})" },
+  { label: 'geo_variance(path,key,obj)', snippet: "geo_variance('${1:location_variance}', ${2:field('TRANSACTIONID')}, obj(lat=${3:field('LAT')},lon=${4:field('LON')},time=${5:field('MIS_TXNDATE')}))" },
+  { label: 'geo_conflict_flag(path,key,obj)', snippet: "geo_conflict_flag('${1:multi_location_flag}', ${2:field('TRANSACTIONID')}, obj(customer=${3:field('CUSTACCOUNTNUMBER')},time=${4:field('MIS_TXNDATE')},lat=${5:field('LAT')},lon=${6:field('LON')}))" },
+  { label: 'unique_rolling(path,key,obj)', snippet: "unique_rolling('${1:rolling_txn_count}', ${2:field('TRANSACTIONID')}, obj(value=${3:1},time=${4:field('MIS_TXNDATE')},windows='${5:5m,1h,1d}',retention=${6:30},allowed_lateness='${7:0s}'))" },
+  { label: 'unique_window(path,key,obj)', snippet: "unique_window('${1:rolling_amount}', ${2:field('TRANSACTIONID')}, obj(value=${3:num(field('AMOUNT'),0)},time=${4:field('MIS_TXNDATE')},windows='${5:1d,7d}',retention=${6:45}))" },
+  { label: 'window_sum(path,window)', snippet: "window_sum('${1:amount_stats}', '${2:7d}')" },
+  { label: 'window_avg(path,window)', snippet: "window_avg('${1:amount_stats}', '${2:7d}')" },
+  { label: 'trend_flag(path,obj)', snippet: "trend_flag('${1:trend_increase_flag}', obj(short='${2:1d}',long='${3:7d}',metric='${4:avg}',source='${5:amount_stats}'))" },
+  { label: 'anomaly_detection(path,key,value,time,obj)', snippet: "anomaly_detection('${1:anomaly}', ${2:field('TRANSACTIONID')}, ${3:num(field('AMOUNT'),0)}, ${4:field('MIS_TXNDATE')}, obj(partition_by=array(${5:field('CUSTACCOUNTNUMBER')}, ${6:field('TXN_TYPE')}),window='${7:30d}',min_count=${8:5},method='${9:zscore}',z_threshold=${10:2},very_high_z_threshold=${11:3},allowed_lateness='${12:0s}'))" },
+  { label: 'anomaly_group_aggregate(path,key,value,time,obj)', snippet: "anomaly_group_aggregate('${1:anomaly_group}', ${2:field('TRANSACTIONID')}, ${3:num(field('AMOUNT'),0)}, ${4:field('MIS_TXNDATE')}, obj(partition_by=array(${5:field('CUSTACCOUNTNUMBER')}, ${6:field('SERVICENAME')}),window='${7:30d}',min_count=${8:5},z_threshold=${9:2},very_high_z_threshold=${10:3},allowed_lateness='${11:2d}',sort_by='${12:severity}',limit=${13:0}))" },
+  { label: 'sequence_update(path,key,obj)', snippet: "sequence_update('${1:txn_sequence_pattern}', ${2:field('TRANSACTIONID')}, obj(event=${3:field('SERVICENAME')},time=${4:field('MIS_TXNDATE')},pattern='${5:A>B>A}'))" },
+  { label: 'loop_flag(path,source)', snippet: "loop_flag('${1:loop_pattern_flag}', '${2:txn_sequence_pattern}')" },
+  { label: 'repeated_sequence(path,key,event)', snippet: "repeated_sequence('${1:repeated_service_sequence}', ${2:field('TRANSACTIONID')}, ${3:field('SERVICENAME')})" },
+  { label: 'unique_sequence(path,key,obj)', snippet: "unique_sequence('${1:sequence_stats}', ${2:field('TRANSACTIONID')}, obj(event=${3:field('SERVICENAME')},time=${4:field('MIS_TXNDATE')},pattern='${5:A>B>A}'))" },
+  { label: 'unique_geo(path,key,obj)', snippet: "unique_geo('${1:geo_stats}', ${2:field('TRANSACTIONID')}, obj(lat=${3:field('LAT')},lon=${4:field('LON')},time=${5:field('MIS_TXNDATE')}))" },
+  { label: 'partition_count(path,key,partition)', snippet: "partition_count('${1:partition_txn_count}', ${2:field('TRANSACTIONID')}, ${3:field('SERVICENAME')})" },
+  { label: 'partition_avg(path,key,partition,value)', snippet: "partition_avg('${1:partition_avg_amount}', ${2:field('TRANSACTIONID')}, ${3:field('SERVICENAME')}, ${4:num(field('AMOUNT'),0)})" },
+  { label: 'partition_stddev(path,key,partition,value)', snippet: "partition_stddev('${1:partition_std_amount}', ${2:field('TRANSACTIONID')}, ${3:field('SERVICENAME')}, ${4:num(field('AMOUNT'),0)})" },
+  { label: 'partition_percentile(path,key,partition,value,p)', snippet: "partition_percentile('${1:partition_p95}', ${2:field('TRANSACTIONID')}, ${3:field('SERVICENAME')}, ${4:num(field('AMOUNT'),0)}, ${5:95})" },
+  { label: 'partition_zscore(path,key,partition,value)', snippet: "partition_zscore('${1:partition_zscore}', ${2:field('TRANSACTIONID')}, ${3:field('SERVICENAME')}, ${4:num(field('AMOUNT'),0)})" },
+  { label: 'sigma_threshold(path,value,mean,std,sigma)', snippet: "sigma_threshold('${1:sigma_threshold}', ${2:num(field('AMOUNT'),0)}, ${3:metric_get('amount_stats','avg')}, ${4:metric_get('amount_stats','std')}, ${5:3})" },
+  { label: 'threshold_reason(path,value,thresholds)', snippet: "threshold_reason('${1:threshold_reason}', ${2:num(field('AMOUNT'),0)}, obj(low=${3:0},high=${4:10000}))" },
+  { label: 'zscore_threshold_flag(path,zscore,threshold)', snippet: "zscore_threshold_flag('${1:zscore_threshold_flag}', ${2:metric_get('partition_zscore','value')}, ${3:3})" },
 ]
 
 export const CUSTOM_FIELD_TIPS_TEXT = `Available functions:
@@ -395,6 +444,25 @@ prev(path, default), inc(path_or_value, amount, default), map_inc(path_or_map,ke
 append_unique(path_or_list,value,max_items), safe_div(num,den,default),
 rolling_update(name,value,txn_time,windows,retention_days),
 group_aggregate(key_path, metrics, key_name) [profile mode keeps incremental state and returns grouped array]
+
+FNS v2 dedupe-aware helpers:
+unique_metrics(), unique_group_aggregate(), unique_signal(),
+unique_count(), unique_sum(), unique_avg(), unique_min(), unique_max(), unique_stats(), unique_metric(),
+unique_ratio(), unique_rate(), unique_flag(), unique_map(), top_key(), unique_interval(), unique_velocity(),
+burst_flag(), metric_get(), entropy_update(), min_update(), max_update(),
+repetition_rate(), change_rate(), geo_variance(), geo_conflict_flag(),
+unique_rolling(), unique_window(), window_sum(), window_avg(), trend_flag(),
+anomaly_detection(),
+anomaly_group_aggregate(),
+sequence_update(), loop_flag(), repeated_sequence(), unique_sequence(), unique_geo(),
+partition_count(), partition_avg(), partition_stddev(), partition_percentile(), partition_zscore(),
+sigma_threshold(), threshold_reason(), zscore_threshold_flag()
+
+Common dedupe control (options obj):
+dedupe_key=<txn_or_unique_key>, on_duplicate='ignore', normalize='upper_trim', invalid_key='skip'
+
+Event-time window control (payload obj):
+allowed_lateness='0s|5m|2h|1d' to ignore very-late events beyond watermark
 
 count_if operators:
 eq / ==, != / not, contains / not_contains, like / not_like, in / not_in,

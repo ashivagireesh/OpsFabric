@@ -4,6 +4,7 @@ import AppLayout from './layouts/AppLayout'
 import Dashboard from './pages/Dashboard'
 import PipelineList from './pages/PipelineList'
 import PipelineEditor from './pages/PipelineEditor'
+import PipelineBusinessWorkflowEditor from './pages/PipelineBusinessWorkflowEditor'
 import ExecutionList from './pages/ExecutionList'
 import CredentialManager from './pages/CredentialManager'
 import Settings from './pages/Settings'
@@ -38,10 +39,11 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: string |
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter future={{ v7_relativeSplatPath: true }}>
       <Routes>
         {/* Full-screen editors — no sidebar */}
         <Route path="/pipelines/:id/edit" element={<PipelineEditor />} />
+        <Route path="/pipelines/:id/business-workflow/:nodeId/edit" element={<PipelineBusinessWorkflowEditor />} />
         <Route path="/dashboards/:id/edit" element={<ErrorBoundary><DashboardEditor /></ErrorBoundary>} />
         <Route path="/mlops/:id/edit" element={<MLOpsEditor />} />
         <Route path="/business/:id/edit" element={<BusinessWorkflowEditor />} />

@@ -199,12 +199,12 @@ function NodeCard({ node, onDragStart, onClick }: {
       >
         {/* Mini icon */}
         <div style={{
-          width: 28, height: 28,
+          width: 32, height: 32,
           background: node.bgColor,
           border: `1px solid ${node.color}25`,
           borderRadius: 7,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: 14, flexShrink: 0,
+          fontSize: 16, flexShrink: 0,
           fontFamily: 'system-ui',
         }}>
           {node.icon}
