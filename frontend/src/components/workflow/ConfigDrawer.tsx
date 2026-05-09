@@ -622,6 +622,8 @@ const MAX_PATH_OPTIONS = 6000
 const MAX_ARRAY_INDEX_OPTIONS = 3
 const MAX_OBJECT_KEYS_PER_LEVEL = 200
 const MAX_SAMPLE_ROWS_FOR_PATH_DISCOVERY = 5000
+const DATA_QUERY_PREVIEW_MAX_ROWS_DEFAULT = 50000
+const DATA_QUERY_PREVIEW_MAX_ROWS_CAP = 500000
 const MAX_PARSEABLE_OBJECTLIKE_TEXT_CHARS = 2000000
 const MAX_PREVIEW_SIGNATURE_CHARS = 4096
 const MAX_JSON_TAG_DEPTH = 8
@@ -673,6 +675,8 @@ const DATA_QUERY_STUDIO_SNAPSHOT_KEYS = [
   'array_match_mode',
   'offset',
   'limit',
+  'preview_source_mode',
+  'preview_max_rows',
   'profile_patch_enabled',
   'profile_patch_reflect_output',
   'profile_patch_stage',
@@ -4714,6 +4718,16 @@ function parseStringList(value: unknown): string[] {
   return []
 }
 
+function normalizeDataQueryPickerPath(value: unknown): string {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  const match = text.match(/^dqsrc::[^.]+\.(.+)$/)
+  if (match && match[1]) {
+    return String(match[1]).trim()
+  }
+  return text
+}
+
 function createMLOpsStage2FieldConfig(seed?: Partial<MLOpsStage2FieldConfig>): MLOpsStage2FieldConfig {
   const normalizePick = <T extends string>(values: unknown, allowed: Set<string>): T[] =>
     uniqueFieldNames(parseStringList(values))
@@ -6357,6 +6371,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [dataQueryRemoteDetectionLoading, setDataQueryRemoteDetectionLoading] = useState(false)
   const [dataQueryRemoteDetectionError, setDataQueryRemoteDetectionError] = useState<string | null>(null)
   const [dataQueryRemoteFieldHints, setDataQueryRemoteFieldHints] = useState<string[]>([])
+  const [dataQueryRemoteFieldHintsBySource, setDataQueryRemoteFieldHintsBySource] = useState<Record<string, string[]>>({})
   const [dataQueryRemotePreviewRows, setDataQueryRemotePreviewRows] = useState<Array<Record<string, unknown>>>([])
   const [mlopsStudioOpen, setMLOpsStudioOpen] = useState(false)
   const [mlopsProfileLoading, setMLOpsProfileLoading] = useState(false)
@@ -6465,6 +6480,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [dataQueryIncludeOriginalRowDraft, setDataQueryIncludeOriginalRowDraft] = useState(true)
   const [dataQueryOffsetDraft, setDataQueryOffsetDraft] = useState<number>(0)
   const [dataQueryLimitDraft, setDataQueryLimitDraft] = useState<number>(0)
+  const [dataQueryPreviewSourceModeDraft, setDataQueryPreviewSourceModeDraft] = useState<'sample' | 'full'>('sample')
+  const [dataQueryPreviewMaxRowsDraft, setDataQueryPreviewMaxRowsDraft] = useState<number>(DATA_QUERY_PREVIEW_MAX_ROWS_DEFAULT)
+  const [dataQueryFullPreviewRows, setDataQueryFullPreviewRows] = useState<Array<Record<string, unknown>>>([])
+  const [dataQueryFullPreviewLoading, setDataQueryFullPreviewLoading] = useState(false)
+  const [dataQueryFullPreviewError, setDataQueryFullPreviewError] = useState<string | null>(null)
   const [dataQueryProfilePatchEnabledDraft, setDataQueryProfilePatchEnabledDraft] = useState(false)
   const [dataQueryProfilePatchReflectOutputDraft, setDataQueryProfilePatchReflectOutputDraft] = useState(true)
   const [dataQueryProfilePatchStageDraft, setDataQueryProfilePatchStageDraft] = useState<'pre' | 'post'>('post')
@@ -8666,7 +8686,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     if (parsed.length > 0) {
       return parsed.map((item, index) => ({
         id: String(item.id || `rule_${index + 1}`),
-        field: String(item.field || item.leftField || ''),
+        field: normalizeDataQueryPickerPath(item.field || item.leftField || ''),
         operator: String(item.operator || 'equals'),
         value: item.value == null
           ? (item.rightValue == null ? '' : String(item.rightValue))
@@ -8688,15 +8708,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         ),
       }))
     }
-    const legacyField = String(nodeConfig.field || '').trim()
-    if (!legacyField) return []
-    return [{
-      id: 'rule_1',
-      field: legacyField,
-      operator: String(nodeConfig.operator || 'equals'),
-      value: nodeConfig.value == null ? '' : String(nodeConfig.value),
-      rightMode: 'literal',
-    }]
+  const legacyField = String(nodeConfig.field || '').trim()
+  if (!legacyField) return []
+  return [{
+    id: 'rule_1',
+    field: normalizeDataQueryPickerPath(legacyField),
+    operator: String(nodeConfig.operator || 'equals'),
+    value: nodeConfig.value == null ? '' : String(nodeConfig.value),
+    rightMode: 'literal',
+  }]
   }, [nodeConfig.criteria, nodeConfig.field, nodeConfig.operator, nodeConfig.value])
 
   const persistConditionCriteria = useCallback((nextCriteria: Array<Record<string, any>>, nextMode?: 'all' | 'any') => {
@@ -8945,6 +8965,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       return Number.isFinite(n) ? Math.max(0, Math.trunc(n)) : 0
     },
     [nodeConfig.limit]
+  )
+  const dataQueryPreviewSourceModeConfigured = useMemo<'sample' | 'full'>(
+    () => (String(nodeConfig.preview_source_mode || 'sample').trim().toLowerCase() === 'full' ? 'full' : 'sample'),
+    [nodeConfig.preview_source_mode]
+  )
+  const dataQueryPreviewMaxRowsConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.preview_max_rows ?? DATA_QUERY_PREVIEW_MAX_ROWS_DEFAULT)
+      if (!Number.isFinite(n)) return DATA_QUERY_PREVIEW_MAX_ROWS_DEFAULT
+      return Math.max(1, Math.min(Math.trunc(n), DATA_QUERY_PREVIEW_MAX_ROWS_CAP))
+    },
+    [nodeConfig.preview_max_rows]
   )
   const mlopsSampleSizeConfigured = useMemo(
     () => {
@@ -9528,23 +9560,76 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     },
     [nodeType, selectedNodeId, nodes, edges]
   )
+  const dataQueryDirectSourceNodeIds = useMemo(
+    () => {
+      if (nodeType !== 'profile_query_transform' || !selectedNodeId) return [] as string[]
+      return uniqueFieldNames(
+        edges
+          .filter((edge) => String(edge?.target || '').trim() === String(selectedNodeId || '').trim())
+          .map((edge) => String(edge?.source || '').trim())
+          .filter(Boolean),
+      )
+    },
+    [nodeType, selectedNodeId, edges],
+  )
+  const dataQueryProfilePatchCandidateNodes = useMemo(
+    () => {
+      if (nodeType !== 'profile_query_transform') return [] as Array<{
+        id: string
+        label: string
+        nodeType: string
+        config: Record<string, unknown>
+        source: 'upstream'
+      }>
+
+      const isProfileCandidate = (nodeTypeRaw: string, cfg: Record<string, unknown>): boolean => {
+        const kind = String(nodeTypeRaw || '').trim().toLowerCase()
+        return (
+          (kind === 'map_transform' && parseBoolLike(cfg.custom_profile_enabled, false))
+          || kind === 'lmdb_source'
+        )
+      }
+
+      const seen = new Set<string>()
+      const out: Array<{
+        id: string
+        label: string
+        nodeType: string
+        config: Record<string, unknown>
+        source: 'upstream'
+      }> = []
+
+      dataQueryUpstreamCandidateNodes.forEach((item) => {
+        const id = String(item.id || '').trim()
+        const kind = String(item.nodeType || '').trim().toLowerCase()
+        const cfg = (item.config && typeof item.config === 'object' ? item.config : {}) as Record<string, unknown>
+        if (!id || seen.has(id) || !isProfileCandidate(kind, cfg)) return
+        seen.add(id)
+        out.push({
+          id,
+          label: String(item.label || id),
+          nodeType: kind,
+          config: cfg,
+          source: 'upstream',
+        })
+      })
+
+      return out
+    },
+    [nodeType, dataQueryUpstreamCandidateNodes]
+  )
   const dataQueryProfilePatchNodeOptions = useMemo(
-    () => dataQueryUpstreamCandidateNodes
-      .filter((item) => (
-        (item.nodeType === 'map_transform' && parseBoolLike(item.config.custom_profile_enabled, false))
-        || item.nodeType === 'lmdb_source'
-      ))
-      .map((item) => ({
-        value: item.id,
-        label: item.nodeType === 'lmdb_source'
-          ? `${item.label} (LMDB source)`
-          : `${item.label} (profile)`,
-      })),
-    [dataQueryUpstreamCandidateNodes]
+    () => dataQueryProfilePatchCandidateNodes.map((item) => ({
+      value: item.id,
+      label: item.nodeType === 'lmdb_source'
+        ? `${item.label} (LMDB source • upstream)`
+        : `${item.label} (profile • upstream)`,
+    })),
+    [dataQueryProfilePatchCandidateNodes]
   )
   const dataQueryProfilePatchSelectedUpstreamNode = useMemo(
-    () => dataQueryUpstreamCandidateNodes.find((item) => String(item.id || '').trim() === String(dataQueryProfilePatchNodeIdDraft || '').trim()) || null,
-    [dataQueryUpstreamCandidateNodes, dataQueryProfilePatchNodeIdDraft]
+    () => dataQueryProfilePatchCandidateNodes.find((item) => String(item.id || '').trim() === String(dataQueryProfilePatchNodeIdDraft || '').trim()) || null,
+    [dataQueryProfilePatchCandidateNodes, dataQueryProfilePatchNodeIdDraft]
   )
   const dataQueryProfilePatchIsDirectLmdbSource = useMemo(
     () => String(dataQueryProfilePatchSelectedUpstreamNode?.nodeType || '').trim().toLowerCase() === 'lmdb_source',
@@ -9556,74 +9641,198 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       ...upstreamReferenceFields,
       ...upstreamPreviewReferenceFields,
       ...dataQueryRemoteFieldHints,
-    ]),
+    ].map((field) => normalizeDataQueryPickerPath(field))),
     [mapInputFieldOptions, upstreamReferenceFields, upstreamPreviewReferenceFields, dataQueryRemoteFieldHints]
   )
-  const dataQueryFieldTreeData = useMemo(() => {
-    type TreeNode = { title: string; key: string; path?: string; children?: TreeNode[]; isLeaf?: boolean }
-    const root: TreeNode[] = []
-    const rootMap = new Map<string, TreeNode>()
-    const ensureChild = (parent: TreeNode, part: string, fullKey: string, isLeaf: boolean): TreeNode => {
-      if (!Array.isArray(parent.children)) parent.children = []
-      const existing = parent.children.find((child) => child.key === fullKey)
-      if (existing) {
-        if (isLeaf) {
-          existing.isLeaf = true
-          existing.path = fullKey
-        } else if (existing.isLeaf) {
-          // Node was previously discovered as a direct leaf path (e.g. a.b),
-          // and later appears as an object parent (e.g. a.b.c). It must stop
-          // being leaf so tree-level +/- controls render at object level.
-          existing.isLeaf = false
+  const dataQueryFieldOptionsBySource = useMemo(
+    () => {
+      if (nodeType !== 'profile_query_transform' || !selectedNodeId) return [] as Array<{
+        sourceId: string
+        sourceLabel: string
+        sourceType: string
+        fields: string[]
+      }>
+      const sourceCandidates = (
+        dataQueryUpstreamCandidateNodes.length > 0
+          ? dataQueryUpstreamCandidateNodes.map((item) => ({ ...item, source: 'upstream' as const }))
+          : dataQueryProfilePatchCandidateNodes
+      )
+      if (!sourceCandidates.length) return []
+      const fieldDiscoveryLimit = 300
+      const list = sourceCandidates.map((src) => {
+        const sourceId = String(src.id || '').trim()
+        const sourceLabel = String(src.label || sourceId).trim() || sourceId
+        const sourceType = String(src.nodeType || '').trim().toLowerCase() || 'upstream'
+        if (!sourceId) {
+          return {
+            sourceId: '',
+            sourceLabel: '',
+            sourceType: 'upstream',
+            fields: [] as string[],
+          }
         }
-        return existing
+        const inferred = inferUpstreamInputFields(
+          selectedNodeId,
+          nodes,
+          edges,
+          [sourceId],
+          true,
+        )
+        const strictRows = inferUpstreamPreviewRows(
+          selectedNodeId,
+          nodes,
+          edges,
+          fieldDiscoveryLimit,
+          [sourceId],
+          true,
+          true,
+        )
+        const relaxedRows = strictRows.length > 0
+          ? strictRows
+          : inferUpstreamPreviewRows(
+            selectedNodeId,
+            nodes,
+            edges,
+            fieldDiscoveryLimit,
+            [sourceId],
+            false,
+            true,
+          )
+        const discovered = uniqueFieldNames([
+          ...extractPriorityJsonFieldPaths(relaxedRows),
+          ...extractSampleFieldPaths(relaxedRows),
+        ])
+        const sourceInputHints = inferUpstreamInputFields(
+          sourceId,
+          nodes,
+          edges,
+        )
+        const fields = uniqueFieldNames([
+          ...inferred,
+          ...sourceInputHints,
+          ...discovered,
+          ...(dataQueryRemoteFieldHintsBySource[sourceId] || []),
+        ].map((field) => normalizeDataQueryPickerPath(field)))
+        return {
+          sourceId,
+          sourceLabel,
+          sourceType,
+          fields,
+        }
+      }).filter((item) => item.sourceId)
+      return list
+    },
+    [
+      nodeType,
+      selectedNodeId,
+      nodes,
+      edges,
+      dataQueryProfilePatchCandidateNodes,
+      dataQueryUpstreamCandidateNodes,
+      dataQueryRemoteFieldHintsBySource,
+    ],
+  )
+  const dataQueryFieldTreeData = useMemo(() => {
+    type FieldTreeNodeInternal = {
+      key: string
+      label: string
+      path: string
+      selectable: boolean
+      isLeaf: boolean
+      children: FieldTreeNodeInternal[]
+      childMap: Map<string, FieldTreeNodeInternal>
+    }
+    const rootNodes: FieldTreeNodeInternal[] = []
+    const rootMap = new Map<string, FieldTreeNodeInternal>()
+    const getOrCreateNode = (
+      map: Map<string, FieldTreeNodeInternal>,
+      list: FieldTreeNodeInternal[],
+      key: string,
+      label: string,
+      path: string,
+      selectable = false,
+    ) => {
+      const existing = map.get(key)
+      if (existing) return existing
+      const created: FieldTreeNodeInternal = {
+        key,
+        label,
+        path,
+        selectable,
+        isLeaf: selectable,
+        children: [],
+        childMap: new Map<string, FieldTreeNodeInternal>(),
       }
-      const created: TreeNode = { title: part, key: fullKey, path: isLeaf ? fullKey : undefined, isLeaf }
-      parent.children.push(created)
+      map.set(key, created)
+      list.push(created)
       return created
     }
-    dataQueryFieldOptions.forEach((path) => {
-      const text = String(path || '').trim()
-      if (!text) return
-      const parts = text.split('.').filter(Boolean)
-      if (parts.length <= 1) {
-        const existing = rootMap.get(text)
-        if (existing) {
-          // Keep direct root path selectable, but if it also has children
-          // it must render as object node with expand control.
-          existing.path = text
-          if (Array.isArray(existing.children) && existing.children.length > 0) {
-            existing.isLeaf = false
-          } else {
-            existing.isLeaf = true
-          }
-        } else {
-          const node: TreeNode = { title: text, key: text, path: text, isLeaf: true }
-          root.push(node)
-          rootMap.set(text, node)
-        }
-        return
-      }
-      const first = parts[0]
-      let current = rootMap.get(first)
-      if (!current) {
-        current = { title: first, key: first, path: first, children: [] }
-        root.push(current)
-        rootMap.set(first, current)
-      }
-      // Root path may also appear as direct field; ensure object roots always
-      // show expand controls when nested paths are present.
-      if (current.isLeaf) current.isLeaf = false
-      if (!Array.isArray(current.children)) current.children = []
-      let runningKey = first
-      for (let idx = 1; idx < parts.length; idx += 1) {
-        const part = parts[idx]
-        runningKey = `${runningKey}.${part}`
-        current = ensureChild(current, part, runningKey, idx === parts.length - 1)
-      }
+    const addPathUnderParent = (parentNode: FieldTreeNodeInternal | null, fullPath: string) => {
+      const segments = splitPathSegments(fullPath)
+      if (!segments.length) return
+      let parentList = parentNode ? parentNode.children : rootNodes
+      let parentMap = parentNode ? parentNode.childMap : rootMap
+      let normalizedPath = parentNode ? parentNode.path : ''
+      segments.forEach((seg, idx) => {
+        normalizedPath = appendPathSegment(normalizedPath, seg)
+        const treeKey = parentNode ? `${parentNode.key}::${normalizedPath}` : normalizedPath
+        const node = getOrCreateNode(
+          parentMap,
+          parentList,
+          treeKey,
+          seg,
+          normalizedPath,
+          idx === segments.length - 1,
+        )
+        if (idx !== segments.length - 1) node.isLeaf = false
+        parentList = node.children
+        parentMap = node.childMap
+      })
+    }
+
+    if (dataQueryFieldOptionsBySource.length > 0) {
+      dataQueryFieldOptionsBySource.forEach((sourceCluster) => {
+        const sourceRootKey = `dqsrc::${sourceCluster.sourceId}`
+        const sourcePrefix = sourceCluster.sourceType === 'profile_query_transform'
+          ? 'Data Query'
+          : (sourceCluster.sourceType === 'lmdb_source' ? 'LMDB' : 'Profile')
+        const sourceTitle = `${sourcePrefix} · ${sourceCluster.sourceLabel}`
+        const sourceRoot = getOrCreateNode(
+          rootMap,
+          rootNodes,
+          sourceRootKey,
+          sourceTitle,
+          '',
+          false,
+        )
+        sourceRoot.isLeaf = false
+        const sourceFieldSet = new Set<string>()
+        sourceCluster.fields.forEach((rawPath) => {
+          const fullPath = String(rawPath || '').trim()
+          if (!fullPath) return
+          const normalized = fullPath.toLowerCase()
+          if (sourceFieldSet.has(normalized)) return
+          sourceFieldSet.add(normalized)
+          addPathUnderParent(sourceRoot, fullPath)
+        })
+      })
+    } else {
+      dataQueryFieldOptions.forEach((rawPath) => {
+        const fullPath = String(rawPath || '').trim()
+        if (!fullPath) return
+        addPathUnderParent(null, fullPath)
+      })
+    }
+    const toTreeData = (node: FieldTreeNodeInternal): any => ({
+      key: node.key,
+      path: node.path,
+      selectable: node.selectable,
+      title: node.label,
+      isLeaf: node.isLeaf,
+      children: node.children.map(toTreeData),
     })
-    return root
-  }, [dataQueryFieldOptions])
+    return rootNodes.map(toTreeData)
+  }, [dataQueryFieldOptions, dataQueryFieldOptionsBySource])
   const dataQueryFieldSearchNormalized = useMemo(
     () => String(dataQueryFieldSearchQuery || '').trim().toLowerCase(),
     [dataQueryFieldSearchQuery]
@@ -9633,9 +9842,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const filterNodes = (nodes: any[]): any[] => {
       const out: any[] = []
       nodes.forEach((node) => {
-        const title = String(node?.title || '').toLowerCase()
+        const title = String(node?.title || '')
+        const key = String(node?.key || '')
+        const path = String(node?.path || '')
+        const haystack = `${title} ${key} ${path}`.toLowerCase()
         const childMatches = Array.isArray(node?.children) ? filterNodes(node.children) : []
-        if (title.includes(dataQueryFieldSearchNormalized) || childMatches.length > 0) {
+        if (haystack.includes(dataQueryFieldSearchNormalized) || childMatches.length > 0) {
           out.push({
             ...node,
             children: childMatches.length > 0 ? childMatches : node.children,
@@ -9658,17 +9870,26 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     walk(dataQueryFilteredFieldTreeData as any[])
     return uniqueFieldNames(keys)
   }, [dataQueryFilteredFieldTreeData])
+  const dataQueryFieldOptionsForPicker = useMemo(
+    () => filterUserFacingFieldNames([
+      ...dataQueryFieldOptions,
+      ...dataQueryFieldOptionsBySource.flatMap((sourceCluster) => (
+        (Array.isArray(sourceCluster.fields) ? sourceCluster.fields : []).map((field) => normalizeDataQueryPickerPath(field))
+      )),
+    ]),
+    [dataQueryFieldOptions, dataQueryFieldOptionsBySource]
+  )
   const dataQueryFilteredFieldOptions = useMemo(
     () => (
       !dataQueryFieldSearchNormalized
-        ? dataQueryFieldOptions
-        : dataQueryFieldOptions.filter((fieldName) =>
+        ? dataQueryFieldOptionsForPicker
+        : dataQueryFieldOptionsForPicker.filter((fieldName) =>
           String(fieldName || '').toLowerCase().includes(dataQueryFieldSearchNormalized))
     ),
-    [dataQueryFieldOptions, dataQueryFieldSearchNormalized]
+    [dataQueryFieldOptionsForPicker, dataQueryFieldSearchNormalized]
   )
   const dataQueryFieldAutoCompleteOptions = useMemo(
-    () => dataQueryFilteredFieldOptions.slice(0, 400).map((value) => ({ value, label: value })),
+    () => dataQueryFilteredFieldOptions.map((value) => ({ value, label: value })),
     [dataQueryFilteredFieldOptions]
   )
   const dataQueryQuickPickFields = useMemo(
@@ -9683,24 +9904,37 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   }, [dataQueryStudioOpen, nodeType, selectedNodeId, nodes, edges])
   const dataQueryPreviewRows = useMemo(() => {
     if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform' || !selectedNodeId) return []
+    if (dataQueryPreviewSourceModeDraft === 'full' && dataQueryFullPreviewRows.length > 0) {
+      const safeMax = Number.isFinite(dataQueryPreviewMaxRowsDraft)
+        ? Math.max(1, Math.min(Math.trunc(dataQueryPreviewMaxRowsDraft), DATA_QUERY_PREVIEW_MAX_ROWS_CAP))
+        : DATA_QUERY_PREVIEW_MAX_ROWS_DEFAULT
+      return dataQueryFullPreviewRows.slice(0, safeMax)
+    }
     if (dataQueryLocalPreviewRows.length > 0) return dataQueryLocalPreviewRows
     return (dataQueryRemotePreviewRows || []).slice(0, 300)
   }, [
     dataQueryStudioOpen,
     nodeType,
     selectedNodeId,
+    dataQueryPreviewSourceModeDraft,
+    dataQueryPreviewMaxRowsDraft,
+    dataQueryFullPreviewRows,
     dataQueryLocalPreviewRows,
     dataQueryRemotePreviewRows,
   ])
   const dataQueryFieldSamples = useMemo(() => {
     const out = new Map<string, string>()
-    if (!dataQueryStudioOpen || dataQueryPreviewRows.length <= 0 || dataQueryFieldOptions.length <= 0) return out
-    dataQueryFieldOptions.forEach((path) => {
+    // Sample extraction is only used by Quick Picker labels; skip expensive scans otherwise.
+    if (!dataQueryStudioOpen || !dataQueryShowQuickPicker || dataQueryPreviewRows.length <= 0 || dataQueryFieldOptionsForPicker.length <= 0) {
+      return out
+    }
+    const sampleRows = dataQueryPreviewRows.slice(0, 300)
+    dataQueryFieldOptionsForPicker.forEach((path) => {
       if (out.size >= 2000) return
       const rawPath = String(path || '').trim()
       if (!rawPath) return
       let sampleValue: any = undefined
-      for (const row of dataQueryPreviewRows) {
+      for (const row of sampleRows) {
         if (!row || typeof row !== 'object') continue
         const values = readPathValues(row as Record<string, unknown>, rawPath)
         if (Array.isArray(values) && values.length > 0) {
@@ -9729,7 +9963,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       out.set(rawPath, String(sampleValue))
     })
     return out
-  }, [dataQueryStudioOpen, dataQueryPreviewRows, dataQueryFieldOptions])
+  }, [dataQueryStudioOpen, dataQueryShowQuickPicker, dataQueryPreviewRows, dataQueryFieldOptionsForPicker])
   const mlopsDataQuerySourceNodeIds = useMemo(() => {
     if (!mlopsStudioOpen || nodeType !== 'mlops_transform' || !selectedNodeId) return [] as string[]
     const nodeMap = new Map(nodes.map((item) => [String(item.id || ''), item] as const))
@@ -10778,6 +11012,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     include_original_row: dataQueryIncludeOriginalRowDraft,
     offset: dataQueryOffsetDraft,
     limit: dataQueryLimitDraft,
+    preview_source_mode: dataQueryPreviewSourceModeDraft,
+    preview_max_rows: dataQueryPreviewMaxRowsDraft,
     profile_patch_enabled: dataQueryProfilePatchEnabledDraft,
     profile_patch_reflect_output: dataQueryProfilePatchReflectOutputDraft,
     profile_patch_stage: dataQueryProfilePatchStageDraft,
@@ -10802,6 +11038,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     dataQueryIncludeOriginalRowDraft,
     dataQueryOffsetDraft,
     dataQueryLimitDraft,
+    dataQueryPreviewSourceModeDraft,
+    dataQueryPreviewMaxRowsDraft,
     dataQueryProfilePatchEnabledDraft,
     dataQueryProfilePatchReflectOutputDraft,
     dataQueryProfilePatchStageDraft,
@@ -10868,17 +11106,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   ])
   const detectDataQuerySourceFieldOptions = useCallback(async () => {
     if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform') return
-    if (dataQueryLocalPreviewRows.length > 0) {
-      setDataQueryRemoteFieldHints([])
-      setDataQueryRemotePreviewRows([])
-      setDataQueryRemoteDetectionError(null)
-      return
-    }
     const sourceNodes = dataQueryUpstreamCandidateNodes
       .filter((item) => String(item.nodeType || '').trim().toLowerCase().endsWith('_source'))
       .slice(0, 25)
     if (sourceNodes.length <= 0) {
       setDataQueryRemoteFieldHints([])
+      setDataQueryRemoteFieldHintsBySource({})
       setDataQueryRemotePreviewRows([])
       setDataQueryRemoteDetectionError(null)
       return
@@ -10888,13 +11121,38 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const rowsOut: Array<Record<string, unknown>> = []
     const rowSeen = new Set<string>()
     const fieldSet = new Set<string>()
+    const sourceFieldMap: Record<string, string[]> = {}
+    const pipelineId = String(activePipelineId || '').trim()
+    const upstreamProfileNodeIds = uniqueFieldNames(
+      dataQueryUpstreamCandidateNodes
+        .filter((item) => {
+          const kind = String(item.nodeType || '').trim().toLowerCase()
+          if (kind !== 'map_transform') return false
+          const cfg = item.config && typeof item.config === 'object'
+            ? item.config as Record<string, unknown>
+            : {}
+          return parseBoolLike(cfg.custom_profile_enabled, false)
+        })
+        .map((item) => String(item.id || '').trim()),
+    )
     try {
       for (const sourceNode of sourceNodes) {
         let response: any = null
         try {
+          const requestConfig: Record<string, unknown> = {
+            ...((sourceNode.config && typeof sourceNode.config === 'object'
+              ? sourceNode.config
+              : {}) as Record<string, unknown>),
+          }
+          if (String(sourceNode.nodeType || '').trim().toLowerCase() === 'lmdb_source') {
+            if (pipelineId) requestConfig._schema_pipeline_id = pipelineId
+            if (upstreamProfileNodeIds.length > 0) {
+              requestConfig._schema_profile_node_ids = upstreamProfileNodeIds
+            }
+          }
           response = await api.detectSourceFieldOptions(
             sourceNode.nodeType,
-            sourceNode.config || {},
+            requestConfig,
             5000,
             {
               previewRows: 300,
@@ -10907,8 +11165,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         } catch {
           continue
         }
+        const sourceId = String(sourceNode.id || '').trim()
+        const sourceFields = new Set<string>()
         const cols = parseFieldList(response?.columns)
-        cols.forEach((name) => fieldSet.add(name))
+        cols.forEach((name) => {
+          fieldSet.add(name)
+          sourceFields.add(name)
+        })
+        const nested = parseFieldList(response?.field_paths)
+        nested.forEach((name) => {
+          fieldSet.add(name)
+          sourceFields.add(name)
+        })
         const previewRows = Array.isArray(response?.preview)
           ? response.preview.filter((row: unknown) => !!row && typeof row === 'object' && !Array.isArray(row)) as Array<Record<string, unknown>>
           : []
@@ -10916,7 +11184,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           ...extractPriorityJsonFieldPaths(previewRows),
           ...extractSampleFieldPaths(previewRows),
         ])
-        discovered.forEach((name) => fieldSet.add(name))
+        discovered.forEach((name) => {
+          fieldSet.add(name)
+          sourceFields.add(name)
+        })
+        if (sourceId) {
+          sourceFieldMap[sourceId] = uniqueFieldNames(Array.from(sourceFields))
+        }
         for (const row of previewRows) {
           if (rowsOut.length >= 1000) break
           let sig = ''
@@ -10931,6 +11205,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         }
       }
       setDataQueryRemoteFieldHints(uniqueFieldNames(Array.from(fieldSet)))
+      setDataQueryRemoteFieldHintsBySource(sourceFieldMap)
       setDataQueryRemotePreviewRows(rowsOut.slice(0, 1000))
     } catch (err: any) {
       setDataQueryRemoteDetectionError(String(err?.message || 'Failed to detect source field options for Data Query.'))
@@ -10940,7 +11215,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   }, [
     dataQueryStudioOpen,
     nodeType,
-    dataQueryLocalPreviewRows,
+    activePipelineId,
     dataQueryUpstreamCandidateNodes,
   ])
   useEffect(() => {
@@ -11008,6 +11283,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       setDataQueryFieldSearchQuery('')
       setDataQueryTreeExpandedKeys([])
       setDataQueryShowQuickPicker(false)
+      setDataQueryRemoteFieldHintsBySource({})
+      setDataQueryFullPreviewRows([])
+      setDataQueryFullPreviewError(null)
+      setDataQueryFullPreviewLoading(false)
     }
   }, [dataQueryStudioOpen])
   useEffect(() => {
@@ -12194,7 +12473,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const persistDataQueryCriteria = useCallback((nextCriteria: Array<Record<string, any>>) => {
     const normalized = (nextCriteria || []).map((item, index) => ({
       id: String(item.id || `rule_${index + 1}`),
-      field: String(item.field || '').trim(),
+      field: normalizeDataQueryPickerPath(item.field || ''),
       operator: String(item.operator || 'equals').trim().toLowerCase() || 'equals',
       value: item.value == null ? '' : String(item.value),
       rightMode: (
@@ -12247,7 +12526,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   }, [dataQueryCriteriaDraft, persistDataQueryCriteria])
 
   const applyDataQueryFieldFromPicker = useCallback((fieldPath: string) => {
-    const picked = String(fieldPath || '').trim()
+    const picked = normalizeDataQueryPickerPath(fieldPath)
     if (!picked) return
     const activeRuleId = String(dataQueryActiveRuleId || '').trim()
     const fallbackRuleId = String(dataQueryCriteriaDraft[0]?.id || '').trim()
@@ -12392,10 +12671,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     ))
   }, [nodeConfig.case_sensitive])
 
-  const runDataQueryPreview = useCallback(() => {
-    const rows = Array.isArray(dataQueryPreviewRows)
-      ? dataQueryPreviewRows.filter((row) => row && typeof row === 'object') as Array<Record<string, unknown>>
-      : []
+  const runDataQueryPreviewLocal = useCallback((rowsOverride?: Array<Record<string, unknown>>) => {
+    const rows = Array.isArray(rowsOverride)
+      ? rowsOverride.filter((row) => row && typeof row === 'object') as Array<Record<string, unknown>>
+      : (
+        Array.isArray(dataQueryPreviewRows)
+          ? dataQueryPreviewRows.filter((row) => row && typeof row === 'object') as Array<Record<string, unknown>>
+          : []
+      )
     const rules = (dataQueryCriteriaDraft || []).filter((rule) => String(rule.field || '').trim())
     const mode = dataQueryMatchModeDraft === 'any' ? 'any' : 'all'
     const selectedFields = uniqueFieldNames(dataQuerySelectFieldsDraft)
@@ -12711,6 +12994,397 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     evaluateDataQueryRuleMatch,
   ])
 
+  const loadDataQueryFullPreviewRows = useCallback(async (): Promise<Array<Record<string, unknown>>> => {
+    if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform' || !selectedNodeId) return []
+    const pipelineId = String(activePipelineId || '').trim()
+    if (!pipelineId) {
+      const msg = 'Pipeline id is missing. Save pipeline and run once, then retry Full Preview.'
+      setDataQueryFullPreviewError(msg)
+      return []
+    }
+    const sourceNodeIds = dataQueryDirectSourceNodeIds.length > 0
+      ? dataQueryDirectSourceNodeIds
+      : [String(selectedNodeId || '').trim()].filter(Boolean)
+    if (sourceNodeIds.length <= 0) {
+      const msg = 'No upstream source nodes are connected for full preview.'
+      setDataQueryFullPreviewError(msg)
+      return []
+    }
+    const safeMaxRows = Number.isFinite(dataQueryPreviewMaxRowsDraft)
+      ? Math.max(1, Math.min(Math.trunc(dataQueryPreviewMaxRowsDraft), DATA_QUERY_PREVIEW_MAX_ROWS_CAP))
+      : DATA_QUERY_PREVIEW_MAX_ROWS_DEFAULT
+    setDataQueryFullPreviewLoading(true)
+    setDataQueryFullPreviewError(null)
+    const merged: Array<Record<string, unknown>> = []
+    const seen = new Set<string>()
+    const perSourceErrors: string[] = []
+    const sourceMetaById = new Map<string, {
+      label: string
+      nodeType: string
+      config: Record<string, unknown>
+    }>(
+      dataQueryUpstreamCandidateNodes.map((item) => [
+        String(item.id || '').trim(),
+        {
+          label: String(item.label || item.id || '').trim() || String(item.id || '').trim(),
+          nodeType: String(item.nodeType || '').trim().toLowerCase(),
+          config: (item.config && typeof item.config === 'object')
+            ? { ...(item.config as Record<string, unknown>) }
+            : {},
+        },
+      ]),
+    )
+    const toRoot = (value: unknown): string => {
+      const normalized = normalizeDataQueryPickerPath(value)
+      if (!normalized) return ''
+      const first = normalized.split(/[.[\]]/).find((item) => String(item || '').trim())
+      return String(first || '').trim()
+    }
+    const activeRoots = uniqueFieldNames([
+      ...(dataQueryCriteriaDraft || []).map((item) => toRoot(item?.field)),
+      ...(dataQuerySelectFieldsDraft || []).map((field) => toRoot(field)),
+    ].filter(Boolean))
+    const sourcePriority = new Map<string, number>()
+    const sourceRootsById = new Map<string, Set<string>>(
+      dataQueryFieldOptionsBySource.map((cluster) => {
+        const sourceId = String(cluster.sourceId || '').trim()
+        const roots = new Set<string>(
+          (Array.isArray(cluster.fields) ? cluster.fields : [])
+            .map((field) => toRoot(field))
+            .filter(Boolean),
+        )
+        return [sourceId, roots] as const
+      }),
+    )
+    sourceNodeIds.forEach((sourceId, index) => {
+      const sourceKey = String(sourceId || '').trim()
+      if (!sourceKey) return
+      const roots = sourceRootsById.get(sourceKey) || new Set<string>()
+      const rootScore = activeRoots.reduce((count, root) => count + (roots.has(root) ? 1 : 0), 0)
+      // Stable tiebreaker by original order.
+      const score = (rootScore * 100000) - index
+      sourcePriority.set(sourceKey, score)
+    })
+    const prioritizedSourceNodeIds = [...sourceNodeIds].sort((a, b) => {
+      const aScore = sourcePriority.get(String(a || '').trim()) ?? Number.NEGATIVE_INFINITY
+      const bScore = sourcePriority.get(String(b || '').trim()) ?? Number.NEGATIVE_INFINITY
+      return bScore - aScore
+    })
+    const computeRowSignature = (row: Record<string, unknown>): string => {
+      const lmdbKey = String((row as any)?.lmdb_key || '').trim()
+      if (lmdbKey) return `lmdb_key:${lmdbKey}`
+      const entityKey = String((row as any)?.lmdb_entity_key || '').trim()
+      if (entityKey) return `lmdb_entity_key:${entityKey}`
+      const entityToken = String((row as any)?._entity_token || '').trim()
+      if (entityToken) return `_entity_token:${entityToken}`
+      try {
+        return JSON.stringify(row) || ''
+      } catch {
+        return ''
+      }
+    }
+    const scanCriteria = (dataQueryCriteriaDraft || []).filter((rule) => {
+      const field = String(rule?.field || '').trim()
+      const op = String(rule?.operator || '').trim().toLowerCase()
+      return Boolean(field) || op === 'raw'
+    })
+    const scanMode = String(dataQueryMatchModeDraft || 'all').trim().toLowerCase() === 'any' ? 'any' : 'all'
+    const shouldFilterWhileScanning = scanCriteria.length > 0
+    const backendFilterCriteria = shouldFilterWhileScanning
+      ? scanCriteria.map((rule) => {
+        const rightMode = String(rule?.rightMode || 'literal').trim().toLowerCase()
+        const isFieldRight = rightMode === 'field'
+        const rawValue = rule?.value
+        return {
+          id: String(rule?.id || '').trim() || undefined,
+          field: normalizeDataQueryPickerPath(String(rule?.field || '').trim()),
+          operator: String(rule?.operator || 'equals').trim().toLowerCase() || 'equals',
+          value: isFieldRight
+            ? normalizeDataQueryPickerPath(String(rawValue || '').trim())
+            : rawValue,
+          rightMode: rightMode || 'literal',
+        }
+      })
+      : []
+    const backendRulesApplied = backendFilterCriteria.length > 0
+    const backendFilterConfig = backendRulesApplied
+      ? {
+        query_mode: 'upstream',
+        criteria_mode: scanMode,
+        criteria: backendFilterCriteria,
+        case_sensitive: Boolean(nodeConfig.case_sensitive),
+      }
+      : null
+    const rowMatchesScanCriteria = (row: Record<string, unknown>): boolean => {
+      if (!shouldFilterWhileScanning) return true
+      if (scanMode === 'any') {
+        return scanCriteria.some((rule) => evaluateDataQueryRuleMatch(row, rule))
+      }
+      return scanCriteria.every((rule) => evaluateDataQueryRuleMatch(row, rule))
+    }
+    let lastErr = ''
+    try {
+      for (const sourceNodeId of prioritizedSourceNodeIds) {
+        if (merged.length >= safeMaxRows) break
+        const normalizedSourceId = String(sourceNodeId || '').trim()
+        if (!normalizedSourceId) continue
+        const sourceMeta = sourceMetaById.get(normalizedSourceId) || null
+        const sourceLabel = sourceMeta?.label || normalizedSourceId
+
+        const extractErrorDetail = (err: any): string => {
+          const detail = err?.response?.data?.detail
+          if (typeof detail === 'string' && detail.trim()) return detail.trim()
+          if (Array.isArray(detail)) return detail.map((item) => String(item || '').trim()).filter(Boolean).join('; ')
+          return String(err?.message || '').trim()
+        }
+
+        let response: any = null
+        let strictErr = ''
+        const runSourceScanFallback = async (sourceTargetRows: number): Promise<Array<Record<string, unknown>>> => {
+          const canSourceScan = Boolean(sourceMeta && sourceMeta.nodeType.endsWith('_source'))
+          if (!canSourceScan || !sourceMeta) return []
+          const sourceRows: Array<Record<string, unknown>> = []
+          const sourceSeen = new Set<string>()
+          let page = 1
+          let hasMore = true
+          const pageCap = 500
+          const safeTargetRows = Math.max(1, sourceTargetRows)
+          const scanRowsCap = shouldFilterWhileScanning
+            ? (
+              backendRulesApplied
+                ? Math.max(
+                  Math.max(safeTargetRows, 10000),
+                  Math.min(DATA_QUERY_PREVIEW_MAX_ROWS_CAP, safeTargetRows * 60),
+                )
+                : Math.max(safeTargetRows, Math.min(DATA_QUERY_PREVIEW_MAX_ROWS_CAP, safeTargetRows * 12))
+            )
+            : safeTargetRows
+          let scannedRows = 0
+          while (hasMore && scannedRows < scanRowsCap && sourceRows.length < safeTargetRows) {
+            const remainingScan = Math.max(1, scanRowsCap - scannedRows)
+            const pageSize = Math.max(1, Math.min(pageCap, remainingScan))
+            const sourceResponse = await api.detectSourceFieldOptions(
+              sourceMeta.nodeType,
+              sourceMeta.config,
+              scanRowsCap,
+              {
+                page,
+                previewRows: pageSize,
+                includeSchemaScan: false,
+                schemaScanLimit: 250,
+                previewCompact: false,
+                timeoutMs: 45000,
+              },
+            )
+            const batch = Array.isArray(sourceResponse?.preview)
+              ? sourceResponse.preview.filter((row: unknown) => !!row && typeof row === 'object' && !Array.isArray(row)) as Array<Record<string, unknown>>
+              : []
+            if (batch.length <= 0) break
+            scannedRows += batch.length
+            for (const row of batch) {
+              if (!rowMatchesScanCriteria(row)) continue
+              const sig = computeRowSignature(row)
+              if (sig && sourceSeen.has(sig)) continue
+              if (sig) sourceSeen.add(sig)
+              sourceRows.push(row)
+              if (sourceRows.length >= safeTargetRows) break
+            }
+            hasMore = Boolean(sourceResponse?.has_more) && sourceRows.length < safeTargetRows && scannedRows < scanRowsCap
+            page += 1
+          }
+          return sourceRows
+        }
+        const sourceLimit = Math.max(1, safeMaxRows - merged.length)
+        const sourceType = String(sourceMeta?.nodeType || '').trim().toLowerCase()
+        const sourceConfig = (
+          sourceMeta?.config && typeof sourceMeta.config === 'object'
+            ? sourceMeta.config
+            : {}
+        ) as Record<string, unknown>
+        const isProfileStoreNode = (
+          sourceType === 'map_transform'
+          && parseBoolLike(sourceConfig.custom_profile_enabled, false)
+        )
+        try {
+          if (!response) {
+            const queryLimit = backendRulesApplied
+              ? sourceLimit
+              : (
+                shouldFilterWhileScanning
+                  ? Math.max(sourceLimit, Math.min(DATA_QUERY_PREVIEW_MAX_ROWS_CAP, sourceLimit * 8))
+                  : sourceLimit
+              )
+            if (isProfileStoreNode) {
+              const profileStoreScanLimit = backendRulesApplied
+                ? Math.max(
+                  Math.max(sourceLimit, 10000),
+                  Math.min(DATA_QUERY_PREVIEW_MAX_ROWS_CAP, sourceLimit * 60),
+                )
+                : sourceLimit
+              response = await api.runTabularQuery({
+                source_type: 'profile_store',
+                pipeline_id: pipelineId,
+                profile_node_id: normalizedSourceId,
+                profile_node_config: sourceConfig,
+                profile_store_scan_limit: profileStoreScanLimit,
+                limit: queryLimit,
+                profile_query_config: backendFilterConfig || undefined,
+                profile_query_filter_only: backendRulesApplied,
+              })
+            } else {
+              response = await api.runTabularQuery({
+                source_type: 'pipeline',
+                pipeline_id: pipelineId,
+                pipeline_node_id: normalizedSourceId,
+                strict_node_output: true,
+                limit: queryLimit,
+                profile_query_config: backendFilterConfig || undefined,
+                profile_query_filter_only: backendRulesApplied,
+              })
+            }
+          }
+        } catch (err: any) {
+          strictErr = extractErrorDetail(err)
+          lastErr = strictErr || String(err?.message || '')
+          // Relax strict mode as a fallback so full preview still works when
+          // latest execution doesn't have a strict row sample for this node.
+          try {
+            const queryLimit = backendRulesApplied
+              ? sourceLimit
+              : (
+                shouldFilterWhileScanning
+                  ? Math.max(sourceLimit, Math.min(DATA_QUERY_PREVIEW_MAX_ROWS_CAP, sourceLimit * 8))
+                  : sourceLimit
+              )
+            if (isProfileStoreNode) {
+              const profileStoreScanLimit = backendRulesApplied
+                ? Math.max(
+                  Math.max(sourceLimit, 10000),
+                  Math.min(DATA_QUERY_PREVIEW_MAX_ROWS_CAP, sourceLimit * 60),
+                )
+                : sourceLimit
+              response = await api.runTabularQuery({
+                source_type: 'profile_store',
+                pipeline_id: pipelineId,
+                profile_node_id: normalizedSourceId,
+                profile_node_config: sourceConfig,
+                profile_store_scan_limit: profileStoreScanLimit,
+                limit: queryLimit,
+                profile_query_config: backendFilterConfig || undefined,
+                profile_query_filter_only: backendRulesApplied,
+              })
+            } else {
+              response = await api.runTabularQuery({
+                source_type: 'pipeline',
+                pipeline_id: pipelineId,
+                pipeline_node_id: normalizedSourceId,
+                strict_node_output: false,
+                limit: queryLimit,
+                profile_query_config: backendFilterConfig || undefined,
+                profile_query_filter_only: backendRulesApplied,
+              })
+            }
+          } catch (fallbackErr: any) {
+            const fallbackDetail = extractErrorDetail(fallbackErr)
+            lastErr = fallbackDetail || strictErr || String(fallbackErr?.message || '')
+            try {
+              const sourceRows = await runSourceScanFallback(sourceLimit)
+              if (sourceRows.length > 0) {
+                response = { data: sourceRows }
+              } else {
+                response = { data: [] }
+              }
+            } catch (sourceErr: any) {
+              const sourceDetail = extractErrorDetail(sourceErr)
+              lastErr = sourceDetail || lastErr
+              perSourceErrors.push(`${sourceLabel}: ${lastErr || 'failed to fetch rows'}`)
+              continue
+            }
+          }
+        }
+
+        let rows = Array.isArray(response?.data)
+          ? response.data.filter((row: unknown) => !!row && typeof row === 'object' && !Array.isArray(row)) as Array<Record<string, unknown>>
+          : []
+
+        // If execution history is summarized, backend may return a single
+        // wrapper row like { kind: "summary_only_object", rows, sample_rows, data }.
+        // Full preview must avoid using this sampled wrapper and source-scan instead.
+        const summaryWrapper = rows.find((row) => {
+          const kind = String((row as Record<string, unknown>)?.kind || '').trim().toLowerCase()
+          return kind === 'summary_only_object' || kind === 'summary_only_rows'
+        }) as Record<string, unknown> | undefined
+        if (summaryWrapper) {
+          try {
+            const sourceRows = await runSourceScanFallback(sourceLimit)
+            if (sourceRows.length > 0) {
+              rows = sourceRows
+            } else {
+              const wrapped = Array.isArray(summaryWrapper.data)
+                ? summaryWrapper.data.filter((r: unknown) => !!r && typeof r === 'object' && !Array.isArray(r)) as Array<Record<string, unknown>>
+                : []
+              rows = wrapped
+            }
+          } catch {
+            const wrapped = Array.isArray(summaryWrapper.data)
+              ? summaryWrapper.data.filter((r: unknown) => !!r && typeof r === 'object' && !Array.isArray(r)) as Array<Record<string, unknown>>
+              : []
+            rows = wrapped
+          }
+        }
+
+        for (const row of rows) {
+          if (merged.length >= safeMaxRows) break
+          if (!backendRulesApplied && !rowMatchesScanCriteria(row)) continue
+          const sig = computeRowSignature(row)
+          if (sig && seen.has(sig)) continue
+          if (sig) seen.add(sig)
+          merged.push(row)
+        }
+      }
+      if (merged.length <= 0) {
+        const msg = perSourceErrors.length > 0
+          ? `Full preview failed for connected source node(s): ${perSourceErrors.slice(0, 3).join(' | ')}`
+          : (lastErr || 'No rows available from full preview source scan.')
+        setDataQueryFullPreviewError(msg)
+      } else {
+        setDataQueryFullPreviewError(null)
+      }
+      setDataQueryFullPreviewRows(merged)
+      return merged
+    } finally {
+      setDataQueryFullPreviewLoading(false)
+    }
+  }, [
+    dataQueryStudioOpen,
+    nodeType,
+    selectedNodeId,
+    activePipelineId,
+    dataQueryUpstreamCandidateNodes,
+    dataQueryDirectSourceNodeIds,
+    dataQueryFieldOptionsBySource,
+    dataQueryCriteriaDraft,
+    dataQueryMatchModeDraft,
+    dataQuerySelectFieldsDraft,
+    dataQueryPreviewMaxRowsDraft,
+    evaluateDataQueryRuleMatch,
+    nodeConfig.case_sensitive,
+  ])
+
+  const runDataQueryPreview = useCallback(async () => {
+    if (dataQueryPreviewSourceModeDraft === 'full') {
+      const fullRows = await loadDataQueryFullPreviewRows()
+      // In full mode, never silently fall back to sample rows.
+      runDataQueryPreviewLocal(fullRows)
+      return
+    }
+    runDataQueryPreviewLocal()
+  }, [
+    dataQueryPreviewSourceModeDraft,
+    loadDataQueryFullPreviewRows,
+    runDataQueryPreviewLocal,
+  ])
+
   const saveDataQueryStudioConfig = useCallback(() => {
     if (!selectedNodeId) return
     const normalizedCriteria = (dataQueryCriteriaDraft || [])
@@ -12760,6 +13434,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       include_original_row: Boolean(dataQueryIncludeOriginalRowDraft),
       offset: safeOffset,
       limit: safeLimit,
+      preview_source_mode: dataQueryPreviewSourceModeDraft,
+      preview_max_rows: Number.isFinite(dataQueryPreviewMaxRowsDraft)
+        ? Math.max(1, Math.min(Math.trunc(dataQueryPreviewMaxRowsDraft), DATA_QUERY_PREVIEW_MAX_ROWS_CAP))
+        : DATA_QUERY_PREVIEW_MAX_ROWS_DEFAULT,
       profile_patch_enabled: Boolean(dataQueryProfilePatchEnabledDraft),
       profile_patch_reflect_output: Boolean(dataQueryProfilePatchReflectOutputDraft),
       profile_patch_stage: dataQueryProfilePatchStageDraft,
@@ -12795,6 +13473,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     dataQueryIncludeOriginalRowDraft,
     dataQueryOffsetDraft,
     dataQueryLimitDraft,
+    dataQueryPreviewSourceModeDraft,
+    dataQueryPreviewMaxRowsDraft,
     dataQueryProfilePatchEnabledDraft,
     dataQueryProfilePatchReflectOutputDraft,
     dataQueryProfilePatchStageDraft,
@@ -12831,6 +13511,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const includeOriginal = dataQueryIncludeOriginalConfigured
     const offset = dataQueryOffsetConfigured
     const limit = dataQueryLimitConfigured
+    const previewSourceMode = dataQueryPreviewSourceModeConfigured
+    const previewMaxRows = dataQueryPreviewMaxRowsConfigured
     const profilePatchEnabled = dataQueryProfilePatchEnabledConfigured
     const profilePatchReflectOutput = dataQueryProfilePatchReflectOutputConfigured
     const profilePatchStage = dataQueryProfilePatchStageConfigured
@@ -12856,6 +13538,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setDataQueryIncludeOriginalRowDraft(includeOriginal)
     setDataQueryOffsetDraft(offset)
     setDataQueryLimitDraft(limit)
+    setDataQueryPreviewSourceModeDraft(previewSourceMode)
+    setDataQueryPreviewMaxRowsDraft(previewMaxRows)
+    setDataQueryFullPreviewRows([])
+    setDataQueryFullPreviewError(null)
+    setDataQueryFullPreviewLoading(false)
     setDataQueryProfilePatchEnabledDraft(profilePatchEnabled)
     setDataQueryProfilePatchReflectOutputDraft(profilePatchReflectOutput)
     setDataQueryProfilePatchStageDraft(profilePatchStage)
@@ -12901,6 +13588,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       include_original_row: includeOriginal,
       offset,
       limit,
+      preview_source_mode: previewSourceMode,
+      preview_max_rows: previewMaxRows,
       profile_patch_enabled: profilePatchEnabled,
       profile_patch_reflect_output: profilePatchReflectOutput,
       profile_patch_stage: profilePatchStage,
@@ -12930,6 +13619,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     dataQueryIncludeOriginalConfigured,
     dataQueryOffsetConfigured,
     dataQueryLimitConfigured,
+    dataQueryPreviewSourceModeConfigured,
+    dataQueryPreviewMaxRowsConfigured,
     dataQueryProfilePatchEnabledConfigured,
     dataQueryProfilePatchReflectOutputConfigured,
     dataQueryProfilePatchStageConfigured,
@@ -13462,10 +14153,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage2LabelFieldDraft,
   ])
 
-  const runMLOpsStage3Test = useCallback(async () => {
-    if (nodeType !== 'mlops_transform' || !selectedNodeId) return
-
-    const rowsForTraining = (
+  const resolveMLOpsTrainingRows = useCallback(async (): Promise<Array<Record<string, unknown>>> => {
+    const fallbackRows = (
       mlopsStage2PreviewRows.length > 0
         ? mlopsStage2PreviewRows
         : mlopsPreviewRows
@@ -13473,11 +14162,58 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       .slice(0, 50000)
       .filter((row) => row && typeof row === 'object') as Array<Record<string, unknown>>
 
-    if (rowsForTraining.length <= 0) {
-      setMLOpsStage3RunError('No rows available for training test. Connect Data Query output and run pipeline once.')
-      setMLOpsStage3RunSummary(null)
-      return
+    if (nodeType !== 'mlops_transform' || !selectedNodeId) return fallbackRows
+
+    const pipelineId = String(activePipelineId || '').trim()
+    const preferredSourceIds = (
+      mlopsDataQuerySourceNodeIds.length > 0
+        ? mlopsDataQuerySourceNodeIds
+        : mlopsPreferredSourceNodeIds
+    )
+      .map((id) => String(id || '').trim())
+      .filter(Boolean)
+    if (!pipelineId || preferredSourceIds.length <= 0) return fallbackRows
+
+    const merged: Array<Record<string, unknown>> = []
+    const hardCap = 500000
+    for (const sourceNodeId of preferredSourceIds) {
+      if (merged.length >= hardCap) break
+      let response: {
+        data?: Array<Record<string, unknown>>
+      } | null = null
+      try {
+        response = await api.runTabularQuery({
+          source_type: 'pipeline',
+          pipeline_id: pipelineId,
+          pipeline_node_id: sourceNodeId,
+          strict_node_output: true,
+          limit: 0,
+        })
+      } catch {
+        continue
+      }
+      const rows = Array.isArray(response?.data)
+        ? response.data.filter((row: unknown) => !!row && typeof row === 'object' && !Array.isArray(row)) as Array<Record<string, unknown>>
+        : []
+      for (const row of rows) {
+        merged.push(row)
+        if (merged.length >= hardCap) break
+      }
     }
+
+    return merged.length > 0 ? merged : fallbackRows
+  }, [
+    nodeType,
+    selectedNodeId,
+    activePipelineId,
+    mlopsDataQuerySourceNodeIds,
+    mlopsPreferredSourceNodeIds,
+    mlopsPreviewRows,
+    mlopsStage2PreviewRows,
+  ])
+
+  const runMLOpsStage3Test = useCallback(async () => {
+    if (nodeType !== 'mlops_transform' || !selectedNodeId) return
 
     const taskType = mlopsStage3TaskTypeDraft
     const featureFields = uniqueFieldNames(
@@ -13510,6 +14246,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setMLOpsStage3RunLoading(true)
     setMLOpsStage3RunError(null)
     try {
+      const rowsForTraining = await resolveMLOpsTrainingRows()
+      if (rowsForTraining.length <= 0) {
+        setMLOpsStage3RunError('No rows available for training test. Connect Data Query output and run pipeline once.')
+        setMLOpsStage3RunSummary(null)
+        return
+      }
+
       const response = await api.getMLOpsNodeStage3Train({
         rows: rowsForTraining,
         task_type: taskType,
@@ -13630,8 +14373,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   }, [
     nodeType,
     selectedNodeId,
-    mlopsPreviewRows,
-    mlopsStage2PreviewRows,
+    resolveMLOpsTrainingRows,
     mlopsStage3SelectedFeatureFields,
     mlopsStage3AvailableFields,
     mlopsStage3TaskTypeDraft,
@@ -13664,19 +14406,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
   const runMLOpsStage4Deploy = useCallback(async () => {
     if (nodeType !== 'mlops_transform' || !selectedNodeId) return
-    const rowsForStage4 = (
-      mlopsStage2PreviewRows.length > 0
-        ? mlopsStage2PreviewRows
-        : mlopsPreviewRows
-    )
-      .slice(0, 50000)
-      .filter((row) => row && typeof row === 'object') as Array<Record<string, unknown>>
-
-    if (rowsForStage4.length <= 0) {
-      setMLOpsStage4RunError('No rows available for Stage 4. Connect Data Query output and run pipeline once.')
-      setMLOpsStage4Summary(null)
-      return
-    }
     if (!mlopsStage3RunSummary) {
       setMLOpsStage4RunError('Run Stage 3 training first. Stage 4 uses Stage 3 metrics for gate/deploy checks.')
       setMLOpsStage4Summary(null)
@@ -13686,6 +14415,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setMLOpsStage4RunLoading(true)
     setMLOpsStage4RunError(null)
     try {
+      const rowsForStage4 = await resolveMLOpsTrainingRows()
+      if (rowsForStage4.length <= 0) {
+        setMLOpsStage4RunError('No rows available for Stage 4. Connect Data Query output and run pipeline once.')
+        setMLOpsStage4Summary(null)
+        return
+      }
+
       const response = await api.getMLOpsNodeStage4Deploy({
         rows: rowsForStage4,
         stage3_summary: mlopsStage3RunSummary as unknown as Record<string, unknown>,
@@ -13763,8 +14499,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   }, [
     nodeType,
     selectedNodeId,
-    mlopsStage2PreviewRows,
-    mlopsPreviewRows,
+    resolveMLOpsTrainingRows,
     mlopsStage3RunSummary,
     mlopsProfileResult,
     mlopsStage3TaskTypeDraft,
@@ -21510,6 +22245,38 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             ]}
             style={{ minWidth: 128 }}
           />
+          <Select
+            size="small"
+            value={dataQueryPreviewSourceModeDraft}
+            onChange={(value) => {
+              const mode = String(value || '').trim().toLowerCase()
+              setDataQueryPreviewSourceModeDraft(mode === 'full' ? 'full' : 'sample')
+              if (mode !== 'full') {
+                setDataQueryFullPreviewError(null)
+              }
+            }}
+            options={[
+              { value: 'sample', label: 'Preview: Sample' },
+              { value: 'full', label: 'Preview: Full Dataset' },
+            ]}
+            style={{ minWidth: 170 }}
+          />
+          {dataQueryPreviewSourceModeDraft === 'full' ? (
+            <InputNumber
+              min={1}
+              max={DATA_QUERY_PREVIEW_MAX_ROWS_CAP}
+              value={dataQueryPreviewMaxRowsDraft}
+              onChange={(value) => {
+                const next = Number(value || DATA_QUERY_PREVIEW_MAX_ROWS_DEFAULT)
+                setDataQueryPreviewMaxRowsDraft(
+                  Number.isFinite(next)
+                    ? Math.max(1, Math.min(Math.trunc(next), DATA_QUERY_PREVIEW_MAX_ROWS_CAP))
+                    : DATA_QUERY_PREVIEW_MAX_ROWS_DEFAULT,
+                )
+              }}
+              style={{ width: 150 }}
+            />
+          ) : null}
           <Space size={6}>
             <Switch
               size="small"
@@ -21518,7 +22285,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             />
             <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Compact</Text>
           </Space>
-          <Button onClick={runDataQueryPreview}>Run Preview</Button>
+          <Button
+            loading={dataQueryFullPreviewLoading}
+            onClick={() => { void runDataQueryPreview() }}
+          >
+            {dataQueryPreviewSourceModeDraft === 'full' ? 'Run Full Preview' : 'Run Preview'}
+          </Button>
           <Button type="primary" icon={<SaveOutlined />} onClick={saveDataQueryStudioConfig}>
             Save
           </Button>
@@ -21558,15 +22330,63 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               </Text>
             </>
           ) : null}
+          {dataQueryFullPreviewError ? (
+            <>
+              <br />
+              <Text style={{ color: '#ef4444', fontSize: 11 }}>
+                {dataQueryFullPreviewError}
+              </Text>
+            </>
+          ) : null}
           <br />
           <Space size={6} wrap style={{ marginTop: 6 }}>
             <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9' }}>
               fields: {dataQueryFieldOptions.length}
             </Tag>
             <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e' }}>
-              sample rows: {dataQueryPreviewRows.length}
+              {dataQueryPreviewSourceModeDraft === 'full' ? 'preview rows' : 'sample rows'}: {dataQueryPreviewRows.length}
+            </Tag>
+            <Tag style={{ background: '#a855f714', border: '1px solid #a855f730', color: '#a855f7' }}>
+              connected lmdb/profile nodes: {dataQueryProfilePatchCandidateNodes.length}
             </Tag>
           </Space>
+
+          {dataQueryProfilePatchCandidateNodes.length > 0 ? (
+            <div style={{ marginTop: 8, display: 'grid', gap: 6 }}>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                Connected LMDB/Profile nodes ({dataQueryProfilePatchCandidateNodes.length})
+              </Text>
+              <div
+                style={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: 6,
+                  maxHeight: 116,
+                  overflowY: 'auto',
+                  paddingRight: 2,
+                }}
+              >
+                {dataQueryProfilePatchCandidateNodes.map((item) => {
+                  const nodeId = String(item.id || '').trim()
+                  const shortId = nodeId ? nodeId.slice(0, 8) : ''
+                  const nodeKind = String(item.nodeType || '').trim().toLowerCase() === 'lmdb_source' ? 'lmdb' : 'profile'
+                  return (
+                    <Tag
+                      key={`dq_profile_node_hint_${item.id}`}
+                      style={{
+                        marginInlineEnd: 0,
+                        background: '#22c55e14',
+                        border: '1px solid #22c55e30',
+                        color: '#22c55e',
+                      }}
+                    >
+                      {item.label} [{nodeKind} • upstream • {shortId}]
+                    </Tag>
+                  )
+                })}
+              </div>
+            </div>
+          ) : null}
 
           <Divider style={{ borderColor: 'var(--app-border)', margin: '12px 0' }} />
           <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Input Field Picker</Text>
@@ -22358,7 +23178,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         >
           <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Validation Output</Text>
           <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
-            Preview runs against upstream sample rows only.
+            {dataQueryPreviewSourceModeDraft === 'full'
+              ? `Preview runs against upstream full dataset rows (capped at ${Math.max(1, Math.min(Math.trunc(Number(dataQueryPreviewMaxRowsDraft || DATA_QUERY_PREVIEW_MAX_ROWS_DEFAULT)), DATA_QUERY_PREVIEW_MAX_ROWS_CAP)).toLocaleString()}).`
+              : 'Preview runs against upstream sample rows only.'}
           </Text>
 
           <Space size={8} style={{ width: '100%', justifyContent: 'space-between' }}>
@@ -22416,7 +23238,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             </div>
             <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: dataQueryCompactView ? 6 : 8, background: 'var(--app-card-bg)' }}>
               <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
-                Input sample ({Math.min(5, dataQueryPreviewRows.length)} rows)
+                {dataQueryPreviewSourceModeDraft === 'full' ? 'Input rows' : 'Input sample'} ({Math.min(5, dataQueryPreviewRows.length)} rows)
               </Text>
               <Input.TextArea
                 readOnly
@@ -24310,7 +25132,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           mode="multiple"
                           size="small"
                           value={mlopsStage4SelectedMonitorFields}
-                          options={mlopsStage4MonitorFieldOptions.map((field) => ({ value: field, label: field }))}
+                          options={mlopsStage4MonitorFieldOptions}
                           onChange={(values) => {
                             const selected = uniqueFieldNames((values || []).map((item) => String(item || '').trim()))
                             setMLOpsStage4MonitorNumericFieldsDraft(selected)

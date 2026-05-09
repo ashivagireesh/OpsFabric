@@ -526,22 +526,34 @@ export const ETLNode = memo(({ id, data, selected }: ETLNodeProps) => {
 
           <div
             style={{
-              width: 44,
-              height: 44,
-              borderRadius: 7,
+              width: '90%',
+              height: '90%',
+              borderRadius: 10,
               border: `1px solid ${accentColor}25`,
               background: bgColor,
+              padding: '5%',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
-              fontSize: isConditionNode ? 30 : 24,
               color: 'inherit',
               fontFamily: 'system-ui',
               position: 'relative',
               overflow: 'hidden',
             }}
           >
-            {icon}
+            <div
+              style={{
+                width: '100%',
+                height: '100%',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                fontSize: isConditionNode ? 52 : 48,
+                lineHeight: 1,
+              }}
+            >
+              {icon}
+            </div>
           </div>
 
           {status === 'success' && (
@@ -857,14 +869,27 @@ export const ETLNode = memo(({ id, data, selected }: ETLNodeProps) => {
               : bgColor,
             border: isNinStyle ? '1px solid #dbe2ea' : `1px solid ${accentColor}25`,
             borderRadius: 7,
+            padding: '5%',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
-            fontSize: isConditionNode ? 30 : 24, flexShrink: 0,
+            flexShrink: 0,
             color: 'inherit',
             fontFamily: 'system-ui',
             position: 'relative',
             overflow: 'hidden',
           }}>
-            {icon}
+            <div
+              style={{
+                width: '100%',
+                height: '100%',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                fontSize: isConditionNode ? 34 : 30,
+                lineHeight: 1,
+              }}
+            >
+              {icon}
+            </div>
           </div>
           {/* Label + status */}
           <div style={{ flex: 1, minWidth: 0 }}>
