@@ -393,7 +393,7 @@ const api = {
   validateConditionFlow: async (payload: {
     condition_config: Record<string, unknown>
     rows?: Array<Record<string, unknown>>
-    validation_source?: 'upstream_preview' | 'profile_store' | 'source_scan' | 'rows'
+    validation_source?: 'upstream_preview' | 'profile_store' | 'source_scan' | 'data_query_output' | 'rows'
     max_rows?: number
     sample_rows?: number
     pipeline_id?: string
@@ -401,9 +401,99 @@ const api = {
     profile_node_config?: Record<string, unknown>
     source_node_type?: string
     source_node_config?: Record<string, unknown>
+    data_query_node_id?: string
+    data_query_node_config?: Record<string, unknown>
   }) => {
     const r = await http.post('/api/condition/validate', payload)
     return r.data
+  },
+
+  getMLOpsNodeStage1Profile: async (payload: {
+    rows: Array<Record<string, unknown>>
+    sample_size?: number
+    preview_rows?: number
+    max_chart_columns?: number
+    include_ydata?: boolean
+    chart_types?: string[]
+    chart_theme?: 'auto' | 'light' | 'dark'
+  }) => {
+    const r = await http.post('/api/mlops/node/stage1/profile', payload, {
+      timeout: 120000,
+    })
+    return r.data
+  },
+
+  getMLOpsNodeStage3Train: async (payload: {
+    rows: Array<Record<string, unknown>>
+    task_type: 'classification' | 'regression' | 'clustering' | 'forecasting' | 'anomaly_detection'
+    model?: string
+    feature_fields?: string[]
+    target_field?: string
+    target_fields?: string[]
+    forecast_date_field?: string
+    forecast_horizon?: number
+    forecast_frequency?: 'D' | 'W' | 'M' | string
+    arima_order?: number[]
+    sarima_seasonal_order?: number[]
+    forecast_auto_tune_orders?: boolean
+    forecast_order_search_max_evals?: number
+    train_test_split?: number
+    cv_folds?: number
+    epochs?: number
+    batch_size?: number
+    random_seed?: number
+    tuning_enabled?: boolean
+    tuning_method?: 'grid_search' | 'random_search' | 'bayesian_optimization'
+    tuning_params?: Array<{ name?: string; values?: string }>
+    tracking_enabled?: boolean
+    run_name?: string
+  }) => {
+    const r = await http.post('/api/mlops/node/stage3/train', payload, {
+      timeout: 180000,
+    })
+    return r.data
+  },
+
+  getMLOpsNodeStage4Deploy: async (payload: {
+    rows: Array<Record<string, unknown>>
+    stage3_summary?: Record<string, unknown> | null
+    stage1_profile?: Record<string, unknown> | null
+    task_type?: 'classification' | 'regression' | 'clustering' | 'forecasting' | 'anomaly_detection'
+    model?: string
+    feature_fields?: string[]
+    target_field?: string
+    gate_enabled?: boolean
+    min_accuracy?: number | null
+    min_f1_score?: number | null
+    max_rmse?: number | null
+    max_mae?: number | null
+    min_r2?: number | null
+    min_silhouette_score?: number | null
+    max_anomaly_ratio?: number | null
+    max_avg_drift_score?: number | null
+    deploy_enabled?: boolean
+    deployment_environment?: 'dev' | 'staging' | 'prod' | string
+    endpoint_name?: string
+    model_version?: string
+    monitor_enabled?: boolean
+    monitor_sample_size?: number
+    monitor_numeric_fields?: string[]
+  }) => {
+    const r = await http.post('/api/mlops/node/stage4/deploy', payload, {
+      timeout: 180000,
+    })
+    return r.data
+  },
+
+  runTabularQuery: async (payload: Record<string, unknown>) => {
+    const r = await http.post('/api/query', payload, {
+      timeout: 120000,
+    })
+    return r.data as {
+      data?: Array<Record<string, unknown>>
+      columns?: string[]
+      row_count?: number
+    }
   },
 
   uploadLmdbEnv: async (files: File[]) => {

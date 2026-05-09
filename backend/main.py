@@ -13,6 +13,8 @@ import html as _html
 import re
 import math
 import base64
+import gzip
+import pickle
 import smtplib
 import ssl
 import sqlite3 as _sqlite3
@@ -1968,6 +1970,71 @@ class MLOpsFeatureProfileRequest(BaseModel):
     node_id: Optional[str] = None
     sample_size: int = 2000
 
+
+class MLOpsNodeStage1ProfileRequest(BaseModel):
+    rows: List[Dict[str, Any]] = Field(default_factory=list)
+    sample_size: int = 2000
+    preview_rows: int = 25
+    max_chart_columns: int = 6
+    include_ydata: bool = True
+    chart_types: List[str] = Field(default_factory=list)
+    chart_theme: str = "auto"
+
+
+class MLOpsNodeStage3TrainRequest(BaseModel):
+    rows: List[Dict[str, Any]] = Field(default_factory=list)
+    task_type: str = "classification"  # classification|regression|clustering|forecasting|anomaly_detection
+    model: str = ""
+    feature_fields: List[str] = Field(default_factory=list)
+    target_field: Optional[str] = None
+    target_fields: List[str] = Field(default_factory=list)
+    forecast_date_field: Optional[str] = None
+    forecast_horizon: int = 30
+    forecast_frequency: str = "D"  # D|W|M
+    arima_order: List[int] = Field(default_factory=lambda: [1, 1, 1])  # [p,d,q]
+    sarima_seasonal_order: List[int] = Field(default_factory=lambda: [1, 1, 1, 7])  # [P,D,Q,s]
+    forecast_auto_tune_orders: bool = False
+    forecast_order_search_max_evals: int = 16
+    train_test_split: float = 0.2
+    cv_folds: int = 5
+    epochs: int = 20
+    batch_size: int = 32
+    random_seed: int = 42
+    tuning_enabled: bool = False
+    tuning_method: str = "random_search"  # grid_search|random_search|bayesian_optimization
+    tuning_params: List[Dict[str, Any]] = Field(default_factory=list)
+    tracking_enabled: bool = True
+    run_name: Optional[str] = None
+
+
+class MLOpsNodeStage4DeployRequest(BaseModel):
+    rows: List[Dict[str, Any]] = Field(default_factory=list)
+    stage3_summary: Optional[Dict[str, Any]] = None
+    stage1_profile: Optional[Dict[str, Any]] = None
+    task_type: str = "classification"
+    model: str = ""
+    feature_fields: List[str] = Field(default_factory=list)
+    target_field: Optional[str] = None
+
+    gate_enabled: bool = True
+    min_accuracy: Optional[float] = 0.7
+    min_f1_score: Optional[float] = 0.65
+    max_rmse: Optional[float] = None
+    max_mae: Optional[float] = None
+    min_r2: Optional[float] = 0.0
+    min_silhouette_score: Optional[float] = 0.1
+    max_anomaly_ratio: Optional[float] = 0.25
+    max_avg_drift_score: Optional[float] = 0.35
+
+    deploy_enabled: bool = False
+    deployment_environment: str = "staging"
+    endpoint_name: Optional[str] = None
+    model_version: Optional[str] = None
+
+    monitor_enabled: bool = True
+    monitor_sample_size: int = 2000
+    monitor_numeric_fields: List[str] = Field(default_factory=list)
+
 class H2OAutoMLTrainRequest(BaseModel):
     source_type: str = "pipeline"  # pipeline | file | sample | workflow | rows | etl
     pipeline_id: Optional[str] = None
@@ -2121,7 +2188,7 @@ class CustomFieldValidationRequest(BaseModel):
 class ConditionValidationRequest(BaseModel):
     condition_config: Dict[str, Any] = Field(default_factory=dict)
     rows: List[Dict[str, Any]] = Field(default_factory=list)
-    validation_source: str = "upstream_preview"  # upstream_preview|profile_store|source_scan|rows
+    validation_source: str = "upstream_preview"  # upstream_preview|profile_store|source_scan|data_query_output|rows
     max_rows: int = 100000
     sample_rows: int = 10
     pipeline_id: Optional[str] = None
@@ -2129,6 +2196,8 @@ class ConditionValidationRequest(BaseModel):
     profile_node_config: Dict[str, Any] = Field(default_factory=dict)
     source_node_type: Optional[str] = None
     source_node_config: Dict[str, Any] = Field(default_factory=dict)
+    data_query_node_id: Optional[str] = None
+    data_query_node_config: Dict[str, Any] = Field(default_factory=dict)
 
 class CredentialCreate(BaseModel):
     name: str
@@ -2720,7 +2789,55 @@ def _mlops_infer_column_profile(rows: List[dict], sample_size: int = 2000) -> Di
     df = pd.DataFrame(sample_rows)
     cols: List[dict] = []
     recommendations: List[dict] = []
-    duplicate_rows = int(df.duplicated().sum()) if not df.empty else 0
+    duplicate_rows = 0
+    if sample_rows:
+        def _stable_row_value(value: Any) -> Any:
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            if isinstance(value, bytes):
+                try:
+                    return value.decode("utf-8", errors="replace")
+                except Exception:
+                    return str(value)
+            if isinstance(value, dict):
+                try:
+                    items = sorted(value.items(), key=lambda item: str(item[0]))
+                except Exception:
+                    items = list(value.items())
+                return {str(k): _stable_row_value(v) for k, v in items}
+            if isinstance(value, (list, tuple)):
+                return [_stable_row_value(v) for v in value]
+            if isinstance(value, set):
+                normalized = [_stable_row_value(v) for v in value]
+                try:
+                    return sorted(
+                        normalized,
+                        key=lambda item: json.dumps(item, sort_keys=True, default=str, ensure_ascii=False),
+                    )
+                except Exception:
+                    return sorted([str(v) for v in normalized])
+            try:
+                if hasattr(value, "isoformat"):
+                    return value.isoformat()
+            except Exception:
+                pass
+            return str(value)
+
+        seen_signatures: Set[str] = set()
+        duplicate_count = 0
+        for row in sample_rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                stable_row = {str(k): _stable_row_value(v) for k, v in sorted(row.items(), key=lambda item: str(item[0]))}
+                signature = json.dumps(stable_row, sort_keys=True, default=str, ensure_ascii=False)
+            except Exception:
+                signature = str(row)
+            if signature in seen_signatures:
+                duplicate_count += 1
+            else:
+                seen_signatures.add(signature)
+        duplicate_rows = int(duplicate_count)
 
     def _num(v: Any) -> Optional[float]:
         try:
@@ -2904,6 +3021,575 @@ def _mlops_infer_column_profile(rows: List[dict], sample_size: int = 2000) -> Di
         "duplicate_rows": duplicate_rows,
         "columns": cols,
         "recommendations": recommendations,
+    }
+
+
+def _mlops_stage1_profile_rows(
+    rows: List[dict],
+    sample_size: int = 2000,
+    preview_rows: int = 25,
+    max_chart_columns: int = 6,
+    include_ydata: bool = True,
+    chart_types: Optional[List[str]] = None,
+    chart_theme: str = "auto",
+) -> Dict[str, Any]:
+    import pandas as pd
+    import plotly.express as px
+
+    supported_chart_types = (
+        "histogram",
+        "box",
+        "violin",
+        "bar",
+        "pie",
+        "heatmap",
+        "scatter",
+        "line",
+        "missingness",
+    )
+    default_chart_types = (
+        "histogram",
+        "bar",
+        "heatmap",
+        "scatter",
+        "line",
+        "box",
+        "violin",
+        "pie",
+        "missingness",
+    )
+    selected_chart_types: List[str] = []
+    for item in (chart_types or []):
+        key = str(item or "").strip().lower()
+        if key in supported_chart_types and key not in selected_chart_types:
+            selected_chart_types.append(key)
+    if not selected_chart_types:
+        selected_chart_types = list(default_chart_types)
+    selected_chart_type_set = set(selected_chart_types)
+
+    normalized_chart_theme = str(chart_theme or "auto").strip().lower()
+    if normalized_chart_theme not in {"auto", "light", "dark"}:
+        normalized_chart_theme = "auto"
+    resolved_chart_theme = normalized_chart_theme
+    if resolved_chart_theme == "auto":
+        resolved_chart_theme = "light"
+    theme_is_dark = resolved_chart_theme == "dark"
+    figure_template = "plotly_dark" if theme_is_dark else "plotly_white"
+    figure_paper_bg = "#0b1220" if theme_is_dark else "#ffffff"
+    figure_plot_bg = "#111827" if theme_is_dark else "#ffffff"
+    figure_font_color = "#e5e7eb" if theme_is_dark else "#111827"
+    figure_grid_color = "#374151" if theme_is_dark else "#e5e7eb"
+    palette = ["#38bdf8", "#a78bfa", "#34d399", "#f59e0b", "#f87171"] if theme_is_dark else ["#0ea5e9", "#6366f1", "#10b981", "#f59e0b", "#ef4444"]
+
+    tabular_rows = [r for r in rows if isinstance(r, dict)]
+    if not tabular_rows:
+        return {
+            "summary": {
+                "input_rows": 0,
+                "sampled_rows": 0,
+                "column_count": 0,
+                "duplicate_rows": 0,
+                "type_counts": {"numeric": 0, "categorical": 0, "datetime": 0, "text": 0},
+                "chart_types_selected": selected_chart_types,
+                "chart_theme": resolved_chart_theme,
+            },
+            "profile": _mlops_infer_column_profile([], sample_size=sample_size),
+            "charts": [],
+            "preview_rows": [],
+            "polars": {"available": False, "reason": "No input rows"},
+            "ydata": {"enabled": bool(include_ydata), "available": False, "reason": "No input rows"},
+        }
+
+    safe_sample = max(100, min(int(sample_size or 2000), len(tabular_rows)))
+    sampled_rows = tabular_rows[:safe_sample]
+    profile = _mlops_infer_column_profile(sampled_rows, sample_size=safe_sample)
+    profile_columns = [c for c in (profile.get("columns") or []) if isinstance(c, dict)]
+
+    type_counts = {"numeric": 0, "categorical": 0, "datetime": 0, "text": 0}
+    for col in profile_columns:
+        col_type = str(col.get("type") or "text").strip().lower()
+        if col_type not in type_counts:
+            col_type = "text"
+        type_counts[col_type] += 1
+
+    polars_meta: Dict[str, Any] = {"available": False}
+    try:
+        import polars as pl  # type: ignore
+
+        pl_df = pl.DataFrame(sampled_rows)
+        estimated = None
+        try:
+            estimated = float(pl_df.estimated_size("mb"))  # type: ignore[arg-type]
+        except Exception:
+            estimated = None
+        polars_meta = {
+            "available": True,
+            "rows": int(pl_df.height),
+            "columns": int(pl_df.width),
+            "estimated_memory_mb": round(float(estimated), 4) if isinstance(estimated, (int, float)) else None,
+        }
+    except Exception as exc:
+        polars_meta = {
+            "available": False,
+            "reason": str(exc),
+        }
+
+    charts: List[Dict[str, Any]] = []
+    df = pd.DataFrame(sampled_rows)
+    df.columns = [str(c) for c in df.columns]
+    safe_max_charts = max(1, min(int(max_chart_columns or 6), 12))
+
+    def _add_chart(fig: Any, chart_id: str, title: str, kind: str) -> None:
+        if len(charts) >= safe_max_charts:
+            return
+        fig.update_layout(
+            template=figure_template,
+            margin=dict(l=26, r=16, t=42, b=28),
+            paper_bgcolor=figure_paper_bg,
+            plot_bgcolor=figure_plot_bg,
+            font=dict(size=11, color=figure_font_color),
+            xaxis=dict(gridcolor=figure_grid_color),
+            yaxis=dict(gridcolor=figure_grid_color),
+        )
+        charts.append(
+            {
+                "id": chart_id,
+                "title": title,
+                "kind": kind,
+                "figure_json": json.loads(fig.to_json()),
+            }
+        )
+
+    numeric_cols = [
+        str(col.get("name") or "")
+        for col in profile_columns
+        if str(col.get("type") or "").strip().lower() == "numeric"
+    ]
+    numeric_cols = [c for c in numeric_cols if c in df.columns]
+    categorical_cols = [
+        str(col.get("name") or "")
+        for col in profile_columns
+        if str(col.get("type") or "").strip().lower() == "categorical"
+    ]
+    categorical_cols = [c for c in categorical_cols if c in df.columns]
+    datetime_cols = [
+        str(col.get("name") or "")
+        for col in profile_columns
+        if str(col.get("type") or "").strip().lower() == "datetime"
+    ]
+    datetime_cols = [c for c in datetime_cols if c in df.columns]
+
+    if "missingness" in selected_chart_type_set and len(charts) < safe_max_charts and not df.empty:
+        missing_pct = ((df.isna().sum() / max(len(df), 1)) * 100.0).sort_values(ascending=False).head(20)
+        if not missing_pct.empty:
+            fig = px.bar(
+                x=[str(col) for col in missing_pct.index.tolist()],
+                y=[float(v) for v in missing_pct.values.tolist()],
+                labels={"x": "column", "y": "missing %"},
+                title="Missingness by column (%)",
+                color_discrete_sequence=[palette[3]],
+            )
+            _add_chart(fig, "missingness", "Missingness by column (%)", "missingness")
+
+    if "histogram" in selected_chart_type_set:
+        max_hist = min(len(numeric_cols), 4)
+        for col in numeric_cols:
+            if len(charts) >= safe_max_charts or max_hist <= 0:
+                break
+            series = pd.to_numeric(df[col], errors="coerce").dropna()
+            if len(series) < 2:
+                continue
+            fig = px.histogram(
+                series,
+                x=col,
+                nbins=35,
+                title=f"{col} distribution",
+                color_discrete_sequence=[palette[0]],
+            )
+            _add_chart(fig, f"hist_{col}", f"{col} distribution", "histogram")
+            max_hist -= 1
+
+    if "box" in selected_chart_type_set:
+        max_box = min(len(numeric_cols), 3)
+        for col in numeric_cols:
+            if len(charts) >= safe_max_charts or max_box <= 0:
+                break
+            series = pd.to_numeric(df[col], errors="coerce").dropna()
+            if len(series) < 2:
+                continue
+            fig = px.box(
+                y=series,
+                points="suspectedoutliers",
+                title=f"{col} box plot",
+                color_discrete_sequence=[palette[1]],
+            )
+            _add_chart(fig, f"box_{col}", f"{col} box plot", "box")
+            max_box -= 1
+
+    if "violin" in selected_chart_type_set:
+        max_violin = min(len(numeric_cols), 2)
+        for col in numeric_cols:
+            if len(charts) >= safe_max_charts or max_violin <= 0:
+                break
+            series = pd.to_numeric(df[col], errors="coerce").dropna()
+            if len(series) < 2:
+                continue
+            fig = px.violin(
+                y=series,
+                box=True,
+                points=False,
+                title=f"{col} violin plot",
+                color_discrete_sequence=[palette[2]],
+            )
+            _add_chart(fig, f"violin_{col}", f"{col} violin plot", "violin")
+            max_violin -= 1
+
+    if "bar" in selected_chart_type_set:
+        max_bar = min(len(categorical_cols), 5)
+        for col in categorical_cols:
+            if len(charts) >= safe_max_charts or max_bar <= 0:
+                break
+            series = df[col].astype(str)
+            top = series.value_counts(dropna=False).head(12)
+            if top.empty:
+                continue
+            fig = px.bar(
+                x=[str(x) for x in top.index.tolist()],
+                y=[int(v) for v in top.values.tolist()],
+                labels={"x": col, "y": "count"},
+                title=f"{col} top values",
+                color_discrete_sequence=[palette[1]],
+            )
+            _add_chart(fig, f"bar_{col}", f"{col} top values", "bar")
+            max_bar -= 1
+
+    if "pie" in selected_chart_type_set:
+        max_pie = min(len(categorical_cols), 2)
+        for col in categorical_cols:
+            if len(charts) >= safe_max_charts or max_pie <= 0:
+                break
+            series = df[col].astype(str)
+            top = series.value_counts(dropna=False).head(8)
+            if top.empty:
+                continue
+            fig = px.pie(
+                values=[int(v) for v in top.values.tolist()],
+                names=[str(x) for x in top.index.tolist()],
+                title=f"{col} share",
+                color_discrete_sequence=palette,
+            )
+            _add_chart(fig, f"pie_{col}", f"{col} share", "pie")
+            max_pie -= 1
+
+    if "scatter" in selected_chart_type_set and len(charts) < safe_max_charts and len(numeric_cols) >= 2:
+        x_col = numeric_cols[0]
+        y_col = numeric_cols[1]
+        scatter_df = pd.DataFrame({
+            x_col: pd.to_numeric(df[x_col], errors="coerce"),
+            y_col: pd.to_numeric(df[y_col], errors="coerce"),
+        }).dropna()
+        if len(scatter_df) >= 2:
+            fig = px.scatter(
+                scatter_df.head(5000),
+                x=x_col,
+                y=y_col,
+                title=f"{x_col} vs {y_col}",
+                color_discrete_sequence=[palette[0]],
+            )
+            _add_chart(fig, f"scatter_{x_col}_{y_col}", f"{x_col} vs {y_col}", "scatter")
+
+    if "line" in selected_chart_type_set and len(charts) < safe_max_charts and len(numeric_cols) >= 1:
+        line_fig = None
+        if datetime_cols:
+            dt_col = datetime_cols[0]
+            val_col = numeric_cols[0]
+            series_df = pd.DataFrame({
+                "_dt": pd.to_datetime(df[dt_col], errors="coerce", utc=True),
+                "_val": pd.to_numeric(df[val_col], errors="coerce"),
+            }).dropna()
+            if len(series_df) >= 2:
+                series_df["_bucket"] = series_df["_dt"].dt.floor("D")
+                agg_df = series_df.groupby("_bucket", as_index=False)["_val"].mean()
+                if len(agg_df) >= 2:
+                    line_fig = px.line(
+                        agg_df,
+                        x="_bucket",
+                        y="_val",
+                        title=f"{val_col} trend by day",
+                        markers=True,
+                        color_discrete_sequence=[palette[2]],
+                    )
+                    line_fig.update_xaxes(title_text=dt_col)
+                    line_fig.update_yaxes(title_text=f"avg({val_col})")
+        if line_fig is None:
+            val_col = numeric_cols[0]
+            val_series = pd.to_numeric(df[val_col], errors="coerce").dropna().reset_index(drop=True)
+            if len(val_series) >= 2:
+                line_df = pd.DataFrame({"row_index": list(range(len(val_series))), val_col: val_series})
+                line_fig = px.line(
+                    line_df,
+                    x="row_index",
+                    y=val_col,
+                    title=f"{val_col} trend",
+                    markers=False,
+                    color_discrete_sequence=[palette[2]],
+                )
+                line_fig.update_xaxes(title_text="sample row index")
+        if line_fig is not None:
+            _add_chart(line_fig, "line_trend", "Trend", "line")
+
+    if "heatmap" in selected_chart_type_set and len(charts) < safe_max_charts and len(numeric_cols) >= 2:
+        corr_cols = numeric_cols[: min(8, len(numeric_cols))]
+        corr_df = df[corr_cols].apply(pd.to_numeric, errors="coerce")
+        corr = corr_df.corr(numeric_only=True).fillna(0)
+        if not corr.empty:
+            fig = px.imshow(
+                corr,
+                title="Numeric correlation heatmap",
+                color_continuous_scale="RdBu_r",
+                zmin=-1,
+                zmax=1,
+                aspect="auto",
+            )
+            _add_chart(fig, "corr_heatmap", "Numeric correlation heatmap", "heatmap")
+
+    ydata_meta: Dict[str, Any] = {"enabled": bool(include_ydata), "available": False}
+    if include_ydata:
+        try:
+            from ydata_profiling import ProfileReport  # type: ignore
+
+            def _ydata_scalar(value: Any) -> Any:
+                if value is None or isinstance(value, (str, int, float, bool)):
+                    return value
+                if isinstance(value, bytes):
+                    try:
+                        return value.decode("utf-8", errors="replace")
+                    except Exception:
+                        return str(value)
+                try:
+                    if hasattr(value, "isoformat"):
+                        return value.isoformat()
+                except Exception:
+                    pass
+                if isinstance(value, dict):
+                    try:
+                        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+                    except Exception:
+                        return str(value)
+                if isinstance(value, (list, tuple, set)):
+                    try:
+                        serialized = list(value) if not isinstance(value, list) else value
+                        return json.dumps(serialized, ensure_ascii=False, default=str)
+                    except Exception:
+                        return str(value)
+                return str(value)
+
+            ydata_rows: List[dict] = []
+            for row in sampled_rows[: min(len(sampled_rows), 1500)]:
+                if not isinstance(row, dict):
+                    continue
+                clean_row: Dict[str, Any] = {}
+                for key, val in row.items():
+                    clean_row[str(key)] = _ydata_scalar(val)
+                ydata_rows.append(clean_row)
+            ydata_df = pd.DataFrame(ydata_rows)
+            report = ProfileReport(
+                ydata_df,
+                minimal=False,
+                explorative=True,
+                progress_bar=False,
+                title="MLOps Stage-1 Profile",
+                vars={"num": {"chi_squared_threshold": 0.0}},
+            )
+            desc = report.get_description()
+            table_summary: Dict[str, Any] = {}
+            try:
+                table_raw = getattr(desc, "table", {}) or {}
+                if isinstance(table_raw, dict):
+                    table_summary = {str(k): _mlops_normalize_sample_value(v) for k, v in table_raw.items()}
+                elif hasattr(table_raw, "items"):
+                    table_summary = {str(k): _mlops_normalize_sample_value(v) for k, v in table_raw.items()}  # type: ignore[call-arg]
+            except Exception:
+                table_summary = {}
+
+            alerts_preview: List[str] = []
+            try:
+                for alert in list(getattr(desc, "alerts", []) or [])[:100]:
+                    if isinstance(alert, dict):
+                        alerts_preview.append(str(alert.get("message") or alert.get("text") or alert))
+                    else:
+                        alerts_preview.append(str(alert))
+            except Exception:
+                alerts_preview = []
+
+            variables_preview: List[Dict[str, Any]] = []
+            try:
+                variables_raw = getattr(desc, "variables", {})
+                variables_map: Dict[str, Any] = {}
+                if isinstance(variables_raw, dict):
+                    variables_map = variables_raw
+                elif hasattr(variables_raw, "to_dict"):
+                    variables_map = variables_raw.to_dict(orient="index")  # type: ignore[assignment]
+                for col_name, meta in list((variables_map or {}).items())[:200]:
+                    if not isinstance(meta, dict):
+                        continue
+                    variables_preview.append(
+                        {
+                            "name": str(col_name),
+                            "type": str(meta.get("type") or meta.get("dtype") or ""),
+                            "missing_pct": _mlops_normalize_sample_value(meta.get("p_missing")),
+                            "distinct": _mlops_normalize_sample_value(meta.get("n_distinct")),
+                            "mean": _mlops_normalize_sample_value(meta.get("mean")),
+                            "std": _mlops_normalize_sample_value(meta.get("std")),
+                            "min": _mlops_normalize_sample_value(meta.get("min")),
+                            "max": _mlops_normalize_sample_value(meta.get("max")),
+                        }
+                    )
+            except Exception:
+                variables_preview = []
+
+            alerts_count = len(alerts_preview)
+            variable_count = len(variables_preview) if variables_preview else len(ydata_df.columns)
+            high_missing_columns: List[str] = []
+            constant_columns: List[str] = []
+            identifier_like_columns: List[str] = []
+            high_cardinality_columns: List[str] = []
+            low_variance_columns: List[str] = []
+            outlier_columns: List[Dict[str, Any]] = []
+            skewed_columns: List[Dict[str, Any]] = []
+            suggested_operation_frequency: Dict[str, int] = {}
+            for col in profile_columns:
+                col_name = str(col.get("name") or "")
+                missing_pct_raw = col.get("missing_pct")
+                missing_pct = float(missing_pct_raw) if isinstance(missing_pct_raw, (int, float)) else None
+                if isinstance(missing_pct, float) and missing_pct >= 20.0:
+                    high_missing_columns.append(col_name)
+                quality_flags = [str(v) for v in (col.get("quality_flags") or []) if isinstance(v, (str, int, float))]
+                if "constant_value" in quality_flags:
+                    constant_columns.append(col_name)
+                if "likely_identifier" in quality_flags:
+                    identifier_like_columns.append(col_name)
+                if "high_cardinality" in quality_flags:
+                    high_cardinality_columns.append(col_name)
+                if "low_variance" in quality_flags:
+                    low_variance_columns.append(col_name)
+                stats_obj = col.get("stats") if isinstance(col.get("stats"), dict) else {}
+                outlier_pct_raw = stats_obj.get("outlier_pct")
+                outlier_pct = float(outlier_pct_raw) if isinstance(outlier_pct_raw, (int, float)) else None
+                if isinstance(outlier_pct, float) and outlier_pct >= 1.0:
+                    outlier_columns.append({"name": col_name, "outlier_pct": round(outlier_pct, 4)})
+                skew_raw = stats_obj.get("skew")
+                skew = float(skew_raw) if isinstance(skew_raw, (int, float)) else None
+                if isinstance(skew, float) and abs(skew) >= 1.0:
+                    skewed_columns.append({"name": col_name, "skew": round(skew, 6)})
+                for op in (col.get("suggested_operations") or []):
+                    op_name = str(op or "").strip()
+                    if not op_name:
+                        continue
+                    suggested_operation_frequency[op_name] = int(suggested_operation_frequency.get(op_name, 0)) + 1
+
+            sampled_rows_count = int(len(ydata_df))
+            duplicate_rows_count = int(profile.get("duplicate_rows") or 0)
+            duplicate_ratio = float(duplicate_rows_count / sampled_rows_count) if sampled_rows_count > 0 else 0.0
+            missing_penalty = min(40.0, len(high_missing_columns) * 5.0)
+            constant_penalty = min(20.0, len(constant_columns) * 4.0)
+            duplicate_penalty = min(20.0, duplicate_ratio * 100.0)
+            identifier_penalty = min(10.0, len(identifier_like_columns) * 2.0)
+            outlier_penalty = min(10.0, len(outlier_columns) * 1.5)
+            readiness_score = max(0.0, 100.0 - (missing_penalty + constant_penalty + duplicate_penalty + identifier_penalty + outlier_penalty))
+            if readiness_score >= 80:
+                readiness_status = "READY"
+            elif readiness_score >= 60:
+                readiness_status = "NEEDS_PREPROCESSING"
+            else:
+                readiness_status = "NOT_READY"
+
+            dataset_understanding = {
+                "rows_sampled": sampled_rows_count,
+                "columns": int(variable_count),
+                "column_types": dict(type_counts),
+                "table_summary": table_summary,
+            }
+            data_quality_checks = {
+                "duplicate_rows": duplicate_rows_count,
+                "duplicate_ratio_pct": round(duplicate_ratio * 100.0, 4),
+                "high_missing_columns": high_missing_columns[:100],
+                "constant_columns": constant_columns[:100],
+                "identifier_like_columns": identifier_like_columns[:100],
+            }
+            feature_analysis = {
+                "high_cardinality_columns": high_cardinality_columns[:100],
+                "low_variance_columns": low_variance_columns[:100],
+                "variables_preview": variables_preview[:120],
+            }
+            anomaly_detection = {
+                "outlier_columns": sorted(outlier_columns, key=lambda item: float(item.get("outlier_pct") or 0), reverse=True)[:100],
+                "skewed_columns": sorted(skewed_columns, key=lambda item: abs(float(item.get("skew") or 0)), reverse=True)[:100],
+                "alerts_preview": alerts_preview[:30],
+            }
+            preprocessing_plan = []
+            for op_name, freq in sorted(suggested_operation_frequency.items(), key=lambda item: (-item[1], item[0]))[:20]:
+                preprocessing_plan.append({"operation": op_name, "column_count": int(freq)})
+            preprocessing_insights = {
+                "recommended_operations": preprocessing_plan,
+                "priority_steps": [
+                    "impute missing values for high-missing columns",
+                    "drop/handle constant and identifier-like columns",
+                    "winsorize/log-transform skewed or high-outlier numeric columns",
+                    "encode high-cardinality categoricals with frequency/target strategy",
+                ],
+            }
+            ml_readiness_analysis = {
+                "readiness_score": round(readiness_score, 2),
+                "readiness_status": readiness_status,
+                "penalties": {
+                    "missing": round(missing_penalty, 2),
+                    "constant": round(constant_penalty, 2),
+                    "duplicates": round(duplicate_penalty, 2),
+                    "identifiers": round(identifier_penalty, 2),
+                    "outliers": round(outlier_penalty, 2),
+                },
+                "next_actions": preprocessing_insights.get("priority_steps", []),
+            }
+            ydata_meta = {
+                "enabled": True,
+                "available": True,
+                "sampled_rows": int(len(ydata_df)),
+                "variable_count": int(variable_count),
+                "alerts_count": int(alerts_count),
+                "table_summary": table_summary,
+                "alerts_preview": alerts_preview[:30],
+                "variables_preview": variables_preview[:120],
+                "dataset_understanding": dataset_understanding,
+                "data_quality_checks": data_quality_checks,
+                "feature_analysis": feature_analysis,
+                "anomaly_detection": anomaly_detection,
+                "preprocessing_insights": preprocessing_insights,
+                "ml_readiness_analysis": ml_readiness_analysis,
+                "message": "YData profiling completed.",
+            }
+        except Exception as exc:
+            ydata_meta = {
+                "enabled": True,
+                "available": False,
+                "reason": str(exc),
+            }
+
+    return {
+        "summary": {
+            "input_rows": int(len(tabular_rows)),
+            "sampled_rows": int(len(sampled_rows)),
+            "column_count": int(profile.get("column_count") or 0),
+            "duplicate_rows": int(profile.get("duplicate_rows") or 0),
+            "type_counts": type_counts,
+            "chart_types_selected": selected_chart_types,
+            "chart_theme": resolved_chart_theme,
+        },
+        "profile": profile,
+        "charts": charts,
+        "preview_rows": _mlops_sanitize_sample_rows(sampled_rows, limit=max(5, min(int(preview_rows or 25), 200))),
+        "polars": polars_meta,
+        "ydata": ydata_meta,
     }
 
 
@@ -3936,6 +4622,1485 @@ def _mlops_run_real_evaluation(
     }
 
 
+def _mlops_stage3_path_tokens(path: str) -> List[Any]:
+    tokens: List[Any] = []
+    for raw_part in str(path or "").split("."):
+        part = str(raw_part or "").strip()
+        if not part:
+            continue
+        while part:
+            base_match = re.match(r"^[^\[\]]+", part)
+            if base_match:
+                base = base_match.group(0)
+                if base:
+                    tokens.append(base)
+                part = part[len(base):]
+                continue
+            if part.startswith("[]"):
+                tokens.append("*")
+                part = part[2:]
+                continue
+            if part.startswith("["):
+                end = part.find("]")
+                if end <= 0:
+                    break
+                idx_token = str(part[1:end] or "").strip()
+                if idx_token in {"", "*"}:
+                    tokens.append("*")
+                elif idx_token.isdigit():
+                    tokens.append(int(idx_token))
+                else:
+                    tokens.append(idx_token)
+                part = part[end + 1:]
+                continue
+            break
+    return tokens
+
+
+def _mlops_stage3_extract_path_values(payload: Any, path: str, max_values: int = 32) -> List[Any]:
+    if max_values <= 0:
+        return []
+    if not isinstance(path, str) or not path.strip():
+        return []
+    tokens = _mlops_stage3_path_tokens(path)
+    if not tokens:
+        if isinstance(payload, dict) and path in payload:
+            return [payload.get(path)]
+        return []
+
+    current: List[Any] = [payload]
+    for token in tokens:
+        if not current:
+            break
+        next_items: List[Any] = []
+        for item in current:
+            if token == "*":
+                if isinstance(item, list):
+                    next_items.extend(item[:max_values])
+                elif isinstance(item, tuple):
+                    next_items.extend(list(item)[:max_values])
+                continue
+            if isinstance(token, int):
+                if isinstance(item, list) and 0 <= token < len(item):
+                    next_items.append(item[token])
+                continue
+            if isinstance(item, dict):
+                if token in item:
+                    next_items.append(item.get(token))
+                else:
+                    token_lower = str(token).lower()
+                    for k, v in item.items():
+                        if str(k).lower() == token_lower:
+                            next_items.append(v)
+                            break
+            elif isinstance(item, list):
+                for child in item:
+                    if isinstance(child, dict):
+                        if token in child:
+                            next_items.append(child.get(token))
+                        else:
+                            token_lower = str(token).lower()
+                            for k, v in child.items():
+                                if str(k).lower() == token_lower:
+                                    next_items.append(v)
+                                    break
+            if len(next_items) >= max_values:
+                break
+        current = next_items[:max_values]
+    return current[:max_values]
+
+
+def _mlops_stage3_to_scalar(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Decimal):
+        try:
+            return float(value)
+        except Exception:
+            return str(value)
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="replace")
+        except Exception:
+            return str(value)
+    if isinstance(value, (datetime, date, time)):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    if isinstance(value, (dict, list, tuple, set)):
+        try:
+            return json.dumps(value, default=str, ensure_ascii=False)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _mlops_stage3_is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float) and not math.isfinite(value):
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    return False
+
+
+def _mlops_stage3_extract_first_scalar(row: Dict[str, Any], path: str) -> Any:
+    values = _mlops_stage3_extract_path_values(row, path, max_values=32)
+    for raw in values:
+        scalar = _mlops_stage3_to_scalar(raw)
+        if not _mlops_stage3_is_missing(scalar):
+            return scalar
+    if isinstance(row, dict) and path in row:
+        scalar = _mlops_stage3_to_scalar(row.get(path))
+        if not _mlops_stage3_is_missing(scalar):
+            return scalar
+    return None
+
+
+def _mlops_stage3_build_estimator(task: str, model_name: str, random_seed: int, epochs: int) -> Tuple[Any, List[str]]:
+    from sklearn.linear_model import LogisticRegression, LinearRegression, Ridge, Lasso
+    from sklearn.ensemble import (
+        RandomForestClassifier,
+        RandomForestRegressor,
+        IsolationForest,
+        GradientBoostingClassifier,
+        GradientBoostingRegressor,
+    )
+    from sklearn.svm import SVC, OneClassSVM
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
+
+    notes: List[str] = []
+    name = str(model_name or "").strip().lower()
+    resolved_task = str(task or "").strip().lower()
+
+    if resolved_task == "regression":
+        if "random forest" in name:
+            return RandomForestRegressor(n_estimators=300, random_state=random_seed, n_jobs=-1), notes
+        if "xgboost" in name:
+            try:
+                from xgboost import XGBRegressor  # type: ignore
+                return XGBRegressor(
+                    random_state=random_seed,
+                    n_estimators=300,
+                    learning_rate=0.05,
+                    max_depth=6,
+                    subsample=0.9,
+                    colsample_bytree=0.9,
+                ), notes
+            except Exception:
+                notes.append("XGBoost not available; fallback model Gradient Boosting Regressor was used.")
+                return GradientBoostingRegressor(random_state=random_seed), notes
+        if "lasso" in name:
+            return Lasso(alpha=0.001, random_state=random_seed), notes
+        if "ridge" in name:
+            return Ridge(alpha=1.0, random_state=random_seed), notes
+        return LinearRegression(), notes
+
+    if resolved_task == "classification":
+        if "random forest" in name:
+            return RandomForestClassifier(
+                n_estimators=300,
+                random_state=random_seed,
+                n_jobs=-1,
+                class_weight="balanced_subsample",
+            ), notes
+        if "xgboost" in name:
+            try:
+                from xgboost import XGBClassifier  # type: ignore
+                return XGBClassifier(
+                    random_state=random_seed,
+                    n_estimators=300,
+                    learning_rate=0.05,
+                    max_depth=6,
+                    subsample=0.9,
+                    colsample_bytree=0.9,
+                    eval_metric="logloss",
+                ), notes
+            except Exception:
+                notes.append("XGBoost not available; fallback model Gradient Boosting Classifier was used.")
+                return GradientBoostingClassifier(random_state=random_seed), notes
+        if "svm" in name:
+            return SVC(probability=True, random_state=random_seed), notes
+        if "neural" in name:
+            return MLPClassifier(
+                hidden_layer_sizes=(128, 64),
+                random_state=random_seed,
+                max_iter=max(250, int(max(1, epochs) * 15)),
+            ), notes
+        return LogisticRegression(max_iter=max(500, int(max(1, epochs) * 20)), n_jobs=None), notes
+
+    if resolved_task == "clustering":
+        if "dbscan" in name:
+            return DBSCAN(eps=0.5, min_samples=5), notes
+        if "hierarchical" in name:
+            return AgglomerativeClustering(n_clusters=2), notes
+        return KMeans(n_clusters=2, n_init="auto", random_state=random_seed), notes
+
+    if resolved_task == "anomaly_detection":
+        if "one-class" in name:
+            return OneClassSVM(nu=0.05, gamma="scale"), notes
+        if "autoencoder" in name:
+            notes.append("Autoencoders are not available in lightweight Stage 3 endpoint; fallback Isolation Forest was used.")
+        return IsolationForest(random_state=random_seed, contamination="auto", n_estimators=200), notes
+
+    notes.append("Unsupported task type; fallback classification model Logistic Regression was used.")
+    return LogisticRegression(max_iter=max(500, int(max(1, epochs) * 20))), notes
+
+
+def _mlops_stage3_parse_tuning_values(raw_values: Any) -> List[Any]:
+    text = str(raw_values or "").strip()
+    if not text:
+        return []
+    parts = [p.strip() for p in re.split(r"[,;\n]", text) if str(p or "").strip()]
+    parsed: List[Any] = []
+    for token in parts:
+        lower = token.lower()
+        if lower in {"true", "false"}:
+            parsed.append(lower == "true")
+            continue
+        if lower in {"none", "null"}:
+            parsed.append(None)
+            continue
+        try:
+            if re.fullmatch(r"[-+]?\d+", token):
+                parsed.append(int(token))
+                continue
+            if re.fullmatch(r"[-+]?\d*\.\d+", token):
+                parsed.append(float(token))
+                continue
+        except Exception:
+            pass
+        parsed.append(token)
+    out: List[Any] = []
+    seen = set()
+    for item in parsed:
+        key = json.dumps(item, default=str, ensure_ascii=False)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _mlops_stage3_to_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        num = float(value)
+        if math.isfinite(num):
+            return num
+    except Exception:
+        return None
+    return None
+
+
+def _mlops_stage3_normalize_forecast_frequency(value: Any) -> str:
+    raw = str(value or "D").strip().upper()
+    if raw in {"D", "DAY", "DAYS", "DAILY"}:
+        return "D"
+    if raw in {"W", "WK", "WEEK", "WEEKS", "WEEKLY"}:
+        return "W"
+    if raw in {"M", "MON", "MONTH", "MONTHS", "MONTHLY"}:
+        return "M"
+    return "D"
+
+
+def _mlops_stage3_parse_int_list(
+    raw_values: Any,
+    expected_len: int,
+    fallback: List[int],
+    *,
+    min_value: int = 0,
+    max_value: int = 3660,
+) -> List[int]:
+    values: List[Any] = []
+    if isinstance(raw_values, (list, tuple)):
+        values = list(raw_values)
+    elif isinstance(raw_values, str) and raw_values.strip():
+        text = raw_values.strip()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    values = parsed
+            except Exception:
+                values = []
+        if not values:
+            values = [part.strip() for part in re.split(r"[,\s;]+", text) if str(part or "").strip()]
+
+    out: List[int] = []
+    for idx in range(expected_len):
+        src = values[idx] if idx < len(values) else (fallback[idx] if idx < len(fallback) else 0)
+        try:
+            n = int(float(src))
+        except Exception:
+            n = int(fallback[idx] if idx < len(fallback) else 0)
+        n = max(min_value, min(n, max_value))
+        out.append(n)
+    return out
+
+
+def _mlops_stage3_persist_runtime_bundle(
+    *,
+    task_type: str,
+    feature_fields: List[str],
+    target_field: Optional[str],
+    predictor_kind: str,
+    model_pipeline: Any = None,
+    preprocessor: Any = None,
+    estimator: Any = None,
+    runtime_metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    try:
+        output_dir = _BACKEND_DIR / "outputs" / "mlops_runtime_models"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        artifact_id = uuid.uuid4().hex
+        artifact_path = output_dir / f"mlops_runtime_{artifact_id}.pkl.gz"
+        payload: Dict[str, Any] = {
+            "version": 1,
+            "created_at": datetime.utcnow().isoformat(),
+            "task_type": str(task_type or "").strip().lower() or "classification",
+            "feature_fields": [str(item or "").strip() for item in (feature_fields or []) if str(item or "").strip()],
+            "target_field": str(target_field or "").strip() or None,
+            "predictor_kind": str(predictor_kind or "pipeline").strip().lower() or "pipeline",
+        }
+        if isinstance(runtime_metadata, dict) and runtime_metadata:
+            try:
+                payload["runtime_metadata"] = json.loads(
+                    json.dumps(runtime_metadata, default=str, ensure_ascii=False)
+                )
+            except Exception:
+                payload["runtime_metadata"] = {
+                    str(k): str(v)
+                    for k, v in runtime_metadata.items()
+                }
+        if payload["predictor_kind"] == "components":
+            payload["preprocessor"] = preprocessor
+            payload["estimator"] = estimator
+        else:
+            payload["model_pipeline"] = model_pipeline
+
+        with gzip.open(artifact_path, "wb") as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+        return {
+            "artifact_type": "pickle_gzip_file",
+            "path": str(artifact_path),
+            "task_type": payload["task_type"],
+            "feature_fields": payload["feature_fields"],
+            "target_field": payload["target_field"],
+            "predictor_kind": payload["predictor_kind"],
+            "created_at": payload["created_at"],
+            "runtime_metadata": payload.get("runtime_metadata") or {},
+        }
+    except Exception as exc:
+        logger.warning(f"MLOps Stage 3 runtime bundle persist failed: {exc}")
+        return None
+
+
+def _mlops_stage3_train_rows(
+    rows: List[Dict[str, Any]],
+    task_type: str = "classification",
+    model_name: str = "",
+    feature_fields: Optional[List[str]] = None,
+    target_field: Optional[str] = None,
+    target_fields: Optional[List[str]] = None,
+    forecast_date_field: Optional[str] = None,
+    forecast_horizon: int = 30,
+    forecast_frequency: str = "D",
+    arima_order: Optional[List[int]] = None,
+    sarima_seasonal_order: Optional[List[int]] = None,
+    forecast_auto_tune_orders: bool = False,
+    forecast_order_search_max_evals: int = 16,
+    train_test_split_ratio: float = 0.2,
+    cv_folds: int = 5,
+    epochs: int = 20,
+    batch_size: int = 32,
+    random_seed: int = 42,
+    tuning_enabled: bool = False,
+    tuning_method: str = "random_search",
+    tuning_params: Optional[List[Dict[str, Any]]] = None,
+    tracking_enabled: bool = True,
+    run_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    import numpy as np
+    import pandas as pd
+    from sklearn.compose import ColumnTransformer
+    from sklearn.impute import SimpleImputer
+    from sklearn.metrics import (
+        accuracy_score,
+        f1_score,
+        mean_absolute_error,
+        mean_squared_error,
+        precision_score,
+        r2_score,
+        recall_score,
+        silhouette_score,
+    )
+    from sklearn.model_selection import train_test_split
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+    task = str(task_type or "classification").strip().lower()
+    if task not in {"classification", "regression", "clustering", "forecasting", "anomaly_detection"}:
+        task = "classification"
+    target_required = task in {"classification", "regression", "forecasting"}
+    target_path = str(target_field or "").strip() if target_required else ""
+
+    normalized_rows = [r for r in (rows or []) if isinstance(r, dict)]
+    if len(normalized_rows) <= 0:
+        raise HTTPException(400, "No tabular rows provided for training.")
+    if len(normalized_rows) > 50000:
+        normalized_rows = normalized_rows[:50000]
+
+    safe_seed = int(random_seed)
+    safe_test = max(0.05, min(float(train_test_split_ratio or 0.2), 0.5))
+    safe_cv = max(2, min(int(cv_folds or 5), 20))
+    safe_epochs = max(1, int(epochs or 20))
+    safe_batch_size = max(1, int(batch_size or 32))
+    notes: List[str] = []
+    if run_name:
+        notes.append(f"run_name={run_name}")
+
+    if task == "forecasting":
+        raw_targets: List[str] = []
+        if isinstance(target_fields, list):
+            raw_targets.extend([str(item or "").strip() for item in target_fields if str(item or "").strip()])
+        raw_target_field = str(target_field or "").strip()
+        if raw_target_field:
+            raw_targets.extend([part.strip() for part in raw_target_field.split(",") if part.strip()])
+        target_paths = list(dict.fromkeys([item for item in raw_targets if item]))
+        if not target_paths:
+            raise HTTPException(400, "Target field is required for forecasting.")
+        target_path = target_paths[0]
+
+        resolved_model = str(model_name or "").strip() or "ARIMA"
+        model_lower = resolved_model.lower()
+        use_sarima = "sarima" in model_lower
+        if "arima" not in model_lower and "sarima" not in model_lower:
+            notes.append("Selected forecasting model is not implemented in Stage 3. Fallback to ARIMA applied.")
+            resolved_model = "ARIMA"
+            use_sarima = False
+
+        freq_code = _mlops_stage3_normalize_forecast_frequency(forecast_frequency)
+        freq_alias = {"D": "D", "W": "W", "M": "M"}.get(freq_code, "D")
+        date_path = str(forecast_date_field or "").strip()
+        horizon = max(1, min(int(forecast_horizon or 30), 3650))
+        auto_tune_orders = bool(forecast_auto_tune_orders)
+        search_budget = max(1, min(int(forecast_order_search_max_evals or 16), 64))
+
+        base_order = tuple(_mlops_stage3_parse_int_list(arima_order, 3, [1, 1, 1], min_value=0, max_value=24))
+        seasonal_vals = _mlops_stage3_parse_int_list(
+            sarima_seasonal_order,
+            4,
+            [1, 1, 1, 7],
+            min_value=0,
+            max_value=3660,
+        )
+        if seasonal_vals[3] <= 1:
+            seasonal_vals[3] = 7 if freq_code == "D" else (52 if freq_code == "W" else 12)
+        base_seasonal_order = tuple(seasonal_vals)
+        if not use_sarima:
+            base_seasonal_order = (0, 0, 0, 0)
+
+        try:
+            from statsmodels.tsa.statespace.sarimax import SARIMAX  # type: ignore
+        except Exception as exc:
+            raise HTTPException(
+                400,
+                "ARIMA/SARIMA requires the 'statsmodels' package. "
+                "Install with: pip install statsmodels",
+            ) from exc
+
+        def _build_series_for_target(field_path: str) -> Tuple["pd.Series", int, int]:
+            extracted: List[Dict[str, Any]] = []
+            dropped_rows_local = 0
+            for row in normalized_rows:
+                y_raw = _mlops_stage3_extract_first_scalar(row, field_path)
+                y_val = _mlops_stage3_to_float(y_raw)
+                if y_val is None:
+                    dropped_rows_local += 1
+                    continue
+                dt_val = None
+                if date_path:
+                    dt_raw = _mlops_stage3_extract_first_scalar(row, date_path)
+                    if dt_raw is None:
+                        dropped_rows_local += 1
+                        continue
+                    dt_parsed = pd.to_datetime(dt_raw, errors="coerce")
+                    if pd.isna(dt_parsed):
+                        dropped_rows_local += 1
+                        continue
+                    dt_val = dt_parsed
+                extracted.append({"__target": float(y_val), "__date": dt_val})
+
+            if len(extracted) < 16:
+                raise HTTPException(
+                    400,
+                    f"Insufficient usable rows for forecasting target '{field_path}'. required>=16, got={len(extracted)}",
+                )
+
+            work_df = pd.DataFrame(extracted)
+            if date_path:
+                work_df = work_df.sort_values("__date")
+                ts_df = work_df.set_index("__date")[["__target"]]
+                ts_df = ts_df.resample(freq_alias).mean()
+                ts_df["__target"] = ts_df["__target"].interpolate(method="linear", limit_direction="both")
+                ts_df["__target"] = ts_df["__target"].ffill().bfill()
+                series_local = ts_df["__target"].astype(float)
+            else:
+                series_local = pd.Series(work_df["__target"].astype(float).tolist())
+
+            series_local = series_local.dropna()
+            if len(series_local) < 16:
+                raise HTTPException(
+                    400,
+                    f"Insufficient non-null points after ordering/resampling for target '{field_path}'. required>=16, got={len(series_local)}",
+                )
+            return series_local, len(extracted), dropped_rows_local
+
+        def _fit_sarimax(series_local: "pd.Series", order_local: Tuple[int, int, int], seasonal_local: Tuple[int, int, int, int]):
+            return SARIMAX(
+                series_local,
+                order=order_local,
+                seasonal_order=seasonal_local,
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            ).fit(disp=False)
+
+        def _candidate_orders() -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int, int]]]:
+            cand: List[Tuple[Tuple[int, int, int], Tuple[int, int, int, int]]] = []
+            p0, d0, q0 = base_order
+            P0, D0, Q0, s0 = base_seasonal_order
+            arima_neighbors = [
+                (p0, d0, q0),
+                (max(0, p0 - 1), d0, q0),
+                (p0 + 1, d0, q0),
+                (p0, d0, max(0, q0 - 1)),
+                (p0, d0, q0 + 1),
+                (max(0, p0 - 1), d0, max(0, q0 - 1)),
+                (p0 + 1, d0, q0 + 1),
+            ]
+            arima_neighbors = list(dict.fromkeys(arima_neighbors))
+            if not use_sarima:
+                for ord_item in arima_neighbors:
+                    cand.append((ord_item, (0, 0, 0, 0)))
+                return cand[:search_budget]
+
+            seasonal_neighbors = [
+                (P0, D0, Q0, s0),
+                (max(0, P0 - 1), D0, Q0, s0),
+                (P0 + 1, D0, Q0, s0),
+                (P0, D0, max(0, Q0 - 1), s0),
+                (P0, D0, Q0 + 1, s0),
+            ]
+            seasonal_neighbors = list(dict.fromkeys(seasonal_neighbors))
+            for ord_item in arima_neighbors:
+                for seas_item in seasonal_neighbors:
+                    cand.append((ord_item, seas_item))
+            dedup: List[Tuple[Tuple[int, int, int], Tuple[int, int, int, int]]] = []
+            seen = set()
+            for item in cand:
+                if item in seen:
+                    continue
+                seen.add(item)
+                dedup.append(item)
+            return dedup[:search_budget]
+
+        def _train_single_target(target_path_local: str) -> Dict[str, Any]:
+            series_local, extracted_count, dropped_rows_local = _build_series_for_target(target_path_local)
+
+            test_len_local = int(max(1, min(round(len(series_local) * safe_test), len(series_local) - 8)))
+            train_len_local = len(series_local) - test_len_local
+            if train_len_local < 8:
+                train_len_local = 8
+                test_len_local = max(1, len(series_local) - train_len_local)
+            val_len_local = int(max(1, min(round(train_len_local * 0.2), max(train_len_local - 6, 1))))
+            train_core_len_local = max(6, train_len_local - val_len_local)
+            if test_len_local <= 0 or train_core_len_local <= 0:
+                raise HTTPException(400, f"Unable to split forecasting series into train/validate/test segments for '{target_path_local}'.")
+
+            train_series_core = series_local.iloc[:train_core_len_local]
+            val_series = series_local.iloc[train_core_len_local:train_len_local]
+            train_plus_val_series = series_local.iloc[:train_len_local]
+            test_series = series_local.iloc[train_len_local:]
+
+            chosen_order = base_order
+            chosen_seasonal = base_seasonal_order
+            fit_model = None
+
+            if auto_tune_orders:
+                best_score = float("inf")
+                best_fit = None
+                for ord_candidate, seas_candidate in _candidate_orders():
+                    try:
+                        trial_fit = _fit_sarimax(train_series_core, ord_candidate, seas_candidate)
+                        trial_forecast = trial_fit.get_forecast(steps=len(val_series))
+                        pred_val = np.asarray(trial_forecast.predicted_mean, dtype=float)
+                        actual_val = np.asarray(val_series.values, dtype=float)
+                        rmse_val = float(np.sqrt(mean_squared_error(actual_val, pred_val)))
+                        if np.isfinite(rmse_val) and rmse_val < best_score:
+                            best_score = rmse_val
+                            chosen_order = ord_candidate
+                            chosen_seasonal = seas_candidate
+                            best_fit = trial_fit
+                    except Exception:
+                        continue
+                if best_fit is None:
+                    fit_model = _fit_sarimax(train_plus_val_series, chosen_order, chosen_seasonal)
+                else:
+                    fit_model = _fit_sarimax(train_plus_val_series, chosen_order, chosen_seasonal)
+            else:
+                fit_model = _fit_sarimax(train_plus_val_series, chosen_order, chosen_seasonal)
+
+            try:
+                test_forecast = fit_model.get_forecast(steps=len(test_series))
+            except Exception as exc:
+                raise HTTPException(400, f"ARIMA/SARIMA holdout forecasting failed for '{target_path_local}': {exc}") from exc
+
+            pred_test = np.asarray(test_forecast.predicted_mean, dtype=float)
+            ci_test = test_forecast.conf_int(alpha=0.05)
+            actual_test = np.asarray(test_series.values, dtype=float)
+
+            rmse = float(np.sqrt(mean_squared_error(actual_test, pred_test)))
+            mae = float(mean_absolute_error(actual_test, pred_test))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ape = np.abs((actual_test - pred_test) / np.where(np.abs(actual_test) < 1e-9, np.nan, np.abs(actual_test)))
+                mape = float(np.nanmean(ape) * 100.0) if np.isfinite(np.nanmean(ape)) else None
+
+            sample_predictions_local: List[Dict[str, Any]] = []
+            for idx in range(min(50, len(pred_test))):
+                test_index = test_series.index[idx] if hasattr(test_series, "index") else idx
+                lower_val = None
+                upper_val = None
+                if isinstance(ci_test, pd.DataFrame) and idx < len(ci_test):
+                    try:
+                        lower_val = float(ci_test.iloc[idx, 0])
+                        upper_val = float(ci_test.iloc[idx, 1])
+                    except Exception:
+                        lower_val = None
+                        upper_val = None
+                sample_predictions_local.append({
+                    "target_field": target_path_local,
+                    "segment": "test_holdout",
+                    "actual": _mlops_stage3_to_scalar(float(actual_test[idx])),
+                    "predicted": _mlops_stage3_to_scalar(float(pred_test[idx])),
+                    "lower_bound": _mlops_stage3_to_scalar(lower_val) if lower_val is not None else None,
+                    "upper_bound": _mlops_stage3_to_scalar(upper_val) if upper_val is not None else None,
+                    "timestamp": str(test_index),
+                    "step": idx + 1,
+                })
+
+            try:
+                full_fit_local = _fit_sarimax(series_local, chosen_order, chosen_seasonal)
+                future_forecast = full_fit_local.get_forecast(steps=horizon)
+                future_pred = np.asarray(future_forecast.predicted_mean, dtype=float)
+                future_ci = future_forecast.conf_int(alpha=0.05)
+            except Exception as exc:
+                raise HTTPException(400, f"ARIMA/SARIMA future forecasting failed for '{target_path_local}': {exc}") from exc
+
+            future_rows_local: List[Dict[str, Any]] = []
+            for idx in range(len(future_pred)):
+                row_obj: Dict[str, Any] = {
+                    "target_field": target_path_local,
+                    "segment": "future_forecast",
+                    "actual": None,
+                    "predicted": _mlops_stage3_to_scalar(float(future_pred[idx])),
+                    "lower_bound": None,
+                    "upper_bound": None,
+                    "step": idx + 1,
+                }
+                if isinstance(future_ci, pd.DataFrame) and idx < len(future_ci):
+                    try:
+                        row_obj["lower_bound"] = _mlops_stage3_to_scalar(float(future_ci.iloc[idx, 0]))
+                        row_obj["upper_bound"] = _mlops_stage3_to_scalar(float(future_ci.iloc[idx, 1]))
+                    except Exception:
+                        pass
+                if hasattr(future_forecast.predicted_mean, "index"):
+                    try:
+                        row_obj["forecast_date"] = str(future_forecast.predicted_mean.index[idx])
+                    except Exception:
+                        pass
+                future_rows_local.append(row_obj)
+
+            target_overview_local = {
+                "count": int(len(series_local)),
+                "min": float(series_local.min()),
+                "max": float(series_local.max()),
+                "mean": float(series_local.mean()),
+                "std": float(series_local.std(ddof=0) if len(series_local) > 1 else 0.0),
+            }
+            train_metrics_local = {
+                "rmse": round(rmse, 6),
+                "mae": round(mae, 6),
+                "mape": round(float(mape), 6) if mape is not None else None,
+            }
+            test_metrics_local = {
+                "rmse": round(rmse, 6),
+                "mae": round(mae, 6),
+                "mape": round(float(mape), 6) if mape is not None else None,
+            }
+
+            return {
+                "target_field": target_path_local,
+                "usable_rows": int(extracted_count),
+                "dropped_rows": int(max(0, dropped_rows_local)),
+                "train_rows": int(train_len_local),
+                "validate_rows": int(val_len_local),
+                "test_rows": int(test_len_local),
+                "target_overview": target_overview_local,
+                "train_metrics": train_metrics_local,
+                "test_metrics": test_metrics_local,
+                "arima_order": list(chosen_order),
+                "sarima_seasonal_order": list(chosen_seasonal),
+                "sample_predictions": sample_predictions_local + future_rows_local[: max(0, 200 - len(sample_predictions_local))],
+                "fit_model": full_fit_local,
+            }
+
+        trained_results: List[Dict[str, Any]] = []
+        model_map: Dict[str, Any] = {}
+        for target_item in target_paths:
+            trained = _train_single_target(target_item)
+            trained_results.append(trained)
+            model_map[target_item] = trained.get("fit_model")
+
+        primary = trained_results[0]
+        sample_predictions: List[Dict[str, Any]] = []
+        for result_item in trained_results:
+            for row_item in (result_item.get("sample_predictions") or []):
+                if len(sample_predictions) >= 200:
+                    break
+                if isinstance(row_item, dict):
+                    sample_predictions.append(row_item)
+            if len(sample_predictions) >= 200:
+                break
+
+        runtime_bundle = _mlops_stage3_persist_runtime_bundle(
+            task_type=task,
+            feature_fields=[date_path] if date_path else ["__step__"],
+            target_field=target_paths[0] if len(target_paths) == 1 else None,
+            predictor_kind="forecasting_multi_sarimax" if len(target_paths) > 1 else "forecasting_sarimax",
+            model_pipeline=model_map if len(target_paths) > 1 else primary.get("fit_model"),
+            runtime_metadata={
+                "target_fields": target_paths,
+                "target_field": target_paths[0] if target_paths else None,
+                "forecast_date_field": date_path or None,
+                "forecast_frequency": freq_code,
+                "forecast_horizon": int(horizon),
+                "forecast_output_mode": "append_future",
+                "uses_sarima": bool(use_sarima),
+                "auto_tune_orders": bool(auto_tune_orders),
+                "order_search_budget": int(search_budget),
+                "orders_by_target": {
+                    str(item.get("target_field") or ""): {
+                        "arima_order": item.get("arima_order"),
+                        "sarima_seasonal_order": item.get("sarima_seasonal_order"),
+                    }
+                    for item in trained_results
+                    if str(item.get("target_field") or "")
+                },
+            },
+        )
+
+        notes.extend([
+            f"Forecast frequency={freq_code}",
+            f"Horizon={horizon}",
+            f"Model={'SARIMA' if use_sarima else 'ARIMA'}",
+            f"Targets={', '.join(target_paths)}",
+            f"Auto order tuning={'ON' if auto_tune_orders else 'OFF'} budget={search_budget}",
+            "Runtime scoring bundle generated for production forecasting mode.",
+        ])
+
+        return {
+            "ran": True,
+            "executed_at": datetime.utcnow().isoformat(),
+            "mode": "real_train",
+            "task_type": "forecasting",
+            "model": "SARIMA" if use_sarima else "ARIMA",
+            "input_rows": int(len(normalized_rows)),
+            "usable_rows": int(primary.get("usable_rows") or 0),
+            "dropped_rows": int(primary.get("dropped_rows") or 0),
+            "feature_count": int(0),
+            "feature_fields": [],
+            "target_field": target_paths[0] if target_paths else None,
+            "target_fields": target_paths,
+            "multi_target": bool(len(target_paths) > 1),
+            "forecast_date_field": date_path or None,
+            "forecast_frequency": freq_code,
+            "forecast_horizon": int(horizon),
+            "auto_tune_orders": bool(auto_tune_orders),
+            "order_search_budget": int(search_budget),
+            "arima_order": primary.get("arima_order") or list(base_order),
+            "sarima_seasonal_order": primary.get("sarima_seasonal_order") or list(base_seasonal_order),
+            "train_rows": int(primary.get("train_rows") or 0),
+            "validate_rows": int(primary.get("validate_rows") or 0),
+            "test_rows": int(primary.get("test_rows") or 0),
+            "cv_folds": int(safe_cv),
+            "epochs": int(safe_epochs),
+            "batch_size": int(safe_batch_size),
+            "random_seed": int(safe_seed),
+            "tuning_enabled": False,
+            "tuning_method": None,
+            "tuning_params": [],
+            "tracking_enabled": bool(tracking_enabled),
+            "run_name": str(run_name or "").strip() or None,
+            "notes": list(dict.fromkeys(notes)),
+            "target_overview": primary.get("target_overview"),
+            "target_overview_by_target": {
+                str(item.get("target_field") or ""): item.get("target_overview")
+                for item in trained_results
+                if str(item.get("target_field") or "")
+            },
+            "train_metrics": primary.get("train_metrics"),
+            "test_metrics": primary.get("test_metrics"),
+            "train_metrics_by_target": {
+                str(item.get("target_field") or ""): item.get("train_metrics")
+                for item in trained_results
+                if str(item.get("target_field") or "")
+            },
+            "test_metrics_by_target": {
+                str(item.get("target_field") or ""): item.get("test_metrics")
+                for item in trained_results
+                if str(item.get("target_field") or "")
+            },
+            "feature_importance": [],
+            "tuning_result": {},
+            "sample_predictions": sample_predictions,
+            "runtime_model_bundle": runtime_bundle,
+        }
+
+    resolved_fields = [
+        str(item or "").strip()
+        for item in (feature_fields or [])
+        if str(item or "").strip()
+    ]
+    resolved_fields = list(dict.fromkeys(resolved_fields))
+    if not resolved_fields:
+        first_row = normalized_rows[0] if normalized_rows else {}
+        resolved_fields = [str(k) for k in list(first_row.keys())[:80] if str(k) and str(k) != target_path]
+    if target_path:
+        resolved_fields = [f for f in resolved_fields if f != target_path]
+    if not resolved_fields:
+        raise HTTPException(400, "No feature fields selected for Stage 3 training.")
+
+    projected_rows: List[Dict[str, Any]] = []
+    for row in normalized_rows:
+        record: Dict[str, Any] = {}
+        for field_path in resolved_fields:
+            record[field_path] = _mlops_stage3_extract_first_scalar(row, field_path)
+        if target_required:
+            record[target_path] = _mlops_stage3_extract_first_scalar(row, target_path)
+        projected_rows.append(record)
+
+    usable_rows: List[Dict[str, Any]] = []
+    dropped_rows = 0
+    for row in projected_rows:
+        present_features = sum(0 if _mlops_stage3_is_missing(row.get(field)) else 1 for field in resolved_fields)
+        if present_features <= 0:
+            dropped_rows += 1
+            continue
+        if target_required and _mlops_stage3_is_missing(row.get(target_path)):
+            dropped_rows += 1
+            continue
+        usable_rows.append(row)
+
+    if len(usable_rows) < 12:
+        raise HTTPException(
+            400,
+            f"Insufficient usable rows after feature/target checks. required>=12, got={len(usable_rows)}",
+        )
+
+    df = pd.DataFrame(usable_rows)
+    feature_df = df[resolved_fields].copy()
+    numeric_cols: List[str] = []
+    categorical_cols: List[str] = []
+    for col in resolved_fields:
+        series = feature_df[col]
+        numeric_series = pd.to_numeric(series, errors="coerce")
+        non_missing_count = int(series.map(lambda v: not _mlops_stage3_is_missing(v)).sum())
+        numeric_ratio = float(numeric_series.notna().sum()) / max(non_missing_count, 1)
+        if numeric_ratio >= 0.85:
+            feature_df[col] = numeric_series
+            numeric_cols.append(col)
+        else:
+            feature_df[col] = series.map(lambda v: None if _mlops_stage3_is_missing(v) else str(v))
+            categorical_cols.append(col)
+
+    if not numeric_cols and not categorical_cols:
+        raise HTTPException(400, "No usable feature columns after preprocessing.")
+
+    transformers: List[Tuple[str, Any, List[str]]] = []
+    if numeric_cols:
+        transformers.append((
+            "num",
+            Pipeline(steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+            ]),
+            numeric_cols,
+        ))
+    if categorical_cols:
+        transformers.append((
+            "cat",
+            Pipeline(steps=[
+                ("imputer", SimpleImputer(strategy="most_frequent")),
+                ("onehot", OneHotEncoder(handle_unknown="ignore")),
+            ]),
+            categorical_cols,
+        ))
+    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+
+    estimator, model_notes = _mlops_stage3_build_estimator(task, model_name, int(random_seed), int(epochs))
+    model_pipeline = Pipeline(steps=[("prep", preprocessor), ("model", estimator)])
+    notes.extend(model_notes)
+
+    target_overview: Optional[Dict[str, Any]] = None
+    train_metrics: Dict[str, Any] = {}
+    test_metrics: Dict[str, Any] = {}
+    sample_predictions: List[Dict[str, Any]] = []
+    feature_importance: List[Dict[str, Any]] = []
+    tuning_result: Dict[str, Any] = {}
+    train_rows = len(usable_rows)
+    test_rows = 0
+    runtime_model_bundle: Optional[Dict[str, Any]] = None
+
+    if task in {"classification", "regression", "forecasting"}:
+        y_series = df[target_path].copy()
+        if task in {"regression", "forecasting"}:
+            y_series = pd.to_numeric(y_series, errors="coerce")
+            keep_mask = y_series.notna()
+            feature_df = feature_df.loc[keep_mask].reset_index(drop=True)
+            y_series = y_series.loc[keep_mask].reset_index(drop=True)
+            if len(feature_df) < 12:
+                raise HTTPException(400, "Target column could not be converted to numeric for enough rows.")
+            target_overview = {
+                "count": int(len(y_series)),
+                "min": float(y_series.min()),
+                "max": float(y_series.max()),
+                "mean": float(y_series.mean()),
+                "std": float(y_series.std(ddof=0) if len(y_series) > 1 else 0.0),
+            }
+        else:
+            y_series = y_series.map(lambda v: None if _mlops_stage3_is_missing(v) else str(v))
+            keep_mask = y_series.notna()
+            feature_df = feature_df.loc[keep_mask].reset_index(drop=True)
+            y_series = y_series.loc[keep_mask].reset_index(drop=True)
+            if len(feature_df) < 12:
+                raise HTTPException(400, "Target column is missing for too many rows.")
+            counts = y_series.value_counts()
+            if len(counts.index) < 2:
+                raise HTTPException(400, "Target column requires at least 2 classes for classification.")
+            target_overview = {
+                "distinct_classes": int(len(counts.index)),
+                "class_distribution": {str(k): int(v) for k, v in counts.to_dict().items()},
+            }
+
+        stratify_arg = None
+        if task == "classification":
+            counts = y_series.value_counts()
+            if len(counts.index) >= 2 and int(counts.min()) >= 2:
+                stratify_arg = y_series
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            feature_df,
+            y_series,
+            test_size=safe_test,
+            random_state=safe_seed,
+            stratify=stratify_arg,
+        )
+        train_rows = int(len(X_train))
+        test_rows = int(len(X_test))
+
+        tuned = False
+        if bool(tuning_enabled):
+            param_grid: Dict[str, List[Any]] = {}
+            for item in (tuning_params or []):
+                if not isinstance(item, dict):
+                    continue
+                raw_name = str(item.get("name") or "").strip()
+                if not raw_name:
+                    continue
+                resolved_name = raw_name if "__" in raw_name else f"model__{raw_name}"
+                parsed_values = _mlops_stage3_parse_tuning_values(item.get("values"))
+                if parsed_values:
+                    param_grid[resolved_name] = parsed_values
+            if param_grid:
+                from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
+                search_method = str(tuning_method or "random_search").strip().lower()
+                cv_for_search = safe_cv
+                if task == "classification":
+                    class_counts = y_train.value_counts()
+                    if len(class_counts.index) > 0:
+                        cv_for_search = max(2, min(cv_for_search, int(class_counts.min())))
+                if cv_for_search >= 2:
+                    if search_method == "grid_search":
+                        search = GridSearchCV(
+                            estimator=model_pipeline,
+                            param_grid=param_grid,
+                            cv=cv_for_search,
+                            n_jobs=-1,
+                            error_score="raise",
+                        )
+                    else:
+                        if search_method == "bayesian_optimization":
+                            notes.append("Bayesian optimization is mapped to random search in this endpoint.")
+                        total_candidates = sum(max(1, len(v)) for v in param_grid.values())
+                        n_iter = max(4, min(20, total_candidates))
+                        search = RandomizedSearchCV(
+                            estimator=model_pipeline,
+                            param_distributions=param_grid,
+                            n_iter=n_iter,
+                            cv=cv_for_search,
+                            random_state=safe_seed,
+                            n_jobs=-1,
+                            error_score="raise",
+                        )
+                    search.fit(X_train, y_train)
+                    model_pipeline = search.best_estimator_
+                    tuning_result = {
+                        "enabled": True,
+                        "method": search_method,
+                        "best_params": search.best_params_,
+                        "best_score": float(search.best_score_),
+                    }
+                    tuned = True
+                else:
+                    notes.append("Hyperparameter tuning skipped due low class counts for cross-validation.")
+            else:
+                notes.append("Hyperparameter tuning enabled but no valid tuning parameters were provided.")
+
+        if not tuned:
+            model_pipeline.fit(X_train, y_train)
+
+        y_pred_train = model_pipeline.predict(X_train)
+        y_pred_test = model_pipeline.predict(X_test)
+
+        if task == "classification":
+            train_metrics = {
+                "accuracy": round(float(accuracy_score(y_train, y_pred_train)), 6),
+                "precision": round(float(precision_score(y_train, y_pred_train, average="weighted", zero_division=0)), 6),
+                "recall": round(float(recall_score(y_train, y_pred_train, average="weighted", zero_division=0)), 6),
+                "f1_score": round(float(f1_score(y_train, y_pred_train, average="weighted", zero_division=0)), 6),
+            }
+            test_metrics = {
+                "accuracy": round(float(accuracy_score(y_test, y_pred_test)), 6),
+                "precision": round(float(precision_score(y_test, y_pred_test, average="weighted", zero_division=0)), 6),
+                "recall": round(float(recall_score(y_test, y_pred_test, average="weighted", zero_division=0)), 6),
+                "f1_score": round(float(f1_score(y_test, y_pred_test, average="weighted", zero_division=0)), 6),
+            }
+        else:
+            train_rmse = float(np.sqrt(mean_squared_error(y_train, y_pred_train)))
+            test_rmse = float(np.sqrt(mean_squared_error(y_test, y_pred_test)))
+            train_metrics = {
+                "rmse": round(train_rmse, 6),
+                "mae": round(float(mean_absolute_error(y_train, y_pred_train)), 6),
+                "r2": round(float(r2_score(y_train, y_pred_train)), 6),
+            }
+            test_metrics = {
+                "rmse": round(test_rmse, 6),
+                "mae": round(float(mean_absolute_error(y_test, y_pred_test)), 6),
+                "r2": round(float(r2_score(y_test, y_pred_test)), 6),
+            }
+
+        for idx in range(min(25, len(y_test))):
+            sample_predictions.append({
+                "actual": _mlops_stage3_to_scalar(y_test.iloc[idx] if hasattr(y_test, "iloc") else y_test[idx]),
+                "predicted": _mlops_stage3_to_scalar(y_pred_test[idx]),
+            })
+
+        try:
+            feature_names = list(model_pipeline.named_steps["prep"].get_feature_names_out())
+            estimator_obj = model_pipeline.named_steps["model"]
+            raw_importance = None
+            if hasattr(estimator_obj, "feature_importances_"):
+                raw_importance = getattr(estimator_obj, "feature_importances_")
+            elif hasattr(estimator_obj, "coef_"):
+                coef = getattr(estimator_obj, "coef_")
+                if isinstance(coef, np.ndarray) and coef.ndim > 1:
+                    coef = np.mean(np.abs(coef), axis=0)
+                raw_importance = np.abs(np.array(coef, dtype=float))
+            if raw_importance is not None:
+                arr = np.array(raw_importance, dtype=float).reshape(-1)
+                total = float(np.sum(np.abs(arr))) or 1.0
+                ranked = sorted(
+                    [{"feature": str(name), "importance": round(float(abs(val) / total), 6)} for name, val in zip(feature_names, arr)],
+                    key=lambda item: item["importance"],
+                    reverse=True,
+                )
+                feature_importance = ranked[:25]
+        except Exception:
+            feature_importance = []
+
+        runtime_model_bundle = _mlops_stage3_persist_runtime_bundle(
+            task_type=task,
+            feature_fields=resolved_fields,
+            target_field=target_path or None,
+            predictor_kind="pipeline",
+            model_pipeline=model_pipeline,
+        )
+
+    elif task == "clustering":
+        transformed = preprocessor.fit_transform(feature_df)
+        labels = estimator.fit_predict(transformed)
+        unique_labels = sorted({int(v) for v in labels.tolist()})
+        cluster_counts: Dict[str, int] = {}
+        for label in labels.tolist():
+            key = str(int(label))
+            cluster_counts[key] = int(cluster_counts.get(key, 0) + 1)
+        score_value = None
+        try:
+            cluster_count_no_noise = len([v for v in unique_labels if v != -1])
+            if cluster_count_no_noise >= 2 and len(labels) > cluster_count_no_noise:
+                score_value = float(silhouette_score(transformed, labels))
+        except Exception:
+            score_value = None
+        train_metrics = {
+            "clusters": cluster_counts,
+            "silhouette_score": round(score_value, 6) if score_value is not None else None,
+        }
+        test_metrics = {}
+        target_overview = {
+            "distinct_clusters": len(unique_labels),
+            "noise_label_present": bool(-1 in unique_labels),
+        }
+        train_rows = int(len(feature_df))
+        test_rows = 0
+        for idx in range(min(25, len(labels))):
+            sample_predictions.append({
+                "cluster": int(labels[idx]),
+            })
+        runtime_model_bundle = _mlops_stage3_persist_runtime_bundle(
+            task_type=task,
+            feature_fields=resolved_fields,
+            target_field=None,
+            predictor_kind="components",
+            preprocessor=preprocessor,
+            estimator=estimator,
+        )
+
+    else:  # anomaly_detection
+        transformed = preprocessor.fit_transform(feature_df)
+        estimator.fit(transformed)
+        pred = estimator.predict(transformed)  # 1=inlier, -1=outlier
+        if hasattr(estimator, "decision_function"):
+            scores = estimator.decision_function(transformed)
+        else:
+            scores = np.zeros(len(pred))
+        anomaly_mask = pred == -1
+        anomaly_count = int(np.sum(anomaly_mask))
+        anomaly_ratio = float(anomaly_count / max(len(pred), 1))
+        train_metrics = {
+            "anomaly_count": anomaly_count,
+            "anomaly_ratio": round(anomaly_ratio, 6),
+            "inlier_count": int(len(pred) - anomaly_count),
+        }
+        test_metrics = {}
+        target_overview = None
+        train_rows = int(len(feature_df))
+        test_rows = 0
+        for idx in range(min(25, len(pred))):
+            sample_predictions.append({
+                "anomaly_flag": bool(pred[idx] == -1),
+                "score": float(scores[idx]) if len(scores) > idx else 0.0,
+            })
+        runtime_model_bundle = _mlops_stage3_persist_runtime_bundle(
+            task_type=task,
+            feature_fields=resolved_fields,
+            target_field=None,
+            predictor_kind="components",
+            preprocessor=preprocessor,
+            estimator=estimator,
+        )
+
+    summary = {
+        "ran": True,
+        "executed_at": datetime.utcnow().isoformat(),
+        "mode": "real_train",
+        "task_type": task,
+        "model": str(model_name or "").strip() or "default",
+        "input_rows": int(len(normalized_rows)),
+        "usable_rows": int(len(usable_rows)),
+        "dropped_rows": int(max(0, dropped_rows)),
+        "feature_count": int(len(resolved_fields)),
+        "feature_fields": resolved_fields,
+        "target_field": target_path or None,
+        "train_rows": int(train_rows),
+        "test_rows": int(test_rows),
+        "cv_folds": int(safe_cv),
+        "epochs": int(safe_epochs),
+        "batch_size": int(safe_batch_size),
+        "random_seed": int(safe_seed),
+        "tuning_enabled": bool(tuning_enabled),
+        "tuning_method": str(tuning_method or "").strip().lower() if bool(tuning_enabled) else None,
+        "tuning_params": [
+            {"name": str(item.get("name") or ""), "values": str(item.get("values") or "")}
+            for item in (tuning_params or [])
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ] if bool(tuning_enabled) else [],
+        "tracking_enabled": bool(tracking_enabled),
+        "run_name": str(run_name or "").strip() or None,
+        "notes": list(dict.fromkeys(notes)),
+        "target_overview": target_overview,
+        "train_metrics": train_metrics,
+        "test_metrics": test_metrics,
+        "feature_importance": feature_importance,
+        "tuning_result": tuning_result,
+        "sample_predictions": sample_predictions,
+        "runtime_model_bundle": runtime_model_bundle,
+    }
+    return summary
+
+
+def _mlops_stage4_to_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        num = float(value)
+        if math.isfinite(num):
+            return num
+    except Exception:
+        return None
+    return None
+
+
+def _mlops_stage4_extract_numeric_series(rows: List[Dict[str, Any]], field_path: str, limit: int = 5000) -> List[float]:
+    out: List[float] = []
+    safe_limit = max(1, min(int(limit or 5000), 200000))
+    for row in rows[:safe_limit]:
+        if not isinstance(row, dict):
+            continue
+        value = _mlops_stage3_extract_first_scalar(row, field_path)
+        num = _mlops_stage4_to_float(value)
+        if num is None:
+            continue
+        out.append(num)
+    return out
+
+
+def _mlops_stage4_validate_deploy_rows(
+    rows: List[Dict[str, Any]],
+    stage3_summary: Optional[Dict[str, Any]] = None,
+    stage1_profile: Optional[Dict[str, Any]] = None,
+    task_type: str = "classification",
+    model: str = "",
+    feature_fields: Optional[List[str]] = None,
+    target_field: Optional[str] = None,
+    gate_enabled: bool = True,
+    min_accuracy: Optional[float] = 0.7,
+    min_f1_score: Optional[float] = 0.65,
+    max_rmse: Optional[float] = None,
+    max_mae: Optional[float] = None,
+    min_r2: Optional[float] = 0.0,
+    min_silhouette_score: Optional[float] = 0.1,
+    max_anomaly_ratio: Optional[float] = 0.25,
+    max_avg_drift_score: Optional[float] = 0.35,
+    deploy_enabled: bool = False,
+    deployment_environment: str = "staging",
+    endpoint_name: Optional[str] = None,
+    model_version: Optional[str] = None,
+    monitor_enabled: bool = True,
+    monitor_sample_size: int = 2000,
+    monitor_numeric_fields: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    safe_rows = [row for row in (rows or []) if isinstance(row, dict)]
+    safe_stage3 = stage3_summary if isinstance(stage3_summary, dict) else {}
+    safe_stage1 = stage1_profile if isinstance(stage1_profile, dict) else {}
+    resolved_task = str(task_type or safe_stage3.get("task_type") or "classification").strip().lower()
+    if resolved_task not in {"classification", "regression", "clustering", "forecasting", "anomaly_detection"}:
+        resolved_task = "classification"
+
+    metrics_test = safe_stage3.get("test_metrics") if isinstance(safe_stage3.get("test_metrics"), dict) else {}
+    metrics_train = safe_stage3.get("train_metrics") if isinstance(safe_stage3.get("train_metrics"), dict) else {}
+    all_metrics: Dict[str, Any] = {}
+    all_metrics.update(metrics_train)
+    all_metrics.update(metrics_test)
+
+    checks: List[Dict[str, Any]] = []
+    notes: List[str] = []
+
+    def _add_gate(metric_name: str, actual: Any, threshold: Any, comparator: str) -> None:
+        actual_num = _mlops_stage4_to_float(actual)
+        threshold_num = _mlops_stage4_to_float(threshold)
+        if threshold_num is None:
+            return
+        if actual_num is None:
+            checks.append({
+                "metric": metric_name,
+                "actual": actual,
+                "threshold": threshold_num,
+                "comparator": comparator,
+                "passed": False,
+                "reason": "metric_missing",
+            })
+            return
+        if comparator == ">=":
+            passed = actual_num >= threshold_num
+        else:
+            passed = actual_num <= threshold_num
+        checks.append({
+            "metric": metric_name,
+            "actual": round(actual_num, 6),
+            "threshold": round(threshold_num, 6),
+            "comparator": comparator,
+            "passed": bool(passed),
+        })
+
+    if resolved_task == "classification":
+        _add_gate("accuracy", all_metrics.get("accuracy"), min_accuracy, ">=")
+        _add_gate("f1_score", all_metrics.get("f1_score"), min_f1_score, ">=")
+    elif resolved_task in {"regression", "forecasting"}:
+        _add_gate("rmse", all_metrics.get("rmse"), max_rmse, "<=")
+        _add_gate("mae", all_metrics.get("mae"), max_mae, "<=")
+        _add_gate("r2", all_metrics.get("r2"), min_r2, ">=")
+    elif resolved_task == "clustering":
+        _add_gate("silhouette_score", all_metrics.get("silhouette_score"), min_silhouette_score, ">=")
+    elif resolved_task == "anomaly_detection":
+        _add_gate("anomaly_ratio", all_metrics.get("anomaly_ratio"), max_anomaly_ratio, "<=")
+
+    # Stage 1 numeric baseline extraction for drift checks.
+    baseline_numeric: Dict[str, Dict[str, float]] = {}
+    stage1_columns = (
+        safe_stage1.get("profile", {}).get("columns")
+        if isinstance(safe_stage1.get("profile"), dict)
+        else None
+    )
+    if isinstance(stage1_columns, list):
+        for item in stage1_columns:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            stats = item.get("stats")
+            if not isinstance(stats, dict):
+                continue
+            mean_val = _mlops_stage4_to_float(stats.get("mean"))
+            std_val = _mlops_stage4_to_float(stats.get("std"))
+            if mean_val is None and std_val is None:
+                continue
+            baseline_numeric[name] = {
+                "mean": 0.0 if mean_val is None else float(mean_val),
+                "std": 0.0 if std_val is None else float(std_val),
+            }
+
+    monitor_rows = safe_rows[: max(10, min(int(monitor_sample_size or 2000), len(safe_rows) if safe_rows else 10))]
+    requested_monitor_fields = [
+        str(item or "").strip()
+        for item in (monitor_numeric_fields or [])
+        if str(item or "").strip()
+    ]
+    candidate_fields = requested_monitor_fields[:]
+    if not candidate_fields:
+        if baseline_numeric:
+            candidate_fields = list(baseline_numeric.keys())[:20]
+        elif isinstance(feature_fields, list):
+            candidate_fields = [str(item or "").strip() for item in feature_fields if str(item or "").strip()][:20]
+
+    drift_details: List[Dict[str, Any]] = []
+    for field_path in candidate_fields:
+        series = _mlops_stage4_extract_numeric_series(monitor_rows, field_path, limit=len(monitor_rows))
+        if not series:
+            continue
+        live_mean = float(sum(series) / max(len(series), 1))
+        if len(series) > 1:
+            variance = sum((value - live_mean) ** 2 for value in series) / max(len(series), 1)
+            live_std = float(math.sqrt(max(variance, 0.0)))
+        else:
+            live_std = 0.0
+        base = baseline_numeric.get(field_path, {})
+        base_mean = _mlops_stage4_to_float(base.get("mean")) if isinstance(base, dict) else None
+        base_std = _mlops_stage4_to_float(base.get("std")) if isinstance(base, dict) else None
+        if base_mean is None:
+            base_mean = live_mean
+        if base_std is None:
+            base_std = 0.0
+        denom = abs(float(base_std)) if abs(float(base_std)) > 1e-9 else max(abs(float(base_mean)), 1.0)
+        drift_score = abs(live_mean - float(base_mean)) / max(denom, 1e-9)
+        drift_details.append({
+            "field": field_path,
+            "sample_count": len(series),
+            "baseline_mean": round(float(base_mean), 6),
+            "baseline_std": round(float(base_std), 6),
+            "live_mean": round(float(live_mean), 6),
+            "live_std": round(float(live_std), 6),
+            "drift_score": round(float(drift_score), 6),
+        })
+
+    avg_drift = 0.0
+    if drift_details:
+        avg_drift = float(sum(float(item.get("drift_score") or 0.0) for item in drift_details) / len(drift_details))
+    _add_gate("avg_drift_score", avg_drift, max_avg_drift_score, "<=")
+
+    gate_passed = True
+    if gate_enabled:
+        for item in checks:
+            if not bool(item.get("passed")):
+                gate_passed = False
+                break
+
+    deployment_env = str(deployment_environment or "staging").strip().lower() or "staging"
+    endpoint = str(endpoint_name or "").strip() or f"mlops-{deployment_env}-endpoint"
+    version = str(model_version or "").strip() or f"v{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+
+    deployment_status = "dry_run"
+    if bool(deploy_enabled):
+        deployment_status = "ready" if gate_passed else "blocked"
+    if not gate_enabled and deploy_enabled:
+        notes.append("Gate disabled: deployment readiness is not quality-gated.")
+    if gate_enabled and not checks:
+        notes.append("No applicable gate metrics found for the selected task/model summary.")
+
+    monitor_alerts: List[str] = []
+    drift_threshold_num = _mlops_stage4_to_float(max_avg_drift_score)
+    if monitor_enabled and drift_threshold_num is not None and avg_drift > drift_threshold_num:
+        monitor_alerts.append(
+            f"Average drift score {round(avg_drift, 6)} exceeded threshold {round(float(drift_threshold_num), 6)}."
+        )
+    if monitor_enabled and not drift_details:
+        monitor_alerts.append("No numeric monitor fields produced drift stats.")
+
+    return {
+        "ran": True,
+        "executed_at": datetime.utcnow().isoformat(),
+        "task_type": resolved_task,
+        "model": str(model or safe_stage3.get("model") or "").strip() or "default",
+        "input_rows": int(len(safe_rows)),
+        "feature_fields": [str(item or "").strip() for item in (feature_fields or []) if str(item or "").strip()],
+        "target_field": str(target_field or safe_stage3.get("target_field") or "").strip() or None,
+        "gate": {
+            "enabled": bool(gate_enabled),
+            "passed": bool(gate_passed),
+            "checks": checks,
+            "failed_checks": [item for item in checks if not bool(item.get("passed"))],
+        },
+        "deployment": {
+            "enabled": bool(deploy_enabled),
+            "status": deployment_status,
+            "environment": deployment_env,
+            "endpoint_name": endpoint,
+            "model_version": version,
+            "ready_for_release": bool(gate_passed),
+        },
+        "monitoring": {
+            "enabled": bool(monitor_enabled),
+            "row_count": int(len(monitor_rows)),
+            "numeric_fields": [str(item.get("field") or "") for item in drift_details if str(item.get("field") or "")],
+            "avg_drift_score": round(avg_drift, 6),
+            "drift_details": drift_details[:40],
+            "alerts": monitor_alerts,
+        },
+        "metrics_used": {
+            "train_metrics": metrics_train,
+            "test_metrics": metrics_test,
+        },
+        "notes": list(dict.fromkeys(notes)),
+        "output_preview": _mlops_sanitize_sample_rows(safe_rows, limit=25),
+    }
+
+
 def _mlops_extract_source_from_workflow(workflow: models.MLOpsWorkflow, db: Session) -> Dict[str, Any]:
     nodes = workflow.nodes or []
     edges = workflow.edges or []
@@ -4474,6 +6639,116 @@ async def mlops_feature_profile(
         "available_operations": _mlops_feature_operation_catalog(),
         "profile": profile,
         "sample_rows": _mlops_sanitize_sample_rows(rows_for_profile, limit=25),
+    }
+
+
+@app.post("/api/mlops/node/stage1/profile")
+async def mlops_node_stage1_profile(
+    body: MLOpsNodeStage1ProfileRequest,
+):
+    safe_sample_size = max(100, min(int(body.sample_size or 2000), 20000))
+    safe_preview_rows = max(5, min(int(body.preview_rows or 25), 200))
+    safe_max_chart_columns = max(1, min(int(body.max_chart_columns or 6), 12))
+    input_rows = [r for r in (body.rows or []) if isinstance(r, dict)]
+    result = _mlops_stage1_profile_rows(
+        input_rows,
+        sample_size=safe_sample_size,
+        preview_rows=safe_preview_rows,
+        max_chart_columns=safe_max_chart_columns,
+        include_ydata=bool(body.include_ydata),
+        chart_types=list(body.chart_types or []),
+        chart_theme=str(body.chart_theme or "auto"),
+    )
+    return {
+        "status": "success",
+        "stage": "profile_analytics",
+        "engine": "python-polars-plotly",
+        "input_rows": len(input_rows),
+        **result,
+    }
+
+
+@app.post("/api/mlops/node/stage3/train")
+async def mlops_node_stage3_train(
+    body: MLOpsNodeStage3TrainRequest,
+):
+    input_rows = [r for r in (body.rows or []) if isinstance(r, dict)]
+    if len(input_rows) <= 0:
+        raise HTTPException(status_code=400, detail="No rows were provided for Stage 3 training.")
+
+    summary = _mlops_stage3_train_rows(
+        rows=input_rows,
+        task_type=str(body.task_type or "classification"),
+        model_name=str(body.model or ""),
+        feature_fields=list(body.feature_fields or []),
+        target_field=body.target_field,
+        target_fields=list(body.target_fields or []),
+        forecast_date_field=body.forecast_date_field,
+        forecast_horizon=int(body.forecast_horizon or 30),
+        forecast_frequency=str(body.forecast_frequency or "D"),
+        arima_order=list(body.arima_order or []),
+        sarima_seasonal_order=list(body.sarima_seasonal_order or []),
+        forecast_auto_tune_orders=bool(body.forecast_auto_tune_orders),
+        forecast_order_search_max_evals=int(body.forecast_order_search_max_evals or 16),
+        train_test_split_ratio=float(body.train_test_split or 0.2),
+        cv_folds=int(body.cv_folds or 5),
+        epochs=int(body.epochs or 20),
+        batch_size=int(body.batch_size or 32),
+        random_seed=int(body.random_seed or 42),
+        tuning_enabled=bool(body.tuning_enabled),
+        tuning_method=str(body.tuning_method or "random_search"),
+        tuning_params=list(body.tuning_params or []),
+        tracking_enabled=bool(body.tracking_enabled),
+        run_name=body.run_name,
+    )
+    return {
+        "status": "success",
+        "stage": "model_training",
+        "engine": "python-stage3-mlops",
+        "input_rows": len(input_rows),
+        "summary": summary,
+    }
+
+
+@app.post("/api/mlops/node/stage4/deploy")
+async def mlops_node_stage4_deploy(
+    body: MLOpsNodeStage4DeployRequest,
+):
+    input_rows = [r for r in (body.rows or []) if isinstance(r, dict)]
+    if len(input_rows) <= 0:
+        raise HTTPException(status_code=400, detail="No rows were provided for Stage 4 deploy/monitor validation.")
+
+    summary = _mlops_stage4_validate_deploy_rows(
+        rows=input_rows,
+        stage3_summary=body.stage3_summary if isinstance(body.stage3_summary, dict) else {},
+        stage1_profile=body.stage1_profile if isinstance(body.stage1_profile, dict) else {},
+        task_type=str(body.task_type or "classification"),
+        model=str(body.model or ""),
+        feature_fields=list(body.feature_fields or []),
+        target_field=body.target_field,
+        gate_enabled=bool(body.gate_enabled),
+        min_accuracy=body.min_accuracy,
+        min_f1_score=body.min_f1_score,
+        max_rmse=body.max_rmse,
+        max_mae=body.max_mae,
+        min_r2=body.min_r2,
+        min_silhouette_score=body.min_silhouette_score,
+        max_anomaly_ratio=body.max_anomaly_ratio,
+        max_avg_drift_score=body.max_avg_drift_score,
+        deploy_enabled=bool(body.deploy_enabled),
+        deployment_environment=str(body.deployment_environment or "staging"),
+        endpoint_name=body.endpoint_name,
+        model_version=body.model_version,
+        monitor_enabled=bool(body.monitor_enabled),
+        monitor_sample_size=max(50, min(int(body.monitor_sample_size or 2000), 50000)),
+        monitor_numeric_fields=list(body.monitor_numeric_fields or []),
+    )
+    return {
+        "status": "success",
+        "stage": "deploy_monitor",
+        "engine": "python-mlops-stage4",
+        "input_rows": len(input_rows),
+        "summary": summary,
     }
 
 
@@ -11813,6 +14088,8 @@ def _normalize_condition_validation_source(value: Any) -> str:
     text = str(value or "upstream_preview").strip().lower()
     if text in {"rows", "sample", "upstream_preview", "preview"}:
         return "upstream_preview"
+    if text in {"data_query_output", "data_query", "profile_query_output", "profile_query"}:
+        return "data_query_output"
     if text in {"profile_store", "profile", "profile_state", "lmdb", "rocksdb", "redis", "oracle"}:
         return "profile_store"
     if text in {"source_scan", "source", "direct_source"}:
@@ -11969,6 +14246,36 @@ async def validate_condition_flow(body: ConditionValidationRequest):
         })
         if len(normalized_rows) >= max_rows:
             warnings.append("Source scan reached max_rows limit; counts may be truncated.")
+    elif source_mode == "data_query_output":
+        data_query_cfg = body.data_query_node_config if isinstance(body.data_query_node_config, dict) else {}
+        source_rows = _normalize_condition_validation_rows(body.rows, max_rows)
+        source_meta.update({
+            "data_query_node_id": str(body.data_query_node_id or "").strip(),
+            "data_query_input_rows": len(source_rows),
+        })
+        if not source_rows:
+            warnings.append("No Data Query input rows available; evaluated against a single empty row.")
+            normalized_rows = []
+        else:
+            try:
+                transformed = await etl_engine._transform_profile_query(
+                    source_rows,
+                    data_query_cfg,
+                    incoming_by_source={},
+                    incoming_order=[],
+                    execution_context={},
+                )
+                normalized_rows = _normalize_condition_validation_rows(transformed, max_rows)
+                source_meta.update({
+                    "data_query_output_rows": len(normalized_rows),
+                })
+            except Exception as exc:
+                warnings.append(f"Data Query evaluation failed during validation; fallback to input rows: {exc}")
+                normalized_rows = source_rows
+                source_meta.update({
+                    "data_query_output_rows": len(normalized_rows),
+                    "data_query_fallback": "input_rows",
+                })
     else:
         normalized_rows = _normalize_condition_validation_rows(body.rows, max_rows)
         source_meta.update({
@@ -12950,7 +15257,11 @@ def _rows_from_pipeline_result(result_value: Any) -> list:
     return []
 
 
-def _extract_rows_from_pipeline_execution(node_results: Any, preferred_node_id: Optional[str] = None) -> list:
+def _extract_rows_from_pipeline_execution(
+    node_results: Any,
+    preferred_node_id: Optional[str] = None,
+    strict_preferred: bool = False,
+) -> list:
     payload = node_results
     if isinstance(payload, str):
         try:
@@ -12961,10 +15272,16 @@ def _extract_rows_from_pipeline_execution(node_results: Any, preferred_node_id: 
     if not isinstance(payload, dict) or not payload:
         return []
 
-    if preferred_node_id and preferred_node_id in payload:
-        chosen_rows = _rows_from_pipeline_result(payload.get(preferred_node_id))
+    preferred_id = str(preferred_node_id or "").strip()
+    if preferred_id and preferred_id in payload:
+        chosen_rows = _rows_from_pipeline_result(payload.get(preferred_id))
         if chosen_rows:
             return chosen_rows
+        if strict_preferred:
+            return []
+
+    if preferred_id and strict_preferred:
+        return []
 
     for _, result_value in reversed(list(payload.items())):
         rows = _rows_from_pipeline_result(result_value)
@@ -13458,7 +15775,12 @@ def _load_source_rows_for_query(body: dict, db: Session, apply_sql: bool = True)
         ).order_by(models.Execution.started_at.desc()).first()
         if not exec_row or not exec_row.node_results:
             raise HTTPException(400, "No successful execution found with data")
-        data = _extract_rows_from_pipeline_execution(exec_row.node_results, pipeline_node_id)
+        strict_node_output = bool(body.get("strict_node_output"))
+        data = _extract_rows_from_pipeline_execution(
+            exec_row.node_results,
+            pipeline_node_id,
+            strict_preferred=strict_node_output,
+        )
         if not data:
             raise HTTPException(400, "No tabular pipeline output found in latest successful execution")
     elif source_type == "file":

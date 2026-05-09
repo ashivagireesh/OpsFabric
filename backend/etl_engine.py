@@ -6,10 +6,12 @@ import asyncio
 import ast
 import base64
 import csv
+import gzip
 import hashlib
 import json
 import math
 import os
+import pickle
 import queue as _queue
 import random
 import re
@@ -257,6 +259,8 @@ class ETLEngine:
         self._profile_redis_enabled = _redis is not None
         self._profile_redis_client = None
         self._profile_redis_url_cached: Optional[str] = None
+        self._mlops_runtime_model_cache: Dict[str, Dict[str, Any]] = {}
+        self._mlops_runtime_model_cache_lock = threading.Lock()
         self._oracle_full_scan_block_until: Dict[str, float] = {}
         self._oracle_profile_schema_lock = threading.Lock()
         self._oracle_profile_schema_checked_tables: set = set()
@@ -5182,7 +5186,7 @@ END;"""
         return node_type.endswith("_source")
 
     def _is_chunkable_transform(self, node_type: str, config: Dict[str, Any]) -> bool:
-        if node_type in {"filter_transform", "profile_query_transform", "rename_transform", "type_convert_transform", "flatten_transform"}:
+        if node_type in {"filter_transform", "profile_query_transform", "mlops_transform", "rename_transform", "type_convert_transform", "flatten_transform"}:
             return True
         if node_type == "map_transform":
             # Grouped custom fields require full group scope.
@@ -7700,6 +7704,12 @@ END;"""
                 config,
                 incoming_by_source=incoming_by_source or {},
                 incoming_order=incoming_order or [],
+                execution_context=execution_context,
+            )
+        elif node_type == "mlops_transform":
+            return self._transform_mlops(
+                upstream,
+                config,
                 execution_context=execution_context,
             )
         elif node_type == "map_transform":
@@ -17976,6 +17986,615 @@ END;"""
                 )
 
         return merged_rows
+
+    def _normalize_mlops_mode(self, value: Any) -> str:
+        text = str(value or "").strip().lower()
+        if text in {"production", "prod", "predict", "prediction", "inference"}:
+            return "production"
+        return "training"
+
+    def _mlops_runtime_to_scalar(self, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, (datetime, date, time)):
+            safe = self._json_safe_value(value)
+            return safe if isinstance(safe, (str, int, float, bool)) or safe is None else str(safe)
+        if isinstance(value, (list, tuple, set)):
+            items = list(value)
+            if len(items) == 0:
+                return None
+            if len(items) == 1:
+                return self._mlops_runtime_to_scalar(items[0])
+            try:
+                return json.dumps(self._json_safe_value(items), ensure_ascii=False)
+            except Exception:
+                return str(items)
+        if isinstance(value, dict):
+            try:
+                return json.dumps(self._json_safe_value(value), ensure_ascii=False)
+            except Exception:
+                return str(value)
+        safe_value = self._json_safe_value(value)
+        if isinstance(safe_value, (str, int, float, bool)) or safe_value is None:
+            return safe_value
+        try:
+            return json.dumps(safe_value, ensure_ascii=False)
+        except Exception:
+            return str(safe_value)
+
+    def _load_mlops_runtime_model_bundle(self, bundle_cfg: Any) -> Dict[str, Any]:
+        bundle_raw = bundle_cfg
+        if isinstance(bundle_raw, str):
+            text = bundle_raw.strip()
+            if not text:
+                raise RuntimeError("MLOps runtime model bundle is empty.")
+            try:
+                bundle_raw = json.loads(text)
+            except Exception:
+                raise RuntimeError("MLOps runtime model bundle is not valid JSON.") from None
+        if not isinstance(bundle_raw, dict):
+            raise RuntimeError("MLOps runtime model bundle is missing or invalid.")
+
+        artifact_type = str(
+            bundle_raw.get("artifact_type")
+            or bundle_raw.get("type")
+            or "pickle_gzip_file"
+        ).strip().lower()
+        artifact_path = str(bundle_raw.get("path") or "").strip()
+        if not artifact_path:
+            raise RuntimeError("MLOps runtime model bundle path is missing.")
+
+        resolved_path = artifact_path
+        if not os.path.isabs(resolved_path):
+            resolved_path = os.path.abspath(os.path.join(os.path.dirname(__file__), resolved_path))
+        if not os.path.exists(resolved_path):
+            raise RuntimeError(f"MLOps runtime model bundle file not found: {resolved_path}")
+
+        try:
+            mtime = float(os.path.getmtime(resolved_path))
+        except Exception:
+            mtime = 0.0
+        cache_key = f"{artifact_type}:{resolved_path}:{mtime:.6f}"
+
+        with self._mlops_runtime_model_cache_lock:
+            cached = self._mlops_runtime_model_cache.get(cache_key)
+            if isinstance(cached, dict):
+                return cached
+
+        if artifact_type == "pickle_file":
+            with open(resolved_path, "rb") as handle:
+                payload = pickle.load(handle)
+        else:
+            with gzip.open(resolved_path, "rb") as handle:
+                payload = pickle.load(handle)
+
+        if not isinstance(payload, dict):
+            raise RuntimeError("MLOps runtime model bundle payload is invalid.")
+
+        with self._mlops_runtime_model_cache_lock:
+            if len(self._mlops_runtime_model_cache) > 32:
+                self._mlops_runtime_model_cache.clear()
+            self._mlops_runtime_model_cache[cache_key] = payload
+        return payload
+
+    def _set_mlops_runtime_field(self, row: Dict[str, Any], path: str, value: Any) -> None:
+        field_path = str(path or "").strip()
+        if not field_path:
+            return
+        safe_value = self._json_safe_value(value)
+        if "." in field_path or "[" in field_path:
+            self._set_profile_path_value_with_wildcards(row, field_path, safe_value)
+            return
+        row[field_path] = safe_value
+
+    def _transform_mlops(
+        self,
+        data: list,
+        config: dict,
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> list:
+        rows = data if isinstance(data, list) else []
+        mode = self._normalize_mlops_mode((config or {}).get("mlops_mode"))
+        if mode != "production":
+            return rows
+
+        bundle_cfg = (config or {}).get("mlops_stage3_model_bundle")
+        if not bundle_cfg and isinstance((config or {}).get("mlops_stage3_last_run_summary"), dict):
+            bundle_cfg = (config or {}).get("mlops_stage3_last_run_summary", {}).get("runtime_model_bundle")
+        if not bundle_cfg:
+            raise RuntimeError(
+                "MLOps node is in production mode but no trained model bundle is available. "
+                "Run Stage 3 training and save MLOps Studio first."
+            )
+
+        bundle = self._load_mlops_runtime_model_bundle(bundle_cfg)
+        raw_feature_fields = bundle.get("feature_fields")
+        if not raw_feature_fields:
+            raw_feature_fields = (config or {}).get("mlops_stage3_feature_fields")
+        if isinstance(raw_feature_fields, str):
+            text = raw_feature_fields.strip()
+            if text.startswith("[") and text.endswith("]"):
+                try:
+                    parsed = json.loads(text)
+                    raw_feature_fields = parsed
+                except Exception:
+                    raw_feature_fields = [part.strip() for part in text.split(",") if part.strip()]
+            elif text:
+                raw_feature_fields = [part.strip() for part in text.split(",") if part.strip()]
+            else:
+                raw_feature_fields = []
+        if not isinstance(raw_feature_fields, (list, tuple, set)):
+            raw_feature_fields = []
+        feature_fields = [
+            str(item or "").strip()
+            for item in raw_feature_fields
+            if str(item or "").strip()
+        ]
+
+        pred_field = str((config or {}).get("mlops_prediction_field") or "prediction").strip() or "prediction"
+        score_field = str((config or {}).get("mlops_prediction_score_field") or "prediction_score").strip()
+
+        dict_rows: List[Dict[str, Any]] = [row for row in rows if isinstance(row, dict)]
+        predictor_kind = str(bundle.get("predictor_kind") or "pipeline").strip().lower() or "pipeline"
+        task_type = str(bundle.get("task_type") or "").strip().lower()
+        runtime_metadata = bundle.get("runtime_metadata") if isinstance(bundle.get("runtime_metadata"), dict) else {}
+
+        def _sanitize_field_suffix(value: Any, fallback: str) -> str:
+            text = str(value or "").strip()
+            if not text:
+                text = fallback
+            text = re.sub(r"[^0-9A-Za-z_]+", "_", text).strip("_").lower()
+            return text or fallback
+
+        def _normalize_forecast_mode(value: Any) -> str:
+            raw = str(value or "").strip().lower()
+            if raw in {"future_only", "future-only", "future"}:
+                return "future_only"
+            if raw in {"in_place", "inplace", "in-place", "input_only", "row"}:
+                return "in_place"
+            return "append_future"
+
+        def _normalize_forecast_frequency(value: Any) -> str:
+            raw = str(value or "").strip().upper()
+            if raw.startswith("W"):
+                return "W"
+            if raw.startswith("M"):
+                return "M"
+            return "D"
+
+        is_forecasting_bundle = (
+            task_type == "forecasting"
+            or predictor_kind in {"forecasting_sarimax", "forecasting_multi_sarimax"}
+        )
+        if is_forecasting_bundle:
+            try:
+                import numpy as _np  # type: ignore
+                import pandas as _pd  # type: ignore
+            except Exception as exc:
+                raise RuntimeError(f"MLOps production forecasting requires pandas/numpy runtime dependencies: {exc}")
+
+            target_fields_raw = runtime_metadata.get("target_fields")
+            target_fields: List[str] = []
+            if isinstance(target_fields_raw, (list, tuple, set)):
+                target_fields = [
+                    str(item or "").strip()
+                    for item in target_fields_raw
+                    if str(item or "").strip()
+                ]
+            if not target_fields:
+                single_target = str(
+                    runtime_metadata.get("target_field")
+                    or bundle.get("target_field")
+                    or ""
+                ).strip()
+                if single_target:
+                    target_fields = [single_target]
+            if not target_fields:
+                target_fields = [pred_field]
+
+            model_map: Dict[str, Any] = {}
+            if predictor_kind == "forecasting_multi_sarimax":
+                raw_map = bundle.get("model_pipeline")
+                if not isinstance(raw_map, dict) or not raw_map:
+                    raise RuntimeError("MLOps forecasting bundle is missing target model map.")
+                for idx, target in enumerate(target_fields):
+                    model_map[target] = raw_map.get(target)
+                    if model_map[target] is None and idx < len(raw_map):
+                        try:
+                            model_map[target] = list(raw_map.values())[idx]
+                        except Exception:
+                            model_map[target] = None
+            else:
+                model_obj = bundle.get("model_pipeline")
+                if model_obj is None:
+                    raise RuntimeError("MLOps forecasting bundle is missing SARIMAX model object.")
+                model_map[target_fields[0]] = model_obj
+
+            forecast_mode = _normalize_forecast_mode(
+                (config or {}).get("mlops_forecast_output_mode")
+                or runtime_metadata.get("forecast_output_mode")
+                or "append_future"
+            )
+            raw_steps = (
+                (config or {}).get("mlops_forecast_runtime_steps")
+                or (config or {}).get("mlops_stage3_forecast_horizon")
+                or runtime_metadata.get("forecast_horizon")
+                or 0
+            )
+            try:
+                forecast_steps = int(float(raw_steps))
+            except Exception:
+                forecast_steps = 0
+            if forecast_steps <= 0:
+                forecast_steps = max(1, int(len(dict_rows) if len(dict_rows) > 0 else 30))
+            forecast_steps = max(1, min(forecast_steps, 3650))
+            in_place_steps = max(0, len(dict_rows))
+            steps_to_predict = max(forecast_steps, in_place_steps if in_place_steps > 0 else 0)
+            if steps_to_predict <= 0:
+                steps_to_predict = forecast_steps
+
+            freq_code = _normalize_forecast_frequency(
+                (config or {}).get("mlops_stage3_forecast_frequency")
+                or runtime_metadata.get("forecast_frequency")
+                or "D"
+            )
+            date_field = str(
+                (config or {}).get("mlops_stage3_forecast_date_field")
+                or runtime_metadata.get("forecast_date_field")
+                or ""
+            ).strip()
+            date_output_field = str(
+                (config or {}).get("mlops_forecast_output_date_field")
+                or (date_field if date_field else "forecast_date")
+            ).strip() or "forecast_date"
+
+            fallback_future_dates: List[str] = []
+            if date_field:
+                parsed_dates: List[Any] = []
+                for row in dict_rows:
+                    value, found = self._extract_row_value_by_path(row, date_field)
+                    if not found:
+                        value = row.get(date_field)
+                    if isinstance(value, dict):
+                        value = None
+                    elif hasattr(value, "tolist") and not isinstance(value, (str, bytes)):
+                        try:
+                            arr = value.tolist()
+                        except Exception:
+                            arr = None
+                        if isinstance(arr, list):
+                            value = arr[0] if arr else None
+                        elif arr is not None and not isinstance(arr, (dict, list, tuple, set)):
+                            value = arr
+                    elif isinstance(value, (list, tuple, set)):
+                        value = next(iter(value), None)
+                    try:
+                        dt = _pd.to_datetime(value, errors="coerce")
+                    except Exception:
+                        dt = _pd.NaT
+                    if isinstance(dt, _pd.Series):
+                        dt = dt.dropna().iloc[0] if not dt.dropna().empty else _pd.NaT
+                    elif isinstance(dt, _pd.DataFrame):
+                        non_empty_dt = dt.stack().dropna()
+                        dt = non_empty_dt.iloc[0] if not non_empty_dt.empty else _pd.NaT
+                    try:
+                        if _pd.notna(dt):
+                            parsed_dates.append(dt)
+                    except Exception:
+                        pass
+                if parsed_dates:
+                    base_dt = max(parsed_dates)
+                    try:
+                        rng = _pd.date_range(start=base_dt, periods=forecast_steps + 1, freq=freq_code)[1:]
+                        fallback_future_dates = [str(item) for item in list(rng)]
+                    except Exception:
+                        fallback_future_dates = []
+
+            def _series_to_list(value: Any) -> List[Any]:
+                if value is None:
+                    return []
+                if hasattr(value, "tolist"):
+                    try:
+                        out = value.tolist()
+                        if isinstance(out, list):
+                            return out
+                    except Exception:
+                        pass
+                if isinstance(value, (list, tuple)):
+                    return list(value)
+                try:
+                    return [value]
+                except Exception:
+                    return []
+
+            def _forecast_values(model_obj: Any, steps: int) -> Dict[str, Any]:
+                if model_obj is None:
+                    raise RuntimeError("MLOps forecasting model object is missing for target.")
+                preds: List[Any] = []
+                scores: List[Any] = []
+                dates: List[str] = []
+                if hasattr(model_obj, "get_forecast"):
+                    forecast_result = model_obj.get_forecast(steps=int(steps))
+                    predicted_mean = getattr(forecast_result, "predicted_mean", None)
+                    if predicted_mean is None and hasattr(model_obj, "forecast"):
+                        predicted_mean = model_obj.forecast(steps=int(steps))
+                    preds = _series_to_list(predicted_mean)
+                    idx = getattr(predicted_mean, "index", None) if predicted_mean is not None else None
+                    if idx is not None:
+                        try:
+                            dates = [str(item) for item in list(idx)]
+                        except Exception:
+                            dates = []
+                    se_mean = getattr(forecast_result, "se_mean", None)
+                    scores = _series_to_list(se_mean)
+                elif hasattr(model_obj, "forecast"):
+                    predicted_mean = model_obj.forecast(steps=int(steps))
+                    preds = _series_to_list(predicted_mean)
+                    idx = getattr(predicted_mean, "index", None)
+                    if idx is not None:
+                        try:
+                            dates = [str(item) for item in list(idx)]
+                        except Exception:
+                            dates = []
+                else:
+                    raise RuntimeError("MLOps forecasting model does not support forecast/get_forecast.")
+
+                if len(preds) < int(steps):
+                    preds = list(preds) + [None] * (int(steps) - len(preds))
+                if len(scores) < int(steps):
+                    scores = list(scores) + [None] * (int(steps) - len(scores))
+                return {
+                    "predictions": preds[: int(steps)],
+                    "scores": scores[: int(steps)],
+                    "dates": dates[: int(steps)],
+                }
+
+            target_forecasts: Dict[str, Dict[str, Any]] = {}
+            for target in target_fields:
+                model_obj = model_map.get(target)
+                if model_obj is None and model_map:
+                    model_obj = list(model_map.values())[0]
+                target_forecasts[target] = _forecast_values(model_obj, steps_to_predict)
+
+            pred_aux_prefix = _sanitize_field_suffix(pred_field, "prediction")
+            score_aux_prefix = _sanitize_field_suffix(score_field, "prediction_score") if score_field else "prediction_score"
+            is_multi_target = len(target_fields) > 1
+
+            output_rows: List[Any] = []
+            if forecast_mode in {"append_future", "in_place"}:
+                dict_index = 0
+                for row in rows:
+                    if not isinstance(row, dict):
+                        output_rows.append(row)
+                        continue
+                    next_row = dict(row)
+                    if is_multi_target:
+                        pred_map: Dict[str, Any] = {}
+                        score_map: Dict[str, Any] = {}
+                        for target_idx, target in enumerate(target_fields):
+                            fpack = target_forecasts.get(target) or {}
+                            target_preds = list(fpack.get("predictions") or [])
+                            target_scores = list(fpack.get("scores") or [])
+                            target_pred = (
+                                self._mlops_runtime_to_scalar(target_preds[dict_index])
+                                if dict_index < len(target_preds) else None
+                            )
+                            pred_map[target] = target_pred
+                            target_key = _sanitize_field_suffix(target, f"target_{target_idx + 1}")
+                            self._set_mlops_runtime_field(next_row, f"{pred_aux_prefix}_{target_key}", target_pred)
+                            if score_field:
+                                target_score = (
+                                    self._mlops_runtime_to_scalar(target_scores[dict_index])
+                                    if dict_index < len(target_scores) else None
+                                )
+                                score_map[target] = target_score
+                                self._set_mlops_runtime_field(next_row, f"{score_aux_prefix}_{target_key}", target_score)
+                        self._set_mlops_runtime_field(next_row, pred_field, pred_map)
+                        if score_field:
+                            self._set_mlops_runtime_field(next_row, score_field, score_map)
+                    else:
+                        target = target_fields[0]
+                        fpack = target_forecasts.get(target) or {}
+                        target_preds = list(fpack.get("predictions") or [])
+                        target_scores = list(fpack.get("scores") or [])
+                        prediction_value = (
+                            self._mlops_runtime_to_scalar(target_preds[dict_index])
+                            if dict_index < len(target_preds) else None
+                        )
+                        self._set_mlops_runtime_field(next_row, pred_field, prediction_value)
+                        if score_field:
+                            score_value = (
+                                self._mlops_runtime_to_scalar(target_scores[dict_index])
+                                if dict_index < len(target_scores) else None
+                            )
+                            self._set_mlops_runtime_field(next_row, score_field, score_value)
+                    output_rows.append(next_row)
+                    dict_index += 1
+
+            if forecast_mode in {"append_future", "future_only"}:
+                for step_idx in range(forecast_steps):
+                    future_row: Dict[str, Any] = {
+                        "mlops_segment": "future_forecast",
+                        "mlops_step": int(step_idx + 1),
+                    }
+                    if date_output_field:
+                        forecast_date = None
+                        for target in target_fields:
+                            target_dates = list((target_forecasts.get(target) or {}).get("dates") or [])
+                            if step_idx < len(target_dates) and str(target_dates[step_idx]).strip():
+                                forecast_date = str(target_dates[step_idx])
+                                break
+                        if forecast_date is None and step_idx < len(fallback_future_dates):
+                            forecast_date = fallback_future_dates[step_idx]
+                        if forecast_date is not None:
+                            self._set_mlops_runtime_field(future_row, date_output_field, forecast_date)
+
+                    if is_multi_target:
+                        pred_map: Dict[str, Any] = {}
+                        score_map: Dict[str, Any] = {}
+                        for target_idx, target in enumerate(target_fields):
+                            fpack = target_forecasts.get(target) or {}
+                            target_preds = list(fpack.get("predictions") or [])
+                            target_scores = list(fpack.get("scores") or [])
+                            target_pred = (
+                                self._mlops_runtime_to_scalar(target_preds[step_idx])
+                                if step_idx < len(target_preds) else None
+                            )
+                            pred_map[target] = target_pred
+                            target_key = _sanitize_field_suffix(target, f"target_{target_idx + 1}")
+                            self._set_mlops_runtime_field(future_row, f"{pred_aux_prefix}_{target_key}", target_pred)
+                            if score_field:
+                                target_score = (
+                                    self._mlops_runtime_to_scalar(target_scores[step_idx])
+                                    if step_idx < len(target_scores) else None
+                                )
+                                score_map[target] = target_score
+                                self._set_mlops_runtime_field(future_row, f"{score_aux_prefix}_{target_key}", target_score)
+                        self._set_mlops_runtime_field(future_row, pred_field, pred_map)
+                        if score_field:
+                            self._set_mlops_runtime_field(future_row, score_field, score_map)
+                    else:
+                        target = target_fields[0]
+                        fpack = target_forecasts.get(target) or {}
+                        target_preds = list(fpack.get("predictions") or [])
+                        target_scores = list(fpack.get("scores") or [])
+                        prediction_value = (
+                            self._mlops_runtime_to_scalar(target_preds[step_idx])
+                            if step_idx < len(target_preds) else None
+                        )
+                        self._set_mlops_runtime_field(future_row, pred_field, prediction_value)
+                        if score_field:
+                            score_value = (
+                                self._mlops_runtime_to_scalar(target_scores[step_idx])
+                                if step_idx < len(target_scores) else None
+                            )
+                            self._set_mlops_runtime_field(future_row, score_field, score_value)
+                    output_rows.append(future_row)
+
+            if isinstance(execution_context, dict):
+                node_warnings = execution_context.get("node_warnings")
+                if isinstance(node_warnings, list):
+                    mode_msg = (
+                        f"MLOps production forecasting applied: mode={forecast_mode}, "
+                        f"targets={len(target_fields)}, input_rows={len(dict_rows)}, "
+                        f"future_steps={forecast_steps}, prediction_field={pred_field}"
+                    )
+                    if score_field:
+                        mode_msg += f", score_field={score_field}"
+                    if mode_msg not in node_warnings:
+                        node_warnings.append(mode_msg)
+            if forecast_mode == "future_only":
+                return [row for row in output_rows if isinstance(row, dict) and row.get("mlops_segment") == "future_forecast"]
+            return output_rows
+
+        if not feature_fields:
+            raise RuntimeError("MLOps production mode requires feature fields from Stage 3 training.")
+
+        feature_records: List[Dict[str, Any]] = []
+        for row in dict_rows:
+            record: Dict[str, Any] = {}
+            for field_path in feature_fields:
+                value, found = self._extract_row_value_by_path(row, field_path)
+                if not found:
+                    value = row.get(field_path)
+                record[field_path] = self._mlops_runtime_to_scalar(value)
+            feature_records.append(record)
+
+        if len(feature_records) <= 0:
+            return rows
+
+        try:
+            import numpy as _np  # type: ignore
+            import pandas as _pd  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(f"MLOps production mode requires pandas/numpy runtime dependencies: {exc}")
+
+        feature_df = _pd.DataFrame(feature_records, columns=feature_fields)
+        predictions: List[Any] = []
+        scores: List[Any] = []
+
+        if predictor_kind == "components":
+            preprocessor = bundle.get("preprocessor")
+            estimator = bundle.get("estimator")
+            if preprocessor is None or estimator is None:
+                raise RuntimeError("MLOps runtime model components are missing preprocessor/estimator.")
+            transformed = preprocessor.transform(feature_df)
+            pred_arr = estimator.predict(transformed)
+            predictions = pred_arr.tolist() if hasattr(pred_arr, "tolist") else list(pred_arr)
+            if hasattr(estimator, "predict_proba"):
+                proba = estimator.predict_proba(transformed)
+                if getattr(proba, "ndim", 0) == 2:
+                    scores = [float(_np.max(row)) for row in proba]
+            elif task_type == "anomaly_detection" and hasattr(estimator, "decision_function"):
+                decision = estimator.decision_function(transformed)
+                scores = decision.tolist() if hasattr(decision, "tolist") else list(decision)
+        else:
+            model_pipeline = bundle.get("model_pipeline")
+            if model_pipeline is None:
+                raise RuntimeError("MLOps runtime model bundle is missing model pipeline.")
+            try:
+                pred_arr = model_pipeline.predict(feature_df)
+                predictions = pred_arr.tolist() if hasattr(pred_arr, "tolist") else list(pred_arr)
+                if hasattr(model_pipeline, "predict_proba"):
+                    proba = model_pipeline.predict_proba(feature_df)
+                    if getattr(proba, "ndim", 0) == 2:
+                        scores = [float(_np.max(row)) for row in proba]
+            except Exception as exc:
+                # Backward-compat safety: older forecasting bundles may have
+                # predictor_kind='pipeline' but carry a SARIMAX fit object.
+                if hasattr(model_pipeline, "get_forecast") or hasattr(model_pipeline, "forecast"):
+                    forecast_steps = int(len(dict_rows))
+                    if hasattr(model_pipeline, "get_forecast"):
+                        forecast_result = model_pipeline.get_forecast(steps=forecast_steps)
+                        predicted_mean = getattr(forecast_result, "predicted_mean", None)
+                        if predicted_mean is not None:
+                            predictions = predicted_mean.tolist() if hasattr(predicted_mean, "tolist") else list(predicted_mean)
+                        else:
+                            fallback_pred = model_pipeline.forecast(steps=forecast_steps)
+                            predictions = fallback_pred.tolist() if hasattr(fallback_pred, "tolist") else list(fallback_pred)
+                        se_mean = getattr(forecast_result, "se_mean", None)
+                        if se_mean is not None:
+                            scores = se_mean.tolist() if hasattr(se_mean, "tolist") else list(se_mean)
+                    else:
+                        fallback_pred = model_pipeline.forecast(steps=forecast_steps)
+                        predictions = fallback_pred.tolist() if hasattr(fallback_pred, "tolist") else list(fallback_pred)
+                else:
+                    raise RuntimeError(f"MLOps production scoring failed: {exc}") from exc
+
+        if len(predictions) != len(dict_rows):
+            raise RuntimeError(
+                f"MLOps prediction row-count mismatch: predicted={len(predictions)} input={len(dict_rows)}"
+            )
+
+        out_rows: List[Any] = []
+        dict_index = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                out_rows.append(row)
+                continue
+            next_row = dict(row)
+            prediction_value = self._mlops_runtime_to_scalar(predictions[dict_index])
+            self._set_mlops_runtime_field(next_row, pred_field, prediction_value)
+            if score_field:
+                score_value = None
+                if dict_index < len(scores):
+                    score_value = self._mlops_runtime_to_scalar(scores[dict_index])
+                self._set_mlops_runtime_field(next_row, score_field, score_value)
+            out_rows.append(next_row)
+            dict_index += 1
+
+        if isinstance(execution_context, dict):
+            node_warnings = execution_context.get("node_warnings")
+            if isinstance(node_warnings, list):
+                mode_msg = (
+                    f"MLOps production scoring applied: rows={len(dict_rows)}, "
+                    f"prediction_field={pred_field}{', score_field=' + score_field if score_field else ''}"
+                )
+                if mode_msg not in node_warnings:
+                    node_warnings.append(mode_msg)
+        return out_rows
 
     def _transform_map(
         self,

@@ -3,6 +3,7 @@ uvicorn[standard]==0.27.0
 sqlalchemy==2.0.25
 pydantic==2.5.3
 pydantic-settings==2.1.0
+setuptools<81
 python-multipart==0.0.6
 websockets==12.0
 aiofiles==23.2.1
@@ -21,6 +22,7 @@ sqlalchemy-utils==0.41.1
 # File processing
 pandas==2.1.4
 plotly==5.24.1
+ydata-profiling==4.12.2
 openpyxl==3.1.2
 xlrd==2.0.1
 pyarrow==14.0.2
@@ -46,6 +48,7 @@ uuid==1.30
 loguru==0.7.2
 rapidfuzz==3.14.3
 scikit-learn==1.8.0
+statsmodels==0.14.4
 h2o==3.46.0.8
 lmdb==1.5.1
 rocksdict

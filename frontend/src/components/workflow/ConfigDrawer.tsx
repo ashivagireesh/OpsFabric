@@ -3,8 +3,9 @@ import {
   Drawer, Form, Input, Select, Switch, InputNumber,
   Button, Typography, Space, Tabs, Divider, Tag, Tooltip, Table, notification, Modal, Popover, AutoComplete, Tree
 } from 'antd'
-import { ArrowDownOutlined, ArrowUpOutlined, CloseOutlined, CopyOutlined, DeleteOutlined, InfoCircleOutlined, MinusSquareOutlined, PlusSquareOutlined, ReloadOutlined, SaveOutlined } from '@ant-design/icons'
+import { ArrowDownOutlined, ArrowUpOutlined, ArrowsAltOutlined, CloseOutlined, CopyOutlined, DeleteOutlined, InfoCircleOutlined, MinusSquareOutlined, PlusSquareOutlined, ReloadOutlined, SaveOutlined } from '@ant-design/icons'
 import Editor, { type Monaco } from '@monaco-editor/react'
+import Plot from 'react-plotly.js'
 import { useWorkflowStore } from '../../store'
 import { SourceFilePicker, DestinationPathPicker } from './FilePicker'
 import ConditionBuilderModal from './ConditionBuilderModal'
@@ -79,6 +80,8 @@ type CustomFnsV2Normalize = 'upper_trim' | 'lower_trim' | 'trim' | 'upper' | 'lo
 type CustomFnsV2InvalidKey = 'skip' | 'allow' | 'raise'
 type CustomProfileStorage = 'lmdb' | 'rocksdb' | 'redis' | 'oracle'
 type CustomProfileOracleWriteStrategy = 'single' | 'parallel_key'
+type MLOpsChartTheme = 'auto' | 'light' | 'dark'
+type MLOpsRuntimeMode = 'training' | 'production'
 type CustomEditorColorProfile =
   | 'high_contrast'
   | 'soft'
@@ -217,6 +220,272 @@ type DataQueryPreviewSummary = {
   matchedSamples: Array<Record<string, unknown>>
   outputSamples: Array<Record<string, unknown>>
 }
+
+type MLOpsStage1Chart = {
+  id: string
+  title: string
+  kind: string
+  figure_json?: Record<string, unknown>
+  figure_html?: string
+}
+
+type MLOpsStage1ProfileResult = {
+  status?: string
+  input_rows?: number
+  summary?: {
+    input_rows?: number
+    sampled_rows?: number
+    column_count?: number
+    duplicate_rows?: number
+    type_counts?: Record<string, number>
+  }
+  profile?: {
+    columns?: Array<Record<string, unknown>>
+    recommendations?: Array<Record<string, unknown>>
+  }
+  charts?: MLOpsStage1Chart[]
+  preview_rows?: Array<Record<string, unknown>>
+  polars?: Record<string, unknown>
+  ydata?: Record<string, unknown>
+}
+
+const MLOPS_CHART_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: 'histogram', label: 'Histogram' },
+  { value: 'box', label: 'Box' },
+  { value: 'violin', label: 'Violin' },
+  { value: 'bar', label: 'Bar (Top values)' },
+  { value: 'pie', label: 'Pie (Category share)' },
+  { value: 'heatmap', label: 'Correlation heatmap' },
+  { value: 'scatter', label: 'Scatter' },
+  { value: 'line', label: 'Line / Trend' },
+  { value: 'missingness', label: 'Missingness' },
+]
+const MLOPS_DEFAULT_CHART_TYPES = MLOPS_CHART_TYPE_OPTIONS.map((item) => item.value)
+
+type MLOpsStage2FieldKind = 'numeric' | 'categorical' | 'text' | 'datetime' | 'mixed' | 'unknown'
+type MLOpsStage2CleaningOperation =
+  | 'duplicate_removal'
+  | 'invalid_value_correction'
+  | 'schema_datatype_correction'
+  | 'standardization'
+  | 'noise_removal'
+type MLOpsStage2MissingOperation =
+  | 'row_removal'
+  | 'column_removal'
+  | 'mean_imputation'
+  | 'median_imputation'
+  | 'mode_imputation'
+  | 'forward_fill'
+  | 'backward_fill'
+type MLOpsStage2EncodingOperation =
+  | 'label_encoding'
+  | 'one_hot_encoding'
+  | 'ordinal_encoding'
+  | 'target_encoding'
+  | 'rare_category_grouping'
+type MLOpsStage2ScalingOperation =
+  | 'standard_scaling'
+  | 'min_max_scaling'
+  | 'robust_scaling'
+  | 'log_transformation'
+  | 'outlier_clipping'
+
+type MLOpsStage2FieldConfig = {
+  field_path: string
+  enabled: boolean
+  cleaning: MLOpsStage2CleaningOperation[]
+  missing_values: MLOpsStage2MissingOperation[]
+  encoding: MLOpsStage2EncodingOperation[]
+  scaling: MLOpsStage2ScalingOperation[]
+}
+
+type MLOpsStage2PreviewSummary = {
+  ran: boolean
+  inputRows: number
+  outputRows: number
+  droppedRows: number
+  configuredFields: number
+  generatedColumns: number
+}
+type MLOpsStage3RunSummary = {
+  ran: boolean
+  executed_at: string
+  mode: 'dry_run' | 'real_train'
+  task_type: MLOpsStage3TaskType
+  model: string
+  input_rows: number
+  usable_rows: number
+  dropped_rows: number
+  feature_count: number
+  feature_fields: string[]
+  target_field: string | null
+  target_fields?: string[]
+  multi_target?: boolean
+  train_rows: number
+  validate_rows?: number
+  test_rows: number
+  forecast_horizon?: number
+  forecast_frequency?: string | null
+  auto_tune_orders?: boolean
+  order_search_budget?: number
+  cv_folds: number
+  epochs: number
+  batch_size: number
+  random_seed: number
+  tuning_enabled: boolean
+  tuning_method: MLOpsStage3TuningMethod | null
+  tuning_params: Array<{ name: string; values: string }>
+  tracking_enabled: boolean
+  notes: string[]
+  target_overview: Record<string, unknown> | null
+  train_metrics?: Record<string, unknown>
+  test_metrics?: Record<string, unknown>
+  feature_importance?: Array<Record<string, unknown>>
+  tuning_result?: Record<string, unknown>
+  sample_predictions?: Array<Record<string, unknown>>
+  run_name?: string | null
+  runtime_model_bundle?: Record<string, unknown> | null
+}
+type MLOpsStage3TaskType = 'classification' | 'regression' | 'clustering' | 'forecasting' | 'anomaly_detection'
+type MLOpsForecastFrequency = 'D' | 'W' | 'M'
+type MLOpsStage3TuningMethod = 'grid_search' | 'random_search' | 'bayesian_optimization'
+type MLOpsStage3TuningParameter = {
+  id: string
+  name: string
+  values: string
+}
+type MLOpsStage3VizType =
+  | 'split_bar'
+  | 'metrics_bar'
+  | 'actual_vs_predicted_scatter'
+  | 'actual_vs_predicted_line'
+  | 'prediction_error_hist'
+  | 'feature_importance'
+type MLOpsStage4Environment = 'dev' | 'staging' | 'prod'
+type MLOpsStage4Summary = {
+  ran: boolean
+  executed_at: string
+  task_type: MLOpsStage3TaskType
+  model: string
+  input_rows: number
+  feature_fields: string[]
+  target_field: string | null
+  gate?: {
+    enabled?: boolean
+    passed?: boolean
+    checks?: Array<Record<string, unknown>>
+    failed_checks?: Array<Record<string, unknown>>
+  }
+  deployment?: {
+    enabled?: boolean
+    status?: string
+    environment?: string
+    endpoint_name?: string
+    model_version?: string
+    ready_for_release?: boolean
+  }
+  monitoring?: {
+    enabled?: boolean
+    row_count?: number
+    numeric_fields?: string[]
+    avg_drift_score?: number
+    drift_details?: Array<Record<string, unknown>>
+    alerts?: string[]
+  }
+  metrics_used?: {
+    train_metrics?: Record<string, unknown>
+    test_metrics?: Record<string, unknown>
+  }
+  notes?: string[]
+  output_preview?: Array<Record<string, unknown>>
+}
+
+const MLOPS_STAGE2_CLEANING_OPTIONS: Array<{ value: MLOpsStage2CleaningOperation; label: string }> = [
+  { value: 'duplicate_removal', label: 'Duplicate Removal' },
+  { value: 'invalid_value_correction', label: 'Invalid Value Correction' },
+  { value: 'schema_datatype_correction', label: 'Schema / Datatype Correction' },
+  { value: 'standardization', label: 'Standardization' },
+  { value: 'noise_removal', label: 'Noise Removal' },
+]
+const MLOPS_STAGE2_MISSING_OPTIONS: Array<{ value: MLOpsStage2MissingOperation; label: string }> = [
+  { value: 'row_removal', label: 'Row Removal' },
+  { value: 'column_removal', label: 'Column Removal' },
+  { value: 'mean_imputation', label: 'Mean Imputation' },
+  { value: 'median_imputation', label: 'Median Imputation' },
+  { value: 'mode_imputation', label: 'Mode Imputation' },
+  { value: 'forward_fill', label: 'Forward Fill' },
+  { value: 'backward_fill', label: 'Backward Fill' },
+]
+const MLOPS_STAGE2_ENCODING_OPTIONS: Array<{ value: MLOpsStage2EncodingOperation; label: string }> = [
+  { value: 'label_encoding', label: 'Label Encoding' },
+  { value: 'one_hot_encoding', label: 'One-Hot Encoding' },
+  { value: 'ordinal_encoding', label: 'Ordinal Encoding' },
+  { value: 'target_encoding', label: 'Target Encoding (frequency)' },
+  { value: 'rare_category_grouping', label: 'Rare Category Grouping' },
+]
+const MLOPS_STAGE2_SCALING_OPTIONS: Array<{ value: MLOpsStage2ScalingOperation; label: string }> = [
+  { value: 'standard_scaling', label: 'Standard Scaling' },
+  { value: 'min_max_scaling', label: 'Min-Max Scaling' },
+  { value: 'robust_scaling', label: 'Robust Scaling' },
+  { value: 'log_transformation', label: 'Log Transformation' },
+  { value: 'outlier_clipping', label: 'Outlier Clipping' },
+]
+const MLOPS_STAGE3_TASK_OPTIONS: Array<{ value: MLOpsStage3TaskType; label: string }> = [
+  { value: 'classification', label: 'Classification' },
+  { value: 'regression', label: 'Regression' },
+  { value: 'clustering', label: 'Clustering' },
+  { value: 'forecasting', label: 'Forecasting' },
+  { value: 'anomaly_detection', label: 'Anomaly Detection' },
+]
+const MLOPS_STAGE3_MODEL_CATALOG: Record<MLOpsStage3TaskType, string[]> = {
+  classification: [
+    'Logistic Regression',
+    'Random Forest Classifier',
+    'XGBoost Classifier',
+    'SVM',
+    'Neural Networks',
+  ],
+  regression: [
+    'Linear Regression',
+    'Random Forest Regressor',
+    'XGBoost Regressor',
+    'Ridge Regression',
+    'Lasso Regression',
+  ],
+  clustering: [
+    'KMeans',
+    'DBSCAN',
+    'Hierarchical Clustering',
+  ],
+  forecasting: [
+    'ARIMA',
+    'SARIMA',
+  ],
+  anomaly_detection: [
+    'Isolation Forest',
+    'One-Class SVM',
+    'Autoencoders',
+  ],
+}
+const MLOPS_STAGE3_TUNING_METHOD_OPTIONS: Array<{ value: MLOpsStage3TuningMethod; label: string }> = [
+  { value: 'grid_search', label: 'Grid Search' },
+  { value: 'random_search', label: 'Random Search' },
+  { value: 'bayesian_optimization', label: 'Bayesian Optimization' },
+]
+const MLOPS_STAGE3_VIZ_OPTIONS: Array<{ value: MLOpsStage3VizType; label: string }> = [
+  { value: 'split_bar', label: 'Train vs Test Rows' },
+  { value: 'metrics_bar', label: 'Train vs Test Metrics' },
+  { value: 'actual_vs_predicted_scatter', label: 'Actual vs Predicted (Scatter)' },
+  { value: 'actual_vs_predicted_line', label: 'Actual vs Predicted (Line)' },
+  { value: 'prediction_error_hist', label: 'Prediction Error Histogram' },
+  { value: 'feature_importance', label: 'Feature Importance' },
+]
+const MLOPS_STAGE4_ENV_OPTIONS: Array<{ value: MLOpsStage4Environment; label: string }> = [
+  { value: 'dev', label: 'Dev' },
+  { value: 'staging', label: 'Staging' },
+  { value: 'prod', label: 'Prod' },
+]
+
 
 type UiConditionBuilderState = {
   clusters: UiConditionCluster[]
@@ -4445,6 +4714,197 @@ function parseStringList(value: unknown): string[] {
   return []
 }
 
+function createMLOpsStage2FieldConfig(seed?: Partial<MLOpsStage2FieldConfig>): MLOpsStage2FieldConfig {
+  const normalizePick = <T extends string>(values: unknown, allowed: Set<string>): T[] =>
+    uniqueFieldNames(parseStringList(values))
+      .map((item) => String(item || '').trim().toLowerCase())
+      .filter((item) => allowed.has(item)) as T[]
+
+  const cleaningAllowed = new Set(MLOPS_STAGE2_CLEANING_OPTIONS.map((item) => item.value))
+  const missingAllowed = new Set(MLOPS_STAGE2_MISSING_OPTIONS.map((item) => item.value))
+  const encodingAllowed = new Set(MLOPS_STAGE2_ENCODING_OPTIONS.map((item) => item.value))
+  const scalingAllowed = new Set(MLOPS_STAGE2_SCALING_OPTIONS.map((item) => item.value))
+  return {
+    field_path: String(seed?.field_path || '').trim(),
+    enabled: Boolean(seed?.enabled),
+    cleaning: normalizePick<MLOpsStage2CleaningOperation>(seed?.cleaning || [], cleaningAllowed),
+    missing_values: normalizePick<MLOpsStage2MissingOperation>(seed?.missing_values || [], missingAllowed),
+    encoding: normalizePick<MLOpsStage2EncodingOperation>(seed?.encoding || [], encodingAllowed),
+    scaling: normalizePick<MLOpsStage2ScalingOperation>(seed?.scaling || [], scalingAllowed),
+  }
+}
+
+function parseMLOpsStage2FieldConfigs(value: unknown): MLOpsStage2FieldConfig[] {
+  let raw = value
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      raw = JSON.parse(raw)
+    } catch {
+      return []
+    }
+  }
+  if (!Array.isArray(raw)) return []
+  const out: MLOpsStage2FieldConfig[] = []
+  raw.forEach((item) => {
+    if (!item || typeof item !== 'object') return
+    const rec = item as Record<string, unknown>
+    const normalized = createMLOpsStage2FieldConfig({
+      field_path: String(rec.field_path || rec.field || rec.path || ''),
+      enabled: parseBoolLike(rec.enabled, true),
+      cleaning: (rec.cleaning as any) || [],
+      missing_values: (rec.missing_values as any) || (rec.missing as any) || [],
+      encoding: (rec.encoding as any) || [],
+      scaling: (rec.scaling as any) || [],
+    })
+    if (!normalized.field_path) return
+    out.push(normalized)
+  })
+  const byField: Record<string, MLOpsStage2FieldConfig> = {}
+  out.forEach((item) => {
+    byField[item.field_path] = item
+  })
+  return Object.values(byField).sort((a, b) => a.field_path.localeCompare(b.field_path))
+}
+
+function hasMLOpsStage2FieldOps(config: MLOpsStage2FieldConfig | null | undefined): boolean {
+  if (!config) return false
+  return (
+    config.cleaning.length > 0
+    || config.missing_values.length > 0
+    || config.encoding.length > 0
+    || config.scaling.length > 0
+  )
+}
+
+function serializeMLOpsStage2FieldConfigMap(
+  configByField: Record<string, MLOpsStage2FieldConfig>,
+): MLOpsStage2FieldConfig[] {
+  const out = Object.values(configByField || {})
+    .map((item) => createMLOpsStage2FieldConfig(item))
+    .filter((item) => item.field_path)
+    .filter((item) => item.enabled || hasMLOpsStage2FieldOps(item))
+    .sort((a, b) => a.field_path.localeCompare(b.field_path))
+  return out
+}
+
+function mlopsStage2ToNumber(value: unknown): number | null {
+  if (value == null) return null
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (typeof value === 'boolean') return value ? 1 : 0
+  const text = String(value || '').trim()
+  if (!text) return null
+  const num = Number(text.replace(/,/g, ''))
+  return Number.isFinite(num) ? num : null
+}
+
+function mlopsStage2IsMissing(value: unknown): boolean {
+  if (value == null) return true
+  if (typeof value === 'string') return String(value).trim().length <= 0
+  return false
+}
+
+function mlopsStage2ToScalar(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    const first = value.find((item) => !mlopsStage2IsMissing(item))
+    return first == null ? null : mlopsStage2ToScalar(first)
+  }
+  if (value && typeof value === 'object') {
+    try {
+      return JSON.stringify(value)
+    } catch {
+      return String(value)
+    }
+  }
+  return value
+}
+
+function mlopsStage2Quantile(values: number[], q: number): number {
+  if (values.length <= 0) return 0
+  if (values.length === 1) return values[0]
+  const sorted = [...values].sort((a, b) => a - b)
+  const pos = (sorted.length - 1) * Math.min(Math.max(q, 0), 1)
+  const lo = Math.floor(pos)
+  const hi = Math.ceil(pos)
+  if (lo === hi) return sorted[lo]
+  const w = pos - lo
+  return sorted[lo] * (1 - w) + sorted[hi] * w
+}
+
+function createMLOpsStage3TuningParameter(seed?: Partial<MLOpsStage3TuningParameter>): MLOpsStage3TuningParameter {
+  return {
+    id: String(seed?.id || `tune_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+    name: String(seed?.name || '').trim(),
+    values: String(seed?.values || '').trim(),
+  }
+}
+
+function parseMLOpsStage3TuningParameters(value: unknown): MLOpsStage3TuningParameter[] {
+  let raw = value
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      raw = JSON.parse(raw)
+    } catch {
+      return []
+    }
+  }
+  if (!Array.isArray(raw)) return []
+  const out: MLOpsStage3TuningParameter[] = []
+  const seen = new Set<string>()
+  raw.forEach((item) => {
+    if (!item || typeof item !== 'object') return
+    const normalized = createMLOpsStage3TuningParameter(item as Partial<MLOpsStage3TuningParameter>)
+    if (!normalized.id || seen.has(normalized.id)) return
+    seen.add(normalized.id)
+    out.push(normalized)
+  })
+  return out
+}
+
+function serializeMLOpsStage3TuningParameters(items: MLOpsStage3TuningParameter[]): MLOpsStage3TuningParameter[] {
+  const out: MLOpsStage3TuningParameter[] = []
+  const seen = new Set<string>()
+  ;(items || []).forEach((item) => {
+    const normalized = createMLOpsStage3TuningParameter(item)
+    if (!normalized.id || seen.has(normalized.id)) return
+    seen.add(normalized.id)
+    out.push(normalized)
+  })
+  return out
+}
+
+function inferMLOpsStage2FieldKind(values: unknown[]): MLOpsStage2FieldKind {
+  const sample = values.filter((value) => !mlopsStage2IsMissing(value)).slice(0, 60)
+  if (sample.length <= 0) return 'unknown'
+  let numeric = 0
+  let dateLike = 0
+  let textLike = 0
+  let objectLike = 0
+  sample.forEach((value) => {
+    if (mlopsStage2ToNumber(value) != null) {
+      numeric += 1
+      return
+    }
+    if (value && typeof value === 'object') {
+      objectLike += 1
+      return
+    }
+    const text = String(value || '').trim()
+    if (text) {
+      const dateMs = Date.parse(text)
+      if (!Number.isNaN(dateMs)) dateLike += 1
+      else textLike += 1
+    }
+  })
+  const total = Math.max(sample.length, 1)
+  if (numeric / total >= 0.85) return 'numeric'
+  if (dateLike / total >= 0.7) return 'datetime'
+  if (objectLike > 0) return 'mixed'
+  const distinct = new Set(sample.map((item) => String(item || '').trim())).size
+  if (textLike > 0 && distinct <= 20) return 'categorical'
+  if (textLike > 0) return 'text'
+  return 'mixed'
+}
+
 function normalizeDataQueryProfilePatchOpKind(value: unknown): DataQueryProfilePatchOpKind {
   const raw = String(value || '').trim().toLowerCase()
   if (raw === 'set_where' || raw === 'unset' || raw === 'inc' || raw === 'append' || raw === 'remove' || raw === 'rename') {
@@ -5894,6 +6354,106 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [conditionValidationMaxRows, setConditionValidationMaxRows] = useState<number>(100000)
   const conditionStudioInitialConfigRef = useRef<Record<string, unknown> | null>(null)
   const [dataQueryStudioOpen, setDataQueryStudioOpen] = useState(false)
+  const [dataQueryRemoteDetectionLoading, setDataQueryRemoteDetectionLoading] = useState(false)
+  const [dataQueryRemoteDetectionError, setDataQueryRemoteDetectionError] = useState<string | null>(null)
+  const [dataQueryRemoteFieldHints, setDataQueryRemoteFieldHints] = useState<string[]>([])
+  const [dataQueryRemotePreviewRows, setDataQueryRemotePreviewRows] = useState<Array<Record<string, unknown>>>([])
+  const [mlopsStudioOpen, setMLOpsStudioOpen] = useState(false)
+  const [mlopsProfileLoading, setMLOpsProfileLoading] = useState(false)
+  const [mlopsProfileError, setMLOpsProfileError] = useState<string | null>(null)
+  const [mlopsProfileResult, setMLOpsProfileResult] = useState<MLOpsStage1ProfileResult | null>(null)
+  const [mlopsSampleSizeDraft, setMLOpsSampleSizeDraft] = useState(2000)
+  const [mlopsPreviewRowsDraft, setMLOpsPreviewRowsDraft] = useState(25)
+  const [mlopsMaxChartColumnsDraft, setMLOpsMaxChartColumnsDraft] = useState(6)
+  const [mlopsIncludeYDataDraft, setMLOpsIncludeYDataDraft] = useState(true)
+  const [mlopsChartTypesDraft, setMLOpsChartTypesDraft] = useState<string[]>(MLOPS_DEFAULT_CHART_TYPES)
+  const [mlopsChartThemeDraft, setMLOpsChartThemeDraft] = useState<MLOpsChartTheme>('auto')
+  const [mlopsExpandedChart, setMLOpsExpandedChart] = useState<MLOpsStage1Chart | null>(null)
+  const [mlopsCompactView, setMLOpsCompactView] = useState(true)
+  const [mlopsYDataActiveField, setMLOpsYDataActiveField] = useState('')
+  const [mlopsStudioTab, setMLOpsStudioTab] = useState<'eda' | 'pre_processing' | 'model_training' | 'deploy_monitor'>('eda')
+  const [mlopsRemoteRowsLoading, setMLOpsRemoteRowsLoading] = useState(false)
+  const [mlopsRemoteRowsError, setMLOpsRemoteRowsError] = useState<string | null>(null)
+  const [mlopsRemoteRows, setMLOpsRemoteRows] = useState<Array<Record<string, unknown>>>([])
+  const [mlopsStage2FieldConfigsByFieldDraft, setMLOpsStage2FieldConfigsByFieldDraft] = useState<Record<string, MLOpsStage2FieldConfig>>({})
+  const [mlopsStage2PreviewLimitDraft, setMLOpsStage2PreviewLimitDraft] = useState<number>(200)
+  const [mlopsStage2TargetFieldDraft, setMLOpsStage2TargetFieldDraft] = useState('')
+  const [mlopsStage2LabelFieldDraft, setMLOpsStage2LabelFieldDraft] = useState('')
+  const [mlopsStage2FieldSearchDraft, setMLOpsStage2FieldSearchDraft] = useState('')
+  const [mlopsStage2PreviewLoading, setMLOpsStage2PreviewLoading] = useState(false)
+  const [mlopsStage2PreviewError, setMLOpsStage2PreviewError] = useState<string | null>(null)
+  const [mlopsStage2PreviewRows, setMLOpsStage2PreviewRows] = useState<Array<Record<string, unknown>>>([])
+  const [mlopsStage2PreviewSummary, setMLOpsStage2PreviewSummary] = useState<MLOpsStage2PreviewSummary>({
+    ran: false,
+    inputRows: 0,
+    outputRows: 0,
+    droppedRows: 0,
+    configuredFields: 0,
+    generatedColumns: 0,
+  })
+  const [mlopsStage2ArtifactDraft, setMLOpsStage2ArtifactDraft] = useState<Record<string, unknown> | null>(null)
+  const [mlopsStage3TaskTypeDraft, setMLOpsStage3TaskTypeDraft] = useState<MLOpsStage3TaskType>('classification')
+  const [mlopsStage3ModelDraft, setMLOpsStage3ModelDraft] = useState('')
+  const [mlopsStage3FeatureFieldsDraft, setMLOpsStage3FeatureFieldsDraft] = useState<string[]>([])
+  const [mlopsStage3TargetFieldDraft, setMLOpsStage3TargetFieldDraft] = useState('')
+  const [mlopsStage3TargetFieldsDraft, setMLOpsStage3TargetFieldsDraft] = useState<string[]>([])
+  const [mlopsStage3ForecastDateFieldDraft, setMLOpsStage3ForecastDateFieldDraft] = useState('')
+  const [mlopsStage3ForecastHorizonDraft, setMLOpsStage3ForecastHorizonDraft] = useState<number>(30)
+  const [mlopsStage3ForecastFrequencyDraft, setMLOpsStage3ForecastFrequencyDraft] = useState<MLOpsForecastFrequency>('D')
+  const [mlopsStage3ForecastAutoTuneOrdersDraft, setMLOpsStage3ForecastAutoTuneOrdersDraft] = useState(false)
+  const [mlopsStage3ForecastOrderSearchMaxEvalsDraft, setMLOpsStage3ForecastOrderSearchMaxEvalsDraft] = useState<number>(16)
+  const [mlopsForecastOutputModeDraft, setMLOpsForecastOutputModeDraft] = useState<'append_future' | 'future_only' | 'in_place'>('append_future')
+  const [mlopsForecastRuntimeStepsDraft, setMLOpsForecastRuntimeStepsDraft] = useState<number>(0)
+  const [mlopsStage3ARIMAPDraft, setMLOpsStage3ARIMAPDraft] = useState<number>(1)
+  const [mlopsStage3ARIMADDraft, setMLOpsStage3ARIMADDraft] = useState<number>(1)
+  const [mlopsStage3ARIMAQDraft, setMLOpsStage3ARIMAQDraft] = useState<number>(1)
+  const [mlopsStage3SARIMAPPDraft, setMLOpsStage3SARIMAPPDraft] = useState<number>(1)
+  const [mlopsStage3SARIMAPDDraft, setMLOpsStage3SARIMAPDDraft] = useState<number>(1)
+  const [mlopsStage3SARIMAQDraft, setMLOpsStage3SARIMAQDraft] = useState<number>(1)
+  const [mlopsStage3SARIMASDraft, setMLOpsStage3SARIMASDraft] = useState<number>(7)
+  const [mlopsStage3TrainTestSplitDraft, setMLOpsStage3TrainTestSplitDraft] = useState<number>(0.2)
+  const [mlopsStage3CvFoldsDraft, setMLOpsStage3CvFoldsDraft] = useState<number>(5)
+  const [mlopsStage3EpochsDraft, setMLOpsStage3EpochsDraft] = useState<number>(20)
+  const [mlopsStage3BatchSizeDraft, setMLOpsStage3BatchSizeDraft] = useState<number>(32)
+  const [mlopsStage3RandomSeedDraft, setMLOpsStage3RandomSeedDraft] = useState<number>(42)
+  const [mlopsStage3TuningEnabledDraft, setMLOpsStage3TuningEnabledDraft] = useState(false)
+  const [mlopsStage3TuningMethodDraft, setMLOpsStage3TuningMethodDraft] = useState<MLOpsStage3TuningMethod>('random_search')
+  const [mlopsStage3TuningParamsDraft, setMLOpsStage3TuningParamsDraft] = useState<MLOpsStage3TuningParameter[]>([])
+  const [mlopsStage3TrackingEnabledDraft, setMLOpsStage3TrackingEnabledDraft] = useState(true)
+  const [mlopsStage3TrackVersionsDraft, setMLOpsStage3TrackVersionsDraft] = useState(true)
+  const [mlopsStage3TrackParamsDraft, setMLOpsStage3TrackParamsDraft] = useState(true)
+  const [mlopsStage3TrackMetricsDraft, setMLOpsStage3TrackMetricsDraft] = useState(true)
+  const [mlopsStage3TrackLogsDraft, setMLOpsStage3TrackLogsDraft] = useState(true)
+  const [mlopsStage3RunNameDraft, setMLOpsStage3RunNameDraft] = useState('')
+  const [mlopsStage3RunLoading, setMLOpsStage3RunLoading] = useState(false)
+  const [mlopsStage3RunError, setMLOpsStage3RunError] = useState<string | null>(null)
+  const [mlopsStage3RunSummary, setMLOpsStage3RunSummary] = useState<MLOpsStage3RunSummary | null>(null)
+  const [mlopsRuntimeModeDraft, setMLOpsRuntimeModeDraft] = useState<MLOpsRuntimeMode>('training')
+  const [mlopsPredictionFieldDraft, setMLOpsPredictionFieldDraft] = useState('prediction')
+  const [mlopsPredictionScoreFieldDraft, setMLOpsPredictionScoreFieldDraft] = useState('prediction_score')
+  const [mlopsStage3ModelBundleDraft, setMLOpsStage3ModelBundleDraft] = useState<Record<string, unknown> | null>(null)
+  const [mlopsStage3VizTypeDraft, setMLOpsStage3VizTypeDraft] = useState<MLOpsStage3VizType>('split_bar')
+  const [mlopsStage3TableViewDraft, setMLOpsStage3TableViewDraft] = useState<'predictions' | 'feature_importance' | 'metrics'>('predictions')
+  const [mlopsStage4GateEnabledDraft, setMLOpsStage4GateEnabledDraft] = useState(true)
+  const [mlopsStage4MinAccuracyDraft, setMLOpsStage4MinAccuracyDraft] = useState<number>(0.7)
+  const [mlopsStage4MinF1ScoreDraft, setMLOpsStage4MinF1ScoreDraft] = useState<number>(0.65)
+  const [mlopsStage4MaxRmseDraft, setMLOpsStage4MaxRmseDraft] = useState<number | null>(null)
+  const [mlopsStage4MaxMaeDraft, setMLOpsStage4MaxMaeDraft] = useState<number | null>(null)
+  const [mlopsStage4MinR2Draft, setMLOpsStage4MinR2Draft] = useState<number>(0)
+  const [mlopsStage4MinSilhouetteDraft, setMLOpsStage4MinSilhouetteDraft] = useState<number>(0.1)
+  const [mlopsStage4MaxAnomalyRatioDraft, setMLOpsStage4MaxAnomalyRatioDraft] = useState<number>(0.25)
+  const [mlopsStage4MaxAvgDriftDraft, setMLOpsStage4MaxAvgDriftDraft] = useState<number>(0.35)
+  const [mlopsStage4DeployEnabledDraft, setMLOpsStage4DeployEnabledDraft] = useState(false)
+  const [mlopsStage4EnvironmentDraft, setMLOpsStage4EnvironmentDraft] = useState<MLOpsStage4Environment>('staging')
+  const [mlopsStage4EndpointNameDraft, setMLOpsStage4EndpointNameDraft] = useState('')
+  const [mlopsStage4ModelVersionDraft, setMLOpsStage4ModelVersionDraft] = useState('')
+  const [mlopsStage4MonitorEnabledDraft, setMLOpsStage4MonitorEnabledDraft] = useState(true)
+  const [mlopsStage4MonitorSampleSizeDraft, setMLOpsStage4MonitorSampleSizeDraft] = useState<number>(2000)
+  const [mlopsStage4MonitorNumericFieldsDraft, setMLOpsStage4MonitorNumericFieldsDraft] = useState<string[]>([])
+  const [mlopsStage4RunLoading, setMLOpsStage4RunLoading] = useState(false)
+  const [mlopsStage4RunError, setMLOpsStage4RunError] = useState<string | null>(null)
+  const [mlopsStage4Summary, setMLOpsStage4Summary] = useState<MLOpsStage4Summary | null>(null)
+  const mlopsStudioInitialConfigRef = useRef<Record<string, unknown> | null>(null)
   const [dataQueryCriteriaDraft, setDataQueryCriteriaDraft] = useState<Array<Record<string, any>>>([])
   const [dataQueryModeDraft, setDataQueryModeDraft] = useState<'upstream' | 'pushdown' | 'hybrid'>('hybrid')
   const [dataQueryMatchModeDraft, setDataQueryMatchModeDraft] = useState<'all' | 'any'>('all')
@@ -6855,7 +7415,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     : ''
   const upstreamReferenceFields = useMemo(
     () => (
-      (nodeType === 'map_transform' || nodeType === 'profile_query_transform') && selectedNodeId
+      (nodeType === 'map_transform' || nodeType === 'profile_query_transform' || nodeType === 'mlops_transform') && selectedNodeId
         ? inferUpstreamInputFields(selectedNodeId, nodes, edges)
         : []
     ),
@@ -6863,7 +7423,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   )
   const upstreamPreviewReferenceFields = useMemo(
     () => {
-      if ((nodeType !== 'map_transform' && nodeType !== 'profile_query_transform') || !selectedNodeId) return []
+      if ((nodeType !== 'map_transform' && nodeType !== 'profile_query_transform' && nodeType !== 'mlops_transform') || !selectedNodeId) return []
       const previewRows = inferUpstreamPreviewRows(selectedNodeId, nodes, edges, 300)
       if (!previewRows.length) return []
       return filterUserFacingFieldNames(extractSampleFieldPaths(previewRows))
@@ -8386,6 +8946,466 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     },
     [nodeConfig.limit]
   )
+  const mlopsSampleSizeConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_sample_size ?? 2000)
+      if (!Number.isFinite(n)) return 2000
+      return Math.max(100, Math.min(Math.trunc(n), 20000))
+    },
+    [nodeConfig.mlops_sample_size]
+  )
+  const mlopsPreviewRowsConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_preview_rows ?? 25)
+      if (!Number.isFinite(n)) return 25
+      return Math.max(5, Math.min(Math.trunc(n), 200))
+    },
+    [nodeConfig.mlops_preview_rows]
+  )
+  const mlopsMaxChartColumnsConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_max_chart_columns ?? 6)
+      if (!Number.isFinite(n)) return 6
+      return Math.max(1, Math.min(Math.trunc(n), 12))
+    },
+    [nodeConfig.mlops_max_chart_columns]
+  )
+  const mlopsIncludeYDataConfigured = useMemo(
+    () => parseBoolLike(nodeConfig.mlops_include_ydata, true),
+    [nodeConfig.mlops_include_ydata]
+  )
+  const mlopsChartTypesConfigured = useMemo(() => {
+    const allowed = new Set(MLOPS_CHART_TYPE_OPTIONS.map((item) => item.value))
+    const pick = (rawList: unknown[]): string[] => uniqueFieldNames(
+      rawList
+        .map((item) => String(item || '').trim().toLowerCase())
+        .filter((item) => !!item && allowed.has(item)),
+    )
+    const raw = nodeConfig.mlops_chart_types
+    if (Array.isArray(raw)) {
+      const out = pick(raw)
+      return out.length > 0 ? out : [...MLOPS_DEFAULT_CHART_TYPES]
+    }
+    if (typeof raw === 'string' && raw.trim()) {
+      try {
+        const parsed = JSON.parse(raw)
+        if (Array.isArray(parsed)) {
+          const out = pick(parsed)
+          return out.length > 0 ? out : [...MLOPS_DEFAULT_CHART_TYPES]
+        }
+      } catch {
+        const out = pick(raw.split(','))
+        return out.length > 0 ? out : [...MLOPS_DEFAULT_CHART_TYPES]
+      }
+    }
+    return [...MLOPS_DEFAULT_CHART_TYPES]
+  }, [nodeConfig.mlops_chart_types])
+  const mlopsChartThemeConfigured = useMemo<MLOpsChartTheme>(
+    () => {
+      const theme = String(nodeConfig.mlops_chart_theme || 'auto').trim().toLowerCase()
+      if (theme === 'dark' || theme === 'light') return theme
+      return 'auto'
+    },
+    [nodeConfig.mlops_chart_theme],
+  )
+  const mlopsStage2FieldConfigsConfigured = useMemo(
+    () => parseMLOpsStage2FieldConfigs(nodeConfig.mlops_stage2_field_configs),
+    [nodeConfig.mlops_stage2_field_configs],
+  )
+  const mlopsStage2PreviewLimitConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_stage2_preview_limit ?? 200)
+      if (!Number.isFinite(n)) return 200
+      return Math.max(10, Math.min(Math.trunc(n), 5000))
+    },
+    [nodeConfig.mlops_stage2_preview_limit],
+  )
+  const mlopsStage2TargetFieldConfigured = useMemo(
+    () => String(nodeConfig.mlops_stage2_target_field || '').trim(),
+    [nodeConfig.mlops_stage2_target_field],
+  )
+  const mlopsStage2LabelFieldConfigured = useMemo(
+    () => String(nodeConfig.mlops_stage2_label_field || '').trim(),
+    [nodeConfig.mlops_stage2_label_field],
+  )
+  const mlopsStage3TaskTypeConfigured = useMemo<MLOpsStage3TaskType>(
+    () => {
+      const value = String(nodeConfig.mlops_stage3_task_type || '').trim().toLowerCase()
+      if (value === 'regression' || value === 'clustering' || value === 'forecasting' || value === 'anomaly_detection') return value
+      return 'classification'
+    },
+    [nodeConfig.mlops_stage3_task_type],
+  )
+  const mlopsStage3ModelConfigured = useMemo(
+    () => String(nodeConfig.mlops_stage3_model || '').trim(),
+    [nodeConfig.mlops_stage3_model],
+  )
+  const mlopsStage3FeatureFieldsConfigured = useMemo(
+    () => parseFieldList(nodeConfig.mlops_stage3_feature_fields),
+    [nodeConfig.mlops_stage3_feature_fields],
+  )
+  const mlopsStage3TargetFieldConfigured = useMemo(
+    () => String(nodeConfig.mlops_stage3_target_field || '').trim(),
+    [nodeConfig.mlops_stage3_target_field],
+  )
+  const mlopsStage3TargetFieldsConfigured = useMemo(
+    () => {
+      const parsed = parseFieldList(nodeConfig.mlops_stage3_target_fields)
+      if (parsed.length > 0) return parsed
+      const single = String(nodeConfig.mlops_stage3_target_field || '').trim()
+      if (!single) return [] as string[]
+      return uniqueFieldNames(single.split(',').map((item) => item.trim()).filter(Boolean))
+    },
+    [nodeConfig.mlops_stage3_target_fields, nodeConfig.mlops_stage3_target_field],
+  )
+  const mlopsStage3ForecastDateFieldConfigured = useMemo(
+    () => String(nodeConfig.mlops_stage3_forecast_date_field || '').trim(),
+    [nodeConfig.mlops_stage3_forecast_date_field],
+  )
+  const mlopsStage3ForecastHorizonConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_stage3_forecast_horizon ?? 30)
+      if (!Number.isFinite(n)) return 30
+      return Math.max(1, Math.min(Math.trunc(n), 3650))
+    },
+    [nodeConfig.mlops_stage3_forecast_horizon],
+  )
+  const mlopsStage3ForecastFrequencyConfigured = useMemo<MLOpsForecastFrequency>(
+    () => {
+      const raw = String(nodeConfig.mlops_stage3_forecast_frequency || 'D').trim().toUpperCase()
+      if (raw === 'W' || raw === 'M') return raw
+      return 'D'
+    },
+    [nodeConfig.mlops_stage3_forecast_frequency],
+  )
+  const mlopsStage3ForecastAutoTuneOrdersConfigured = useMemo(
+    () => parseBoolLike(nodeConfig.mlops_stage3_forecast_auto_tune_orders, false),
+    [nodeConfig.mlops_stage3_forecast_auto_tune_orders],
+  )
+  const mlopsStage3ForecastOrderSearchMaxEvalsConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_stage3_forecast_order_search_max_evals ?? 16)
+      if (!Number.isFinite(n)) return 16
+      return Math.max(1, Math.min(Math.trunc(n), 64))
+    },
+    [nodeConfig.mlops_stage3_forecast_order_search_max_evals],
+  )
+  const mlopsForecastOutputModeConfigured = useMemo<'append_future' | 'future_only' | 'in_place'>(
+    () => {
+      const raw = String(nodeConfig.mlops_forecast_output_mode || '').trim().toLowerCase()
+      if (raw === 'future_only') return 'future_only'
+      if (raw === 'in_place' || raw === 'inplace') return 'in_place'
+      return 'append_future'
+    },
+    [nodeConfig.mlops_forecast_output_mode],
+  )
+  const mlopsForecastRuntimeStepsConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_forecast_runtime_steps ?? 0)
+      if (!Number.isFinite(n)) return 0
+      return Math.max(0, Math.min(Math.trunc(n), 3650))
+    },
+    [nodeConfig.mlops_forecast_runtime_steps],
+  )
+  const mlopsStage3ARIMAOrderConfigured = useMemo<[number, number, number]>(
+    () => {
+      const raw = nodeConfig.mlops_stage3_arima_order
+      const fallback: [number, number, number] = [1, 1, 1]
+      if (Array.isArray(raw) && raw.length >= 3) {
+        return [
+          Math.max(0, Math.min(24, Math.trunc(Number(raw[0]) || 0))),
+          Math.max(0, Math.min(24, Math.trunc(Number(raw[1]) || 0))),
+          Math.max(0, Math.min(24, Math.trunc(Number(raw[2]) || 0))),
+        ]
+      }
+      if (typeof raw === 'string' && raw.trim()) {
+        const parts = raw.split(',').map((part) => Math.trunc(Number(part.trim())))
+        if (parts.length >= 3 && parts.every((n) => Number.isFinite(n))) {
+          return [
+            Math.max(0, Math.min(24, parts[0])),
+            Math.max(0, Math.min(24, parts[1])),
+            Math.max(0, Math.min(24, parts[2])),
+          ]
+        }
+      }
+      return fallback
+    },
+    [nodeConfig.mlops_stage3_arima_order],
+  )
+  const mlopsStage3SARIMASeasonalOrderConfigured = useMemo<[number, number, number, number]>(
+    () => {
+      const raw = nodeConfig.mlops_stage3_sarima_seasonal_order
+      const fallback: [number, number, number, number] = [1, 1, 1, 7]
+      if (Array.isArray(raw) && raw.length >= 4) {
+        return [
+          Math.max(0, Math.min(24, Math.trunc(Number(raw[0]) || 0))),
+          Math.max(0, Math.min(24, Math.trunc(Number(raw[1]) || 0))),
+          Math.max(0, Math.min(24, Math.trunc(Number(raw[2]) || 0))),
+          Math.max(0, Math.min(3660, Math.trunc(Number(raw[3]) || 0))),
+        ]
+      }
+      if (typeof raw === 'string' && raw.trim()) {
+        const parts = raw.split(',').map((part) => Math.trunc(Number(part.trim())))
+        if (parts.length >= 4 && parts.every((n) => Number.isFinite(n))) {
+          return [
+            Math.max(0, Math.min(24, parts[0])),
+            Math.max(0, Math.min(24, parts[1])),
+            Math.max(0, Math.min(24, parts[2])),
+            Math.max(0, Math.min(3660, parts[3])),
+          ]
+        }
+      }
+      return fallback
+    },
+    [nodeConfig.mlops_stage3_sarima_seasonal_order],
+  )
+  const mlopsStage3TrainTestSplitConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_stage3_train_test_split ?? 0.2)
+      if (!Number.isFinite(n)) return 0.2
+      return Math.max(0.05, Math.min(n, 0.5))
+    },
+    [nodeConfig.mlops_stage3_train_test_split],
+  )
+  const mlopsStage3CvFoldsConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_stage3_cv_folds ?? 5)
+      if (!Number.isFinite(n)) return 5
+      return Math.max(2, Math.min(Math.trunc(n), 20))
+    },
+    [nodeConfig.mlops_stage3_cv_folds],
+  )
+  const mlopsStage3EpochsConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_stage3_epochs ?? 20)
+      if (!Number.isFinite(n)) return 20
+      return Math.max(1, Math.min(Math.trunc(n), 10000))
+    },
+    [nodeConfig.mlops_stage3_epochs],
+  )
+  const mlopsStage3BatchSizeConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_stage3_batch_size ?? 32)
+      if (!Number.isFinite(n)) return 32
+      return Math.max(1, Math.min(Math.trunc(n), 4096))
+    },
+    [nodeConfig.mlops_stage3_batch_size],
+  )
+  const mlopsStage3RandomSeedConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_stage3_random_seed ?? 42)
+      if (!Number.isFinite(n)) return 42
+      return Math.trunc(n)
+    },
+    [nodeConfig.mlops_stage3_random_seed],
+  )
+  const mlopsStage3TuningEnabledConfigured = useMemo(
+    () => parseBoolLike(nodeConfig.mlops_stage3_tuning_enabled, false),
+    [nodeConfig.mlops_stage3_tuning_enabled],
+  )
+  const mlopsStage3TuningMethodConfigured = useMemo<MLOpsStage3TuningMethod>(
+    () => {
+      const value = String(nodeConfig.mlops_stage3_tuning_method || '').trim().toLowerCase()
+      if (value === 'grid_search' || value === 'bayesian_optimization') return value
+      return 'random_search'
+    },
+    [nodeConfig.mlops_stage3_tuning_method],
+  )
+  const mlopsStage3TuningParamsConfigured = useMemo(
+    () => parseMLOpsStage3TuningParameters(nodeConfig.mlops_stage3_tuning_params),
+    [nodeConfig.mlops_stage3_tuning_params],
+  )
+  const mlopsStage3TrackingEnabledConfigured = useMemo(
+    () => parseBoolLike(nodeConfig.mlops_stage3_tracking_enabled, true),
+    [nodeConfig.mlops_stage3_tracking_enabled],
+  )
+  const mlopsStage3TrackVersionsConfigured = useMemo(
+    () => parseBoolLike(nodeConfig.mlops_stage3_track_versions, true),
+    [nodeConfig.mlops_stage3_track_versions],
+  )
+  const mlopsStage3TrackParamsConfigured = useMemo(
+    () => parseBoolLike(nodeConfig.mlops_stage3_track_params, true),
+    [nodeConfig.mlops_stage3_track_params],
+  )
+  const mlopsStage3TrackMetricsConfigured = useMemo(
+    () => parseBoolLike(nodeConfig.mlops_stage3_track_metrics, true),
+    [nodeConfig.mlops_stage3_track_metrics],
+  )
+  const mlopsStage3TrackLogsConfigured = useMemo(
+    () => parseBoolLike(nodeConfig.mlops_stage3_track_logs, true),
+    [nodeConfig.mlops_stage3_track_logs],
+  )
+  const mlopsStage3RunNameConfigured = useMemo(
+    () => String(nodeConfig.mlops_stage3_run_name || '').trim(),
+    [nodeConfig.mlops_stage3_run_name],
+  )
+  const mlopsRuntimeModeConfigured = useMemo<MLOpsRuntimeMode>(
+    () => {
+      const value = String(nodeConfig.mlops_mode || '').trim().toLowerCase()
+      return value === 'production' ? 'production' : 'training'
+    },
+    [nodeConfig.mlops_mode],
+  )
+  const mlopsPredictionFieldConfigured = useMemo(
+    () => String(nodeConfig.mlops_prediction_field || 'prediction').trim() || 'prediction',
+    [nodeConfig.mlops_prediction_field],
+  )
+  const mlopsPredictionScoreFieldConfigured = useMemo(
+    () => String(nodeConfig.mlops_prediction_score_field || 'prediction_score').trim() || 'prediction_score',
+    [nodeConfig.mlops_prediction_score_field],
+  )
+  const mlopsStage3ModelBundleConfigured = useMemo<Record<string, unknown> | null>(
+    () => {
+      const raw = nodeConfig.mlops_stage3_model_bundle
+      if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw as Record<string, unknown>
+      if (typeof raw === 'string' && raw.trim()) {
+        try {
+          const parsed = JSON.parse(raw)
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            return parsed as Record<string, unknown>
+          }
+        } catch {
+          return null
+        }
+      }
+      return null
+    },
+    [nodeConfig.mlops_stage3_model_bundle],
+  )
+  const mlopsStage3VizTypeConfigured = useMemo<MLOpsStage3VizType>(
+    () => {
+      const raw = String(nodeConfig.mlops_stage3_viz_type || '').trim()
+      const allowed = new Set<MLOpsStage3VizType>(MLOPS_STAGE3_VIZ_OPTIONS.map((item) => item.value))
+      return allowed.has(raw as MLOpsStage3VizType) ? (raw as MLOpsStage3VizType) : 'split_bar'
+    },
+    [nodeConfig.mlops_stage3_viz_type],
+  )
+  const mlopsStage3TableViewConfigured = useMemo<'predictions' | 'feature_importance' | 'metrics'>(
+    () => {
+      const raw = String(nodeConfig.mlops_stage3_table_view || '').trim()
+      if (raw === 'feature_importance' || raw === 'metrics') return raw
+      return 'predictions'
+    },
+    [nodeConfig.mlops_stage3_table_view],
+  )
+  const mlopsStage3LastRunSummaryConfigured = useMemo<MLOpsStage3RunSummary | null>(
+    () => {
+      const raw = nodeConfig.mlops_stage3_last_run_summary
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+      return raw as MLOpsStage3RunSummary
+    },
+    [nodeConfig.mlops_stage3_last_run_summary],
+  )
+  const mlopsStage4GateEnabledConfigured = useMemo(
+    () => parseBoolLike(nodeConfig.mlops_stage4_gate_enabled, true),
+    [nodeConfig.mlops_stage4_gate_enabled],
+  )
+  const mlopsStage4MinAccuracyConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_stage4_min_accuracy ?? 0.7)
+      return Number.isFinite(n) ? Math.max(0, Math.min(n, 1)) : 0.7
+    },
+    [nodeConfig.mlops_stage4_min_accuracy],
+  )
+  const mlopsStage4MinF1ScoreConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_stage4_min_f1_score ?? 0.65)
+      return Number.isFinite(n) ? Math.max(0, Math.min(n, 1)) : 0.65
+    },
+    [nodeConfig.mlops_stage4_min_f1_score],
+  )
+  const mlopsStage4MaxRmseConfigured = useMemo<number | null>(
+    () => {
+      const raw = nodeConfig.mlops_stage4_max_rmse
+      if (raw == null || raw === '') return null
+      const n = Number(raw)
+      if (!Number.isFinite(n)) return null
+      return Math.max(0, n)
+    },
+    [nodeConfig.mlops_stage4_max_rmse],
+  )
+  const mlopsStage4MaxMaeConfigured = useMemo<number | null>(
+    () => {
+      const raw = nodeConfig.mlops_stage4_max_mae
+      if (raw == null || raw === '') return null
+      const n = Number(raw)
+      if (!Number.isFinite(n)) return null
+      return Math.max(0, n)
+    },
+    [nodeConfig.mlops_stage4_max_mae],
+  )
+  const mlopsStage4MinR2Configured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_stage4_min_r2 ?? 0)
+      return Number.isFinite(n) ? Math.max(-1, Math.min(n, 1)) : 0
+    },
+    [nodeConfig.mlops_stage4_min_r2],
+  )
+  const mlopsStage4MinSilhouetteConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_stage4_min_silhouette_score ?? 0.1)
+      return Number.isFinite(n) ? Math.max(-1, Math.min(n, 1)) : 0.1
+    },
+    [nodeConfig.mlops_stage4_min_silhouette_score],
+  )
+  const mlopsStage4MaxAnomalyRatioConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_stage4_max_anomaly_ratio ?? 0.25)
+      return Number.isFinite(n) ? Math.max(0, Math.min(n, 1)) : 0.25
+    },
+    [nodeConfig.mlops_stage4_max_anomaly_ratio],
+  )
+  const mlopsStage4MaxAvgDriftConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_stage4_max_avg_drift_score ?? 0.35)
+      return Number.isFinite(n) ? Math.max(0, n) : 0.35
+    },
+    [nodeConfig.mlops_stage4_max_avg_drift_score],
+  )
+  const mlopsStage4DeployEnabledConfigured = useMemo(
+    () => parseBoolLike(nodeConfig.mlops_stage4_deploy_enabled, false),
+    [nodeConfig.mlops_stage4_deploy_enabled],
+  )
+  const mlopsStage4EnvironmentConfigured = useMemo<MLOpsStage4Environment>(
+    () => {
+      const raw = String(nodeConfig.mlops_stage4_environment || 'staging').trim().toLowerCase()
+      if (raw === 'dev' || raw === 'prod') return raw
+      return 'staging'
+    },
+    [nodeConfig.mlops_stage4_environment],
+  )
+  const mlopsStage4EndpointNameConfigured = useMemo(
+    () => String(nodeConfig.mlops_stage4_endpoint_name || '').trim(),
+    [nodeConfig.mlops_stage4_endpoint_name],
+  )
+  const mlopsStage4ModelVersionConfigured = useMemo(
+    () => String(nodeConfig.mlops_stage4_model_version || '').trim(),
+    [nodeConfig.mlops_stage4_model_version],
+  )
+  const mlopsStage4MonitorEnabledConfigured = useMemo(
+    () => parseBoolLike(nodeConfig.mlops_stage4_monitor_enabled, true),
+    [nodeConfig.mlops_stage4_monitor_enabled],
+  )
+  const mlopsStage4MonitorSampleSizeConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_stage4_monitor_sample_size ?? 2000)
+      if (!Number.isFinite(n)) return 2000
+      return Math.max(50, Math.min(Math.trunc(n), 50000))
+    },
+    [nodeConfig.mlops_stage4_monitor_sample_size],
+  )
+  const mlopsStage4MonitorNumericFieldsConfigured = useMemo(
+    () => parseFieldList(nodeConfig.mlops_stage4_monitor_numeric_fields),
+    [nodeConfig.mlops_stage4_monitor_numeric_fields],
+  )
+  const mlopsStage4LastRunSummaryConfigured = useMemo<MLOpsStage4Summary | null>(
+    () => {
+      const raw = nodeConfig.mlops_stage4_last_run_summary
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+      return raw as MLOpsStage4Summary
+    },
+    [nodeConfig.mlops_stage4_last_run_summary],
+  )
   const dataQueryProfilePatchEnabledConfigured = useMemo(
     () => parseBoolLike(nodeConfig.profile_patch_enabled, false),
     [nodeConfig.profile_patch_enabled]
@@ -8535,8 +9555,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       ...mapInputFieldOptions,
       ...upstreamReferenceFields,
       ...upstreamPreviewReferenceFields,
+      ...dataQueryRemoteFieldHints,
     ]),
-    [mapInputFieldOptions, upstreamReferenceFields, upstreamPreviewReferenceFields]
+    [mapInputFieldOptions, upstreamReferenceFields, upstreamPreviewReferenceFields, dataQueryRemoteFieldHints]
   )
   const dataQueryFieldTreeData = useMemo(() => {
     type TreeNode = { title: string; key: string; path?: string; children?: TreeNode[]; isLeaf?: boolean }
@@ -8654,12 +9675,23 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => dataQueryFilteredFieldOptions.slice(0, dataQueryShowQuickPicker ? 300 : 80),
     [dataQueryFilteredFieldOptions, dataQueryShowQuickPicker]
   )
-  const dataQueryPreviewRows = useMemo(() => {
+  const dataQueryLocalPreviewRows = useMemo(() => {
     if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform' || !selectedNodeId) return []
     return inferUpstreamPreviewRows(selectedNodeId, nodes, edges, 300)
       .filter((row) => row && typeof row === 'object')
       .slice(0, 300)
   }, [dataQueryStudioOpen, nodeType, selectedNodeId, nodes, edges])
+  const dataQueryPreviewRows = useMemo(() => {
+    if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform' || !selectedNodeId) return []
+    if (dataQueryLocalPreviewRows.length > 0) return dataQueryLocalPreviewRows
+    return (dataQueryRemotePreviewRows || []).slice(0, 300)
+  }, [
+    dataQueryStudioOpen,
+    nodeType,
+    selectedNodeId,
+    dataQueryLocalPreviewRows,
+    dataQueryRemotePreviewRows,
+  ])
   const dataQueryFieldSamples = useMemo(() => {
     const out = new Map<string, string>()
     if (!dataQueryStudioOpen || dataQueryPreviewRows.length <= 0 || dataQueryFieldOptions.length <= 0) return out
@@ -8698,6 +9730,1042 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     })
     return out
   }, [dataQueryStudioOpen, dataQueryPreviewRows, dataQueryFieldOptions])
+  const mlopsDataQuerySourceNodeIds = useMemo(() => {
+    if (!mlopsStudioOpen || nodeType !== 'mlops_transform' || !selectedNodeId) return [] as string[]
+    const nodeMap = new Map(nodes.map((item) => [String(item.id || ''), item] as const))
+    const directIncoming = edges
+      .filter((edge) => String(edge?.target || '').trim() === String(selectedNodeId || '').trim())
+      .map((edge) => String(edge?.source || '').trim())
+      .filter(Boolean)
+    return uniqueFieldNames(
+      directIncoming.filter((id) => {
+        const n = nodeMap.get(String(id || '').trim())
+        const nType = String(n?.data?.nodeType || '').trim().toLowerCase()
+        return nType === 'profile_query_transform'
+      }),
+    )
+  }, [mlopsStudioOpen, nodeType, selectedNodeId, nodes, edges])
+  const mlopsDirectSourceNodeIds = useMemo(() => {
+    if (!mlopsStudioOpen || nodeType !== 'mlops_transform' || !selectedNodeId) return [] as string[]
+    return uniqueFieldNames(
+      edges
+        .filter((edge) => String(edge?.target || '').trim() === String(selectedNodeId || '').trim())
+        .map((edge) => String(edge?.source || '').trim())
+        .filter(Boolean),
+    )
+  }, [mlopsStudioOpen, nodeType, selectedNodeId, edges])
+  const mlopsPreferredSourceNodeIds = useMemo(
+    () => (
+      mlopsDataQuerySourceNodeIds.length > 0
+        ? mlopsDataQuerySourceNodeIds
+        : mlopsDirectSourceNodeIds
+    ),
+    [mlopsDataQuerySourceNodeIds, mlopsDirectSourceNodeIds],
+  )
+  const mlopsPreviewRowsLocal = useMemo(() => {
+    if (!mlopsStudioOpen || nodeType !== 'mlops_transform' || !selectedNodeId) return []
+    if (mlopsPreferredSourceNodeIds.length <= 0) return []
+    const nodeMap = new Map(nodes.map((item) => [String(item.id || '').trim(), item] as const))
+    const dedupeRows = (rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> => {
+      const out: Array<Record<string, unknown>> = []
+      const seen = new Set<string>()
+      for (const row of rows) {
+        if (!row || typeof row !== 'object') continue
+        let sig = ''
+        try {
+          sig = JSON.stringify(row) || ''
+        } catch {
+          sig = ''
+        }
+        if (sig && seen.has(sig)) continue
+        if (sig) seen.add(sig)
+        out.push(row)
+        if (out.length >= 5000) break
+      }
+      return out
+    }
+
+    // Strict mode: when Data Query is connected, only consume its output rows
+    // (do not traverse to upstream sources for field discovery).
+    if (mlopsDataQuerySourceNodeIds.length > 0) {
+      const outputOnlyRows: Array<Record<string, unknown>> = []
+      for (const sourceId of mlopsDataQuerySourceNodeIds) {
+        if (outputOnlyRows.length >= 5000) break
+        const sourceNode = nodeMap.get(String(sourceId || '').trim())
+        if (!sourceNode) continue
+        const rows = extractPreviewRowsFromNode(sourceNode, {
+          includeConfigPreview: false,
+          includeExecutionOutput: true,
+          includeExecutionInput: false,
+        })
+        rows.forEach((row) => {
+          if (outputOnlyRows.length < 5000) outputOnlyRows.push(row)
+        })
+      }
+      const dedupedOutput = dedupeRows(outputOnlyRows)
+      if (dedupedOutput.length > 0) return dedupedOutput.slice(0, 5000)
+
+      // Fallback for not-yet-run Data Query nodes: use only this node's own
+      // preview sample/config snapshot, still without ancestor traversal.
+      const localFallback: Array<Record<string, unknown>> = []
+      for (const sourceId of mlopsDataQuerySourceNodeIds) {
+        if (localFallback.length >= 5000) break
+        const sourceNode = nodeMap.get(String(sourceId || '').trim())
+        if (!sourceNode) continue
+        const rows = extractPreviewRowsFromNode(sourceNode, {
+          includeConfigPreview: true,
+          includeExecutionOutput: true,
+          includeExecutionInput: false,
+        })
+        rows.forEach((row) => {
+          if (localFallback.length < 5000) localFallback.push(row)
+        })
+      }
+      return dedupeRows(localFallback).slice(0, 5000)
+    }
+
+    return inferUpstreamPreviewRows(
+      String(selectedNodeId),
+      nodes,
+      edges,
+      5000,
+      mlopsPreferredSourceNodeIds,
+      true,
+      true,
+    )
+      .filter((row) => row && typeof row === 'object')
+      .slice(0, 5000)
+  }, [
+    mlopsStudioOpen,
+    nodeType,
+    selectedNodeId,
+    nodes,
+    edges,
+    mlopsPreferredSourceNodeIds,
+    mlopsDataQuerySourceNodeIds,
+  ])
+  useEffect(() => {
+    if (!mlopsStudioOpen || nodeType !== 'mlops_transform' || !selectedNodeId) {
+      setMLOpsRemoteRowsLoading(false)
+      setMLOpsRemoteRowsError(null)
+      setMLOpsRemoteRows([])
+      return
+    }
+    if (mlopsPreviewRowsLocal.length > 0) {
+      setMLOpsRemoteRowsLoading(false)
+      setMLOpsRemoteRowsError(null)
+      setMLOpsRemoteRows([])
+      return
+    }
+    const pipelineId = String(activePipelineId || '').trim()
+    if (!pipelineId || mlopsPreferredSourceNodeIds.length <= 0) {
+      setMLOpsRemoteRowsLoading(false)
+      setMLOpsRemoteRowsError(null)
+      setMLOpsRemoteRows([])
+      return
+    }
+    let cancelled = false
+    const fetchRows = async () => {
+      setMLOpsRemoteRowsLoading(true)
+      setMLOpsRemoteRowsError(null)
+      try {
+        const merged: Array<Record<string, unknown>> = []
+        const seen = new Set<string>()
+        for (const sourceNodeId of mlopsPreferredSourceNodeIds) {
+          if (cancelled || merged.length >= 5000) break
+          let response: any = null
+          try {
+            response = await api.runTabularQuery({
+              source_type: 'pipeline',
+              pipeline_id: pipelineId,
+              pipeline_node_id: String(sourceNodeId || '').trim(),
+              strict_node_output: true,
+            })
+          } catch {
+            continue
+          }
+          const rows = Array.isArray(response?.data)
+            ? response.data.filter((row: unknown) => !!row && typeof row === 'object' && !Array.isArray(row)) as Array<Record<string, unknown>>
+            : []
+          for (const row of rows) {
+            if (merged.length >= 5000) break
+            let sig = ''
+            try {
+              sig = JSON.stringify(row) || ''
+            } catch {
+              sig = ''
+            }
+            if (sig && seen.has(sig)) continue
+            if (sig) seen.add(sig)
+            merged.push(row)
+          }
+        }
+        if (!cancelled) {
+          setMLOpsRemoteRows(merged.slice(0, 5000))
+          if (merged.length <= 0) {
+            setMLOpsRemoteRowsError(
+              mlopsDataQuerySourceNodeIds.length > 0
+                ? 'No Data Query output found in latest successful pipeline execution.'
+                : 'No upstream output found in latest successful pipeline execution.',
+            )
+          }
+        }
+      } catch (err: any) {
+        if (!cancelled) {
+          setMLOpsRemoteRows([])
+          setMLOpsRemoteRowsError(String(err?.message || 'Failed to fetch Data Query output for MLOps.'))
+        }
+      } finally {
+        if (!cancelled) setMLOpsRemoteRowsLoading(false)
+      }
+    }
+    void fetchRows()
+    return () => {
+      cancelled = true
+    }
+  }, [
+    mlopsStudioOpen,
+    nodeType,
+    selectedNodeId,
+    activePipelineId,
+    mlopsPreferredSourceNodeIds,
+    mlopsDataQuerySourceNodeIds,
+    mlopsPreviewRowsLocal,
+  ])
+  const mlopsPreviewRows = useMemo(
+    () => (mlopsPreviewRowsLocal.length > 0 ? mlopsPreviewRowsLocal : mlopsRemoteRows).slice(0, 5000),
+    [mlopsPreviewRowsLocal, mlopsRemoteRows],
+  )
+  const mlopsFieldOptions = useMemo(
+    () => filterUserFacingFieldNames([
+      ...extractPriorityJsonFieldPaths(mlopsPreviewRows),
+      ...extractSampleFieldPaths(mlopsPreviewRows),
+    ]),
+    [mlopsPreviewRows],
+  )
+  const mlopsStage2FieldSearchNormalized = useMemo(
+    () => String(mlopsStage2FieldSearchDraft || '').trim().toLowerCase(),
+    [mlopsStage2FieldSearchDraft],
+  )
+  const mlopsStage2FieldSampleMap = useMemo(() => {
+    const out = new Map<string, string>()
+    if (!mlopsStudioOpen || mlopsPreviewRows.length <= 0 || mlopsFieldOptions.length <= 0) return out
+    mlopsFieldOptions.forEach((fieldPath) => {
+      if (out.size >= 2000) return
+      const rawPath = String(fieldPath || '').trim()
+      if (!rawPath) return
+      let sampleValue: unknown = undefined
+      for (const row of mlopsPreviewRows) {
+        if (!row || typeof row !== 'object') continue
+        const values = readPathValues(row as Record<string, unknown>, rawPath)
+        if (Array.isArray(values) && values.length > 0) {
+          sampleValue = values[0]
+          break
+        }
+        const hit = readPathValue(row as Record<string, unknown>, rawPath)
+        if (hit.found) {
+          sampleValue = hit.value
+          break
+        }
+        if (Object.prototype.hasOwnProperty.call(row, rawPath)) {
+          sampleValue = (row as Record<string, unknown>)[rawPath]
+          break
+        }
+      }
+      if (sampleValue === undefined) return
+      if (sampleValue !== null && typeof sampleValue === 'object') {
+        try {
+          out.set(rawPath, JSON.stringify(sampleValue))
+        } catch {
+          out.set(rawPath, '[object]')
+        }
+        return
+      }
+      out.set(rawPath, String(sampleValue))
+    })
+    return out
+  }, [mlopsStudioOpen, mlopsPreviewRows, mlopsFieldOptions])
+  const mlopsStage2FieldKinds = useMemo(() => {
+    const out = new Map<string, MLOpsStage2FieldKind>()
+    if (!mlopsStudioOpen || mlopsPreviewRows.length <= 0 || mlopsFieldOptions.length <= 0) return out
+    const rowsSample = mlopsPreviewRows.slice(0, 120)
+    mlopsFieldOptions.forEach((fieldPath) => {
+      const values: unknown[] = []
+      for (const row of rowsSample) {
+        if (!row || typeof row !== 'object') continue
+        const hit = readPathValue(row as Record<string, unknown>, fieldPath)
+        if (!hit.found) continue
+        values.push(mlopsStage2ToScalar(hit.value))
+        if (values.length >= 60) break
+      }
+      out.set(fieldPath, inferMLOpsStage2FieldKind(values))
+    })
+    return out
+  }, [mlopsStudioOpen, mlopsPreviewRows, mlopsFieldOptions])
+  const mlopsStage2EffectiveConfigRows = useMemo(() => {
+    const map = mlopsStage2FieldConfigsByFieldDraft || {}
+    const merged: MLOpsStage2FieldConfig[] = []
+    const known = new Set<string>()
+    mlopsFieldOptions.forEach((fieldPath) => {
+      const path = String(fieldPath || '').trim()
+      if (!path) return
+      known.add(path)
+      const base = map[path]
+      merged.push(createMLOpsStage2FieldConfig({
+        field_path: path,
+        enabled: base?.enabled ?? false,
+        cleaning: base?.cleaning || [],
+        missing_values: base?.missing_values || [],
+        encoding: base?.encoding || [],
+        scaling: base?.scaling || [],
+      }))
+    })
+    Object.values(map).forEach((item) => {
+      const path = String(item?.field_path || '').trim()
+      if (!path || known.has(path)) return
+      merged.push(createMLOpsStage2FieldConfig(item))
+    })
+    const filtered = mlopsStage2FieldSearchNormalized
+      ? merged.filter((item) => String(item.field_path || '').toLowerCase().includes(mlopsStage2FieldSearchNormalized))
+      : merged
+    return filtered
+      .sort((a, b) => {
+        const aOps = hasMLOpsStage2FieldOps(a) ? 1 : 0
+        const bOps = hasMLOpsStage2FieldOps(b) ? 1 : 0
+        if (aOps !== bOps) return bOps - aOps
+        return String(a.field_path || '').localeCompare(String(b.field_path || ''))
+      })
+  }, [mlopsFieldOptions, mlopsStage2FieldConfigsByFieldDraft, mlopsStage2FieldSearchNormalized])
+  const mlopsStage2SerializedConfig = useMemo(
+    () => serializeMLOpsStage2FieldConfigMap(mlopsStage2FieldConfigsByFieldDraft),
+    [mlopsStage2FieldConfigsByFieldDraft],
+  )
+  const mlopsStage2EnabledConfigCount = useMemo(
+    () => mlopsStage2SerializedConfig.filter((item) => item.enabled).length,
+    [mlopsStage2SerializedConfig],
+  )
+  const mlopsStage2FieldSelectorOptions = useMemo(
+    () => mlopsFieldOptions.map((path) => ({ value: path, label: path })),
+    [mlopsFieldOptions],
+  )
+  const mlopsStage2EnabledFields = useMemo(
+    () => uniqueFieldNames(
+      mlopsStage2SerializedConfig
+        .filter((item) => item.enabled)
+        .map((item) => String(item.field_path || '').trim())
+        .filter(Boolean),
+    ),
+    [mlopsStage2SerializedConfig],
+  )
+  const mlopsStage3AvailableFields = useMemo(
+    () => (mlopsStage2EnabledFields.length > 0 ? mlopsStage2EnabledFields : mlopsFieldOptions),
+    [mlopsStage2EnabledFields, mlopsFieldOptions],
+  )
+  const mlopsStage3FeatureFieldOptions = useMemo(
+    () => mlopsStage3AvailableFields.map((path) => ({ value: path, label: path })),
+    [mlopsStage3AvailableFields],
+  )
+  const mlopsStage4MonitorFieldOptions = useMemo(
+    () => mlopsStage3AvailableFields.map((path) => ({ value: path, label: path })),
+    [mlopsStage3AvailableFields],
+  )
+  const mlopsStage3ModelOptions = useMemo(
+    () => (MLOPS_STAGE3_MODEL_CATALOG[mlopsStage3TaskTypeDraft] || []).map((model) => ({ value: model, label: model })),
+    [mlopsStage3TaskTypeDraft],
+  )
+  const mlopsStage3SelectedFeatureFields = useMemo(
+    () => uniqueFieldNames(mlopsStage3FeatureFieldsDraft.filter((item) => mlopsStage3AvailableFields.includes(item))),
+    [mlopsStage3FeatureFieldsDraft, mlopsStage3AvailableFields],
+  )
+  const mlopsStage4SelectedMonitorFields = useMemo(
+    () => uniqueFieldNames(mlopsStage4MonitorNumericFieldsDraft.filter((item) => mlopsStage3AvailableFields.includes(item))),
+    [mlopsStage4MonitorNumericFieldsDraft, mlopsStage3AvailableFields],
+  )
+  const mlopsStage3VizFigure = useMemo(() => {
+    if (!mlopsStage3RunSummary) return null
+    const summary = mlopsStage3RunSummary
+    const layoutBase: Record<string, unknown> = {
+      autosize: true,
+      margin: { l: 36, r: 16, t: 28, b: 34 },
+      paper_bgcolor: 'transparent',
+      plot_bgcolor: 'transparent',
+      font: { size: 11, color: '#cbd5e1' },
+    }
+    const toNum = (v: unknown): number | null => {
+      const n = Number(v)
+      return Number.isFinite(n) ? n : null
+    }
+
+    if (mlopsStage3VizTypeDraft === 'split_bar') {
+      return {
+        data: [
+          {
+            type: 'bar',
+            x: ['Train', 'Test'],
+            y: [Number(summary.train_rows || 0), Number(summary.test_rows || 0)],
+            marker: { color: ['#22c55e', '#0ea5e9'] },
+          },
+        ],
+        layout: { ...layoutBase, title: 'Train/Test Data Split' },
+      }
+    }
+
+    if (mlopsStage3VizTypeDraft === 'metrics_bar') {
+      const trainMetrics = (summary.train_metrics || {}) as Record<string, unknown>
+      const testMetrics = (summary.test_metrics || {}) as Record<string, unknown>
+      const keys = uniqueFieldNames([
+        ...Object.keys(trainMetrics),
+        ...Object.keys(testMetrics),
+      ]).filter((key) => toNum(trainMetrics[key]) != null || toNum(testMetrics[key]) != null)
+      if (keys.length <= 0) return null
+      return {
+        data: [
+          {
+            type: 'bar',
+            name: 'Train',
+            x: keys,
+            y: keys.map((key) => toNum(trainMetrics[key]) ?? 0),
+            marker: { color: '#22c55e' },
+          },
+          {
+            type: 'bar',
+            name: 'Test',
+            x: keys,
+            y: keys.map((key) => toNum(testMetrics[key]) ?? 0),
+            marker: { color: '#f59e0b' },
+          },
+        ],
+        layout: { ...layoutBase, barmode: 'group', title: 'Train vs Test Metrics' },
+      }
+    }
+
+    if (mlopsStage3VizTypeDraft === 'feature_importance') {
+      const items = Array.isArray(summary.feature_importance)
+        ? summary.feature_importance
+        : []
+      const rows = items
+        .map((item) => ({
+          feature: String((item as Record<string, unknown>)?.feature || ''),
+          importance: toNum((item as Record<string, unknown>)?.importance),
+        }))
+        .filter((item) => item.feature && item.importance != null)
+        .slice(0, 25)
+      if (rows.length <= 0) return null
+      return {
+        data: [
+          {
+            type: 'bar',
+            orientation: 'h',
+            x: rows.map((item) => item.importance as number).reverse(),
+            y: rows.map((item) => item.feature).reverse(),
+            marker: { color: '#a78bfa' },
+          },
+        ],
+        layout: { ...layoutBase, title: 'Feature Importance', height: 360 },
+      }
+    }
+
+    const preds = (Array.isArray(summary.sample_predictions) ? summary.sample_predictions : [])
+      .map((row, idx) => ({
+        idx: idx + 1,
+        actual: toNum((row as Record<string, unknown>)?.actual),
+        predicted: toNum((row as Record<string, unknown>)?.predicted),
+      }))
+      .filter((row) => row.actual != null && row.predicted != null)
+    if (preds.length <= 0) return null
+
+    if (mlopsStage3VizTypeDraft === 'actual_vs_predicted_scatter') {
+      return {
+        data: [
+          {
+            type: 'scatter',
+            mode: 'markers',
+            x: preds.map((row) => row.actual as number),
+            y: preds.map((row) => row.predicted as number),
+            marker: { color: '#38bdf8', size: 8 },
+            name: 'Predictions',
+          },
+        ],
+        layout: { ...layoutBase, title: 'Actual vs Predicted (Scatter)', xaxis: { title: 'Actual' }, yaxis: { title: 'Predicted' } },
+      }
+    }
+
+    if (mlopsStage3VizTypeDraft === 'actual_vs_predicted_line') {
+      return {
+        data: [
+          {
+            type: 'scatter',
+            mode: 'lines+markers',
+            x: preds.map((row) => row.idx),
+            y: preds.map((row) => row.actual as number),
+            line: { color: '#22c55e' },
+            name: 'Actual',
+          },
+          {
+            type: 'scatter',
+            mode: 'lines+markers',
+            x: preds.map((row) => row.idx),
+            y: preds.map((row) => row.predicted as number),
+            line: { color: '#f59e0b' },
+            name: 'Predicted',
+          },
+        ],
+        layout: { ...layoutBase, title: 'Actual vs Predicted (Line)', xaxis: { title: 'Sample' }, yaxis: { title: 'Value' } },
+      }
+    }
+
+    const errors = preds.map((row) => (row.predicted as number) - (row.actual as number))
+    return {
+      data: [
+        {
+          type: 'histogram',
+          x: errors,
+          marker: { color: '#ef4444' },
+          nbinsx: Math.min(20, Math.max(6, Math.trunc(Math.sqrt(errors.length)))),
+          name: 'Prediction Error',
+        },
+      ],
+      layout: { ...layoutBase, title: 'Prediction Error Histogram', xaxis: { title: 'Predicted - Actual' }, yaxis: { title: 'Frequency' } },
+    }
+  }, [mlopsStage3RunSummary, mlopsStage3VizTypeDraft])
+  const mlopsStage3TableColumns = useMemo(() => {
+    const summary = mlopsStage3RunSummary
+    if (!summary) return [] as any[]
+    let rows: Array<Record<string, unknown>> = []
+    if (mlopsStage3TableViewDraft === 'metrics') {
+      const trainMetrics = (summary.train_metrics || {}) as Record<string, unknown>
+      const testMetrics = (summary.test_metrics || {}) as Record<string, unknown>
+      rows = uniqueFieldNames([...Object.keys(trainMetrics), ...Object.keys(testMetrics)]).map((name) => ({
+        metric: name,
+        train: trainMetrics[name] ?? null,
+        test: testMetrics[name] ?? null,
+      }))
+    } else if (mlopsStage3TableViewDraft === 'feature_importance') {
+      rows = Array.isArray(summary.feature_importance)
+        ? summary.feature_importance.map((item) => ({ ...(item as Record<string, unknown>) }))
+        : []
+    } else {
+      rows = Array.isArray(summary.sample_predictions)
+        ? summary.sample_predictions.map((item) => ({ ...(item as Record<string, unknown>) }))
+        : []
+    }
+    const first = rows.find((row) => row && typeof row === 'object')
+    const keys = first ? Object.keys(first) : []
+    return keys.map((key) => ({
+      title: key,
+      dataIndex: key,
+      key,
+      ellipsis: true,
+      render: (value: unknown) => {
+        if (value == null) return ''
+        if (typeof value === 'object') {
+          try { return JSON.stringify(value) } catch { return String(value) }
+        }
+        return String(value)
+      },
+    }))
+  }, [mlopsStage3RunSummary, mlopsStage3TableViewDraft])
+  const mlopsStage3TableRows = useMemo(() => {
+    const summary = mlopsStage3RunSummary
+    if (!summary) return [] as Array<Record<string, unknown>>
+    if (mlopsStage3TableViewDraft === 'metrics') {
+      const trainMetrics = (summary.train_metrics || {}) as Record<string, unknown>
+      const testMetrics = (summary.test_metrics || {}) as Record<string, unknown>
+      return uniqueFieldNames([...Object.keys(trainMetrics), ...Object.keys(testMetrics)]).map((name, idx) => ({
+        _key: `metric_${idx}_${name}`,
+        metric: name,
+        train: trainMetrics[name] ?? null,
+        test: testMetrics[name] ?? null,
+      }))
+    }
+    if (mlopsStage3TableViewDraft === 'feature_importance') {
+      return Array.isArray(summary.feature_importance)
+        ? summary.feature_importance.map((item, idx) => ({ _key: `fi_${idx}`, ...(item as Record<string, unknown>) }))
+        : []
+    }
+    return Array.isArray(summary.sample_predictions)
+      ? summary.sample_predictions.map((item, idx) => ({ _key: `pred_${idx}`, ...(item as Record<string, unknown>) }))
+      : []
+  }, [mlopsStage3RunSummary, mlopsStage3TableViewDraft])
+  useEffect(() => {
+    if (!mlopsStudioOpen || nodeType !== 'mlops_transform') return
+    const modelCatalog = MLOPS_STAGE3_MODEL_CATALOG[mlopsStage3TaskTypeDraft] || []
+    if (modelCatalog.length > 0 && !modelCatalog.includes(mlopsStage3ModelDraft)) {
+      setMLOpsStage3ModelDraft(modelCatalog[0])
+    }
+  }, [mlopsStudioOpen, nodeType, mlopsStage3TaskTypeDraft, mlopsStage3ModelDraft])
+  useEffect(() => {
+    if (!mlopsStudioOpen || nodeType !== 'mlops_transform') return
+    const allowed = new Set(mlopsStage3AvailableFields)
+    const cleaned = uniqueFieldNames(mlopsStage3FeatureFieldsDraft.filter((item) => allowed.has(item)))
+    if (cleaned.length !== mlopsStage3FeatureFieldsDraft.length) {
+      setMLOpsStage3FeatureFieldsDraft(cleaned)
+      return
+    }
+    if (cleaned.length <= 0 && mlopsStage3AvailableFields.length > 0) {
+      setMLOpsStage3FeatureFieldsDraft(mlopsStage3AvailableFields.slice(0, Math.min(8, mlopsStage3AvailableFields.length)))
+    }
+  }, [mlopsStudioOpen, nodeType, mlopsStage3FeatureFieldsDraft, mlopsStage3AvailableFields])
+  useEffect(() => {
+    if (!mlopsStudioOpen || nodeType !== 'mlops_transform') return
+    const allowed = new Set(mlopsStage3AvailableFields)
+    const cleaned = uniqueFieldNames(mlopsStage4MonitorNumericFieldsDraft.filter((item) => allowed.has(item)))
+    if (cleaned.length !== mlopsStage4MonitorNumericFieldsDraft.length) {
+      setMLOpsStage4MonitorNumericFieldsDraft(cleaned)
+      return
+    }
+    if (cleaned.length <= 0 && mlopsStage3AvailableFields.length > 0) {
+      setMLOpsStage4MonitorNumericFieldsDraft(mlopsStage3AvailableFields.slice(0, Math.min(8, mlopsStage3AvailableFields.length)))
+    }
+  }, [mlopsStudioOpen, nodeType, mlopsStage4MonitorNumericFieldsDraft, mlopsStage3AvailableFields])
+  useEffect(() => {
+    if (!mlopsStudioOpen || nodeType !== 'mlops_transform') return
+    if (mlopsStage3TargetFieldDraft) return
+    const autoTarget = String(mlopsStage2TargetFieldDraft || '').trim()
+    if (autoTarget) setMLOpsStage3TargetFieldDraft(autoTarget)
+  }, [mlopsStudioOpen, nodeType, mlopsStage3TargetFieldDraft, mlopsStage2TargetFieldDraft])
+  const mlopsStage2PreviewColumns = useMemo(() => {
+    const keys = new Set<string>()
+    mlopsStage2PreviewRows.slice(0, 300).forEach((row) => {
+      Object.keys(row || {}).forEach((key) => keys.add(String(key || '')))
+    })
+    return Array.from(keys)
+      .filter(Boolean)
+      .slice(0, 220)
+      .map((key) => ({
+        title: key,
+        dataIndex: key,
+        key,
+        width: 180,
+        ellipsis: true,
+        render: (value: unknown) => {
+          if (value == null) return ''
+          if (typeof value === 'object') {
+            try {
+              return JSON.stringify(value)
+            } catch {
+              return '[object]'
+            }
+          }
+          return String(value)
+        },
+      }))
+  }, [mlopsStage2PreviewRows])
+  const mlopsProfileColumns = useMemo(
+    () => {
+      const cols = (mlopsProfileResult?.profile?.columns || []) as Array<Record<string, unknown>>
+      return cols.map((item) => ({
+        name: String(item?.name || ''),
+        type: String(item?.type || ''),
+        missing_pct: Number(item?.missing_pct || 0),
+        unique_count: Number(item?.unique_count || 0),
+        suggested_operations: Array.isArray(item?.suggested_operations)
+          ? (item?.suggested_operations as unknown[]).map((v) => String(v || '')).filter(Boolean).slice(0, 3).join(', ')
+          : '',
+      }))
+    },
+    [mlopsProfileResult],
+  )
+  const resolvedMLOpsChartTheme = useMemo<'light' | 'dark'>(() => {
+    if (mlopsChartThemeDraft === 'light' || mlopsChartThemeDraft === 'dark') return mlopsChartThemeDraft
+    try {
+      const root = typeof document !== 'undefined' ? document.documentElement : null
+      const attrTheme = String(root?.getAttribute('data-theme') || '').toLowerCase()
+      const classTheme = String(root?.className || '').toLowerCase()
+      if (attrTheme.includes('dark') || classTheme.includes('dark')) return 'dark'
+      if (typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        return 'dark'
+      }
+    } catch {
+      // fall through to light
+    }
+    return 'light'
+  }, [mlopsChartThemeDraft])
+  const mlopsYDataVariables = useMemo(
+    () => (
+      Array.isArray(mlopsProfileResult?.ydata?.variables_preview)
+        ? (mlopsProfileResult?.ydata?.variables_preview as Array<Record<string, unknown>>)
+        : []
+    ),
+    [mlopsProfileResult],
+  )
+  const mlopsYDataSections = useMemo(() => {
+    const y = (mlopsProfileResult?.ydata || {}) as Record<string, unknown>
+    return {
+      dataset_understanding: (y.dataset_understanding || {}) as Record<string, unknown>,
+      data_quality_checks: (y.data_quality_checks || {}) as Record<string, unknown>,
+      feature_analysis: (y.feature_analysis || {}) as Record<string, unknown>,
+      anomaly_detection: (y.anomaly_detection || {}) as Record<string, unknown>,
+      preprocessing_insights: (y.preprocessing_insights || {}) as Record<string, unknown>,
+      ml_readiness_analysis: (y.ml_readiness_analysis || {}) as Record<string, unknown>,
+    }
+  }, [mlopsProfileResult])
+  const mlopsYDataFieldOptions = useMemo(
+    () =>
+      uniqueFieldNames(
+        [
+          ...mlopsYDataVariables.map((item) => String(item?.name || '').trim()),
+          ...mlopsProfileColumns.map((item) => String((item as any)?.name || '').trim()),
+        ].filter(Boolean),
+      ),
+    [mlopsYDataVariables, mlopsProfileColumns],
+  )
+  useEffect(() => {
+    if (!mlopsStudioOpen || nodeType !== 'mlops_transform') return
+    if (mlopsYDataFieldOptions.length <= 0) {
+      setMLOpsYDataActiveField('')
+      return
+    }
+    setMLOpsYDataActiveField((prev) => (mlopsYDataFieldOptions.includes(prev) ? prev : mlopsYDataFieldOptions[0]))
+  }, [mlopsStudioOpen, nodeType, mlopsYDataFieldOptions])
+  const mlopsYDataActiveMeta = useMemo(() => {
+    const target = String(mlopsYDataActiveField || '').trim()
+    if (!target) return null
+    return (
+      (mlopsYDataVariables.find((item) => String(item?.name || '').trim() === target) as Record<string, unknown> | undefined) || null
+    )
+  }, [mlopsYDataVariables, mlopsYDataActiveField])
+  const mlopsYDataVariableExplorer = useMemo(() => {
+    const fieldPath = String(mlopsYDataActiveField || '').trim()
+    const rowsSource = (
+      Array.isArray(mlopsProfileResult?.preview_rows) && (mlopsProfileResult?.preview_rows as Array<Record<string, unknown>>).length > 0
+    )
+      ? (mlopsProfileResult?.preview_rows as Array<Record<string, unknown>>)
+      : mlopsPreviewRows
+    if (!fieldPath || !Array.isArray(rowsSource) || rowsSource.length <= 0) {
+      return {
+        statsRows: [] as Array<{ key: string; metric: string; value: string }>,
+        plotData: [] as any[],
+        plotLayout: {} as Record<string, unknown>,
+        chartMessage: 'Select a field to view profile chart.',
+      }
+    }
+
+    const rawValues: unknown[] = []
+    rowsSource.forEach((row) => {
+      if (!row || typeof row !== 'object') return
+      const values = readPathValues(row as Record<string, unknown>, fieldPath)
+      values.forEach((value) => {
+        if (Array.isArray(value)) rawValues.push(...value)
+        else rawValues.push(value)
+      })
+    })
+    const values = rawValues.filter((value) => hasMeaningfulValue(value))
+    const scalar = (value: unknown): string | number | boolean => {
+      if (value === null || value === undefined) return ''
+      if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value
+      try {
+        return JSON.stringify(value)
+      } catch {
+        return String(value)
+      }
+    }
+    const scalarValues = values.map((value) => scalar(value))
+    const toNumber = (value: unknown): number | null => {
+      if (typeof value === 'number' && Number.isFinite(value)) return value
+      if (typeof value === 'string' && value.trim().length > 0) {
+        const parsed = Number(value)
+        if (Number.isFinite(parsed)) return parsed
+      }
+      return null
+    }
+    const numericValues = scalarValues
+      .map((value) => toNumber(value))
+      .filter((value): value is number => value !== null)
+    const toEpoch = (value: unknown): number | null => {
+      if (value instanceof Date) {
+        const ms = value.getTime()
+        return Number.isFinite(ms) ? ms : null
+      }
+      const text = String(value ?? '').trim()
+      if (!text) return null
+      const ms = Date.parse(text)
+      return Number.isFinite(ms) ? ms : null
+    }
+    const datetimeValues = scalarValues
+      .map((value) => toEpoch(value))
+      .filter((value): value is number => value !== null)
+
+    const totalCount = scalarValues.length
+    const numericRatio = totalCount > 0 ? numericValues.length / totalCount : 0
+    const datetimeRatio = totalCount > 0 ? datetimeValues.length / totalCount : 0
+    const metaType = String((mlopsYDataActiveMeta?.type as string) || '').toLowerCase()
+    const detectedType = metaType.includes('date')
+      ? 'datetime'
+      : metaType.includes('num')
+        ? 'numeric'
+        : numericRatio >= 0.8
+          ? 'numeric'
+          : datetimeRatio >= 0.8
+            ? 'datetime'
+            : 'categorical'
+
+    const distinctCount = (() => {
+      const seen = new Set<string>()
+      scalarValues.forEach((value) => seen.add(String(value)))
+      return seen.size
+    })()
+    const safeNum = (n: number): string => Number.isFinite(n) ? n.toFixed(6).replace(/\.?0+$/, '') : ''
+    const statsRows: Array<{ key: string; metric: string; value: string }> = [
+      { key: 'field', metric: 'Field', value: fieldPath },
+      { key: 'dtype', metric: 'Detected Type', value: detectedType },
+      { key: 'nonnull', metric: 'Non-null Count', value: String(totalCount) },
+      { key: 'distinct', metric: 'Distinct Count', value: String(distinctCount) },
+      { key: 'missing', metric: 'Missing %', value: mlopsYDataActiveMeta?.missing_pct == null ? '' : String(mlopsYDataActiveMeta.missing_pct) },
+      { key: 'suggested', metric: 'Profile Mean', value: mlopsYDataActiveMeta?.mean == null ? '' : String(mlopsYDataActiveMeta.mean) },
+      { key: 'std', metric: 'Profile Std', value: mlopsYDataActiveMeta?.std == null ? '' : String(mlopsYDataActiveMeta.std) },
+      { key: 'min', metric: 'Profile Min', value: mlopsYDataActiveMeta?.min == null ? '' : String(mlopsYDataActiveMeta.min) },
+      { key: 'max', metric: 'Profile Max', value: mlopsYDataActiveMeta?.max == null ? '' : String(mlopsYDataActiveMeta.max) },
+    ]
+
+    const lineColor = resolvedMLOpsChartTheme === 'dark' ? '#60a5fa' : '#2563eb'
+    const barColor = resolvedMLOpsChartTheme === 'dark' ? '#34d399' : '#0ea5e9'
+    const gridColor = resolvedMLOpsChartTheme === 'dark' ? '#374151' : '#e5e7eb'
+    const layoutBase: Record<string, unknown> = {
+      autosize: true,
+      showlegend: false,
+      paper_bgcolor: 'transparent',
+      plot_bgcolor: 'transparent',
+      margin: { l: 44, r: 10, t: 34, b: 48 },
+      font: { size: 11, color: 'var(--app-text)' },
+      xaxis: { gridcolor: gridColor },
+      yaxis: { gridcolor: gridColor },
+    }
+
+    if (detectedType === 'numeric' && numericValues.length > 0) {
+      const mean = numericValues.reduce((sum, v) => sum + v, 0) / numericValues.length
+      const variance = numericValues.reduce((acc, v) => acc + (v - mean) ** 2, 0) / Math.max(1, numericValues.length)
+      const std = Math.sqrt(variance)
+      statsRows.push({ key: 'calc_mean', metric: 'Sample Mean', value: safeNum(mean) })
+      statsRows.push({ key: 'calc_std', metric: 'Sample Std', value: safeNum(std) })
+      return {
+        statsRows,
+        plotData: [
+          {
+            type: 'histogram',
+            x: numericValues,
+            marker: { color: barColor, line: { width: 1, color: lineColor } },
+            nbinsx: 24,
+            opacity: 0.9,
+          },
+        ],
+        plotLayout: {
+          ...layoutBase,
+          title: { text: `${fieldPath} distribution`, x: 0, xanchor: 'left' },
+          xaxis: { ...(layoutBase.xaxis as Record<string, unknown>), title: { text: fieldPath } },
+          yaxis: { ...(layoutBase.yaxis as Record<string, unknown>), title: { text: 'count' } },
+        },
+        chartMessage: '',
+      }
+    }
+
+    if (detectedType === 'datetime' && datetimeValues.length > 0) {
+      const dayBucket = new Map<string, number>()
+      datetimeValues.forEach((ms) => {
+        const isoDay = new Date(ms).toISOString().slice(0, 10)
+        dayBucket.set(isoDay, (dayBucket.get(isoDay) || 0) + 1)
+      })
+      const points = Array.from(dayBucket.entries()).sort((a, b) => a[0].localeCompare(b[0]))
+      return {
+        statsRows,
+        plotData: [
+          {
+            type: 'scatter',
+            mode: 'lines+markers',
+            x: points.map((item) => item[0]),
+            y: points.map((item) => item[1]),
+            line: { color: lineColor, width: 2 },
+            marker: { color: barColor, size: 6 },
+          },
+        ],
+        plotLayout: {
+          ...layoutBase,
+          title: { text: `${fieldPath} timeline`, x: 0, xanchor: 'left' },
+          xaxis: { ...(layoutBase.xaxis as Record<string, unknown>), title: { text: 'date' } },
+          yaxis: { ...(layoutBase.yaxis as Record<string, unknown>), title: { text: 'count' } },
+        },
+        chartMessage: '',
+      }
+    }
+
+    if (scalarValues.length > 0) {
+      const counts = new Map<string, number>()
+      scalarValues.forEach((value) => {
+        const text = String(value)
+        counts.set(text, (counts.get(text) || 0) + 1)
+      })
+      const topValues = Array.from(counts.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 20)
+      return {
+        statsRows,
+        plotData: [
+          {
+            type: 'bar',
+            x: topValues.map((item) => item[1]),
+            y: topValues.map((item) => (item[0].length > 60 ? `${item[0].slice(0, 57)}...` : item[0])),
+            orientation: 'h',
+            marker: { color: barColor },
+          },
+        ],
+        plotLayout: {
+          ...layoutBase,
+          title: { text: `${fieldPath} top values`, x: 0, xanchor: 'left' },
+          xaxis: { ...(layoutBase.xaxis as Record<string, unknown>), title: { text: 'count' } },
+          yaxis: { ...(layoutBase.yaxis as Record<string, unknown>), automargin: true },
+        },
+        chartMessage: '',
+      }
+    }
+
+    return {
+      statsRows,
+      plotData: [] as any[],
+      plotLayout: {} as Record<string, unknown>,
+      chartMessage: 'No non-null values available for selected field.',
+    }
+  }, [mlopsYDataActiveField, mlopsProfileResult, mlopsPreviewRows, mlopsYDataActiveMeta, resolvedMLOpsChartTheme])
+  const mlopsStudioDraftSnapshot = useMemo(
+    () => ({
+      mlops_sample_size: mlopsSampleSizeDraft,
+      mlops_preview_rows: mlopsPreviewRowsDraft,
+      mlops_max_chart_columns: mlopsMaxChartColumnsDraft,
+      mlops_include_ydata: mlopsIncludeYDataDraft,
+      mlops_chart_types: mlopsChartTypesDraft,
+      mlops_chart_theme: mlopsChartThemeDraft,
+      mlops_stage2_preview_limit: mlopsStage2PreviewLimitDraft,
+      mlops_stage2_target_field: mlopsStage2TargetFieldDraft,
+      mlops_stage2_label_field: mlopsStage2LabelFieldDraft,
+      mlops_stage2_field_configs: mlopsStage2SerializedConfig,
+      mlops_stage3_task_type: mlopsStage3TaskTypeDraft,
+      mlops_stage3_model: mlopsStage3ModelDraft,
+      mlops_stage3_feature_fields: mlopsStage3SelectedFeatureFields,
+      mlops_stage3_target_field: mlopsStage3TaskTypeDraft === 'forecasting'
+        ? (mlopsStage3TargetFieldsDraft[0] || mlopsStage3TargetFieldDraft)
+        : mlopsStage3TargetFieldDraft,
+      mlops_stage3_target_fields: mlopsStage3TaskTypeDraft === 'forecasting'
+        ? uniqueFieldNames((mlopsStage3TargetFieldsDraft || []).map((item) => String(item || '').trim()).filter(Boolean))
+        : [],
+      mlops_stage3_forecast_date_field: mlopsStage3ForecastDateFieldDraft,
+      mlops_stage3_forecast_horizon: mlopsStage3ForecastHorizonDraft,
+      mlops_stage3_forecast_frequency: mlopsStage3ForecastFrequencyDraft,
+      mlops_stage3_forecast_auto_tune_orders: mlopsStage3ForecastAutoTuneOrdersDraft,
+      mlops_stage3_forecast_order_search_max_evals: mlopsStage3ForecastOrderSearchMaxEvalsDraft,
+      mlops_forecast_output_mode: mlopsForecastOutputModeDraft,
+      mlops_forecast_runtime_steps: mlopsForecastRuntimeStepsDraft,
+      mlops_stage3_arima_order: [mlopsStage3ARIMAPDraft, mlopsStage3ARIMADDraft, mlopsStage3ARIMAQDraft],
+      mlops_stage3_sarima_seasonal_order: [mlopsStage3SARIMAPPDraft, mlopsStage3SARIMAPDDraft, mlopsStage3SARIMAQDraft, mlopsStage3SARIMASDraft],
+      mlops_stage3_train_test_split: mlopsStage3TrainTestSplitDraft,
+      mlops_stage3_cv_folds: mlopsStage3CvFoldsDraft,
+      mlops_stage3_epochs: mlopsStage3EpochsDraft,
+      mlops_stage3_batch_size: mlopsStage3BatchSizeDraft,
+      mlops_stage3_random_seed: mlopsStage3RandomSeedDraft,
+      mlops_stage3_tuning_enabled: mlopsStage3TuningEnabledDraft,
+      mlops_stage3_tuning_method: mlopsStage3TuningMethodDraft,
+      mlops_stage3_tuning_params: serializeMLOpsStage3TuningParameters(mlopsStage3TuningParamsDraft),
+      mlops_stage3_tracking_enabled: mlopsStage3TrackingEnabledDraft,
+      mlops_stage3_track_versions: mlopsStage3TrackVersionsDraft,
+      mlops_stage3_track_params: mlopsStage3TrackParamsDraft,
+      mlops_stage3_track_metrics: mlopsStage3TrackMetricsDraft,
+      mlops_stage3_track_logs: mlopsStage3TrackLogsDraft,
+      mlops_stage3_run_name: mlopsStage3RunNameDraft,
+      mlops_mode: mlopsRuntimeModeDraft,
+      mlops_prediction_field: mlopsPredictionFieldDraft,
+      mlops_prediction_score_field: mlopsPredictionScoreFieldDraft,
+      mlops_stage3_model_bundle: mlopsStage3ModelBundleDraft,
+      mlops_stage4_gate_enabled: mlopsStage4GateEnabledDraft,
+      mlops_stage4_min_accuracy: mlopsStage4MinAccuracyDraft,
+      mlops_stage4_min_f1_score: mlopsStage4MinF1ScoreDraft,
+      mlops_stage4_max_rmse: mlopsStage4MaxRmseDraft,
+      mlops_stage4_max_mae: mlopsStage4MaxMaeDraft,
+      mlops_stage4_min_r2: mlopsStage4MinR2Draft,
+      mlops_stage4_min_silhouette_score: mlopsStage4MinSilhouetteDraft,
+      mlops_stage4_max_anomaly_ratio: mlopsStage4MaxAnomalyRatioDraft,
+      mlops_stage4_max_avg_drift_score: mlopsStage4MaxAvgDriftDraft,
+      mlops_stage4_deploy_enabled: mlopsStage4DeployEnabledDraft,
+      mlops_stage4_environment: mlopsStage4EnvironmentDraft,
+      mlops_stage4_endpoint_name: mlopsStage4EndpointNameDraft,
+      mlops_stage4_model_version: mlopsStage4ModelVersionDraft,
+      mlops_stage4_monitor_enabled: mlopsStage4MonitorEnabledDraft,
+      mlops_stage4_monitor_sample_size: mlopsStage4MonitorSampleSizeDraft,
+      mlops_stage4_monitor_numeric_fields: mlopsStage4SelectedMonitorFields,
+    }),
+    [
+      mlopsSampleSizeDraft,
+      mlopsPreviewRowsDraft,
+      mlopsMaxChartColumnsDraft,
+      mlopsIncludeYDataDraft,
+      mlopsChartTypesDraft,
+      mlopsChartThemeDraft,
+      mlopsStage2PreviewLimitDraft,
+      mlopsStage2TargetFieldDraft,
+      mlopsStage2LabelFieldDraft,
+      mlopsStage2SerializedConfig,
+      mlopsStage3TaskTypeDraft,
+      mlopsStage3ModelDraft,
+      mlopsStage3SelectedFeatureFields,
+      mlopsStage3TargetFieldDraft,
+      mlopsStage3TargetFieldsDraft,
+      mlopsStage3ForecastDateFieldDraft,
+      mlopsStage3ForecastHorizonDraft,
+      mlopsStage3ForecastFrequencyDraft,
+      mlopsStage3ForecastAutoTuneOrdersDraft,
+      mlopsStage3ForecastOrderSearchMaxEvalsDraft,
+      mlopsForecastOutputModeDraft,
+      mlopsForecastRuntimeStepsDraft,
+      mlopsStage3ARIMAPDraft,
+      mlopsStage3ARIMADDraft,
+      mlopsStage3ARIMAQDraft,
+      mlopsStage3SARIMAPPDraft,
+      mlopsStage3SARIMAPDDraft,
+      mlopsStage3SARIMAQDraft,
+      mlopsStage3SARIMASDraft,
+      mlopsStage3TrainTestSplitDraft,
+      mlopsStage3CvFoldsDraft,
+      mlopsStage3EpochsDraft,
+      mlopsStage3BatchSizeDraft,
+      mlopsStage3RandomSeedDraft,
+      mlopsStage3TuningEnabledDraft,
+      mlopsStage3TuningMethodDraft,
+      mlopsStage3TuningParamsDraft,
+      mlopsStage3TrackingEnabledDraft,
+      mlopsStage3TrackVersionsDraft,
+      mlopsStage3TrackParamsDraft,
+      mlopsStage3TrackMetricsDraft,
+      mlopsStage3TrackLogsDraft,
+      mlopsStage3RunNameDraft,
+      mlopsRuntimeModeDraft,
+      mlopsPredictionFieldDraft,
+      mlopsPredictionScoreFieldDraft,
+      mlopsStage3ModelBundleDraft,
+      mlopsStage4GateEnabledDraft,
+      mlopsStage4MinAccuracyDraft,
+      mlopsStage4MinF1ScoreDraft,
+      mlopsStage4MaxRmseDraft,
+      mlopsStage4MaxMaeDraft,
+      mlopsStage4MinR2Draft,
+      mlopsStage4MinSilhouetteDraft,
+      mlopsStage4MaxAnomalyRatioDraft,
+      mlopsStage4MaxAvgDriftDraft,
+      mlopsStage4DeployEnabledDraft,
+      mlopsStage4EnvironmentDraft,
+      mlopsStage4EndpointNameDraft,
+      mlopsStage4ModelVersionDraft,
+      mlopsStage4MonitorEnabledDraft,
+      mlopsStage4MonitorSampleSizeDraft,
+      mlopsStage4SelectedMonitorFields,
+    ],
+  )
+  const mlopsStudioHasUnsavedChanges = useMemo(() => {
+    if (!mlopsStudioOpen || nodeType !== 'mlops_transform') return false
+    const initial = mlopsStudioInitialConfigRef.current
+    if (!initial) return false
+    try {
+      return JSON.stringify(initial) !== JSON.stringify(mlopsStudioDraftSnapshot)
+    } catch {
+      return true
+    }
+  }, [mlopsStudioOpen, nodeType, mlopsStudioDraftSnapshot])
   const dataQueryStudioDraftSnapshot = useMemo(() => ({
     query_mode: dataQueryModeDraft,
     criteria: dataQueryCriteriaDraft,
@@ -8798,6 +10866,87 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     dataQueryProfilePatchNodeIdDraft,
     dataQueryProfilePatchNodeOptions,
   ])
+  const detectDataQuerySourceFieldOptions = useCallback(async () => {
+    if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform') return
+    if (dataQueryLocalPreviewRows.length > 0) {
+      setDataQueryRemoteFieldHints([])
+      setDataQueryRemotePreviewRows([])
+      setDataQueryRemoteDetectionError(null)
+      return
+    }
+    const sourceNodes = dataQueryUpstreamCandidateNodes
+      .filter((item) => String(item.nodeType || '').trim().toLowerCase().endsWith('_source'))
+      .slice(0, 25)
+    if (sourceNodes.length <= 0) {
+      setDataQueryRemoteFieldHints([])
+      setDataQueryRemotePreviewRows([])
+      setDataQueryRemoteDetectionError(null)
+      return
+    }
+    setDataQueryRemoteDetectionLoading(true)
+    setDataQueryRemoteDetectionError(null)
+    const rowsOut: Array<Record<string, unknown>> = []
+    const rowSeen = new Set<string>()
+    const fieldSet = new Set<string>()
+    try {
+      for (const sourceNode of sourceNodes) {
+        let response: any = null
+        try {
+          response = await api.detectSourceFieldOptions(
+            sourceNode.nodeType,
+            sourceNode.config || {},
+            5000,
+            {
+              previewRows: 300,
+              includeSchemaScan: true,
+              schemaScanLimit: 10000,
+              previewCompact: false,
+              timeoutMs: 45000,
+            },
+          )
+        } catch {
+          continue
+        }
+        const cols = parseFieldList(response?.columns)
+        cols.forEach((name) => fieldSet.add(name))
+        const previewRows = Array.isArray(response?.preview)
+          ? response.preview.filter((row: unknown) => !!row && typeof row === 'object' && !Array.isArray(row)) as Array<Record<string, unknown>>
+          : []
+        const discovered = uniqueFieldNames([
+          ...extractPriorityJsonFieldPaths(previewRows),
+          ...extractSampleFieldPaths(previewRows),
+        ])
+        discovered.forEach((name) => fieldSet.add(name))
+        for (const row of previewRows) {
+          if (rowsOut.length >= 1000) break
+          let sig = ''
+          try {
+            sig = JSON.stringify(row) || ''
+          } catch {
+            sig = ''
+          }
+          if (sig && rowSeen.has(sig)) continue
+          if (sig) rowSeen.add(sig)
+          rowsOut.push(row)
+        }
+      }
+      setDataQueryRemoteFieldHints(uniqueFieldNames(Array.from(fieldSet)))
+      setDataQueryRemotePreviewRows(rowsOut.slice(0, 1000))
+    } catch (err: any) {
+      setDataQueryRemoteDetectionError(String(err?.message || 'Failed to detect source field options for Data Query.'))
+    } finally {
+      setDataQueryRemoteDetectionLoading(false)
+    }
+  }, [
+    dataQueryStudioOpen,
+    nodeType,
+    dataQueryLocalPreviewRows,
+    dataQueryUpstreamCandidateNodes,
+  ])
+  useEffect(() => {
+    if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform') return
+    void detectDataQuerySourceFieldOptions()
+  }, [dataQueryStudioOpen, nodeType, detectDataQuerySourceFieldOptions])
   const conditionRoutingModeConfigured = useMemo<'boolean' | 'case'>(
     () => (String(nodeConfig.condition_routing_mode || 'boolean').trim().toLowerCase() === 'case' ? 'case' : 'boolean'),
     [nodeConfig.condition_routing_mode]
@@ -8861,6 +11010,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       setDataQueryShowQuickPicker(false)
     }
   }, [dataQueryStudioOpen])
+  useEffect(() => {
+    if (!mlopsStudioOpen) {
+      setMLOpsProfileLoading(false)
+      setMLOpsProfileError(null)
+    }
+  }, [mlopsStudioOpen])
   useEffect(() => {
     if (nodeType !== 'condition_node' || !selectedNodeId || conditionStudioOpen) return
     const rawMode = String(nodeConfig.condition_validation_source || 'upstream_preview').trim().toLowerCase()
@@ -10718,6 +12873,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setDataQueryFieldSearchQuery('')
     setDataQueryTreeExpandedKeys([])
     setDataQueryShowQuickPicker(false)
+    setDataQueryRemoteFieldHints([])
+    setDataQueryRemotePreviewRows([])
+    setDataQueryRemoteDetectionError(null)
     setDataQueryPreviewSummary({
       ran: false,
       inputRows: 0,
@@ -10815,6 +12973,1298 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     dataQueryStudioOpen,
     dataQueryStudioHasUnsavedChanges,
     saveDataQueryStudioConfig,
+  ])
+
+  const runMLOpsStage1Profile = useCallback(async () => {
+    if (nodeType !== 'mlops_transform' || !selectedNodeId) return
+    const inputRows = mlopsPreviewRows.slice(0, 5000)
+    if (inputRows.length === 0) {
+      setMLOpsProfileError('No Data Query output rows detected. Run the pipeline once with Data Query connected directly to MLOps.')
+      setMLOpsProfileResult(null)
+      return
+    }
+    setMLOpsProfileLoading(true)
+    setMLOpsProfileError(null)
+    try {
+      const response = await api.getMLOpsNodeStage1Profile({
+        rows: inputRows,
+        sample_size: mlopsSampleSizeDraft,
+        preview_rows: mlopsPreviewRowsDraft,
+        max_chart_columns: mlopsMaxChartColumnsDraft,
+        include_ydata: mlopsIncludeYDataDraft,
+        chart_types: uniqueFieldNames(mlopsChartTypesDraft),
+        chart_theme: resolvedMLOpsChartTheme,
+      })
+      setMLOpsProfileResult((response || {}) as MLOpsStage1ProfileResult)
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to profile incoming rows')
+      setMLOpsProfileError(message)
+      setMLOpsProfileResult(null)
+    } finally {
+      setMLOpsProfileLoading(false)
+    }
+  }, [
+    nodeType,
+    selectedNodeId,
+    mlopsPreviewRows,
+    mlopsSampleSizeDraft,
+    mlopsPreviewRowsDraft,
+    mlopsMaxChartColumnsDraft,
+    mlopsIncludeYDataDraft,
+    mlopsChartTypesDraft,
+    resolvedMLOpsChartTheme,
+  ])
+
+  const updateMLOpsStage2FieldConfig = useCallback((
+    fieldPath: string,
+    patch: Partial<MLOpsStage2FieldConfig>,
+  ) => {
+    const key = String(fieldPath || '').trim()
+    if (!key) return
+    setMLOpsStage2FieldConfigsByFieldDraft((prev) => {
+      const current = createMLOpsStage2FieldConfig(prev[key] || { field_path: key, enabled: false })
+      const next = createMLOpsStage2FieldConfig({
+        ...current,
+        ...patch,
+        field_path: key,
+      })
+      return {
+        ...prev,
+        [key]: next,
+      }
+    })
+  }, [])
+
+  const runMLOpsStage2Preview = useCallback(() => {
+    if (nodeType !== 'mlops_transform' || !selectedNodeId) return
+    const inputRows = mlopsPreviewRows
+      .slice(0, 5000)
+      .filter((row) => row && typeof row === 'object') as Array<Record<string, unknown>>
+    if (inputRows.length <= 0) {
+      setMLOpsStage2PreviewError('No rows available. Connect Data Query output to MLOps and run pipeline once.')
+      setMLOpsStage2PreviewRows([])
+      setMLOpsStage2ArtifactDraft(null)
+      setMLOpsStage2PreviewSummary({
+        ran: true,
+        inputRows: 0,
+        outputRows: 0,
+        droppedRows: 0,
+        configuredFields: 0,
+        generatedColumns: 0,
+      })
+      return
+    }
+    const configs = mlopsStage2SerializedConfig.filter((item) => item.enabled)
+    if (configs.length <= 0) {
+      setMLOpsStage2PreviewError('No enabled fields selected. Enable at least one field to run Stage 2 preview.')
+      setMLOpsStage2PreviewRows([])
+      setMLOpsStage2ArtifactDraft(null)
+      setMLOpsStage2PreviewSummary({
+        ran: true,
+        inputRows: inputRows.length,
+        outputRows: 0,
+        droppedRows: inputRows.length,
+        configuredFields: 0,
+        generatedColumns: 0,
+      })
+      return
+    }
+
+    const safeLimit = Number.isFinite(mlopsStage2PreviewLimitDraft)
+      ? Math.max(10, Math.min(Math.trunc(mlopsStage2PreviewLimitDraft), 5000))
+      : 200
+    setMLOpsStage2PreviewLoading(true)
+    setMLOpsStage2PreviewError(null)
+    try {
+      const extractFieldValue = (row: Record<string, unknown>, path: string): unknown => {
+        const values = readPathValues(row, path)
+        if (Array.isArray(values) && values.length > 0) return mlopsStage2ToScalar(values[0])
+        const hit = readPathValue(row, path)
+        if (hit.found) return mlopsStage2ToScalar(hit.value)
+        if (Object.prototype.hasOwnProperty.call(row, path)) return mlopsStage2ToScalar(row[path])
+        return null
+      }
+      const categoryKey = (value: unknown): string => {
+        if (value == null) return '__NULL__'
+        return String(value).trim()
+      }
+      const sanitizeColumnToken = (value: string): string => {
+        const text = String(value || '').trim()
+        if (!text) return 'value'
+        return text
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '_')
+          .replace(/^_+|_+$/g, '')
+          .slice(0, 48) || 'value'
+      }
+
+      const rowKeepMask = new Array(inputRows.length).fill(true)
+      const removeColumns = new Set<string>()
+      const derivedColumns: Record<string, unknown[]> = {}
+      const fieldValues: Record<string, unknown[]> = {}
+      const targetFieldPath = String(mlopsStage2TargetFieldDraft || '').trim()
+      const labelFieldPath = String(mlopsStage2LabelFieldDraft || '').trim()
+      const targetMode = targetFieldPath || labelFieldPath ? 'supervised' : 'frequency_fallback'
+      configs.forEach((cfg) => {
+        fieldValues[cfg.field_path] = inputRows.map((row) => extractFieldValue(row, cfg.field_path))
+      })
+
+      const hasDuplicateRemoval = configs.some((cfg) => cfg.cleaning.includes('duplicate_removal'))
+      configs.forEach((cfg) => {
+        const field = cfg.field_path
+        const values = [...(fieldValues[field] || [])]
+        if (values.length <= 0) return
+
+        // Cleaning
+        if (cfg.cleaning.includes('invalid_value_correction')) {
+          for (let i = 0; i < values.length; i += 1) {
+            const v = values[i]
+            if (v == null) continue
+            const text = String(v || '').trim().toLowerCase()
+            if (!text || ['na', 'n/a', 'null', 'none', 'nan', 'undefined', '-'].includes(text)) values[i] = null
+          }
+        }
+        if (cfg.cleaning.includes('standardization')) {
+          for (let i = 0; i < values.length; i += 1) {
+            const v = values[i]
+            if (typeof v === 'string') values[i] = v.trim().replace(/\s+/g, ' ')
+          }
+        }
+        if (cfg.cleaning.includes('noise_removal')) {
+          for (let i = 0; i < values.length; i += 1) {
+            const v = values[i]
+            if (typeof v === 'string') values[i] = v.replace(/[^\x20-\x7E]+/g, '')
+          }
+        }
+        if (cfg.cleaning.includes('schema_datatype_correction')) {
+          for (let i = 0; i < values.length; i += 1) {
+            const v = values[i]
+            if (v == null) continue
+            const num = mlopsStage2ToNumber(v)
+            if (num != null) {
+              values[i] = num
+              continue
+            }
+            const text = String(v || '').trim()
+            if (!text) continue
+            const dateMs = Date.parse(text)
+            if (!Number.isNaN(dateMs)) {
+              values[i] = new Date(dateMs).toISOString()
+            }
+          }
+        }
+
+        // Missing values
+        if (cfg.missing_values.includes('column_removal')) removeColumns.add(field)
+        const missingIndices = values
+          .map((value, index) => (mlopsStage2IsMissing(value) ? index : -1))
+          .filter((index) => index >= 0)
+        const numericSeries = values
+          .map((value) => mlopsStage2ToNumber(value))
+          .filter((value): value is number => value != null)
+        const nonMissingValues = values
+          .map((value) => (mlopsStage2IsMissing(value) ? null : value))
+          .filter((value) => value != null) as unknown[]
+        if (cfg.missing_values.includes('mean_imputation') && numericSeries.length > 0) {
+          const mean = numericSeries.reduce((sum, item) => sum + item, 0) / numericSeries.length
+          missingIndices.forEach((idx) => { values[idx] = mean })
+        }
+        if (cfg.missing_values.includes('median_imputation') && numericSeries.length > 0) {
+          const median = mlopsStage2Quantile(numericSeries, 0.5)
+          missingIndices.forEach((idx) => { values[idx] = median })
+        }
+        if (cfg.missing_values.includes('mode_imputation') && nonMissingValues.length > 0) {
+          const countMap = new Map<string, { value: unknown; count: number }>()
+          nonMissingValues.forEach((value) => {
+            const key = categoryKey(value)
+            const hit = countMap.get(key)
+            if (hit) hit.count += 1
+            else countMap.set(key, { value, count: 1 })
+          })
+          const mode = Array.from(countMap.values()).sort((a, b) => b.count - a.count)[0]?.value
+          if (mode != null) missingIndices.forEach((idx) => { values[idx] = mode })
+        }
+        if (cfg.missing_values.includes('forward_fill')) {
+          let carry: unknown = null
+          for (let i = 0; i < values.length; i += 1) {
+            if (mlopsStage2IsMissing(values[i])) {
+              if (!mlopsStage2IsMissing(carry)) values[i] = carry
+            } else {
+              carry = values[i]
+            }
+          }
+        }
+        if (cfg.missing_values.includes('backward_fill')) {
+          let carry: unknown = null
+          for (let i = values.length - 1; i >= 0; i -= 1) {
+            if (mlopsStage2IsMissing(values[i])) {
+              if (!mlopsStage2IsMissing(carry)) values[i] = carry
+            } else {
+              carry = values[i]
+            }
+          }
+        }
+        if (cfg.missing_values.includes('row_removal')) {
+          for (let i = 0; i < values.length; i += 1) {
+            if (mlopsStage2IsMissing(values[i])) rowKeepMask[i] = false
+          }
+        }
+
+        // Encoding
+        if (cfg.encoding.includes('rare_category_grouping')) {
+          const counts = new Map<string, number>()
+          values.forEach((value) => {
+            if (mlopsStage2IsMissing(value)) return
+            const key = categoryKey(value)
+            counts.set(key, (counts.get(key) || 0) + 1)
+          })
+          const total = Math.max(Array.from(counts.values()).reduce((sum, n) => sum + n, 0), 1)
+          const threshold = Math.max(2, Math.ceil(total * 0.02))
+          for (let i = 0; i < values.length; i += 1) {
+            if (mlopsStage2IsMissing(values[i])) continue
+            const key = categoryKey(values[i])
+            const count = counts.get(key) || 0
+            if (count < threshold) values[i] = 'OTHER'
+          }
+        }
+        if (cfg.encoding.includes('one_hot_encoding')) {
+          const categoryList = uniqueFieldNames(
+            values
+              .map((value) => (mlopsStage2IsMissing(value) ? '' : String(value)))
+              .filter(Boolean)
+          ).slice(0, 30)
+          categoryList.forEach((category) => {
+            const colKey = `${field}__${sanitizeColumnToken(category)}`
+            derivedColumns[colKey] = values.map((value) => {
+              if (mlopsStage2IsMissing(value)) return 0
+              return String(value) === category ? 1 : 0
+            })
+          })
+        }
+        if (cfg.encoding.includes('ordinal_encoding')) {
+          const categories = uniqueFieldNames(
+            values
+              .map((value) => (mlopsStage2IsMissing(value) ? '' : String(value)))
+              .filter(Boolean)
+          ).sort((a, b) => a.localeCompare(b))
+          const rank = new Map<string, number>()
+          categories.forEach((item, idx) => rank.set(item, idx))
+          for (let i = 0; i < values.length; i += 1) {
+            if (mlopsStage2IsMissing(values[i])) continue
+            values[i] = rank.get(String(values[i])) ?? null
+          }
+        }
+        if (cfg.encoding.includes('label_encoding')) {
+          const categories = uniqueFieldNames(
+            values
+              .map((value) => (mlopsStage2IsMissing(value) ? '' : String(value)))
+              .filter(Boolean)
+          )
+          const rank = new Map<string, number>()
+          categories.forEach((item, idx) => rank.set(item, idx))
+          for (let i = 0; i < values.length; i += 1) {
+            if (mlopsStage2IsMissing(values[i])) continue
+            values[i] = rank.get(String(values[i])) ?? null
+          }
+        }
+        if (cfg.encoding.includes('target_encoding')) {
+          const supervisedTargetPath = targetFieldPath || labelFieldPath
+          const targetSeries = supervisedTargetPath
+            ? inputRows.map((row) => mlopsStage2ToNumber(extractFieldValue(row, supervisedTargetPath)))
+            : []
+          const hasSupervisedTarget = targetSeries.some((item) => item != null)
+          if (hasSupervisedTarget) {
+            const sums = new Map<string, number>()
+            const counts = new Map<string, number>()
+            for (let i = 0; i < values.length; i += 1) {
+              const categoryValue = values[i]
+              const targetValue = targetSeries[i]
+              if (mlopsStage2IsMissing(categoryValue) || targetValue == null) continue
+              const key = categoryKey(categoryValue)
+              sums.set(key, (sums.get(key) || 0) + targetValue)
+              counts.set(key, (counts.get(key) || 0) + 1)
+            }
+            const globalTargets = targetSeries.filter((item): item is number => item != null)
+            const globalMean = globalTargets.length > 0
+              ? globalTargets.reduce((sum, item) => sum + item, 0) / globalTargets.length
+              : 0
+            for (let i = 0; i < values.length; i += 1) {
+              if (mlopsStage2IsMissing(values[i])) continue
+              const key = categoryKey(values[i])
+              const count = counts.get(key) || 0
+              const sum = sums.get(key) || 0
+              values[i] = count > 0 ? (sum / count) : globalMean
+            }
+          } else {
+            const counts = new Map<string, number>()
+            values.forEach((value) => {
+              if (mlopsStage2IsMissing(value)) return
+              const key = categoryKey(value)
+              counts.set(key, (counts.get(key) || 0) + 1)
+            })
+            const total = Math.max(Array.from(counts.values()).reduce((sum, n) => sum + n, 0), 1)
+            for (let i = 0; i < values.length; i += 1) {
+              if (mlopsStage2IsMissing(values[i])) continue
+              const key = categoryKey(values[i])
+              values[i] = (counts.get(key) || 0) / total
+            }
+          }
+        }
+
+        // Scaling & transformation
+        const numericAfterEncoding = values.map((value) => mlopsStage2ToNumber(value))
+        const numericSeriesAfter = numericAfterEncoding.filter((value): value is number => value != null)
+        if (cfg.scaling.includes('outlier_clipping') && numericSeriesAfter.length > 0) {
+          const q1 = mlopsStage2Quantile(numericSeriesAfter, 0.25)
+          const q3 = mlopsStage2Quantile(numericSeriesAfter, 0.75)
+          const iqr = q3 - q1
+          const low = q1 - 1.5 * iqr
+          const high = q3 + 1.5 * iqr
+          for (let i = 0; i < values.length; i += 1) {
+            const num = mlopsStage2ToNumber(values[i])
+            if (num == null) continue
+            values[i] = Math.min(high, Math.max(low, num))
+          }
+        }
+        const numericForScaling = values.map((value) => mlopsStage2ToNumber(value))
+        const numericSeriesFinal = numericForScaling.filter((value): value is number => value != null)
+        if (cfg.scaling.includes('log_transformation')) {
+          for (let i = 0; i < values.length; i += 1) {
+            const num = mlopsStage2ToNumber(values[i])
+            if (num == null) continue
+            values[i] = num >= 0 ? Math.log1p(num) : -Math.log1p(Math.abs(num))
+          }
+        }
+        if (cfg.scaling.includes('standard_scaling') && numericSeriesFinal.length > 0) {
+          const mean = numericSeriesFinal.reduce((sum, item) => sum + item, 0) / numericSeriesFinal.length
+          const variance = numericSeriesFinal.reduce((sum, item) => sum + ((item - mean) ** 2), 0) / numericSeriesFinal.length
+          const std = Math.sqrt(variance)
+          for (let i = 0; i < values.length; i += 1) {
+            const num = mlopsStage2ToNumber(values[i])
+            if (num == null) continue
+            values[i] = std > 0 ? (num - mean) / std : 0
+          }
+        }
+        if (cfg.scaling.includes('min_max_scaling') && numericSeriesFinal.length > 0) {
+          const min = Math.min(...numericSeriesFinal)
+          const max = Math.max(...numericSeriesFinal)
+          const delta = max - min
+          for (let i = 0; i < values.length; i += 1) {
+            const num = mlopsStage2ToNumber(values[i])
+            if (num == null) continue
+            values[i] = delta > 0 ? (num - min) / delta : 0
+          }
+        }
+        if (cfg.scaling.includes('robust_scaling') && numericSeriesFinal.length > 0) {
+          const median = mlopsStage2Quantile(numericSeriesFinal, 0.5)
+          const q1 = mlopsStage2Quantile(numericSeriesFinal, 0.25)
+          const q3 = mlopsStage2Quantile(numericSeriesFinal, 0.75)
+          const iqr = q3 - q1
+          for (let i = 0; i < values.length; i += 1) {
+            const num = mlopsStage2ToNumber(values[i])
+            if (num == null) continue
+            values[i] = iqr > 0 ? (num - median) / iqr : 0
+          }
+        }
+        fieldValues[field] = values
+      })
+
+      if (hasDuplicateRemoval) {
+        const dedupeFields = configs.map((cfg) => cfg.field_path)
+        const seen = new Set<string>()
+        for (let i = 0; i < inputRows.length; i += 1) {
+          if (!rowKeepMask[i]) continue
+          const signature = dedupeFields.map((path) => {
+            const value = fieldValues[path]?.[i]
+            try {
+              return JSON.stringify(value)
+            } catch {
+              return String(value)
+            }
+          }).join('|')
+          if (seen.has(signature)) rowKeepMask[i] = false
+          else seen.add(signature)
+        }
+      }
+
+      const outRows: Array<Record<string, unknown>> = []
+      for (let i = 0; i < inputRows.length; i += 1) {
+        if (!rowKeepMask[i]) continue
+        const out: Record<string, unknown> = {}
+        configs.forEach((cfg) => {
+          if (removeColumns.has(cfg.field_path)) return
+          out[cfg.field_path] = fieldValues[cfg.field_path]?.[i] ?? null
+        })
+        Object.entries(derivedColumns).forEach(([col, values]) => {
+          out[col] = values?.[i] ?? null
+        })
+        if (Object.keys(out).length > 0) outRows.push(out)
+      }
+
+      const previewRows = outRows.slice(0, safeLimit)
+      const artifact: Record<string, unknown> = {
+        stage: 'pre_processing',
+        version: 'mlops-stage2-v1',
+        generated_at: new Date().toISOString(),
+        input_rows: inputRows.length,
+        output_rows: outRows.length,
+        dropped_rows: Math.max(0, inputRows.length - outRows.length),
+        preview_limit: safeLimit,
+        configured_fields: configs.length,
+        target_field: targetFieldPath || null,
+        label_field: labelFieldPath || null,
+        target_encoding_mode: targetMode,
+        derived_columns: Object.keys(derivedColumns),
+        operations: configs.map((cfg) => ({
+          field_path: cfg.field_path,
+          cleaning: cfg.cleaning,
+          missing_values: cfg.missing_values,
+          encoding: cfg.encoding,
+          scaling: cfg.scaling,
+        })),
+      }
+
+      setMLOpsStage2PreviewRows(previewRows)
+      setMLOpsStage2ArtifactDraft(artifact)
+      setMLOpsStage2PreviewSummary({
+        ran: true,
+        inputRows: inputRows.length,
+        outputRows: outRows.length,
+        droppedRows: Math.max(0, inputRows.length - outRows.length),
+        configuredFields: configs.length,
+        generatedColumns: Object.keys(derivedColumns).length,
+      })
+    } catch (err: any) {
+      setMLOpsStage2PreviewRows([])
+      setMLOpsStage2ArtifactDraft(null)
+      setMLOpsStage2PreviewSummary({
+        ran: true,
+        inputRows: inputRows.length,
+        outputRows: 0,
+        droppedRows: inputRows.length,
+        configuredFields: configs.length,
+        generatedColumns: 0,
+      })
+      setMLOpsStage2PreviewError(String(err?.message || 'Failed to run preprocessing preview'))
+    } finally {
+      setMLOpsStage2PreviewLoading(false)
+    }
+  }, [
+    nodeType,
+    selectedNodeId,
+    mlopsPreviewRows,
+    mlopsStage2SerializedConfig,
+    mlopsStage2PreviewLimitDraft,
+    mlopsStage2TargetFieldDraft,
+    mlopsStage2LabelFieldDraft,
+  ])
+
+  const runMLOpsStage3Test = useCallback(async () => {
+    if (nodeType !== 'mlops_transform' || !selectedNodeId) return
+
+    const rowsForTraining = (
+      mlopsStage2PreviewRows.length > 0
+        ? mlopsStage2PreviewRows
+        : mlopsPreviewRows
+    )
+      .slice(0, 50000)
+      .filter((row) => row && typeof row === 'object') as Array<Record<string, unknown>>
+
+    if (rowsForTraining.length <= 0) {
+      setMLOpsStage3RunError('No rows available for training test. Connect Data Query output and run pipeline once.')
+      setMLOpsStage3RunSummary(null)
+      return
+    }
+
+    const taskType = mlopsStage3TaskTypeDraft
+    const featureFields = uniqueFieldNames(
+      (mlopsStage3SelectedFeatureFields.length > 0
+        ? mlopsStage3SelectedFeatureFields
+        : mlopsStage3AvailableFields
+      )
+        .map((item) => String(item || '').trim())
+        .filter(Boolean),
+    )
+    if (taskType !== 'forecasting' && featureFields.length <= 0) {
+      setMLOpsStage3RunError('No feature fields selected. Select at least one field from Pre-Processing output.')
+      setMLOpsStage3RunSummary(null)
+      return
+    }
+
+    const forecastTargets = uniqueFieldNames(
+      (mlopsStage3TargetFieldsDraft || []).map((item) => String(item || '').trim()).filter(Boolean),
+    )
+    const targetField = String(
+      (taskType === 'forecasting' ? (forecastTargets[0] || mlopsStage3TargetFieldDraft) : mlopsStage3TargetFieldDraft) || '',
+    ).trim()
+    const targetRequired = taskType === 'classification' || taskType === 'regression' || taskType === 'forecasting'
+    if (targetRequired && !targetField && !(taskType === 'forecasting' && forecastTargets.length > 0)) {
+      setMLOpsStage3RunError('Target / Label field is required for selected task type.')
+      setMLOpsStage3RunSummary(null)
+      return
+    }
+
+    setMLOpsStage3RunLoading(true)
+    setMLOpsStage3RunError(null)
+    try {
+      const response = await api.getMLOpsNodeStage3Train({
+        rows: rowsForTraining,
+        task_type: taskType,
+        model: String(mlopsStage3ModelDraft || '').trim(),
+        feature_fields: featureFields,
+        target_field: targetField || undefined,
+        target_fields: taskType === 'forecasting' ? forecastTargets : undefined,
+        forecast_date_field: String(mlopsStage3ForecastDateFieldDraft || '').trim() || undefined,
+        forecast_horizon: Math.max(1, Math.min(Math.trunc(Number(mlopsStage3ForecastHorizonDraft || 30)), 3650)),
+        forecast_frequency: mlopsStage3ForecastFrequencyDraft,
+        arima_order: [
+          Math.max(0, Math.min(Math.trunc(Number(mlopsStage3ARIMAPDraft || 0)), 24)),
+          Math.max(0, Math.min(Math.trunc(Number(mlopsStage3ARIMADDraft || 0)), 24)),
+          Math.max(0, Math.min(Math.trunc(Number(mlopsStage3ARIMAQDraft || 0)), 24)),
+        ],
+        sarima_seasonal_order: [
+          Math.max(0, Math.min(Math.trunc(Number(mlopsStage3SARIMAPPDraft || 0)), 24)),
+          Math.max(0, Math.min(Math.trunc(Number(mlopsStage3SARIMAPDDraft || 0)), 24)),
+          Math.max(0, Math.min(Math.trunc(Number(mlopsStage3SARIMAQDraft || 0)), 24)),
+          Math.max(0, Math.min(Math.trunc(Number(mlopsStage3SARIMASDraft || 0)), 3660)),
+        ],
+        forecast_auto_tune_orders: taskType === 'forecasting' ? Boolean(mlopsStage3ForecastAutoTuneOrdersDraft) : undefined,
+        forecast_order_search_max_evals: taskType === 'forecasting'
+          ? Math.max(1, Math.min(Math.trunc(Number(mlopsStage3ForecastOrderSearchMaxEvalsDraft || 16)), 64))
+          : undefined,
+        train_test_split: Math.max(0.05, Math.min(Number(mlopsStage3TrainTestSplitDraft || 0.2), 0.5)),
+        cv_folds: Math.max(2, Math.min(Math.trunc(Number(mlopsStage3CvFoldsDraft || 5)), 20)),
+        epochs: Math.max(1, Math.trunc(Number(mlopsStage3EpochsDraft || 20))),
+        batch_size: Math.max(1, Math.trunc(Number(mlopsStage3BatchSizeDraft || 32))),
+        random_seed: Math.trunc(Number(mlopsStage3RandomSeedDraft || 42)),
+        tuning_enabled: Boolean(mlopsStage3TuningEnabledDraft),
+        tuning_method: mlopsStage3TuningMethodDraft,
+        tuning_params: serializeMLOpsStage3TuningParameters(mlopsStage3TuningParamsDraft)
+          .filter((item) => item.name)
+          .map((item) => ({ name: item.name, values: item.values })),
+        tracking_enabled: Boolean(mlopsStage3TrackingEnabledDraft),
+        run_name: String(mlopsStage3RunNameDraft || '').trim() || undefined,
+      })
+
+      const backendSummary = (response?.summary || response || {}) as Record<string, unknown>
+      const summary: MLOpsStage3RunSummary = {
+        ran: Boolean(backendSummary.ran ?? true),
+        executed_at: String(backendSummary.executed_at || new Date().toISOString()),
+        mode: String(backendSummary.mode || 'real_train') === 'real_train' ? 'real_train' : 'dry_run',
+        task_type: (String(backendSummary.task_type || taskType) as MLOpsStage3TaskType),
+        model: String(backendSummary.model || mlopsStage3ModelDraft || 'default'),
+        input_rows: Number(backendSummary.input_rows || rowsForTraining.length),
+        usable_rows: Number(backendSummary.usable_rows || 0),
+        dropped_rows: Number(backendSummary.dropped_rows || 0),
+        feature_count: Number(backendSummary.feature_count || featureFields.length),
+        feature_fields: Array.isArray(backendSummary.feature_fields)
+          ? (backendSummary.feature_fields as unknown[]).map((item) => String(item || '')).filter(Boolean)
+          : featureFields,
+        target_field: backendSummary.target_field == null ? null : String(backendSummary.target_field),
+        target_fields: Array.isArray(backendSummary.target_fields)
+          ? (backendSummary.target_fields as unknown[]).map((item) => String(item || '').trim()).filter(Boolean)
+          : (taskType === 'forecasting' ? forecastTargets : []),
+        multi_target: Boolean(backendSummary.multi_target ?? (taskType === 'forecasting' && forecastTargets.length > 1)),
+        train_rows: Number(backendSummary.train_rows || 0),
+        validate_rows: Number(backendSummary.validate_rows || 0),
+        test_rows: Number(backendSummary.test_rows || 0),
+        forecast_horizon: Number(backendSummary.forecast_horizon || mlopsStage3ForecastHorizonDraft || 0),
+        forecast_frequency: String(backendSummary.forecast_frequency || mlopsStage3ForecastFrequencyDraft || ''),
+        auto_tune_orders: Boolean(backendSummary.auto_tune_orders ?? mlopsStage3ForecastAutoTuneOrdersDraft),
+        order_search_budget: Number(backendSummary.order_search_budget || mlopsStage3ForecastOrderSearchMaxEvalsDraft || 0),
+        cv_folds: Number(backendSummary.cv_folds || Math.max(2, Math.min(Math.trunc(Number(mlopsStage3CvFoldsDraft || 5)), 20))),
+        epochs: Number(backendSummary.epochs || Math.max(1, Math.trunc(Number(mlopsStage3EpochsDraft || 20)))),
+        batch_size: Number(backendSummary.batch_size || Math.max(1, Math.trunc(Number(mlopsStage3BatchSizeDraft || 32)))),
+        random_seed: Number(backendSummary.random_seed || Math.trunc(Number(mlopsStage3RandomSeedDraft || 42))),
+        tuning_enabled: Boolean(backendSummary.tuning_enabled ?? mlopsStage3TuningEnabledDraft),
+        tuning_method: backendSummary.tuning_method == null ? null : (String(backendSummary.tuning_method) as MLOpsStage3TuningMethod),
+        tuning_params: Array.isArray(backendSummary.tuning_params)
+          ? (backendSummary.tuning_params as Array<{ name?: string; values?: string }>).map((item) => ({
+            name: String(item?.name || ''),
+            values: String(item?.values || ''),
+          })).filter((item) => item.name)
+          : [],
+        tracking_enabled: Boolean(backendSummary.tracking_enabled ?? mlopsStage3TrackingEnabledDraft),
+        notes: Array.isArray(backendSummary.notes)
+          ? (backendSummary.notes as unknown[]).map((item) => String(item || '')).filter(Boolean)
+          : [],
+        target_overview: backendSummary.target_overview && typeof backendSummary.target_overview === 'object'
+          ? backendSummary.target_overview as Record<string, unknown>
+          : null,
+        train_metrics: backendSummary.train_metrics && typeof backendSummary.train_metrics === 'object'
+          ? backendSummary.train_metrics as Record<string, unknown>
+          : undefined,
+        test_metrics: backendSummary.test_metrics && typeof backendSummary.test_metrics === 'object'
+          ? backendSummary.test_metrics as Record<string, unknown>
+          : undefined,
+        feature_importance: Array.isArray(backendSummary.feature_importance)
+          ? backendSummary.feature_importance as Array<Record<string, unknown>>
+          : undefined,
+        tuning_result: backendSummary.tuning_result && typeof backendSummary.tuning_result === 'object'
+          ? backendSummary.tuning_result as Record<string, unknown>
+          : undefined,
+        sample_predictions: Array.isArray(backendSummary.sample_predictions)
+          ? backendSummary.sample_predictions as Array<Record<string, unknown>>
+          : undefined,
+        run_name: backendSummary.run_name == null ? null : String(backendSummary.run_name),
+        runtime_model_bundle: backendSummary.runtime_model_bundle && typeof backendSummary.runtime_model_bundle === 'object'
+          ? backendSummary.runtime_model_bundle as Record<string, unknown>
+          : null,
+      }
+      setMLOpsStage3RunSummary(summary)
+      setMLOpsStage3ModelBundleDraft(summary.runtime_model_bundle || null)
+      setMLOpsStage3RunError(null)
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to run model training.')
+      setMLOpsStage3RunSummary(null)
+      setMLOpsStage3RunError(message)
+    } finally {
+      setMLOpsStage3RunLoading(false)
+    }
+  }, [
+    nodeType,
+    selectedNodeId,
+    mlopsPreviewRows,
+    mlopsStage2PreviewRows,
+    mlopsStage3SelectedFeatureFields,
+    mlopsStage3AvailableFields,
+    mlopsStage3TaskTypeDraft,
+    mlopsStage3TargetFieldDraft,
+    mlopsStage3TargetFieldsDraft,
+    mlopsStage3ForecastDateFieldDraft,
+    mlopsStage3ForecastHorizonDraft,
+    mlopsStage3ForecastFrequencyDraft,
+    mlopsStage3ForecastAutoTuneOrdersDraft,
+    mlopsStage3ForecastOrderSearchMaxEvalsDraft,
+    mlopsStage3ARIMAPDraft,
+    mlopsStage3ARIMADDraft,
+    mlopsStage3ARIMAQDraft,
+    mlopsStage3SARIMAPPDraft,
+    mlopsStage3SARIMAPDDraft,
+    mlopsStage3SARIMAQDraft,
+    mlopsStage3SARIMASDraft,
+    mlopsStage3TrainTestSplitDraft,
+    mlopsStage3CvFoldsDraft,
+    mlopsStage3EpochsDraft,
+    mlopsStage3BatchSizeDraft,
+    mlopsStage3RandomSeedDraft,
+    mlopsStage3ModelDraft,
+    mlopsStage3TuningEnabledDraft,
+    mlopsStage3TuningMethodDraft,
+    mlopsStage3TuningParamsDraft,
+    mlopsStage3TrackingEnabledDraft,
+    mlopsStage3RunNameDraft,
+  ])
+
+  const runMLOpsStage4Deploy = useCallback(async () => {
+    if (nodeType !== 'mlops_transform' || !selectedNodeId) return
+    const rowsForStage4 = (
+      mlopsStage2PreviewRows.length > 0
+        ? mlopsStage2PreviewRows
+        : mlopsPreviewRows
+    )
+      .slice(0, 50000)
+      .filter((row) => row && typeof row === 'object') as Array<Record<string, unknown>>
+
+    if (rowsForStage4.length <= 0) {
+      setMLOpsStage4RunError('No rows available for Stage 4. Connect Data Query output and run pipeline once.')
+      setMLOpsStage4Summary(null)
+      return
+    }
+    if (!mlopsStage3RunSummary) {
+      setMLOpsStage4RunError('Run Stage 3 training first. Stage 4 uses Stage 3 metrics for gate/deploy checks.')
+      setMLOpsStage4Summary(null)
+      return
+    }
+
+    setMLOpsStage4RunLoading(true)
+    setMLOpsStage4RunError(null)
+    try {
+      const response = await api.getMLOpsNodeStage4Deploy({
+        rows: rowsForStage4,
+        stage3_summary: mlopsStage3RunSummary as unknown as Record<string, unknown>,
+        stage1_profile: mlopsProfileResult as unknown as Record<string, unknown>,
+        task_type: mlopsStage3TaskTypeDraft,
+        model: String(mlopsStage3ModelDraft || '').trim(),
+        feature_fields: mlopsStage3SelectedFeatureFields,
+        target_field: String(mlopsStage3TargetFieldDraft || '').trim() || undefined,
+        gate_enabled: Boolean(mlopsStage4GateEnabledDraft),
+        min_accuracy: mlopsStage4MinAccuracyDraft,
+        min_f1_score: mlopsStage4MinF1ScoreDraft,
+        max_rmse: mlopsStage4MaxRmseDraft,
+        max_mae: mlopsStage4MaxMaeDraft,
+        min_r2: mlopsStage4MinR2Draft,
+        min_silhouette_score: mlopsStage4MinSilhouetteDraft,
+        max_anomaly_ratio: mlopsStage4MaxAnomalyRatioDraft,
+        max_avg_drift_score: mlopsStage4MaxAvgDriftDraft,
+        deploy_enabled: Boolean(mlopsStage4DeployEnabledDraft),
+        deployment_environment: mlopsStage4EnvironmentDraft,
+        endpoint_name: String(mlopsStage4EndpointNameDraft || '').trim() || undefined,
+        model_version: String(mlopsStage4ModelVersionDraft || '').trim() || undefined,
+        monitor_enabled: Boolean(mlopsStage4MonitorEnabledDraft),
+        monitor_sample_size: Math.max(50, Math.min(Math.trunc(Number(mlopsStage4MonitorSampleSizeDraft || 2000)), 50000)),
+        monitor_numeric_fields: mlopsStage4SelectedMonitorFields,
+      })
+
+      const backendSummary = (response?.summary || response || {}) as Record<string, unknown>
+      const summary: MLOpsStage4Summary = {
+        ran: Boolean(backendSummary.ran ?? true),
+        executed_at: String(backendSummary.executed_at || new Date().toISOString()),
+        task_type: String(backendSummary.task_type || mlopsStage3TaskTypeDraft) as MLOpsStage3TaskType,
+        model: String(backendSummary.model || mlopsStage3ModelDraft || 'default'),
+        input_rows: Number(backendSummary.input_rows || rowsForStage4.length),
+        feature_fields: Array.isArray(backendSummary.feature_fields)
+          ? (backendSummary.feature_fields as unknown[]).map((item) => String(item || '')).filter(Boolean)
+          : mlopsStage3SelectedFeatureFields,
+        target_field: backendSummary.target_field == null ? null : String(backendSummary.target_field),
+        gate: backendSummary.gate && typeof backendSummary.gate === 'object'
+          ? backendSummary.gate as MLOpsStage4Summary['gate']
+          : undefined,
+        deployment: backendSummary.deployment && typeof backendSummary.deployment === 'object'
+          ? backendSummary.deployment as MLOpsStage4Summary['deployment']
+          : undefined,
+        monitoring: backendSummary.monitoring && typeof backendSummary.monitoring === 'object'
+          ? backendSummary.monitoring as MLOpsStage4Summary['monitoring']
+          : undefined,
+        metrics_used: backendSummary.metrics_used && typeof backendSummary.metrics_used === 'object'
+          ? backendSummary.metrics_used as MLOpsStage4Summary['metrics_used']
+          : undefined,
+        notes: Array.isArray(backendSummary.notes)
+          ? (backendSummary.notes as unknown[]).map((item) => String(item || '')).filter(Boolean)
+          : [],
+        output_preview: Array.isArray(backendSummary.output_preview)
+          ? backendSummary.output_preview as Array<Record<string, unknown>>
+          : [],
+      }
+      setMLOpsStage4Summary(summary)
+      setMLOpsStage4RunError(null)
+      if (summary.deployment?.endpoint_name && !String(mlopsStage4EndpointNameDraft || '').trim()) {
+        setMLOpsStage4EndpointNameDraft(String(summary.deployment.endpoint_name))
+      }
+      if (summary.deployment?.model_version && !String(mlopsStage4ModelVersionDraft || '').trim()) {
+        setMLOpsStage4ModelVersionDraft(String(summary.deployment.model_version))
+      }
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to run Stage 4 deploy/monitor validation.')
+      setMLOpsStage4Summary(null)
+      setMLOpsStage4RunError(message)
+    } finally {
+      setMLOpsStage4RunLoading(false)
+    }
+  }, [
+    nodeType,
+    selectedNodeId,
+    mlopsStage2PreviewRows,
+    mlopsPreviewRows,
+    mlopsStage3RunSummary,
+    mlopsProfileResult,
+    mlopsStage3TaskTypeDraft,
+    mlopsStage3ModelDraft,
+    mlopsStage3SelectedFeatureFields,
+    mlopsStage3TargetFieldDraft,
+    mlopsStage4GateEnabledDraft,
+    mlopsStage4MinAccuracyDraft,
+    mlopsStage4MinF1ScoreDraft,
+    mlopsStage4MaxRmseDraft,
+    mlopsStage4MaxMaeDraft,
+    mlopsStage4MinR2Draft,
+    mlopsStage4MinSilhouetteDraft,
+    mlopsStage4MaxAnomalyRatioDraft,
+    mlopsStage4MaxAvgDriftDraft,
+    mlopsStage4DeployEnabledDraft,
+    mlopsStage4EnvironmentDraft,
+    mlopsStage4EndpointNameDraft,
+    mlopsStage4ModelVersionDraft,
+    mlopsStage4MonitorEnabledDraft,
+    mlopsStage4MonitorSampleSizeDraft,
+    mlopsStage4SelectedMonitorFields,
+  ])
+
+  const saveMLOpsStudioConfig = useCallback(() => {
+    if (nodeType !== 'mlops_transform' || !selectedNodeId) return
+    const safeStage2PreviewLimit = Number.isFinite(mlopsStage2PreviewLimitDraft)
+      ? Math.max(10, Math.min(Math.trunc(mlopsStage2PreviewLimitDraft), 5000))
+      : 200
+    updateNodeConfig(selectedNodeId, {
+      mlops_sample_size: Math.max(100, Math.min(Math.trunc(Number(mlopsSampleSizeDraft || 2000)), 20000)),
+      mlops_preview_rows: Math.max(5, Math.min(Math.trunc(Number(mlopsPreviewRowsDraft || 25)), 200)),
+      mlops_max_chart_columns: Math.max(1, Math.min(Math.trunc(Number(mlopsMaxChartColumnsDraft || 6)), 12)),
+      mlops_include_ydata: Boolean(mlopsIncludeYDataDraft),
+      mlops_chart_types: uniqueFieldNames(mlopsChartTypesDraft),
+      mlops_chart_theme: mlopsChartThemeDraft,
+      mlops_stage2_preview_limit: safeStage2PreviewLimit,
+      mlops_stage2_target_field: String(mlopsStage2TargetFieldDraft || '').trim(),
+      mlops_stage2_label_field: String(mlopsStage2LabelFieldDraft || '').trim(),
+      mlops_stage2_field_configs: mlopsStage2SerializedConfig,
+      mlops_stage2_artifact: mlopsStage2ArtifactDraft || null,
+      mlops_stage3_task_type: mlopsStage3TaskTypeDraft,
+      mlops_stage3_model: String(mlopsStage3ModelDraft || '').trim(),
+      mlops_stage3_feature_fields: mlopsStage3SelectedFeatureFields,
+      mlops_stage3_target_field: String(
+        (mlopsStage3TaskTypeDraft === 'forecasting'
+          ? (mlopsStage3TargetFieldsDraft[0] || mlopsStage3TargetFieldDraft)
+          : mlopsStage3TargetFieldDraft) || '',
+      ).trim(),
+      mlops_stage3_target_fields: mlopsStage3TaskTypeDraft === 'forecasting'
+        ? uniqueFieldNames((mlopsStage3TargetFieldsDraft || []).map((item) => String(item || '').trim()).filter(Boolean))
+        : [],
+      mlops_stage3_forecast_date_field: String(mlopsStage3ForecastDateFieldDraft || '').trim(),
+      mlops_stage3_forecast_horizon: Math.max(1, Math.min(Math.trunc(Number(mlopsStage3ForecastHorizonDraft || 30)), 3650)),
+      mlops_stage3_forecast_frequency: mlopsStage3ForecastFrequencyDraft,
+      mlops_stage3_forecast_auto_tune_orders: Boolean(mlopsStage3ForecastAutoTuneOrdersDraft),
+      mlops_stage3_forecast_order_search_max_evals: Math.max(1, Math.min(Math.trunc(Number(mlopsStage3ForecastOrderSearchMaxEvalsDraft || 16)), 64)),
+      mlops_forecast_output_mode: mlopsForecastOutputModeDraft,
+      mlops_forecast_runtime_steps: Math.max(0, Math.min(Math.trunc(Number(mlopsForecastRuntimeStepsDraft || 0)), 3650)),
+      mlops_stage3_arima_order: [
+        Math.max(0, Math.min(Math.trunc(Number(mlopsStage3ARIMAPDraft || 0)), 24)),
+        Math.max(0, Math.min(Math.trunc(Number(mlopsStage3ARIMADDraft || 0)), 24)),
+        Math.max(0, Math.min(Math.trunc(Number(mlopsStage3ARIMAQDraft || 0)), 24)),
+      ],
+      mlops_stage3_sarima_seasonal_order: [
+        Math.max(0, Math.min(Math.trunc(Number(mlopsStage3SARIMAPPDraft || 0)), 24)),
+        Math.max(0, Math.min(Math.trunc(Number(mlopsStage3SARIMAPDDraft || 0)), 24)),
+        Math.max(0, Math.min(Math.trunc(Number(mlopsStage3SARIMAQDraft || 0)), 24)),
+        Math.max(0, Math.min(Math.trunc(Number(mlopsStage3SARIMASDraft || 0)), 3660)),
+      ],
+      mlops_stage3_train_test_split: mlopsStage3TrainTestSplitDraft,
+      mlops_stage3_cv_folds: mlopsStage3CvFoldsDraft,
+      mlops_stage3_epochs: mlopsStage3EpochsDraft,
+      mlops_stage3_batch_size: mlopsStage3BatchSizeDraft,
+      mlops_stage3_random_seed: mlopsStage3RandomSeedDraft,
+      mlops_stage3_tuning_enabled: mlopsStage3TuningEnabledDraft,
+      mlops_stage3_tuning_method: mlopsStage3TuningMethodDraft,
+      mlops_stage3_tuning_params: serializeMLOpsStage3TuningParameters(mlopsStage3TuningParamsDraft),
+      mlops_stage3_tracking_enabled: mlopsStage3TrackingEnabledDraft,
+      mlops_stage3_track_versions: mlopsStage3TrackVersionsDraft,
+      mlops_stage3_track_params: mlopsStage3TrackParamsDraft,
+      mlops_stage3_track_metrics: mlopsStage3TrackMetricsDraft,
+      mlops_stage3_track_logs: mlopsStage3TrackLogsDraft,
+      mlops_stage3_run_name: String(mlopsStage3RunNameDraft || '').trim(),
+      mlops_mode: mlopsRuntimeModeDraft,
+      mlops_prediction_field: String(mlopsPredictionFieldDraft || '').trim() || 'prediction',
+      mlops_prediction_score_field: String(mlopsPredictionScoreFieldDraft || '').trim() || 'prediction_score',
+      mlops_stage3_model_bundle: mlopsStage3ModelBundleDraft || (mlopsStage3RunSummary?.runtime_model_bundle || null),
+      mlops_stage3_viz_type: mlopsStage3VizTypeDraft,
+      mlops_stage3_table_view: mlopsStage3TableViewDraft,
+      mlops_stage3_last_run_summary: mlopsStage3RunSummary || null,
+      mlops_stage4_gate_enabled: mlopsStage4GateEnabledDraft,
+      mlops_stage4_min_accuracy: mlopsStage4MinAccuracyDraft,
+      mlops_stage4_min_f1_score: mlopsStage4MinF1ScoreDraft,
+      mlops_stage4_max_rmse: mlopsStage4MaxRmseDraft,
+      mlops_stage4_max_mae: mlopsStage4MaxMaeDraft,
+      mlops_stage4_min_r2: mlopsStage4MinR2Draft,
+      mlops_stage4_min_silhouette_score: mlopsStage4MinSilhouetteDraft,
+      mlops_stage4_max_anomaly_ratio: mlopsStage4MaxAnomalyRatioDraft,
+      mlops_stage4_max_avg_drift_score: mlopsStage4MaxAvgDriftDraft,
+      mlops_stage4_deploy_enabled: mlopsStage4DeployEnabledDraft,
+      mlops_stage4_environment: mlopsStage4EnvironmentDraft,
+      mlops_stage4_endpoint_name: String(mlopsStage4EndpointNameDraft || '').trim(),
+      mlops_stage4_model_version: String(mlopsStage4ModelVersionDraft || '').trim(),
+      mlops_stage4_monitor_enabled: mlopsStage4MonitorEnabledDraft,
+      mlops_stage4_monitor_sample_size: mlopsStage4MonitorSampleSizeDraft,
+      mlops_stage4_monitor_numeric_fields: mlopsStage4SelectedMonitorFields,
+      mlops_stage4_last_run_summary: mlopsStage4Summary || null,
+    })
+    notification.success({
+      message: 'MLOps Studio saved',
+      description: 'EDA, Pre-Processing, Model Training, and Deploy/Monitor configuration saved.',
+      placement: 'bottomRight',
+      duration: 2,
+    })
+    mlopsStudioInitialConfigRef.current = null
+    setMLOpsStudioOpen(false)
+  }, [
+    nodeType,
+    selectedNodeId,
+    mlopsSampleSizeDraft,
+    mlopsPreviewRowsDraft,
+    mlopsMaxChartColumnsDraft,
+    mlopsIncludeYDataDraft,
+    mlopsChartTypesDraft,
+    mlopsChartThemeDraft,
+    mlopsStage2PreviewLimitDraft,
+    mlopsStage2TargetFieldDraft,
+    mlopsStage2LabelFieldDraft,
+    mlopsStage2SerializedConfig,
+    mlopsStage2ArtifactDraft,
+    mlopsStage3TaskTypeDraft,
+    mlopsStage3ModelDraft,
+    mlopsStage3SelectedFeatureFields,
+    mlopsStage3TargetFieldDraft,
+    mlopsStage3TargetFieldsDraft,
+    mlopsStage3ForecastDateFieldDraft,
+    mlopsStage3ForecastHorizonDraft,
+    mlopsStage3ForecastFrequencyDraft,
+    mlopsStage3ForecastAutoTuneOrdersDraft,
+    mlopsStage3ForecastOrderSearchMaxEvalsDraft,
+    mlopsForecastOutputModeDraft,
+    mlopsForecastRuntimeStepsDraft,
+    mlopsStage3ARIMAPDraft,
+    mlopsStage3ARIMADDraft,
+    mlopsStage3ARIMAQDraft,
+    mlopsStage3SARIMAPPDraft,
+    mlopsStage3SARIMAPDDraft,
+    mlopsStage3SARIMAQDraft,
+    mlopsStage3SARIMASDraft,
+    mlopsStage3TrainTestSplitDraft,
+    mlopsStage3CvFoldsDraft,
+    mlopsStage3EpochsDraft,
+    mlopsStage3BatchSizeDraft,
+    mlopsStage3RandomSeedDraft,
+    mlopsStage3TuningEnabledDraft,
+    mlopsStage3TuningMethodDraft,
+    mlopsStage3TuningParamsDraft,
+    mlopsStage3TrackingEnabledDraft,
+    mlopsStage3TrackVersionsDraft,
+    mlopsStage3TrackParamsDraft,
+    mlopsStage3TrackMetricsDraft,
+    mlopsStage3TrackLogsDraft,
+    mlopsStage3RunNameDraft,
+    mlopsRuntimeModeDraft,
+    mlopsPredictionFieldDraft,
+    mlopsPredictionScoreFieldDraft,
+    mlopsStage3ModelBundleDraft,
+    mlopsStage3VizTypeDraft,
+    mlopsStage3TableViewDraft,
+    mlopsStage3RunSummary,
+    mlopsStage4GateEnabledDraft,
+    mlopsStage4MinAccuracyDraft,
+    mlopsStage4MinF1ScoreDraft,
+    mlopsStage4MaxRmseDraft,
+    mlopsStage4MaxMaeDraft,
+    mlopsStage4MinR2Draft,
+    mlopsStage4MinSilhouetteDraft,
+    mlopsStage4MaxAnomalyRatioDraft,
+    mlopsStage4MaxAvgDriftDraft,
+    mlopsStage4DeployEnabledDraft,
+    mlopsStage4EnvironmentDraft,
+    mlopsStage4EndpointNameDraft,
+    mlopsStage4ModelVersionDraft,
+    mlopsStage4MonitorEnabledDraft,
+    mlopsStage4MonitorSampleSizeDraft,
+    mlopsStage4SelectedMonitorFields,
+    mlopsStage4Summary,
+    updateNodeConfig,
+  ])
+
+  const openMLOpsStudio = useCallback(() => {
+    if (nodeType !== 'mlops_transform' || !selectedNodeId) return
+    const stage2ConfigMap: Record<string, MLOpsStage2FieldConfig> = {}
+    mlopsStage2FieldConfigsConfigured.forEach((item) => {
+      const normalized = createMLOpsStage2FieldConfig(item)
+      if (!normalized.field_path) return
+      stage2ConfigMap[normalized.field_path] = normalized
+    })
+    setMLOpsSampleSizeDraft(mlopsSampleSizeConfigured)
+    setMLOpsPreviewRowsDraft(mlopsPreviewRowsConfigured)
+    setMLOpsMaxChartColumnsDraft(mlopsMaxChartColumnsConfigured)
+    setMLOpsIncludeYDataDraft(mlopsIncludeYDataConfigured)
+    setMLOpsChartTypesDraft([...mlopsChartTypesConfigured])
+    setMLOpsChartThemeDraft(mlopsChartThemeConfigured)
+    setMLOpsStage2FieldConfigsByFieldDraft(stage2ConfigMap)
+    setMLOpsStage2PreviewLimitDraft(mlopsStage2PreviewLimitConfigured)
+    setMLOpsStage2TargetFieldDraft(mlopsStage2TargetFieldConfigured)
+    setMLOpsStage2LabelFieldDraft(mlopsStage2LabelFieldConfigured)
+    setMLOpsStage3TaskTypeDraft(mlopsStage3TaskTypeConfigured)
+    setMLOpsStage3ModelDraft(
+      mlopsStage3ModelConfigured
+      || MLOPS_STAGE3_MODEL_CATALOG[mlopsStage3TaskTypeConfigured]?.[0]
+      || '',
+    )
+    setMLOpsStage3FeatureFieldsDraft(
+      mlopsStage3FeatureFieldsConfigured.length > 0
+        ? mlopsStage3FeatureFieldsConfigured
+        : stage2ConfigMap
+          ? Object.values(stage2ConfigMap)
+            .filter((item) => Boolean(item.enabled))
+            .map((item) => String(item.field_path || '').trim())
+            .filter(Boolean)
+          : [],
+    )
+    setMLOpsStage3TargetFieldDraft(mlopsStage3TargetFieldConfigured || mlopsStage2TargetFieldConfigured || '')
+    setMLOpsStage3TargetFieldsDraft(
+      mlopsStage3TargetFieldsConfigured.length > 0
+        ? mlopsStage3TargetFieldsConfigured
+        : (mlopsStage3TargetFieldConfigured ? [mlopsStage3TargetFieldConfigured] : []),
+    )
+    setMLOpsStage3ForecastDateFieldDraft(mlopsStage3ForecastDateFieldConfigured || '')
+    setMLOpsStage3ForecastHorizonDraft(mlopsStage3ForecastHorizonConfigured)
+    setMLOpsStage3ForecastFrequencyDraft(mlopsStage3ForecastFrequencyConfigured)
+    setMLOpsStage3ForecastAutoTuneOrdersDraft(mlopsStage3ForecastAutoTuneOrdersConfigured)
+    setMLOpsStage3ForecastOrderSearchMaxEvalsDraft(mlopsStage3ForecastOrderSearchMaxEvalsConfigured)
+    setMLOpsForecastOutputModeDraft(mlopsForecastOutputModeConfigured)
+    setMLOpsForecastRuntimeStepsDraft(mlopsForecastRuntimeStepsConfigured)
+    setMLOpsStage3ARIMAPDraft(mlopsStage3ARIMAOrderConfigured[0])
+    setMLOpsStage3ARIMADDraft(mlopsStage3ARIMAOrderConfigured[1])
+    setMLOpsStage3ARIMAQDraft(mlopsStage3ARIMAOrderConfigured[2])
+    setMLOpsStage3SARIMAPPDraft(mlopsStage3SARIMASeasonalOrderConfigured[0])
+    setMLOpsStage3SARIMAPDDraft(mlopsStage3SARIMASeasonalOrderConfigured[1])
+    setMLOpsStage3SARIMAQDraft(mlopsStage3SARIMASeasonalOrderConfigured[2])
+    setMLOpsStage3SARIMASDraft(mlopsStage3SARIMASeasonalOrderConfigured[3])
+    setMLOpsStage3TrainTestSplitDraft(mlopsStage3TrainTestSplitConfigured)
+    setMLOpsStage3CvFoldsDraft(mlopsStage3CvFoldsConfigured)
+    setMLOpsStage3EpochsDraft(mlopsStage3EpochsConfigured)
+    setMLOpsStage3BatchSizeDraft(mlopsStage3BatchSizeConfigured)
+    setMLOpsStage3RandomSeedDraft(mlopsStage3RandomSeedConfigured)
+    setMLOpsStage3TuningEnabledDraft(mlopsStage3TuningEnabledConfigured)
+    setMLOpsStage3TuningMethodDraft(mlopsStage3TuningMethodConfigured)
+    setMLOpsStage3TuningParamsDraft(mlopsStage3TuningParamsConfigured)
+    setMLOpsStage3TrackingEnabledDraft(mlopsStage3TrackingEnabledConfigured)
+    setMLOpsStage3TrackVersionsDraft(mlopsStage3TrackVersionsConfigured)
+    setMLOpsStage3TrackParamsDraft(mlopsStage3TrackParamsConfigured)
+    setMLOpsStage3TrackMetricsDraft(mlopsStage3TrackMetricsConfigured)
+    setMLOpsStage3TrackLogsDraft(mlopsStage3TrackLogsConfigured)
+    setMLOpsStage3RunNameDraft(mlopsStage3RunNameConfigured)
+    setMLOpsRuntimeModeDraft(mlopsRuntimeModeConfigured)
+    setMLOpsPredictionFieldDraft(mlopsPredictionFieldConfigured)
+    setMLOpsPredictionScoreFieldDraft(mlopsPredictionScoreFieldConfigured)
+    setMLOpsStage3ModelBundleDraft(
+      mlopsStage3ModelBundleConfigured
+      || (mlopsStage3LastRunSummaryConfigured?.runtime_model_bundle || null),
+    )
+    setMLOpsStage3VizTypeDraft(mlopsStage3VizTypeConfigured)
+    setMLOpsStage3TableViewDraft(mlopsStage3TableViewConfigured)
+    setMLOpsStage4GateEnabledDraft(mlopsStage4GateEnabledConfigured)
+    setMLOpsStage4MinAccuracyDraft(mlopsStage4MinAccuracyConfigured)
+    setMLOpsStage4MinF1ScoreDraft(mlopsStage4MinF1ScoreConfigured)
+    setMLOpsStage4MaxRmseDraft(mlopsStage4MaxRmseConfigured)
+    setMLOpsStage4MaxMaeDraft(mlopsStage4MaxMaeConfigured)
+    setMLOpsStage4MinR2Draft(mlopsStage4MinR2Configured)
+    setMLOpsStage4MinSilhouetteDraft(mlopsStage4MinSilhouetteConfigured)
+    setMLOpsStage4MaxAnomalyRatioDraft(mlopsStage4MaxAnomalyRatioConfigured)
+    setMLOpsStage4MaxAvgDriftDraft(mlopsStage4MaxAvgDriftConfigured)
+    setMLOpsStage4DeployEnabledDraft(mlopsStage4DeployEnabledConfigured)
+    setMLOpsStage4EnvironmentDraft(mlopsStage4EnvironmentConfigured)
+    setMLOpsStage4EndpointNameDraft(mlopsStage4EndpointNameConfigured)
+    setMLOpsStage4ModelVersionDraft(mlopsStage4ModelVersionConfigured)
+    setMLOpsStage4MonitorEnabledDraft(mlopsStage4MonitorEnabledConfigured)
+    setMLOpsStage4MonitorSampleSizeDraft(mlopsStage4MonitorSampleSizeConfigured)
+    setMLOpsStage4MonitorNumericFieldsDraft(
+      mlopsStage4MonitorNumericFieldsConfigured.length > 0
+        ? mlopsStage4MonitorNumericFieldsConfigured
+        : (
+          mlopsStage3FeatureFieldsConfigured.length > 0
+            ? mlopsStage3FeatureFieldsConfigured
+            : Object.values(stage2ConfigMap)
+              .filter((item) => Boolean(item.enabled))
+              .map((item) => String(item.field_path || '').trim())
+              .filter(Boolean)
+        ).slice(0, 12),
+    )
+    setMLOpsStage2FieldSearchDraft('')
+    setMLOpsStage2PreviewLoading(false)
+    setMLOpsStage2PreviewError(null)
+    setMLOpsStage2PreviewRows([])
+    setMLOpsStage2ArtifactDraft(null)
+    setMLOpsStage2PreviewSummary({
+      ran: false,
+      inputRows: 0,
+      outputRows: 0,
+      droppedRows: 0,
+      configuredFields: 0,
+      generatedColumns: 0,
+    })
+    setMLOpsStudioTab('eda')
+    setMLOpsProfileError(null)
+    setMLOpsProfileResult(null)
+    setMLOpsExpandedChart(null)
+    setMLOpsStage3RunLoading(false)
+    setMLOpsStage3RunError(null)
+    setMLOpsStage3RunSummary(mlopsStage3LastRunSummaryConfigured)
+    setMLOpsStage4RunLoading(false)
+    setMLOpsStage4RunError(null)
+    setMLOpsStage4Summary(mlopsStage4LastRunSummaryConfigured)
+    mlopsStudioInitialConfigRef.current = {
+      mlops_sample_size: mlopsSampleSizeConfigured,
+      mlops_preview_rows: mlopsPreviewRowsConfigured,
+      mlops_max_chart_columns: mlopsMaxChartColumnsConfigured,
+      mlops_include_ydata: mlopsIncludeYDataConfigured,
+      mlops_chart_types: [...mlopsChartTypesConfigured],
+      mlops_chart_theme: mlopsChartThemeConfigured,
+      mlops_stage2_preview_limit: mlopsStage2PreviewLimitConfigured,
+      mlops_stage2_target_field: mlopsStage2TargetFieldConfigured,
+      mlops_stage2_label_field: mlopsStage2LabelFieldConfigured,
+      mlops_stage2_field_configs: serializeMLOpsStage2FieldConfigMap(stage2ConfigMap),
+      mlops_stage3_task_type: mlopsStage3TaskTypeConfigured,
+      mlops_stage3_model: mlopsStage3ModelConfigured || MLOPS_STAGE3_MODEL_CATALOG[mlopsStage3TaskTypeConfigured]?.[0] || '',
+      mlops_stage3_feature_fields: mlopsStage3FeatureFieldsConfigured.length > 0
+        ? mlopsStage3FeatureFieldsConfigured
+        : Object.values(stage2ConfigMap)
+          .filter((item) => Boolean(item.enabled))
+          .map((item) => String(item.field_path || '').trim())
+          .filter(Boolean),
+      mlops_stage3_target_field: mlopsStage3TargetFieldConfigured || mlopsStage2TargetFieldConfigured || '',
+      mlops_stage3_target_fields: mlopsStage3TargetFieldsConfigured.length > 0
+        ? mlopsStage3TargetFieldsConfigured
+        : (mlopsStage3TargetFieldConfigured ? [mlopsStage3TargetFieldConfigured] : []),
+      mlops_stage3_forecast_date_field: mlopsStage3ForecastDateFieldConfigured || '',
+      mlops_stage3_forecast_horizon: mlopsStage3ForecastHorizonConfigured,
+      mlops_stage3_forecast_frequency: mlopsStage3ForecastFrequencyConfigured,
+      mlops_stage3_forecast_auto_tune_orders: mlopsStage3ForecastAutoTuneOrdersConfigured,
+      mlops_stage3_forecast_order_search_max_evals: mlopsStage3ForecastOrderSearchMaxEvalsConfigured,
+      mlops_forecast_output_mode: mlopsForecastOutputModeConfigured,
+      mlops_forecast_runtime_steps: mlopsForecastRuntimeStepsConfigured,
+      mlops_stage3_arima_order: [...mlopsStage3ARIMAOrderConfigured],
+      mlops_stage3_sarima_seasonal_order: [...mlopsStage3SARIMASeasonalOrderConfigured],
+      mlops_stage3_train_test_split: mlopsStage3TrainTestSplitConfigured,
+      mlops_stage3_cv_folds: mlopsStage3CvFoldsConfigured,
+      mlops_stage3_epochs: mlopsStage3EpochsConfigured,
+      mlops_stage3_batch_size: mlopsStage3BatchSizeConfigured,
+      mlops_stage3_random_seed: mlopsStage3RandomSeedConfigured,
+      mlops_stage3_tuning_enabled: mlopsStage3TuningEnabledConfigured,
+      mlops_stage3_tuning_method: mlopsStage3TuningMethodConfigured,
+      mlops_stage3_tuning_params: serializeMLOpsStage3TuningParameters(mlopsStage3TuningParamsConfigured),
+      mlops_stage3_tracking_enabled: mlopsStage3TrackingEnabledConfigured,
+      mlops_stage3_track_versions: mlopsStage3TrackVersionsConfigured,
+      mlops_stage3_track_params: mlopsStage3TrackParamsConfigured,
+      mlops_stage3_track_metrics: mlopsStage3TrackMetricsConfigured,
+      mlops_stage3_track_logs: mlopsStage3TrackLogsConfigured,
+      mlops_stage3_run_name: mlopsStage3RunNameConfigured,
+      mlops_mode: mlopsRuntimeModeConfigured,
+      mlops_prediction_field: mlopsPredictionFieldConfigured,
+      mlops_prediction_score_field: mlopsPredictionScoreFieldConfigured,
+      mlops_stage3_model_bundle: mlopsStage3ModelBundleConfigured
+        || (mlopsStage3LastRunSummaryConfigured?.runtime_model_bundle || null),
+      mlops_stage3_viz_type: mlopsStage3VizTypeConfigured,
+      mlops_stage3_table_view: mlopsStage3TableViewConfigured,
+      mlops_stage4_gate_enabled: mlopsStage4GateEnabledConfigured,
+      mlops_stage4_min_accuracy: mlopsStage4MinAccuracyConfigured,
+      mlops_stage4_min_f1_score: mlopsStage4MinF1ScoreConfigured,
+      mlops_stage4_max_rmse: mlopsStage4MaxRmseConfigured,
+      mlops_stage4_max_mae: mlopsStage4MaxMaeConfigured,
+      mlops_stage4_min_r2: mlopsStage4MinR2Configured,
+      mlops_stage4_min_silhouette_score: mlopsStage4MinSilhouetteConfigured,
+      mlops_stage4_max_anomaly_ratio: mlopsStage4MaxAnomalyRatioConfigured,
+      mlops_stage4_max_avg_drift_score: mlopsStage4MaxAvgDriftConfigured,
+      mlops_stage4_deploy_enabled: mlopsStage4DeployEnabledConfigured,
+      mlops_stage4_environment: mlopsStage4EnvironmentConfigured,
+      mlops_stage4_endpoint_name: mlopsStage4EndpointNameConfigured,
+      mlops_stage4_model_version: mlopsStage4ModelVersionConfigured,
+      mlops_stage4_monitor_enabled: mlopsStage4MonitorEnabledConfigured,
+      mlops_stage4_monitor_sample_size: mlopsStage4MonitorSampleSizeConfigured,
+      mlops_stage4_monitor_numeric_fields: mlopsStage4MonitorNumericFieldsConfigured.length > 0
+        ? mlopsStage4MonitorNumericFieldsConfigured
+        : (
+          mlopsStage3FeatureFieldsConfigured.length > 0
+            ? mlopsStage3FeatureFieldsConfigured
+            : Object.values(stage2ConfigMap)
+              .filter((item) => Boolean(item.enabled))
+              .map((item) => String(item.field_path || '').trim())
+              .filter(Boolean)
+        ).slice(0, 12),
+    }
+    setMLOpsStudioOpen(true)
+  }, [
+    nodeType,
+    selectedNodeId,
+    mlopsSampleSizeConfigured,
+    mlopsPreviewRowsConfigured,
+    mlopsMaxChartColumnsConfigured,
+    mlopsIncludeYDataConfigured,
+    mlopsChartTypesConfigured,
+    mlopsChartThemeConfigured,
+    mlopsStage2FieldConfigsConfigured,
+    mlopsStage2PreviewLimitConfigured,
+    mlopsStage2TargetFieldConfigured,
+    mlopsStage2LabelFieldConfigured,
+    mlopsStage3TaskTypeConfigured,
+    mlopsStage3ModelConfigured,
+    mlopsStage3FeatureFieldsConfigured,
+    mlopsStage3TargetFieldConfigured,
+    mlopsStage3TargetFieldsConfigured,
+    mlopsStage3ForecastDateFieldConfigured,
+    mlopsStage3ForecastHorizonConfigured,
+    mlopsStage3ForecastFrequencyConfigured,
+    mlopsStage3ForecastAutoTuneOrdersConfigured,
+    mlopsStage3ForecastOrderSearchMaxEvalsConfigured,
+    mlopsForecastOutputModeConfigured,
+    mlopsForecastRuntimeStepsConfigured,
+    mlopsStage3ARIMAOrderConfigured,
+    mlopsStage3SARIMASeasonalOrderConfigured,
+    mlopsStage3TrainTestSplitConfigured,
+    mlopsStage3CvFoldsConfigured,
+    mlopsStage3EpochsConfigured,
+    mlopsStage3BatchSizeConfigured,
+    mlopsStage3RandomSeedConfigured,
+    mlopsStage3TuningEnabledConfigured,
+    mlopsStage3TuningMethodConfigured,
+    mlopsStage3TuningParamsConfigured,
+    mlopsStage3TrackingEnabledConfigured,
+    mlopsStage3TrackVersionsConfigured,
+    mlopsStage3TrackParamsConfigured,
+    mlopsStage3TrackMetricsConfigured,
+    mlopsStage3TrackLogsConfigured,
+    mlopsStage3RunNameConfigured,
+    mlopsRuntimeModeConfigured,
+    mlopsPredictionFieldConfigured,
+    mlopsPredictionScoreFieldConfigured,
+    mlopsStage3ModelBundleConfigured,
+    mlopsStage3VizTypeConfigured,
+    mlopsStage3TableViewConfigured,
+    mlopsStage3LastRunSummaryConfigured,
+    mlopsStage4GateEnabledConfigured,
+    mlopsStage4MinAccuracyConfigured,
+    mlopsStage4MinF1ScoreConfigured,
+    mlopsStage4MaxRmseConfigured,
+    mlopsStage4MaxMaeConfigured,
+    mlopsStage4MinR2Configured,
+    mlopsStage4MinSilhouetteConfigured,
+    mlopsStage4MaxAnomalyRatioConfigured,
+    mlopsStage4MaxAvgDriftConfigured,
+    mlopsStage4DeployEnabledConfigured,
+    mlopsStage4EnvironmentConfigured,
+    mlopsStage4EndpointNameConfigured,
+    mlopsStage4ModelVersionConfigured,
+    mlopsStage4MonitorEnabledConfigured,
+    mlopsStage4MonitorSampleSizeConfigured,
+    mlopsStage4MonitorNumericFieldsConfigured,
+    mlopsStage4LastRunSummaryConfigured,
+  ])
+
+  const requestCloseMLOpsStudio = useCallback(() => {
+    if (!mlopsStudioOpen) {
+      mlopsStudioInitialConfigRef.current = null
+      setMLOpsStudioOpen(false)
+      setMLOpsExpandedChart(null)
+      setMLOpsStudioTab('eda')
+      return
+    }
+    if (!mlopsStudioHasUnsavedChanges) {
+      mlopsStudioInitialConfigRef.current = null
+      setMLOpsStudioOpen(false)
+      setMLOpsExpandedChart(null)
+      setMLOpsStudioTab('eda')
+      return
+    }
+    Modal.confirm({
+      title: 'Unsaved changes',
+      content: 'MLOps Studio has unsaved changes. Save before closing?',
+      okText: 'Save & Close',
+      cancelText: 'Discard',
+      centered: true,
+      onOk: () => {
+        saveMLOpsStudioConfig()
+      },
+      onCancel: () => {
+        mlopsStudioInitialConfigRef.current = null
+        setMLOpsStudioOpen(false)
+        setMLOpsExpandedChart(null)
+        setMLOpsStudioTab('eda')
+      },
+    })
+  }, [
+    mlopsStudioOpen,
+    mlopsStudioHasUnsavedChanges,
+    saveMLOpsStudioConfig,
   ])
 
   const getConditionValueByPath = useCallback((row: any, fieldPath: string): any => {
@@ -11044,6 +14494,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         caseCounts: {} as Record<string, number>,
         sourceLabel: 'NOT_RUN',
         warnings: [] as string[],
+        sourceMeta: {} as Record<string, unknown>,
+        infoNotes: [] as string[],
       }
     }
     const inputRows = Number(remote.input_rows || 0)
@@ -11058,6 +14510,23 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const warnings = Array.isArray(remote.warnings)
       ? remote.warnings.map((item) => String(item))
       : []
+    const sourceMeta = remote.source_meta && typeof remote.source_meta === 'object'
+      ? (remote.source_meta as Record<string, unknown>)
+      : {}
+    const infoNotes: string[] = []
+    const rowSource = String(sourceMeta.ui_data_query_row_source || '').trim()
+    if (rowSource) {
+      infoNotes.push(`Data Query row source: ${rowSource}`)
+    }
+    if (Boolean(sourceMeta.ui_snapshot_refresh_used)) {
+      infoNotes.push('Auto-refreshed latest pipeline snapshot for validation rows.')
+    }
+    if (Boolean(sourceMeta.ui_condition_preview_fallback_used)) {
+      infoNotes.push('Fallback used: Condition preview rows were used because Data Query rows were unavailable.')
+    }
+    if (String(sourceMeta.data_query_fallback || '').trim()) {
+      infoNotes.push(`Backend fallback: ${String(sourceMeta.data_query_fallback)}`)
+    }
     const sourceLabel = String(remote.validation_source || conditionValidationSourceMode || 'preview').toUpperCase()
     return {
       totalRows: inputRows,
@@ -11069,6 +14538,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       caseCounts,
       sourceLabel,
       warnings,
+      sourceMeta,
+      infoNotes,
     }
   }, [conditionValidationRemoteSummary, conditionValidationSourceMode, conditionPreviewRows])
   const runConditionValidation = useCallback(async () => {
@@ -11077,6 +14548,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setConditionValidationError(null)
     try {
       const sourceMode = conditionValidationSourceMode
+      let dataQueryRowsOrigin = ''
+      let usedFreshSnapshotFallback = false
+      let usedConditionPreviewFallback = false
       const safeMaxRows = Number.isFinite(conditionValidationMaxRows)
         ? Math.max(0, Math.min(Math.trunc(conditionValidationMaxRows), 500000))
         : 100000
@@ -11135,7 +14609,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       }
       const payload: Record<string, unknown> = {
         condition_config: payloadConditionConfig,
-        validation_source: sourceMode === 'data_query_output' ? 'upstream_preview' : sourceMode,
+        validation_source: sourceMode,
         max_rows: safeMaxRows,
         sample_rows: 10,
       }
@@ -11170,6 +14644,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             includeExecutionInput: false,
           },
         )
+        if (dataQueryRows.length > 0 && !dataQueryRowsOrigin) {
+          dataQueryRowsOrigin = 'execution_output'
+        }
         if (!dataQueryRows.length) {
           dataQueryRows = extractPreviewRowsFromNode(
             targetNode,
@@ -11179,6 +14656,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               includeExecutionInput: false,
             },
           )
+          if (dataQueryRows.length > 0 && !dataQueryRowsOrigin) {
+            dataQueryRowsOrigin = 'node_preview_or_output'
+          }
         }
         if (!dataQueryRows.length) {
           dataQueryRows = extractPreviewRowsFromNode(
@@ -11189,8 +14669,74 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               includeExecutionInput: true,
             },
           )
+          if (dataQueryRows.length > 0 && !dataQueryRowsOrigin) {
+            dataQueryRowsOrigin = 'node_input'
+          }
+        }
+        if (!dataQueryRows.length) {
+          dataQueryRows = inferUpstreamPreviewRows(
+            targetNodeId,
+            nodes,
+            edges,
+            safeMaxRows > 0 ? safeMaxRows : 100000,
+            undefined,
+            false,
+            false,
+          )
+          if (dataQueryRows.length > 0 && !dataQueryRowsOrigin) {
+            dataQueryRowsOrigin = 'upstream_preview_cache'
+          }
+        }
+        if (!dataQueryRows.length && activePipelineId) {
+          try {
+            usedFreshSnapshotFallback = true
+            const freshPipeline = await api.getPipeline(activePipelineId)
+            const freshNodes = (Array.isArray((freshPipeline as any)?.nodes)
+              ? (freshPipeline as any).nodes
+              : []) as ETLNode[]
+            const freshEdges = (Array.isArray((freshPipeline as any)?.edges)
+              ? (freshPipeline as any).edges
+              : []) as Array<{ source: string; target: string }>
+            const freshTargetNode = freshNodes.find(
+              (item) => String(item?.id || '').trim() === targetNodeId
+            )
+            dataQueryRows = extractPreviewRowsFromNode(
+              freshTargetNode,
+              {
+                includeConfigPreview: true,
+                includeExecutionOutput: true,
+                includeExecutionInput: true,
+              },
+            )
+            if (dataQueryRows.length > 0 && !dataQueryRowsOrigin) {
+              dataQueryRowsOrigin = 'fresh_pipeline_snapshot_node_preview'
+            }
+            if (!dataQueryRows.length) {
+              dataQueryRows = inferUpstreamPreviewRows(
+                targetNodeId,
+                freshNodes,
+                freshEdges,
+                safeMaxRows > 0 ? safeMaxRows : 100000,
+                undefined,
+                false,
+                false,
+              )
+              if (dataQueryRows.length > 0 && !dataQueryRowsOrigin) {
+                dataQueryRowsOrigin = 'fresh_pipeline_snapshot_upstream'
+              }
+            }
+          } catch {
+            // Keep existing fallback chain if fresh snapshot cannot be loaded.
+          }
+        }
+        if (!dataQueryRows.length && validationRows.length > 0) {
+          dataQueryRows = validationRows
+          usedConditionPreviewFallback = true
+          if (!dataQueryRowsOrigin) dataQueryRowsOrigin = 'condition_preview_rows'
         }
         payload.rows = dataQueryRows.slice(0, safeMaxRows > 0 ? safeMaxRows : dataQueryRows.length)
+        payload.data_query_node_id = targetNodeId
+        payload.data_query_node_config = targetNodeConfig
       } else {
         payload.rows = validationRows
       }
@@ -11198,7 +14744,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       const result = await api.validateConditionFlow(payload as any)
       const normalized = (result || {}) as ConditionValidationResult
       if (sourceMode === 'data_query_output') {
-        normalized.validation_source = 'data_query_output'
+        const meta = normalized.source_meta && typeof normalized.source_meta === 'object'
+          ? { ...(normalized.source_meta as Record<string, unknown>) }
+          : {}
+        if (!meta.ui_data_query_row_source) meta.ui_data_query_row_source = dataQueryRowsOrigin || 'none'
+        if (!meta.ui_snapshot_refresh_used) meta.ui_snapshot_refresh_used = usedFreshSnapshotFallback
+        if (!meta.ui_condition_preview_fallback_used) meta.ui_condition_preview_fallback_used = usedConditionPreviewFallback
+        normalized.source_meta = meta
       }
       setConditionValidationRemoteSummary(normalized)
       const warnings = Array.isArray(normalized.warnings)
@@ -15200,6 +18752,52 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               </div>
             ) : null}
 
+            {nodeType === 'mlops_transform' ? (
+              <div style={{
+                background: '#0ea5e90f',
+                border: '1px solid #0ea5e930',
+                borderRadius: 10,
+                padding: '10px 12px',
+                marginBottom: 12,
+              }}>
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                    <Text style={{ color: '#0ea5e9', fontSize: 12, fontWeight: 700 }}>
+                      MLOps Studio
+                    </Text>
+                    <Button
+                      size="small"
+                      onClick={openMLOpsStudio}
+                      style={{
+                        background: '#0ea5e91a',
+                        border: '1px solid #0ea5e940',
+                        color: '#0ea5e9',
+                      }}
+                    >
+                      Open Full Screen
+                    </Button>
+                  </Space>
+                  <Space size={6} wrap>
+                    <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>
+                      stage: 1
+                    </Tag>
+                    <Tag style={{ background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1' }}>
+                      sample: {mlopsSampleSizeConfigured}
+                    </Tag>
+                    <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b' }}>
+                      charts: {mlopsMaxChartColumnsConfigured}
+                    </Tag>
+                    <Tag style={{ background: '#ec489914', border: '1px solid #ec489930', color: '#ec4899' }}>
+                      ydata: {mlopsIncludeYDataConfigured ? 'on' : 'off'}
+                    </Tag>
+                  </Space>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Incoming data profiling + compact analytics visualization (Polars + Plotly + optional YData).
+                  </Text>
+                </Space>
+              </div>
+            ) : null}
+
             {nodeType === 'condition_node' ? (
               <div style={{
                 background: '#0ea5e90f',
@@ -17939,10 +21537,27 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           }}
         >
           <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Input Source</Text>
+          <Button
+            size="small"
+            icon={<ReloadOutlined />}
+            loading={dataQueryRemoteDetectionLoading}
+            onClick={() => { void detectDataQuerySourceFieldOptions() }}
+            style={{ marginInlineStart: 8 }}
+          >
+            Refresh
+          </Button>
           <br />
           <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
             Fields discovered from directly connected upstream output.
           </Text>
+          {dataQueryRemoteDetectionError ? (
+            <>
+              <br />
+              <Text style={{ color: '#ef4444', fontSize: 11 }}>
+                {dataQueryRemoteDetectionError}
+              </Text>
+            </>
+          ) : null}
           <br />
           <Space size={6} wrap style={{ marginTop: 6 }}>
             <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9' }}>
@@ -18855,6 +22470,2092 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             </div>
           </div>
         </div>
+      </div>
+    </Modal>
+    <Modal
+      open={mlopsStudioOpen && nodeType === 'mlops_transform'}
+      onCancel={requestCloseMLOpsStudio}
+      footer={null}
+      closable={false}
+      centered
+      width="96vw"
+      styles={{
+        content: {
+          padding: 0,
+          borderRadius: 12,
+          overflow: 'hidden',
+          border: '1px solid var(--app-border-strong)',
+          background: 'var(--app-panel-bg)',
+          height: '94vh',
+          display: 'flex',
+          flexDirection: 'column',
+        },
+        body: {
+          padding: 0,
+          flex: 1,
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+        },
+      }}
+    >
+      <div
+        style={{
+          borderBottom: '1px solid var(--app-border-strong)',
+          background: 'var(--app-card-bg)',
+          padding: '12px 16px',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: 12,
+        }}
+      >
+        <div>
+          <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 16 }}>
+            MLOps Studio
+          </Text>
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+            Stage 1 (EDA), Stage 2 (Pre-Processing), Stage 3 (Model Training), and Stage 4 (Deploy & Monitor).
+          </Text>
+        </div>
+        <Space wrap>
+          <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6', marginInlineEnd: 0 }}>
+            tab: {mlopsStudioTab === 'pre_processing'
+              ? 'Pre-Processing'
+              : (mlopsStudioTab === 'model_training'
+                ? 'Model Training'
+                : (mlopsStudioTab === 'deploy_monitor' ? 'Deploy & Monitor' : 'EDA'))}
+          </Tag>
+          <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9', marginInlineEnd: 0 }}>
+            fields: {mlopsFieldOptions.length}
+          </Tag>
+          <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b', marginInlineEnd: 0 }}>
+            rows: {mlopsPreviewRows.length}
+          </Tag>
+          {mlopsRemoteRowsLoading && (
+            <Tag style={{ background: '#a855f714', border: '1px solid #a855f730', color: '#a855f7', marginInlineEnd: 0 }}>
+              loading latest Data Query output…
+            </Tag>
+          )}
+          <Space size={6}>
+            <Switch size="small" checked={mlopsCompactView} onChange={(checked) => setMLOpsCompactView(Boolean(checked))} />
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Compact</Text>
+          </Space>
+          <Space size={6} align="center">
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Runtime</Text>
+            <Select
+              size="small"
+              value={mlopsRuntimeModeDraft}
+              onChange={(value) => setMLOpsRuntimeModeDraft(String(value || 'training') === 'production' ? 'production' : 'training')}
+              options={[
+                { value: 'training', label: 'Training' },
+                { value: 'production', label: 'Production' },
+              ]}
+              style={{ width: 132 }}
+            />
+          </Space>
+          <Button
+            onClick={() => {
+              if (mlopsStudioTab === 'pre_processing') {
+                void runMLOpsStage2Preview()
+                return
+              }
+              if (mlopsStudioTab === 'model_training') {
+                void runMLOpsStage3Test()
+                return
+              }
+              if (mlopsStudioTab === 'deploy_monitor') {
+                void runMLOpsStage4Deploy()
+                return
+              }
+              void runMLOpsStage1Profile()
+            }}
+            loading={
+              mlopsStudioTab === 'pre_processing'
+                ? mlopsStage2PreviewLoading
+                : (mlopsStudioTab === 'model_training'
+                  ? mlopsStage3RunLoading
+                  : (mlopsStudioTab === 'deploy_monitor' ? mlopsStage4RunLoading : mlopsProfileLoading))
+            }
+            disabled={mlopsPreviewRows.length <= 0}
+          >
+            {mlopsStudioTab === 'pre_processing'
+              ? 'Run Preview'
+              : (mlopsStudioTab === 'model_training'
+                ? 'Run Training Test'
+                : (mlopsStudioTab === 'deploy_monitor' ? 'Run Deploy Test' : 'Run Profiling'))}
+          </Button>
+          <Button type="primary" icon={<SaveOutlined />} onClick={saveMLOpsStudioConfig}>
+            Save
+          </Button>
+          <Button onClick={requestCloseMLOpsStudio}>Close</Button>
+        </Space>
+      </div>
+
+      <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+        <div style={{ padding: '0 12px', borderBottom: '1px solid var(--app-border-strong)', background: 'var(--app-card-bg)' }}>
+          <Tabs
+            activeKey={mlopsStudioTab}
+            onChange={(key) => setMLOpsStudioTab(
+              key === 'pre_processing'
+                ? 'pre_processing'
+                : (key === 'model_training' ? 'model_training' : (key === 'deploy_monitor' ? 'deploy_monitor' : 'eda'))
+            )}
+            items={[
+              { key: 'eda', label: 'EDA' },
+              { key: 'pre_processing', label: 'Pre-Processing' },
+              { key: 'model_training', label: 'Model Training' },
+              { key: 'deploy_monitor', label: 'Deploy & Monitor' },
+            ]}
+            style={{ marginTop: 6 }}
+          />
+        </div>
+        {mlopsStudioTab === 'eda' ? (
+      <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+        <div
+          style={{
+            width: '24%',
+            minWidth: 300,
+            borderRight: '1px solid var(--app-border-strong)',
+            padding: 12,
+            overflowY: 'auto',
+          }}
+        >
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Input Source</Text>
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+            Discovered from directly connected upstream output.
+          </Text>
+          <br />
+          <Space size={6} wrap style={{ marginTop: 6 }}>
+            <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9' }}>
+              fields: {mlopsFieldOptions.length}
+            </Tag>
+            <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e' }}>
+              sample rows: {mlopsPreviewRows.length}
+            </Tag>
+            {mlopsPreviewRowsLocal.length <= 0 && mlopsRemoteRows.length > 0 && (
+              <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>
+                source: latest execution
+              </Tag>
+            )}
+          </Space>
+          {mlopsRemoteRowsError && (
+            <Text style={{ display: 'block', color: '#ef4444', fontSize: 11, marginTop: 6 }}>
+              {mlopsRemoteRowsError}
+            </Text>
+          )}
+
+          <Divider style={{ borderColor: 'var(--app-border)', margin: '12px 0' }} />
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Field List</Text>
+          <div style={{
+            border: '1px solid var(--app-border-strong)',
+            borderRadius: 8,
+            background: 'var(--app-card-bg)',
+            padding: 8,
+            marginTop: 8,
+            maxHeight: 280,
+            overflowY: 'auto',
+          }}>
+            {(mlopsFieldOptions.length > 0 ? mlopsFieldOptions : ['(no fields discovered)']).slice(0, 350).map((path) => (
+              <div key={`mlops_field_${path}`} style={{ marginBottom: 4 }}>
+                <Text style={{ color: 'var(--app-text)', fontSize: 12, fontFamily: 'monospace' }}>
+                  {path}
+                </Text>
+              </div>
+            ))}
+          </div>
+
+          <Divider style={{ borderColor: 'var(--app-border)', margin: '12px 0' }} />
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Input Sample Rows</Text>
+          <Input.TextArea
+            readOnly
+            rows={mlopsCompactView ? 12 : 16}
+            value={JSON.stringify(mlopsPreviewRows.slice(0, 5), null, 2)}
+            style={{
+              marginTop: 8,
+              background: 'var(--app-input-bg)',
+              border: '1px solid var(--app-border-strong)',
+              color: 'var(--app-text)',
+              fontFamily: 'monospace',
+              fontSize: 12,
+            }}
+          />
+        </div>
+
+        <div style={{ flex: 1, minWidth: 0, padding: 12, overflowY: 'auto' }}>
+          <div
+            style={{
+              border: '1px solid var(--app-border-strong)',
+              borderRadius: 10,
+              background: 'var(--app-card-bg)',
+              padding: mlopsCompactView ? 10 : 14,
+              marginBottom: 12,
+            }}
+          >
+            <Space size={10} wrap align="end">
+              <div>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Profile sample size</Text>
+                <InputNumber
+                  size="small"
+                  min={100}
+                  max={20000}
+                  value={mlopsSampleSizeDraft}
+                  onChange={(value) => setMLOpsSampleSizeDraft(Number.isFinite(Number(value)) ? Number(value) : 2000)}
+                  style={{ width: 140, marginTop: 4 }}
+                />
+              </div>
+              <div>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Preview rows</Text>
+                <InputNumber
+                  size="small"
+                  min={5}
+                  max={200}
+                  value={mlopsPreviewRowsDraft}
+                  onChange={(value) => setMLOpsPreviewRowsDraft(Number.isFinite(Number(value)) ? Number(value) : 25)}
+                  style={{ width: 120, marginTop: 4 }}
+                />
+              </div>
+              <div>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Max chart columns</Text>
+                <InputNumber
+                  size="small"
+                  min={1}
+                  max={12}
+                  value={mlopsMaxChartColumnsDraft}
+                  onChange={(value) => setMLOpsMaxChartColumnsDraft(Number.isFinite(Number(value)) ? Number(value) : 6)}
+                  style={{ width: 140, marginTop: 4 }}
+                />
+              </div>
+              <div>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Include YData</Text>
+                <br />
+                <Switch
+                  size="small"
+                  checked={mlopsIncludeYDataDraft}
+                  onChange={(checked) => setMLOpsIncludeYDataDraft(Boolean(checked))}
+                />
+              </div>
+              <div style={{ minWidth: 320 }}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Graphs to generate</Text>
+                <Select
+                  mode="multiple"
+                  size="small"
+                  value={mlopsChartTypesDraft}
+                  onChange={(values) => {
+                    const selected = uniqueFieldNames((values || []).map((v) => String(v || '').trim().toLowerCase()))
+                    setMLOpsChartTypesDraft(selected.length > 0 ? selected : [...MLOPS_DEFAULT_CHART_TYPES])
+                  }}
+                  options={MLOPS_CHART_TYPE_OPTIONS}
+                  style={{ width: '100%', marginTop: 4 }}
+                  maxTagCount={3}
+                  placeholder="Select chart types"
+                />
+              </div>
+              <div>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Chart theme</Text>
+                <Select
+                  size="small"
+                  value={mlopsChartThemeDraft}
+                  onChange={(value) => setMLOpsChartThemeDraft((String(value || 'auto') as MLOpsChartTheme))}
+                  options={[
+                    { value: 'auto', label: `Auto (${resolvedMLOpsChartTheme})` },
+                    { value: 'light', label: 'Light' },
+                    { value: 'dark', label: 'Dark' },
+                  ]}
+                  style={{ width: 150, marginTop: 4 }}
+                />
+              </div>
+            </Space>
+            {mlopsProfileError ? (
+              <Text style={{ display: 'block', color: '#ef4444', marginTop: 10, fontSize: 12 }}>
+                {mlopsProfileError}
+              </Text>
+            ) : null}
+          </div>
+
+          <div
+            style={{
+              border: '1px solid var(--app-border-strong)',
+              borderRadius: 10,
+              background: 'var(--app-card-bg)',
+              padding: mlopsCompactView ? 10 : 14,
+              marginBottom: 12,
+            }}
+          >
+            <Space size={8} wrap>
+              <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9' }}>
+                input: {Number(mlopsProfileResult?.summary?.input_rows || mlopsProfileResult?.input_rows || 0)}
+              </Tag>
+              <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>
+                sampled: {Number(mlopsProfileResult?.summary?.sampled_rows || 0)}
+              </Tag>
+              <Tag style={{ background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1' }}>
+                columns: {Number(mlopsProfileResult?.summary?.column_count || 0)}
+              </Tag>
+              <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b' }}>
+                duplicates: {Number(mlopsProfileResult?.summary?.duplicate_rows || 0)}
+              </Tag>
+              <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e' }}>
+                polars: {Boolean(mlopsProfileResult?.polars?.available) ? 'ready' : 'not available'}
+              </Tag>
+              <Tag style={{ background: '#ec489914', border: '1px solid #ec489930', color: '#ec4899' }}>
+                ydata: {Boolean(mlopsProfileResult?.ydata?.available) ? 'ready' : (mlopsIncludeYDataDraft ? 'not available' : 'off')}
+              </Tag>
+              <Tag style={{ background: '#8b5cf614', border: '1px solid #8b5cf630', color: '#8b5cf6' }}>
+                graphs: {uniqueFieldNames(mlopsChartTypesDraft).length}
+              </Tag>
+            </Space>
+          </div>
+
+          <div
+            style={{
+              border: '1px solid var(--app-border-strong)',
+              borderRadius: 10,
+              background: 'var(--app-card-bg)',
+              padding: mlopsCompactView ? 8 : 12,
+              marginBottom: 12,
+            }}
+          >
+            <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Column Profile</Text>
+            <Table
+              size="small"
+              style={{ marginTop: 8 }}
+              rowKey={(row) => String((row as any).name || Math.random())}
+              dataSource={mlopsProfileColumns}
+              pagination={{ pageSize: mlopsCompactView ? 8 : 12, showSizeChanger: false }}
+              columns={[
+                { title: 'Field', dataIndex: 'name', key: 'name', width: 220, ellipsis: true },
+                { title: 'Type', dataIndex: 'type', key: 'type', width: 110 },
+                { title: 'Missing %', dataIndex: 'missing_pct', key: 'missing_pct', width: 100, render: (v: number) => Number(v || 0).toFixed(2) },
+                { title: 'Unique', dataIndex: 'unique_count', key: 'unique_count', width: 90 },
+                { title: 'Suggested Ops', dataIndex: 'suggested_operations', key: 'suggested_operations', ellipsis: true },
+              ]}
+            />
+          </div>
+
+          <div
+            style={{
+              border: '1px solid var(--app-border-strong)',
+              borderRadius: 10,
+              background: 'var(--app-card-bg)',
+              padding: mlopsCompactView ? 8 : 12,
+              marginBottom: 12,
+            }}
+          >
+            <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Analytics Visuals</Text>
+            {(mlopsProfileResult?.charts || []).length <= 0 ? (
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12, display: 'block', marginTop: 8 }}>
+                Run profiling to generate compact visuals.
+              </Text>
+            ) : (
+              <div style={{ marginTop: 8, display: 'grid', gap: 12, gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))' }}>
+                {(mlopsProfileResult?.charts || []).map((chart) => (
+                  <div
+                    key={`mlops_chart_${String(chart.id || '')}`}
+                    style={{
+                      border: '1px solid var(--app-border-strong)',
+                      borderRadius: 8,
+                      background: 'var(--app-panel-bg)',
+                      padding: 8,
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                      <Text style={{ color: 'var(--app-text)', fontSize: 12, fontWeight: 600 }}>
+                        {String(chart.title || chart.id || 'Chart')}
+                      </Text>
+                      <Button
+                        size="small"
+                        type="text"
+                        icon={<ArrowsAltOutlined />}
+                        onClick={() => setMLOpsExpandedChart(chart)}
+                      >
+                        Expand
+                      </Button>
+                    </div>
+                    {chart.figure_json && typeof chart.figure_json === 'object' ? (
+                      <Plot
+                        data={(((chart.figure_json as any) || {}).data || []) as any[]}
+                        layout={{
+                          ...((((chart.figure_json as any) || {}).layout || {}) as Record<string, unknown>),
+                          autosize: true,
+                          paper_bgcolor: 'transparent',
+                          plot_bgcolor: 'transparent',
+                        } as any}
+                        config={{ responsive: true, displayModeBar: false, displaylogo: false }}
+                        style={{ width: '100%', height: mlopsCompactView ? 220 : 260, marginTop: 8 }}
+                        useResizeHandler
+                      />
+                    ) : (
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12, display: 'block', marginTop: 8 }}>
+                        Chart data not available.
+                      </Text>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div
+            style={{
+              border: '1px solid var(--app-border-strong)',
+              borderRadius: 10,
+              background: 'var(--app-card-bg)',
+              padding: mlopsCompactView ? 8 : 12,
+              marginBottom: 12,
+            }}
+          >
+            <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>YData Profiling</Text>
+            {!mlopsIncludeYDataDraft ? (
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12, display: 'block', marginTop: 8 }}>
+                YData is disabled in settings.
+              </Text>
+            ) : !Boolean(mlopsProfileResult?.ydata?.available) ? (
+              <Text style={{ color: '#ef4444', fontSize: 12, display: 'block', marginTop: 8 }}>
+                {String(mlopsProfileResult?.ydata?.reason || 'YData profiling not available')}
+              </Text>
+            ) : (
+              <>
+                <Space size={8} wrap style={{ marginTop: 8 }}>
+                  <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>
+                    sampled: {Number(mlopsProfileResult?.ydata?.sampled_rows || 0)}
+                  </Tag>
+                  <Tag style={{ background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1' }}>
+                    variables: {Number(mlopsProfileResult?.ydata?.variable_count || 0)}
+                  </Tag>
+                  <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b' }}>
+                    alerts: {Number(mlopsProfileResult?.ydata?.alerts_count || 0)}
+                  </Tag>
+                  <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e' }}>
+                    readiness: {String(mlopsYDataSections.ml_readiness_analysis?.readiness_status || 'NA')}
+                  </Tag>
+                </Space>
+                <div
+                  style={{
+                    marginTop: 10,
+                    border: '1px solid var(--app-border-strong)',
+                    borderRadius: 8,
+                    padding: 8,
+                    background: 'var(--app-panel-bg)',
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Variable Explorer (YData style)</Text>
+                    <Select
+                      size="small"
+                      showSearch
+                      value={mlopsYDataActiveField || undefined}
+                      placeholder="Select field"
+                      options={mlopsYDataFieldOptions.map((path) => ({ value: path, label: path }))}
+                      onChange={(value) => setMLOpsYDataActiveField(String(value || ''))}
+                      style={{ minWidth: 320, maxWidth: '62vw' }}
+                      filterOption={(input, option) => String(option?.label || '').toLowerCase().includes(String(input || '').toLowerCase())}
+                    />
+                  </div>
+                  <div
+                    style={{
+                      marginTop: 8,
+                      display: 'grid',
+                      gap: 10,
+                      gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))',
+                    }}
+                  >
+                    <div
+                      style={{
+                        border: '1px solid var(--app-border-strong)',
+                        borderRadius: 8,
+                        background: 'var(--app-card-bg)',
+                        padding: 8,
+                      }}
+                    >
+                      <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Field Summary</Text>
+                      <Table
+                        size="small"
+                        style={{ marginTop: 6 }}
+                        rowKey={(row) => String((row as any).key || Math.random())}
+                        dataSource={mlopsYDataVariableExplorer.statsRows}
+                        pagination={false}
+                        columns={[
+                          { title: 'Metric', dataIndex: 'metric', key: 'metric', width: 180, ellipsis: true },
+                          { title: 'Value', dataIndex: 'value', key: 'value', ellipsis: true },
+                        ]}
+                      />
+                    </div>
+                    <div
+                      style={{
+                        border: '1px solid var(--app-border-strong)',
+                        borderRadius: 8,
+                        background: 'var(--app-card-bg)',
+                        padding: 8,
+                      }}
+                    >
+                      <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Field Distribution</Text>
+                      {(mlopsYDataVariableExplorer.plotData || []).length > 0 ? (
+                        <Plot
+                          data={(mlopsYDataVariableExplorer.plotData || []) as any[]}
+                          layout={{
+                            ...(mlopsYDataVariableExplorer.plotLayout || {}),
+                            autosize: true,
+                            paper_bgcolor: 'transparent',
+                            plot_bgcolor: 'transparent',
+                          } as any}
+                          config={{ responsive: true, displayModeBar: false, displaylogo: false }}
+                          style={{ width: '100%', height: mlopsCompactView ? 250 : 300, marginTop: 6 }}
+                          useResizeHandler
+                        />
+                      ) : (
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12, display: 'block', marginTop: 8 }}>
+                          {String(mlopsYDataVariableExplorer.chartMessage || 'No chart data available')}
+                        </Text>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                <div style={{ marginTop: 8, display: 'grid', gap: 8, gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))' }}>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 8, background: 'var(--app-panel-bg)' }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Dataset Understanding</Text>
+                    <Input.TextArea
+                      readOnly
+                      rows={mlopsCompactView ? 5 : 6}
+                      value={JSON.stringify(mlopsYDataSections.dataset_understanding || {}, null, 2)}
+                      style={{
+                        marginTop: 6,
+                        background: 'var(--app-input-bg)',
+                        border: '1px solid var(--app-border-strong)',
+                        color: 'var(--app-text)',
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                      }}
+                    />
+                  </div>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 8, background: 'var(--app-panel-bg)' }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Data Quality Checks</Text>
+                    <Input.TextArea
+                      readOnly
+                      rows={mlopsCompactView ? 5 : 6}
+                      value={JSON.stringify(mlopsYDataSections.data_quality_checks || {}, null, 2)}
+                      style={{
+                        marginTop: 6,
+                        background: 'var(--app-input-bg)',
+                        border: '1px solid var(--app-border-strong)',
+                        color: 'var(--app-text)',
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                      }}
+                    />
+                  </div>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 8, background: 'var(--app-panel-bg)' }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Feature Analysis</Text>
+                    <Input.TextArea
+                      readOnly
+                      rows={mlopsCompactView ? 5 : 6}
+                      value={JSON.stringify(mlopsYDataSections.feature_analysis || {}, null, 2)}
+                      style={{
+                        marginTop: 6,
+                        background: 'var(--app-input-bg)',
+                        border: '1px solid var(--app-border-strong)',
+                        color: 'var(--app-text)',
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                      }}
+                    />
+                  </div>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 8, background: 'var(--app-panel-bg)' }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Anomaly Detection</Text>
+                    <Input.TextArea
+                      readOnly
+                      rows={mlopsCompactView ? 5 : 6}
+                      value={JSON.stringify(mlopsYDataSections.anomaly_detection || {}, null, 2)}
+                      style={{
+                        marginTop: 6,
+                        background: 'var(--app-input-bg)',
+                        border: '1px solid var(--app-border-strong)',
+                        color: 'var(--app-text)',
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                      }}
+                    />
+                  </div>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 8, background: 'var(--app-panel-bg)' }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Preprocessing Insights</Text>
+                    <Input.TextArea
+                      readOnly
+                      rows={mlopsCompactView ? 5 : 6}
+                      value={JSON.stringify(mlopsYDataSections.preprocessing_insights || {}, null, 2)}
+                      style={{
+                        marginTop: 6,
+                        background: 'var(--app-input-bg)',
+                        border: '1px solid var(--app-border-strong)',
+                        color: 'var(--app-text)',
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                      }}
+                    />
+                  </div>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 8, background: 'var(--app-panel-bg)' }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>ML Readiness Analysis</Text>
+                    <Input.TextArea
+                      readOnly
+                      rows={mlopsCompactView ? 5 : 6}
+                      value={JSON.stringify(mlopsYDataSections.ml_readiness_analysis || {}, null, 2)}
+                      style={{
+                        marginTop: 6,
+                        background: 'var(--app-input-bg)',
+                        border: '1px solid var(--app-border-strong)',
+                        color: 'var(--app-text)',
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                      }}
+                    />
+                  </div>
+                </div>
+                <Table
+                  size="small"
+                  style={{ marginTop: 8 }}
+                  rowKey={(row) => String((row as any).name || Math.random())}
+                  dataSource={mlopsYDataVariables.slice(0, mlopsCompactView ? 20 : 40)}
+                  pagination={{ pageSize: mlopsCompactView ? 6 : 10, showSizeChanger: false }}
+                  columns={[
+                    { title: 'Field', dataIndex: 'name', key: 'name', width: 220, ellipsis: true },
+                    { title: 'Type', dataIndex: 'type', key: 'type', width: 110 },
+                    { title: 'Missing %', dataIndex: 'missing_pct', key: 'missing_pct', width: 120, render: (v: any) => (v == null ? '' : String(v)) },
+                    { title: 'Distinct', dataIndex: 'distinct', key: 'distinct', width: 100, render: (v: any) => (v == null ? '' : String(v)) },
+                    { title: 'Mean', dataIndex: 'mean', key: 'mean', width: 120, ellipsis: true, render: (v: any) => (v == null ? '' : String(v)) },
+                    { title: 'Std', dataIndex: 'std', key: 'std', width: 120, ellipsis: true, render: (v: any) => (v == null ? '' : String(v)) },
+                  ]}
+                />
+                <Input.TextArea
+                  readOnly
+                  rows={mlopsCompactView ? 4 : 6}
+                  value={JSON.stringify(mlopsProfileResult?.ydata?.alerts_preview || [], null, 2)}
+                  style={{
+                    marginTop: 8,
+                    background: 'var(--app-input-bg)',
+                    border: '1px solid var(--app-border-strong)',
+                    color: 'var(--app-text)',
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                  }}
+                />
+              </>
+            )}
+          </div>
+
+          <div
+            style={{
+              border: '1px solid var(--app-border-strong)',
+              borderRadius: 10,
+              background: 'var(--app-card-bg)',
+              padding: mlopsCompactView ? 8 : 12,
+            }}
+          >
+            <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Preview Rows (Profile Output)</Text>
+            <Input.TextArea
+              readOnly
+              rows={mlopsCompactView ? 8 : 12}
+              value={JSON.stringify(mlopsProfileResult?.preview_rows || [], null, 2)}
+              style={{
+                marginTop: 8,
+                background: 'var(--app-input-bg)',
+                border: '1px solid var(--app-border-strong)',
+                color: 'var(--app-text)',
+                fontFamily: 'monospace',
+                fontSize: 12,
+              }}
+            />
+          </div>
+        </div>
+      </div>
+        ) : (mlopsStudioTab === 'pre_processing' ? (
+          <div
+            style={{
+              flex: 1,
+              minHeight: 0,
+              overflowY: 'auto',
+              padding: 12,
+            }}
+          >
+            <div
+              style={{
+                border: '1px solid var(--app-border-strong)',
+                borderRadius: 10,
+                background: 'var(--app-card-bg)',
+                padding: 12,
+              }}
+            >
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  gap: 8,
+                  flexWrap: 'wrap',
+                }}
+              >
+                <div>
+                  <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 14 }}>
+                    Pre-Processing (Stage 2)
+                  </Text>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12, display: 'block', marginTop: 4 }}>
+                    Configure field-level cleaning, missing handling, encoding, and scaling. Run preview to generate artifact + transformed output table.
+                  </Text>
+                </div>
+                <Space size={8} wrap>
+                  <Input
+                    size="small"
+                    value={mlopsStage2FieldSearchDraft}
+                    onChange={(event) => setMLOpsStage2FieldSearchDraft(String(event.target.value || ''))}
+                    placeholder="Search field path..."
+                    style={{ width: 240 }}
+                  />
+                  <Select
+                    size="small"
+                    allowClear
+                    showSearch
+                    optionFilterProp="label"
+                    value={mlopsStage2TargetFieldDraft || undefined}
+                    onChange={(value) => setMLOpsStage2TargetFieldDraft(String(value || '').trim())}
+                    options={mlopsStage2FieldSelectorOptions}
+                    placeholder="Target field (target encoding)"
+                    style={{ width: 240 }}
+                  />
+                  <Select
+                    size="small"
+                    allowClear
+                    showSearch
+                    optionFilterProp="label"
+                    value={mlopsStage2LabelFieldDraft || undefined}
+                    onChange={(value) => setMLOpsStage2LabelFieldDraft(String(value || '').trim())}
+                    options={mlopsStage2FieldSelectorOptions}
+                    placeholder="Label field (optional)"
+                    style={{ width: 220 }}
+                  />
+                  <InputNumber
+                    size="small"
+                    min={10}
+                    max={5000}
+                    value={mlopsStage2PreviewLimitDraft}
+                    onChange={(value) => setMLOpsStage2PreviewLimitDraft(Number.isFinite(Number(value)) ? Number(value) : 200)}
+                    style={{ width: 140 }}
+                  />
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      setMLOpsStage2FieldConfigsByFieldDraft({})
+                      setMLOpsStage2TargetFieldDraft('')
+                      setMLOpsStage2LabelFieldDraft('')
+                      setMLOpsStage2PreviewRows([])
+                      setMLOpsStage2PreviewError(null)
+                      setMLOpsStage2ArtifactDraft(null)
+                      setMLOpsStage2PreviewSummary({
+                        ran: false,
+                        inputRows: 0,
+                        outputRows: 0,
+                        droppedRows: 0,
+                        configuredFields: 0,
+                        generatedColumns: 0,
+                      })
+                    }}
+                  >
+                    Reset Config
+                  </Button>
+                  <Button size="small" type="primary" onClick={runMLOpsStage2Preview} loading={mlopsStage2PreviewLoading}>
+                    Run Preview
+                  </Button>
+                </Space>
+              </div>
+              <Space size={8} wrap style={{ marginTop: 10 }}>
+                <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9' }}>
+                  input rows: {mlopsPreviewRows.length}
+                </Tag>
+                <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e' }}>
+                  fields: {mlopsFieldOptions.length}
+                </Tag>
+                <Tag style={{ background: '#8b5cf614', border: '1px solid #8b5cf630', color: '#8b5cf6' }}>
+                  configured: {mlopsStage2EnabledConfigCount}
+                </Tag>
+                <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b' }}>
+                  output: {mlopsStage2PreviewSummary.ran ? mlopsStage2PreviewSummary.outputRows : 0}
+                </Tag>
+              </Space>
+              {mlopsStage2PreviewError ? (
+                <Text style={{ display: 'block', color: '#ef4444', marginTop: 8, fontSize: 12 }}>
+                  {mlopsStage2PreviewError}
+                </Text>
+              ) : null}
+              <div
+                style={{
+                  marginTop: 10,
+                  display: 'grid',
+                  gridTemplateColumns: '64% 36%',
+                  gap: 8,
+                }}
+              >
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Field Configuration Table</Text>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', marginTop: 4 }}>
+                      Multi-select operations by field. Applies artifact logic for Cleaning, Missing Values, Encoding, and Scaling.
+                    </Text>
+                    <Table
+                      size="small"
+                      style={{ marginTop: 8 }}
+                      rowKey={(row) => String((row as MLOpsStage2FieldConfig).field_path)}
+                      dataSource={mlopsStage2EffectiveConfigRows}
+                      pagination={{ pageSize: mlopsCompactView ? 12 : 18, showSizeChanger: false }}
+                      scroll={{ x: 1800 }}
+                      columns={[
+                        {
+                          title: 'Field',
+                          dataIndex: 'field_path',
+                          key: 'field_path',
+                          width: 320,
+                          fixed: 'left',
+                          render: (value: unknown) => {
+                            const path = String(value || '')
+                            const sample = mlopsStage2FieldSampleMap.get(path)
+                            const kind = mlopsStage2FieldKinds.get(path) || 'unknown'
+                            return (
+                              <div>
+                                <Text style={{ color: 'var(--app-text)', fontFamily: 'monospace', fontSize: 12 }}>{path}</Text>
+                                <div style={{ marginTop: 2, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                                  <Tag style={{ marginInlineEnd: 0, background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1' }}>
+                                    {kind}
+                                  </Tag>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                                    {sample ? (sample.length > 56 ? `${sample.slice(0, 53)}...` : sample) : '(no sample)'}
+                                  </Text>
+                                </div>
+                              </div>
+                            )
+                          },
+                        },
+                        {
+                          title: 'Enabled',
+                          dataIndex: 'enabled',
+                          key: 'enabled',
+                          width: 86,
+                          render: (_: unknown, row: any) => (
+                            <Switch
+                              size="small"
+                              checked={Boolean(row.enabled)}
+                              onChange={(checked) => updateMLOpsStage2FieldConfig(String(row.field_path || ''), { enabled: Boolean(checked) })}
+                            />
+                          ),
+                        },
+                        {
+                          title: 'Cleaning',
+                          dataIndex: 'cleaning',
+                          key: 'cleaning',
+                          width: 280,
+                          render: (_: unknown, row: any) => (
+                            <Select
+                              mode="multiple"
+                              size="small"
+                              value={row.cleaning || []}
+                              onChange={(values) => updateMLOpsStage2FieldConfig(String(row.field_path || ''), { cleaning: values as MLOpsStage2CleaningOperation[] })}
+                              options={MLOPS_STAGE2_CLEANING_OPTIONS}
+                              style={{ width: '100%' }}
+                              maxTagCount={1}
+                              placeholder="Select"
+                            />
+                          ),
+                        },
+                        {
+                          title: 'Missing Values',
+                          dataIndex: 'missing_values',
+                          key: 'missing_values',
+                          width: 280,
+                          render: (_: unknown, row: any) => (
+                            <Select
+                              mode="multiple"
+                              size="small"
+                              value={row.missing_values || []}
+                              onChange={(values) => updateMLOpsStage2FieldConfig(String(row.field_path || ''), { missing_values: values as MLOpsStage2MissingOperation[] })}
+                              options={MLOPS_STAGE2_MISSING_OPTIONS}
+                              style={{ width: '100%' }}
+                              maxTagCount={1}
+                              placeholder="Select"
+                            />
+                          ),
+                        },
+                        {
+                          title: 'Encoding',
+                          dataIndex: 'encoding',
+                          key: 'encoding',
+                          width: 280,
+                          render: (_: unknown, row: any) => (
+                            <Select
+                              mode="multiple"
+                              size="small"
+                              value={row.encoding || []}
+                              onChange={(values) => updateMLOpsStage2FieldConfig(String(row.field_path || ''), { encoding: values as MLOpsStage2EncodingOperation[] })}
+                              options={MLOPS_STAGE2_ENCODING_OPTIONS}
+                              style={{ width: '100%' }}
+                              maxTagCount={1}
+                              placeholder="Select"
+                            />
+                          ),
+                        },
+                        {
+                          title: 'Scaling & Transform',
+                          dataIndex: 'scaling',
+                          key: 'scaling',
+                          width: 280,
+                          render: (_: unknown, row: any) => (
+                            <Select
+                              mode="multiple"
+                              size="small"
+                              value={row.scaling || []}
+                              onChange={(values) => updateMLOpsStage2FieldConfig(String(row.field_path || ''), { scaling: values as MLOpsStage2ScalingOperation[] })}
+                              options={MLOPS_STAGE2_SCALING_OPTIONS}
+                              style={{ width: '100%' }}
+                              maxTagCount={1}
+                              placeholder="Select"
+                            />
+                          ),
+                        },
+                      ]}
+                    />
+                  </div>
+                </div>
+                <div style={{ minWidth: 0, display: 'grid', gap: 8 }}>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Preview Result</Text>
+                    <Space size={6} wrap style={{ marginTop: 6 }}>
+                      <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9', marginInlineEnd: 0 }}>
+                        input: {mlopsStage2PreviewSummary.ran ? mlopsStage2PreviewSummary.inputRows : 0}
+                      </Tag>
+                      <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e', marginInlineEnd: 0 }}>
+                        output: {mlopsStage2PreviewSummary.ran ? mlopsStage2PreviewSummary.outputRows : 0}
+                      </Tag>
+                      <Tag style={{ background: '#ef444414', border: '1px solid #ef444430', color: '#ef4444', marginInlineEnd: 0 }}>
+                        dropped: {mlopsStage2PreviewSummary.ran ? mlopsStage2PreviewSummary.droppedRows : 0}
+                      </Tag>
+                      <Tag style={{ background: '#8b5cf614', border: '1px solid #8b5cf630', color: '#8b5cf6', marginInlineEnd: 0 }}>
+                        derived cols: {mlopsStage2PreviewSummary.ran ? mlopsStage2PreviewSummary.generatedColumns : 0}
+                      </Tag>
+                    </Space>
+                    <Input.TextArea
+                      readOnly
+                      rows={mlopsCompactView ? 7 : 9}
+                      value={JSON.stringify(mlopsStage2ArtifactDraft || {}, null, 2)}
+                      style={{
+                        marginTop: 8,
+                        background: 'var(--app-input-bg)',
+                        border: '1px solid var(--app-border-strong)',
+                        color: 'var(--app-text)',
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                      }}
+                    />
+                  </div>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Output Data Table (Preview)</Text>
+                    <Table
+                      size="small"
+                      style={{ marginTop: 6 }}
+                      rowKey={(_row, idx) => `mlops_stage2_preview_${idx}`}
+                      dataSource={mlopsStage2PreviewRows}
+                      pagination={{ pageSize: mlopsCompactView ? 8 : 12, showSizeChanger: false }}
+                      scroll={{ x: 1200 }}
+                      columns={mlopsStage2PreviewColumns}
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : (mlopsStudioTab === 'model_training' ? (
+          <div
+            style={{
+              flex: 1,
+              minHeight: 0,
+              overflowY: 'auto',
+              padding: 12,
+            }}
+          >
+            <div
+              style={{
+                border: '1px solid var(--app-border-strong)',
+                borderRadius: 10,
+                background: 'var(--app-card-bg)',
+                padding: 12,
+              }}
+            >
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: '36% 64%',
+                  gap: 10,
+                }}
+              >
+                <div style={{ minWidth: 0, display: 'grid', gap: 10 }}>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8, flexWrap: 'wrap' }}>
+                      <div>
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 14 }}>Model Training (Stage 3)</Text>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12, display: 'block', marginTop: 4 }}>
+                          Train-ready setup using Pre-Processing selected fields, model configuration, tuning, and experiment tracking.
+                        </Text>
+                      </div>
+                      <Space size={8}>
+                        <Button size="small" onClick={() => { setMLOpsStage3RunError(null); setMLOpsStage3RunSummary(null) }}>
+                          Reset Test
+                        </Button>
+                        <Button size="small" type="primary" loading={mlopsStage3RunLoading} onClick={runMLOpsStage3Test}>
+                          Run Training Test
+                        </Button>
+                      </Space>
+                    </div>
+                    <Space size={8} wrap style={{ marginTop: 8 }}>
+                      <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e', marginInlineEnd: 0 }}>
+                        preproc fields: {mlopsStage2EnabledFields.length}
+                      </Tag>
+                      <Tag style={{ background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1', marginInlineEnd: 0 }}>
+                        selected features: {mlopsStage3SelectedFeatureFields.length}
+                      </Tag>
+                      <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9', marginInlineEnd: 0 }}>
+                        rows: {mlopsPreviewRows.length}
+                      </Tag>
+                      <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b', marginInlineEnd: 0 }}>
+                        split: {mlopsStage3RunSummary?.ran
+                          ? `${mlopsStage3RunSummary.train_rows}/${mlopsStage3RunSummary.validate_rows || 0}/${mlopsStage3RunSummary.test_rows}`
+                          : 'not run'}
+                      </Tag>
+                    </Space>
+                    {mlopsStage3RunError ? (
+                      <Text style={{ color: '#ef4444', fontSize: 12, display: 'block', marginTop: 8 }}>
+                        {mlopsStage3RunError}
+                      </Text>
+                    ) : null}
+                    {mlopsStage3RunSummary ? (
+                      <Input.TextArea
+                        readOnly
+                        rows={mlopsCompactView ? 5 : 7}
+                        value={JSON.stringify(mlopsStage3RunSummary, null, 2)}
+                        style={{
+                          marginTop: 8,
+                          background: 'var(--app-input-bg)',
+                          border: '1px solid var(--app-border-strong)',
+                          color: 'var(--app-text)',
+                          fontFamily: 'monospace',
+                          fontSize: 12,
+                        }}
+                      />
+                    ) : null}
+                  </div>
+
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Input Features (from Pre-Processing)</Text>
+                    <Select
+                      mode="multiple"
+                      size="small"
+                      style={{ width: '100%', marginTop: 8 }}
+                      options={mlopsStage3FeatureFieldOptions}
+                      value={mlopsStage3SelectedFeatureFields}
+                      onChange={(values) => setMLOpsStage3FeatureFieldsDraft(uniqueFieldNames((values || []).map((item) => String(item || '').trim())))}
+                      placeholder="Select feature fields"
+                      maxTagCount={6}
+                    />
+                    <div style={{ marginTop: 8, maxHeight: 200, overflowY: 'auto', border: '1px solid var(--app-border)', borderRadius: 6, padding: 8 }}>
+                      {(mlopsStage3AvailableFields.length > 0 ? mlopsStage3AvailableFields : ['(no pre-processing fields enabled)']).map((field) => (
+                        <div key={`mlops_stage3_field_${field}`} style={{ marginBottom: 4 }}>
+                          <Text style={{ color: 'var(--app-text)', fontSize: 12, fontFamily: 'monospace' }}>{field}</Text>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ minWidth: 0, display: 'grid', gap: 10 }}>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Model Selection</Text>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 8 }}>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Task Type</Text>
+                        <Select
+                          size="small"
+                          value={mlopsStage3TaskTypeDraft}
+                          options={MLOPS_STAGE3_TASK_OPTIONS}
+                          onChange={(value) => setMLOpsStage3TaskTypeDraft(String(value || 'classification') as MLOpsStage3TaskType)}
+                          style={{ width: '100%', marginTop: 4 }}
+                        />
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Model</Text>
+                        <Select
+                          size="small"
+                          value={mlopsStage3ModelDraft || undefined}
+                          options={mlopsStage3ModelOptions}
+                          onChange={(value) => setMLOpsStage3ModelDraft(String(value || '').trim())}
+                          style={{ width: '100%', marginTop: 4 }}
+                          placeholder="Select model"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Runtime Prediction Mode</Text>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginTop: 8 }}>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Mode</Text>
+                        <Select
+                          size="small"
+                          value={mlopsRuntimeModeDraft}
+                          options={[
+                            { value: 'training', label: 'Training (pass-through)' },
+                            { value: 'production', label: 'Production (predict)' },
+                          ]}
+                          onChange={(value) => setMLOpsRuntimeModeDraft(String(value || 'training') === 'production' ? 'production' : 'training')}
+                          style={{ width: '100%', marginTop: 4 }}
+                        />
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Prediction field</Text>
+                        <Input
+                          size="small"
+                          value={mlopsPredictionFieldDraft}
+                          onChange={(event) => setMLOpsPredictionFieldDraft(String(event.target.value || 'prediction'))}
+                          placeholder="prediction"
+                          style={{ marginTop: 4 }}
+                        />
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Score field</Text>
+                        <Input
+                          size="small"
+                          value={mlopsPredictionScoreFieldDraft}
+                          onChange={(event) => setMLOpsPredictionScoreFieldDraft(String(event.target.value || 'prediction_score'))}
+                          placeholder="prediction_score"
+                          style={{ marginTop: 4 }}
+                        />
+                      </div>
+                    </div>
+                    {mlopsStage3TaskTypeDraft === 'forecasting' ? (
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 8 }}>
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Forecast Output Mode</Text>
+                          <Select
+                            size="small"
+                            value={mlopsForecastOutputModeDraft}
+                            options={[
+                              { value: 'append_future', label: 'Append input + future rows' },
+                              { value: 'future_only', label: 'Future rows only' },
+                              { value: 'in_place', label: 'In-place input rows only' },
+                            ]}
+                            onChange={(value) => {
+                              const raw = String(value || 'append_future').trim().toLowerCase()
+                              if (raw === 'future_only') setMLOpsForecastOutputModeDraft('future_only')
+                              else if (raw === 'in_place') setMLOpsForecastOutputModeDraft('in_place')
+                              else setMLOpsForecastOutputModeDraft('append_future')
+                            }}
+                            style={{ width: '100%', marginTop: 4 }}
+                          />
+                        </div>
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Runtime Forecast Steps</Text>
+                          <InputNumber
+                            size="small"
+                            min={0}
+                            max={3650}
+                            value={mlopsForecastRuntimeStepsDraft}
+                            onChange={(value) => {
+                              const n = Number(value)
+                              if (!Number.isFinite(n)) {
+                                setMLOpsForecastRuntimeStepsDraft(0)
+                                return
+                              }
+                              setMLOpsForecastRuntimeStepsDraft(Math.max(0, Math.min(Math.trunc(n), 3650)))
+                            }}
+                            style={{ width: '100%', marginTop: 4 }}
+                          />
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10, display: 'block', marginTop: 4 }}>
+                            0 = use training horizon. Positive value overrides future steps in production mode.
+                          </Text>
+                        </div>
+                      </div>
+                    ) : null}
+                    <Space size={8} style={{ marginTop: 8 }} wrap>
+                      <Tag style={{
+                        background: mlopsStage3ModelBundleDraft ? '#22c55e14' : '#ef444414',
+                        border: `1px solid ${mlopsStage3ModelBundleDraft ? '#22c55e30' : '#ef444430'}`,
+                        color: mlopsStage3ModelBundleDraft ? '#22c55e' : '#ef4444',
+                        marginInlineEnd: 0,
+                      }}>
+                        model bundle: {mlopsStage3ModelBundleDraft ? 'ready' : 'missing'}
+                      </Tag>
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                        Run Stage 3 training and Save to refresh production artifact.
+                      </Text>
+                    </Space>
+                  </div>
+
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Training Configuration</Text>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(120px, 1fr))', gap: 8, marginTop: 8 }}>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Train/Test Split (test)</Text>
+                        <InputNumber size="small" min={0.05} max={0.5} step={0.01} value={mlopsStage3TrainTestSplitDraft} onChange={(v) => setMLOpsStage3TrainTestSplitDraft(Number.isFinite(Number(v)) ? Number(v) : 0.2)} style={{ width: '100%', marginTop: 4 }} />
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Cross Validation Folds</Text>
+                        <InputNumber size="small" min={2} max={20} value={mlopsStage3CvFoldsDraft} onChange={(v) => setMLOpsStage3CvFoldsDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 5)} style={{ width: '100%', marginTop: 4 }} />
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Epochs</Text>
+                        <InputNumber size="small" min={1} max={10000} value={mlopsStage3EpochsDraft} onChange={(v) => setMLOpsStage3EpochsDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 20)} style={{ width: '100%', marginTop: 4 }} />
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Batch Size</Text>
+                        <InputNumber size="small" min={1} max={4096} value={mlopsStage3BatchSizeDraft} onChange={(v) => setMLOpsStage3BatchSizeDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 32)} style={{ width: '100%', marginTop: 4 }} />
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Random Seed</Text>
+                        <InputNumber size="small" value={mlopsStage3RandomSeedDraft} onChange={(v) => setMLOpsStage3RandomSeedDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 42)} style={{ width: '100%', marginTop: 4 }} />
+                      </div>
+                    </div>
+                    <div style={{ marginTop: 8 }}>
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Target / Label Field</Text>
+                      {mlopsStage3TaskTypeDraft === 'forecasting' ? (
+                        <Select
+                          mode="multiple"
+                          size="small"
+                          allowClear
+                          showSearch
+                          optionFilterProp="label"
+                          value={mlopsStage3TargetFieldsDraft}
+                          options={mlopsStage3FeatureFieldOptions}
+                          onChange={(values) => {
+                            const picked = uniqueFieldNames((values || []).map((item) => String(item || '').trim()).filter(Boolean))
+                            setMLOpsStage3TargetFieldsDraft(picked)
+                            setMLOpsStage3TargetFieldDraft(picked[0] || '')
+                          }}
+                          style={{ width: '100%', marginTop: 4 }}
+                          placeholder="Select one or more forecasting targets"
+                          maxTagCount={4}
+                        />
+                      ) : (
+                        <Select
+                          size="small"
+                          allowClear
+                          showSearch
+                          optionFilterProp="label"
+                          value={mlopsStage3TargetFieldDraft || undefined}
+                          options={mlopsStage3FeatureFieldOptions}
+                          onChange={(value) => setMLOpsStage3TargetFieldDraft(String(value || '').trim())}
+                          style={{ width: '100%', marginTop: 4 }}
+                          placeholder="Select target/label field"
+                        />
+                      )}
+                    </div>
+                    {mlopsStage3TaskTypeDraft === 'forecasting' ? (
+                      <div style={{ marginTop: 10, borderTop: '1px dashed var(--app-border)', paddingTop: 10 }}>
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Forecast Configuration (ARIMA/SARIMA)</Text>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 130px 130px', gap: 8, marginTop: 8 }}>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Date/Time Field</Text>
+                            <Select
+                              size="small"
+                              allowClear
+                              showSearch
+                              optionFilterProp="label"
+                              value={mlopsStage3ForecastDateFieldDraft || undefined}
+                              options={mlopsStage3FeatureFieldOptions}
+                              onChange={(value) => setMLOpsStage3ForecastDateFieldDraft(String(value || '').trim())}
+                              style={{ width: '100%', marginTop: 4 }}
+                              placeholder="Optional date field"
+                            />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Frequency</Text>
+                            <Select
+                              size="small"
+                              value={mlopsStage3ForecastFrequencyDraft}
+                              options={[
+                                { value: 'D', label: 'Daily (D)' },
+                                { value: 'W', label: 'Weekly (W)' },
+                                { value: 'M', label: 'Monthly (M)' },
+                              ]}
+                              onChange={(value) => setMLOpsStage3ForecastFrequencyDraft((String(value || 'D').toUpperCase() as MLOpsForecastFrequency))}
+                              style={{ width: '100%', marginTop: 4 }}
+                            />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Horizon</Text>
+                            <InputNumber
+                              size="small"
+                              min={1}
+                              max={3650}
+                              value={mlopsStage3ForecastHorizonDraft}
+                              onChange={(value) => setMLOpsStage3ForecastHorizonDraft(Number.isFinite(Number(value)) ? Math.trunc(Number(value)) : 30)}
+                              style={{ width: '100%', marginTop: 4 }}
+                            />
+                          </div>
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(80px, 1fr))', gap: 8, marginTop: 8 }}>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>ARIMA p</Text>
+                            <InputNumber size="small" min={0} max={24} value={mlopsStage3ARIMAPDraft} onChange={(v) => setMLOpsStage3ARIMAPDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 1)} style={{ width: '100%', marginTop: 4 }} />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>ARIMA d</Text>
+                            <InputNumber size="small" min={0} max={24} value={mlopsStage3ARIMADDraft} onChange={(v) => setMLOpsStage3ARIMADDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 1)} style={{ width: '100%', marginTop: 4 }} />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>ARIMA q</Text>
+                            <InputNumber size="small" min={0} max={24} value={mlopsStage3ARIMAQDraft} onChange={(v) => setMLOpsStage3ARIMAQDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 1)} style={{ width: '100%', marginTop: 4 }} />
+                          </div>
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(80px, 1fr))', gap: 8, marginTop: 8 }}>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>SARIMA P</Text>
+                            <InputNumber size="small" min={0} max={24} value={mlopsStage3SARIMAPPDraft} onChange={(v) => setMLOpsStage3SARIMAPPDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 1)} style={{ width: '100%', marginTop: 4 }} />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>SARIMA D</Text>
+                            <InputNumber size="small" min={0} max={24} value={mlopsStage3SARIMAPDDraft} onChange={(v) => setMLOpsStage3SARIMAPDDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 1)} style={{ width: '100%', marginTop: 4 }} />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>SARIMA Q</Text>
+                            <InputNumber size="small" min={0} max={24} value={mlopsStage3SARIMAQDraft} onChange={(v) => setMLOpsStage3SARIMAQDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 1)} style={{ width: '100%', marginTop: 4 }} />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Season s</Text>
+                            <InputNumber size="small" min={1} max={3660} value={mlopsStage3SARIMASDraft} onChange={(v) => setMLOpsStage3SARIMASDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 7)} style={{ width: '100%', marginTop: 4 }} />
+                          </div>
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 180px', gap: 8, marginTop: 8 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <Switch
+                              size="small"
+                              checked={mlopsStage3ForecastAutoTuneOrdersDraft}
+                              onChange={(checked) => setMLOpsStage3ForecastAutoTuneOrdersDraft(Boolean(checked))}
+                            />
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                              Auto tune ARIMA/SARIMA orders
+                            </Text>
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Order Search Budget</Text>
+                            <InputNumber
+                              size="small"
+                              min={1}
+                              max={64}
+                              value={mlopsStage3ForecastOrderSearchMaxEvalsDraft}
+                              onChange={(value) => setMLOpsStage3ForecastOrderSearchMaxEvalsDraft(Number.isFinite(Number(value)) ? Math.trunc(Number(value)) : 16)}
+                              style={{ width: '100%', marginTop: 4 }}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                      <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Hyperparameter Tuning</Text>
+                      <Switch size="small" checked={mlopsStage3TuningEnabledDraft} onChange={(checked) => setMLOpsStage3TuningEnabledDraft(Boolean(checked))} />
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8, marginTop: 8 }}>
+                      <Select
+                        size="small"
+                        value={mlopsStage3TuningMethodDraft}
+                        options={MLOPS_STAGE3_TUNING_METHOD_OPTIONS}
+                        onChange={(value) => setMLOpsStage3TuningMethodDraft(String(value || 'random_search') as MLOpsStage3TuningMethod)}
+                        disabled={!mlopsStage3TuningEnabledDraft}
+                      />
+                      <Button
+                        size="small"
+                        onClick={() => setMLOpsStage3TuningParamsDraft((prev) => [...prev, createMLOpsStage3TuningParameter()])}
+                        disabled={!mlopsStage3TuningEnabledDraft}
+                      >
+                        + Parameter
+                      </Button>
+                    </div>
+                    <div style={{ marginTop: 8, display: 'grid', gap: 6 }}>
+                      {(mlopsStage3TuningParamsDraft.length > 0 ? mlopsStage3TuningParamsDraft : []).map((item) => (
+                        <div key={item.id} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 6 }}>
+                          <Input
+                            size="small"
+                            value={item.name}
+                            onChange={(e) => setMLOpsStage3TuningParamsDraft((prev) => prev.map((row) => row.id === item.id ? { ...row, name: String(e.target.value || '') } : row))}
+                            placeholder="parameter (e.g. learning_rate)"
+                            disabled={!mlopsStage3TuningEnabledDraft}
+                          />
+                          <Input
+                            size="small"
+                            value={item.values}
+                            onChange={(e) => setMLOpsStage3TuningParamsDraft((prev) => prev.map((row) => row.id === item.id ? { ...row, values: String(e.target.value || '') } : row))}
+                            placeholder="values/range (e.g. 0.01,0.1,0.2)"
+                            disabled={!mlopsStage3TuningEnabledDraft}
+                          />
+                          <Button
+                            size="small"
+                            danger
+                            onClick={() => setMLOpsStage3TuningParamsDraft((prev) => prev.filter((row) => row.id !== item.id))}
+                            disabled={!mlopsStage3TuningEnabledDraft}
+                          >
+                            Remove
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                      <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Experiment Tracking</Text>
+                      <Switch size="small" checked={mlopsStage3TrackingEnabledDraft} onChange={(checked) => setMLOpsStage3TrackingEnabledDraft(Boolean(checked))} />
+                    </div>
+                    <Input
+                      size="small"
+                      value={mlopsStage3RunNameDraft}
+                      onChange={(e) => setMLOpsStage3RunNameDraft(String(e.target.value || ''))}
+                      placeholder="Run name (optional)"
+                      style={{ marginTop: 8 }}
+                      disabled={!mlopsStage3TrackingEnabledDraft}
+                    />
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(120px, 1fr))', gap: 8, marginTop: 8 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <Switch size="small" checked={mlopsStage3TrackVersionsDraft} onChange={(checked) => setMLOpsStage3TrackVersionsDraft(Boolean(checked))} disabled={!mlopsStage3TrackingEnabledDraft} />
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Model versions</Text>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <Switch size="small" checked={mlopsStage3TrackParamsDraft} onChange={(checked) => setMLOpsStage3TrackParamsDraft(Boolean(checked))} disabled={!mlopsStage3TrackingEnabledDraft} />
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Parameters used</Text>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <Switch size="small" checked={mlopsStage3TrackMetricsDraft} onChange={(checked) => setMLOpsStage3TrackMetricsDraft(Boolean(checked))} disabled={!mlopsStage3TrackingEnabledDraft} />
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Metrics history</Text>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <Switch size="small" checked={mlopsStage3TrackLogsDraft} onChange={(checked) => setMLOpsStage3TrackLogsDraft(Boolean(checked))} disabled={!mlopsStage3TrackingEnabledDraft} />
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Training logs</Text>
+                      </div>
+                    </div>
+                    <Input.TextArea
+                      readOnly
+                      rows={mlopsCompactView ? 5 : 7}
+                      value={JSON.stringify({
+                        task_type: mlopsStage3TaskTypeDraft,
+                        model: mlopsStage3ModelDraft,
+                        feature_fields: mlopsStage3SelectedFeatureFields,
+                        target_field: mlopsStage3TargetFieldDraft || null,
+                        forecasting: mlopsStage3TaskTypeDraft === 'forecasting' ? {
+                          date_field: mlopsStage3ForecastDateFieldDraft || null,
+                          frequency: mlopsStage3ForecastFrequencyDraft,
+                          horizon: mlopsStage3ForecastHorizonDraft,
+                          arima_order: [mlopsStage3ARIMAPDraft, mlopsStage3ARIMADDraft, mlopsStage3ARIMAQDraft],
+                          sarima_seasonal_order: [mlopsStage3SARIMAPPDraft, mlopsStage3SARIMAPDDraft, mlopsStage3SARIMAQDraft, mlopsStage3SARIMASDraft],
+                        } : null,
+                        training: {
+                          train_test_split: mlopsStage3TrainTestSplitDraft,
+                          cv_folds: mlopsStage3CvFoldsDraft,
+                          epochs: mlopsStage3EpochsDraft,
+                          batch_size: mlopsStage3BatchSizeDraft,
+                          random_seed: mlopsStage3RandomSeedDraft,
+                        },
+                        tuning: {
+                          enabled: mlopsStage3TuningEnabledDraft,
+                          method: mlopsStage3TuningMethodDraft,
+                          params: serializeMLOpsStage3TuningParameters(mlopsStage3TuningParamsDraft),
+                        },
+                        tracking: {
+                          enabled: mlopsStage3TrackingEnabledDraft,
+                          run_name: mlopsStage3RunNameDraft || null,
+                          model_versions: mlopsStage3TrackVersionsDraft,
+                          parameters: mlopsStage3TrackParamsDraft,
+                          accuracy_history: mlopsStage3TrackMetricsDraft,
+                          training_logs: mlopsStage3TrackLogsDraft,
+                        },
+                        runtime: {
+                          mode: mlopsRuntimeModeDraft,
+                          prediction_field: String(mlopsPredictionFieldDraft || '').trim() || 'prediction',
+                          prediction_score_field: String(mlopsPredictionScoreFieldDraft || '').trim() || 'prediction_score',
+                          model_bundle_ready: Boolean(mlopsStage3ModelBundleDraft),
+                        },
+                      }, null, 2)}
+                      style={{
+                        marginTop: 8,
+                        background: 'var(--app-input-bg)',
+                        border: '1px solid var(--app-border-strong)',
+                        color: 'var(--app-text)',
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                      }}
+                    />
+                  </div>
+
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                      <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Training Visualization & Data Table</Text>
+                      <Space size={8} wrap>
+                        <Select
+                          size="small"
+                          value={mlopsStage3VizTypeDraft}
+                          options={MLOPS_STAGE3_VIZ_OPTIONS}
+                          onChange={(value) => setMLOpsStage3VizTypeDraft(String(value || 'split_bar') as MLOpsStage3VizType)}
+                          style={{ minWidth: 220 }}
+                        />
+                        <Select
+                          size="small"
+                          value={mlopsStage3TableViewDraft}
+                          onChange={(value) => setMLOpsStage3TableViewDraft(String(value || 'predictions') as 'predictions' | 'feature_importance' | 'metrics')}
+                          options={[
+                            { value: 'predictions', label: 'Prediction Table' },
+                            { value: 'feature_importance', label: 'Feature Importance Table' },
+                            { value: 'metrics', label: 'Metrics Table' },
+                          ]}
+                          style={{ minWidth: 190 }}
+                        />
+                      </Space>
+                    </div>
+                    <div style={{ marginTop: 8, border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-input-bg)', height: mlopsCompactView ? 280 : 360 }}>
+                      {mlopsStage3VizFigure ? (
+                        <Plot
+                          data={(mlopsStage3VizFigure.data || []) as any[]}
+                          layout={{
+                            ...(mlopsStage3VizFigure.layout || {}),
+                            autosize: true,
+                            paper_bgcolor: 'transparent',
+                            plot_bgcolor: 'transparent',
+                          } as any}
+                          config={{ responsive: true, displayModeBar: true, displaylogo: false }}
+                          style={{ width: '100%', height: '100%' }}
+                          useResizeHandler
+                        />
+                      ) : (
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12, display: 'block', padding: 10 }}>
+                          Run training and choose a compatible graph type to visualize results.
+                        </Text>
+                      )}
+                    </div>
+                    <div style={{ marginTop: 8 }}>
+                      <Table
+                        size="small"
+                        bordered
+                        pagination={{ pageSize: 10, size: 'small' }}
+                        rowKey={(row) => String((row as Record<string, unknown>)._key || '')}
+                        columns={mlopsStage3TableColumns as any[]}
+                        dataSource={mlopsStage3TableRows}
+                        scroll={{ x: true, y: mlopsCompactView ? 220 : 320 }}
+                        locale={{ emptyText: 'No tabular training output yet.' }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div
+            style={{
+              flex: 1,
+              minHeight: 0,
+              overflowY: 'auto',
+              padding: 12,
+            }}
+          >
+            <div
+              style={{
+                border: '1px solid var(--app-border-strong)',
+                borderRadius: 10,
+                background: 'var(--app-card-bg)',
+                padding: 12,
+              }}
+            >
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: '42% 58%',
+                  gap: 10,
+                }}
+              >
+                <div style={{ minWidth: 0, display: 'grid', gap: 10 }}>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8, flexWrap: 'wrap' }}>
+                      <div>
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 14 }}>Deploy & Monitor (Stage 4)</Text>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12, display: 'block', marginTop: 4 }}>
+                          Validate deployment gate, generate release readiness, and monitor drift against Stage 1 baseline.
+                        </Text>
+                      </div>
+                      <Space size={8}>
+                        <Button
+                          size="small"
+                          onClick={() => {
+                            setMLOpsStage4RunError(null)
+                            setMLOpsStage4Summary(null)
+                          }}
+                        >
+                          Reset
+                        </Button>
+                        <Button size="small" type="primary" loading={mlopsStage4RunLoading} onClick={runMLOpsStage4Deploy}>
+                          Run Deploy Test
+                        </Button>
+                      </Space>
+                    </div>
+                    <Space size={8} wrap style={{ marginTop: 8 }}>
+                      <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9', marginInlineEnd: 0 }}>
+                        input rows: {mlopsStage2PreviewRows.length > 0 ? mlopsStage2PreviewRows.length : mlopsPreviewRows.length}
+                      </Tag>
+                      <Tag style={{ background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1', marginInlineEnd: 0 }}>
+                        model: {String(mlopsStage3ModelDraft || 'default')}
+                      </Tag>
+                      <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b', marginInlineEnd: 0 }}>
+                        monitor fields: {mlopsStage4SelectedMonitorFields.length}
+                      </Tag>
+                      <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e', marginInlineEnd: 0 }}>
+                        stage3: {mlopsStage3RunSummary?.ran ? 'ready' : 'not run'}
+                      </Tag>
+                    </Space>
+                    {mlopsStage4RunError ? (
+                      <Text style={{ color: '#ef4444', fontSize: 12, display: 'block', marginTop: 8 }}>
+                        {mlopsStage4RunError}
+                      </Text>
+                    ) : null}
+                  </div>
+
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                      <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Gate Configuration</Text>
+                      <Switch size="small" checked={mlopsStage4GateEnabledDraft} onChange={(checked) => setMLOpsStage4GateEnabledDraft(Boolean(checked))} />
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(120px, 1fr))', gap: 8, marginTop: 8 }}>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Min Accuracy</Text>
+                        <InputNumber
+                          size="small"
+                          min={0}
+                          max={1}
+                          step={0.01}
+                          value={mlopsStage4MinAccuracyDraft}
+                          onChange={(value) => setMLOpsStage4MinAccuracyDraft(Number.isFinite(Number(value)) ? Number(value) : 0.7)}
+                          style={{ width: '100%', marginTop: 4 }}
+                        />
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Min F1 Score</Text>
+                        <InputNumber
+                          size="small"
+                          min={0}
+                          max={1}
+                          step={0.01}
+                          value={mlopsStage4MinF1ScoreDraft}
+                          onChange={(value) => setMLOpsStage4MinF1ScoreDraft(Number.isFinite(Number(value)) ? Number(value) : 0.65)}
+                          style={{ width: '100%', marginTop: 4 }}
+                        />
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Max RMSE (opt)</Text>
+                        <InputNumber
+                          size="small"
+                          min={0}
+                          step={0.01}
+                          value={mlopsStage4MaxRmseDraft}
+                          onChange={(value) => {
+                            if (value === null || value === undefined || String(value) === '') {
+                              setMLOpsStage4MaxRmseDraft(null)
+                              return
+                            }
+                            setMLOpsStage4MaxRmseDraft(Number.isFinite(Number(value)) ? Number(value) : null)
+                          }}
+                          style={{ width: '100%', marginTop: 4 }}
+                        />
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Max MAE (opt)</Text>
+                        <InputNumber
+                          size="small"
+                          min={0}
+                          step={0.01}
+                          value={mlopsStage4MaxMaeDraft}
+                          onChange={(value) => {
+                            if (value === null || value === undefined || String(value) === '') {
+                              setMLOpsStage4MaxMaeDraft(null)
+                              return
+                            }
+                            setMLOpsStage4MaxMaeDraft(Number.isFinite(Number(value)) ? Number(value) : null)
+                          }}
+                          style={{ width: '100%', marginTop: 4 }}
+                        />
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Min R2</Text>
+                        <InputNumber
+                          size="small"
+                          min={-1}
+                          max={1}
+                          step={0.01}
+                          value={mlopsStage4MinR2Draft}
+                          onChange={(value) => setMLOpsStage4MinR2Draft(Number.isFinite(Number(value)) ? Number(value) : 0)}
+                          style={{ width: '100%', marginTop: 4 }}
+                        />
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Min Silhouette</Text>
+                        <InputNumber
+                          size="small"
+                          min={-1}
+                          max={1}
+                          step={0.01}
+                          value={mlopsStage4MinSilhouetteDraft}
+                          onChange={(value) => setMLOpsStage4MinSilhouetteDraft(Number.isFinite(Number(value)) ? Number(value) : 0.1)}
+                          style={{ width: '100%', marginTop: 4 }}
+                        />
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Max Anomaly Ratio</Text>
+                        <InputNumber
+                          size="small"
+                          min={0}
+                          max={1}
+                          step={0.01}
+                          value={mlopsStage4MaxAnomalyRatioDraft}
+                          onChange={(value) => setMLOpsStage4MaxAnomalyRatioDraft(Number.isFinite(Number(value)) ? Number(value) : 0.25)}
+                          style={{ width: '100%', marginTop: 4 }}
+                        />
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Max Avg Drift</Text>
+                        <InputNumber
+                          size="small"
+                          min={0}
+                          step={0.01}
+                          value={mlopsStage4MaxAvgDriftDraft}
+                          onChange={(value) => setMLOpsStage4MaxAvgDriftDraft(Number.isFinite(Number(value)) ? Number(value) : 0.35)}
+                          style={{ width: '100%', marginTop: 4 }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <div style={{ display: 'grid', gap: 8 }}>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                        <div>
+                          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Deploy Settings</Text>
+                          <div style={{ marginTop: 4, display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <Switch size="small" checked={mlopsStage4DeployEnabledDraft} onChange={(checked) => setMLOpsStage4DeployEnabledDraft(Boolean(checked))} />
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Enable deployment readiness</Text>
+                          </div>
+                        </div>
+                        <div>
+                          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Monitoring</Text>
+                          <div style={{ marginTop: 4, display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <Switch size="small" checked={mlopsStage4MonitorEnabledDraft} onChange={(checked) => setMLOpsStage4MonitorEnabledDraft(Boolean(checked))} />
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Enable drift checks</Text>
+                          </div>
+                        </div>
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Environment</Text>
+                          <Select
+                            size="small"
+                            value={mlopsStage4EnvironmentDraft}
+                            options={MLOPS_STAGE4_ENV_OPTIONS}
+                            onChange={(value) => {
+                              const normalized = String(value || 'staging').trim().toLowerCase()
+                              if (normalized === 'dev' || normalized === 'prod') {
+                                setMLOpsStage4EnvironmentDraft(normalized)
+                                return
+                              }
+                              setMLOpsStage4EnvironmentDraft('staging')
+                            }}
+                            style={{ width: '100%', marginTop: 4 }}
+                          />
+                        </div>
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Monitor sample size</Text>
+                          <InputNumber
+                            size="small"
+                            min={50}
+                            max={50000}
+                            value={mlopsStage4MonitorSampleSizeDraft}
+                            onChange={(value) => setMLOpsStage4MonitorSampleSizeDraft(Number.isFinite(Number(value)) ? Math.max(50, Math.min(Math.trunc(Number(value)), 50000)) : 2000)}
+                            style={{ width: '100%', marginTop: 4 }}
+                          />
+                        </div>
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Endpoint name</Text>
+                          <Input
+                            size="small"
+                            value={mlopsStage4EndpointNameDraft}
+                            onChange={(event) => setMLOpsStage4EndpointNameDraft(String(event.target.value || ''))}
+                            placeholder="Auto if blank"
+                            style={{ marginTop: 4 }}
+                          />
+                        </div>
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Model version</Text>
+                          <Input
+                            size="small"
+                            value={mlopsStage4ModelVersionDraft}
+                            onChange={(event) => setMLOpsStage4ModelVersionDraft(String(event.target.value || ''))}
+                            placeholder="Auto if blank"
+                            style={{ marginTop: 4 }}
+                          />
+                        </div>
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Monitor numeric fields</Text>
+                        <Select
+                          mode="multiple"
+                          size="small"
+                          value={mlopsStage4SelectedMonitorFields}
+                          options={mlopsStage4MonitorFieldOptions.map((field) => ({ value: field, label: field }))}
+                          onChange={(values) => {
+                            const selected = uniqueFieldNames((values || []).map((item) => String(item || '').trim()))
+                            setMLOpsStage4MonitorNumericFieldsDraft(selected)
+                          }}
+                          style={{ width: '100%', marginTop: 4 }}
+                          maxTagCount={5}
+                          placeholder="Select numeric fields for drift"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Effective Stage 4 Payload</Text>
+                    <Input.TextArea
+                      readOnly
+                      rows={mlopsCompactView ? 6 : 8}
+                      value={JSON.stringify({
+                        task_type: mlopsStage3TaskTypeDraft,
+                        model: mlopsStage3ModelDraft,
+                        feature_fields: mlopsStage3SelectedFeatureFields,
+                        target_field: mlopsStage3TargetFieldDraft || null,
+                        gate: {
+                          enabled: mlopsStage4GateEnabledDraft,
+                          min_accuracy: mlopsStage4MinAccuracyDraft,
+                          min_f1_score: mlopsStage4MinF1ScoreDraft,
+                          max_rmse: mlopsStage4MaxRmseDraft,
+                          max_mae: mlopsStage4MaxMaeDraft,
+                          min_r2: mlopsStage4MinR2Draft,
+                          min_silhouette_score: mlopsStage4MinSilhouetteDraft,
+                          max_anomaly_ratio: mlopsStage4MaxAnomalyRatioDraft,
+                          max_avg_drift_score: mlopsStage4MaxAvgDriftDraft,
+                        },
+                        deploy: {
+                          enabled: mlopsStage4DeployEnabledDraft,
+                          environment: mlopsStage4EnvironmentDraft,
+                          endpoint_name: String(mlopsStage4EndpointNameDraft || '').trim() || null,
+                          model_version: String(mlopsStage4ModelVersionDraft || '').trim() || null,
+                        },
+                        monitor: {
+                          enabled: mlopsStage4MonitorEnabledDraft,
+                          sample_size: mlopsStage4MonitorSampleSizeDraft,
+                          numeric_fields: mlopsStage4SelectedMonitorFields,
+                        },
+                      }, null, 2)}
+                      style={{
+                        marginTop: 8,
+                        background: 'var(--app-input-bg)',
+                        border: '1px solid var(--app-border-strong)',
+                        color: 'var(--app-text)',
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div style={{ minWidth: 0, display: 'grid', gap: 10 }}>
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Validation Output</Text>
+                    <Space size={8} wrap style={{ marginTop: 8 }}>
+                      <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9', marginInlineEnd: 0 }}>
+                        ran: {mlopsStage4Summary?.ran ? 'yes' : 'no'}
+                      </Tag>
+                      <Tag style={{
+                        background: Boolean(mlopsStage4Summary?.gate?.passed) ? '#22c55e14' : '#ef444414',
+                        border: `1px solid ${Boolean(mlopsStage4Summary?.gate?.passed) ? '#22c55e30' : '#ef444430'}`,
+                        color: Boolean(mlopsStage4Summary?.gate?.passed) ? '#22c55e' : '#ef4444',
+                        marginInlineEnd: 0,
+                      }}>
+                        gate: {mlopsStage4Summary?.gate?.enabled ? (mlopsStage4Summary?.gate?.passed ? 'pass' : 'fail') : 'disabled'}
+                      </Tag>
+                      <Tag style={{ background: '#8b5cf614', border: '1px solid #8b5cf630', color: '#8b5cf6', marginInlineEnd: 0 }}>
+                        deploy: {String(mlopsStage4Summary?.deployment?.status || 'not-run')}
+                      </Tag>
+                      <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b', marginInlineEnd: 0 }}>
+                        drift: {Number(mlopsStage4Summary?.monitoring?.avg_drift_score || 0).toFixed(4)}
+                      </Tag>
+                      <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6', marginInlineEnd: 0 }}>
+                        monitor fields: {Number(mlopsStage4Summary?.monitoring?.numeric_fields?.length || 0)}
+                      </Tag>
+                    </Space>
+                    <Input.TextArea
+                      readOnly
+                      rows={mlopsCompactView ? 5 : 7}
+                      value={JSON.stringify(mlopsStage4Summary || {}, null, 2)}
+                      style={{
+                        marginTop: 8,
+                        background: 'var(--app-input-bg)',
+                        border: '1px solid var(--app-border-strong)',
+                        color: 'var(--app-text)',
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                      }}
+                    />
+                  </div>
+
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Gate Checks</Text>
+                    <Table
+                      size="small"
+                      style={{ marginTop: 8 }}
+                      rowKey={(_row, idx) => `mlops_stage4_gate_${idx}`}
+                      dataSource={(mlopsStage4Summary?.gate?.checks || []) as Array<Record<string, unknown>>}
+                      pagination={{ pageSize: mlopsCompactView ? 5 : 8, showSizeChanger: false }}
+                      columns={[
+                        { title: 'Metric', dataIndex: 'metric', key: 'metric', width: 160, ellipsis: true },
+                        { title: 'Actual', dataIndex: 'actual', key: 'actual', width: 110, render: (value: unknown) => value == null ? 'NA' : String(value) },
+                        { title: 'Rule', dataIndex: 'comparator', key: 'comparator', width: 90, render: (value: unknown, row: any) => `${String(value || '')} ${String(row?.threshold ?? '')}` },
+                        {
+                          title: 'Passed',
+                          dataIndex: 'passed',
+                          key: 'passed',
+                          width: 90,
+                          render: (value: unknown) => (
+                            <Tag style={{
+                              marginInlineEnd: 0,
+                              background: value ? '#22c55e14' : '#ef444414',
+                              border: `1px solid ${value ? '#22c55e30' : '#ef444430'}`,
+                              color: value ? '#22c55e' : '#ef4444',
+                            }}>
+                              {value ? 'YES' : 'NO'}
+                            </Tag>
+                          ),
+                        },
+                        { title: 'Reason', dataIndex: 'reason', key: 'reason', ellipsis: true, render: (value: unknown) => value == null ? '' : String(value) },
+                      ]}
+                      locale={{ emptyText: 'Run Stage 4 to view checks.' }}
+                    />
+                  </div>
+
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Drift Details</Text>
+                    <Table
+                      size="small"
+                      style={{ marginTop: 8 }}
+                      rowKey={(row) => String((row as any).field || Math.random())}
+                      dataSource={(mlopsStage4Summary?.monitoring?.drift_details || []) as Array<Record<string, unknown>>}
+                      pagination={{ pageSize: mlopsCompactView ? 5 : 8, showSizeChanger: false }}
+                      columns={[
+                        { title: 'Field', dataIndex: 'field', key: 'field', width: 220, ellipsis: true },
+                        { title: 'Baseline Mean', dataIndex: 'baseline_mean', key: 'baseline_mean', width: 120 },
+                        { title: 'Live Mean', dataIndex: 'live_mean', key: 'live_mean', width: 110 },
+                        { title: 'Drift Score', dataIndex: 'drift_score', key: 'drift_score', width: 110 },
+                        { title: 'Samples', dataIndex: 'sample_count', key: 'sample_count', width: 90 },
+                      ]}
+                      locale={{ emptyText: 'No drift details available.' }}
+                    />
+                  </div>
+
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                    <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                      <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Notes / Alerts</Text>
+                      <Input.TextArea
+                        readOnly
+                        rows={mlopsCompactView ? 7 : 9}
+                        value={JSON.stringify({
+                          notes: mlopsStage4Summary?.notes || [],
+                          alerts: mlopsStage4Summary?.monitoring?.alerts || [],
+                        }, null, 2)}
+                        style={{
+                          marginTop: 8,
+                          background: 'var(--app-input-bg)',
+                          border: '1px solid var(--app-border-strong)',
+                          color: 'var(--app-text)',
+                          fontFamily: 'monospace',
+                          fontSize: 12,
+                        }}
+                      />
+                    </div>
+                    <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                      <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Output Preview (passed rows)</Text>
+                      <Input.TextArea
+                        readOnly
+                        rows={mlopsCompactView ? 7 : 9}
+                        value={JSON.stringify((mlopsStage4Summary?.output_preview || []).slice(0, 10), null, 2)}
+                        style={{
+                          marginTop: 8,
+                          background: 'var(--app-input-bg)',
+                          border: '1px solid var(--app-border-strong)',
+                          color: 'var(--app-text)',
+                          fontFamily: 'monospace',
+                          fontSize: 12,
+                        }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )))}
+      </div>
+    </Modal>
+    <Modal
+      open={Boolean(mlopsExpandedChart)}
+      onCancel={() => setMLOpsExpandedChart(null)}
+      footer={null}
+      centered
+      width="92vw"
+      styles={{
+        content: {
+          padding: 12,
+          borderRadius: 12,
+          overflow: 'hidden',
+          border: '1px solid var(--app-border-strong)',
+          background: 'var(--app-panel-bg)',
+          height: '88vh',
+          display: 'flex',
+          flexDirection: 'column',
+        },
+        body: {
+          padding: 0,
+          flex: 1,
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+        },
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 8 }}>
+        <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 14 }}>
+          {String(mlopsExpandedChart?.title || mlopsExpandedChart?.id || 'Chart')}
+        </Text>
+        <Button size="small" onClick={() => setMLOpsExpandedChart(null)}>Close</Button>
+      </div>
+      <div style={{ flex: 1, minHeight: 0, border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)' }}>
+        {mlopsExpandedChart?.figure_json && typeof mlopsExpandedChart.figure_json === 'object' ? (
+          <Plot
+            data={(((mlopsExpandedChart.figure_json as any) || {}).data || []) as any[]}
+            layout={{
+              ...((((mlopsExpandedChart.figure_json as any) || {}).layout || {}) as Record<string, unknown>),
+              autosize: true,
+              paper_bgcolor: 'transparent',
+              plot_bgcolor: 'transparent',
+            } as any}
+            config={{ responsive: true, displayModeBar: true, displaylogo: false }}
+            style={{ width: '100%', height: '100%' }}
+            useResizeHandler
+          />
+        ) : (
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12, display: 'block', margin: 8 }}>
+            Chart data not available.
+          </Text>
+        )}
       </div>
     </Modal>
     <Modal
@@ -19810,6 +25511,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               <Text style={{ color: '#f59e0b', fontSize: 11 }}>
                 {String(conditionValidationDisplaySummary.warnings[0] || '')}
               </Text>
+            </div>
+          ) : null}
+          {(conditionValidationDisplaySummary.infoNotes || []).length > 0 ? (
+            <div style={{ marginTop: 8, border: '1px solid #0ea5e940', borderRadius: 8, padding: 8, background: '#0ea5e914' }}>
+              {(conditionValidationDisplaySummary.infoNotes || []).slice(0, 2).map((note, idx) => (
+                <Text key={`cv_info_${idx}`} style={{ color: '#0ea5e9', fontSize: 11, display: 'block' }}>
+                  {String(note || '')}
+                </Text>
+              ))}
             </div>
           ) : null}
           <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, marginTop: 8, display: 'block' }}>
