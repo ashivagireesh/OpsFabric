@@ -1973,7 +1973,7 @@ class MLOpsFeatureProfileRequest(BaseModel):
 
 class MLOpsNodeStage1ProfileRequest(BaseModel):
     rows: List[Dict[str, Any]] = Field(default_factory=list)
-    sample_size: int = 2000
+    sample_size: int = 0
     preview_rows: int = 25
     max_chart_columns: int = 6
     include_ydata: bool = True
@@ -3036,6 +3036,12 @@ def _mlops_stage1_profile_rows(
     import pandas as pd
     import plotly.express as px
 
+    def _stage1_env_int(name: str, default: int) -> int:
+        try:
+            return max(0, int(_os.getenv(name, str(default)) or default))
+        except Exception:
+            return max(0, int(default))
+
     supported_chart_types = (
         "histogram",
         "box",
@@ -3100,7 +3106,18 @@ def _mlops_stage1_profile_rows(
             "ydata": {"enabled": bool(include_ydata), "available": False, "reason": "No input rows"},
         }
 
-    safe_sample = max(100, min(int(sample_size or 2000), len(tabular_rows)))
+    try:
+        requested_sample = int(sample_size or 0)
+    except Exception:
+        requested_sample = 0
+    eda_row_cap = _stage1_env_int("MLOPS_STAGE1_MAX_EDA_ROWS", 500000)
+    effective_limit = len(tabular_rows)
+    if eda_row_cap > 0:
+        effective_limit = min(effective_limit, eda_row_cap)
+    if requested_sample <= 0:
+        requested_sample = effective_limit
+    safe_sample = max(1, min(requested_sample, effective_limit, len(tabular_rows)))
+    profile_limited = safe_sample < len(tabular_rows)
     sampled_rows = tabular_rows[:safe_sample]
     profile = _mlops_infer_column_profile(sampled_rows, sample_size=safe_sample)
     profile_columns = [c for c in (profile.get("columns") or []) if isinstance(c, dict)]
@@ -3384,8 +3401,10 @@ def _mlops_stage1_profile_rows(
                         return str(value)
                 return str(value)
 
+            ydata_row_cap = _stage1_env_int("MLOPS_STAGE1_YDATA_MAX_ROWS", eda_row_cap or len(sampled_rows))
+            ydata_limit = len(sampled_rows) if ydata_row_cap <= 0 else min(len(sampled_rows), ydata_row_cap)
             ydata_rows: List[dict] = []
-            for row in sampled_rows[: min(len(sampled_rows), 1500)]:
+            for row in sampled_rows[:ydata_limit]:
                 if not isinstance(row, dict):
                     continue
                 clean_row: Dict[str, Any] = {}
@@ -3555,6 +3574,8 @@ def _mlops_stage1_profile_rows(
                 "enabled": True,
                 "available": True,
                 "sampled_rows": int(len(ydata_df)),
+                "profile_limited": bool(len(ydata_df) < len(tabular_rows)),
+                "row_cap": int(ydata_row_cap) if ydata_row_cap > 0 else None,
                 "variable_count": int(variable_count),
                 "alerts_count": int(alerts_count),
                 "table_summary": table_summary,
@@ -3579,6 +3600,9 @@ def _mlops_stage1_profile_rows(
         "summary": {
             "input_rows": int(len(tabular_rows)),
             "sampled_rows": int(len(sampled_rows)),
+            "profile_limited": bool(profile_limited),
+            "profile_scope": "sampled" if profile_limited else "full",
+            "eda_row_cap": int(eda_row_cap) if eda_row_cap > 0 else None,
             "column_count": int(profile.get("column_count") or 0),
             "duplicate_rows": int(profile.get("duplicate_rows") or 0),
             "type_counts": type_counts,
@@ -5053,8 +5077,14 @@ def _mlops_stage3_train_rows(
     normalized_rows = [r for r in (rows or []) if isinstance(r, dict)]
     if len(normalized_rows) <= 0:
         raise HTTPException(400, "No tabular rows provided for training.")
-    if len(normalized_rows) > 50000:
-        normalized_rows = normalized_rows[:50000]
+    try:
+        stage3_row_cap = int(_os.getenv("MLOPS_STAGE3_MAX_TRAIN_ROWS", "500000") or 500000)
+    except Exception:
+        stage3_row_cap = 500000
+    stage3_cap_note = ""
+    if stage3_row_cap > 0 and len(normalized_rows) > stage3_row_cap:
+        normalized_rows = normalized_rows[:stage3_row_cap]
+        stage3_cap_note = f"Training rows capped at {stage3_row_cap:,}. Set MLOPS_STAGE3_MAX_TRAIN_ROWS=0 to disable this backend cap."
 
     safe_seed = int(random_seed)
     safe_test = max(0.05, min(float(train_test_split_ratio or 0.2), 0.5))
@@ -5062,6 +5092,8 @@ def _mlops_stage3_train_rows(
     safe_epochs = max(1, int(epochs or 20))
     safe_batch_size = max(1, int(batch_size or 32))
     notes: List[str] = []
+    if stage3_cap_note:
+        notes.append(stage3_cap_note)
     if run_name:
         notes.append(f"run_name={run_name}")
 
@@ -6646,7 +6678,10 @@ async def mlops_feature_profile(
 async def mlops_node_stage1_profile(
     body: MLOpsNodeStage1ProfileRequest,
 ):
-    safe_sample_size = max(100, min(int(body.sample_size or 2000), 20000))
+    try:
+        safe_sample_size = int(body.sample_size or 0)
+    except Exception:
+        safe_sample_size = 0
     safe_preview_rows = max(5, min(int(body.preview_rows or 25), 200))
     safe_max_chart_columns = max(1, min(int(body.max_chart_columns or 6), 12))
     input_rows = [r for r in (body.rows or []) if isinstance(r, dict)]
@@ -12570,6 +12605,168 @@ def _collect_source_columns(rows: list, max_columns: int = 5000) -> list:
     return columns
 
 
+def _collect_source_field_paths(
+    rows: list,
+    max_fields: int = 20000,
+    max_depth: int = 8,
+) -> list:
+    paths: List[str] = []
+    seen = set()
+    safe_max = max(1, min(int(max_fields or 20000), 100000))
+    safe_depth = max(1, min(int(max_depth or 8), 16))
+
+    def add(path: str) -> None:
+        name = str(path or "").strip()
+        if not name or name in seen:
+            return
+        seen.add(name)
+        paths.append(name)
+
+    def walk(value: Any, path: str, depth: int) -> None:
+        if len(paths) >= safe_max or depth > safe_depth:
+            return
+        if isinstance(value, dict):
+            if path:
+                add(path)
+            for k, v in value.items():
+                key = str(k or "").strip()
+                if not key:
+                    continue
+                child = f"{path}.{key}" if path else key
+                add(child)
+                walk(v, child, depth + 1)
+            return
+        if isinstance(value, list):
+            array_path = f"{path}[]" if path else "[]"
+            if path:
+                add(array_path)
+            for item in value[:5]:
+                if isinstance(item, (dict, list)):
+                    walk(item, array_path, depth + 1)
+            return
+        if path:
+            add(path)
+
+    for row in rows or []:
+        if len(paths) >= safe_max:
+            break
+        if isinstance(row, dict):
+            for key, value in row.items():
+                root = str(key or "").strip()
+                if not root:
+                    continue
+                add(root)
+                walk(value, root, 1)
+        else:
+            add("value")
+
+    return paths
+
+
+def _lmdb_profile_entity_prefix_from_key_text(key_text: str) -> Optional[str]:
+    text = str(key_text or "").strip()
+    if not text:
+        return None
+    marker = "::@e::"
+    idx = text.find(marker)
+    if idx <= 0:
+        return None
+    tail = text[idx + len(marker):]
+    node_id, sep, _entity = tail.partition("::")
+    node_id = str(node_id or "").strip()
+    if not sep or not node_id:
+        return None
+    return f"{text[:idx]}{marker}{node_id}::"
+
+
+def _discover_lmdb_profile_entity_prefixes(
+    config: dict,
+    max_prefixes: int = 64,
+    max_scan_keys: int = 250000,
+) -> List[str]:
+    if _lmdb is None:
+        return []
+    raw_path = (
+        config.get("env_path")
+        or config.get("file_path")
+        or config.get("path")
+        or ""
+    )
+    if not str(raw_path or "").strip():
+        return []
+    try:
+        env_path = etl_engine._resolve_lmdb_env_path(str(raw_path))
+    except Exception:
+        return []
+
+    try:
+        max_dbs = int(config.get("max_dbs", 16) or 16)
+    except Exception:
+        max_dbs = 16
+    max_dbs = max(1, min(max_dbs, 256))
+    safe_max_prefixes = max(1, min(int(max_prefixes or 64), 256))
+    safe_max_scan_keys = max(1000, min(int(max_scan_keys or 250000), 2_000_000))
+    pipeline_hint = str(config.get("_schema_pipeline_id") or "").strip()
+
+    def _scan_prefixes(txn: Any, pipeline_scope: Optional[str]) -> List[str]:
+        local: List[str] = []
+        local_seen = set()
+        scope_bytes = (
+            f"{pipeline_scope}::@e::".encode("utf-8")
+            if pipeline_scope
+            else None
+        )
+        cursor = txn.cursor()
+        if scope_bytes is not None:
+            has_item = cursor.set_range(scope_bytes)
+        else:
+            has_item = cursor.first()
+        scanned = 0
+        while has_item and scanned < safe_max_scan_keys and len(local) < safe_max_prefixes:
+            key_bytes, _value = cursor.item()
+            if scope_bytes is not None and not key_bytes.startswith(scope_bytes):
+                break
+            try:
+                key_text = key_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                key_text = ""
+            prefix = _lmdb_profile_entity_prefix_from_key_text(key_text)
+            if prefix and prefix not in local_seen:
+                local_seen.add(prefix)
+                local.append(prefix)
+            scanned += 1
+            has_item = cursor.next()
+        return local
+
+    env = None
+    try:
+        env = _lmdb.open(
+            env_path,
+            readonly=True,
+            lock=False,
+            readahead=False,
+            max_dbs=max_dbs,
+            subdir=True,
+        )
+        with env.begin(write=False) as txn:
+            prefixes = _scan_prefixes(txn, pipeline_hint if pipeline_hint else None)
+            # If current pipeline has no profile entities in this LMDB, discover
+            # all available profile namespaces so Data Query can still list them.
+            if pipeline_hint and not prefixes:
+                prefixes = _scan_prefixes(txn, None)
+    except Exception:
+        return []
+    finally:
+        if env is not None:
+            try:
+                env.close()
+            except Exception:
+                pass
+
+    prefixes.sort()
+    return prefixes
+
+
 async def _load_lmdb_rows_for_preview(
     config: dict,
     max_rows: int,
@@ -13115,10 +13312,58 @@ async def detect_source_field_options(body: SourceFieldOptionsRequest):
         include_schema_scan = bool(body.include_schema_scan)
         schema_scan_limit = max(1, min(int(body.schema_scan_limit or 5000), 20000))
         preview_config = dict(body.config or {})
+        schema_pipeline_id = str(preview_config.get("_schema_pipeline_id") or "").strip()
+        raw_schema_profile_node_ids = preview_config.get("_schema_profile_node_ids", [])
+        if isinstance(raw_schema_profile_node_ids, str):
+            raw_schema_profile_node_ids = [raw_schema_profile_node_ids]
+        elif not isinstance(raw_schema_profile_node_ids, (list, tuple, set)):
+            raw_schema_profile_node_ids = []
+        schema_profile_node_ids = []
+        schema_profile_seen = set()
+        for item in raw_schema_profile_node_ids:
+            text = str(item or "").strip()
+            if not text or text in schema_profile_seen:
+                continue
+            schema_profile_seen.add(text)
+            schema_profile_node_ids.append(text)
         if bool(body.preview_compact):
             preview_config["preview_compact"] = True
             preview_config["preview_max_cell_chars"] = max(200, min(int(body.preview_max_cell_chars or 2000), 20000))
             preview_config["preview_max_collection_items"] = max(8, min(int(body.preview_max_collection_items or 64), 500))
+        # Internal hints for schema discovery only; never forwarded to source execution.
+        preview_config.pop("_schema_pipeline_id", None)
+        preview_config.pop("_schema_profile_node_ids", None)
+
+        resolved_lmdb_prefixes: List[str] = []
+        if node_type == "lmdb_source":
+            key_prefix_cfg = str(preview_config.get("key_prefix") or "").strip()
+            if key_prefix_cfg:
+                resolved_lmdb_prefixes = [key_prefix_cfg]
+            elif schema_pipeline_id and schema_profile_node_ids:
+                resolved_lmdb_prefixes = [
+                    f"{schema_pipeline_id}::@e::{node_id}::"
+                    for node_id in schema_profile_node_ids
+                ]
+            else:
+                resolved_lmdb_prefixes = _discover_lmdb_profile_entity_prefixes(
+                    {
+                        **preview_config,
+                        "_schema_pipeline_id": schema_pipeline_id,
+                    },
+                    max_prefixes=128,
+                    max_scan_keys=max(20000, min(max_rows * 30, 500000)),
+                )
+            # Normalize + dedupe while preserving order.
+            deduped_prefixes: List[str] = []
+            seen_prefixes = set()
+            for prefix in resolved_lmdb_prefixes:
+                text = str(prefix or "").strip()
+                if not text or text in seen_prefixes:
+                    continue
+                seen_prefixes.add(text)
+                deduped_prefixes.append(text)
+            resolved_lmdb_prefixes = deduped_prefixes
+
         if node_type == "rocksdb_source":
             preview = await _load_rocksdb_rows_for_preview(
                 preview_config,
@@ -13127,12 +13372,60 @@ async def detect_source_field_options(body: SourceFieldOptionsRequest):
                 preview_rows=request_preview_rows,
             )
         else:
-            preview = await _load_lmdb_rows_for_preview(
-                preview_config,
-                max_rows=max_rows,
-                page=request_page,
-                preview_rows=request_preview_rows,
-            )
+            # Namespace-balanced preview for LMDB profile stores:
+            # when multiple entity prefixes exist, gather preview rows in
+            # round-robin so sparse profiles (e.g., AGENT_PROFILE) appear in
+            # sample mode without requiring full scans.
+            if len(resolved_lmdb_prefixes) > 1 and request_page == 1:
+                rr_rows: List[Dict[str, Any]] = []
+                per_prefix_page = {prefix: 1 for prefix in resolved_lmdb_prefixes}
+                per_prefix_has_more = {prefix: True for prefix in resolved_lmdb_prefixes}
+                rr_index = 0
+                while len(rr_rows) < request_preview_rows and any(per_prefix_has_more.values()):
+                    prefix = resolved_lmdb_prefixes[rr_index % len(resolved_lmdb_prefixes)]
+                    rr_index += 1
+                    if not per_prefix_has_more.get(prefix, False):
+                        continue
+                    remaining = request_preview_rows - len(rr_rows)
+                    page_size = max(1, min(100, remaining))
+                    prefix_config = dict(preview_config)
+                    prefix_config["key_prefix"] = prefix
+                    prefix_preview = await _load_lmdb_rows_for_preview(
+                        prefix_config,
+                        max_rows=max_rows,
+                        page=per_prefix_page[prefix],
+                        preview_rows=page_size,
+                    )
+                    batch = prefix_preview.get("rows", []) if isinstance(prefix_preview, dict) else []
+                    normalized_batch = _normalize_source_rows(
+                        batch if isinstance(batch, list) else [],
+                        page_size,
+                    )
+                    if normalized_batch:
+                        rr_rows.extend(normalized_batch)
+                    has_more = bool(prefix_preview.get("has_more", False))
+                    if has_more and normalized_batch:
+                        per_prefix_page[prefix] = per_prefix_page[prefix] + 1
+                    else:
+                        per_prefix_has_more[prefix] = False
+                preview = {
+                    "rows": rr_rows[:request_preview_rows],
+                    "page": 1,
+                    "preview_rows": request_preview_rows,
+                    "row_count": max(
+                        len(rr_rows),
+                        (request_preview_rows + 1) if any(per_prefix_has_more.values()) else len(rr_rows),
+                    ),
+                    "has_more": bool(any(per_prefix_has_more.values())),
+                    "sample_limited": True,
+                }
+            else:
+                preview = await _load_lmdb_rows_for_preview(
+                    preview_config,
+                    max_rows=max_rows,
+                    page=request_page,
+                    preview_rows=request_preview_rows,
+                )
         rows = preview.get("rows", []) if isinstance(preview, dict) else []
         normalized_rows = _normalize_source_rows(rows if isinstance(rows, list) else [], int(preview.get("preview_rows") or 50))
 
@@ -13142,40 +13435,107 @@ async def detect_source_field_options(body: SourceFieldOptionsRequest):
         schema_has_more = False
         if include_schema_scan:
             schema_scan_cap = max(1, min(max_rows, schema_scan_limit))
-            schema_page = 1
-            schema_has_more = True
-            while schema_has_more and len(schema_rows) < schema_scan_cap:
-                remaining = schema_scan_cap - len(schema_rows)
-                page_size = max(1, min(500, remaining))
-                if node_type == "rocksdb_source":
+            # For LMDB profile stores, scan entity-prefixes in round-robin so
+            # all connected profile namespaces (AGENT/CUSTOMER/TXN...) are represented.
+            if node_type == "lmdb_source":
+                schema_prefixes: List[str] = list(resolved_lmdb_prefixes)
+                if not schema_prefixes:
+                    schema_prefixes = _discover_lmdb_profile_entity_prefixes(
+                        {
+                            **preview_config,
+                            "_schema_pipeline_id": schema_pipeline_id,
+                        },
+                        max_prefixes=128,
+                        max_scan_keys=max(20000, min(schema_scan_cap * 30, 500000)),
+                    )
+                    schema_prefixes = [
+                        str(prefix or "").strip()
+                        for prefix in schema_prefixes
+                        if str(prefix or "").strip()
+                    ]
+                if len(schema_prefixes) > 1:
+                    per_prefix_page = {prefix: 1 for prefix in schema_prefixes}
+                    per_prefix_has_more = {prefix: True for prefix in schema_prefixes}
+                    rr_index = 0
+                    while len(schema_rows) < schema_scan_cap and any(per_prefix_has_more.values()):
+                        prefix = schema_prefixes[rr_index % len(schema_prefixes)]
+                        rr_index += 1
+                        if not per_prefix_has_more.get(prefix, False):
+                            continue
+                        remaining = schema_scan_cap - len(schema_rows)
+                        page_size = max(1, min(200, remaining))
+                        prefix_config = dict(preview_config)
+                        prefix_config["key_prefix"] = prefix
+                        schema_preview = await _load_lmdb_rows_for_preview(
+                            prefix_config,
+                            max_rows=max_rows,
+                            page=per_prefix_page[prefix],
+                            preview_rows=page_size,
+                        )
+                        schema_batch = schema_preview.get("rows", []) if isinstance(schema_preview, dict) else []
+                        normalized_batch = _normalize_source_rows(
+                            schema_batch if isinstance(schema_batch, list) else [],
+                            page_size,
+                        )
+                        if normalized_batch:
+                            schema_rows.extend(normalized_batch)
+                        has_more = bool(schema_preview.get("has_more", False))
+                        if has_more and normalized_batch:
+                            per_prefix_page[prefix] = per_prefix_page[prefix] + 1
+                        else:
+                            per_prefix_has_more[prefix] = False
+                    schema_has_more = bool(any(per_prefix_has_more.values()) and len(schema_rows) >= schema_scan_cap)
+                else:
+                    schema_page = 1
+                    schema_has_more = True
+                    while schema_has_more and len(schema_rows) < schema_scan_cap:
+                        remaining = schema_scan_cap - len(schema_rows)
+                        page_size = max(1, min(500, remaining))
+                        schema_preview = await _load_lmdb_rows_for_preview(
+                            preview_config,
+                            max_rows=max_rows,
+                            page=schema_page,
+                            preview_rows=page_size,
+                        )
+                        schema_batch = schema_preview.get("rows", []) if isinstance(schema_preview, dict) else []
+                        normalized_batch = _normalize_source_rows(
+                            schema_batch if isinstance(schema_batch, list) else [],
+                            page_size,
+                        )
+                        if not normalized_batch:
+                            break
+                        schema_rows.extend(normalized_batch)
+                        schema_has_more = bool(schema_preview.get("has_more", False))
+                        schema_page += 1
+            else:
+                schema_page = 1
+                schema_has_more = True
+                while schema_has_more and len(schema_rows) < schema_scan_cap:
+                    remaining = schema_scan_cap - len(schema_rows)
+                    page_size = max(1, min(500, remaining))
                     schema_preview = await _load_rocksdb_rows_for_preview(
                         preview_config,
                         max_rows=max_rows,
                         page=schema_page,
                         preview_rows=page_size,
                     )
-                else:
-                    schema_preview = await _load_lmdb_rows_for_preview(
-                        preview_config,
-                        max_rows=max_rows,
-                        page=schema_page,
-                        preview_rows=page_size,
+                    schema_batch = schema_preview.get("rows", []) if isinstance(schema_preview, dict) else []
+                    normalized_batch = _normalize_source_rows(
+                        schema_batch if isinstance(schema_batch, list) else [],
+                        page_size,
                     )
-                schema_batch = schema_preview.get("rows", []) if isinstance(schema_preview, dict) else []
-                normalized_batch = _normalize_source_rows(
-                    schema_batch if isinstance(schema_batch, list) else [],
-                    page_size,
-                )
-                if not normalized_batch:
-                    break
-                schema_rows.extend(normalized_batch)
-                schema_has_more = bool(schema_preview.get("has_more", False))
-                schema_page += 1
+                    if not normalized_batch:
+                        break
+                    schema_rows.extend(normalized_batch)
+                    schema_has_more = bool(schema_preview.get("has_more", False))
+                    schema_page += 1
 
         columns = _collect_source_columns(schema_rows if schema_rows else normalized_rows)
+        field_paths = _collect_source_field_paths(schema_rows if schema_rows else normalized_rows)
         return {
             "node_type": body.node_type,
             "columns": columns,
+            "field_paths": field_paths,
             "row_count": int(preview.get("row_count") or len(normalized_rows)),
             "preview": normalized_rows,
             "sample_limited": bool(preview.get("sample_limited", True)),
@@ -13190,11 +13550,13 @@ async def detect_source_field_options(body: SourceFieldOptionsRequest):
     rows = await _load_tabular_rows_for_source(body.node_type, body.config, max_rows=max_rows)
     normalized_rows = _normalize_source_rows(rows, max_rows)
     columns = _collect_source_columns(normalized_rows)
+    field_paths = _collect_source_field_paths(normalized_rows)
     preview_rows = max(1, min(int(body.preview_rows or 50), 500))
     preview = normalized_rows[:preview_rows]
     return {
         "node_type": body.node_type,
         "columns": columns,
+        "field_paths": field_paths,
         "row_count": len(normalized_rows),
         "preview": preview,
         "sample_limited": True,
@@ -15241,6 +15603,13 @@ def _rows_from_pipeline_result(result_value: Any) -> list:
         return [{"value": row} for row in result_value]
 
     if isinstance(result_value, dict):
+        wrapper_kind = str(result_value.get("kind") or "").strip().lower()
+        if wrapper_kind in {"summary_only_object", "summary_only_rows", "truncated_rows", "truncated_values"}:
+            for nested_key in ("data", "sample"):
+                nested_rows = result_value.get(nested_key)
+                if isinstance(nested_rows, list) and all(isinstance(row, dict) for row in nested_rows):
+                    return nested_rows
+            return []
         if _looks_like_pipeline_metadata_row(result_value):
             path = result_value.get("path")
             if isinstance(path, str):
@@ -15799,6 +16168,61 @@ def _load_source_rows_for_query(body: dict, db: Session, apply_sql: bool = True)
         else:
             raise HTTPException(400, f"Unsupported file: .{suffix}")
         data = df.fillna("").to_dict(orient="records")
+    elif source_type in {"profile_store", "profile", "profile_state"}:
+        pipeline_id = str(body.get("pipeline_id") or "").strip()
+        profile_node_id = str(
+            body.get("profile_node_id")
+            or body.get("pipeline_node_id")
+            or ""
+        ).strip()
+        if not pipeline_id or not profile_node_id:
+            raise HTTPException(
+                400,
+                "profile_store source requires pipeline_id and profile_node_id.",
+            )
+
+        profile_node_config = (
+            dict(body.get("profile_node_config"))
+            if isinstance(body.get("profile_node_config"), dict)
+            else {}
+        )
+        if not profile_node_config:
+            p = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
+            if p and isinstance(p.nodes, list):
+                for node in p.nodes:
+                    if not isinstance(node, dict):
+                        continue
+                    if str(node.get("id") or "").strip() != profile_node_id:
+                        continue
+                    raw_cfg = node.get("config")
+                    if isinstance(raw_cfg, dict):
+                        profile_node_config = dict(raw_cfg)
+                    break
+
+        try:
+            raw_scan_limit = int(
+                body.get("profile_store_scan_limit")
+                or body.get("source_scan_limit")
+                or body.get("scan_limit")
+                or body.get("max_rows")
+                or body.get("limit")
+                or 0
+            )
+        except Exception:
+            raw_scan_limit = 0
+        safe_scan_cap = 500000
+        scan_limit = (
+            safe_scan_cap
+            if raw_scan_limit <= 0
+            else max(1, min(raw_scan_limit, safe_scan_cap))
+        )
+
+        data, _total_entities, _storage = _load_profile_rows_for_condition_validation(
+            pipeline_id=pipeline_id,
+            profile_node_id=profile_node_id,
+            profile_node_config=profile_node_config,
+            max_rows=scan_limit,
+        )
     elif source_type == "mlops":
         workflow_id = str(body.get("mlops_workflow_id") or body.get("workflow_id") or "").strip()
         if not workflow_id:
@@ -18279,16 +18703,527 @@ async def generate_python_visualization(body: PythonAnalyticsRequest, db: Sessio
     }
 
 
+def _build_query_filter_only_config_for_scan(
+    profile_query_cfg: Optional[Dict[str, Any]],
+    filter_only: bool,
+    case_sensitive: bool,
+) -> Optional[Dict[str, Any]]:
+    if not filter_only or not isinstance(profile_query_cfg, dict):
+        return None
+    return {
+        "query_mode": "upstream",
+        "criteria": profile_query_cfg.get("criteria", []),
+        "criteria_mode": profile_query_cfg.get("criteria_mode", "all"),
+        "field": profile_query_cfg.get("field", ""),
+        "operator": profile_query_cfg.get("operator", "equals"),
+        "value": profile_query_cfg.get("value", ""),
+        "case_sensitive": bool(case_sensitive),
+        "offset": 0,
+        "limit": 0,
+        "select_fields": "",
+        "select_field_sorts": {},
+        "select_field_aliases": {},
+        "include_original_row": True,
+        "array_output_mode": "list",
+        "array_match_mode": "all_elements",
+        "profile_patch_enabled": False,
+        "profile_patch_ops": [],
+    }
+
+
+def _normalize_query_field_path_for_scan(path: Any) -> str:
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    # Source-cluster labels in UI can prefix fields as:
+    # dqsrc::<source_id>.<field.path>
+    # Backend scanning works on raw row field paths.
+    match = re.match(r"^dqsrc::[^.]+\.(.+)$", text)
+    if match and match.group(1):
+        return str(match.group(1)).strip()
+    return text
+
+
+def _extract_query_filter_roots_for_scan(filter_cfg: Optional[Dict[str, Any]]) -> List[str]:
+    roots: List[str] = []
+    seen = set()
+
+    def _add(field_path: Any) -> None:
+        normalized = _normalize_query_field_path_for_scan(field_path)
+        if not normalized:
+            return
+        root = re.split(r"[.\[]", normalized, maxsplit=1)[0].strip()
+        if not root:
+            return
+        if root in seen:
+            return
+        seen.add(root)
+        roots.append(root)
+
+    if not isinstance(filter_cfg, dict):
+        return roots
+
+    _add(filter_cfg.get("field"))
+    _add(filter_cfg.get("source_field"))
+    _add(filter_cfg.get("sourceField"))
+    for item in (filter_cfg.get("criteria") or []):
+        if isinstance(item, dict):
+            _add(item.get("field"))
+            _add(item.get("source_field"))
+            _add(item.get("sourceField"))
+    return roots
+
+
+async def _scan_kv_source_rows_for_query(
+    node_type: str,
+    source_config: Dict[str, Any],
+    target_rows: int,
+    scan_limit: int,
+    filter_cfg: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    normalized_type = str(node_type or "").strip().lower()
+    if normalized_type not in {"lmdb_source", "rocksdb_source"}:
+        return [], {"scanned_rows": 0, "pages": 0, "has_more": False}
+
+    safe_target = max(1, min(int(target_rows or 1), 500000))
+    safe_scan_limit = max(safe_target, min(int(scan_limit or safe_target), 500000))
+    roots_for_scan = _extract_query_filter_roots_for_scan(filter_cfg)
+    scan_cfg_base = dict(source_config or {})
+    # Internal schema hints are for detection only, never for runtime scans.
+    scan_cfg_base.pop("_schema_pipeline_id", None)
+    scan_cfg_base.pop("_schema_profile_node_ids", None)
+
+    rows_out: List[Dict[str, Any]] = []
+    scanned_rows = 0
+    scan_units: List[Dict[str, Any]] = []
+
+    def _append_scan_unit(cfg: Dict[str, Any]) -> None:
+        scan_units.append({"config": cfg})
+
+    if normalized_type == "lmdb_source":
+        fixed_prefix = str(scan_cfg_base.get("key_prefix") or "").strip()
+        if fixed_prefix:
+            cfg = dict(scan_cfg_base)
+            cfg["key_prefix"] = fixed_prefix
+            _append_scan_unit(cfg)
+        else:
+            prefixes = _discover_lmdb_profile_entity_prefixes(
+                scan_cfg_base,
+                max_prefixes=128,
+                max_scan_keys=max(20000, min(safe_scan_limit * 20, 500000)),
+            )
+            if not prefixes:
+                _append_scan_unit(dict(scan_cfg_base))
+            else:
+                prioritized_prefixes = list(prefixes)
+                # Fast namespace planning: probe a tiny sample per namespace and
+                # prioritize prefixes that contain requested filter roots
+                # (e.g., AGENT_PROFILE / CUSTOMER_PROFILE).
+                if roots_for_scan:
+                    scored: List[Tuple[int, str]] = []
+                    for prefix in prefixes:
+                        probe_cfg = dict(scan_cfg_base)
+                        probe_cfg["key_prefix"] = prefix
+                        probe_cfg["limit"] = 20
+                        probe_cfg["preview_offset"] = 0
+                        try:
+                            probe_rows = await etl_engine._execute_lmdb(probe_cfg)
+                        except Exception:
+                            probe_rows = []
+                        probe_rows = _normalize_source_rows(
+                            probe_rows if isinstance(probe_rows, list) else [],
+                            20,
+                        )
+                        score = 0
+                        for row in probe_rows:
+                            if not isinstance(row, dict):
+                                continue
+                            for root in roots_for_scan:
+                                if root in row and row.get(root) is not None:
+                                    score += 1
+                                    break
+                        scored.append((score, prefix))
+                    scored.sort(key=lambda item: item[0], reverse=True)
+                    matched_prefixes = [prefix for score, prefix in scored if score > 0]
+                    if matched_prefixes:
+                        remaining = [prefix for prefix in prefixes if prefix not in set(matched_prefixes)]
+                        prioritized_prefixes = matched_prefixes + remaining
+
+                for prefix in prioritized_prefixes:
+                    cfg = dict(scan_cfg_base)
+                    cfg["key_prefix"] = prefix
+                    _append_scan_unit(cfg)
+    else:
+        _append_scan_unit(dict(scan_cfg_base))
+
+    async def _apply_filter(batch_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not filter_cfg:
+            return batch_rows
+        try:
+            transformed = await etl_engine._transform_profile_query(
+                batch_rows,
+                filter_cfg,
+                incoming_by_source={},
+                incoming_order=[],
+                execution_context={},
+            )
+            return transformed if isinstance(transformed, list) else []
+        except Exception:
+            return []
+
+    for unit in scan_units:
+        if scanned_rows >= safe_scan_limit or len(rows_out) >= safe_target:
+            break
+        unit_cfg = dict(unit.get("config") or {})
+        remaining_scan = max(1, safe_scan_limit - scanned_rows)
+        unit_cfg["limit"] = remaining_scan
+        unit_cfg["preview_offset"] = 0
+
+        if normalized_type == "lmdb_source":
+            raw_rows = await etl_engine._execute_lmdb(unit_cfg)
+        else:
+            raw_rows = await etl_engine._execute_rocksdb(unit_cfg)
+
+        batch_rows = _normalize_source_rows(
+            raw_rows if isinstance(raw_rows, list) else [],
+            remaining_scan,
+        )
+        if not batch_rows:
+            continue
+
+        scanned_rows += len(batch_rows)
+        batch_rows = await _apply_filter(batch_rows)
+        if not batch_rows:
+            continue
+
+        remaining_rows = safe_target - len(rows_out)
+        if remaining_rows <= 0:
+            break
+        rows_out.extend(batch_rows[:remaining_rows])
+
+    return rows_out, {
+        "scanned_rows": scanned_rows,
+        "pages": max(1, len(scan_units)) if scan_units else 0,
+        "has_more": bool(scanned_rows < safe_scan_limit),
+    }
+
+
 @app.post("/api/query")
 async def run_query(body: dict, db: Session = Depends(get_db)):
     """Execute a query against selected source and return tabular rows."""
-    data = _load_source_rows_for_query(body, db, apply_sql=True)
+    # Optional server-side Data Query filtering/projection for fast full previews.
+    profile_query_cfg_raw = body.get("profile_query_config")
+    profile_query_cfg: Optional[Dict[str, Any]] = None
+    if isinstance(profile_query_cfg_raw, dict):
+        profile_query_cfg = dict(profile_query_cfg_raw)
+    elif isinstance(profile_query_cfg_raw, str) and profile_query_cfg_raw.strip():
+        try:
+            parsed_cfg = json.loads(profile_query_cfg_raw)
+            if isinstance(parsed_cfg, dict):
+                profile_query_cfg = dict(parsed_cfg)
+        except Exception:
+            profile_query_cfg = None
+
+    raw_filter_only = body.get("profile_query_filter_only")
+    profile_query_filter_only = (
+        raw_filter_only is True
+        or str(raw_filter_only or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+    )
+    scan_filter_cfg = _build_query_filter_only_config_for_scan(
+        profile_query_cfg,
+        profile_query_filter_only,
+        bool(
+            (profile_query_cfg or {}).get("case_sensitive")
+            if isinstance(profile_query_cfg, dict)
+            else body.get("case_sensitive", False)
+        ),
+    )
+    scan_filter_applied = False
+    source_type = str(body.get("source_type", "sample") or "").strip().lower()
+    prefer_source_scan = str(body.get("prefer_source_scan") or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
+    async def _scan_pipeline_source_if_supported() -> Tuple[bool, List[Dict[str, Any]], bool]:
+        if source_type != "pipeline":
+            return False, [], False
+
+        pipeline_id = str(body.get("pipeline_id") or "").strip()
+        pipeline_node_id = str(body.get("pipeline_node_id") or "").strip()
+        if not pipeline_id or not pipeline_node_id:
+            return False, [], False
+
+        pipeline = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
+        node_meta: Optional[Dict[str, Any]] = None
+        pipeline_node_map: Dict[str, Dict[str, Any]] = {}
+        if pipeline and isinstance(pipeline.nodes, list):
+            for node in pipeline.nodes:
+                if not isinstance(node, dict):
+                    continue
+                node_id = str(node.get("id") or "").strip()
+                if node_id:
+                    pipeline_node_map[node_id] = node
+                if node_id == pipeline_node_id:
+                    node_meta = node
+
+        def _pipeline_node_type(node: Optional[Dict[str, Any]]) -> str:
+            if not isinstance(node, dict):
+                return ""
+            data_obj = node.get("data") if isinstance(node.get("data"), dict) else {}
+            return str(data_obj.get("nodeType") or node.get("type") or "").strip().lower()
+
+        def _pipeline_node_config(node: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+            if not isinstance(node, dict):
+                return {}
+            data_obj = node.get("data") if isinstance(node.get("data"), dict) else {}
+            cfg = data_obj.get("config")
+            if not isinstance(cfg, dict):
+                cfg = node.get("config")
+            return dict(cfg) if isinstance(cfg, dict) else {}
+
+        node_type = _pipeline_node_type(node_meta)
+        source_cfg = _pipeline_node_config(node_meta)
+
+        if bool(body.get("return_all")):
+            target_rows = 500000
+        else:
+            raw_limit_value = body.get("limit")
+            try:
+                raw_limit = int(raw_limit_value) if raw_limit_value is not None else 5000
+            except Exception:
+                raw_limit = 5000
+            if raw_limit <= 0:
+                target_rows = 500000
+            else:
+                target_rows = max(1, min(raw_limit, 500000))
+
+        direct_source_types = {
+            "postgres_source",
+            "mysql_source",
+            "oracle_source",
+            "mongodb_source",
+            "redis_source",
+            "elasticsearch_source",
+            "rest_api_source",
+            "graphql_source",
+            "json_source",
+        }
+        if node_type in direct_source_types:
+            try:
+                source_rows = await _load_tabular_rows_for_source(
+                    node_type,
+                    source_cfg,
+                    max_rows=target_rows,
+                    hard_cap=500000,
+                )
+                return True, [row for row in source_rows if isinstance(row, dict)], False
+            except HTTPException:
+                return False, [], False
+            except Exception:
+                return False, [], False
+
+        if node_type == "profile_query_transform":
+            incoming_source_ids: List[str] = []
+            if pipeline and isinstance(pipeline.edges, list):
+                for edge in pipeline.edges:
+                    if not isinstance(edge, dict):
+                        continue
+                    target_id = str(edge.get("target") or "").strip()
+                    source_id = str(edge.get("source") or "").strip()
+                    if target_id == pipeline_node_id and source_id:
+                        incoming_source_ids.append(source_id)
+            incoming_source_ids = list(dict.fromkeys(incoming_source_ids))
+            if not incoming_source_ids:
+                return False, [], False
+
+            incoming_by_source: Dict[str, List[Dict[str, Any]]] = {}
+            merged_rows: List[Dict[str, Any]] = []
+            for source_id in incoming_source_ids:
+                if len(merged_rows) >= target_rows:
+                    break
+                source_target_rows = max(1, target_rows - len(merged_rows))
+                source_node = pipeline_node_map.get(source_id)
+                source_type_for_node = _pipeline_node_type(source_node)
+                source_config_for_node = _pipeline_node_config(source_node)
+                source_rows: List[Dict[str, Any]] = []
+                if source_type_for_node in direct_source_types:
+                    try:
+                        loaded_rows = await _load_tabular_rows_for_source(
+                            source_type_for_node,
+                            source_config_for_node,
+                            max_rows=source_target_rows,
+                            hard_cap=500000,
+                        )
+                        source_rows = [row for row in loaded_rows if isinstance(row, dict)]
+                    except Exception:
+                        source_rows = []
+                elif source_type_for_node in {"lmdb_source", "rocksdb_source"}:
+                    try:
+                        source_rows, _scan_meta = await _scan_kv_source_rows_for_query(
+                            node_type=source_type_for_node,
+                            source_config=source_config_for_node,
+                            target_rows=source_target_rows,
+                            scan_limit=source_target_rows,
+                            filter_cfg=None,
+                        )
+                    except Exception:
+                        source_rows = []
+                if not source_rows:
+                    try:
+                        source_rows = _extract_rows_from_pipeline_execution(
+                            getattr(db.query(models.Execution).filter(
+                                models.Execution.pipeline_id == pipeline_id,
+                                models.Execution.status == "success",
+                            ).order_by(models.Execution.started_at.desc()).first(), "node_results", None),
+                            source_id,
+                            strict_preferred=True,
+                        )
+                        source_rows = [row for row in source_rows if isinstance(row, dict)]
+                    except Exception:
+                        source_rows = []
+                incoming_by_source[source_id] = source_rows
+                merged_rows.extend(source_rows[:source_target_rows])
+
+            if not merged_rows:
+                return False, [], False
+
+            query_cfg = dict(source_cfg)
+            query_cfg["profile_patch_enabled"] = False
+            if bool(body.get("return_all")) or str(body.get("limit") or "").strip() == "0":
+                query_cfg["limit"] = 0
+
+            context_nodes: Dict[str, Dict[str, Any]] = {}
+            for source_id in incoming_source_ids:
+                source_node = pipeline_node_map.get(source_id)
+                context_nodes[source_id] = {
+                    "id": source_id,
+                    "data": {
+                        "nodeType": _pipeline_node_type(source_node),
+                        "config": _pipeline_node_config(source_node),
+                    },
+                }
+            transformed = await etl_engine._transform_profile_query(
+                merged_rows,
+                query_cfg,
+                incoming_by_source=incoming_by_source,
+                incoming_order=incoming_source_ids,
+                execution_context={"pipeline_nodes": context_nodes},
+            )
+            return True, [row for row in transformed if isinstance(row, dict)], False
+
+        if node_type not in {"lmdb_source", "rocksdb_source"}:
+            return False, [], False
+
+        try:
+            raw_scan_limit = int(
+                body.get("profile_store_scan_limit")
+                or body.get("source_scan_limit")
+                or body.get("scan_limit")
+                or body.get("max_rows")
+                or 0
+            )
+        except Exception:
+            raw_scan_limit = 0
+
+        # Allow deeper scan for sparse filtered matches.
+        if raw_scan_limit <= 0:
+            if scan_filter_cfg is not None:
+                scan_limit = min(500000, max(50000, target_rows * 100))
+            else:
+                scan_limit = min(500000, max(target_rows, 5000))
+        else:
+            scan_limit = max(1, min(raw_scan_limit, 500000))
+
+        scanned_rows, _scan_meta = await _scan_kv_source_rows_for_query(
+            node_type=node_type,
+            source_config=source_cfg,
+            target_rows=target_rows,
+            scan_limit=scan_limit,
+            filter_cfg=scan_filter_cfg,
+        )
+        return True, scanned_rows, scan_filter_cfg is not None
+
+    data: List[Dict[str, Any]] = []
+    if prefer_source_scan and source_type == "pipeline":
+        handled, scanned_rows, scan_applied = await _scan_pipeline_source_if_supported()
+        if handled:
+            data = scanned_rows
+            scan_filter_applied = scan_applied
+        else:
+            data = _load_source_rows_for_query(body, db, apply_sql=True)
+    else:
+        try:
+            data = _load_source_rows_for_query(body, db, apply_sql=True)
+        except HTTPException:
+            if source_type not in {"pipeline"}:
+                raise
+            handled, scanned_rows, scan_applied = await _scan_pipeline_source_if_supported()
+            if not handled:
+                raise
+            data = scanned_rows
+            scan_filter_applied = scan_applied
+
     data = _apply_drill_filters_to_rows(data, body.get("drill_filters"))
+
+    if profile_query_cfg and isinstance(data, list) and data:
+        # If this response is a summarized wrapper payload, keep it as-is so
+        # frontend can trigger source-scan fallback instead of filtering summary.
+        has_summary_wrapper = any(
+            isinstance(row, dict)
+            and str(row.get("kind") or "").strip().lower() in {"summary_only_object", "summary_only_rows"}
+            for row in data
+        )
+        if not has_summary_wrapper:
+            safe_query_cfg = dict(profile_query_cfg)
+            if profile_query_filter_only:
+                if scan_filter_applied:
+                    safe_query_cfg = {}
+                else:
+                    safe_query_cfg = _build_query_filter_only_config_for_scan(
+                        safe_query_cfg,
+                        True,
+                        bool(safe_query_cfg.get("case_sensitive", False)),
+                    ) or {}
+            if not safe_query_cfg:
+                transformed = data
+            else:
+                try:
+                    transformed = await etl_engine._transform_profile_query(
+                        data,
+                        safe_query_cfg,
+                        incoming_by_source={},
+                        incoming_order=[],
+                        execution_context={},
+                    )
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    raise HTTPException(400, f"Data Query backend filter failed: {exc}")
+            if isinstance(transformed, list):
+                data = transformed
 
     if not data:
         return {"data": [], "columns": [], "row_count": 0}
 
-    output_rows = data[:5000]
+    # Backward-compatible default for UI previews is 5000 rows.
+    # Clients can request larger windows (or full rows) via:
+    # - limit: 0 (means capped-unlimited)
+    # - return_all: true
+    safe_cap = 500000
+    output_limit = 5000
+    if bool(body.get("return_all")):
+        output_limit = min(len(data), safe_cap)
+    else:
+        raw_limit = body.get("limit")
+        if raw_limit is not None:
+            try:
+                parsed_limit = int(raw_limit)
+            except Exception:
+                parsed_limit = 5000
+            if parsed_limit <= 0:
+                output_limit = min(len(data), safe_cap)
+            else:
+                output_limit = max(1, min(parsed_limit, safe_cap))
+
+    output_rows = data[:output_limit]
     ordered_columns: List[str] = []
     seen_columns: set[str] = set()
 

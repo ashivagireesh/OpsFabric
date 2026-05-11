@@ -235,6 +235,9 @@ type MLOpsStage1ProfileResult = {
   summary?: {
     input_rows?: number
     sampled_rows?: number
+    profile_limited?: boolean
+    profile_scope?: string
+    eda_row_cap?: number | null
     column_count?: number
     duplicate_rows?: number
     type_counts?: Record<string, number>
@@ -4728,6 +4731,20 @@ function normalizeDataQueryPickerPath(value: unknown): string {
   return text
 }
 
+function extractDataQuerySourceIdFromFieldRef(value: unknown): string {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  const match = text.match(/^dqsrc::([^.]+)\..+$/)
+  return match && match[1] ? String(match[1]).trim() : ''
+}
+
+function buildDataQuerySourceFieldRef(sourceId: string, fieldPath: string): string {
+  const sid = String(sourceId || '').trim()
+  const path = normalizeDataQueryPickerPath(fieldPath)
+  if (!sid || !path) return ''
+  return `dqsrc::${sid}.${path}`
+}
+
 function createMLOpsStage2FieldConfig(seed?: Partial<MLOpsStage2FieldConfig>): MLOpsStage2FieldConfig {
   const normalizePick = <T extends string>(values: unknown, allowed: Set<string>): T[] =>
     uniqueFieldNames(parseStringList(values))
@@ -8829,7 +8846,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     if (parsed.length > 0) {
       return parsed.map((item, index) => ({
         id: String(item.id || `rule_${index + 1}`),
-        field: String(item.field || item.leftField || ''),
+        field: normalizeDataQueryPickerPath(String(item.field || item.leftField || '')),
+        sourceField: String(
+          item.sourceField
+          || item.source_field
+          || (String(item.field || '').trim().startsWith('dqsrc::') ? String(item.field || '').trim() : '')
+          || '',
+        ).trim(),
         operator: String(item.operator || 'equals'),
         value: item.value == null
           ? (item.rightValue == null ? '' : String(item.rightValue))
@@ -8851,11 +8874,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         ),
       }))
     }
-    const legacyField = String(nodeConfig.field || '').trim()
+    const legacyField = normalizeDataQueryPickerPath(String(nodeConfig.field || '').trim())
     if (!legacyField) return []
     return [{
       id: 'rule_1',
       field: legacyField,
+      sourceField: '',
       operator: String(nodeConfig.operator || 'equals'),
       value: nodeConfig.value == null ? '' : String(nodeConfig.value),
       rightMode: 'literal',
@@ -8874,7 +8898,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     [nodeConfig.query_mode]
   )
   const dataQuerySelectFieldsConfigured = useMemo(
-    () => parseFieldList(nodeConfig.select_fields),
+    () => uniqueFieldNames(
+      parseFieldList(nodeConfig.select_fields).map((field) => normalizeDataQueryPickerPath(field)),
+    ),
     [nodeConfig.select_fields]
   )
   const dataQuerySelectFieldSortsConfigured = useMemo(() => {
@@ -8887,7 +8913,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     }
     if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
       Object.entries(raw as Record<string, unknown>).forEach(([fieldPath, modeValue]) => {
-        const path = String(fieldPath || '').trim()
+        const path = normalizeDataQueryPickerPath(String(fieldPath || '').trim())
         if (!path) return
         const mode = normalizeMode(modeValue)
         if (mode !== 'none') out[path] = mode
@@ -8899,7 +8925,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         const parsed = JSON.parse(raw)
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
           Object.entries(parsed as Record<string, unknown>).forEach(([fieldPath, modeValue]) => {
-            const path = String(fieldPath || '').trim()
+            const path = normalizeDataQueryPickerPath(String(fieldPath || '').trim())
             if (!path) return
             const mode = normalizeMode(modeValue)
             if (mode !== 'none') out[path] = mode
@@ -8916,7 +8942,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
       const out: Record<string, string> = {}
       Object.entries(raw as Record<string, unknown>).forEach(([k, v]) => {
-        const path = String(k || '').trim()
+        const path = normalizeDataQueryPickerPath(String(k || '').trim())
         const alias = String(v || '').trim()
         if (path && alias) out[path] = alias
       })
@@ -8928,7 +8954,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
           const out: Record<string, string> = {}
           Object.entries(parsed as Record<string, unknown>).forEach(([k, v]) => {
-            const path = String(k || '').trim()
+            const path = normalizeDataQueryPickerPath(String(k || '').trim())
             const alias = String(v || '').trim()
             if (path && alias) out[path] = alias
           })
@@ -9579,15 +9605,34 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         label: string
         nodeType: string
         config: Record<string, unknown>
-        source: 'upstream'
+        source: 'upstream' | 'pipeline'
+        storage: 'lmdb' | 'rocksdb' | 'redis' | 'oracle'
       }>
 
+      const selectedStorage = (
+        dataQueryProfilePatchStorageDraft === 'rocksdb'
+        || dataQueryProfilePatchStorageDraft === 'redis'
+        || dataQueryProfilePatchStorageDraft === 'oracle'
+          ? dataQueryProfilePatchStorageDraft
+          : 'lmdb'
+      )
+      const normalizeProfileStorage = (value: unknown): 'lmdb' | 'rocksdb' | 'redis' | 'oracle' => {
+        const raw = String(value || '').trim().toLowerCase()
+        if (raw === 'rocksdb' || raw === 'redis' || raw === 'oracle') return raw
+        return 'lmdb'
+      }
+      const getCandidateStorage = (nodeTypeRaw: string, cfg: Record<string, unknown>): 'lmdb' | 'rocksdb' | 'redis' | 'oracle' => {
+        const kind = String(nodeTypeRaw || '').trim().toLowerCase()
+        if (kind === 'lmdb_source') return 'lmdb'
+        if (kind === 'oracle_source') return 'oracle'
+        return normalizeProfileStorage(cfg.custom_profile_storage || cfg.profile_storage || 'lmdb')
+      }
       const isProfileCandidate = (nodeTypeRaw: string, cfg: Record<string, unknown>): boolean => {
         const kind = String(nodeTypeRaw || '').trim().toLowerCase()
-        return (
-          (kind === 'map_transform' && parseBoolLike(cfg.custom_profile_enabled, false))
-          || kind === 'lmdb_source'
-        )
+        if (kind === 'lmdb_source') return selectedStorage === 'lmdb'
+        if (kind === 'oracle_source') return selectedStorage === 'oracle'
+        if (kind !== 'map_transform' || !parseBoolLike(cfg.custom_profile_enabled, false)) return false
+        return getCandidateStorage(kind, cfg) === selectedStorage
       }
 
       const seen = new Set<string>()
@@ -9596,10 +9641,19 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         label: string
         nodeType: string
         config: Record<string, unknown>
-        source: 'upstream'
+        source: 'upstream' | 'pipeline'
+        storage: 'lmdb' | 'rocksdb' | 'redis' | 'oracle'
       }> = []
 
-      dataQueryUpstreamCandidateNodes.forEach((item) => {
+      const addCandidate = (
+        item: {
+          id: string
+          label: string
+          nodeType: string
+          config: Record<string, unknown>
+        },
+        source: 'upstream' | 'pipeline',
+      ) => {
         const id = String(item.id || '').trim()
         const kind = String(item.nodeType || '').trim().toLowerCase()
         const cfg = (item.config && typeof item.config === 'object' ? item.config : {}) as Record<string, unknown>
@@ -9610,21 +9664,53 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           label: String(item.label || id),
           nodeType: kind,
           config: cfg,
-          source: 'upstream',
+          source,
+          storage: getCandidateStorage(kind, cfg),
         })
+      }
+
+      dataQueryUpstreamCandidateNodes.forEach((item) => {
+        addCandidate(item, 'upstream')
+      })
+
+      nodes.forEach((node) => {
+        const id = String(node?.id || '').trim()
+        const data = node?.data || {}
+        const kind = String(data?.nodeType || '').trim().toLowerCase()
+        const cfg = (
+          data?.config && typeof data.config === 'object'
+            ? data.config
+            : {}
+        ) as Record<string, unknown>
+        addCandidate({
+          id,
+          label: String(data?.label || data?.definition?.label || id),
+          nodeType: kind,
+          config: cfg,
+        }, 'pipeline')
       })
 
       return out
     },
-    [nodeType, dataQueryUpstreamCandidateNodes]
+    [nodeType, dataQueryProfilePatchStorageDraft, dataQueryUpstreamCandidateNodes, nodes]
   )
   const dataQueryProfilePatchNodeOptions = useMemo(
-    () => dataQueryProfilePatchCandidateNodes.map((item) => ({
-      value: item.id,
-      label: item.nodeType === 'lmdb_source'
-        ? `${item.label} (LMDB source • upstream)`
-        : `${item.label} (profile • upstream)`,
-    })),
+    () => {
+      const storageLabels: Record<string, string> = {
+        lmdb: 'LMDB',
+        rocksdb: 'RocksDB',
+        redis: 'Redis',
+        oracle: 'Oracle',
+      }
+      return dataQueryProfilePatchCandidateNodes.map((item) => ({
+        value: item.id,
+        label: item.nodeType === 'lmdb_source'
+          ? `${item.label} (LMDB source • ${item.source})`
+          : item.nodeType === 'oracle_source'
+            ? `${item.label} (Oracle profile table • ${item.source})`
+            : `${item.label} (${storageLabels[item.storage] || 'Profile'} profile • ${item.source})`,
+      }))
+    },
     [dataQueryProfilePatchCandidateNodes]
   )
   const dataQueryProfilePatchSelectedUpstreamNode = useMemo(
@@ -9910,6 +9996,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         : DATA_QUERY_PREVIEW_MAX_ROWS_DEFAULT
       return dataQueryFullPreviewRows.slice(0, safeMax)
     }
+    const hasDirectSourceUpstream = dataQueryUpstreamCandidateNodes.some((item) => (
+      String(item?.nodeType || '').trim().toLowerCase().endsWith('_source')
+    ))
+    // For source-backed Data Query, remote detection rows are usually more
+    // representative (mixed profile namespaces) than local execution snippets.
+    if (hasDirectSourceUpstream && dataQueryRemotePreviewRows.length > 0) {
+      return dataQueryRemotePreviewRows.slice(0, 300)
+    }
     if (dataQueryLocalPreviewRows.length > 0) return dataQueryLocalPreviewRows
     return (dataQueryRemotePreviewRows || []).slice(0, 300)
   }, [
@@ -9921,6 +10015,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     dataQueryFullPreviewRows,
     dataQueryLocalPreviewRows,
     dataQueryRemotePreviewRows,
+    dataQueryUpstreamCandidateNodes,
   ])
   const dataQueryFieldSamples = useMemo(() => {
     const out = new Map<string, string>()
@@ -12474,6 +12569,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const normalized = (nextCriteria || []).map((item, index) => ({
       id: String(item.id || `rule_${index + 1}`),
       field: normalizeDataQueryPickerPath(item.field || ''),
+      sourceField: String(item.sourceField || item.source_field || '').trim(),
       operator: String(item.operator || 'equals').trim().toLowerCase() || 'equals',
       value: item.value == null ? '' : String(item.value),
       rightMode: (
@@ -12499,6 +12595,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       {
         id: nextRuleId,
         field: '',
+        sourceField: '',
         operator: 'equals',
         value: '',
         rightMode: 'literal',
@@ -12525,9 +12622,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     persistDataQueryCriteria(next)
   }, [dataQueryCriteriaDraft, persistDataQueryCriteria])
 
-  const applyDataQueryFieldFromPicker = useCallback((fieldPath: string) => {
+  const applyDataQueryFieldFromPicker = useCallback((fieldPath: string, sourceId?: string) => {
     const picked = normalizeDataQueryPickerPath(fieldPath)
     if (!picked) return
+    const sourceFieldRef = buildDataQuerySourceFieldRef(String(sourceId || '').trim(), picked)
     const activeRuleId = String(dataQueryActiveRuleId || '').trim()
     const fallbackRuleId = String(dataQueryCriteriaDraft[0]?.id || '').trim()
     const targetRuleId = activeRuleId || fallbackRuleId
@@ -12536,6 +12634,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       const next = [{
         id: nextRuleId,
         field: picked,
+        sourceField: sourceFieldRef,
         operator: 'equals',
         value: '',
         rightMode: 'literal',
@@ -12544,7 +12643,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       setDataQueryActiveRuleId(nextRuleId)
       return
     }
-    updateDataQueryRule(targetRuleId, { field: picked })
+    updateDataQueryRule(targetRuleId, { field: picked, sourceField: sourceFieldRef })
   }, [dataQueryActiveRuleId, dataQueryCriteriaDraft, persistDataQueryCriteria, updateDataQueryRule])
 
   const persistDataQueryPatchOps = useCallback((nextOps: DataQueryProfilePatchOperation[]) => {
@@ -13010,6 +13109,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       setDataQueryFullPreviewError(msg)
       return []
     }
+    const hintedSourceNodeIds = uniqueFieldNames(
+      (dataQueryCriteriaDraft || [])
+        .map((rule) => extractDataQuerySourceIdFromFieldRef((rule as Record<string, unknown>)?.sourceField || (rule as Record<string, unknown>)?.source_field || ''))
+        .filter(Boolean),
+    )
+    const effectiveSourceNodeIds = hintedSourceNodeIds.length > 0
+      ? sourceNodeIds.filter((item) => hintedSourceNodeIds.includes(String(item || '').trim()))
+      : sourceNodeIds
+    const sourceNodeIdsForScan = effectiveSourceNodeIds.length > 0 ? effectiveSourceNodeIds : sourceNodeIds
     const safeMaxRows = Number.isFinite(dataQueryPreviewMaxRowsDraft)
       ? Math.max(1, Math.min(Math.trunc(dataQueryPreviewMaxRowsDraft), DATA_QUERY_PREVIEW_MAX_ROWS_CAP))
       : DATA_QUERY_PREVIEW_MAX_ROWS_DEFAULT
@@ -13056,7 +13164,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         return [sourceId, roots] as const
       }),
     )
-    sourceNodeIds.forEach((sourceId, index) => {
+    sourceNodeIdsForScan.forEach((sourceId, index) => {
       const sourceKey = String(sourceId || '').trim()
       if (!sourceKey) return
       const roots = sourceRootsById.get(sourceKey) || new Set<string>()
@@ -13065,7 +13173,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       const score = (rootScore * 100000) - index
       sourcePriority.set(sourceKey, score)
     })
-    const prioritizedSourceNodeIds = [...sourceNodeIds].sort((a, b) => {
+    const prioritizedSourceNodeIds = [...sourceNodeIdsForScan].sort((a, b) => {
       const aScore = sourcePriority.get(String(a || '').trim()) ?? Number.NEGATIVE_INFINITY
       const bScore = sourcePriority.get(String(b || '').trim()) ?? Number.NEGATIVE_INFINITY
       return bScore - aScore
@@ -13095,9 +13203,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         const rightMode = String(rule?.rightMode || 'literal').trim().toLowerCase()
         const isFieldRight = rightMode === 'field'
         const rawValue = rule?.value
+        const sourceField = String((rule as Record<string, unknown>)?.sourceField || (rule as Record<string, unknown>)?.source_field || '').trim()
         return {
           id: String(rule?.id || '').trim() || undefined,
           field: normalizeDataQueryPickerPath(String(rule?.field || '').trim()),
+          sourceField: sourceField || undefined,
+          source_field: sourceField || undefined,
           operator: String(rule?.operator || 'equals').trim().toLowerCase() || 'equals',
           value: isFieldRight
             ? normalizeDataQueryPickerPath(String(rawValue || '').trim())
@@ -13201,6 +13312,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             ? sourceMeta.config
             : {}
         ) as Record<string, unknown>
+        const preferSourceScan = sourceType.endsWith('_source')
         const isProfileStoreNode = (
           sourceType === 'map_transform'
           && parseBoolLike(sourceConfig.custom_profile_enabled, false)
@@ -13237,6 +13349,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 pipeline_id: pipelineId,
                 pipeline_node_id: normalizedSourceId,
                 strict_node_output: true,
+                prefer_source_scan: preferSourceScan,
                 limit: queryLimit,
                 profile_query_config: backendFilterConfig || undefined,
                 profile_query_filter_only: backendRulesApplied,
@@ -13279,6 +13392,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 pipeline_id: pipelineId,
                 pipeline_node_id: normalizedSourceId,
                 strict_node_output: false,
+                prefer_source_scan: preferSourceScan,
                 limit: queryLimit,
                 profile_query_config: backendFilterConfig || undefined,
                 profile_query_filter_only: backendRulesApplied,
@@ -13371,6 +13485,222 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     nodeConfig.case_sensitive,
   ])
 
+  const loadDataQueryFilteredSampleRows = useCallback(async (): Promise<Array<Record<string, unknown>>> => {
+    if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform' || !selectedNodeId) return []
+    const pipelineId = String(activePipelineId || '').trim()
+    if (!pipelineId) return []
+    const sourceNodeIds = dataQueryDirectSourceNodeIds.length > 0
+      ? dataQueryDirectSourceNodeIds
+      : [String(selectedNodeId || '').trim()].filter(Boolean)
+    if (sourceNodeIds.length <= 0) return []
+    const hintedSourceNodeIds = uniqueFieldNames(
+      (dataQueryCriteriaDraft || [])
+        .map((rule) => extractDataQuerySourceIdFromFieldRef((rule as Record<string, unknown>)?.sourceField || (rule as Record<string, unknown>)?.source_field || ''))
+        .filter(Boolean),
+    )
+    const effectiveSourceNodeIds = hintedSourceNodeIds.length > 0
+      ? sourceNodeIds.filter((item) => hintedSourceNodeIds.includes(String(item || '').trim()))
+      : sourceNodeIds
+    const sourceNodeIdsForScan = effectiveSourceNodeIds.length > 0 ? effectiveSourceNodeIds : sourceNodeIds
+
+    const scanCriteria = (dataQueryCriteriaDraft || []).filter((rule) => {
+      const field = String(rule?.field || '').trim()
+      const op = String(rule?.operator || '').trim().toLowerCase()
+      return Boolean(field) || op === 'raw'
+    })
+    if (scanCriteria.length <= 0) return []
+
+    const scanMode = String(dataQueryMatchModeDraft || 'all').trim().toLowerCase() === 'any' ? 'any' : 'all'
+    const backendFilterCriteria = scanCriteria.map((rule) => {
+      const rightMode = String(rule?.rightMode || 'literal').trim().toLowerCase()
+      const isFieldRight = rightMode === 'field'
+      const rawValue = rule?.value
+      const sourceField = String((rule as Record<string, unknown>)?.sourceField || (rule as Record<string, unknown>)?.source_field || '').trim()
+      return {
+        id: String(rule?.id || '').trim() || undefined,
+        field: normalizeDataQueryPickerPath(String(rule?.field || '').trim()),
+        sourceField: sourceField || undefined,
+        source_field: sourceField || undefined,
+        operator: String(rule?.operator || 'equals').trim().toLowerCase() || 'equals',
+        value: isFieldRight
+          ? normalizeDataQueryPickerPath(String(rawValue || '').trim())
+          : rawValue,
+        rightMode: rightMode || 'literal',
+      }
+    })
+    const backendFilterConfig = {
+      query_mode: 'upstream',
+      criteria_mode: scanMode,
+      criteria: backendFilterCriteria,
+      case_sensitive: Boolean(nodeConfig.case_sensitive),
+    }
+
+    const sourceMetaById = new Map<string, {
+      label: string
+      nodeType: string
+      config: Record<string, unknown>
+    }>(
+      dataQueryUpstreamCandidateNodes.map((item) => [
+        String(item.id || '').trim(),
+        {
+          label: String(item.label || item.id || '').trim() || String(item.id || '').trim(),
+          nodeType: String(item.nodeType || '').trim().toLowerCase(),
+          config: (item.config && typeof item.config === 'object')
+            ? { ...(item.config as Record<string, unknown>) }
+            : {},
+        },
+      ]),
+    )
+
+    const toRoot = (value: unknown): string => {
+      const normalized = normalizeDataQueryPickerPath(value)
+      if (!normalized) return ''
+      const first = normalized.split(/[.[\]]/).find((item) => String(item || '').trim())
+      return String(first || '').trim()
+    }
+    const activeRoots = uniqueFieldNames([
+      ...scanCriteria.map((item) => toRoot(item?.field)),
+      ...(dataQuerySelectFieldsDraft || []).map((field) => toRoot(field)),
+    ].filter(Boolean))
+    const sourceRootsById = new Map<string, Set<string>>(
+      dataQueryFieldOptionsBySource.map((cluster) => {
+        const sourceId = String(cluster.sourceId || '').trim()
+        const roots = new Set<string>(
+          (Array.isArray(cluster.fields) ? cluster.fields : [])
+            .map((field) => toRoot(field))
+            .filter(Boolean),
+        )
+        return [sourceId, roots] as const
+      }),
+    )
+    const prioritizedSourceNodeIds = [...sourceNodeIdsForScan].sort((a, b) => {
+      const aRoots = sourceRootsById.get(String(a || '').trim()) || new Set<string>()
+      const bRoots = sourceRootsById.get(String(b || '').trim()) || new Set<string>()
+      const aScore = activeRoots.reduce((count, root) => count + (aRoots.has(root) ? 1 : 0), 0)
+      const bScore = activeRoots.reduce((count, root) => count + (bRoots.has(root) ? 1 : 0), 0)
+      return bScore - aScore
+    })
+
+    const maxRows = 300
+    const merged: Array<Record<string, unknown>> = []
+    const seen = new Set<string>()
+    const computeRowSignature = (row: Record<string, unknown>): string => {
+      const lmdbKey = String((row as any)?.lmdb_key || '').trim()
+      if (lmdbKey) return `lmdb_key:${lmdbKey}`
+      const entityKey = String((row as any)?.lmdb_entity_key || '').trim()
+      if (entityKey) return `lmdb_entity_key:${entityKey}`
+      const entityToken = String((row as any)?._entity_token || '').trim()
+      if (entityToken) return `_entity_token:${entityToken}`
+      try {
+        return JSON.stringify(row) || ''
+      } catch {
+        return ''
+      }
+    }
+
+    for (const sourceNodeId of prioritizedSourceNodeIds) {
+      if (merged.length >= maxRows) break
+      const normalizedSourceId = String(sourceNodeId || '').trim()
+      if (!normalizedSourceId) continue
+      const sourceMeta = sourceMetaById.get(normalizedSourceId) || null
+      const sourceType = String(sourceMeta?.nodeType || '').trim().toLowerCase()
+      const sourceConfig = (
+        sourceMeta?.config && typeof sourceMeta.config === 'object'
+          ? sourceMeta.config
+          : {}
+      ) as Record<string, unknown>
+      const preferSourceScan = sourceType.endsWith('_source')
+      const isProfileStoreNode = (
+        sourceType === 'map_transform'
+        && parseBoolLike(sourceConfig.custom_profile_enabled, false)
+      )
+      const sourceLimit = Math.max(1, maxRows - merged.length)
+      const profileStoreScanLimit = Math.max(
+        Math.max(sourceLimit, 10000),
+        Math.min(DATA_QUERY_PREVIEW_MAX_ROWS_CAP, sourceLimit * 60),
+      )
+
+      let response: any = null
+      try {
+        if (isProfileStoreNode) {
+          response = await api.runTabularQuery({
+            source_type: 'profile_store',
+            pipeline_id: pipelineId,
+            profile_node_id: normalizedSourceId,
+            profile_node_config: sourceConfig,
+            profile_store_scan_limit: profileStoreScanLimit,
+            limit: sourceLimit,
+            profile_query_config: backendFilterConfig,
+            profile_query_filter_only: true,
+          })
+        } else {
+          response = await api.runTabularQuery({
+            source_type: 'pipeline',
+            pipeline_id: pipelineId,
+            pipeline_node_id: normalizedSourceId,
+            strict_node_output: true,
+            prefer_source_scan: preferSourceScan,
+            limit: sourceLimit,
+            profile_query_config: backendFilterConfig,
+            profile_query_filter_only: true,
+          })
+        }
+      } catch {
+        try {
+          if (isProfileStoreNode) {
+            response = await api.runTabularQuery({
+              source_type: 'profile_store',
+              pipeline_id: pipelineId,
+              profile_node_id: normalizedSourceId,
+              profile_node_config: sourceConfig,
+              profile_store_scan_limit: profileStoreScanLimit,
+              limit: sourceLimit,
+              profile_query_config: backendFilterConfig,
+              profile_query_filter_only: true,
+            })
+          } else {
+            response = await api.runTabularQuery({
+              source_type: 'pipeline',
+              pipeline_id: pipelineId,
+              pipeline_node_id: normalizedSourceId,
+              strict_node_output: false,
+              prefer_source_scan: preferSourceScan,
+              limit: sourceLimit,
+              profile_query_config: backendFilterConfig,
+              profile_query_filter_only: true,
+            })
+          }
+        } catch {
+          continue
+        }
+      }
+
+      const rows = Array.isArray(response?.data)
+        ? response.data.filter((row: unknown) => !!row && typeof row === 'object' && !Array.isArray(row)) as Array<Record<string, unknown>>
+        : []
+      for (const row of rows) {
+        if (merged.length >= maxRows) break
+        const sig = computeRowSignature(row)
+        if (sig && seen.has(sig)) continue
+        if (sig) seen.add(sig)
+        merged.push(row)
+      }
+    }
+    return merged
+  }, [
+    dataQueryStudioOpen,
+    nodeType,
+    selectedNodeId,
+    activePipelineId,
+    dataQueryDirectSourceNodeIds,
+    dataQueryUpstreamCandidateNodes,
+    dataQueryCriteriaDraft,
+    dataQueryMatchModeDraft,
+    dataQuerySelectFieldsDraft,
+    dataQueryFieldOptionsBySource,
+    nodeConfig.case_sensitive,
+  ])
+
   const runDataQueryPreview = useCallback(async () => {
     if (dataQueryPreviewSourceModeDraft === 'full') {
       const fullRows = await loadDataQueryFullPreviewRows()
@@ -13378,9 +13708,23 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       runDataQueryPreviewLocal(fullRows)
       return
     }
+    const hasRules = (dataQueryCriteriaDraft || []).some((rule) => String(rule?.field || '').trim())
+    const hasDirectSourceUpstream = dataQueryUpstreamCandidateNodes.some((item) => (
+      String(item?.nodeType || '').trim().toLowerCase().endsWith('_source')
+    ))
+    if (hasRules && hasDirectSourceUpstream) {
+      const filteredSampleRows = await loadDataQueryFilteredSampleRows()
+      if (filteredSampleRows.length > 0) {
+        runDataQueryPreviewLocal(filteredSampleRows)
+        return
+      }
+    }
     runDataQueryPreviewLocal()
   }, [
     dataQueryPreviewSourceModeDraft,
+    dataQueryCriteriaDraft,
+    dataQueryUpstreamCandidateNodes,
+    loadDataQueryFilteredSampleRows,
     loadDataQueryFullPreviewRows,
     runDataQueryPreviewLocal,
   ])
@@ -13390,7 +13734,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const normalizedCriteria = (dataQueryCriteriaDraft || [])
       .map((item, index) => ({
         id: String(item.id || `rule_${index + 1}`),
-        field: String(item.field || '').trim(),
+        field: normalizeDataQueryPickerPath(String(item.field || '').trim()),
+        sourceField: String(item.sourceField || item.source_field || '').trim(),
         operator: String(item.operator || 'equals').trim().toLowerCase() || 'equals',
         value: item.value == null ? '' : String(item.value),
         rightMode: (
@@ -13421,14 +13766,23 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       field: firstRule?.field || '',
       operator: firstRule?.operator || 'equals',
       value: firstRule?.value || '',
-      select_fields: uniqueFieldNames(dataQuerySelectFieldsDraft).join(', '),
+      select_fields: uniqueFieldNames(dataQuerySelectFieldsDraft.map((field) => normalizeDataQueryPickerPath(field))).join(', '),
       select_field_sorts: Object.fromEntries(
-        Object.entries(dataQuerySelectFieldSortsDraft || {}).filter(([, mode]) => (
-          String(mode || '').trim().toLowerCase() === 'asc'
-          || String(mode || '').trim().toLowerCase() === 'desc'
-        ))
+        Object.entries(dataQuerySelectFieldSortsDraft || {})
+          .map(([fieldPath, mode]) => [normalizeDataQueryPickerPath(fieldPath), mode] as const)
+          .filter(([fieldPath, mode]) => (
+            Boolean(String(fieldPath || '').trim())
+            && (
+              String(mode || '').trim().toLowerCase() === 'asc'
+              || String(mode || '').trim().toLowerCase() === 'desc'
+            )
+          ))
       ),
-      select_field_aliases: dataQuerySelectFieldAliasesDraft,
+      select_field_aliases: Object.fromEntries(
+        Object.entries(dataQuerySelectFieldAliasesDraft || {})
+          .map(([fieldPath, alias]) => [normalizeDataQueryPickerPath(fieldPath), String(alias || '').trim()] as const)
+          .filter(([fieldPath, alias]) => Boolean(String(fieldPath || '').trim()) && Boolean(alias)),
+      ),
       array_output_mode: dataQueryArrayOutputModeDraft,
       array_match_mode: dataQueryArrayMatchModeDraft,
       include_original_row: Boolean(dataQueryIncludeOriginalRowDraft),
@@ -13666,20 +14020,100 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     saveDataQueryStudioConfig,
   ])
 
+  const resolveMLOpsFullSourceRows = useCallback(async (
+    fallbackInputRows?: Array<Record<string, unknown>>,
+  ): Promise<Array<Record<string, unknown>>> => {
+    const hardCap = 500000
+    const fallbackRows = (Array.isArray(fallbackInputRows) ? fallbackInputRows : mlopsPreviewRows)
+      .slice(0, hardCap)
+      .filter((row) => row && typeof row === 'object') as Array<Record<string, unknown>>
+    const unwrapSummaryRows = (rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> => {
+      const out: Array<Record<string, unknown>> = []
+      for (const row of rows) {
+        const kind = String((row as Record<string, unknown>)?.kind || '').trim().toLowerCase()
+        if (kind === 'summary_only_object' || kind === 'summary_only_rows' || kind === 'truncated_rows' || kind === 'truncated_values') {
+          const rawNestedRows = Array.isArray((row as Record<string, unknown>).data)
+            ? (row as Record<string, unknown>).data
+            : Array.isArray((row as Record<string, unknown>).sample)
+              ? (row as Record<string, unknown>).sample
+              : []
+          const nestedRows = rawNestedRows as unknown[]
+          nestedRows.forEach((nested: unknown) => {
+            if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+              out.push(nested as Record<string, unknown>)
+            }
+          })
+          continue
+        }
+        out.push(row)
+      }
+      return out
+    }
+
+    if (nodeType !== 'mlops_transform' || !selectedNodeId) return fallbackRows
+
+    const pipelineId = String(activePipelineId || '').trim()
+    const preferredSourceIds = (
+      mlopsDataQuerySourceNodeIds.length > 0
+        ? mlopsDataQuerySourceNodeIds
+        : mlopsPreferredSourceNodeIds
+    )
+      .map((id) => String(id || '').trim())
+      .filter(Boolean)
+    if (!pipelineId || preferredSourceIds.length <= 0) return fallbackRows
+
+    const merged: Array<Record<string, unknown>> = []
+    for (const sourceNodeId of preferredSourceIds) {
+      if (merged.length >= hardCap) break
+      let response: {
+        data?: Array<Record<string, unknown>>
+      } | null = null
+      try {
+        response = await api.runTabularQuery({
+          source_type: 'pipeline',
+          pipeline_id: pipelineId,
+          pipeline_node_id: sourceNodeId,
+          strict_node_output: true,
+          prefer_source_scan: true,
+          limit: 0,
+          return_all: true,
+        })
+      } catch {
+        continue
+      }
+      const rows = Array.isArray(response?.data)
+        ? unwrapSummaryRows(response.data.filter((row: unknown) => !!row && typeof row === 'object' && !Array.isArray(row)) as Array<Record<string, unknown>>)
+        : []
+      for (const row of rows) {
+        merged.push(row)
+        if (merged.length >= hardCap) break
+      }
+    }
+
+    return merged.length > 0 ? merged : fallbackRows
+  }, [
+    nodeType,
+    selectedNodeId,
+    activePipelineId,
+    mlopsDataQuerySourceNodeIds,
+    mlopsPreferredSourceNodeIds,
+    mlopsPreviewRows,
+  ])
+
   const runMLOpsStage1Profile = useCallback(async () => {
     if (nodeType !== 'mlops_transform' || !selectedNodeId) return
-    const inputRows = mlopsPreviewRows.slice(0, 5000)
-    if (inputRows.length === 0) {
-      setMLOpsProfileError('No Data Query output rows detected. Run the pipeline once with Data Query connected directly to MLOps.')
-      setMLOpsProfileResult(null)
-      return
-    }
     setMLOpsProfileLoading(true)
     setMLOpsProfileError(null)
     try {
+      const inputRows = await resolveMLOpsFullSourceRows()
+      if (inputRows.length === 0) {
+        setMLOpsProfileError('No Data Query output rows detected. Run the pipeline once with Data Query connected directly to MLOps.')
+        setMLOpsProfileResult(null)
+        return
+      }
       const response = await api.getMLOpsNodeStage1Profile({
         rows: inputRows,
-        sample_size: mlopsSampleSizeDraft,
+        sample_size: inputRows.length,
         preview_rows: mlopsPreviewRowsDraft,
         max_chart_columns: mlopsMaxChartColumnsDraft,
         include_ydata: mlopsIncludeYDataDraft,
@@ -13700,8 +14134,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   }, [
     nodeType,
     selectedNodeId,
-    mlopsPreviewRows,
-    mlopsSampleSizeDraft,
+    resolveMLOpsFullSourceRows,
     mlopsPreviewRowsDraft,
     mlopsMaxChartColumnsDraft,
     mlopsIncludeYDataDraft,
@@ -14158,56 +14591,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlopsStage2PreviewRows.length > 0
         ? mlopsStage2PreviewRows
         : mlopsPreviewRows
-    )
-      .slice(0, 50000)
-      .filter((row) => row && typeof row === 'object') as Array<Record<string, unknown>>
-
-    if (nodeType !== 'mlops_transform' || !selectedNodeId) return fallbackRows
-
-    const pipelineId = String(activePipelineId || '').trim()
-    const preferredSourceIds = (
-      mlopsDataQuerySourceNodeIds.length > 0
-        ? mlopsDataQuerySourceNodeIds
-        : mlopsPreferredSourceNodeIds
-    )
-      .map((id) => String(id || '').trim())
-      .filter(Boolean)
-    if (!pipelineId || preferredSourceIds.length <= 0) return fallbackRows
-
-    const merged: Array<Record<string, unknown>> = []
-    const hardCap = 500000
-    for (const sourceNodeId of preferredSourceIds) {
-      if (merged.length >= hardCap) break
-      let response: {
-        data?: Array<Record<string, unknown>>
-      } | null = null
-      try {
-        response = await api.runTabularQuery({
-          source_type: 'pipeline',
-          pipeline_id: pipelineId,
-          pipeline_node_id: sourceNodeId,
-          strict_node_output: true,
-          limit: 0,
-        })
-      } catch {
-        continue
-      }
-      const rows = Array.isArray(response?.data)
-        ? response.data.filter((row: unknown) => !!row && typeof row === 'object' && !Array.isArray(row)) as Array<Record<string, unknown>>
-        : []
-      for (const row of rows) {
-        merged.push(row)
-        if (merged.length >= hardCap) break
-      }
-    }
-
-    return merged.length > 0 ? merged : fallbackRows
+    ) as Array<Record<string, unknown>>
+    return resolveMLOpsFullSourceRows(fallbackRows)
   }, [
-    nodeType,
-    selectedNodeId,
-    activePipelineId,
-    mlopsDataQuerySourceNodeIds,
-    mlopsPreferredSourceNodeIds,
+    resolveMLOpsFullSourceRows,
     mlopsPreviewRows,
     mlopsStage2PreviewRows,
   ])
@@ -22347,14 +22734,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               {dataQueryPreviewSourceModeDraft === 'full' ? 'preview rows' : 'sample rows'}: {dataQueryPreviewRows.length}
             </Tag>
             <Tag style={{ background: '#a855f714', border: '1px solid #a855f730', color: '#a855f7' }}>
-              connected lmdb/profile nodes: {dataQueryProfilePatchCandidateNodes.length}
+              patch target nodes: {dataQueryProfilePatchCandidateNodes.length}
             </Tag>
           </Space>
 
           {dataQueryProfilePatchCandidateNodes.length > 0 ? (
             <div style={{ marginTop: 8, display: 'grid', gap: 6 }}>
               <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
-                Connected LMDB/Profile nodes ({dataQueryProfilePatchCandidateNodes.length})
+                Available patch target nodes ({dataQueryProfilePatchCandidateNodes.length})
               </Text>
               <div
                 style={{
@@ -22369,7 +22756,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 {dataQueryProfilePatchCandidateNodes.map((item) => {
                   const nodeId = String(item.id || '').trim()
                   const shortId = nodeId ? nodeId.slice(0, 8) : ''
-                  const nodeKind = String(item.nodeType || '').trim().toLowerCase() === 'lmdb_source' ? 'lmdb' : 'profile'
+                  const nodeTypeText = String(item.nodeType || '').trim().toLowerCase()
+                  const nodeKind = nodeTypeText === 'lmdb_source'
+                    ? 'lmdb'
+                    : nodeTypeText === 'oracle_source'
+                      ? 'oracle table'
+                      : String(item.storage || 'profile')
                   return (
                     <Tag
                       key={`dq_profile_node_hint_${item.id}`}
@@ -22380,7 +22772,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         color: '#22c55e',
                       }}
                     >
-                      {item.label} [{nodeKind} • upstream • {shortId}]
+                      {item.label} [{nodeKind} • {item.source} • {shortId}]
                     </Tag>
                   )
                 })}
@@ -22521,7 +22913,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               onSelect={(_, info) => {
                 const fieldPath = String((info.node as any)?.path || '').trim()
                 if (!fieldPath) return
-                applyDataQueryFieldFromPicker(fieldPath)
+                const treeKey = String((info.node as any)?.key || '').trim()
+                const sourceIdMatch = treeKey.match(/^dqsrc::([^:]+)::/)
+                const sourceId = sourceIdMatch && sourceIdMatch[1] ? String(sourceIdMatch[1]).trim() : ''
+                applyDataQueryFieldFromPicker(fieldPath, sourceId)
               }}
             />
           </div>
@@ -22952,13 +23347,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 onChange={(value) => {
                   const next = String(value || '').trim()
                   setDataQueryProfilePatchNodeIdDraft(next)
-                  const selected = dataQueryUpstreamCandidateNodes.find((item) => String(item.id || '').trim() === next)
+                  const selected = dataQueryProfilePatchCandidateNodes.find((item) => String(item.id || '').trim() === next)
                   if (String(selected?.nodeType || '').trim().toLowerCase() === 'lmdb_source') {
                     setDataQueryProfilePatchStorageDraft('lmdb')
+                  } else if (selected?.storage) {
+                    setDataQueryProfilePatchStorageDraft(selected.storage)
                   }
                 }}
                 options={dataQueryProfilePatchNodeOptions}
-                placeholder="Select upstream profile/LMDB node"
+                placeholder="Select profile target node"
                 style={{ width: '100%', marginTop: 4 }}
                 disabled={!dataQueryProfilePatchEnabledDraft}
                 allowClear
@@ -23455,7 +23852,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               fields: {mlopsFieldOptions.length}
             </Tag>
             <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e' }}>
-              sample rows: {mlopsPreviewRows.length}
+              preview rows: {mlopsPreviewRows.length}
             </Tag>
             {mlopsPreviewRowsLocal.length <= 0 && mlopsRemoteRows.length > 0 && (
               <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>
@@ -23518,15 +23915,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           >
             <Space size={10} wrap align="end">
               <div>
-                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Profile sample size</Text>
-                <InputNumber
-                  size="small"
-                  min={100}
-                  max={20000}
-                  value={mlopsSampleSizeDraft}
-                  onChange={(value) => setMLOpsSampleSizeDraft(Number.isFinite(Number(value)) ? Number(value) : 2000)}
-                  style={{ width: 140, marginTop: 4 }}
-                />
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Profile rows</Text>
+                <br />
+                <Tag style={{ marginTop: 6, background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>
+                  full source
+                </Tag>
               </div>
               <div>
                 <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Preview rows</Text>
@@ -23611,7 +24004,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 input: {Number(mlopsProfileResult?.summary?.input_rows || mlopsProfileResult?.input_rows || 0)}
               </Tag>
               <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>
-                sampled: {Number(mlopsProfileResult?.summary?.sampled_rows || 0)}
+                profiled: {Number(mlopsProfileResult?.summary?.sampled_rows || 0)}
+              </Tag>
+              <Tag style={{ background: '#64748b14', border: '1px solid #64748b30', color: '#64748b' }}>
+                scope: {String(mlopsProfileResult?.summary?.profile_scope || 'full')}
               </Tag>
               <Tag style={{ background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1' }}>
                 columns: {Number(mlopsProfileResult?.summary?.column_count || 0)}
@@ -24340,7 +24736,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         selected features: {mlopsStage3SelectedFeatureFields.length}
                       </Tag>
                       <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9', marginInlineEnd: 0 }}>
-                        rows: {mlopsPreviewRows.length}
+                        rows: {mlopsStage3RunSummary?.ran
+                          ? `${Number(mlopsStage3RunSummary.input_rows || 0).toLocaleString()} trained`
+                          : `${mlopsPreviewRows.length.toLocaleString()} preview`}
                       </Tag>
                       <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b', marginInlineEnd: 0 }}>
                         split: {mlopsStage3RunSummary?.ran

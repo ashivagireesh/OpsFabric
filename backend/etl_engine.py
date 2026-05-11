@@ -11191,6 +11191,685 @@ END;"""
             return str(value).encode("utf-8", errors="replace")
         return json.dumps(self._json_safe_value(value), ensure_ascii=False).encode("utf-8")
 
+    def _profile_query_extract_oracle_source_table(self, config: Dict[str, Any]) -> str:
+        table = str(
+            (config or {}).get("custom_profile_oracle_table")
+            or (config or {}).get("profile_table")
+            or (config or {}).get("table")
+            or ""
+        ).strip()
+        if table:
+            return table
+        query = str((config or {}).get("query") or "").strip()
+        match = re.search(
+            r"\bfrom\s+([A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)?)",
+            query,
+            flags=re.IGNORECASE,
+        )
+        return str(match.group(1)).strip() if match else "ETL_PROFILE_STATE"
+
+    def _profile_query_extract_oracle_source_profile_node_id(self, config: Dict[str, Any]) -> str:
+        explicit = str(
+            (config or {}).get("profile_node_id")
+            or (config or {}).get("target_profile_node_id")
+            or (config or {}).get("custom_profile_node_id")
+            or (config or {}).get("custom_profile_oracle_node_id")
+            or ""
+        ).strip()
+        if explicit:
+            return explicit
+        query = str((config or {}).get("query") or "").strip()
+        match = re.search(
+            r"\bnode_id\s*=\s*'([^']+)'",
+            query,
+            flags=re.IGNORECASE,
+        )
+        return str(match.group(1)).strip() if match else ""
+
+    def _profile_query_extract_oracle_source_profile_pipeline_id(self, config: Dict[str, Any]) -> str:
+        explicit = str(
+            (config or {}).get("profile_pipeline_id")
+            or (config or {}).get("target_profile_pipeline_id")
+            or (config or {}).get("custom_profile_pipeline_id")
+            or (config or {}).get("custom_profile_oracle_pipeline_id")
+            or ""
+        ).strip()
+        if explicit:
+            return explicit
+        query = str((config or {}).get("query") or "").strip()
+        match = re.search(
+            r"\bpipeline_id\s*=\s*'([^']+)'",
+            query,
+            flags=re.IGNORECASE,
+        )
+        return str(match.group(1)).strip() if match else ""
+
+    def _profile_query_rows_have_first_value(
+        self,
+        rows: List[Any],
+        field_paths: List[str],
+        sample_limit: int = 25,
+    ) -> bool:
+        for raw_row in (rows or [])[: max(1, int(sample_limit or 25))]:
+            row_obj = raw_row if isinstance(raw_row, dict) else {"value": raw_row}
+            value, found = self._profile_query_extract_first_row_value(row_obj, field_paths)
+            if found and value is not None and str(value).strip():
+                return True
+        return False
+
+    def _profile_query_oracle_profile_cfg_from_source_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        cfg = dict(config or {})
+        return {
+            "custom_profile_oracle_host": cfg.get("custom_profile_oracle_host") or cfg.get("host"),
+            "custom_profile_oracle_port": cfg.get("custom_profile_oracle_port") or cfg.get("port"),
+            "custom_profile_oracle_service_name": (
+                cfg.get("custom_profile_oracle_service_name")
+                or cfg.get("service_name")
+            ),
+            "custom_profile_oracle_sid": cfg.get("custom_profile_oracle_sid") or cfg.get("sid"),
+            "custom_profile_oracle_user": cfg.get("custom_profile_oracle_user") or cfg.get("user"),
+            "custom_profile_oracle_password": (
+                cfg.get("custom_profile_oracle_password")
+                or cfg.get("password")
+            ),
+            "custom_profile_oracle_dsn": cfg.get("custom_profile_oracle_dsn") or cfg.get("dsn"),
+            "custom_profile_oracle_table": self._profile_query_extract_oracle_source_table(cfg),
+            "custom_profile_oracle_write_strategy": (
+                cfg.get("custom_profile_oracle_write_strategy")
+                or cfg.get("write_strategy")
+            ),
+            "custom_profile_oracle_parallel_workers": (
+                cfg.get("custom_profile_oracle_parallel_workers")
+                or cfg.get("parallel_workers")
+            ),
+            "custom_profile_oracle_parallel_min_tokens": (
+                cfg.get("custom_profile_oracle_parallel_min_tokens")
+                or cfg.get("parallel_min_tokens")
+            ),
+            "custom_profile_oracle_merge_batch_size": (
+                cfg.get("custom_profile_oracle_merge_batch_size")
+                or cfg.get("merge_batch_size")
+            ),
+            "custom_profile_oracle_parallel_force": (
+                cfg.get("custom_profile_oracle_parallel_force")
+                or cfg.get("parallel_force")
+            ),
+        }
+
+    def _profile_query_patch_ops_for_stored_profile_document(
+        self,
+        patch_ops: List[Dict[str, Any]],
+        strip_document_json: bool = False,
+    ) -> List[Dict[str, Any]]:
+        if not strip_document_json:
+            return patch_ops
+        out: List[Dict[str, Any]] = []
+        for raw_op in patch_ops or []:
+            if not isinstance(raw_op, dict):
+                continue
+            op = dict(raw_op)
+            target_path = str(op.get("target_path") or "").strip()
+            if target_path.lower().startswith("document_json."):
+                op["target_path"] = target_path[len("DOCUMENT_JSON."):]
+            out.append(op)
+        return out
+
+    def _lmdb_write_map_size_for_patch(self, env_path: str, config: Dict[str, Any]) -> int:
+        raw_size = (
+            (config or {}).get("profile_patch_lmdb_map_size")
+            or (config or {}).get("lmdb_map_size")
+            or (config or {}).get("map_size")
+            or os.getenv("PROFILE_PATCH_LMDB_MAP_SIZE")
+            or os.getenv("PROFILE_LMDB_MAP_SIZE")
+            or ""
+        )
+        configured_size = 0
+        try:
+            configured_size = int(raw_size or 0)
+        except Exception:
+            configured_size = 0
+
+        data_path = os.path.join(str(env_path or ""), "data.mdb")
+        current_size = 0
+        try:
+            if os.path.isfile(data_path):
+                current_size = int(os.path.getsize(data_path) or 0)
+        except Exception:
+            current_size = 0
+
+        default_size = 4 * 1024 * 1024 * 1024
+        min_growth_size = current_size * 4 if current_size > 0 else 0
+        return max(configured_size, min_growth_size, default_size)
+
+    def _profile_query_extract_first_row_value(
+        self,
+        row_obj: Dict[str, Any],
+        paths: List[str],
+    ) -> Tuple[Any, bool]:
+        if not isinstance(row_obj, dict):
+            return None, False
+        for raw_path in paths or []:
+            path = str(raw_path or "").strip()
+            if not path:
+                continue
+            value, found = self._extract_row_value_by_path(row_obj, path)
+            if not found and path in row_obj:
+                value = row_obj.get(path)
+                found = True
+            if found and value is not None and str(value).strip() != "":
+                return value, True
+        return None, False
+
+    def _profile_query_json_dict_from_row_value(self, value: Any) -> Tuple[Dict[str, Any], bool]:
+        if isinstance(value, dict):
+            return self._json_safe_value(value), True
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("{") and text.endswith("}"):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        return self._json_safe_value(parsed), True
+                except Exception:
+                    pass
+        return {}, False
+
+    def _profile_query_oracle_source_doc_from_row(
+        self,
+        row_obj: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], bool]:
+        if not isinstance(row_obj, dict):
+            return {}, {}, False
+
+        doc_value, doc_found = self._profile_query_extract_first_row_value(
+            row_obj,
+            [
+                "DOCUMENT_JSON",
+                "document_json",
+                "documentJson",
+            ],
+        )
+        doc, parsed_doc = self._profile_query_json_dict_from_row_value(doc_value) if doc_found else ({}, False)
+
+        meta_value, meta_found = self._profile_query_extract_first_row_value(
+            row_obj,
+            [
+                "META_JSON",
+                "meta_json",
+                "metaJson",
+            ],
+        )
+        meta, parsed_meta = self._profile_query_json_dict_from_row_value(meta_value) if meta_found else ({}, False)
+        return doc, meta if parsed_meta else {}, parsed_doc
+
+    def _profile_query_extract_row_or_document_path(
+        self,
+        row_obj: Dict[str, Any],
+        path: str,
+    ) -> Tuple[Any, bool]:
+        if not isinstance(row_obj, dict):
+            return None, False
+        path_text = str(path or "").strip()
+        if not path_text:
+            return None, False
+
+        value, found = self._extract_row_value_by_path(row_obj, path_text)
+        if not found and path_text in row_obj:
+            value = row_obj.get(path_text)
+            found = True
+        if found:
+            return value, True
+
+        doc_value, doc_found = self._profile_query_extract_first_row_value(
+            row_obj,
+            [
+                "DOCUMENT_JSON",
+                "document_json",
+                "documentJson",
+            ],
+        )
+        doc, parsed_doc = self._profile_query_json_dict_from_row_value(doc_value) if doc_found else ({}, False)
+        if not parsed_doc:
+            return None, False
+        if path_text.lower().startswith("document_json."):
+            path_text = path_text[len("DOCUMENT_JSON."):]
+        value, found = self._extract_row_value_by_path(doc, path_text)
+        if not found and path_text in doc:
+            value = doc.get(path_text)
+            found = True
+        return value, found
+
+    def _profile_query_set_where_row_matches(
+        self,
+        row_obj: Dict[str, Any],
+        op_cfg: Dict[str, Any],
+    ) -> Optional[bool]:
+        if not isinstance(row_obj, dict) or not isinstance(op_cfg, dict):
+            return None
+        if str(op_cfg.get("op") or "").strip().lower() != "set_where":
+            return None
+        where_field = str(op_cfg.get("where_field") or "").strip()
+        if not where_field:
+            return None
+        where_value_mode = str(op_cfg.get("where_value_mode") or "row").strip().lower()
+        if where_value_mode != "fixed":
+            return None
+        where_value = self._profile_query_coerce_patch_value_literal(op_cfg.get("where_value"))
+        left_value, left_found = self._profile_query_extract_row_or_document_path(row_obj, where_field)
+        if not left_found:
+            return None
+        return bool(self._flow_condition_eval_operator(left_value, "equals", where_value, False))
+
+    def _profile_query_patch_ops_can_apply_to_row(
+        self,
+        row_obj: Dict[str, Any],
+        patch_ops: List[Dict[str, Any]],
+    ) -> bool:
+        saw_conclusive_where = False
+        for op_cfg in patch_ops or []:
+            if not isinstance(op_cfg, dict):
+                continue
+            if str(op_cfg.get("op") or "set").strip().lower() != "set_where":
+                return True
+            where_match = self._profile_query_set_where_row_matches(row_obj, op_cfg)
+            if where_match is None:
+                return True
+            saw_conclusive_where = True
+            if where_match:
+                return True
+        return not saw_conclusive_where
+
+    def _profile_query_oracle_partial_update_enabled(self, config: Dict[str, Any]) -> bool:
+        raw_value = (
+            (config or {}).get("profile_patch_oracle_partial_update_enabled")
+            if isinstance(config, dict)
+            else None
+        )
+        if raw_value is None and isinstance(config, dict):
+            raw_value = (config or {}).get("profile_patch_oracle_partial_update")
+        if raw_value is None:
+            raw_value = os.getenv("PROFILE_PATCH_ORACLE_PARTIAL_UPDATE_ENABLED", "true")
+        return self._parse_bool_like(raw_value, True)
+
+    def _profile_query_oracle_full_document_fallback_enabled(self, config: Dict[str, Any]) -> bool:
+        raw_value = None
+        if isinstance(config, dict):
+            raw_value = config.get("profile_patch_oracle_full_document_fallback")
+            if raw_value is None:
+                raw_value = config.get("profile_patch_oracle_fallback")
+        if raw_value is None:
+            raw_value = os.getenv("PROFILE_PATCH_ORACLE_FULL_DOCUMENT_FALLBACK", "true")
+        return self._parse_bool_like(raw_value, True)
+
+    def _profile_query_oracle_json_transform_path(self, raw_path: Any) -> str:
+        path_text = self._normalize_json_path_expr(str(raw_path or "").strip())
+        if path_text.lower().startswith("document_json."):
+            path_text = path_text[len("DOCUMENT_JSON."):]
+        tokens = self._split_profile_path(path_text)
+        if not tokens:
+            return ""
+        path_parts: List[str] = []
+        for token in tokens:
+            if not isinstance(token, str):
+                return ""
+            part = str(token or "").strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part):
+                return ""
+            path_parts.append(part)
+        return "$." + ".".join(path_parts) if path_parts else ""
+
+    def _profile_query_oracle_partial_bind_scalar(
+        self,
+        raw_value: Any,
+        *,
+        numeric: bool = False,
+    ) -> Tuple[Any, bool]:
+        value = self._json_safe_value(raw_value)
+        if numeric:
+            number_value = self._profile_query_coerce_numeric_value(value)
+            if number_value is None:
+                return None, False
+            return int(number_value) if float(number_value).is_integer() else float(number_value), True
+        if value is None or isinstance(value, bool):
+            return None, False
+        if isinstance(value, int):
+            return int(value), True
+        if isinstance(value, float):
+            if math.isnan(value) or math.isinf(value):
+                return None, False
+            return float(value), True
+        if isinstance(value, str):
+            return value, True
+        return None, False
+
+    def _profile_query_oracle_partial_where_bind(
+        self,
+        raw_value: Any,
+    ) -> Tuple[str, bool]:
+        value = self._json_safe_value(raw_value)
+        if value is None or isinstance(value, (dict, list, tuple, set)):
+            return "", False
+        if isinstance(value, bool):
+            return "true" if value else "false", True
+        if isinstance(value, float):
+            if math.isnan(value) or math.isinf(value):
+                return "", False
+        return str(value), True
+
+    def _profile_query_oracle_partial_update_sql(
+        self,
+        table_sql: str,
+        patch_ops: List[Dict[str, Any]],
+        has_hash_columns: bool,
+        require_pipeline_id: bool = True,
+    ) -> Tuple[str, List[Dict[str, Any]], str]:
+        if not patch_ops:
+            return "", [], "patch operations are empty"
+
+        op_specs: List[Dict[str, Any]] = []
+        transform_ops: List[str] = []
+        where_clauses: List[str] = []
+        set_where_count = 0
+        seen_targets: set = set()
+
+        for idx, raw_op in enumerate(patch_ops or []):
+            if not isinstance(raw_op, dict):
+                return "", [], "patch operation is not an object"
+            op_cfg = dict(raw_op)
+            op_type = str(op_cfg.get("op") or "set").strip().lower()
+            if op_type not in {"set", "unset", "inc", "set_where"}:
+                return "", [], f"operation {op_type or 'unknown'} requires full-document fallback"
+
+            target_json_path = self._profile_query_oracle_json_transform_path(op_cfg.get("target_path"))
+            if not target_json_path:
+                return "", [], "target path is not a simple Oracle JSON object path"
+            if target_json_path in seen_targets:
+                return "", [], "multiple patch operations target the same JSON path"
+            seen_targets.add(target_json_path)
+
+            bind_name = f"patch_value_{idx}"
+            spec: Dict[str, Any] = {
+                "op": op_type,
+                "target_json_path": target_json_path,
+                "bind_name": bind_name,
+                "op_cfg": op_cfg,
+            }
+            if op_type == "set":
+                transform_ops.append(f"SET '{target_json_path}' = :{bind_name}")
+            elif op_type == "unset":
+                transform_ops.append(f"REMOVE '{target_json_path}'")
+            elif op_type == "inc":
+                transform_ops.append(
+                    f"SET '{target_json_path}' = "
+                    f"COALESCE(JSON_VALUE(DOCUMENT_JSON, '{target_json_path}' RETURNING NUMBER NULL ON ERROR), 0) "
+                    f"+ :{bind_name}"
+                )
+            elif op_type == "set_where":
+                set_where_count += 1
+                if len(patch_ops) != 1:
+                    return "", [], "set_where partial update cannot be mixed with other operations"
+                where_json_path = self._profile_query_oracle_json_transform_path(op_cfg.get("where_field"))
+                if not where_json_path:
+                    return "", [], "set_where field is not a simple Oracle JSON object path"
+                where_bind_name = f"where_value_{idx}"
+                spec["where_json_path"] = where_json_path
+                spec["where_bind_name"] = where_bind_name
+                transform_ops.append(f"SET '{target_json_path}' = :{bind_name}")
+                where_clauses.append(
+                    f"JSON_VALUE(DOCUMENT_JSON, '{where_json_path}' RETURNING VARCHAR2(4000) NULL ON ERROR) "
+                    f"= :{where_bind_name}"
+                )
+            op_specs.append(spec)
+
+        if set_where_count > 1:
+            return "", [], "only one set_where operation can use Oracle partial update"
+
+        set_fragments = [
+            "DOCUMENT_JSON = JSON_TRANSFORM("
+            "NVL(DOCUMENT_JSON, TO_CLOB('{}')), "
+            f"{', '.join(transform_ops)} RETURNING CLOB"
+            ")",
+            "UPDATED_AT = SYSTIMESTAMP",
+        ]
+        if has_hash_columns:
+            set_fragments.append("DOC_SHA1 = NULL")
+
+        key_clauses = []
+        if require_pipeline_id:
+            key_clauses.append("PIPELINE_ID = :pipeline_id")
+        key_clauses.extend(
+            [
+                "NODE_ID = :node_id",
+                "ENTITY_TOKEN = :entity_token",
+            ]
+        )
+        sql = f"UPDATE {table_sql} SET " + ", ".join(set_fragments) + " WHERE " + " AND ".join(key_clauses)
+        if where_clauses:
+            sql += " AND " + " AND ".join(where_clauses)
+        return sql, op_specs, ""
+
+    def _profile_query_oracle_partial_update_binds(
+        self,
+        rows: List[Any],
+        patch_ops: List[Dict[str, Any]],
+        op_specs: List[Dict[str, Any]],
+        primary_key_field: str,
+        default_pipeline_id: str,
+        default_node_id: str,
+        use_row_pipeline_id: bool = False,
+        use_row_node_id: bool = False,
+    ) -> Tuple[List[Dict[str, Any]], int, int, str]:
+        binds: List[Dict[str, Any]] = []
+        skipped_missing_key = 0
+        skipped_invalid_patch = 0
+
+        for raw_row in rows or []:
+            row_obj = raw_row if isinstance(raw_row, dict) else {"value": raw_row}
+            token_value, token_found = self._profile_query_extract_first_row_value(
+                row_obj,
+                [
+                    primary_key_field,
+                    "ENTITY_TOKEN",
+                    "entity_token",
+                    "entityToken",
+                ],
+            )
+            token = str(token_value).strip() if token_found and token_value is not None else ""
+            row_pipeline_value, row_pipeline_found = self._profile_query_extract_first_row_value(
+                row_obj,
+                [
+                    "PIPELINE_ID",
+                    "pipeline_id",
+                    "pipelineId",
+                ],
+            )
+            row_node_value, row_node_found = self._profile_query_extract_first_row_value(
+                row_obj,
+                [
+                    "NODE_ID",
+                    "node_id",
+                    "nodeId",
+                ],
+            )
+            row_pipeline_id = (
+                str(row_pipeline_value).strip()
+                if use_row_pipeline_id and row_pipeline_found and row_pipeline_value is not None
+                else str(default_pipeline_id or "").strip()
+            )
+            row_node_id = (
+                str(row_node_value).strip()
+                if use_row_node_id and row_node_found and row_node_value is not None
+                else str(default_node_id or "").strip()
+            )
+            if not token or not row_pipeline_id or not row_node_id:
+                skipped_missing_key += 1
+                continue
+
+            bind_row: Dict[str, Any] = {
+                "pipeline_id": row_pipeline_id,
+                "node_id": row_node_id,
+                "entity_token": token,
+            }
+            row_supported = True
+            row_invalid = False
+            for spec in op_specs:
+                op_cfg = spec.get("op_cfg") if isinstance(spec.get("op_cfg"), dict) else {}
+                op_type = str(spec.get("op") or "").strip().lower()
+                if op_type == "unset":
+                    continue
+                patch_value, patch_found = self._profile_query_pick_patch_value(
+                    row_obj=row_obj,
+                    patch_source_path=str(op_cfg.get("source_path") or "").strip(),
+                    patch_target_path=str(op_cfg.get("target_path") or "").strip(),
+                    patch_value_mode=str(op_cfg.get("value_mode") or "row").strip().lower(),
+                    patch_value_literal=op_cfg.get("value"),
+                )
+                if not patch_found:
+                    row_invalid = True
+                    break
+                bind_value, scalar_supported = self._profile_query_oracle_partial_bind_scalar(
+                    patch_value,
+                    numeric=op_type == "inc",
+                )
+                if not scalar_supported:
+                    row_supported = False
+                    break
+                bind_row[str(spec.get("bind_name"))] = bind_value
+
+                if op_type == "set_where":
+                    where_value_mode = str(op_cfg.get("where_value_mode") or "row").strip().lower()
+                    if where_value_mode == "fixed":
+                        where_value = self._profile_query_coerce_patch_value_literal(op_cfg.get("where_value"))
+                        where_found = True
+                    else:
+                        where_row_path = str(
+                            op_cfg.get("where_source_path")
+                            or op_cfg.get("where_field")
+                            or ""
+                        ).strip()
+                        where_value, where_found = self._extract_row_value_by_path(row_obj, where_row_path)
+                        if not where_found and where_row_path in row_obj:
+                            where_value = row_obj.get(where_row_path)
+                            where_found = True
+                    if not where_found:
+                        row_invalid = True
+                        break
+                    where_bind_value, where_supported = self._profile_query_oracle_partial_where_bind(where_value)
+                    if not where_supported:
+                        row_supported = False
+                        break
+                    bind_row[str(spec.get("where_bind_name"))] = where_bind_value
+
+            if not row_supported:
+                return [], skipped_missing_key, skipped_invalid_patch, "patch value is not a scalar supported by Oracle partial update"
+            if row_invalid:
+                skipped_invalid_patch += 1
+                continue
+            binds.append(bind_row)
+
+        return binds, skipped_missing_key, skipped_invalid_patch, ""
+
+    def _apply_profile_query_patch_updates_oracle_source_partial(
+        self,
+        rows: List[Any],
+        patch_ops: List[Dict[str, Any]],
+        config: Dict[str, Any],
+        profile_cfg: Dict[str, Any],
+        primary_key_field: str,
+        default_pipeline_id: str,
+        default_node_id: str,
+        use_row_pipeline_id: bool = False,
+        use_row_node_id: bool = False,
+        allow_any_pipeline_id: bool = False,
+        warn_cb: Optional[Any] = None,
+    ) -> Tuple[int, int, int, str, str]:
+        if not self._profile_query_oracle_partial_update_enabled(config):
+            return 0, 0, 0, "unsupported", "Oracle partial update is disabled"
+
+        session: Optional[Dict[str, Any]] = None
+        cursor = None
+        try:
+            session = self._open_oracle_profile_session(profile_cfg, require_write_schema=True)
+            conn = session.get("conn")
+            table_sql = str(session.get("table_sql") or "ETL_PROFILE_STATE")
+            column_specs = session.get("column_specs") if isinstance(session.get("column_specs"), dict) else {}
+            has_hash_columns = self._oracle_profile_hash_columns_available(column_specs)
+            update_sql, op_specs, unsupported_reason = self._profile_query_oracle_partial_update_sql(
+                table_sql,
+                patch_ops,
+                has_hash_columns,
+            )
+            if unsupported_reason:
+                return 0, 0, 0, "unsupported", unsupported_reason
+
+            binds, skipped_missing_key, skipped_invalid_patch, bind_reason = (
+                self._profile_query_oracle_partial_update_binds(
+                    rows,
+                    patch_ops,
+                    op_specs,
+                    primary_key_field,
+                    default_pipeline_id,
+                    default_node_id,
+                    use_row_pipeline_id=use_row_pipeline_id,
+                    use_row_node_id=use_row_node_id,
+                )
+            )
+            if bind_reason:
+                return 0, skipped_missing_key, skipped_invalid_patch, "unsupported", bind_reason
+            if not binds:
+                return 0, skipped_missing_key, skipped_invalid_patch, "applied", ""
+
+            cursor = conn.cursor()
+            cursor.executemany(update_sql, binds)
+            updated_count = int(cursor.rowcount or 0)
+            if updated_count <= 0 and allow_any_pipeline_id:
+                update_sql_any_pipeline, _, any_pipeline_reason = self._profile_query_oracle_partial_update_sql(
+                    table_sql,
+                    patch_ops,
+                    has_hash_columns,
+                    require_pipeline_id=False,
+                )
+                if update_sql_any_pipeline and not any_pipeline_reason:
+                    any_pipeline_binds = [
+                        {key: value for key, value in bind_row.items() if key != "pipeline_id"}
+                        for bind_row in binds
+                    ]
+                    cursor.executemany(update_sql_any_pipeline, any_pipeline_binds)
+                    updated_count = int(cursor.rowcount or 0)
+            if updated_count <= 0 and callable(warn_cb):
+                warn_cb(
+                    "Profile Query Oracle partial update matched zero rows: "
+                    f"bind_rows={len(binds)}, target_node_id={default_node_id or 'missing'}, "
+                    f"target_pipeline_id={default_pipeline_id or 'missing'}, "
+                    f"use_row_pipeline_id={str(bool(use_row_pipeline_id)).lower()}, "
+                    f"use_row_node_id={str(bool(use_row_node_id)).lower()}, "
+                    f"allow_any_pipeline_id={str(bool(allow_any_pipeline_id)).lower()}."
+                )
+            self._close_oracle_profile_session(session, commit=True)
+            session = None
+            return updated_count, skipped_missing_key, skipped_invalid_patch, "applied", ""
+        except Exception as exc:
+            try:
+                if session is not None:
+                    self._close_oracle_profile_session(session, commit=False, rollback_on_error=True)
+                    session = None
+            except Exception:
+                pass
+            if callable(warn_cb):
+                warn_cb(f"Profile Query Oracle partial update failed: {exc}")
+            return 0, 0, 0, "failed", str(exc)
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if session is not None:
+                try:
+                    self._close_oracle_profile_session(session, commit=False)
+                except Exception:
+                    pass
+
     def _apply_profile_query_patch_updates_lmdb_source(
         self,
         rows: List[Any],
@@ -11234,11 +11913,16 @@ END;"""
         skipped_invalid_patch = 0
         env = None
         try:
+            map_size = self._lmdb_write_map_size_for_patch(
+                env_path,
+                {**dict(lmdb_source_config or {}), **dict(config or {})},
+            )
             env = lmdb.open(
                 env_path,
                 readonly=False,
                 lock=True,
                 readahead=False,
+                map_size=map_size,
                 max_dbs=max_dbs,
                 subdir=True,
             )
@@ -11301,6 +11985,224 @@ END;"""
                 except Exception:
                     pass
         return updated_rows, skipped_missing_key, skipped_invalid_patch
+
+    def _apply_profile_query_patch_updates_oracle_source(
+        self,
+        rows: List[Any],
+        config: Dict[str, Any],
+        oracle_source_config: Dict[str, Any],
+        pipeline_id: str = "",
+        target_node_id: str = "",
+        warn_cb: Optional[Any] = None,
+    ) -> Tuple[int, int, int]:
+        if not isinstance(rows, list) or not rows:
+            return 0, 0, 0
+
+        patch_ops = self._profile_query_patch_ops_for_stored_profile_document(
+            self._normalize_profile_query_patch_operations(config),
+            strip_document_json=True,
+        )
+        if not patch_ops:
+            if callable(warn_cb):
+                warn_cb("Profile Query Oracle patch skipped: patch operations are empty.")
+            return 0, 0, 0
+
+        primary_key_field = str(config.get("profile_patch_primary_key_field") or "").strip()
+        if not primary_key_field:
+            primary_key_field = "ENTITY_TOKEN"
+
+        profile_cfg = self._profile_query_oracle_profile_cfg_from_source_config(oracle_source_config)
+        query_node_id = self._profile_query_extract_oracle_source_profile_node_id(oracle_source_config)
+        query_pipeline_id = self._profile_query_extract_oracle_source_profile_pipeline_id(oracle_source_config)
+        default_node_id = str(query_node_id or target_node_id or "").strip()
+        default_pipeline_id = str(query_pipeline_id or pipeline_id or "").strip()
+        fallback_enabled = self._profile_query_oracle_full_document_fallback_enabled(config)
+        default_use_row_pipeline_id = (
+            not bool(query_pipeline_id)
+            and self._profile_query_rows_have_first_value(
+                rows,
+                [
+                    "PIPELINE_ID",
+                    "pipeline_id",
+                    "pipelineId",
+                ],
+            )
+        )
+        default_use_row_node_id = (
+            not bool(query_node_id)
+            and self._profile_query_rows_have_first_value(
+                rows,
+                [
+                    "NODE_ID",
+                    "node_id",
+                    "nodeId",
+                ],
+            )
+        )
+        use_row_pipeline_id = self._parse_bool_like(
+            config.get("profile_patch_use_row_pipeline_id"),
+            default_use_row_pipeline_id,
+        )
+        use_row_node_id = self._parse_bool_like(
+            config.get("profile_patch_use_row_node_id"),
+            default_use_row_node_id,
+        )
+        allow_any_pipeline_id = self._parse_bool_like(
+            config.get("profile_patch_oracle_allow_any_pipeline_id"),
+            bool(query_node_id) and not bool(query_pipeline_id) and not bool(use_row_pipeline_id),
+        )
+
+        partial_updated_count, partial_missing_key, partial_invalid_patch, partial_status, partial_reason = (
+            self._apply_profile_query_patch_updates_oracle_source_partial(
+                rows,
+                patch_ops,
+                config,
+                profile_cfg,
+                primary_key_field,
+                default_pipeline_id,
+                default_node_id,
+                use_row_pipeline_id=use_row_pipeline_id,
+                use_row_node_id=use_row_node_id,
+                allow_any_pipeline_id=allow_any_pipeline_id,
+                warn_cb=warn_cb,
+            )
+        )
+        if partial_status == "applied":
+            return partial_updated_count, partial_missing_key, partial_invalid_patch
+        if not fallback_enabled:
+            if callable(warn_cb):
+                warn_cb(
+                    "Profile Query Oracle full-document fallback disabled; "
+                    f"partial update not used ({partial_reason or partial_status})."
+                )
+            return partial_updated_count, partial_missing_key, partial_invalid_patch
+        if callable(warn_cb) and partial_reason:
+            warn_cb(
+                "Profile Query Oracle partial update unavailable; "
+                f"falling back to full-document patch ({partial_reason})."
+            )
+
+        docs_by_group: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+        meta_by_group: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+        changed_by_group: Dict[Tuple[str, str], List[str]] = {}
+        skipped_missing_key = 0
+        skipped_invalid_patch = 0
+
+        for raw_row in rows:
+            row_obj = raw_row if isinstance(raw_row, dict) else {"value": raw_row}
+            if not self._profile_query_patch_ops_can_apply_to_row(row_obj, patch_ops):
+                continue
+
+            token_value, token_found = self._profile_query_extract_first_row_value(
+                row_obj,
+                [
+                    primary_key_field,
+                    "ENTITY_TOKEN",
+                    "entity_token",
+                    "entityToken",
+                ],
+            )
+            token = str(token_value).strip() if token_found and token_value is not None else ""
+            row_pipeline_value, row_pipeline_found = self._profile_query_extract_first_row_value(
+                row_obj,
+                [
+                    "PIPELINE_ID",
+                    "pipeline_id",
+                    "pipelineId",
+                ],
+            )
+            row_node_value, row_node_found = self._profile_query_extract_first_row_value(
+                row_obj,
+                [
+                    "NODE_ID",
+                    "node_id",
+                    "nodeId",
+                ],
+            )
+            row_pipeline_id = (
+                str(row_pipeline_value).strip()
+                if use_row_pipeline_id and row_pipeline_found and row_pipeline_value is not None
+                else default_pipeline_id
+            )
+            row_node_id = (
+                str(row_node_value).strip()
+                if use_row_node_id and row_node_found and row_node_value is not None
+                else default_node_id
+            )
+
+            if not token or not row_pipeline_id or not row_node_id:
+                skipped_missing_key += 1
+                continue
+
+            group_key = (row_pipeline_id, row_node_id)
+            docs_store = docs_by_group.setdefault(group_key, {})
+            meta_store = meta_by_group.setdefault(group_key, {})
+            changed_tokens = changed_by_group.setdefault(group_key, [])
+
+            if token in docs_store:
+                base_doc = docs_store.get(token) if isinstance(docs_store.get(token), dict) else {}
+                base_meta = meta_store.get(token) if isinstance(meta_store.get(token), dict) else {}
+            else:
+                row_doc, row_meta, row_doc_found = self._profile_query_oracle_source_doc_from_row(row_obj)
+                if row_doc_found:
+                    base_doc = row_doc
+                    base_meta = row_meta
+                else:
+                    base_doc_loaded, base_meta_loaded = self._load_profile_state_single_entity(
+                        row_pipeline_id,
+                        row_node_id,
+                        token,
+                        storage="oracle",
+                        profile_cfg=profile_cfg,
+                    )
+                    base_doc = base_doc_loaded if isinstance(base_doc_loaded, dict) else {}
+                    base_meta = base_meta_loaded if isinstance(base_meta_loaded, dict) else {}
+
+            next_doc, applied_ops, invalid_ops = self._profile_query_apply_patch_operations_to_doc(
+                base_doc,
+                row_obj,
+                patch_ops,
+            )
+            if applied_ops <= 0:
+                skipped_invalid_patch += 1
+                continue
+            if invalid_ops > 0:
+                skipped_invalid_patch += invalid_ops
+
+            docs_store[token] = next_doc if isinstance(next_doc, dict) else {}
+            meta_store[token] = base_meta if isinstance(base_meta, dict) else {}
+            if token not in changed_tokens:
+                changed_tokens.append(token)
+
+        updated_count = 0
+        for (group_pipeline_id, group_node_id), changed_tokens in changed_by_group.items():
+            if not changed_tokens:
+                continue
+            node_state = {
+                "documents": docs_by_group.get((group_pipeline_id, group_node_id), {}),
+                "meta": meta_by_group.get((group_pipeline_id, group_node_id), {}),
+                "stats": {
+                    "profile_query_patch_updated_at": datetime.utcnow().isoformat(),
+                    "profile_query_patch_updated_count": len(changed_tokens),
+                },
+            }
+            persisted = self._save_profile_state_single_node_by_storage(
+                group_pipeline_id,
+                group_node_id,
+                node_state,
+                changed_tokens=changed_tokens,
+                storage="oracle",
+                profile_cfg=profile_cfg,
+            )
+            if persisted:
+                updated_count += len(changed_tokens)
+            elif callable(warn_cb):
+                warn_cb(
+                    "Profile Query Oracle patch failed to persist updates "
+                    f"(pipeline={group_pipeline_id}, node={group_node_id}, updated={len(changed_tokens)})."
+                )
+
+        return updated_count, skipped_missing_key, skipped_invalid_patch
 
     def _apply_profile_query_patch_updates(
         self,
@@ -11390,13 +12292,54 @@ END;"""
                 )
             return
 
+        if target_node_type == "oracle_source" and storage == "oracle":
+            updated_count, skipped_missing_key, skipped_invalid_patch = self._apply_profile_query_patch_updates_oracle_source(
+                source_rows,
+                safe_cfg,
+                target_node_config,
+                pipeline_id=pipeline_id,
+                target_node_id=target_node_id,
+                warn_cb=warn_cb,
+            )
+            if (
+                updated_count <= 0
+                and patch_stage == "post"
+                and isinstance(pre_rows, list)
+                and len(pre_rows) > 0
+                and pre_rows is not source_rows
+            ):
+                updated_count, skipped_missing_key, skipped_invalid_patch = self._apply_profile_query_patch_updates_oracle_source(
+                    pre_rows,
+                    safe_cfg,
+                    target_node_config,
+                    pipeline_id=pipeline_id,
+                    target_node_id=target_node_id,
+                    warn_cb=warn_cb,
+                )
+            if updated_count <= 0:
+                if callable(warn_cb):
+                    warn_cb(
+                        "Profile Query Oracle patch skipped: "
+                        f"updated=0, missing_key={skipped_missing_key}, invalid_patch={skipped_invalid_patch}."
+                    )
+                return
+            if callable(warn_cb) and (skipped_missing_key > 0 or skipped_invalid_patch > 0):
+                warn_cb(
+                    "Profile Query Oracle patch completed with skips: "
+                    f"updated={updated_count}, missing_key={skipped_missing_key}, invalid_patch={skipped_invalid_patch}."
+                )
+            return
+
         primary_key_field = str(safe_cfg.get("profile_patch_primary_key_field") or "").strip()
         if not primary_key_field:
             if callable(warn_cb):
                 warn_cb("Profile Query patch skipped: primary key field is empty.")
             return
 
-        patch_ops = self._normalize_profile_query_patch_operations(safe_cfg)
+        patch_ops = self._profile_query_patch_ops_for_stored_profile_document(
+            self._normalize_profile_query_patch_operations(safe_cfg),
+            strip_document_json=storage == "oracle",
+        )
         if not patch_ops:
             if callable(warn_cb):
                 warn_cb("Profile Query patch skipped: patch operations are empty.")
@@ -11421,58 +12364,85 @@ END;"""
                 "custom_profile_oracle_parallel_force": node_config.get("custom_profile_oracle_parallel_force"),
             }
 
-        docs_store: Dict[str, Dict[str, Any]] = {}
-        meta_store: Dict[str, Dict[str, Any]] = {}
-        changed_tokens: List[str] = []
-        skipped_missing_key = 0
-        skipped_invalid_patch = 0
+        def _collect_patch_changes(
+            rows_to_patch: List[Any],
+        ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], List[str], int, int]:
+            docs_store_local: Dict[str, Dict[str, Any]] = {}
+            meta_store_local: Dict[str, Dict[str, Any]] = {}
+            changed_tokens_local: List[str] = []
+            skipped_missing_key_local = 0
+            skipped_invalid_patch_local = 0
 
-        for idx, row in enumerate(source_rows):
-            if idx == 0 or idx % 500 == 0:
-                # no-op cancel check guard by caller context; keep loop lightweight.
-                pass
-            row_obj = row if isinstance(row, dict) else {"value": row}
-            pk_value, pk_found = self._extract_row_value_by_path(row_obj, primary_key_field)
-            if not pk_found:
-                pk_value = row_obj.get(primary_key_field)
-            token = str(pk_value).strip() if pk_value is not None else ""
-            if not token:
-                skipped_missing_key += 1
-                continue
+            for idx, row in enumerate(rows_to_patch):
+                if idx == 0 or idx % 500 == 0:
+                    # no-op cancel check guard by caller context; keep loop lightweight.
+                    pass
+                row_obj = row if isinstance(row, dict) else {"value": row}
+                pk_value, pk_found = self._extract_row_value_by_path(row_obj, primary_key_field)
+                if not pk_found:
+                    pk_value = row_obj.get(primary_key_field)
+                token = str(pk_value).strip() if pk_value is not None else ""
+                if not token:
+                    skipped_missing_key_local += 1
+                    continue
 
-            if token in docs_store:
-                base_doc = docs_store.get(token) if isinstance(docs_store.get(token), dict) else {}
-                base_meta = meta_store.get(token) if isinstance(meta_store.get(token), dict) else {}
-            else:
-                base_doc_loaded, base_meta_loaded = self._load_profile_state_single_entity(
-                    pipeline_id,
-                    target_node_id,
-                    token,
-                    storage=storage,
-                    profile_cfg=profile_cfg,
+                if token in docs_store_local:
+                    base_doc = docs_store_local.get(token) if isinstance(docs_store_local.get(token), dict) else {}
+                    base_meta = meta_store_local.get(token) if isinstance(meta_store_local.get(token), dict) else {}
+                else:
+                    base_doc_loaded, base_meta_loaded = self._load_profile_state_single_entity(
+                        pipeline_id,
+                        target_node_id,
+                        token,
+                        storage=storage,
+                        profile_cfg=profile_cfg,
+                    )
+                    base_doc = base_doc_loaded if isinstance(base_doc_loaded, dict) else {}
+                    base_meta = base_meta_loaded if isinstance(base_meta_loaded, dict) else {}
+
+                next_doc, applied_ops, invalid_ops = self._profile_query_apply_patch_operations_to_doc(
+                    base_doc,
+                    row_obj,
+                    patch_ops,
                 )
-                base_doc = base_doc_loaded if isinstance(base_doc_loaded, dict) else {}
-                base_meta = base_meta_loaded if isinstance(base_meta_loaded, dict) else {}
+                if applied_ops <= 0:
+                    skipped_invalid_patch_local += 1
+                    continue
+                if invalid_ops > 0:
+                    skipped_invalid_patch_local += invalid_ops
 
-            next_doc, applied_ops, invalid_ops = self._profile_query_apply_patch_operations_to_doc(
-                base_doc,
-                row_obj,
-                patch_ops,
+                current_pk, current_pk_found = self._extract_row_value_by_path(next_doc, primary_key_field)
+                if (not current_pk_found) or current_pk is None or str(current_pk).strip() == "":
+                    self._set_profile_path_value(next_doc, primary_key_field, self._json_safe_value(pk_value))
+
+                docs_store_local[token] = next_doc if isinstance(next_doc, dict) else {}
+                meta_store_local[token] = base_meta if isinstance(base_meta, dict) else {}
+                if token not in changed_tokens_local:
+                    changed_tokens_local.append(token)
+
+            return (
+                docs_store_local,
+                meta_store_local,
+                changed_tokens_local,
+                skipped_missing_key_local,
+                skipped_invalid_patch_local,
             )
-            if applied_ops <= 0:
-                skipped_invalid_patch += 1
-                continue
-            if invalid_ops > 0:
-                skipped_invalid_patch += invalid_ops
 
-            current_pk, current_pk_found = self._extract_row_value_by_path(next_doc, primary_key_field)
-            if (not current_pk_found) or current_pk is None or str(current_pk).strip() == "":
-                self._set_profile_path_value(next_doc, primary_key_field, self._json_safe_value(pk_value))
-
-            docs_store[token] = next_doc if isinstance(next_doc, dict) else {}
-            meta_store[token] = base_meta if isinstance(base_meta, dict) else {}
-            if token not in changed_tokens:
-                changed_tokens.append(token)
+        docs_store, meta_store, changed_tokens, skipped_missing_key, skipped_invalid_patch = _collect_patch_changes(source_rows)
+        if (
+            not changed_tokens
+            and patch_stage == "post"
+            and isinstance(pre_rows, list)
+            and len(pre_rows) > 0
+            and pre_rows is not source_rows
+        ):
+            (
+                docs_store,
+                meta_store,
+                changed_tokens,
+                skipped_missing_key,
+                skipped_invalid_patch,
+            ) = _collect_patch_changes(pre_rows)
 
         if not changed_tokens:
             if skipped_missing_key > 0 and callable(warn_cb):
