@@ -103,9 +103,9 @@ export default function BusinessWorkflowCanvas() {
         connectionLineStyle={{ stroke: '#f59e0b', strokeWidth: 2 }}
         snapToGrid
         snapGrid={[16, 16]}
-        style={{ background: '#0a0a10' }}
+        style={{ background: 'var(--app-panel-bg)' }}
       >
-        <Background variant={BackgroundVariant.Dots} gap={24} size={1} color="var(--app-border)" />
+        <Background variant={BackgroundVariant.Dots} gap={24} size={1} color="var(--app-canvas-dot)" />
         <Controls
           style={{ background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)', borderRadius: 8 }}
         />

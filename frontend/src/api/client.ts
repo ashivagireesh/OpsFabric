@@ -427,6 +427,8 @@ const api = {
     rows: Array<Record<string, unknown>>
     task_type: 'classification' | 'regression' | 'clustering' | 'forecasting' | 'anomaly_detection'
     model?: string
+    model_mode?: 'single' | 'ensemble_pipeline' | string
+    ensemble_models?: Array<Record<string, unknown>>
     feature_fields?: string[]
     target_field?: string
     target_fields?: string[]
@@ -448,6 +450,7 @@ const api = {
     tuning_params?: Array<{ name?: string; values?: string }>
     tracking_enabled?: boolean
     run_name?: string
+    explainability_method?: 'off' | 'auto' | 'shap' | 'shap_tree' | 'shap_linear' | string
   }) => {
     const r = await http.post('/api/mlops/node/stage3/train', payload, {
       timeout: 180000,

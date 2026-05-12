@@ -599,7 +599,7 @@ export default function WorkflowCanvas() {
           variant={BackgroundVariant.Dots}
           gap={isNinStyle ? 20 : 24}
           size={isNinStyle ? 1 : 1.2}
-          color={isNinStyle ? 'color-mix(in srgb, var(--app-canvas-dot) 88%, #ffffff 12%)' : 'var(--app-canvas-dot)'}
+          color="var(--app-canvas-dot)"
         />
         <Controls
           style={{ background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)', borderRadius: 8 }}

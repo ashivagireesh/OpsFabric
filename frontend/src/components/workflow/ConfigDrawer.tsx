@@ -74,6 +74,15 @@ const GATEWAY_TEST_HEADER_PRESETS = [
   { key: 'SOAPAction', label: 'SOAPAction', value: '' },
   { key: 'User-Agent', label: 'User-Agent', value: 'FRAMEWORK-Gateway-Tester' },
 ]
+const MLOPS_INFLUENCE_OUTPUT_KEY_OPTIONS = [
+  { value: 'feature', label: 'feature' },
+  { value: 'value', label: 'value' },
+  { value: 'impact_score', label: 'impact_score' },
+  { value: 'direction', label: 'direction' },
+  { value: 'percentage_of_final_score', label: 'percentage_of_final_score' },
+  { value: 'percentage_share_of_total_influence', label: 'percentage_share_of_total_influence' },
+]
+const MLOPS_DEFAULT_INFLUENCE_OUTPUT_KEYS = MLOPS_INFLUENCE_OUTPUT_KEY_OPTIONS.map((item) => item.value)
 
 function getFileType(nodeType: string): string {
   if (nodeType.includes('csv'))    return 'csv'
@@ -437,14 +446,67 @@ type MLOpsStage3RunSummary = {
   train_metrics?: Record<string, unknown>
   test_metrics?: Record<string, unknown>
   feature_importance?: Array<Record<string, unknown>>
+  top_influencing_features?: Array<Record<string, unknown>>
+  explainability?: Record<string, unknown>
   tuning_result?: Record<string, unknown>
   sample_predictions?: Array<Record<string, unknown>>
   run_name?: string | null
   runtime_model_bundle?: Record<string, unknown> | null
+  model_mode?: 'single' | 'ensemble_pipeline' | string
+  model_summaries?: Array<Record<string, unknown>>
 }
 type MLOpsStage3TaskType = 'classification' | 'regression' | 'clustering' | 'forecasting' | 'anomaly_detection'
+type MLOpsStage3ModelMode = 'single' | 'ensemble_pipeline'
 type MLOpsForecastFrequency = 'D' | 'W' | 'M'
 type MLOpsStage3TuningMethod = 'grid_search' | 'random_search' | 'bayesian_optimization'
+type MLOpsStage3ExplainabilityMethod = 'off' | 'auto' | 'shap' | 'shap_tree' | 'shap_linear' | 'shap_kernel'
+type MLOpsRuleCondition = {
+  id: string
+  field: string
+  operator: string
+  value: string
+}
+type MLOpsRuleAction = {
+  id: string
+  field: string
+  mode: 'literal' | 'field' | 'template'
+  value: string
+}
+type MLOpsRuleConfig = {
+  id: string
+  enabled: boolean
+  join: 'all' | 'any'
+  action?: 'apply' | 'drop'
+  conditions: MLOpsRuleCondition[]
+  actions: MLOpsRuleAction[]
+}
+type MLOpsEnsembleModelConfig = {
+  id: string
+  enabled: boolean
+  name: string
+  task_type: MLOpsStage3TaskType
+  model: string
+  feature_fields: string[]
+  target_field: string
+  forecast_date_field: string
+  forecast_horizon: number
+  forecast_frequency: MLOpsForecastFrequency
+  forecast_auto_tune_orders: boolean
+  forecast_order_search_max_evals: number
+  prediction_field: string
+  score_field: string
+  explainability_method: MLOpsStage3ExplainabilityMethod
+  influence_field: string
+  influence_limit: number
+  influence_keys: string[]
+  pre_rules: MLOpsRuleConfig[]
+  post_rules: MLOpsRuleConfig[]
+  recommendation: {
+    enabled: boolean
+    field: string
+    template: string
+  }
+}
 type MLOpsStage3TuningParameter = {
   id: string
   name: string
@@ -459,6 +521,8 @@ type MLOpsStage3VizType =
   | 'actual_vs_predicted_scatter'
   | 'actual_vs_predicted_line'
   | 'prediction_error_hist'
+  | 'anomaly_score_distribution'
+  | 'anomaly_score_scatter'
   | 'feature_importance'
 type MLOpsStage4Environment = 'dev' | 'staging' | 'prod'
 type MLOpsStage4Summary = {
@@ -539,15 +603,21 @@ const MLOPS_STAGE3_TASK_OPTIONS: Array<{ value: MLOpsStage3TaskType; label: stri
 const MLOPS_STAGE3_MODEL_CATALOG: Record<MLOpsStage3TaskType, string[]> = {
   classification: [
     'Logistic Regression',
+    'Decision Tree Classifier',
     'Random Forest Classifier',
     'XGBoost Classifier',
+    'LightGBM Classifier',
+    'CatBoost Classifier',
     'SVM',
     'Neural Networks',
   ],
   regression: [
     'Linear Regression',
+    'Decision Tree Regressor',
     'Random Forest Regressor',
     'XGBoost Regressor',
+    'LightGBM Regressor',
+    'CatBoost Regressor',
     'Ridge Regression',
     'Lasso Regression',
   ],
@@ -571,6 +641,14 @@ const MLOPS_STAGE3_TUNING_METHOD_OPTIONS: Array<{ value: MLOpsStage3TuningMethod
   { value: 'random_search', label: 'Random Search' },
   { value: 'bayesian_optimization', label: 'Bayesian Optimization' },
 ]
+const MLOPS_STAGE3_EXPLAINABILITY_METHOD_OPTIONS: Array<{ value: MLOpsStage3ExplainabilityMethod; label: string }> = [
+  { value: 'off', label: 'Off' },
+  { value: 'auto', label: 'Auto Explainability' },
+  { value: 'shap', label: 'SHAP Auto' },
+  { value: 'shap_tree', label: 'SHAP Tree' },
+  { value: 'shap_linear', label: 'SHAP Linear' },
+  { value: 'shap_kernel', label: 'SHAP Kernel' },
+]
 const MLOPS_STAGE3_VIZ_OPTIONS: Array<{ value: MLOpsStage3VizType; label: string }> = [
   { value: 'split_bar', label: 'Train vs Test Rows' },
   { value: 'metrics_bar', label: 'Train vs Test Metrics' },
@@ -580,8 +658,14 @@ const MLOPS_STAGE3_VIZ_OPTIONS: Array<{ value: MLOpsStage3VizType; label: string
   { value: 'actual_vs_predicted_scatter', label: 'Actual vs Predicted (Scatter)' },
   { value: 'actual_vs_predicted_line', label: 'Actual vs Predicted (Line)' },
   { value: 'prediction_error_hist', label: 'Prediction Error Histogram' },
+  { value: 'anomaly_score_distribution', label: 'Anomaly Score Distribution' },
+  { value: 'anomaly_score_scatter', label: 'Anomaly Score Scatter' },
   { value: 'feature_importance', label: 'Feature Importance' },
 ]
+const MLOPS_STAGE3_ANOMALY_ONLY_VIZ_TYPES = new Set<MLOpsStage3VizType>([
+  'anomaly_score_distribution',
+  'anomaly_score_scatter',
+])
 const MLOPS_STAGE3_CLUSTER_ONLY_VIZ_TYPES = new Set<MLOpsStage3VizType>([
   'cluster_distribution',
   'cluster_scatter',
@@ -5711,6 +5795,187 @@ function createMLOpsStage3TuningParameter(seed?: Partial<MLOpsStage3TuningParame
   }
 }
 
+function createMLOpsRuleCondition(seed?: Partial<MLOpsRuleCondition>): MLOpsRuleCondition {
+  return {
+    id: String(seed?.id || `cond_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+    field: String(seed?.field || '').trim(),
+    operator: String(seed?.operator || 'equals').trim() || 'equals',
+    value: String(seed?.value ?? ''),
+  }
+}
+
+function createMLOpsRuleAction(seed?: Partial<MLOpsRuleAction>): MLOpsRuleAction {
+  const mode = String(seed?.mode || 'literal') === 'field' || String(seed?.mode || '') === 'template'
+    ? String(seed?.mode) as MLOpsRuleAction['mode']
+    : 'literal'
+  return {
+    id: String(seed?.id || `act_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+    field: String(seed?.field || '').trim(),
+    mode,
+    value: String(seed?.value ?? ''),
+  }
+}
+
+function createMLOpsRule(seed?: Partial<MLOpsRuleConfig>): MLOpsRuleConfig {
+  return {
+    id: String(seed?.id || `rule_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+    enabled: seed?.enabled !== false,
+    join: seed?.join === 'any' ? 'any' : 'all',
+    action: seed?.action === 'drop' ? 'drop' : 'apply',
+    conditions: Array.isArray(seed?.conditions) && seed.conditions.length > 0
+      ? seed.conditions.map((item) => createMLOpsRuleCondition(item))
+      : [createMLOpsRuleCondition()],
+    actions: Array.isArray(seed?.actions)
+      ? seed.actions.map((item) => createMLOpsRuleAction(item))
+      : [],
+  }
+}
+
+function createMLOpsEnsembleModel(seed?: Partial<MLOpsEnsembleModelConfig>, index = 0): MLOpsEnsembleModelConfig {
+  const rawTask = String(seed?.task_type || 'classification')
+  const task = (['classification', 'regression', 'clustering', 'forecasting', 'anomaly_detection'].includes(rawTask)
+    ? rawTask
+    : 'classification') as MLOpsEnsembleModelConfig['task_type']
+  const id = String(seed?.id || `model_${index + 1}`).trim() || `model_${index + 1}`
+  const rawFeatureFields = Array.isArray(seed?.feature_fields) ? seed.feature_fields : []
+  const rawInfluenceKeys = Array.isArray(seed?.influence_keys) ? seed.influence_keys : []
+  return {
+    id,
+    enabled: seed?.enabled !== false,
+    name: String(seed?.name || `Model ${index + 1}`).trim() || `Model ${index + 1}`,
+    task_type: task,
+    model: String(seed?.model || MLOPS_STAGE3_MODEL_CATALOG[task]?.[0] || '').trim(),
+    feature_fields: uniqueFieldNames(rawFeatureFields.map((item) => String(item || '').trim()).filter(Boolean)),
+    target_field: String(seed?.target_field || '').trim(),
+    forecast_date_field: String(seed?.forecast_date_field || '').trim(),
+    forecast_horizon: Math.max(1, Math.min(Math.trunc(Number(seed?.forecast_horizon || 30)), 3650)),
+    forecast_frequency: (String(seed?.forecast_frequency || 'D').toUpperCase() === 'W'
+      ? 'W'
+      : String(seed?.forecast_frequency || 'D').toUpperCase() === 'M'
+        ? 'M'
+        : 'D') as MLOpsForecastFrequency,
+    forecast_auto_tune_orders: Boolean(seed?.forecast_auto_tune_orders),
+    forecast_order_search_max_evals: Math.max(1, Math.min(Math.trunc(Number(seed?.forecast_order_search_max_evals || 16)), 64)),
+    prediction_field: String(seed?.prediction_field || `${id}_prediction`).trim() || `${id}_prediction`,
+    score_field: String(seed?.score_field || `${id}_prediction_score`).trim(),
+    explainability_method: String(seed?.explainability_method || 'off') as MLOpsStage3ExplainabilityMethod,
+    influence_field: String(seed?.influence_field || `${id}_top_influencing_features`).trim(),
+    influence_limit: Math.max(1, Math.min(Math.trunc(Number(seed?.influence_limit || 5)), 50)),
+    influence_keys: rawInfluenceKeys.length > 0
+      ? rawInfluenceKeys.map((item) => String(item || '').trim()).filter(Boolean)
+      : MLOPS_DEFAULT_INFLUENCE_OUTPUT_KEYS,
+    pre_rules: Array.isArray(seed?.pre_rules) ? seed.pre_rules.map((item) => createMLOpsRule(item)) : [],
+    post_rules: Array.isArray(seed?.post_rules) ? seed.post_rules.map((item) => createMLOpsRule(item)) : [],
+    recommendation: {
+      enabled: Boolean(seed?.recommendation?.enabled),
+      field: String(seed?.recommendation?.field || 'recommendation').trim() || 'recommendation',
+      template: String(seed?.recommendation?.template || ''),
+    },
+  }
+}
+
+function serializeMLOpsRule(rule: MLOpsRuleConfig): Record<string, unknown> {
+  return {
+    enabled: rule.enabled,
+    join: rule.join,
+    action: rule.action || 'apply',
+    conditions: (rule.conditions || []).map((item) => ({
+      field: item.field,
+      operator: item.operator,
+      value: item.value,
+    })).filter((item) => item.field),
+    actions: (rule.actions || []).map((item) => ({
+      field: item.field,
+      mode: item.mode,
+      value: item.value,
+    })).filter((item) => item.field),
+  }
+}
+
+function serializeMLOpsEnsembleModels(items: MLOpsEnsembleModelConfig[]): Array<Record<string, unknown>> {
+  return (items || []).map((item) => ({
+    id: item.id,
+    enabled: item.enabled,
+    name: item.name,
+    task_type: item.task_type,
+    model: item.model,
+    feature_fields: uniqueFieldNames(item.feature_fields || []),
+    target_field: item.target_field || undefined,
+    forecast_date_field: item.forecast_date_field || undefined,
+    forecast_horizon: item.forecast_horizon,
+    forecast_frequency: item.forecast_frequency,
+    forecast_auto_tune_orders: item.forecast_auto_tune_orders,
+    forecast_order_search_max_evals: item.forecast_order_search_max_evals,
+    prediction_field: item.prediction_field,
+    score_field: item.score_field,
+    explainability_method: item.explainability_method,
+    influence_field: item.influence_field,
+    influence_limit: item.influence_limit,
+    influence_keys: item.influence_keys,
+    pre_rules: (item.pre_rules || []).map(serializeMLOpsRule),
+    post_rules: (item.post_rules || []).map(serializeMLOpsRule),
+    recommendation: item.recommendation,
+  }))
+}
+
+function formatMLOpsOutcomeMetric(value: unknown): string {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return value == null ? '-' : String(value)
+  if (Math.abs(n) <= 1) return `${(n * 100).toFixed(2)}%`
+  return Number.isInteger(n) ? String(n) : n.toFixed(4)
+}
+
+function getMLOpsPrimaryOutcomeMetric(summary: Record<string, unknown> | null | undefined, taskType?: string): { label: string; value: string; raw: unknown; source: string } {
+  const empty = { label: 'Accuracy', value: '-', raw: null, source: '' }
+  if (!summary || typeof summary !== 'object') return empty
+  const testMetrics = summary.test_metrics && typeof summary.test_metrics === 'object'
+    ? summary.test_metrics as Record<string, unknown>
+    : {}
+  const trainMetrics = summary.train_metrics && typeof summary.train_metrics === 'object'
+    ? summary.train_metrics as Record<string, unknown>
+    : {}
+  const normalizedTask = String(taskType || summary.task_type || '').toLowerCase()
+  const candidates = normalizedTask === 'regression'
+    ? ['r2', 'r2_score', 'mae', 'rmse', 'mse']
+    : normalizedTask === 'clustering'
+      ? ['silhouette_score', 'calinski_harabasz_score', 'davies_bouldin_score']
+      : normalizedTask === 'anomaly_detection'
+        ? ['accuracy', 'f1', 'f1_score', 'precision', 'recall', 'anomaly_rate']
+        : ['accuracy', 'balanced_accuracy', 'f1', 'f1_score', 'precision', 'recall', 'auc', 'roc_auc']
+  for (const key of candidates) {
+    if (testMetrics[key] != null) {
+      return { label: key.replace(/_/g, ' '), value: formatMLOpsOutcomeMetric(testMetrics[key]), raw: testMetrics[key], source: 'test' }
+    }
+  }
+  for (const key of candidates) {
+    if (trainMetrics[key] != null) {
+      return { label: key.replace(/_/g, ' '), value: formatMLOpsOutcomeMetric(trainMetrics[key]), raw: trainMetrics[key], source: 'train' }
+    }
+  }
+  const firstTest = Object.entries(testMetrics).find(([, value]) => value != null && Number.isFinite(Number(value)))
+  if (firstTest) {
+    return { label: firstTest[0].replace(/_/g, ' '), value: formatMLOpsOutcomeMetric(firstTest[1]), raw: firstTest[1], source: 'test' }
+  }
+  return empty
+}
+
+function getMLOpsTrainingOutcomeRows(summary: Record<string, unknown> | null | undefined): Array<Record<string, unknown>> {
+  if (!summary || typeof summary !== 'object') return []
+  const trainMetrics = summary.train_metrics && typeof summary.train_metrics === 'object'
+    ? summary.train_metrics as Record<string, unknown>
+    : {}
+  const testMetrics = summary.test_metrics && typeof summary.test_metrics === 'object'
+    ? summary.test_metrics as Record<string, unknown>
+    : {}
+  const keys = uniqueFieldNames([...Object.keys(trainMetrics), ...Object.keys(testMetrics)])
+  return keys.map((key) => ({
+    _key: key,
+    metric: key.replace(/_/g, ' '),
+    train: trainMetrics[key] ?? null,
+    test: testMetrics[key] ?? null,
+  }))
+}
+
 function parseMLOpsStage3TuningParameters(value: unknown): MLOpsStage3TuningParameter[] {
   let raw = value
   if (typeof raw === 'string' && raw.trim()) {
@@ -7338,6 +7603,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [mlopsStage2ArtifactDraft, setMLOpsStage2ArtifactDraft] = useState<Record<string, unknown> | null>(null)
   const [mlopsStage3TaskTypeDraft, setMLOpsStage3TaskTypeDraft] = useState<MLOpsStage3TaskType>('classification')
   const [mlopsStage3ModelDraft, setMLOpsStage3ModelDraft] = useState('')
+  const [mlopsStage3ModelModeDraft, setMLOpsStage3ModelModeDraft] = useState<MLOpsStage3ModelMode>('single')
+  const [mlopsStage3EnsembleModelsDraft, setMLOpsStage3EnsembleModelsDraft] = useState<MLOpsEnsembleModelConfig[]>([])
+  const [mlopsStage3EnsembleModelModalId, setMLOpsStage3EnsembleModelModalId] = useState<string | null>(null)
+  const [mlopsStage3NewEnsembleModelDraft, setMLOpsStage3NewEnsembleModelDraft] = useState<MLOpsEnsembleModelConfig | null>(null)
   const [mlopsStage3FeatureFieldsDraft, setMLOpsStage3FeatureFieldsDraft] = useState<string[]>([])
   const [mlopsStage3TargetFieldDraft, setMLOpsStage3TargetFieldDraft] = useState('')
   const [mlopsStage3TargetFieldsDraft, setMLOpsStage3TargetFieldsDraft] = useState<string[]>([])
@@ -7364,6 +7633,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [mlopsStage3TuningEnabledDraft, setMLOpsStage3TuningEnabledDraft] = useState(false)
   const [mlopsStage3TuningMethodDraft, setMLOpsStage3TuningMethodDraft] = useState<MLOpsStage3TuningMethod>('random_search')
   const [mlopsStage3TuningParamsDraft, setMLOpsStage3TuningParamsDraft] = useState<MLOpsStage3TuningParameter[]>([])
+  const [mlopsStage3ExplainabilityMethodDraft, setMLOpsStage3ExplainabilityMethodDraft] = useState<MLOpsStage3ExplainabilityMethod>('off')
   const [mlopsStage3TrackingEnabledDraft, setMLOpsStage3TrackingEnabledDraft] = useState(true)
   const [mlopsStage3TrackVersionsDraft, setMLOpsStage3TrackVersionsDraft] = useState(true)
   const [mlopsStage3TrackParamsDraft, setMLOpsStage3TrackParamsDraft] = useState(true)
@@ -7373,12 +7643,22 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [mlopsStage3RunLoading, setMLOpsStage3RunLoading] = useState(false)
   const [mlopsStage3RunError, setMLOpsStage3RunError] = useState<string | null>(null)
   const [mlopsStage3RunSummary, setMLOpsStage3RunSummary] = useState<MLOpsStage3RunSummary | null>(null)
+  const [mlopsStage3ModelRunLoadingId, setMLOpsStage3ModelRunLoadingId] = useState<string | null>(null)
+  const [mlopsStage3ModelRunErrors, setMLOpsStage3ModelRunErrors] = useState<Record<string, string>>({})
+  const [mlopsStage3ModelRunSummaries, setMLOpsStage3ModelRunSummaries] = useState<Record<string, Record<string, unknown>>>({})
   const [mlopsRuntimeModeDraft, setMLOpsRuntimeModeDraft] = useState<MLOpsRuntimeMode>('training')
   const [mlopsPredictionFieldDraft, setMLOpsPredictionFieldDraft] = useState('prediction')
   const [mlopsPredictionScoreFieldDraft, setMLOpsPredictionScoreFieldDraft] = useState('prediction_score')
+  const [mlopsTopInfluencingFeaturesFieldDraft, setMLOpsTopInfluencingFeaturesFieldDraft] = useState('top_influencing_features')
+  const [mlopsTopInfluencingFeaturesLimitDraft, setMLOpsTopInfluencingFeaturesLimitDraft] = useState<number>(10)
+  const [mlopsTopInfluencingFeaturesKeysDraft, setMLOpsTopInfluencingFeaturesKeysDraft] = useState<string[]>(MLOPS_DEFAULT_INFLUENCE_OUTPUT_KEYS)
   const [mlopsStage3ModelBundleDraft, setMLOpsStage3ModelBundleDraft] = useState<Record<string, unknown> | null>(null)
   const [mlopsStage3VizTypeDraft, setMLOpsStage3VizTypeDraft] = useState<MLOpsStage3VizType>('split_bar')
-  const [mlopsStage3TableViewDraft, setMLOpsStage3TableViewDraft] = useState<'predictions' | 'feature_importance' | 'metrics'>('predictions')
+  const [mlopsStage3TableViewDraft, setMLOpsStage3TableViewDraft] = useState<'predictions' | 'feature_importance' | 'influencing_features' | 'metrics'>('predictions')
+  const [mlopsStage3ModelVizTypeDraft, setMLOpsStage3ModelVizTypeDraft] = useState<MLOpsStage3VizType>('split_bar')
+  const [mlopsStage3ModelTableViewDraft, setMLOpsStage3ModelTableViewDraft] = useState<'predictions' | 'feature_importance' | 'influencing_features' | 'metrics'>('predictions')
+  const [mlopsStage3ModelVizXFieldDraft, setMLOpsStage3ModelVizXFieldDraft] = useState('')
+  const [mlopsStage3ModelVizYFieldDraft, setMLOpsStage3ModelVizYFieldDraft] = useState('')
   const [mlopsStage4GateEnabledDraft, setMLOpsStage4GateEnabledDraft] = useState(true)
   const [mlopsStage4MinAccuracyDraft, setMLOpsStage4MinAccuracyDraft] = useState<number>(0.7)
   const [mlopsStage4MinF1ScoreDraft, setMLOpsStage4MinF1ScoreDraft] = useState<number>(0.65)
@@ -10984,6 +11264,26 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => String(nodeConfig.mlops_stage3_model || '').trim(),
     [nodeConfig.mlops_stage3_model],
   )
+  const mlopsStage3ModelModeConfigured = useMemo<MLOpsStage3ModelMode>(
+    () => String(nodeConfig.mlops_stage3_model_mode || '').trim().toLowerCase() === 'ensemble_pipeline' ? 'ensemble_pipeline' : 'single',
+    [nodeConfig.mlops_stage3_model_mode],
+  )
+  const mlopsStage3EnsembleModelsConfigured = useMemo<MLOpsEnsembleModelConfig[]>(
+    () => {
+      const raw = nodeConfig.mlops_stage3_ensemble_models
+      let parsed: unknown = raw
+      if (typeof raw === 'string' && raw.trim()) {
+        try {
+          parsed = JSON.parse(raw)
+        } catch {
+          parsed = []
+        }
+      }
+      if (!Array.isArray(parsed)) return []
+      return parsed.map((item, index) => createMLOpsEnsembleModel(item as Partial<MLOpsEnsembleModelConfig>, index))
+    },
+    [nodeConfig.mlops_stage3_ensemble_models],
+  )
   const mlopsStage3FeatureFieldsConfigured = useMemo(
     () => parseFieldList(nodeConfig.mlops_stage3_feature_fields),
     [nodeConfig.mlops_stage3_feature_fields],
@@ -11167,6 +11467,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => parseMLOpsStage3TuningParameters(nodeConfig.mlops_stage3_tuning_params),
     [nodeConfig.mlops_stage3_tuning_params],
   )
+  const mlopsStage3ExplainabilityMethodConfigured = useMemo<MLOpsStage3ExplainabilityMethod>(
+    () => {
+      const value = String(nodeConfig.mlops_stage3_explainability_method || 'off').trim().toLowerCase()
+      if (value === 'auto' || value === 'shap' || value === 'shap_tree' || value === 'shap_linear') return value
+      return 'off'
+    },
+    [nodeConfig.mlops_stage3_explainability_method],
+  )
   const mlopsStage3TrackingEnabledConfigured = useMemo(
     () => parseBoolLike(nodeConfig.mlops_stage3_tracking_enabled, true),
     [nodeConfig.mlops_stage3_tracking_enabled],
@@ -11206,6 +11514,39 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => String(nodeConfig.mlops_prediction_score_field || 'prediction_score').trim() || 'prediction_score',
     [nodeConfig.mlops_prediction_score_field],
   )
+  const mlopsTopInfluencingFeaturesFieldConfigured = useMemo(
+    () => String(nodeConfig.mlops_top_influencing_features_field || 'top_influencing_features').trim() || 'top_influencing_features',
+    [nodeConfig.mlops_top_influencing_features_field],
+  )
+  const mlopsTopInfluencingFeaturesLimitConfigured = useMemo(
+    () => {
+      const raw = Number(nodeConfig.mlops_top_influencing_features_limit ?? 10)
+      return Number.isFinite(raw) ? Math.max(1, Math.min(50, Math.trunc(raw))) : 10
+    },
+    [nodeConfig.mlops_top_influencing_features_limit],
+  )
+  const mlopsTopInfluencingFeaturesKeysConfigured = useMemo(
+    () => {
+      const raw = nodeConfig.mlops_top_influencing_features_keys
+      let values: unknown[] = []
+      if (Array.isArray(raw)) {
+        values = raw
+      } else if (typeof raw === 'string' && raw.trim()) {
+        try {
+          const parsed = JSON.parse(raw)
+          values = Array.isArray(parsed) ? parsed : raw.split(',')
+        } catch {
+          values = raw.split(',')
+        }
+      }
+      const allowed = new Set(MLOPS_DEFAULT_INFLUENCE_OUTPUT_KEYS)
+      const selected = values
+        .map((item) => String(item || '').trim())
+        .filter((item) => allowed.has(item))
+      return selected.length > 0 ? selected : MLOPS_DEFAULT_INFLUENCE_OUTPUT_KEYS
+    },
+    [nodeConfig.mlops_top_influencing_features_keys],
+  )
   const mlopsStage3ModelBundleConfigured = useMemo<Record<string, unknown> | null>(
     () => {
       const raw = nodeConfig.mlops_stage3_model_bundle
@@ -11232,10 +11573,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     },
     [nodeConfig.mlops_stage3_viz_type],
   )
-  const mlopsStage3TableViewConfigured = useMemo<'predictions' | 'feature_importance' | 'metrics'>(
+  const mlopsStage3TableViewConfigured = useMemo<'predictions' | 'feature_importance' | 'influencing_features' | 'metrics'>(
     () => {
       const raw = String(nodeConfig.mlops_stage3_table_view || '').trim()
-      if (raw === 'feature_importance' || raw === 'metrics') return raw
+      if (raw === 'feature_importance' || raw === 'influencing_features' || raw === 'metrics') return raw
       return 'predictions'
     },
     [nodeConfig.mlops_stage3_table_view],
@@ -12288,6 +12629,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => mlopsStage3AvailableFields.map((path) => ({ value: path, label: path })),
     [mlopsStage3AvailableFields],
   )
+  const mlopsStage3EnsembleFeatureOptions = useMemo(
+    () => {
+      const upstreamOutputs: string[] = []
+      mlopsStage3EnsembleModelsDraft.forEach((model) => {
+        if (model.prediction_field) upstreamOutputs.push(model.prediction_field)
+        if (model.score_field) upstreamOutputs.push(model.score_field)
+      })
+      return uniqueFieldNames([...mlopsStage3AvailableFields, ...upstreamOutputs]).map((path) => ({ value: path, label: path }))
+    },
+    [mlopsStage3AvailableFields, mlopsStage3EnsembleModelsDraft],
+  )
   const mlopsStage4MonitorFieldOptions = useMemo(
     () => mlopsStage3AvailableFields.map((path) => ({ value: path, label: path })),
     [mlopsStage3AvailableFields],
@@ -12296,6 +12648,581 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => (MLOPS_STAGE3_MODEL_CATALOG[mlopsStage3TaskTypeDraft] || []).map((model) => ({ value: model, label: model })),
     [mlopsStage3TaskTypeDraft],
   )
+  const ensembleModelOptionsForTask = useCallback(
+    (taskType: MLOpsEnsembleModelConfig['task_type']) => (MLOPS_STAGE3_MODEL_CATALOG[taskType] || []).map((model) => ({ value: model, label: model })),
+    [],
+  )
+  const selectedMLOpsEnsembleModel = useMemo(
+    () => mlopsStage3NewEnsembleModelDraft || mlopsStage3EnsembleModelsDraft.find((item) => item.id === mlopsStage3EnsembleModelModalId) || null,
+    [mlopsStage3EnsembleModelsDraft, mlopsStage3EnsembleModelModalId, mlopsStage3NewEnsembleModelDraft],
+  )
+  const selectedMLOpsEnsembleModelIsNew = Boolean(mlopsStage3NewEnsembleModelDraft)
+  const mlopsStage3ModelSummaryForId = useCallback((modelId: string): Record<string, unknown> | undefined => {
+    const standaloneSummary = mlopsStage3ModelRunSummaries[modelId]
+    if (standaloneSummary) return standaloneSummary
+    const summaries = Array.isArray(mlopsStage3RunSummary?.model_summaries) ? mlopsStage3RunSummary.model_summaries : []
+    return summaries.find((item) => String(item.step_id || '') === modelId) as Record<string, unknown> | undefined
+  }, [mlopsStage3ModelRunSummaries, mlopsStage3RunSummary])
+  const mlopsStage3DisplayModelSummaries = useMemo(
+    () => mlopsStage3EnsembleModelsDraft
+      .map((model) => mlopsStage3ModelSummaryForId(model.id))
+      .filter((item): item is Record<string, unknown> => Boolean(item)),
+    [mlopsStage3EnsembleModelsDraft, mlopsStage3ModelSummaryForId],
+  )
+  const selectedMLOpsEnsembleModelSummary = useMemo(
+    () => {
+      if (!selectedMLOpsEnsembleModel) return null
+      return mlopsStage3ModelSummaryForId(selectedMLOpsEnsembleModel.id) || null
+    },
+    [mlopsStage3ModelSummaryForId, selectedMLOpsEnsembleModel],
+  )
+  const selectedMLOpsEnsembleModelOutcome = useMemo(
+    () => getMLOpsPrimaryOutcomeMetric(
+      selectedMLOpsEnsembleModelSummary as Record<string, unknown> | null,
+      selectedMLOpsEnsembleModel?.task_type,
+    ),
+    [selectedMLOpsEnsembleModel?.task_type, selectedMLOpsEnsembleModelSummary],
+  )
+  const selectedMLOpsEnsembleModelOutcomeRows = useMemo(
+    () => getMLOpsTrainingOutcomeRows(selectedMLOpsEnsembleModelSummary as Record<string, unknown> | null),
+    [selectedMLOpsEnsembleModelSummary],
+  )
+  const selectedMLOpsEnsembleModelTotalRecords = useMemo(() => {
+    const summary = selectedMLOpsEnsembleModelSummary as Record<string, unknown> | null
+    if (!summary) return '-'
+    const explicitTotal = Number(summary.total_records ?? summary.total_rows ?? summary.input_rows ?? summary.rows)
+    if (Number.isFinite(explicitTotal)) return String(Math.trunc(explicitTotal))
+    const trainRows = Number(summary.train_rows ?? 0)
+    const testRows = Number(summary.test_rows ?? 0)
+    if (Number.isFinite(trainRows) || Number.isFinite(testRows)) return String(Math.trunc((Number.isFinite(trainRows) ? trainRows : 0) + (Number.isFinite(testRows) ? testRows : 0)))
+    return '-'
+  }, [selectedMLOpsEnsembleModelSummary])
+  const selectedMLOpsEnsembleModelVizOptions = useMemo(
+    () => MLOPS_STAGE3_VIZ_OPTIONS.filter((option) => {
+      const task = selectedMLOpsEnsembleModel?.task_type
+      if (task === 'clustering') return !MLOPS_STAGE3_SUPERVISED_ONLY_VIZ_TYPES.has(option.value) && !MLOPS_STAGE3_ANOMALY_ONLY_VIZ_TYPES.has(option.value)
+      if (task === 'anomaly_detection') return !MLOPS_STAGE3_CLUSTER_ONLY_VIZ_TYPES.has(option.value)
+      return !MLOPS_STAGE3_CLUSTER_ONLY_VIZ_TYPES.has(option.value) && !MLOPS_STAGE3_ANOMALY_ONLY_VIZ_TYPES.has(option.value)
+    }),
+    [selectedMLOpsEnsembleModel?.task_type],
+  )
+  const selectedMLOpsEnsembleModelVizFieldOptions = useMemo(() => {
+    const summary = selectedMLOpsEnsembleModelSummary as Record<string, unknown> | null
+    const sampleRows = Array.isArray(summary?.sample_predictions) ? summary?.sample_predictions as Array<Record<string, unknown>> : []
+    return uniqueFieldNames([
+      ...(selectedMLOpsEnsembleModel?.feature_fields || []),
+      ...(Array.isArray(summary?.feature_fields) ? summary?.feature_fields as string[] : []),
+      ...sampleRows.flatMap((row) => Object.keys(row)),
+    ]).map((field) => ({ value: field, label: field }))
+  }, [selectedMLOpsEnsembleModel?.feature_fields, selectedMLOpsEnsembleModelSummary])
+  const selectedMLOpsEnsembleModelVizFigure = useMemo(() => {
+    const summary = selectedMLOpsEnsembleModelSummary as Record<string, unknown> | null
+    if (!summary) return null
+    const layoutBase: Record<string, unknown> = {
+      autosize: true,
+      margin: { l: 36, r: 16, t: 28, b: 34 },
+      paper_bgcolor: 'transparent',
+      plot_bgcolor: 'transparent',
+      font: { size: 11, color: '#cbd5e1' },
+    }
+    const toNum = (value: unknown): number | null => {
+      const n = Number(value)
+      return Number.isFinite(n) ? n : null
+    }
+    const clusterPalette = ['#38bdf8', '#a78bfa', '#22c55e', '#f59e0b', '#f472b6', '#14b8a6', '#fb7185', '#c084fc', '#84cc16', '#60a5fa']
+    const clusterSort = (a: string, b: string): number => {
+      const na = Number(a)
+      const nb = Number(b)
+      if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb
+      return a.localeCompare(b)
+    }
+    const sampleRows = Array.isArray(summary.sample_predictions) ? summary.sample_predictions as Array<Record<string, unknown>> : []
+    const clusterLabelOf = (row: Record<string, unknown>): string => String(row.cluster ?? row.Cluster ?? row.predicted ?? row.prediction ?? 'unknown')
+    const clusterDistribution = (): Array<{ label: string; count: number }> => {
+      const trainMetrics = (summary.train_metrics || {}) as Record<string, unknown>
+      const rawClusters = (trainMetrics.clusters || {}) as Record<string, unknown>
+      const fromMetrics = Object.entries(rawClusters)
+        .map(([label, value]) => ({ label: String(label), count: Number(value || 0) }))
+        .filter((item) => Number.isFinite(item.count))
+      if (fromMetrics.length > 0) return fromMetrics.sort((a, b) => clusterSort(a.label, b.label))
+      const counts: Record<string, number> = {}
+      sampleRows.forEach((row) => {
+        const label = clusterLabelOf(row)
+        counts[label] = (counts[label] || 0) + 1
+      })
+      return Object.entries(counts)
+        .map(([label, count]) => ({ label, count }))
+        .sort((a, b) => clusterSort(a.label, b.label))
+    }
+    const numericSampleFields = (): string[] => uniqueFieldNames([
+      ...((Array.isArray(summary.feature_fields) ? summary.feature_fields : []) as string[]),
+      ...(selectedMLOpsEnsembleModel?.feature_fields || []),
+      ...sampleRows.flatMap((row) => Object.keys(row).filter((key) => key !== 'cluster' && key !== 'Cluster')),
+    ]).filter((field) => sampleRows.some((row) => toNum(row[field]) != null))
+    const preferredXField = String(mlopsStage3ModelVizXFieldDraft || '').trim()
+    const preferredYField = String(mlopsStage3ModelVizYFieldDraft || '').trim()
+    const scoreFieldCandidates = uniqueFieldNames([
+      preferredYField,
+      selectedMLOpsEnsembleModel?.score_field || '',
+      'prediction_score',
+      'score',
+      'anomaly_score',
+      'decision_score',
+    ].filter(Boolean))
+    const resolveScoreField = (): string => scoreFieldCandidates.find((field) => sampleRows.some((row) => toNum(row[field]) != null)) || ''
+
+    if (mlopsStage3ModelVizTypeDraft === 'cluster_distribution') {
+      const items = clusterDistribution()
+      if (items.length > 0) {
+        return {
+          data: [{
+            type: 'bar',
+            x: items.map((item) => item.label === '-1' ? 'Noise (-1)' : `Cluster ${item.label}`),
+            y: items.map((item) => item.count),
+            marker: { color: items.map((_, idx) => clusterPalette[idx % clusterPalette.length]) },
+            text: items.map((item) => String(item.count)),
+            textposition: 'auto',
+          }],
+          layout: { ...layoutBase, title: 'Cluster Distribution', xaxis: { title: 'Cluster' }, yaxis: { title: 'Rows' } },
+        }
+      }
+    }
+
+    if (mlopsStage3ModelVizTypeDraft === 'cluster_scatter') {
+      const fields = numericSampleFields()
+      const xField = preferredXField && fields.includes(preferredXField) ? preferredXField : fields[0]
+      const yField = preferredYField && fields.includes(preferredYField) ? preferredYField : (fields.find((field) => field !== xField) || fields[1] || fields[0])
+      if (xField && yField) {
+        const labels = uniqueFieldNames(sampleRows.map((row) => clusterLabelOf(row))).sort(clusterSort)
+        const traces = labels.map((label, labelIdx) => {
+          const points = sampleRows
+            .map((row, rowIdx) => ({
+              row,
+              rowIdx,
+              x: fields.length >= 2 ? toNum(row[xField]) : rowIdx + 1,
+              y: toNum(row[yField]),
+            }))
+            .filter((point) => clusterLabelOf(point.row) === label && point.x != null && point.y != null)
+          return {
+            type: 'scatter',
+            mode: 'markers',
+            name: label === '-1' ? 'Noise (-1)' : `Cluster ${label}`,
+            x: points.map((point) => point.x as number),
+            y: points.map((point) => point.y as number),
+            marker: {
+              color: clusterPalette[labelIdx % clusterPalette.length],
+              size: 8,
+              opacity: 0.78,
+              line: { color: 'rgba(15,23,42,0.8)', width: 1 },
+            },
+            text: points.map((point) => [
+              label === '-1' ? 'Noise (-1)' : `Cluster ${label}`,
+              `${xField}: ${String(point.row[xField] ?? '')}`,
+              `${yField}: ${String(point.row[yField] ?? '')}`,
+            ].join('<br>')),
+            hoverinfo: 'text',
+          }
+        }).filter((trace) => (trace.x as number[]).length > 0)
+        if (traces.length > 0) {
+          return {
+            data: traces,
+            layout: {
+              ...layoutBase,
+              title: fields.length >= 2 ? 'Cluster Scatter by Feature' : 'Cluster Feature Spread',
+              xaxis: { title: fields.length >= 2 ? xField : 'Sample' },
+              yaxis: { title: yField },
+            },
+          }
+        }
+      }
+    }
+
+    if (mlopsStage3ModelVizTypeDraft === 'anomaly_score_distribution') {
+      const scoreField = resolveScoreField()
+      const values = scoreField ? sampleRows.map((row) => toNum(row[scoreField])).filter((value): value is number => value != null) : []
+      if (values.length > 0) {
+        return {
+          data: [{ type: 'histogram', x: values, marker: { color: '#f97316' }, nbinsx: 24 }],
+          layout: { ...layoutBase, title: `Anomaly Score Distribution (${scoreField})`, xaxis: { title: scoreField }, yaxis: { title: 'Rows' } },
+        }
+      }
+    }
+
+    if (mlopsStage3ModelVizTypeDraft === 'anomaly_score_scatter') {
+      const fields = numericSampleFields()
+      const scoreField = resolveScoreField()
+      const xField = preferredXField && fields.includes(preferredXField) ? preferredXField : fields.find((field) => field !== scoreField) || fields[0]
+      if (xField && scoreField) {
+        const points = sampleRows
+          .map((row, rowIdx) => ({
+            x: toNum(row[xField]) ?? rowIdx + 1,
+            y: toNum(row[scoreField]),
+            prediction: String(row[selectedMLOpsEnsembleModel?.prediction_field || 'prediction'] ?? row.prediction ?? ''),
+          }))
+          .filter((point) => point.y != null)
+        if (points.length > 0) {
+          return {
+            data: [{
+              type: 'scatter',
+              mode: 'markers',
+              x: points.map((point) => point.x),
+              y: points.map((point) => point.y),
+              marker: {
+                color: points.map((point) => point.prediction === '-1' || point.prediction === '1' ? '#ef4444' : '#38bdf8'),
+                size: 8,
+                opacity: 0.82,
+                line: { color: 'rgba(15,23,42,0.8)', width: 1 },
+              },
+              text: points.map((point) => `prediction: ${point.prediction || 'n/a'}<br>${xField}: ${point.x}<br>${scoreField}: ${point.y}`),
+              hoverinfo: 'text',
+            }],
+            layout: { ...layoutBase, title: 'Anomaly Score Scatter', xaxis: { title: xField || 'Sample' }, yaxis: { title: scoreField } },
+          }
+        }
+      }
+    }
+
+    if (mlopsStage3ModelVizTypeDraft === 'cluster_profile') {
+      const overview = (summary.target_overview || {}) as Record<string, unknown>
+      const rawProfiles = Array.isArray(overview.cluster_profiles)
+        ? overview.cluster_profiles.map((item) => ({ ...(item as Record<string, unknown>) }))
+        : []
+      const overviewFields = Array.isArray(overview.profile_fields)
+        ? (overview.profile_fields as unknown[]).map((item) => String(item || '').trim()).filter(Boolean)
+        : []
+      const fields = uniqueFieldNames([...overviewFields, ...numericSampleFields()]).slice(0, 4)
+      const profiles = rawProfiles.length > 0
+        ? rawProfiles
+        : clusterDistribution().map((item) => {
+            const rows = sampleRows.filter((row) => clusterLabelOf(row) === item.label)
+            const profile: Record<string, unknown> = { cluster: item.label, count: rows.length }
+            fields.forEach((field) => {
+              const values = rows.map((row) => toNum(row[field])).filter((value): value is number => value != null)
+              if (values.length > 0) profile[`${field}_mean`] = values.reduce((sum, value) => sum + value, 0) / values.length
+            })
+            return profile
+          })
+      const sortedProfiles: Array<Record<string, unknown> & { cluster: string }> = profiles
+        .map((item) => ({ ...item, cluster: String(item.cluster ?? 'unknown') }))
+        .sort((a, b) => clusterSort(String(a.cluster), String(b.cluster)))
+      if (fields.length > 0 && sortedProfiles.length > 0) {
+        return {
+          data: fields.map((field, idx) => ({
+            type: 'bar',
+            name: field,
+            x: sortedProfiles.map((item) => String(item.cluster) === '-1' ? 'Noise (-1)' : `Cluster ${String(item.cluster)}`),
+            y: sortedProfiles.map((item) => toNum(item[`${field}_mean`]) ?? 0),
+            marker: { color: clusterPalette[idx % clusterPalette.length] },
+          })),
+          layout: { ...layoutBase, barmode: 'group', title: 'Cluster Feature Profile (Mean)', xaxis: { title: 'Cluster' }, yaxis: { title: 'Mean value' } },
+        }
+      }
+    }
+
+    if (mlopsStage3ModelVizTypeDraft === 'metrics_bar') {
+      const trainMetrics = (summary.train_metrics || {}) as Record<string, unknown>
+      const testMetrics = (summary.test_metrics || {}) as Record<string, unknown>
+      const keys = uniqueFieldNames([...Object.keys(trainMetrics), ...Object.keys(testMetrics)])
+        .filter((key) => toNum(trainMetrics[key]) != null || toNum(testMetrics[key]) != null)
+        .slice(0, 12)
+      if (keys.length > 0) {
+        return {
+          data: [
+            { type: 'bar', name: 'Train', x: keys, y: keys.map((key) => toNum(trainMetrics[key]) ?? 0), marker: { color: '#22c55e' } },
+            { type: 'bar', name: 'Test', x: keys, y: keys.map((key) => toNum(testMetrics[key]) ?? 0), marker: { color: '#38bdf8' } },
+          ],
+          layout: { ...layoutBase, barmode: 'group', title: 'Model Metrics' },
+        }
+      }
+    }
+    if (mlopsStage3ModelVizTypeDraft === 'feature_importance') {
+      const items = Array.isArray(summary.feature_importance) ? summary.feature_importance as Array<Record<string, unknown>> : []
+      const top = items.slice(0, 15)
+      if (top.length > 0) {
+        return {
+          data: [{
+            type: 'bar',
+            orientation: 'h',
+            x: top.map((item) => toNum(item.importance ?? item.value ?? item.score) ?? 0).reverse(),
+            y: top.map((item) => String(item.feature || item.field || '')).reverse(),
+            marker: { color: '#a78bfa' },
+          }],
+          layout: { ...layoutBase, title: 'Feature Importance', xaxis: { title: 'importance' }, yaxis: { automargin: true } },
+        }
+      }
+    }
+    const preds = sampleRows.map((row, idx) => ({
+      idx: idx + 1,
+      actual: toNum(row.actual),
+      predicted: toNum(row.predicted),
+    })).filter((row) => row.actual != null && row.predicted != null)
+    if (preds.length > 0 && mlopsStage3ModelVizTypeDraft === 'actual_vs_predicted_scatter') {
+      return {
+        data: [{ type: 'scatter', mode: 'markers', x: preds.map((row) => row.actual), y: preds.map((row) => row.predicted), marker: { color: '#38bdf8', size: 8 } }],
+        layout: { ...layoutBase, title: 'Actual vs Predicted', xaxis: { title: 'Actual' }, yaxis: { title: 'Predicted' } },
+      }
+    }
+    if (preds.length > 0 && mlopsStage3ModelVizTypeDraft === 'actual_vs_predicted_line') {
+      return {
+        data: [
+          { type: 'scatter', mode: 'lines+markers', name: 'Actual', x: preds.map((row) => row.idx), y: preds.map((row) => row.actual), line: { color: '#22c55e' } },
+          { type: 'scatter', mode: 'lines+markers', name: 'Predicted', x: preds.map((row) => row.idx), y: preds.map((row) => row.predicted), line: { color: '#f59e0b' } },
+        ],
+        layout: { ...layoutBase, title: 'Actual vs Predicted', xaxis: { title: 'Sample' }, yaxis: { title: 'Value' } },
+      }
+    }
+    if (preds.length > 0 && mlopsStage3ModelVizTypeDraft === 'prediction_error_hist') {
+      return {
+        data: [{ type: 'histogram', x: preds.map((row) => Number(row.predicted) - Number(row.actual)), marker: { color: '#ef4444' } }],
+        layout: { ...layoutBase, title: 'Prediction Error', xaxis: { title: 'Predicted - Actual' } },
+      }
+    }
+    return {
+      data: [{
+        type: 'bar',
+        x: ['Train rows', 'Test rows'],
+        y: [Number(summary.train_rows || 0), Number(summary.test_rows || 0)],
+        marker: { color: ['#22c55e', '#38bdf8'] },
+      }],
+      layout: { ...layoutBase, title: 'Train/Test Data Split' },
+    }
+  }, [
+    mlopsStage3ModelVizTypeDraft,
+    mlopsStage3ModelVizXFieldDraft,
+    mlopsStage3ModelVizYFieldDraft,
+    selectedMLOpsEnsembleModel?.feature_fields,
+    selectedMLOpsEnsembleModel?.prediction_field,
+    selectedMLOpsEnsembleModel?.score_field,
+    selectedMLOpsEnsembleModelSummary,
+  ])
+  const selectedMLOpsEnsembleModelTableRows = useMemo(() => {
+    const summary = selectedMLOpsEnsembleModelSummary as Record<string, unknown> | null
+    if (!summary) return [] as Array<Record<string, unknown>>
+    if (mlopsStage3ModelTableViewDraft === 'metrics') {
+      const trainMetrics = (summary.train_metrics || {}) as Record<string, unknown>
+      const testMetrics = (summary.test_metrics || {}) as Record<string, unknown>
+      return uniqueFieldNames([...Object.keys(trainMetrics), ...Object.keys(testMetrics)]).map((name, idx) => ({
+        _key: `model_metric_${idx}_${name}`,
+        metric: name,
+        train: trainMetrics[name] ?? null,
+        test: testMetrics[name] ?? null,
+      }))
+    }
+    if (mlopsStage3ModelTableViewDraft === 'feature_importance') {
+      return Array.isArray(summary.feature_importance)
+        ? (summary.feature_importance as Array<Record<string, unknown>>).map((item, idx) => ({ _key: `model_fi_${idx}`, ...item }))
+        : []
+    }
+    if (mlopsStage3ModelTableViewDraft === 'influencing_features') {
+      return Array.isArray(summary.top_influencing_features)
+        ? (summary.top_influencing_features as Array<Record<string, unknown>>).map((item, idx) => ({ _key: `model_inf_${idx}`, ...item }))
+        : []
+    }
+    return Array.isArray(summary.sample_predictions)
+      ? (summary.sample_predictions as Array<Record<string, unknown>>).map((item, idx) => ({ _key: `model_pred_${idx}`, ...item }))
+      : []
+  }, [mlopsStage3ModelTableViewDraft, selectedMLOpsEnsembleModelSummary])
+  const selectedMLOpsEnsembleModelTableColumns = useMemo(() => {
+    const first = selectedMLOpsEnsembleModelTableRows.find((row) => row && typeof row === 'object')
+    return Object.keys(first || {}).filter((key) => key !== '_key').map((key) => ({
+      title: key,
+      dataIndex: key,
+      key,
+      ellipsis: true,
+      render: (value: unknown) => {
+        if (value == null) return ''
+        if (typeof value === 'object') {
+          try { return JSON.stringify(value) } catch { return String(value) }
+        }
+        return String(value)
+      },
+    }))
+  }, [selectedMLOpsEnsembleModelTableRows])
+  const mlopsStage3EnsembleDashboard = useMemo(() => {
+    const models = mlopsStage3EnsembleModelsDraft || []
+    const enabledModels = models.filter((item) => item.enabled !== false)
+    const typeCounts = new Map<string, number>()
+    enabledModels.forEach((item) => {
+      const key = String(item.task_type || 'unknown')
+      typeCounts.set(key, (typeCounts.get(key) || 0) + 1)
+    })
+    const summaries = mlopsStage3DisplayModelSummaries
+    return {
+      total: models.length,
+      enabled: enabledModels.length,
+      disabled: Math.max(0, models.length - enabledModels.length),
+      typeCounts: Array.from(typeCounts.entries()).map(([type, count]) => ({ type, count })),
+      trainedSteps: summaries.length,
+      outputPreviewRows: Array.isArray(mlopsStage3RunSummary?.sample_predictions) ? mlopsStage3RunSummary.sample_predictions.length : 0,
+      graph: summaries.length > 0 ? {
+        data: [
+          {
+            type: 'bar',
+            x: summaries.map((item, index) => String(item.step_name || item.model || `Model ${index + 1}`)),
+            y: summaries.map((item) => Number(item.train_rows || 0)),
+            name: 'Train rows',
+            marker: { color: '#22c55e' },
+          },
+          {
+            type: 'bar',
+            x: summaries.map((item, index) => String(item.step_name || item.model || `Model ${index + 1}`)),
+            y: summaries.map((item) => Number(item.test_rows || 0)),
+            name: 'Test rows',
+            marker: { color: '#38bdf8' },
+          },
+        ],
+        layout: {
+          autosize: true,
+          barmode: 'group',
+          margin: { l: 36, r: 12, t: 20, b: 70 },
+          paper_bgcolor: 'transparent',
+          plot_bgcolor: 'transparent',
+          font: { size: 11, color: '#cbd5e1' },
+          xaxis: { tickangle: -25, automargin: true },
+          yaxis: { title: { text: 'rows' }, gridcolor: '#33415555' },
+          legend: { orientation: 'h', y: 1.18, x: 0 },
+        },
+      } : null,
+    }
+  }, [mlopsStage3DisplayModelSummaries, mlopsStage3EnsembleModelsDraft, mlopsStage3RunSummary])
+  const mlopsStage3TrainingJsonView = useMemo(() => {
+    if (!mlopsStage3RunSummary && mlopsStage3DisplayModelSummaries.length <= 0) return ''
+    return JSON.stringify({
+      active_pipeline: mlopsStage3ModelModeDraft,
+      training_summary: mlopsStage3RunSummary || null,
+      model_test_summaries: mlopsStage3DisplayModelSummaries,
+    }, null, 2)
+  }, [mlopsStage3DisplayModelSummaries, mlopsStage3ModelModeDraft, mlopsStage3RunSummary])
+  const mlopsStage3DisplayOutcomeSummary = useMemo(() => {
+    if (mlopsStage3RunSummary?.ran) {
+      return {
+        ran: true,
+        inputRows: Number(mlopsStage3RunSummary.input_rows || 0),
+        trainRows: Number(mlopsStage3RunSummary.train_rows || 0),
+        validateRows: Number(mlopsStage3RunSummary.validate_rows || 0),
+        testRows: Number(mlopsStage3RunSummary.test_rows || 0),
+      }
+    }
+    if (mlopsStage3DisplayModelSummaries.length > 0) {
+      const inputRows = Math.max(...mlopsStage3DisplayModelSummaries.map((item) => Number(item.input_rows || item.total_records || item.total_rows || 0)).filter(Number.isFinite), 0)
+      const trainRows = mlopsStage3DisplayModelSummaries.reduce((sum, item) => sum + (Number.isFinite(Number(item.train_rows)) ? Number(item.train_rows) : 0), 0)
+      const testRows = mlopsStage3DisplayModelSummaries.reduce((sum, item) => sum + (Number.isFinite(Number(item.test_rows)) ? Number(item.test_rows) : 0), 0)
+      return { ran: true, inputRows, trainRows, validateRows: 0, testRows }
+    }
+    return { ran: false, inputRows: 0, trainRows: 0, validateRows: 0, testRows: 0 }
+  }, [mlopsStage3DisplayModelSummaries, mlopsStage3RunSummary])
+  const updateMLOpsEnsembleModel = useCallback((modelId: string, patch: Partial<MLOpsEnsembleModelConfig>) => {
+    setMLOpsStage3NewEnsembleModelDraft((prev) => {
+      if (!prev || prev.id !== modelId) return prev
+      const next = { ...prev, ...patch }
+      if (patch.task_type && patch.task_type !== prev.task_type) {
+        next.model = MLOPS_STAGE3_MODEL_CATALOG[patch.task_type]?.[0] || ''
+      }
+      return createMLOpsEnsembleModel(next, mlopsStage3EnsembleModelsDraft.length)
+    })
+    setMLOpsStage3EnsembleModelsDraft((prev) => prev.map((item) => {
+      if (item.id !== modelId) return item
+      const next = { ...item, ...patch }
+      if (patch.task_type && patch.task_type !== item.task_type) {
+        next.model = MLOPS_STAGE3_MODEL_CATALOG[patch.task_type]?.[0] || ''
+      }
+      return createMLOpsEnsembleModel(next, prev.indexOf(item))
+    }))
+  }, [mlopsStage3EnsembleModelsDraft.length])
+  const updateMLOpsEnsembleRule = useCallback((
+    modelId: string,
+    scope: 'pre_rules' | 'post_rules',
+    ruleId: string,
+    patch: Partial<MLOpsRuleConfig>,
+  ) => {
+    setMLOpsStage3NewEnsembleModelDraft((prev) => {
+      if (!prev || prev.id !== modelId) return prev
+      const nextRules = (prev[scope] || []).map((rule) => rule.id === ruleId ? createMLOpsRule({ ...rule, ...patch }) : rule)
+      return createMLOpsEnsembleModel({ ...prev, [scope]: nextRules }, mlopsStage3EnsembleModelsDraft.length)
+    })
+    setMLOpsStage3EnsembleModelsDraft((prev) => prev.map((model, modelIndex) => {
+      if (model.id !== modelId) return model
+      const nextRules = (model[scope] || []).map((rule) => rule.id === ruleId ? createMLOpsRule({ ...rule, ...patch }) : rule)
+      return createMLOpsEnsembleModel({ ...model, [scope]: nextRules }, modelIndex)
+    }))
+  }, [mlopsStage3EnsembleModelsDraft.length])
+  const updateMLOpsEnsembleRuleCondition = useCallback((
+    modelId: string,
+    scope: 'pre_rules' | 'post_rules',
+    ruleId: string,
+    conditionId: string,
+    patch: Partial<MLOpsRuleCondition>,
+  ) => {
+    setMLOpsStage3NewEnsembleModelDraft((prev) => {
+      if (!prev || prev.id !== modelId) return prev
+      const nextRules = (prev[scope] || []).map((rule) => {
+        if (rule.id !== ruleId) return rule
+        return createMLOpsRule({
+          ...rule,
+          conditions: rule.conditions.map((condition) => condition.id === conditionId ? createMLOpsRuleCondition({ ...condition, ...patch }) : condition),
+        })
+      })
+      return createMLOpsEnsembleModel({ ...prev, [scope]: nextRules }, mlopsStage3EnsembleModelsDraft.length)
+    })
+    setMLOpsStage3EnsembleModelsDraft((prev) => prev.map((model, modelIndex) => {
+      if (model.id !== modelId) return model
+      const nextRules = (model[scope] || []).map((rule) => {
+        if (rule.id !== ruleId) return rule
+        return createMLOpsRule({
+          ...rule,
+          conditions: rule.conditions.map((condition) => condition.id === conditionId ? createMLOpsRuleCondition({ ...condition, ...patch }) : condition),
+        })
+      })
+      return createMLOpsEnsembleModel({ ...model, [scope]: nextRules }, modelIndex)
+    }))
+  }, [mlopsStage3EnsembleModelsDraft.length])
+  const updateMLOpsEnsembleRuleAction = useCallback((
+    modelId: string,
+    scope: 'pre_rules' | 'post_rules',
+    ruleId: string,
+    actionId: string,
+    patch: Partial<MLOpsRuleAction>,
+  ) => {
+    setMLOpsStage3NewEnsembleModelDraft((prev) => {
+      if (!prev || prev.id !== modelId) return prev
+      const nextRules = (prev[scope] || []).map((rule) => {
+        if (rule.id !== ruleId) return rule
+        return createMLOpsRule({
+          ...rule,
+          actions: rule.actions.map((action) => action.id === actionId ? createMLOpsRuleAction({ ...action, ...patch }) : action),
+        })
+      })
+      return createMLOpsEnsembleModel({ ...prev, [scope]: nextRules }, mlopsStage3EnsembleModelsDraft.length)
+    })
+    setMLOpsStage3EnsembleModelsDraft((prev) => prev.map((model, modelIndex) => {
+      if (model.id !== modelId) return model
+      const nextRules = (model[scope] || []).map((rule) => {
+        if (rule.id !== ruleId) return rule
+        return createMLOpsRule({
+          ...rule,
+          actions: rule.actions.map((action) => action.id === actionId ? createMLOpsRuleAction({ ...action, ...patch }) : action),
+        })
+      })
+      return createMLOpsEnsembleModel({ ...model, [scope]: nextRules }, modelIndex)
+    }))
+  }, [mlopsStage3EnsembleModelsDraft.length])
+  const activateMLOpsStage3ModelMode = useCallback((mode: MLOpsStage3ModelMode) => {
+    setMLOpsStage3ModelModeDraft(mode)
+    if (mode === 'ensemble_pipeline' && mlopsStage3EnsembleModelsDraft.length <= 0) {
+      const seed = createMLOpsEnsembleModel({
+        feature_fields: uniqueFieldNames(mlopsStage3FeatureFieldsDraft.filter((item) => mlopsStage3AvailableFields.includes(item))),
+        target_field: mlopsStage3TargetFieldDraft,
+        explainability_method: mlopsStage3ExplainabilityMethodDraft,
+      }, 0)
+      setMLOpsStage3EnsembleModelsDraft([seed])
+    }
+  }, [
+    mlopsStage3EnsembleModelsDraft.length,
+    mlopsStage3FeatureFieldsDraft,
+    mlopsStage3AvailableFields,
+    mlopsStage3TargetFieldDraft,
+    mlopsStage3ExplainabilityMethodDraft,
+  ])
   const mlopsStage3VizOptions = useMemo(
     () => MLOPS_STAGE3_VIZ_OPTIONS.filter((option) => {
       if (mlopsStage3TaskTypeDraft === 'clustering') {
@@ -12614,6 +13541,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       rows = Array.isArray(summary.feature_importance)
         ? summary.feature_importance.map((item) => ({ ...(item as Record<string, unknown>) }))
         : []
+    } else if (mlopsStage3TableViewDraft === 'influencing_features') {
+      rows = Array.isArray(summary.top_influencing_features)
+        ? summary.top_influencing_features.map((item) => ({ ...(item as Record<string, unknown>) }))
+        : []
     } else {
       rows = Array.isArray(summary.sample_predictions)
         ? summary.sample_predictions.map((item) => ({ ...(item as Record<string, unknown>) }))
@@ -12651,6 +13582,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     if (mlopsStage3TableViewDraft === 'feature_importance') {
       return Array.isArray(summary.feature_importance)
         ? summary.feature_importance.map((item, idx) => ({ _key: `fi_${idx}`, ...(item as Record<string, unknown>) }))
+        : []
+    }
+    if (mlopsStage3TableViewDraft === 'influencing_features') {
+      return Array.isArray(summary.top_influencing_features)
+        ? summary.top_influencing_features.map((item, idx) => ({ _key: `influence_${idx}`, ...(item as Record<string, unknown>) }))
         : []
     }
     return Array.isArray(summary.sample_predictions)
@@ -13041,6 +13977,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_stage2_target_field: mlopsStage2TargetFieldDraft,
       mlops_stage2_label_field: mlopsStage2LabelFieldDraft,
       mlops_stage2_field_configs: mlopsStage2SerializedConfig,
+      mlops_stage3_model_mode: mlopsStage3ModelModeDraft,
+      mlops_stage3_ensemble_models: serializeMLOpsEnsembleModels(mlopsStage3EnsembleModelsDraft),
       mlops_stage3_task_type: mlopsStage3TaskTypeDraft,
       mlops_stage3_model: mlopsStage3ModelDraft,
       mlops_stage3_feature_fields: mlopsStage3SelectedFeatureFields,
@@ -13068,6 +14006,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_stage3_tuning_enabled: mlopsStage3TuningEnabledDraft,
       mlops_stage3_tuning_method: mlopsStage3TuningMethodDraft,
       mlops_stage3_tuning_params: serializeMLOpsStage3TuningParameters(mlopsStage3TuningParamsDraft),
+      mlops_stage3_explainability_method: mlopsStage3ExplainabilityMethodDraft,
       mlops_stage3_tracking_enabled: mlopsStage3TrackingEnabledDraft,
       mlops_stage3_track_versions: mlopsStage3TrackVersionsDraft,
       mlops_stage3_track_params: mlopsStage3TrackParamsDraft,
@@ -13077,6 +14016,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_mode: mlopsRuntimeModeDraft,
       mlops_prediction_field: mlopsPredictionFieldDraft,
       mlops_prediction_score_field: mlopsPredictionScoreFieldDraft,
+      mlops_top_influencing_features_field: mlopsTopInfluencingFeaturesFieldDraft,
+      mlops_top_influencing_features_limit: mlopsTopInfluencingFeaturesLimitDraft,
+      mlops_top_influencing_features_keys: mlopsTopInfluencingFeaturesKeysDraft,
       mlops_stage3_model_bundle: mlopsStage3ModelBundleDraft,
       mlops_stage4_gate_enabled: mlopsStage4GateEnabledDraft,
       mlops_stage4_min_accuracy: mlopsStage4MinAccuracyDraft,
@@ -13106,6 +14048,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlopsStage2TargetFieldDraft,
       mlopsStage2LabelFieldDraft,
       mlopsStage2SerializedConfig,
+      mlopsStage3ModelModeDraft,
+      mlopsStage3EnsembleModelsDraft,
       mlopsStage3TaskTypeDraft,
       mlopsStage3ModelDraft,
       mlopsStage3SelectedFeatureFields,
@@ -13133,6 +14077,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlopsStage3TuningEnabledDraft,
       mlopsStage3TuningMethodDraft,
       mlopsStage3TuningParamsDraft,
+      mlopsStage3ExplainabilityMethodDraft,
       mlopsStage3TrackingEnabledDraft,
       mlopsStage3TrackVersionsDraft,
       mlopsStage3TrackParamsDraft,
@@ -13142,6 +14087,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlopsRuntimeModeDraft,
       mlopsPredictionFieldDraft,
       mlopsPredictionScoreFieldDraft,
+      mlopsTopInfluencingFeaturesFieldDraft,
+      mlopsTopInfluencingFeaturesLimitDraft,
+      mlopsTopInfluencingFeaturesKeysDraft,
       mlopsStage3ModelBundleDraft,
       mlopsStage4GateEnabledDraft,
       mlopsStage4MinAccuracyDraft,
@@ -16679,6 +17627,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     if (nodeType !== 'mlops_transform' || !selectedNodeId) return
 
     const taskType = mlopsStage3TaskTypeDraft
+    const modelMode = mlopsStage3ModelModeDraft
     const featureFields = uniqueFieldNames(
       (mlopsStage3SelectedFeatureFields.length > 0
         ? mlopsStage3SelectedFeatureFields
@@ -16687,7 +17636,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         .map((item) => String(item || '').trim())
         .filter(Boolean),
     )
-    if (taskType !== 'forecasting' && featureFields.length <= 0) {
+    if (modelMode !== 'ensemble_pipeline' && taskType !== 'forecasting' && featureFields.length <= 0) {
       setMLOpsStage3RunError('No feature fields selected. Select at least one field from Pre-Processing output.')
       setMLOpsStage3RunSummary(null)
       return
@@ -16700,8 +17649,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       (taskType === 'forecasting' ? (forecastTargets[0] || mlopsStage3TargetFieldDraft) : mlopsStage3TargetFieldDraft) || '',
     ).trim()
     const targetRequired = taskType === 'classification' || taskType === 'regression' || taskType === 'forecasting'
-    if (targetRequired && !targetField && !(taskType === 'forecasting' && forecastTargets.length > 0)) {
+    if (modelMode !== 'ensemble_pipeline' && targetRequired && !targetField && !(taskType === 'forecasting' && forecastTargets.length > 0)) {
       setMLOpsStage3RunError('Target / Label field is required for selected task type.')
+      setMLOpsStage3RunSummary(null)
+      return
+    }
+    const ensembleModels = serializeMLOpsEnsembleModels(mlopsStage3EnsembleModelsDraft)
+    if (modelMode === 'ensemble_pipeline' && ensembleModels.length <= 0) {
+      setMLOpsStage3RunError('Add at least one ensemble model step.')
       setMLOpsStage3RunSummary(null)
       return
     }
@@ -16720,6 +17675,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         rows: rowsForTraining,
         task_type: taskType,
         model: String(mlopsStage3ModelDraft || '').trim(),
+        model_mode: modelMode,
+        ensemble_models: modelMode === 'ensemble_pipeline' ? ensembleModels : undefined,
         feature_fields: featureFields,
         target_field: targetField || undefined,
         target_fields: taskType === 'forecasting' ? forecastTargets : undefined,
@@ -16754,6 +17711,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           .map((item) => ({ name: item.name, values: item.values })),
         tracking_enabled: Boolean(mlopsStage3TrackingEnabledDraft),
         run_name: String(mlopsStage3RunNameDraft || '').trim() || undefined,
+        explainability_method: mlopsStage3ExplainabilityMethodDraft,
       })
 
       const backendSummary = (response?.summary || response || {}) as Record<string, unknown>
@@ -16811,6 +17769,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         feature_importance: Array.isArray(backendSummary.feature_importance)
           ? backendSummary.feature_importance as Array<Record<string, unknown>>
           : undefined,
+        top_influencing_features: Array.isArray(backendSummary.top_influencing_features)
+          ? backendSummary.top_influencing_features as Array<Record<string, unknown>>
+          : undefined,
+        explainability: backendSummary.explainability && typeof backendSummary.explainability === 'object'
+          ? backendSummary.explainability as Record<string, unknown>
+          : undefined,
         tuning_result: backendSummary.tuning_result && typeof backendSummary.tuning_result === 'object'
           ? backendSummary.tuning_result as Record<string, unknown>
           : undefined,
@@ -16821,6 +17785,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         runtime_model_bundle: backendSummary.runtime_model_bundle && typeof backendSummary.runtime_model_bundle === 'object'
           ? backendSummary.runtime_model_bundle as Record<string, unknown>
           : null,
+        model_mode: String(backendSummary.model_mode || modelMode),
+        model_summaries: Array.isArray(backendSummary.model_summaries)
+          ? backendSummary.model_summaries as Array<Record<string, unknown>>
+          : undefined,
       }
       setMLOpsStage3RunSummary(summary)
       setMLOpsStage3ModelBundleDraft(summary.runtime_model_bundle || null)
@@ -16841,6 +17809,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     resolveMLOpsTrainingRows,
     mlopsStage3SelectedFeatureFields,
     mlopsStage3AvailableFields,
+    mlopsStage3ModelModeDraft,
+    mlopsStage3EnsembleModelsDraft,
     mlopsStage3TaskTypeDraft,
     mlopsStage3TargetFieldDraft,
     mlopsStage3TargetFieldsDraft,
@@ -16863,6 +17833,96 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage3BatchSizeDraft,
     mlopsStage3RandomSeedDraft,
     mlopsStage3ModelDraft,
+    mlopsStage3TuningEnabledDraft,
+    mlopsStage3TuningMethodDraft,
+    mlopsStage3TuningParamsDraft,
+    mlopsStage3ExplainabilityMethodDraft,
+    mlopsStage3TrackingEnabledDraft,
+    mlopsStage3RunNameDraft,
+  ])
+
+  const runMLOpsSingleEnsembleModelTest = useCallback(async (model: MLOpsEnsembleModelConfig) => {
+    if (nodeType !== 'mlops_transform' || !selectedNodeId || !model) return
+    const featureFields = uniqueFieldNames((model.feature_fields || []).map((item) => String(item || '').trim()).filter(Boolean))
+    if (featureFields.length <= 0) {
+      setMLOpsStage3ModelRunErrors((prev) => ({ ...prev, [model.id]: 'Select at least one feature field before running this model.' }))
+      return
+    }
+    if ((model.task_type === 'classification' || model.task_type === 'regression' || model.task_type === 'forecasting') && !String(model.target_field || '').trim()) {
+      setMLOpsStage3ModelRunErrors((prev) => ({ ...prev, [model.id]: 'Target / Label field is required for this model.' }))
+      return
+    }
+    setMLOpsStage3ModelRunLoadingId(model.id)
+    setMLOpsStage3ModelRunErrors((prev) => ({ ...prev, [model.id]: '' }))
+    try {
+      const rowsForTraining = await resolveMLOpsTrainingRows()
+      if (rowsForTraining.length <= 0) {
+        setMLOpsStage3ModelRunErrors((prev) => ({ ...prev, [model.id]: 'No rows available for model test.' }))
+        return
+      }
+      const response = await api.getMLOpsNodeStage3Train({
+        rows: rowsForTraining,
+        task_type: model.task_type,
+        model: model.model,
+        model_mode: 'single',
+        feature_fields: featureFields,
+        target_field: String(model.target_field || '').trim() || undefined,
+        target_fields: model.task_type === 'forecasting' && String(model.target_field || '').trim()
+          ? [String(model.target_field || '').trim()]
+          : undefined,
+        forecast_date_field: model.task_type === 'forecasting' ? String(model.forecast_date_field || '').trim() || undefined : undefined,
+        forecast_horizon: model.task_type === 'forecasting' ? Math.max(1, Math.min(Math.trunc(Number(model.forecast_horizon || 30)), 3650)) : undefined,
+        forecast_frequency: model.task_type === 'forecasting' ? model.forecast_frequency : undefined,
+        forecast_auto_tune_orders: model.task_type === 'forecasting' ? Boolean(model.forecast_auto_tune_orders) : undefined,
+        forecast_order_search_max_evals: model.task_type === 'forecasting'
+          ? Math.max(1, Math.min(Math.trunc(Number(model.forecast_order_search_max_evals || 16)), 64))
+          : undefined,
+        train_test_split: Math.max(0.05, Math.min(Number(mlopsStage3TrainTestSplitDraft || 0.2), 0.5)),
+        cv_folds: Math.max(2, Math.min(Math.trunc(Number(mlopsStage3CvFoldsDraft || 5)), 20)),
+        cluster_count: Math.max(2, Math.min(Math.trunc(Number(mlopsStage3ClusterCountDraft || 4)), 100)),
+        epochs: Math.max(1, Math.trunc(Number(mlopsStage3EpochsDraft || 20))),
+        batch_size: Math.max(1, Math.trunc(Number(mlopsStage3BatchSizeDraft || 32))),
+        random_seed: Math.trunc(Number(mlopsStage3RandomSeedDraft || 42)),
+        tuning_enabled: Boolean(mlopsStage3TuningEnabledDraft),
+        tuning_method: mlopsStage3TuningMethodDraft,
+        tuning_params: serializeMLOpsStage3TuningParameters(mlopsStage3TuningParamsDraft)
+          .filter((item) => item.name)
+          .map((item) => ({ name: item.name, values: item.values })),
+        tracking_enabled: Boolean(mlopsStage3TrackingEnabledDraft),
+        run_name: `${String(mlopsStage3RunNameDraft || 'model_test').trim() || 'model_test'}:${model.name}`,
+        explainability_method: model.explainability_method,
+      })
+      const backendSummary = (response?.summary || response || {}) as Record<string, unknown>
+      setMLOpsStage3ModelRunSummaries((prev) => ({
+        ...prev,
+        [model.id]: {
+          ...backendSummary,
+          step_id: model.id,
+          step_name: model.name,
+          prediction_field: model.prediction_field,
+          score_field: model.score_field,
+        },
+      }))
+      setMLOpsStage3ModelRunErrors((prev) => ({ ...prev, [model.id]: '' }))
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to run model test.')
+      setMLOpsStage3ModelRunErrors((prev) => ({ ...prev, [model.id]: message }))
+    } finally {
+      setMLOpsStage3ModelRunLoadingId(null)
+    }
+  }, [
+    nodeType,
+    selectedNodeId,
+    resolveMLOpsTrainingRows,
+    mlopsStage3TrainTestSplitDraft,
+    mlopsStage3CvFoldsDraft,
+    mlopsStage3ClusterCountDraft,
+    mlopsStage3EpochsDraft,
+    mlopsStage3BatchSizeDraft,
+    mlopsStage3RandomSeedDraft,
     mlopsStage3TuningEnabledDraft,
     mlopsStage3TuningMethodDraft,
     mlopsStage3TuningParamsDraft,
@@ -17007,6 +18067,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_stage2_label_field: String(mlopsStage2LabelFieldDraft || '').trim(),
       mlops_stage2_field_configs: mlopsStage2SerializedConfig,
       mlops_stage2_artifact: mlopsStage2ArtifactDraft || null,
+      mlops_stage3_model_mode: mlopsStage3ModelModeDraft,
+      mlops_stage3_ensemble_models: serializeMLOpsEnsembleModels(mlopsStage3EnsembleModelsDraft),
       mlops_stage3_task_type: mlopsStage3TaskTypeDraft,
       mlops_stage3_model: String(mlopsStage3ModelDraft || '').trim(),
       mlops_stage3_feature_fields: mlopsStage3SelectedFeatureFields,
@@ -17045,6 +18107,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_stage3_tuning_enabled: mlopsStage3TuningEnabledDraft,
       mlops_stage3_tuning_method: mlopsStage3TuningMethodDraft,
       mlops_stage3_tuning_params: serializeMLOpsStage3TuningParameters(mlopsStage3TuningParamsDraft),
+      mlops_stage3_explainability_method: mlopsStage3ExplainabilityMethodDraft,
       mlops_stage3_tracking_enabled: mlopsStage3TrackingEnabledDraft,
       mlops_stage3_track_versions: mlopsStage3TrackVersionsDraft,
       mlops_stage3_track_params: mlopsStage3TrackParamsDraft,
@@ -17054,6 +18117,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_mode: mlopsRuntimeModeDraft,
       mlops_prediction_field: String(mlopsPredictionFieldDraft || '').trim() || 'prediction',
       mlops_prediction_score_field: String(mlopsPredictionScoreFieldDraft || '').trim() || 'prediction_score',
+      mlops_top_influencing_features_field: String(mlopsTopInfluencingFeaturesFieldDraft || '').trim() || 'top_influencing_features',
+      mlops_top_influencing_features_limit: mlopsTopInfluencingFeaturesLimitDraft,
+      mlops_top_influencing_features_keys: mlopsTopInfluencingFeaturesKeysDraft,
       mlops_stage3_model_bundle: mlopsStage3ModelBundleDraft || (mlopsStage3RunSummary?.runtime_model_bundle || null),
       mlops_stage3_viz_type: mlopsStage3VizTypeDraft,
       mlops_stage3_table_view: mlopsStage3TableViewDraft,
@@ -17098,6 +18164,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage2LabelFieldDraft,
     mlopsStage2SerializedConfig,
     mlopsStage2ArtifactDraft,
+    mlopsStage3ModelModeDraft,
+    mlopsStage3EnsembleModelsDraft,
     mlopsStage3TaskTypeDraft,
     mlopsStage3ModelDraft,
     mlopsStage3SelectedFeatureFields,
@@ -17135,6 +18203,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsRuntimeModeDraft,
     mlopsPredictionFieldDraft,
     mlopsPredictionScoreFieldDraft,
+    mlopsTopInfluencingFeaturesFieldDraft,
+    mlopsTopInfluencingFeaturesLimitDraft,
+    mlopsTopInfluencingFeaturesKeysDraft,
     mlopsStage3ModelBundleDraft,
     mlopsStage3VizTypeDraft,
     mlopsStage3TableViewDraft,
@@ -17159,6 +18230,49 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     updateNodeConfig,
   ])
 
+  const saveMLOpsEnsembleModelConfiguration = useCallback((modelsOverride?: MLOpsEnsembleModelConfig[]) => {
+    if (nodeType !== 'mlops_transform' || !selectedNodeId) return
+    const modelsToSave = modelsOverride || mlopsStage3EnsembleModelsDraft
+    setMLOpsStage3ModelModeDraft('ensemble_pipeline')
+    setMLOpsStage3EnsembleModelsDraft(modelsToSave)
+    updateNodeConfig(selectedNodeId, {
+      mlops_stage3_model_mode: 'ensemble_pipeline',
+      mlops_stage3_ensemble_models: serializeMLOpsEnsembleModels(modelsToSave),
+      mlops_stage3_model_bundle: mlopsStage3ModelBundleDraft || (mlopsStage3RunSummary?.runtime_model_bundle || null),
+      mlops_stage3_last_run_summary: mlopsStage3RunSummary || null,
+    })
+    notification.success({
+      message: 'Model configuration saved',
+      description: 'The ensemble model configuration was saved to this MLOps node.',
+      placement: 'bottomRight',
+      duration: 2,
+    })
+  }, [
+    nodeType,
+    selectedNodeId,
+    mlopsStage3EnsembleModelsDraft,
+    mlopsStage3ModelBundleDraft,
+    mlopsStage3RunSummary,
+    updateNodeConfig,
+  ])
+
+  const deleteMLOpsEnsembleModelFromOverlay = useCallback((modelId: string) => {
+    const nextModels = mlopsStage3EnsembleModelsDraft.filter((item) => item.id !== modelId)
+    setMLOpsStage3EnsembleModelsDraft(nextModels)
+    setMLOpsStage3ModelRunErrors((prev) => {
+      const next = { ...prev }
+      delete next[modelId]
+      return next
+    })
+    setMLOpsStage3ModelRunSummaries((prev) => {
+      const next = { ...prev }
+      delete next[modelId]
+      return next
+    })
+    setMLOpsStage3EnsembleModelModalId(null)
+    saveMLOpsEnsembleModelConfiguration(nextModels)
+  }, [mlopsStage3EnsembleModelsDraft, saveMLOpsEnsembleModelConfiguration])
+
   const openMLOpsStudio = useCallback(() => {
     if (nodeType !== 'mlops_transform' || !selectedNodeId) return
     const stage2ConfigMap: Record<string, MLOpsStage2FieldConfig> = {}
@@ -17177,6 +18291,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setMLOpsStage2PreviewLimitDraft(mlopsStage2PreviewLimitConfigured)
     setMLOpsStage2TargetFieldDraft(mlopsStage2TargetFieldConfigured)
     setMLOpsStage2LabelFieldDraft(mlopsStage2LabelFieldConfigured)
+    setMLOpsStage3ModelModeDraft(mlopsStage3ModelModeConfigured)
+    setMLOpsStage3EnsembleModelsDraft(mlopsStage3EnsembleModelsConfigured)
     setMLOpsStage3TaskTypeDraft(mlopsStage3TaskTypeConfigured)
     setMLOpsStage3ModelDraft(
       mlopsStage3ModelConfigured
@@ -17222,6 +18338,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setMLOpsStage3TuningEnabledDraft(mlopsStage3TuningEnabledConfigured)
     setMLOpsStage3TuningMethodDraft(mlopsStage3TuningMethodConfigured)
     setMLOpsStage3TuningParamsDraft(mlopsStage3TuningParamsConfigured)
+    setMLOpsStage3ExplainabilityMethodDraft(mlopsStage3ExplainabilityMethodConfigured)
     setMLOpsStage3TrackingEnabledDraft(mlopsStage3TrackingEnabledConfigured)
     setMLOpsStage3TrackVersionsDraft(mlopsStage3TrackVersionsConfigured)
     setMLOpsStage3TrackParamsDraft(mlopsStage3TrackParamsConfigured)
@@ -17231,6 +18348,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setMLOpsRuntimeModeDraft(mlopsRuntimeModeConfigured)
     setMLOpsPredictionFieldDraft(mlopsPredictionFieldConfigured)
     setMLOpsPredictionScoreFieldDraft(mlopsPredictionScoreFieldConfigured)
+    setMLOpsTopInfluencingFeaturesFieldDraft(mlopsTopInfluencingFeaturesFieldConfigured)
+    setMLOpsTopInfluencingFeaturesLimitDraft(mlopsTopInfluencingFeaturesLimitConfigured)
+    setMLOpsTopInfluencingFeaturesKeysDraft(mlopsTopInfluencingFeaturesKeysConfigured)
     setMLOpsStage3ModelBundleDraft(
       mlopsStage3ModelBundleConfigured
       || (mlopsStage3LastRunSummaryConfigured?.runtime_model_bundle || null),
@@ -17298,6 +18418,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_stage2_target_field: mlopsStage2TargetFieldConfigured,
       mlops_stage2_label_field: mlopsStage2LabelFieldConfigured,
       mlops_stage2_field_configs: serializeMLOpsStage2FieldConfigMap(stage2ConfigMap),
+      mlops_stage3_model_mode: mlopsStage3ModelModeConfigured,
+      mlops_stage3_ensemble_models: serializeMLOpsEnsembleModels(mlopsStage3EnsembleModelsConfigured),
       mlops_stage3_task_type: mlopsStage3TaskTypeConfigured,
       mlops_stage3_model: mlopsStage3ModelConfigured || MLOPS_STAGE3_MODEL_CATALOG[mlopsStage3TaskTypeConfigured]?.[0] || '',
       mlops_stage3_feature_fields: mlopsStage3FeatureFieldsConfigured.length > 0
@@ -17328,6 +18450,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_stage3_tuning_enabled: mlopsStage3TuningEnabledConfigured,
       mlops_stage3_tuning_method: mlopsStage3TuningMethodConfigured,
       mlops_stage3_tuning_params: serializeMLOpsStage3TuningParameters(mlopsStage3TuningParamsConfigured),
+      mlops_stage3_explainability_method: mlopsStage3ExplainabilityMethodConfigured,
       mlops_stage3_tracking_enabled: mlopsStage3TrackingEnabledConfigured,
       mlops_stage3_track_versions: mlopsStage3TrackVersionsConfigured,
       mlops_stage3_track_params: mlopsStage3TrackParamsConfigured,
@@ -17337,6 +18460,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_mode: mlopsRuntimeModeConfigured,
       mlops_prediction_field: mlopsPredictionFieldConfigured,
       mlops_prediction_score_field: mlopsPredictionScoreFieldConfigured,
+      mlops_top_influencing_features_field: mlopsTopInfluencingFeaturesFieldConfigured,
+      mlops_top_influencing_features_limit: mlopsTopInfluencingFeaturesLimitConfigured,
+      mlops_top_influencing_features_keys: mlopsTopInfluencingFeaturesKeysConfigured,
       mlops_stage3_model_bundle: mlopsStage3ModelBundleConfigured
         || (mlopsStage3LastRunSummaryConfigured?.runtime_model_bundle || null),
       mlops_stage3_viz_type: mlopsStage3VizTypeConfigured,
@@ -17381,6 +18507,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage2PreviewLimitConfigured,
     mlopsStage2TargetFieldConfigured,
     mlopsStage2LabelFieldConfigured,
+    mlopsStage3ModelModeConfigured,
+    mlopsStage3EnsembleModelsConfigured,
     mlopsStage3TaskTypeConfigured,
     mlopsStage3ModelConfigured,
     mlopsStage3FeatureFieldsConfigured,
@@ -17404,6 +18532,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage3TuningEnabledConfigured,
     mlopsStage3TuningMethodConfigured,
     mlopsStage3TuningParamsConfigured,
+    mlopsStage3ExplainabilityMethodConfigured,
     mlopsStage3TrackingEnabledConfigured,
     mlopsStage3TrackVersionsConfigured,
     mlopsStage3TrackParamsConfigured,
@@ -17413,6 +18542,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsRuntimeModeConfigured,
     mlopsPredictionFieldConfigured,
     mlopsPredictionScoreFieldConfigured,
+    mlopsTopInfluencingFeaturesFieldConfigured,
+    mlopsTopInfluencingFeaturesLimitConfigured,
+    mlopsTopInfluencingFeaturesKeysConfigured,
     mlopsStage3ModelBundleConfigured,
     mlopsStage3VizTypeConfigured,
     mlopsStage3TableViewConfigured,
@@ -28283,13 +29415,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         selected features: {mlopsStage3SelectedFeatureFields.length}
                       </Tag>
                       <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9', marginInlineEnd: 0 }}>
-                        rows: {mlopsStage3RunSummary?.ran
-                          ? `${Number(mlopsStage3RunSummary.input_rows || 0).toLocaleString()} trained`
+                        rows: {mlopsStage3DisplayOutcomeSummary.ran
+                          ? `${Number(mlopsStage3DisplayOutcomeSummary.inputRows || 0).toLocaleString()} trained`
                           : `${mlopsPreviewRows.length.toLocaleString()} preview`}
                       </Tag>
                       <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b', marginInlineEnd: 0 }}>
-                        split: {mlopsStage3RunSummary?.ran
-                          ? `${mlopsStage3RunSummary.train_rows}/${mlopsStage3RunSummary.validate_rows || 0}/${mlopsStage3RunSummary.test_rows}`
+                        split: {mlopsStage3DisplayOutcomeSummary.ran
+                          ? `${mlopsStage3DisplayOutcomeSummary.trainRows}/${mlopsStage3DisplayOutcomeSummary.validateRows || 0}/${mlopsStage3DisplayOutcomeSummary.testRows}`
                           : 'not run'}
                       </Tag>
                     </Space>
@@ -28298,23 +29430,48 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         {mlopsStage3RunError}
                       </Text>
                     ) : null}
-                    {mlopsStage3RunSummary ? (
-                      <Input.TextArea
-                        readOnly
-                        rows={mlopsCompactView ? 5 : 7}
-                        value={JSON.stringify(mlopsStage3RunSummary, null, 2)}
-                        style={{
-                          marginTop: 8,
-                          background: 'var(--app-input-bg)',
-                          border: '1px solid var(--app-border-strong)',
-                          color: 'var(--app-text)',
-                          fontFamily: 'monospace',
-                          fontSize: 12,
-                        }}
-                      />
+                    {mlopsStage3TrainingJsonView ? (
+                      <div style={{
+                        marginTop: 8,
+                        border: '1px solid var(--app-border-strong)',
+                        borderRadius: 8,
+                        overflow: 'hidden',
+                        background: 'var(--app-input-bg)',
+                        resize: 'vertical',
+                        minHeight: '60vh',
+                        height: '60vh',
+                        maxHeight: 'calc(100vh - 260px)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                      }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, padding: '6px 8px', borderBottom: '1px solid var(--app-border-strong)' }}>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Training JSON View</Text>
+                          <Tag style={{ marginInlineEnd: 0 }}>
+                            model tests: {mlopsStage3DisplayModelSummaries.length}
+                          </Tag>
+                        </div>
+                        <Editor
+                          height="100%"
+                          defaultLanguage="json"
+                          value={mlopsStage3TrainingJsonView}
+                          theme="vs-dark"
+                          options={{
+                            readOnly: true,
+                            minimap: { enabled: false },
+                            fontSize: 12,
+                            lineNumbers: 'off',
+                            folding: true,
+                            scrollBeyondLastLine: false,
+                            wordWrap: 'on',
+                            overviewRulerLanes: 0,
+                            renderLineHighlight: 'none',
+                          }}
+                        />
+                      </div>
                     ) : null}
                   </div>
 
+                  {mlopsStage3ModelModeDraft === 'single' ? (
                   <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
                     <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Input Features (from Pre-Processing)</Text>
                     <Select
@@ -28335,11 +29492,34 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       ))}
                     </div>
                   </div>
+                  ) : null}
                 </div>
 
                 <div style={{ minWidth: 0, display: 'grid', gap: 10 }}>
                   <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
                     <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Model Selection</Text>
+                    <Tabs
+                      size="small"
+                      activeKey={mlopsStage3ModelModeDraft}
+                      onChange={(key) => activateMLOpsStage3ModelMode(String(key || 'single') === 'ensemble_pipeline' ? 'ensemble_pipeline' : 'single')}
+                      items={[
+                        { key: 'single', label: 'Single Pipeline' },
+                        { key: 'ensemble_pipeline', label: 'Ensemble Pipeline' },
+                      ]}
+                      style={{ marginTop: 4 }}
+                    />
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                      Test run and Save use only the active pipeline tab.
+                    </Text>
+                    <Space size={8} wrap style={{ marginTop: 8 }}>
+                      <Tag color={mlopsStage3ModelModeDraft === 'single' ? 'blue' : undefined} style={{ marginInlineEnd: 0 }}>
+                        Single: {mlopsStage3ModelModeDraft === 'single' ? 'active' : 'inactive'}
+                      </Tag>
+                      <Tag color={mlopsStage3ModelModeDraft === 'ensemble_pipeline' ? 'purple' : undefined} style={{ marginInlineEnd: 0 }}>
+                        Ensemble: {mlopsStage3ModelModeDraft === 'ensemble_pipeline' ? 'active' : 'inactive'}
+                      </Tag>
+                    </Space>
+                    {mlopsStage3ModelModeDraft === 'single' ? (
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 8 }}>
                       <div>
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Task Type</Text>
@@ -28363,8 +29543,985 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         />
                       </div>
                     </div>
+                    ) : null}
                   </div>
 
+                  {mlopsStage3ModelModeDraft === 'ensemble_pipeline' ? (
+                    <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Ensemble Model Pipeline</Text>
+                        <Button
+                          size="small"
+                          icon={<PlusSquareOutlined />}
+                          onClick={() => {
+                            const next = createMLOpsEnsembleModel({}, mlopsStage3EnsembleModelsDraft.length)
+                            setMLOpsStage3NewEnsembleModelDraft(next)
+                            setMLOpsStage3EnsembleModelModalId(null)
+                          }}
+                        >
+                          Add Model
+                        </Button>
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(120px, 1fr))', gap: 8, marginTop: 8 }}>
+                        {[
+                          ['Models', mlopsStage3EnsembleDashboard.total],
+                          ['Enabled', mlopsStage3EnsembleDashboard.enabled],
+                          ['Disabled', mlopsStage3EnsembleDashboard.disabled],
+                          ['Trained Steps', mlopsStage3EnsembleDashboard.trainedSteps],
+                        ].map(([label, value]) => (
+                          <div key={String(label)} style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: 8, background: 'var(--app-input-bg)' }}>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block' }}>{String(label)}</Text>
+                            <Text style={{ color: 'var(--app-text)', fontSize: 20, fontWeight: 700 }}>{String(value)}</Text>
+                          </div>
+                        ))}
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 8 }}>
+                        <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: 8, minHeight: 160, background: 'var(--app-input-bg)' }}>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Training / production overview</Text>
+                          {mlopsStage3EnsembleDashboard.graph ? (
+                            <Plot
+                              data={mlopsStage3EnsembleDashboard.graph.data as any[]}
+                              layout={mlopsStage3EnsembleDashboard.graph.layout as any}
+                              config={{ responsive: true, displayModeBar: false, displaylogo: false }}
+                              style={{ width: '100%', height: 180 }}
+                              useResizeHandler
+                            />
+                          ) : (
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12, display: 'block', marginTop: 20 }}>
+                              Run the active ensemble pipeline to populate training and production monitoring graphs.
+                            </Text>
+                          )}
+                        </div>
+                        <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: 8, background: 'var(--app-input-bg)' }}>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Model type summary</Text>
+                          <div style={{ display: 'grid', gap: 6, marginTop: 8 }}>
+                            {(mlopsStage3EnsembleDashboard.typeCounts.length > 0 ? mlopsStage3EnsembleDashboard.typeCounts : [{ type: 'none', count: 0 }]).map((item) => (
+                              <div key={item.type} style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                                <Text style={{ color: 'var(--app-text)', fontSize: 12 }}>{item.type}</Text>
+                                <Tag style={{ marginInlineEnd: 0 }}>{item.count}</Tag>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 8, marginTop: 8 }}>
+                        {mlopsStage3EnsembleModelsDraft.map((model, modelIndex) => {
+                          const summary = mlopsStage3ModelSummaryForId(model.id)
+                          const outcome = getMLOpsPrimaryOutcomeMetric(summary, model.task_type)
+                          return (
+                            <button
+                              key={`widget_${model.id}`}
+                              type="button"
+                              onClick={() => setMLOpsStage3EnsembleModelModalId(model.id)}
+                              style={{
+                                textAlign: 'left',
+                                border: '1px solid var(--app-border)',
+                                borderRadius: 6,
+                                padding: 8,
+                                background: 'var(--app-input-bg)',
+                                cursor: 'pointer',
+                              }}
+                            >
+                              <Space size={6} wrap>
+                                <Tag style={{ marginInlineEnd: 0 }}>#{modelIndex + 1}</Tag>
+                                <Tag color={model.enabled ? 'green' : 'red'} style={{ marginInlineEnd: 0 }}>{model.enabled ? 'enabled' : 'disabled'}</Tag>
+                                <Tag style={{ marginInlineEnd: 0 }}>{model.task_type}</Tag>
+                              </Space>
+                              <Text style={{ color: 'var(--app-text)', fontWeight: 600, display: 'block', marginTop: 6 }}>{model.name}</Text>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block' }}>{model.model || 'model not selected'}</Text>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', marginTop: 6 }}>
+                                features: {model.feature_fields.length} | label: {model.target_field || 'not required'}
+                              </Text>
+                              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginTop: 8 }}>
+                                <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 6, padding: 6, background: 'var(--app-panel-bg)' }}>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10, display: 'block', textTransform: 'capitalize' }}>
+                                    {outcome.label}{outcome.source ? ` (${outcome.source})` : ''}
+                                  </Text>
+                                  <Text style={{ color: outcome.value === '-' ? 'var(--app-text-subtle)' : '#22c55e', fontSize: 16, fontWeight: 700 }}>
+                                    {outcome.value}
+                                  </Text>
+                                </div>
+                                <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 6, padding: 6, background: 'var(--app-panel-bg)' }}>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10, display: 'block' }}>Train / Test</Text>
+                                  <Text style={{ color: 'var(--app-text)', fontSize: 16, fontWeight: 700 }}>
+                                    {String(summary?.train_rows ?? '-')} / {String(summary?.test_rows ?? '-')}
+                                  </Text>
+                                </div>
+                              </div>
+                            </button>
+                          )
+                        })}
+                      </div>
+                      <div style={{ display: 'none' }}>
+                        {mlopsStage3EnsembleModelsDraft.map((model, modelIndex) => (
+                          <div key={model.id} style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: 8, display: 'grid', gap: 8 }}>
+                            <div style={{ display: 'grid', gridTemplateColumns: '34px 1fr 180px 220px auto', gap: 8, alignItems: 'end' }}>
+                              <Switch size="small" checked={model.enabled} onChange={(checked) => updateMLOpsEnsembleModel(model.id, { enabled: Boolean(checked) })} />
+                              <Input size="small" value={model.name} onChange={(e) => updateMLOpsEnsembleModel(model.id, { name: String(e.target.value || '') })} placeholder={`Model ${modelIndex + 1}`} />
+                              <Select
+                                size="small"
+                                value={model.task_type}
+                                options={MLOPS_STAGE3_TASK_OPTIONS as Array<{ value: MLOpsEnsembleModelConfig['task_type']; label: string }>}
+                                onChange={(value) => updateMLOpsEnsembleModel(model.id, { task_type: String(value || 'classification') as MLOpsEnsembleModelConfig['task_type'] })}
+                              />
+                              <Select
+                                size="small"
+                                value={model.model || undefined}
+                                options={ensembleModelOptionsForTask(model.task_type)}
+                                onChange={(value) => updateMLOpsEnsembleModel(model.id, { model: String(value || '') })}
+                                placeholder="Model"
+                              />
+                              <Button
+                                size="small"
+                                danger
+                                icon={<DeleteOutlined />}
+                                onClick={() => setMLOpsStage3EnsembleModelsDraft((prev) => prev.filter((item) => item.id !== model.id))}
+                              />
+                            </div>
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 220px 180px 180px', gap: 8 }}>
+                              <div>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Feature fields</Text>
+                                <Select
+                                  mode="multiple"
+                                  size="small"
+                                  value={model.feature_fields}
+                                  options={mlopsStage3EnsembleFeatureOptions}
+                                  onChange={(values) => updateMLOpsEnsembleModel(model.id, { feature_fields: uniqueFieldNames((values || []).map((item) => String(item || '').trim()).filter(Boolean)) })}
+                                  maxTagCount={4}
+                                  style={{ width: '100%', marginTop: 4 }}
+                                />
+                              </div>
+                              <div>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Label field</Text>
+                                <Select
+                                  size="small"
+                                  allowClear
+                                  showSearch
+                                  optionFilterProp="label"
+                                  value={model.target_field || undefined}
+                                  options={mlopsStage3EnsembleFeatureOptions}
+                                  onChange={(value) => updateMLOpsEnsembleModel(model.id, { target_field: String(value || '') })}
+                                  disabled={model.task_type === 'clustering' || model.task_type === 'anomaly_detection'}
+                                  style={{ width: '100%', marginTop: 4 }}
+                                />
+                              </div>
+                              <div>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Prediction field</Text>
+                                <Input size="small" value={model.prediction_field} onChange={(e) => updateMLOpsEnsembleModel(model.id, { prediction_field: String(e.target.value || '') })} style={{ marginTop: 4 }} />
+                              </div>
+                              <div>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Score field</Text>
+                                <Input size="small" value={model.score_field} onChange={(e) => updateMLOpsEnsembleModel(model.id, { score_field: String(e.target.value || '') })} style={{ marginTop: 4 }} />
+                              </div>
+                            </div>
+                            <div style={{ display: 'grid', gridTemplateColumns: '180px 1fr 120px', gap: 8 }}>
+                              <Select
+                                size="small"
+                                value={model.explainability_method}
+                                options={MLOPS_STAGE3_EXPLAINABILITY_METHOD_OPTIONS}
+                                onChange={(value) => updateMLOpsEnsembleModel(model.id, { explainability_method: String(value || 'off') as MLOpsStage3ExplainabilityMethod })}
+                              />
+                              <Input size="small" value={model.influence_field} onChange={(e) => updateMLOpsEnsembleModel(model.id, { influence_field: String(e.target.value || '') })} placeholder="influence field" disabled={model.explainability_method === 'off'} />
+                              <InputNumber size="small" min={1} max={50} value={model.influence_limit} onChange={(value) => updateMLOpsEnsembleModel(model.id, { influence_limit: Number(value || 5) })} disabled={model.explainability_method === 'off'} style={{ width: '100%' }} />
+                            </div>
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                              {(['pre_rules', 'post_rules'] as const).map((scope) => (
+                                <div key={`${model.id}_${scope}`} style={{ borderTop: '1px dashed var(--app-border)', paddingTop: 8 }}>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{scope === 'pre_rules' ? 'Pre-processing rules' : 'Post-processing rules'}</Text>
+                                    <Button size="small" onClick={() => updateMLOpsEnsembleModel(model.id, { [scope]: [...model[scope], createMLOpsRule()] } as Partial<MLOpsEnsembleModelConfig>)}>Add Rule</Button>
+                                  </div>
+                                  <div style={{ display: 'grid', gap: 6, marginTop: 6 }}>
+                                    {model[scope].map((rule) => (
+                                      <div key={rule.id} style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: 6, display: 'grid', gap: 6 }}>
+                                        <div style={{ display: 'grid', gridTemplateColumns: '34px 90px 90px auto', gap: 6, alignItems: 'center' }}>
+                                          <Switch size="small" checked={rule.enabled} onChange={(checked) => updateMLOpsEnsembleRule(model.id, scope, rule.id, { enabled: Boolean(checked) })} />
+                                          <Select size="small" value={rule.join} options={[{ value: 'all', label: 'All' }, { value: 'any', label: 'Any' }]} onChange={(value) => updateMLOpsEnsembleRule(model.id, scope, rule.id, { join: String(value || 'all') as 'all' | 'any' })} />
+                                          <Select size="small" value={rule.action || 'apply'} options={[{ value: 'apply', label: 'Apply' }, { value: 'drop', label: 'Drop row' }]} onChange={(value) => updateMLOpsEnsembleRule(model.id, scope, rule.id, { action: String(value || 'apply') as 'apply' | 'drop' })} />
+                                          <Button size="small" danger onClick={() => updateMLOpsEnsembleModel(model.id, { [scope]: model[scope].filter((item) => item.id !== rule.id) } as Partial<MLOpsEnsembleModelConfig>)}>Remove</Button>
+                                        </div>
+                                        {rule.conditions.map((condition) => (
+                                          <div key={condition.id} style={{ display: 'grid', gridTemplateColumns: '1fr 120px 1fr auto', gap: 6 }}>
+                                            <Select size="small" showSearch allowClear optionFilterProp="label" value={condition.field || undefined} options={mlopsStage3EnsembleFeatureOptions} onChange={(value) => updateMLOpsEnsembleRuleCondition(model.id, scope, rule.id, condition.id, { field: String(value || '') })} placeholder="field" />
+                                            <Select size="small" value={condition.operator} options={['equals', 'not_equals', 'contains', 'gt', 'gte', 'lt', 'lte', 'empty', 'not_empty'].map((op) => ({ value: op, label: op }))} onChange={(value) => updateMLOpsEnsembleRuleCondition(model.id, scope, rule.id, condition.id, { operator: String(value || 'equals') })} />
+                                            <Input size="small" value={condition.value} onChange={(e) => updateMLOpsEnsembleRuleCondition(model.id, scope, rule.id, condition.id, { value: String(e.target.value || '') })} placeholder="value" />
+                                            <Button size="small" onClick={() => updateMLOpsEnsembleRule(model.id, scope, rule.id, { conditions: rule.conditions.filter((item) => item.id !== condition.id) })}>-</Button>
+                                          </div>
+                                        ))}
+                                        <Button size="small" onClick={() => updateMLOpsEnsembleRule(model.id, scope, rule.id, { conditions: [...rule.conditions, createMLOpsRuleCondition()] })}>Add Condition</Button>
+                                        {rule.action !== 'drop' ? (
+                                          <>
+                                            {rule.actions.map((action) => (
+                                              <div key={action.id} style={{ display: 'grid', gridTemplateColumns: '1fr 90px 1fr auto', gap: 6 }}>
+                                                <Select size="small" showSearch allowClear optionFilterProp="label" value={action.field || undefined} options={mlopsStage3EnsembleFeatureOptions} onChange={(value) => updateMLOpsEnsembleRuleAction(model.id, scope, rule.id, action.id, { field: String(value || '') })} placeholder="set field" />
+                                                <Select size="small" value={action.mode} options={[{ value: 'literal', label: 'Literal' }, { value: 'field', label: 'Field' }, { value: 'template', label: 'Template' }]} onChange={(value) => updateMLOpsEnsembleRuleAction(model.id, scope, rule.id, action.id, { mode: String(value || 'literal') as MLOpsRuleAction['mode'] })} />
+                                                {action.mode === 'field' ? (
+                                                  <Select size="small" showSearch allowClear optionFilterProp="label" value={action.value || undefined} options={mlopsStage3EnsembleFeatureOptions} onChange={(value) => updateMLOpsEnsembleRuleAction(model.id, scope, rule.id, action.id, { value: String(value || '') })} placeholder="source field" />
+                                                ) : (
+                                                  <Input size="small" value={action.value} onChange={(e) => updateMLOpsEnsembleRuleAction(model.id, scope, rule.id, action.id, { value: String(e.target.value || '') })} placeholder={action.mode === 'template' ? 'template value, e.g. High risk {score}' : 'value'} />
+                                                )}
+                                                <Button size="small" onClick={() => updateMLOpsEnsembleRule(model.id, scope, rule.id, { actions: rule.actions.filter((item) => item.id !== action.id) })}>-</Button>
+                                              </div>
+                                            ))}
+                                            <Button size="small" onClick={() => updateMLOpsEnsembleRule(model.id, scope, rule.id, { actions: [...rule.actions, createMLOpsRuleAction()] })}>Add Action</Button>
+                                          </>
+                                        ) : null}
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                            <div style={{ display: 'grid', gridTemplateColumns: '34px 180px 1fr', gap: 8, alignItems: 'center' }}>
+                              <Switch size="small" checked={model.recommendation.enabled} onChange={(checked) => updateMLOpsEnsembleModel(model.id, { recommendation: { ...model.recommendation, enabled: Boolean(checked) } })} />
+                              <Input size="small" value={model.recommendation.field} onChange={(e) => updateMLOpsEnsembleModel(model.id, { recommendation: { ...model.recommendation, field: String(e.target.value || '') } })} placeholder="recommendation field" disabled={!model.recommendation.enabled} />
+                              <Input size="small" value={model.recommendation.template} onChange={(e) => updateMLOpsEnsembleModel(model.id, { recommendation: { ...model.recommendation, template: String(e.target.value || '') } })} placeholder="Recommendation template using {prediction_field} or {score_field}" disabled={!model.recommendation.enabled} />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                      {mlopsStage3DisplayModelSummaries.length > 0 ? (
+                        <div style={{ marginTop: 8, borderTop: '1px dashed var(--app-border)', paddingTop: 8 }}>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Per-model training and evaluation</Text>
+                          <Table
+                            size="small"
+                            bordered
+                            pagination={false}
+                            rowKey={(row, index) => String((row as Record<string, unknown>).step_id || index)}
+                            style={{ marginTop: 6 }}
+                            columns={[
+                              {
+                                title: 'Step',
+                                dataIndex: 'step_name',
+                                key: 'step_name',
+                                render: (_value: unknown, row: Record<string, unknown>) => String(row.step_name || row.model || ''),
+                              },
+                              {
+                                title: 'Task',
+                                dataIndex: 'task_type',
+                                key: 'task_type',
+                                render: (value: unknown) => String(value || ''),
+                              },
+                              {
+                                title: 'Model',
+                                dataIndex: 'model',
+                                key: 'model',
+                                render: (value: unknown) => String(value || ''),
+                              },
+                              {
+                                title: 'Train Metrics',
+                                dataIndex: 'train_metrics',
+                                key: 'train_metrics',
+                                render: (value: unknown) => (
+                                  <Text style={{ color: 'var(--app-text)', fontSize: 11, fontFamily: 'monospace' }}>
+                                    {JSON.stringify(value || {})}
+                                  </Text>
+                                ),
+                              },
+                              {
+                                title: 'Test Metrics',
+                                dataIndex: 'test_metrics',
+                                key: 'test_metrics',
+                                render: (value: unknown) => (
+                                  <Text style={{ color: 'var(--app-text)', fontSize: 11, fontFamily: 'monospace' }}>
+                                    {JSON.stringify(value || {})}
+                                  </Text>
+                                ),
+                              },
+                            ] as any[]}
+                            dataSource={mlopsStage3DisplayModelSummaries}
+                          />
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  <Modal
+                    open={Boolean(selectedMLOpsEnsembleModel)}
+                    title={selectedMLOpsEnsembleModel ? `${selectedMLOpsEnsembleModelIsNew ? 'New Model' : 'Configure'}: ${selectedMLOpsEnsembleModel.name}` : 'Configure Model'}
+                    onCancel={() => {
+                      setMLOpsStage3EnsembleModelModalId(null)
+                      setMLOpsStage3NewEnsembleModelDraft(null)
+                    }}
+                    footer={[
+                      selectedMLOpsEnsembleModel && !selectedMLOpsEnsembleModelIsNew ? (
+                        <Popconfirm
+                          key="delete"
+                          title="Delete this model?"
+                          okText="Delete"
+                          cancelText="Cancel"
+                          okButtonProps={{ danger: true }}
+                          onConfirm={() => deleteMLOpsEnsembleModelFromOverlay(selectedMLOpsEnsembleModel.id)}
+                        >
+                          <Button danger icon={<DeleteOutlined />}>Delete</Button>
+                        </Popconfirm>
+                      ) : null,
+                      selectedMLOpsEnsembleModel ? (
+                        <Button
+                          key="test"
+                          loading={mlopsStage3ModelRunLoadingId === selectedMLOpsEnsembleModel.id}
+                          onClick={() => void runMLOpsSingleEnsembleModelTest(selectedMLOpsEnsembleModel)}
+                        >
+                          Run Model Test
+                        </Button>
+                      ) : null,
+                      <Button
+                        key="close"
+                        onClick={() => {
+                          setMLOpsStage3EnsembleModelModalId(null)
+                          setMLOpsStage3NewEnsembleModelDraft(null)
+                        }}
+                      >
+                        Close
+                      </Button>,
+                      <Button
+                        key="save"
+                        type="primary"
+                        onClick={() => {
+                          if (mlopsStage3NewEnsembleModelDraft) {
+                            const nextModels = [...mlopsStage3EnsembleModelsDraft, mlopsStage3NewEnsembleModelDraft]
+                            setMLOpsStage3EnsembleModelsDraft(nextModels)
+                            saveMLOpsEnsembleModelConfiguration(nextModels)
+                            setMLOpsStage3NewEnsembleModelDraft(null)
+                          } else {
+                            saveMLOpsEnsembleModelConfiguration()
+                          }
+                          setMLOpsStage3EnsembleModelModalId(null)
+                        }}
+                      >
+                        Save
+                      </Button>,
+                    ]}
+                    centered
+                    width="96vw"
+                    styles={{
+                      content: {
+                        padding: 0,
+                        borderRadius: 12,
+                        overflow: 'hidden',
+                        border: '1px solid var(--app-border-strong)',
+                        background: 'var(--app-panel-bg)',
+                        height: '94vh',
+                        display: 'flex',
+                        flexDirection: 'column',
+                      },
+                      header: {
+                        margin: 0,
+                        padding: '12px 16px',
+                        borderBottom: '1px solid var(--app-border-strong)',
+                        background: 'var(--app-card-bg)',
+                      },
+                      body: {
+                        flex: 1,
+                        minHeight: 0,
+                        overflowY: 'auto',
+                        padding: 12,
+                        background: 'var(--app-bg)',
+                      },
+                      footer: {
+                        margin: 0,
+                        padding: '10px 16px',
+                        borderTop: '1px solid var(--app-border-strong)',
+                        background: 'var(--app-card-bg)',
+                      },
+                    }}
+                    destroyOnClose
+                  >
+                    {selectedMLOpsEnsembleModel ? (
+                      <div style={{ display: 'grid', gridTemplateColumns: '280px minmax(0, 1fr)', gap: 12, maxWidth: 1320, margin: '0 auto', alignItems: 'start' }}>
+                        <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 12, background: 'var(--app-panel-bg)', position: 'sticky', top: 0 }}>
+                          <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Training Outcome</Text>
+                          <div style={{ marginTop: 10, border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 10, background: 'var(--app-input-bg)' }}>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', textTransform: 'capitalize' }}>
+                              {selectedMLOpsEnsembleModelOutcome.label}{selectedMLOpsEnsembleModelOutcome.source ? ` (${selectedMLOpsEnsembleModelOutcome.source})` : ''}
+                            </Text>
+                            <Text style={{ color: selectedMLOpsEnsembleModelOutcome.value === '-' ? 'var(--app-text-subtle)' : '#22c55e', fontSize: 28, fontWeight: 800, lineHeight: 1.2 }}>
+                              {selectedMLOpsEnsembleModelOutcome.value}
+                            </Text>
+                          </div>
+                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 8 }}>
+                            <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: 8, background: 'var(--app-input-bg)' }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10, display: 'block' }}>Total Records</Text>
+                              <Text style={{ color: 'var(--app-text)', fontSize: 16, fontWeight: 700 }}>{selectedMLOpsEnsembleModelTotalRecords}</Text>
+                            </div>
+                            <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: 8, background: 'var(--app-input-bg)' }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10, display: 'block' }}>Train Rows</Text>
+                              <Text style={{ color: 'var(--app-text)', fontSize: 16, fontWeight: 700 }}>{String((selectedMLOpsEnsembleModelSummary as Record<string, unknown> | null)?.train_rows ?? '-')}</Text>
+                            </div>
+                            <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: 8, background: 'var(--app-input-bg)' }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10, display: 'block' }}>Test Rows</Text>
+                              <Text style={{ color: 'var(--app-text)', fontSize: 16, fontWeight: 700 }}>{String((selectedMLOpsEnsembleModelSummary as Record<string, unknown> | null)?.test_rows ?? '-')}</Text>
+                            </div>
+                            <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: 8, background: 'var(--app-input-bg)' }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10, display: 'block' }}>Features</Text>
+                              <Text style={{ color: 'var(--app-text)', fontSize: 16, fontWeight: 700 }}>{selectedMLOpsEnsembleModel.feature_fields.length}</Text>
+                            </div>
+                          </div>
+                          <Space size={6} wrap style={{ marginTop: 10 }}>
+                            <Tag style={{ marginInlineEnd: 0 }}>{selectedMLOpsEnsembleModel.task_type}</Tag>
+                            <Tag style={{ marginInlineEnd: 0 }}>{selectedMLOpsEnsembleModel.model || 'no model'}</Tag>
+                            <Tag color={selectedMLOpsEnsembleModel.enabled ? 'green' : 'red'} style={{ marginInlineEnd: 0 }}>{selectedMLOpsEnsembleModel.enabled ? 'enabled' : 'disabled'}</Tag>
+                          </Space>
+                          <div style={{ marginTop: 10 }}>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Train vs Test Outcome Metrics</Text>
+                            <Table
+                              size="small"
+                              bordered
+                              pagination={false}
+                              rowKey={(row) => String((row as Record<string, unknown>)._key || '')}
+                              dataSource={selectedMLOpsEnsembleModelOutcomeRows}
+                              locale={{ emptyText: 'No train/test metrics yet.' }}
+                              scroll={{ x: true, y: 220 }}
+                              style={{ marginTop: 6 }}
+                              columns={[
+                                {
+                                  title: 'Metric',
+                                  dataIndex: 'metric',
+                                  key: 'metric',
+                                  ellipsis: true,
+                                  render: (value: unknown) => <Text style={{ color: 'var(--app-text)', fontSize: 11, textTransform: 'capitalize' }}>{String(value || '')}</Text>,
+                                },
+                                {
+                                  title: 'Train',
+                                  dataIndex: 'train',
+                                  key: 'train',
+                                  width: 86,
+                                  render: (value: unknown) => <Text style={{ color: 'var(--app-text)', fontSize: 11 }}>{formatMLOpsOutcomeMetric(value)}</Text>,
+                                },
+                                {
+                                  title: 'Test',
+                                  dataIndex: 'test',
+                                  key: 'test',
+                                  width: 86,
+                                  render: (value: unknown) => <Text style={{ color: 'var(--app-text)', fontSize: 11 }}>{formatMLOpsOutcomeMetric(value)}</Text>,
+                                },
+                              ] as any[]}
+                            />
+                          </div>
+                          <div style={{ marginTop: 10 }}>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Available fields</Text>
+                            <div style={{ marginTop: 6, maxHeight: 150, overflowY: 'auto', border: '1px solid var(--app-border)', borderRadius: 6, padding: 6, background: 'var(--app-input-bg)' }}>
+                              {(selectedMLOpsEnsembleModelVizFieldOptions.length > 0 ? selectedMLOpsEnsembleModelVizFieldOptions : mlopsStage3EnsembleFeatureOptions).map((item) => (
+                                <div key={`selected_model_field_${String(item.value)}`} style={{ marginBottom: 4 }}>
+                                  <Text style={{ color: 'var(--app-text)', fontSize: 11, fontFamily: 'monospace', wordBreak: 'break-all' }}>
+                                    {String(item.label || item.value)}
+                                  </Text>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                          {!selectedMLOpsEnsembleModelSummary ? (
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', marginTop: 8 }}>
+                              Run Model Test or active ensemble training to populate this outcome.
+                            </Text>
+                          ) : null}
+                        </div>
+                        <div style={{ display: 'grid', gap: 12, minWidth: 0 }}>
+                        <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 12, background: 'var(--app-panel-bg)' }}>
+                          <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Model Identity</Text>
+                        <div style={{ display: 'grid', gridTemplateColumns: '80px minmax(260px, 1fr) minmax(180px, 220px) minmax(220px, 280px)', gap: 10, alignItems: 'end', marginTop: 8 }}>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Enabled</Text>
+                            <div style={{ marginTop: 4 }}>
+                              <Switch
+                                size="small"
+                                checked={selectedMLOpsEnsembleModel.enabled}
+                                onChange={(checked) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { enabled: Boolean(checked) })}
+                              />
+                            </div>
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Model Name</Text>
+                            <Input
+                              size="small"
+                              value={selectedMLOpsEnsembleModel.name}
+                              onChange={(e) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { name: String(e.target.value || '') })}
+                              style={{ marginTop: 4 }}
+                            />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Task Type</Text>
+                            <Select
+                              size="small"
+                              value={selectedMLOpsEnsembleModel.task_type}
+                              options={MLOPS_STAGE3_TASK_OPTIONS as Array<{ value: MLOpsEnsembleModelConfig['task_type']; label: string }>}
+                              onChange={(value) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { task_type: String(value || 'classification') as MLOpsEnsembleModelConfig['task_type'] })}
+                              style={{ width: '100%', marginTop: 4 }}
+                            />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Algorithm</Text>
+                            <Select
+                              size="small"
+                              value={selectedMLOpsEnsembleModel.model || undefined}
+                              options={ensembleModelOptionsForTask(selectedMLOpsEnsembleModel.task_type)}
+                              onChange={(value) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { model: String(value || '') })}
+                              style={{ width: '100%', marginTop: 4 }}
+                            />
+                          </div>
+                        </div>
+                        </div>
+                        <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 12, background: 'var(--app-panel-bg)' }}>
+                          <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Fields & Outputs</Text>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(320px, 1fr) repeat(3, minmax(180px, 240px))', gap: 10, marginTop: 8 }}>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Feature Fields</Text>
+                            <Select
+                              mode="multiple"
+                              size="small"
+                              value={selectedMLOpsEnsembleModel.feature_fields}
+                              options={mlopsStage3EnsembleFeatureOptions}
+                              onChange={(values) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { feature_fields: uniqueFieldNames((values || []).map((item) => String(item || '').trim()).filter(Boolean)) })}
+                              maxTagCount={6}
+                              style={{ width: '100%', marginTop: 4 }}
+                            />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Label Field</Text>
+                            <Select
+                              size="small"
+                              allowClear
+                              showSearch
+                              optionFilterProp="label"
+                              value={selectedMLOpsEnsembleModel.target_field || undefined}
+                              options={mlopsStage3EnsembleFeatureOptions}
+                              onChange={(value) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { target_field: String(value || '') })}
+                              disabled={selectedMLOpsEnsembleModel.task_type === 'clustering' || selectedMLOpsEnsembleModel.task_type === 'anomaly_detection'}
+                              style={{ width: '100%', marginTop: 4 }}
+                            />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Prediction Field</Text>
+                            <Input size="small" value={selectedMLOpsEnsembleModel.prediction_field} onChange={(e) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { prediction_field: String(e.target.value || '') })} style={{ marginTop: 4 }} />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Score Field</Text>
+                            <Input size="small" value={selectedMLOpsEnsembleModel.score_field} onChange={(e) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { score_field: String(e.target.value || '') })} style={{ marginTop: 4 }} />
+                          </div>
+                        </div>
+                        </div>
+                        <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 12, background: 'var(--app-panel-bg)' }}>
+                          <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Explainability & Recommendation</Text>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 220px) minmax(260px, 1fr) minmax(120px, 160px)', gap: 10, marginTop: 8 }}>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Explainability</Text>
+                            <Select
+                              size="small"
+                              value={selectedMLOpsEnsembleModel.explainability_method}
+                              options={MLOPS_STAGE3_EXPLAINABILITY_METHOD_OPTIONS}
+                              onChange={(value) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { explainability_method: String(value || 'off') as MLOpsStage3ExplainabilityMethod })}
+                              style={{ width: '100%', marginTop: 4 }}
+                            />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Influence Field</Text>
+                            <Input size="small" value={selectedMLOpsEnsembleModel.influence_field} onChange={(e) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { influence_field: String(e.target.value || '') })} disabled={selectedMLOpsEnsembleModel.explainability_method === 'off'} style={{ marginTop: 4 }} />
+                          </div>
+                          <div>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Top Count</Text>
+                            <InputNumber size="small" min={1} max={50} value={selectedMLOpsEnsembleModel.influence_limit} onChange={(value) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { influence_limit: Number(value || 5) })} disabled={selectedMLOpsEnsembleModel.explainability_method === 'off'} style={{ width: '100%', marginTop: 4 }} />
+                          </div>
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: '44px minmax(180px, 240px) minmax(320px, 1fr)', gap: 10, alignItems: 'center', marginTop: 10 }}>
+                          <Switch
+                            size="small"
+                            checked={selectedMLOpsEnsembleModel.recommendation.enabled}
+                            onChange={(checked) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { recommendation: { ...selectedMLOpsEnsembleModel.recommendation, enabled: Boolean(checked) } })}
+                          />
+                          <Input
+                            size="small"
+                            value={selectedMLOpsEnsembleModel.recommendation.field}
+                            onChange={(e) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { recommendation: { ...selectedMLOpsEnsembleModel.recommendation, field: String(e.target.value || '') } })}
+                            disabled={!selectedMLOpsEnsembleModel.recommendation.enabled}
+                          />
+                          <Input
+                            size="small"
+                            value={selectedMLOpsEnsembleModel.recommendation.template}
+                            onChange={(e) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { recommendation: { ...selectedMLOpsEnsembleModel.recommendation, template: String(e.target.value || '') } })}
+                            placeholder="Recommendation template with {field_name}"
+                            disabled={!selectedMLOpsEnsembleModel.recommendation.enabled}
+                          />
+                        </div>
+                        </div>
+                        <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 12, background: 'var(--app-panel-bg)' }}>
+                          <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Model Test & Training Settings</Text>
+                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10, marginTop: 8 }}>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Train/Test Split</Text>
+                              <InputNumber size="small" min={0.05} max={0.5} step={0.01} value={mlopsStage3TrainTestSplitDraft} onChange={(v) => setMLOpsStage3TrainTestSplitDraft(Number.isFinite(Number(v)) ? Number(v) : 0.2)} style={{ width: '100%', marginTop: 4 }} />
+                            </div>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                                {selectedMLOpsEnsembleModel.task_type === 'clustering' ? 'Cluster Count' : 'Cross Validation Folds'}
+                              </Text>
+                              {selectedMLOpsEnsembleModel.task_type === 'clustering' ? (
+                                <InputNumber
+                                  size="small"
+                                  min={2}
+                                  max={100}
+                                  value={mlopsStage3ClusterCountDraft}
+                                  onChange={(v) => setMLOpsStage3ClusterCountDraft(Number.isFinite(Number(v)) ? Math.max(2, Math.min(Math.trunc(Number(v)), 100)) : 4)}
+                                  style={{ width: '100%', marginTop: 4 }}
+                                />
+                              ) : (
+                                <InputNumber size="small" min={2} max={20} value={mlopsStage3CvFoldsDraft} onChange={(v) => setMLOpsStage3CvFoldsDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 5)} style={{ width: '100%', marginTop: 4 }} />
+                              )}
+                            </div>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Epochs</Text>
+                              <InputNumber size="small" min={1} max={10000} value={mlopsStage3EpochsDraft} onChange={(v) => setMLOpsStage3EpochsDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 20)} style={{ width: '100%', marginTop: 4 }} />
+                            </div>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Batch Size</Text>
+                              <InputNumber size="small" min={1} max={4096} value={mlopsStage3BatchSizeDraft} onChange={(v) => setMLOpsStage3BatchSizeDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 32)} style={{ width: '100%', marginTop: 4 }} />
+                            </div>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Random Seed</Text>
+                              <InputNumber size="small" value={mlopsStage3RandomSeedDraft} onChange={(v) => setMLOpsStage3RandomSeedDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 42)} style={{ width: '100%', marginTop: 4 }} />
+                            </div>
+                          </div>
+                          {selectedMLOpsEnsembleModel.task_type === 'forecasting' ? (
+                            <div style={{ marginTop: 10, borderTop: '1px dashed var(--app-border)', paddingTop: 10 }}>
+                              <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Forecast Configuration (ARIMA/SARIMA)</Text>
+                              <div style={{ display: 'grid', gridTemplateColumns: '1fr 130px 130px', gap: 8, marginTop: 8 }}>
+                                <div>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Date/Time Field</Text>
+                                  <Select
+                                    size="small"
+                                    allowClear
+                                    showSearch
+                                    optionFilterProp="label"
+                                    value={selectedMLOpsEnsembleModel.forecast_date_field || undefined}
+                                    options={mlopsStage3EnsembleFeatureOptions}
+                                    onChange={(value) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { forecast_date_field: String(value || '').trim() })}
+                                    style={{ width: '100%', marginTop: 4 }}
+                                    placeholder="Optional date field"
+                                  />
+                                </div>
+                                <div>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Frequency</Text>
+                                  <Select
+                                    size="small"
+                                    value={selectedMLOpsEnsembleModel.forecast_frequency}
+                                    options={[
+                                      { value: 'D', label: 'Daily (D)' },
+                                      { value: 'W', label: 'Weekly (W)' },
+                                      { value: 'M', label: 'Monthly (M)' },
+                                    ]}
+                                    onChange={(value) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { forecast_frequency: String(value || 'D').toUpperCase() as MLOpsForecastFrequency })}
+                                    style={{ width: '100%', marginTop: 4 }}
+                                  />
+                                </div>
+                                <div>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Horizon</Text>
+                                  <InputNumber
+                                    size="small"
+                                    min={1}
+                                    max={3650}
+                                    value={selectedMLOpsEnsembleModel.forecast_horizon}
+                                    onChange={(value) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { forecast_horizon: Number.isFinite(Number(value)) ? Math.trunc(Number(value)) : 30 })}
+                                    style={{ width: '100%', marginTop: 4 }}
+                                  />
+                                </div>
+                              </div>
+                              <div style={{ display: 'grid', gridTemplateColumns: '1fr 180px', gap: 8, marginTop: 8 }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                  <Switch
+                                    size="small"
+                                    checked={selectedMLOpsEnsembleModel.forecast_auto_tune_orders}
+                                    onChange={(checked) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { forecast_auto_tune_orders: Boolean(checked) })}
+                                  />
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                                    Auto tune ARIMA/SARIMA orders
+                                  </Text>
+                                </div>
+                                <div>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Order Search Budget</Text>
+                                  <InputNumber
+                                    size="small"
+                                    min={1}
+                                    max={64}
+                                    value={selectedMLOpsEnsembleModel.forecast_order_search_max_evals}
+                                    onChange={(value) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { forecast_order_search_max_evals: Number.isFinite(Number(value)) ? Math.trunc(Number(value)) : 16 })}
+                                    style={{ width: '100%', marginTop: 4 }}
+                                  />
+                                </div>
+                              </div>
+                            </div>
+                          ) : null}
+                        </div>
+                        <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 12, background: 'var(--app-panel-bg)' }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                            <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Hyperparameter Tuning</Text>
+                            <Switch size="small" checked={mlopsStage3TuningEnabledDraft} onChange={(checked) => setMLOpsStage3TuningEnabledDraft(Boolean(checked))} />
+                          </div>
+                          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(220px, 1fr) auto', gap: 10, marginTop: 8, alignItems: 'center' }}>
+                            <Select
+                              size="small"
+                              value={mlopsStage3TuningMethodDraft}
+                              options={MLOPS_STAGE3_TUNING_METHOD_OPTIONS}
+                              onChange={(value) => setMLOpsStage3TuningMethodDraft(String(value || 'random_search') as MLOpsStage3TuningMethod)}
+                              disabled={!mlopsStage3TuningEnabledDraft}
+                            />
+                            <Button
+                              size="small"
+                              onClick={() => setMLOpsStage3TuningParamsDraft((prev) => [...prev, createMLOpsStage3TuningParameter()])}
+                              disabled={!mlopsStage3TuningEnabledDraft}
+                            >
+                              + Parameter
+                            </Button>
+                          </div>
+                          <div style={{ marginTop: 8, display: 'grid', gap: 6 }}>
+                            {mlopsStage3TuningParamsDraft.length <= 0 ? (
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>No tuning parameters configured.</Text>
+                            ) : null}
+                            {mlopsStage3TuningParamsDraft.map((item) => (
+                              <div key={`modal_tuning_${item.id}`} style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 1fr) minmax(220px, 1fr) auto', gap: 6 }}>
+                                <Input
+                                  size="small"
+                                  value={item.name}
+                                  onChange={(e) => setMLOpsStage3TuningParamsDraft((prev) => prev.map((row) => row.id === item.id ? { ...row, name: String(e.target.value || '') } : row))}
+                                  placeholder="parameter (e.g. learning_rate)"
+                                  disabled={!mlopsStage3TuningEnabledDraft}
+                                />
+                                <Input
+                                  size="small"
+                                  value={item.values}
+                                  onChange={(e) => setMLOpsStage3TuningParamsDraft((prev) => prev.map((row) => row.id === item.id ? { ...row, values: String(e.target.value || '') } : row))}
+                                  placeholder="values/range (e.g. 0.01,0.1,0.2)"
+                                  disabled={!mlopsStage3TuningEnabledDraft}
+                                />
+                                <Button
+                                  size="small"
+                                  danger
+                                  onClick={() => setMLOpsStage3TuningParamsDraft((prev) => prev.filter((row) => row.id !== item.id))}
+                                  disabled={!mlopsStage3TuningEnabledDraft}
+                                >
+                                  Remove
+                                </Button>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                        <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 12, background: 'var(--app-panel-bg)' }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                            <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Experiment Tracking</Text>
+                            <Switch size="small" checked={mlopsStage3TrackingEnabledDraft} onChange={(checked) => setMLOpsStage3TrackingEnabledDraft(Boolean(checked))} />
+                          </div>
+                          <div style={{ marginTop: 8 }}>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Run name</Text>
+                            <Input
+                              size="small"
+                              value={mlopsStage3RunNameDraft}
+                              onChange={(e) => setMLOpsStage3RunNameDraft(String(e.target.value || ''))}
+                              placeholder="Optional run name"
+                              disabled={!mlopsStage3TrackingEnabledDraft}
+                              style={{ marginTop: 4 }}
+                            />
+                          </div>
+                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 8, marginTop: 10 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                              <Switch size="small" checked={mlopsStage3TrackVersionsDraft} onChange={(checked) => setMLOpsStage3TrackVersionsDraft(Boolean(checked))} disabled={!mlopsStage3TrackingEnabledDraft} />
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Model versions</Text>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                              <Switch size="small" checked={mlopsStage3TrackParamsDraft} onChange={(checked) => setMLOpsStage3TrackParamsDraft(Boolean(checked))} disabled={!mlopsStage3TrackingEnabledDraft} />
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Parameters used</Text>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                              <Switch size="small" checked={mlopsStage3TrackMetricsDraft} onChange={(checked) => setMLOpsStage3TrackMetricsDraft(Boolean(checked))} disabled={!mlopsStage3TrackingEnabledDraft} />
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Metrics history</Text>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                              <Switch size="small" checked={mlopsStage3TrackLogsDraft} onChange={(checked) => setMLOpsStage3TrackLogsDraft(Boolean(checked))} disabled={!mlopsStage3TrackingEnabledDraft} />
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Training logs</Text>
+                            </div>
+                          </div>
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(420px, 1fr))', gap: 12 }}>
+                          {(['pre_rules', 'post_rules'] as const).map((scope) => (
+                            <div key={`modal_${selectedMLOpsEnsembleModel.id}_${scope}`} style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: 8, background: 'var(--app-input-bg)', minWidth: 0, overflow: 'hidden' }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                                <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>
+                                  {scope === 'pre_rules' ? 'Pre Rules' : 'Post Rules'}
+                                </Text>
+                                <Button
+                                  size="small"
+                                  onClick={() => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { [scope]: [...selectedMLOpsEnsembleModel[scope], createMLOpsRule()] } as Partial<MLOpsEnsembleModelConfig>)}
+                                >
+                                  Add Rule
+                                </Button>
+                              </div>
+                              <div style={{ display: 'grid', gap: 8, marginTop: 8 }}>
+                                {selectedMLOpsEnsembleModel[scope].length <= 0 ? (
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>No rules configured.</Text>
+                                ) : null}
+                                {selectedMLOpsEnsembleModel[scope].map((rule) => (
+                                  <div key={rule.id} style={{ border: '1px solid var(--app-border-strong)', borderRadius: 6, padding: 8, display: 'grid', gap: 6, minWidth: 0, overflow: 'hidden' }}>
+                                    <div style={{ display: 'grid', gridTemplateColumns: '42px minmax(90px, 110px) minmax(100px, 120px) 96px', gap: 6, alignItems: 'center', minWidth: 0 }}>
+                                      <Switch size="small" checked={rule.enabled} onChange={(checked) => updateMLOpsEnsembleRule(selectedMLOpsEnsembleModel.id, scope, rule.id, { enabled: Boolean(checked) })} />
+                                      <Select size="small" value={rule.join} options={[{ value: 'all', label: 'All' }, { value: 'any', label: 'Any' }]} onChange={(value) => updateMLOpsEnsembleRule(selectedMLOpsEnsembleModel.id, scope, rule.id, { join: String(value || 'all') as 'all' | 'any' })} />
+                                      <Select size="small" value={rule.action || 'apply'} options={[{ value: 'apply', label: 'Apply' }, { value: 'drop', label: 'Drop row' }]} onChange={(value) => updateMLOpsEnsembleRule(selectedMLOpsEnsembleModel.id, scope, rule.id, { action: String(value || 'apply') as 'apply' | 'drop' })} />
+                                      <Button size="small" danger style={{ width: 96 }} onClick={() => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { [scope]: selectedMLOpsEnsembleModel[scope].filter((item) => item.id !== rule.id) } as Partial<MLOpsEnsembleModelConfig>)}>Remove</Button>
+                                    </div>
+                                    {rule.conditions.map((condition) => (
+                                      <div key={condition.id} style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(100px, 130px) minmax(0, 1fr) 30px', gap: 6, minWidth: 0 }}>
+                                        <Select size="small" showSearch allowClear optionFilterProp="label" value={condition.field || undefined} options={mlopsStage3EnsembleFeatureOptions} onChange={(value) => updateMLOpsEnsembleRuleCondition(selectedMLOpsEnsembleModel.id, scope, rule.id, condition.id, { field: String(value || '') })} placeholder="field" />
+                                        <Select size="small" value={condition.operator} options={['equals', 'not_equals', 'contains', 'not_contains', 'gt', 'gte', 'lt', 'lte', 'empty', 'not_empty', 'in', 'not_in'].map((op) => ({ value: op, label: op }))} onChange={(value) => updateMLOpsEnsembleRuleCondition(selectedMLOpsEnsembleModel.id, scope, rule.id, condition.id, { operator: String(value || 'equals') })} />
+                                        <Input size="small" value={condition.value} onChange={(e) => updateMLOpsEnsembleRuleCondition(selectedMLOpsEnsembleModel.id, scope, rule.id, condition.id, { value: String(e.target.value || '') })} placeholder="value" />
+                                        <Button size="small" onClick={() => updateMLOpsEnsembleRule(selectedMLOpsEnsembleModel.id, scope, rule.id, { conditions: rule.conditions.filter((item) => item.id !== condition.id) })}>-</Button>
+                                      </div>
+                                    ))}
+                                    <Button size="small" onClick={() => updateMLOpsEnsembleRule(selectedMLOpsEnsembleModel.id, scope, rule.id, { conditions: [...rule.conditions, createMLOpsRuleCondition()] })}>Add Condition</Button>
+                                    {rule.action !== 'drop' ? (
+                                      <>
+                                        {rule.actions.map((action) => (
+                                          <div key={action.id} style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(90px, 100px) minmax(0, 1.2fr) 30px', gap: 6, minWidth: 0 }}>
+                                            <Select
+                                              size="small"
+                                              showSearch
+                                              allowClear
+                                              optionFilterProp="label"
+                                              value={action.field || undefined}
+                                              options={mlopsStage3EnsembleFeatureOptions}
+                                              onChange={(value) => updateMLOpsEnsembleRuleAction(selectedMLOpsEnsembleModel.id, scope, rule.id, action.id, { field: String(value || '') })}
+                                              placeholder="set field"
+                                            />
+                                            <Select size="small" value={action.mode} options={[{ value: 'literal', label: 'Literal' }, { value: 'field', label: 'Field' }, { value: 'template', label: 'Template' }]} onChange={(value) => updateMLOpsEnsembleRuleAction(selectedMLOpsEnsembleModel.id, scope, rule.id, action.id, { mode: String(value || 'literal') as MLOpsRuleAction['mode'] })} />
+                                            {action.mode === 'field' ? (
+                                              <Select
+                                                size="small"
+                                                showSearch
+                                                allowClear
+                                                optionFilterProp="label"
+                                                value={action.value || undefined}
+                                                options={mlopsStage3EnsembleFeatureOptions}
+                                                onChange={(value) => updateMLOpsEnsembleRuleAction(selectedMLOpsEnsembleModel.id, scope, rule.id, action.id, { value: String(value || '') })}
+                                                placeholder="source field"
+                                              />
+                                            ) : (
+                                              <Input
+                                                size="small"
+                                                value={action.value}
+                                                onChange={(e) => updateMLOpsEnsembleRuleAction(selectedMLOpsEnsembleModel.id, scope, rule.id, action.id, { value: String(e.target.value || '') })}
+                                                placeholder={action.mode === 'template' ? 'template value, e.g. High risk {score}' : 'value'}
+                                              />
+                                            )}
+                                            <Button size="small" onClick={() => updateMLOpsEnsembleRule(selectedMLOpsEnsembleModel.id, scope, rule.id, { actions: rule.actions.filter((item) => item.id !== action.id) })}>-</Button>
+                                          </div>
+                                        ))}
+                                        <Button size="small" onClick={() => updateMLOpsEnsembleRule(selectedMLOpsEnsembleModel.id, scope, rule.id, { actions: [...rule.actions, createMLOpsRuleAction()] })}>Add Action</Button>
+                                      </>
+                                    ) : null}
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                        {mlopsStage3ModelRunErrors[selectedMLOpsEnsembleModel.id] ? (
+                          <Text style={{ color: '#ef4444', fontSize: 12 }}>
+                            {mlopsStage3ModelRunErrors[selectedMLOpsEnsembleModel.id]}
+                          </Text>
+                        ) : null}
+                        <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 12, background: 'var(--app-panel-bg)' }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                            <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Training Visualization & Data Table</Text>
+                            <Space size={8} wrap>
+                              <Select
+                                size="small"
+                                value={mlopsStage3ModelVizTypeDraft}
+                                options={selectedMLOpsEnsembleModelVizOptions}
+                                onChange={(value) => setMLOpsStage3ModelVizTypeDraft(String(value || 'split_bar') as MLOpsStage3VizType)}
+                                style={{ minWidth: 220 }}
+                              />
+                              <Select
+                                size="small"
+                                value={mlopsStage3ModelTableViewDraft}
+                                onChange={(value) => setMLOpsStage3ModelTableViewDraft(String(value || 'predictions') as 'predictions' | 'feature_importance' | 'influencing_features' | 'metrics')}
+                                options={[
+                                  { value: 'predictions', label: selectedMLOpsEnsembleModel.task_type === 'clustering' ? 'Cluster Sample Table' : 'Prediction Table' },
+                                  { value: 'feature_importance', label: 'Feature Importance Table' },
+                                  { value: 'influencing_features', label: 'SHAP Influencing Features' },
+                                  { value: 'metrics', label: 'Metrics Table' },
+                                ]}
+                                style={{ minWidth: 190 }}
+                              />
+                            </Space>
+                          </div>
+                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 8, marginTop: 8 }}>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Optional X field</Text>
+                              <Select
+                                size="small"
+                                allowClear
+                                showSearch
+                                optionFilterProp="label"
+                                value={mlopsStage3ModelVizXFieldDraft || undefined}
+                                options={selectedMLOpsEnsembleModelVizFieldOptions}
+                                onChange={(value) => setMLOpsStage3ModelVizXFieldDraft(String(value || '').trim())}
+                                placeholder="Auto"
+                                style={{ width: '100%', marginTop: 4 }}
+                              />
+                            </div>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Optional Y / score field</Text>
+                              <Select
+                                size="small"
+                                allowClear
+                                showSearch
+                                optionFilterProp="label"
+                                value={mlopsStage3ModelVizYFieldDraft || undefined}
+                                options={selectedMLOpsEnsembleModelVizFieldOptions}
+                                onChange={(value) => setMLOpsStage3ModelVizYFieldDraft(String(value || '').trim())}
+                                placeholder="Auto"
+                                style={{ width: '100%', marginTop: 4 }}
+                              />
+                            </div>
+                          </div>
+                          <div style={{ marginTop: 8, border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-input-bg)', height: mlopsCompactView ? 260 : 340 }}>
+                            {selectedMLOpsEnsembleModelVizFigure ? (
+                              <Plot
+                                data={(selectedMLOpsEnsembleModelVizFigure.data || []) as any[]}
+                                layout={{
+                                  ...(selectedMLOpsEnsembleModelVizFigure.layout || {}),
+                                  autosize: true,
+                                  paper_bgcolor: 'transparent',
+                                  plot_bgcolor: 'transparent',
+                                } as any}
+                                config={{ responsive: true, displayModeBar: true, displaylogo: false }}
+                                style={{ width: '100%', height: '100%' }}
+                                useResizeHandler
+                              />
+                            ) : (
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12, display: 'block', padding: 10 }}>
+                                Run this model test or run ensemble training to visualize model-level results.
+                              </Text>
+                            )}
+                          </div>
+                          <div style={{ marginTop: 8 }}>
+                            <Table
+                              size="small"
+                              bordered
+                              pagination={{ pageSize: 10, size: 'small' }}
+                              rowKey={(row) => String((row as Record<string, unknown>)._key || '')}
+                              columns={selectedMLOpsEnsembleModelTableColumns as any[]}
+                              dataSource={selectedMLOpsEnsembleModelTableRows}
+                              scroll={{ x: true, y: mlopsCompactView ? 220 : 320 }}
+                              locale={{ emptyText: 'No model-level training output yet.' }}
+                            />
+                          </div>
+                        </div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                          Save closes this full-screen configuration window; the active Ensemble Pipeline tab is used for pipeline-level training and production.
+                        </Text>
+                        </div>
+                      </div>
+                    ) : null}
+                  </Modal>
+
+                  {mlopsStage3ModelModeDraft === 'single' ? (
+                  <>
                   <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
                     <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Runtime Prediction Mode</Text>
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginTop: 8 }}>
@@ -28401,7 +30558,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           style={{ marginTop: 4 }}
                         />
                       </div>
-                    </div>
+	                    </div>
                     {mlopsStage3TaskTypeDraft === 'forecasting' ? (
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 8 }}>
                         <div>
@@ -28687,6 +30844,70 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   </div>
 
                   <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>SHAP Explainability</Text>
+                    <div style={{ display: 'grid', gridTemplateColumns: '220px 1fr', gap: 8, marginTop: 8, alignItems: 'center' }}>
+                      <Select
+                        size="small"
+                        value={mlopsStage3ExplainabilityMethodDraft}
+	                        options={MLOPS_STAGE3_EXPLAINABILITY_METHOD_OPTIONS}
+	                        onChange={(value) => setMLOpsStage3ExplainabilityMethodDraft(String(value || 'off') as MLOpsStage3ExplainabilityMethod)}
+	                        disabled={mlopsStage3TaskTypeDraft === 'forecasting'}
+	                      />
+	                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+	                        Auto chooses Linear, Tree, or Kernel SHAP where applicable; clustering/anomaly tasks use profiling, deviation, or reconstruction-error strategies.
+	                      </Text>
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 8 }}>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Influence field</Text>
+                        <Input
+                          size="small"
+                          value={mlopsTopInfluencingFeaturesFieldDraft}
+                          onChange={(event) => setMLOpsTopInfluencingFeaturesFieldDraft(String(event.target.value || 'top_influencing_features'))}
+                          placeholder="top_influencing_features"
+                          style={{ marginTop: 4 }}
+                          disabled={mlopsStage3ExplainabilityMethodDraft === 'off' || mlopsStage3TaskTypeDraft === 'forecasting'}
+                        />
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Top influence count</Text>
+                        <InputNumber
+                          size="small"
+                          min={1}
+                          max={50}
+                          precision={0}
+                          value={mlopsTopInfluencingFeaturesLimitDraft}
+                          onChange={(value) => setMLOpsTopInfluencingFeaturesLimitDraft(Number(value || 1))}
+                          style={{ width: '100%', marginTop: 4 }}
+                          disabled={mlopsStage3ExplainabilityMethodDraft === 'off' || mlopsStage3TaskTypeDraft === 'forecasting'}
+                        />
+                      </div>
+                      <div style={{ gridColumn: '1 / -1' }}>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Influence output keys</Text>
+                        <Select
+                          mode="multiple"
+                          size="small"
+                          value={mlopsTopInfluencingFeaturesKeysDraft}
+                          options={MLOPS_INFLUENCE_OUTPUT_KEY_OPTIONS}
+                          onChange={(values) => {
+                            const selected = (values || []).map((item) => String(item || '').trim()).filter(Boolean)
+                            setMLOpsTopInfluencingFeaturesKeysDraft(selected.length > 0 ? selected : MLOPS_DEFAULT_INFLUENCE_OUTPUT_KEYS)
+                          }}
+                          style={{ width: '100%', marginTop: 4 }}
+                          maxTagCount="responsive"
+                          disabled={mlopsStage3ExplainabilityMethodDraft === 'off' || mlopsStage3TaskTypeDraft === 'forecasting'}
+                        />
+                      </div>
+                    </div>
+                    {mlopsStage3RunSummary?.explainability ? (
+                      <Space size={6} wrap style={{ marginTop: 8 }}>
+                        <Tag style={{ marginInlineEnd: 0 }}>method: {String(mlopsStage3RunSummary.explainability.method || 'off')}</Tag>
+                        <Tag style={{ marginInlineEnd: 0 }}>status: {String(mlopsStage3RunSummary.explainability.status || 'unknown')}</Tag>
+                      </Space>
+                    ) : null}
+                  </div>
+
+                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
                       <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Experiment Tracking</Text>
                       <Switch size="small" checked={mlopsStage3TrackingEnabledDraft} onChange={(checked) => setMLOpsStage3TrackingEnabledDraft(Boolean(checked))} />
@@ -28754,6 +30975,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         },
                         runtime: {
                           mode: mlopsRuntimeModeDraft,
+                          model_mode: mlopsStage3ModelModeDraft,
+                          ensemble_models: [],
                           prediction_field: String(mlopsPredictionFieldDraft || '').trim() || 'prediction',
                           prediction_score_field: String(mlopsPredictionScoreFieldDraft || '').trim() || 'prediction_score',
                           model_bundle_ready: Boolean(mlopsStage3ModelBundleDraft),
@@ -28784,10 +31007,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         <Select
                           size="small"
                           value={mlopsStage3TableViewDraft}
-                          onChange={(value) => setMLOpsStage3TableViewDraft(String(value || 'predictions') as 'predictions' | 'feature_importance' | 'metrics')}
+                          onChange={(value) => setMLOpsStage3TableViewDraft(String(value || 'predictions') as 'predictions' | 'feature_importance' | 'influencing_features' | 'metrics')}
                           options={[
                             { value: 'predictions', label: mlopsStage3TaskTypeDraft === 'clustering' ? 'Cluster Sample Table' : 'Prediction Table' },
                             { value: 'feature_importance', label: 'Feature Importance Table' },
+                            { value: 'influencing_features', label: 'SHAP Influencing Features' },
                             { value: 'metrics', label: 'Metrics Table' },
                           ]}
                           style={{ minWidth: 190 }}
@@ -28836,6 +31060,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       />
                     </div>
                   </div>
+                  </>
+                  ) : null}
                 </div>
               </div>
             </div>

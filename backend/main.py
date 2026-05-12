@@ -1148,6 +1148,10 @@ def _compact_execution_logs_for_history(logs: Any) -> Any:
             message = str(entry.get("message") or "")
             if len(message) > _EXECUTION_HISTORY_LOG_MESSAGE_MAX_CHARS:
                 entry["message"] = message[:_EXECUTION_HISTORY_LOG_MESSAGE_MAX_CHARS] + "..."
+            for sample_key in ("input_sample", "output_sample"):
+                sample_value = entry.get(sample_key)
+                if isinstance(sample_value, list):
+                    entry[sample_key] = _compact_node_result_for_history(sample_value, 3)
             warnings = entry.get("warnings")
             if isinstance(warnings, list) and len(warnings) > 8:
                 entry["warnings"] = warnings[:8]
@@ -1985,9 +1989,13 @@ class MLOpsNodeStage1ProfileRequest(BaseModel):
 
 
 class MLOpsNodeStage3TrainRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     rows: List[Dict[str, Any]] = Field(default_factory=list)
     task_type: str = "classification"  # classification|regression|clustering|forecasting|anomaly_detection
     model: str = ""
+    model_mode: str = "single"  # single|ensemble_pipeline
+    ensemble_models: List[Dict[str, Any]] = Field(default_factory=list)
     feature_fields: List[str] = Field(default_factory=list)
     target_field: Optional[str] = None
     target_fields: List[str] = Field(default_factory=list)
@@ -2009,9 +2017,12 @@ class MLOpsNodeStage3TrainRequest(BaseModel):
     tuning_params: List[Dict[str, Any]] = Field(default_factory=list)
     tracking_enabled: bool = True
     run_name: Optional[str] = None
+    explainability_method: str = "off"  # off|auto|shap|shap_tree|shap_linear
 
 
 class MLOpsNodeStage4DeployRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     rows: List[Dict[str, Any]] = Field(default_factory=list)
     stage3_summary: Optional[Dict[str, Any]] = None
     stage1_profile: Optional[Dict[str, Any]] = None
@@ -4842,6 +4853,212 @@ def _mlops_stage3_extract_first_scalar(row: Dict[str, Any], path: str) -> Any:
     return None
 
 
+def _mlops_stage3_base_feature_name(transformed_name: str, original_fields: List[str]) -> str:
+    name = str(transformed_name or "")
+    for prefix in ("num__", "cat__", "remainder__"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    for field in sorted([str(item) for item in original_fields], key=len, reverse=True):
+        if name == field or name.startswith(f"{field}_"):
+            return field
+    return name
+
+
+def _mlops_stage3_business_reason(feature: str, contribution: float, method: str) -> str:
+    direction = "increased" if contribution >= 0 else "reduced"
+    if str(method or "").startswith("shap"):
+        return f"{feature} {direction} the model output according to SHAP contribution."
+    return f"{feature} {direction} the model output according to model-derived feature influence."
+
+
+def _mlops_stage3_recommended_explainability_method(task: str, estimator_obj: Any) -> str:
+    task_name = str(task or "").strip().lower()
+    estimator_name = estimator_obj.__class__.__name__.lower() if estimator_obj is not None else ""
+    estimator_module = estimator_obj.__class__.__module__.lower() if estimator_obj is not None else ""
+    model_key = f"{estimator_module}.{estimator_name}"
+
+    if task_name == "clustering":
+        if "dbscan" in estimator_name:
+            return "outlier_feature_deviation"
+        return "cluster_profiling"
+    if task_name == "anomaly_detection":
+        if "oneclasssvm" in estimator_name or "svc" in estimator_name:
+            return "shap_kernel"
+        if "autoencoder" in estimator_name or "mlp" in estimator_name:
+            return "reconstruction_error_explanation"
+        if "isolationforest" in estimator_name:
+            return "shap_tree"
+        return "outlier_feature_deviation"
+    if any(token in model_key for token in ("xgb", "lightgbm", "lgbm", "catboost")):
+        return "shap_tree"
+    if any(token in estimator_name for token in ("randomforest", "decisiontree", "gradientboosting", "extratrees")):
+        return "shap_tree"
+    if any(token in estimator_name for token in ("logisticregression", "linearregression", "ridge", "lasso", "elasticnet")):
+        return "shap_linear"
+    if any(token in estimator_name for token in ("svc", "svr", "oneclasssvm", "mlp")):
+        return "shap_kernel"
+    return "shap_auto"
+
+
+def _mlops_stage3_build_influencing_features(
+    model_pipeline: Any,
+    estimator_obj: Any,
+    X_train: Any,
+    X_sample: Any,
+    original_fields: List[str],
+    task: str,
+    method: str,
+    notes: List[str],
+    max_items: int = 10,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    import numpy as np
+
+    requested_method = str(method or "off").strip().lower()
+    if requested_method in {"", "none", "off", "disabled"}:
+        return [], {"enabled": False, "method": "off", "status": "disabled"}
+    recommended_method = _mlops_stage3_recommended_explainability_method(task, estimator_obj)
+    if str(task or "").strip().lower() not in {"classification", "regression"}:
+        notes.append(
+            f"SHAP explainability is not ideal for {task}; recommended explanation strategy is {recommended_method}."
+        )
+        return [], {
+            "enabled": bool(requested_method != "off"),
+            "method": recommended_method if requested_method in {"auto", "shap"} else requested_method,
+            "requested_method": requested_method,
+            "recommended_method": recommended_method,
+            "status": "unsupported_task",
+        }
+
+    safe_sample = X_sample.head(min(len(X_sample), 200)) if hasattr(X_sample, "head") else X_sample
+    if hasattr(safe_sample, "empty") and bool(safe_sample.empty):
+        return [], {"enabled": True, "method": requested_method, "status": "no_sample_rows"}
+
+    used_method = requested_method
+    resolved_method = requested_method
+    if requested_method == "auto":
+        resolved_method = recommended_method
+    source = "shap"
+    transformed_names: List[str] = []
+    transformed_values = None
+    contributions = None
+
+    try:
+        prep = model_pipeline.named_steps["prep"]
+        transformed_names = [str(item) for item in prep.get_feature_names_out()]
+        transformed_values = prep.transform(safe_sample)
+        transformed_background = prep.transform(X_train.head(min(len(X_train), 200)) if hasattr(X_train, "head") else X_train)
+        if hasattr(transformed_values, "toarray"):
+            transformed_values = transformed_values.toarray()
+        if hasattr(transformed_background, "toarray"):
+            transformed_background = transformed_background.toarray()
+        transformed_values = np.asarray(transformed_values, dtype=float)
+        transformed_background = np.asarray(transformed_background, dtype=float)
+    except Exception as exc:
+        notes.append(f"Explainability skipped because preprocessed feature matrix could not be prepared: {exc}")
+        return [], {"enabled": True, "method": requested_method, "status": "preprocessing_failed"}
+
+    try:
+        import shap  # type: ignore
+
+        if resolved_method == "shap_tree":
+            explainer = shap.TreeExplainer(estimator_obj)
+            raw_values = explainer.shap_values(transformed_values)
+            used_method = "shap_tree"
+        elif resolved_method == "shap_linear":
+            explainer = shap.LinearExplainer(estimator_obj, transformed_background)
+            raw_values = explainer.shap_values(transformed_values)
+            used_method = "shap_linear"
+        elif resolved_method == "shap_kernel":
+            background = transformed_background[: min(len(transformed_background), 50)]
+            sample_for_kernel = transformed_values[: min(len(transformed_values), 50)]
+            if str(task or "").strip().lower() == "classification" and hasattr(estimator_obj, "predict_proba"):
+                predict_fn = estimator_obj.predict_proba
+            else:
+                predict_fn = estimator_obj.predict
+            explainer = shap.KernelExplainer(predict_fn, background)
+            raw_values = explainer.shap_values(sample_for_kernel)
+            transformed_values = sample_for_kernel
+            used_method = "shap_kernel"
+        else:
+            explainer = shap.Explainer(estimator_obj, transformed_background)
+            raw_values = explainer(transformed_values).values
+            used_method = "shap_auto"
+
+        if isinstance(raw_values, list):
+            arr = np.stack([np.asarray(item, dtype=float) for item in raw_values], axis=0)
+            contributions = np.mean(arr, axis=0)
+        else:
+            contributions = np.asarray(raw_values, dtype=float)
+            if contributions.ndim == 3:
+                contributions = np.mean(contributions, axis=2)
+        if contributions.ndim != 2:
+            contributions = np.reshape(contributions, (transformed_values.shape[0], -1))
+    except Exception as exc:
+        source = "model_importance_fallback"
+        used_method = "model_importance_fallback"
+        notes.append(f"SHAP explainability unavailable for this model/runtime; using model importance fallback. Detail: {exc}")
+        raw_importance = None
+        if hasattr(estimator_obj, "feature_importances_"):
+            raw_importance = np.asarray(getattr(estimator_obj, "feature_importances_"), dtype=float)
+        elif hasattr(estimator_obj, "coef_"):
+            coef = getattr(estimator_obj, "coef_")
+            coef_arr = np.asarray(coef, dtype=float)
+            raw_importance = np.mean(coef_arr, axis=0) if coef_arr.ndim > 1 else coef_arr
+        if raw_importance is None:
+            return [], {"enabled": True, "method": requested_method, "status": "unsupported_model"}
+        raw_importance = np.asarray(raw_importance, dtype=float).reshape(-1)
+        contributions = np.tile(raw_importance, (transformed_values.shape[0], 1))
+
+    field_stats: Dict[str, Dict[str, float]] = {}
+    for idx, transformed_name in enumerate(transformed_names[:contributions.shape[1]]):
+        field = _mlops_stage3_base_feature_name(transformed_name, original_fields)
+        contrib_col = contributions[:, idx]
+        value_col = transformed_values[:, idx] if transformed_values is not None and idx < transformed_values.shape[1] else np.array([])
+        stat = field_stats.setdefault(field, {"signed": 0.0, "abs": 0.0, "value_sum": 0.0, "value_count": 0.0})
+        signed_mean = float(np.nanmean(contrib_col)) if contrib_col.size else 0.0
+        abs_mean = float(np.nanmean(np.abs(contrib_col))) if contrib_col.size else 0.0
+        stat["signed"] += 0.0 if not math.isfinite(signed_mean) else signed_mean
+        stat["abs"] += 0.0 if not math.isfinite(abs_mean) else abs_mean
+        if value_col.size:
+            finite_values = value_col[np.isfinite(value_col)]
+            if finite_values.size:
+                stat["value_sum"] += float(np.mean(finite_values))
+                stat["value_count"] += 1.0
+
+    total_abs = sum(abs(float(item.get("signed") or 0.0)) for item in field_stats.values()) or sum(float(item.get("abs") or 0.0) for item in field_stats.values()) or 1.0
+    ranked: List[Dict[str, Any]] = []
+    sample_record = safe_sample.iloc[0].to_dict() if hasattr(safe_sample, "iloc") and len(safe_sample) else {}
+    for field, stat in field_stats.items():
+        signed = float(stat.get("signed") or 0.0)
+        magnitude = abs(signed) if abs(signed) > 0 else float(stat.get("abs") or 0.0)
+        if magnitude <= 0:
+            continue
+        feature_value = sample_record.get(field)
+        if _mlops_stage3_is_missing(feature_value) and float(stat.get("value_count") or 0.0) > 0:
+            feature_value = float(stat["value_sum"] / max(stat["value_count"], 1.0))
+        impact_score = round(float((signed if abs(signed) > 0 else magnitude) / total_abs * 100.0), 4)
+        ranked.append({
+            "feature": field,
+            "feature_value": _mlops_stage3_to_scalar(feature_value),
+            "impact_score": impact_score,
+            "direction": "Increased Risk" if impact_score >= 0 else "Reduced Risk",
+            "business_reason": _mlops_stage3_business_reason(field, impact_score, used_method),
+            "explainability_method": used_method,
+            "source": source,
+        })
+
+    ranked.sort(key=lambda item: abs(float(item.get("impact_score") or 0.0)), reverse=True)
+    return ranked[:max(1, int(max_items))], {
+        "enabled": True,
+        "method": used_method,
+        "requested_method": requested_method,
+        "recommended_method": recommended_method,
+        "status": "ok" if ranked else "empty",
+        "sample_rows": int(len(safe_sample)) if hasattr(safe_sample, "__len__") else 0,
+    }
+
+
 def _mlops_stage3_build_estimator(
     task: str,
     model_name: str,
@@ -4857,6 +5074,7 @@ def _mlops_stage3_build_estimator(
         GradientBoostingClassifier,
         GradientBoostingRegressor,
     )
+    from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
     from sklearn.svm import SVC, OneClassSVM
     from sklearn.neural_network import MLPClassifier
     from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
@@ -4866,8 +5084,24 @@ def _mlops_stage3_build_estimator(
     resolved_task = str(task or "").strip().lower()
 
     if resolved_task == "regression":
+        if "decision tree" in name:
+            return DecisionTreeRegressor(random_state=random_seed), notes
         if "random forest" in name:
             return RandomForestRegressor(n_estimators=300, random_state=random_seed, n_jobs=-1), notes
+        if "lightgbm" in name or "light gbm" in name:
+            try:
+                from lightgbm import LGBMRegressor  # type: ignore
+                return LGBMRegressor(random_state=random_seed, n_estimators=300, learning_rate=0.05), notes
+            except Exception:
+                notes.append("LightGBM not available; fallback model Gradient Boosting Regressor was used.")
+                return GradientBoostingRegressor(random_state=random_seed), notes
+        if "catboost" in name or "cat boost" in name:
+            try:
+                from catboost import CatBoostRegressor  # type: ignore
+                return CatBoostRegressor(random_seed=random_seed, iterations=300, learning_rate=0.05, verbose=False), notes
+            except Exception:
+                notes.append("CatBoost not available; fallback model Gradient Boosting Regressor was used.")
+                return GradientBoostingRegressor(random_state=random_seed), notes
         if "xgboost" in name:
             try:
                 from xgboost import XGBRegressor  # type: ignore
@@ -4889,6 +5123,8 @@ def _mlops_stage3_build_estimator(
         return LinearRegression(), notes
 
     if resolved_task == "classification":
+        if "decision tree" in name:
+            return DecisionTreeClassifier(random_state=random_seed, class_weight="balanced"), notes
         if "random forest" in name:
             return RandomForestClassifier(
                 n_estimators=300,
@@ -4896,6 +5132,20 @@ def _mlops_stage3_build_estimator(
                 n_jobs=-1,
                 class_weight="balanced_subsample",
             ), notes
+        if "lightgbm" in name or "light gbm" in name:
+            try:
+                from lightgbm import LGBMClassifier  # type: ignore
+                return LGBMClassifier(random_state=random_seed, n_estimators=300, learning_rate=0.05), notes
+            except Exception:
+                notes.append("LightGBM not available; fallback model Gradient Boosting Classifier was used.")
+                return GradientBoostingClassifier(random_state=random_seed), notes
+        if "catboost" in name or "cat boost" in name:
+            try:
+                from catboost import CatBoostClassifier  # type: ignore
+                return CatBoostClassifier(random_seed=random_seed, iterations=300, learning_rate=0.05, verbose=False), notes
+            except Exception:
+                notes.append("CatBoost not available; fallback model Gradient Boosting Classifier was used.")
+                return GradientBoostingClassifier(random_state=random_seed), notes
         if "xgboost" in name:
             try:
                 from xgboost import XGBClassifier  # type: ignore
@@ -5091,6 +5341,356 @@ def _mlops_stage3_persist_runtime_bundle(
         return None
 
 
+def _mlops_rule_scalar(value: Any) -> Any:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    try:
+        if hasattr(value, "item"):
+            return value.item()
+    except Exception:
+        pass
+    return value
+
+
+def _mlops_rule_get(row: Dict[str, Any], field_path: str) -> Any:
+    if not isinstance(row, dict):
+        return None
+    path = str(field_path or "").strip()
+    if not path:
+        return None
+    if path in row:
+        return row.get(path)
+    current: Any = row
+    for part in path.split("."):
+        if isinstance(current, dict) and part in current:
+            current = current.get(part)
+        else:
+            return None
+    return current
+
+
+def _mlops_rule_set(row: Dict[str, Any], field_path: str, value: Any) -> None:
+    path = str(field_path or "").strip()
+    if not path:
+        return
+    parts = [part for part in path.split(".") if part]
+    if not parts:
+        return
+    current = row
+    for part in parts[:-1]:
+        nxt = current.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            current[part] = nxt
+        current = nxt
+    current[parts[-1]] = _mlops_rule_scalar(value)
+
+
+def _mlops_rule_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        num = float(value)
+        if math.isfinite(num):
+            return num
+    except Exception:
+        return None
+    return None
+
+
+def _mlops_rule_render_template(template: str, row: Dict[str, Any]) -> str:
+    text = str(template or "")
+
+    def _replace(match: re.Match) -> str:
+        key = str(match.group(1) or "").strip()
+        val = _mlops_rule_get(row, key)
+        return "" if val is None else str(val)
+
+    try:
+        return re.sub(r"\{([^{}]+)\}", _replace, text)
+    except Exception:
+        return text
+
+
+def _mlops_rule_compare(left: Any, operator: str, right: Any) -> bool:
+    op = str(operator or "equals").strip().lower()
+    if op in {"empty", "is_empty"}:
+        return left is None or str(left).strip() == ""
+    if op in {"not_empty", "is_not_empty"}:
+        return not (left is None or str(left).strip() == "")
+    if op in {"gt", "gte", "lt", "lte", "greater_than", "less_than"}:
+        lnum = _mlops_rule_float(left)
+        rnum = _mlops_rule_float(right)
+        if lnum is None or rnum is None:
+            return False
+        if op in {"gt", "greater_than"}:
+            return lnum > rnum
+        if op == "gte":
+            return lnum >= rnum
+        if op in {"lt", "less_than"}:
+            return lnum < rnum
+        return lnum <= rnum
+    if op in {"contains", "not_contains"}:
+        matched = str(right).lower() in str(left).lower()
+        return matched if op == "contains" else not matched
+    if op in {"in", "not_in"}:
+        options = right if isinstance(right, list) else [part.strip() for part in str(right).split(",")]
+        matched = str(left) in {str(item) for item in options}
+        return matched if op == "in" else not matched
+    matched = str(left) == str(right)
+    if op in {"not_equals", "neq", "!="}:
+        return not matched
+    return matched
+
+
+def _mlops_apply_row_rules(rows: List[Dict[str, Any]], rules: Any) -> List[Dict[str, Any]]:
+    if not isinstance(rules, list) or not rules:
+        return rows
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        next_row = dict(row)
+        keep_row = True
+        for rule in rules:
+            if not isinstance(rule, dict) or rule.get("enabled") is False:
+                continue
+            conditions = rule.get("conditions")
+            if not isinstance(conditions, list):
+                conditions = []
+            join = str(rule.get("join") or rule.get("match") or "all").strip().lower()
+            checks: List[bool] = []
+            for condition in conditions:
+                if not isinstance(condition, dict):
+                    continue
+                field = str(condition.get("field") or "").strip()
+                left = _mlops_rule_get(next_row, field)
+                checks.append(_mlops_rule_compare(left, str(condition.get("operator") or "equals"), condition.get("value")))
+            matched = True if not checks else (any(checks) if join == "any" else all(checks))
+            if not matched:
+                continue
+            action = str(rule.get("action") or "").strip().lower()
+            if action in {"drop", "exclude", "filter_out"}:
+                keep_row = False
+                break
+            actions = rule.get("actions")
+            if not isinstance(actions, list):
+                actions = []
+            for action_cfg in actions:
+                if not isinstance(action_cfg, dict):
+                    continue
+                target = str(action_cfg.get("field") or action_cfg.get("target") or "").strip()
+                if not target:
+                    continue
+                mode = str(action_cfg.get("mode") or "literal").strip().lower()
+                raw_value = action_cfg.get("value")
+                if mode == "field":
+                    value = _mlops_rule_get(next_row, str(raw_value or ""))
+                elif mode == "template":
+                    value = _mlops_rule_render_template(str(raw_value or ""), next_row)
+                else:
+                    value = raw_value
+                _mlops_rule_set(next_row, target, value)
+        if keep_row:
+            out.append(next_row)
+    return out
+
+
+def _mlops_apply_recommendation(rows: List[Dict[str, Any]], recommendation: Any) -> List[Dict[str, Any]]:
+    if not isinstance(recommendation, dict) or recommendation.get("enabled") is False:
+        return rows
+    field = str(recommendation.get("field") or "recommendation").strip() or "recommendation"
+    template = str(recommendation.get("template") or recommendation.get("value") or "").strip()
+    if not template:
+        return rows
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        next_row = dict(row)
+        _mlops_rule_set(next_row, field, _mlops_rule_render_template(template, next_row))
+        out.append(next_row)
+    return out
+
+
+def _mlops_stage3_train_ensemble_rows(
+    *,
+    rows: List[Dict[str, Any]],
+    ensemble_models: List[Dict[str, Any]],
+    train_test_split_ratio: float = 0.2,
+    cv_folds: int = 5,
+    cluster_count: int = 4,
+    epochs: int = 20,
+    batch_size: int = 32,
+    random_seed: int = 42,
+    tuning_enabled: bool = False,
+    tuning_method: str = "random_search",
+    tuning_params: Optional[List[Dict[str, Any]]] = None,
+    tracking_enabled: bool = True,
+    run_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    from etl_engine import ETLEngine
+
+    steps = [item for item in (ensemble_models or []) if isinstance(item, dict) and item.get("enabled") is not False]
+    if not steps:
+        raise HTTPException(400, "At least one enabled ensemble model step is required.")
+    working_rows: List[Dict[str, Any]] = [
+        json.loads(json.dumps(row, default=str))
+        for row in (rows or [])
+        if isinstance(row, dict)
+    ]
+    if not working_rows:
+        raise HTTPException(400, "No tabular rows provided for ensemble training.")
+
+    engine = ETLEngine()
+    step_summaries: List[Dict[str, Any]] = []
+    runtime_steps: List[Dict[str, Any]] = []
+    notes: List[str] = []
+    for idx, step in enumerate(steps):
+        step_id = str(step.get("id") or f"model_{idx + 1}").strip() or f"model_{idx + 1}"
+        step_name = str(step.get("name") or f"Model {idx + 1}").strip() or f"Model {idx + 1}"
+        task_type = str(step.get("task_type") or "classification").strip().lower()
+        model_name = str(step.get("model") or "").strip()
+        feature_fields = [
+            str(item or "").strip()
+            for item in (step.get("feature_fields") if isinstance(step.get("feature_fields"), list) else [])
+            if str(item or "").strip()
+        ]
+        target_field = str(step.get("target_field") or "").strip() or None
+        if task_type not in {"classification", "regression", "clustering", "forecasting", "anomaly_detection"}:
+            raise HTTPException(400, f"Ensemble step {step_name} uses unsupported task type '{task_type}'.")
+        if not feature_fields:
+            raise HTTPException(400, f"Ensemble step {step_name} requires at least one feature field.")
+        if task_type in {"classification", "regression", "forecasting"} and not target_field:
+            raise HTTPException(400, f"Ensemble step {step_name} requires a target/label field.")
+
+        working_rows = _mlops_apply_row_rules(working_rows, step.get("pre_rules"))
+        if not working_rows:
+            raise HTTPException(400, f"Ensemble step {step_name} has zero rows after pre-processing rules.")
+
+        step_summary = _mlops_stage3_train_rows(
+            rows=working_rows,
+            task_type=task_type,
+            model_name=model_name,
+            feature_fields=feature_fields,
+            target_field=target_field,
+            train_test_split_ratio=train_test_split_ratio,
+            cv_folds=cv_folds,
+            cluster_count=cluster_count,
+            epochs=epochs,
+            batch_size=batch_size,
+            random_seed=random_seed,
+            target_fields=[target_field] if task_type == "forecasting" and target_field else None,
+            forecast_date_field=str(step.get("forecast_date_field") or "").strip() or None,
+            forecast_horizon=int(step.get("forecast_horizon") or 30),
+            forecast_frequency=str(step.get("forecast_frequency") or "D"),
+            forecast_auto_tune_orders=bool(step.get("forecast_auto_tune_orders")),
+            forecast_order_search_max_evals=int(step.get("forecast_order_search_max_evals") or 16),
+            tuning_enabled=tuning_enabled,
+            tuning_method=tuning_method,
+            tuning_params=tuning_params,
+            tracking_enabled=tracking_enabled,
+            run_name=f"{run_name or 'ensemble'}:{step_name}",
+            explainability_method=str(step.get("explainability_method") or "off"),
+        )
+        runtime_bundle = step_summary.get("runtime_model_bundle") if isinstance(step_summary, dict) else None
+        if not isinstance(runtime_bundle, dict):
+            raise HTTPException(400, f"Ensemble step {step_name} did not produce a runtime model bundle.")
+
+        prediction_field = str(step.get("prediction_field") or f"{step_id}_prediction").strip() or f"{step_id}_prediction"
+        score_field = str(step.get("score_field") or f"{step_id}_prediction_score").strip()
+        influence_field = str(step.get("influence_field") or f"{step_id}_top_influencing_features").strip()
+        step_config = {
+            "mlops_mode": "production",
+            "mlops_stage3_model_bundle": runtime_bundle,
+            "mlops_prediction_field": prediction_field,
+            "mlops_prediction_score_field": score_field,
+            "mlops_top_influencing_features_field": influence_field,
+            "mlops_top_influencing_features_limit": int(step.get("influence_limit") or 5),
+            "mlops_top_influencing_features_keys": step.get("influence_keys") or [],
+            "mlops_stage3_explainability_method": str(step.get("explainability_method") or "off"),
+        }
+        working_rows = [
+            row for row in engine._transform_mlops(working_rows, step_config, execution_context={"node_warnings": notes})
+            if isinstance(row, dict)
+        ]
+        working_rows = _mlops_apply_row_rules(working_rows, step.get("post_rules"))
+        working_rows = _mlops_apply_recommendation(working_rows, step.get("recommendation"))
+
+        public_step_summary = dict(step_summary)
+        public_step_summary["step_id"] = step_id
+        public_step_summary["step_name"] = step_name
+        public_step_summary["prediction_field"] = prediction_field
+        public_step_summary["score_field"] = score_field
+        public_step_summary["input_rows_after_rules"] = len(working_rows)
+        step_summaries.append(public_step_summary)
+        runtime_steps.append({
+            "id": step_id,
+            "name": step_name,
+            "task_type": task_type,
+            "model": model_name or public_step_summary.get("model"),
+            "feature_fields": feature_fields,
+            "target_field": target_field,
+            "forecast_date_field": str(step.get("forecast_date_field") or "").strip() or None,
+            "forecast_horizon": int(step.get("forecast_horizon") or 30),
+            "forecast_frequency": str(step.get("forecast_frequency") or "D"),
+            "forecast_auto_tune_orders": bool(step.get("forecast_auto_tune_orders")),
+            "forecast_order_search_max_evals": int(step.get("forecast_order_search_max_evals") or 16),
+            "prediction_field": prediction_field,
+            "score_field": score_field,
+            "influence_field": influence_field,
+            "influence_limit": int(step.get("influence_limit") or 5),
+            "influence_keys": step.get("influence_keys") or [],
+            "explainability_method": str(step.get("explainability_method") or "off"),
+            "pre_rules": step.get("pre_rules") if isinstance(step.get("pre_rules"), list) else [],
+            "post_rules": step.get("post_rules") if isinstance(step.get("post_rules"), list) else [],
+            "recommendation": step.get("recommendation") if isinstance(step.get("recommendation"), dict) else {},
+            "runtime_model_bundle": runtime_bundle,
+        })
+
+    last_summary = step_summaries[-1] if step_summaries else {}
+    runtime_bundle = _mlops_stage3_persist_runtime_bundle(
+        task_type="ensemble_pipeline",
+        feature_fields=[],
+        target_field=None,
+        predictor_kind="ensemble_pipeline",
+        model_pipeline={"steps": runtime_steps},
+        runtime_metadata={
+            "model_mode": "ensemble_pipeline",
+            "step_count": len(runtime_steps),
+            "run_name": run_name,
+        },
+    )
+    return {
+        "ran": True,
+        "executed_at": datetime.utcnow().isoformat(),
+        "mode": "real_train",
+        "model_mode": "ensemble_pipeline",
+        "task_type": str(last_summary.get("task_type") or "ensemble_pipeline"),
+        "model": "Ensemble Pipeline",
+        "input_rows": len(rows or []),
+        "usable_rows": len(working_rows),
+        "dropped_rows": max(0, len(rows or []) - len(working_rows)),
+        "feature_count": 0,
+        "feature_fields": [],
+        "target_field": None,
+        "train_rows": int(sum(int(item.get("train_rows") or 0) for item in step_summaries)),
+        "test_rows": int(sum(int(item.get("test_rows") or 0) for item in step_summaries)),
+        "cv_folds": cv_folds,
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "random_seed": random_seed,
+        "tuning_enabled": tuning_enabled,
+        "tuning_method": tuning_method if tuning_enabled else None,
+        "tuning_params": tuning_params or [],
+        "tracking_enabled": tracking_enabled,
+        "notes": notes + [f"Ensemble pipeline trained with {len(runtime_steps)} model step(s)."],
+        "target_overview": None,
+        "model_summaries": step_summaries,
+        "sample_predictions": working_rows[:10],
+        "run_name": run_name,
+        "runtime_model_bundle": runtime_bundle,
+    }
+
+
 def _mlops_stage3_train_rows(
     rows: List[Dict[str, Any]],
     task_type: str = "classification",
@@ -5116,6 +5716,7 @@ def _mlops_stage3_train_rows(
     tuning_params: Optional[List[Dict[str, Any]]] = None,
     tracking_enabled: bool = True,
     run_name: Optional[str] = None,
+    explainability_method: str = "off",
 ) -> Dict[str, Any]:
     import numpy as np
     import pandas as pd
@@ -5567,6 +6168,8 @@ def _mlops_stage3_train_rows(
                 if str(item.get("target_field") or "")
             },
             "feature_importance": [],
+            "top_influencing_features": [],
+            "explainability": {"enabled": False, "method": "off", "status": "unsupported_task"},
             "tuning_result": {},
             "sample_predictions": sample_predictions,
             "runtime_model_bundle": runtime_bundle,
@@ -5670,11 +6273,31 @@ def _mlops_stage3_train_rows(
     test_metrics: Dict[str, Any] = {}
     sample_predictions: List[Dict[str, Any]] = []
     feature_importance: List[Dict[str, Any]] = []
+    top_influencing_features: List[Dict[str, Any]] = []
+    explainability: Dict[str, Any] = {"enabled": False, "method": "off", "status": "disabled"}
     tuning_result: Dict[str, Any] = {}
     train_rows = len(usable_rows)
     test_rows = 0
     runtime_model_bundle: Optional[Dict[str, Any]] = None
     classification_class_labels: List[str] = []
+    feature_baselines: Dict[str, Any] = {}
+    try:
+        for field in resolved_fields:
+            series = feature_df[field] if field in feature_df.columns else None
+            if series is None:
+                continue
+            numeric_series = pd.to_numeric(series, errors="coerce")
+            if float(numeric_series.notna().mean()) >= 0.85 and numeric_series.notna().any():
+                feature_baselines[field] = _mlops_stage3_to_scalar(float(numeric_series.median()))
+            else:
+                non_missing = series.dropna()
+                if len(non_missing) > 0:
+                    mode_values = non_missing.mode(dropna=True)
+                    feature_baselines[field] = _mlops_stage3_to_scalar(
+                        mode_values.iloc[0] if len(mode_values) > 0 else non_missing.iloc[0]
+                    )
+    except Exception:
+        feature_baselines = {}
 
     def _decode_class_prediction_value(value: Any) -> Any:
         if task == "classification" and classification_class_labels:
@@ -5928,15 +6551,44 @@ def _mlops_stage3_train_rows(
         except Exception:
             feature_importance = []
 
+        try:
+            estimator_obj = model_pipeline.named_steps["model"]
+            top_influencing_features, explainability = _mlops_stage3_build_influencing_features(
+                model_pipeline=model_pipeline,
+                estimator_obj=estimator_obj,
+                X_train=X_train,
+                X_sample=X_test if len(X_test) > 0 else X_train,
+                original_fields=resolved_fields,
+                task=task,
+                method=explainability_method,
+                notes=notes,
+                max_items=10,
+            )
+        except Exception as exc:
+            explainability = {
+                "enabled": str(explainability_method or "off").strip().lower() not in {"", "off", "none", "disabled"},
+                "method": str(explainability_method or "off").strip().lower() or "off",
+                "status": "failed",
+                "error": str(exc),
+            }
+            top_influencing_features = []
+            notes.append(f"Explainability output failed: {exc}")
+
+        runtime_metadata: Dict[str, Any] = {
+            "explainability": explainability,
+            "explainability_method": str(explainability.get("method") or explainability_method or "off"),
+            "feature_baselines": feature_baselines,
+        }
+        if task == "classification" and classification_class_labels:
+            runtime_metadata["classification_class_labels"] = classification_class_labels
+
         runtime_model_bundle = _mlops_stage3_persist_runtime_bundle(
             task_type=task,
             feature_fields=resolved_fields,
             target_field=target_path or None,
             predictor_kind="pipeline",
             model_pipeline=model_pipeline,
-            runtime_metadata={
-                "classification_class_labels": classification_class_labels,
-            } if task == "classification" and classification_class_labels else None,
+            runtime_metadata=runtime_metadata,
         )
 
     elif task == "clustering":
@@ -6032,7 +6684,82 @@ def _mlops_stage3_train_rows(
             predictor_kind="components",
             preprocessor=preprocessor,
             estimator=estimator,
+            runtime_metadata={
+                "feature_baselines": feature_baselines,
+            },
         )
+        requested_explainability = str(explainability_method or "off").strip().lower()
+        if requested_explainability not in {"", "off", "none", "disabled"}:
+            recommended = _mlops_stage3_recommended_explainability_method(task, estimator)
+            explainability = {
+                "enabled": True,
+                "method": recommended if requested_explainability in {"auto", "shap"} else requested_explainability,
+                "requested_method": requested_explainability,
+                "recommended_method": recommended,
+                "status": "non_shap_strategy",
+            }
+            notes.append(f"Clustering explainability uses {recommended}; SHAP is not ideal for clustering models.")
+            try:
+                cluster_feature_rows: List[Dict[str, Any]] = []
+                numeric_feature_fields = [
+                    field for field in resolved_fields
+                    if field in feature_df.columns and pd.to_numeric(feature_df[field], errors="coerce").notna().any()
+                ]
+                if numeric_feature_fields:
+                    profile_df = feature_df[numeric_feature_fields].copy()
+                    profile_df["_cluster"] = [int(v) for v in labels.tolist()]
+                    deviations: List[Dict[str, Any]] = []
+                    for field in numeric_feature_fields:
+                        all_values = pd.to_numeric(profile_df[field], errors="coerce")
+                        all_values = all_values.loc[all_values.notna()]
+                        if all_values.empty:
+                            continue
+                        baseline = float(all_values.median())
+                        spread = float(all_values.quantile(0.75) - all_values.quantile(0.25))
+                        if not math.isfinite(spread) or abs(spread) <= 1e-9:
+                            spread = float(all_values.std() or 1.0)
+                        if not math.isfinite(spread) or abs(spread) <= 1e-9:
+                            spread = 1.0
+                        max_strength = 0.0
+                        representative_value = baseline
+                        for label in unique_labels:
+                            group_values = pd.to_numeric(
+                                profile_df.loc[profile_df["_cluster"] == int(label), field],
+                                errors="coerce",
+                            )
+                            group_values = group_values.loc[group_values.notna()]
+                            if group_values.empty:
+                                continue
+                            current = float(group_values.mean())
+                            strength = (current - baseline) / spread
+                            if abs(strength) > abs(max_strength):
+                                max_strength = strength
+                                representative_value = current
+                        if not math.isfinite(max_strength) or abs(max_strength) <= 1e-12:
+                            continue
+                        deviations.append({
+                            "field": field,
+                            "current": representative_value,
+                            "signed_strength": max_strength,
+                        })
+                    total_abs = sum(abs(float(item["signed_strength"])) for item in deviations) or 1.0
+                    for item in sorted(deviations, key=lambda row: abs(float(row["signed_strength"])), reverse=True)[:10]:
+                        impact = float(item["signed_strength"]) / total_abs * 100.0
+                        cluster_feature_rows.append({
+                            "feature": str(item["field"]),
+                            "feature_value": _mlops_stage3_to_scalar(item["current"]),
+                            "impact_score": round(impact, 4),
+                            "direction": "Increased Risk" if impact >= 0 else "Reduced Risk",
+                            "business_reason": (
+                                f"{item['field']} separates fitted clusters from the global baseline; "
+                                "impact is estimated using cluster profile deviation."
+                            ),
+                            "explainability_method": recommended,
+                            "source": "cluster_profile_deviation",
+                        })
+                top_influencing_features = cluster_feature_rows
+            except Exception as exc:
+                notes.append(f"Cluster influence summary failed: {exc}")
 
     else:  # anomaly_detection
         transformed = preprocessor.fit_transform(feature_df)
@@ -6066,7 +6793,78 @@ def _mlops_stage3_train_rows(
             predictor_kind="components",
             preprocessor=preprocessor,
             estimator=estimator,
+            runtime_metadata={
+                "feature_baselines": feature_baselines,
+            },
         )
+        requested_explainability = str(explainability_method or "off").strip().lower()
+        if requested_explainability not in {"", "off", "none", "disabled"}:
+            lower_model_name = str(model_name or "").strip().lower()
+            if "autoencoder" in lower_model_name:
+                recommended = "reconstruction_error_explanation"
+            elif "one-class" in lower_model_name:
+                recommended = "shap_kernel"
+            else:
+                recommended = _mlops_stage3_recommended_explainability_method(task, estimator)
+            explainability = {
+                "enabled": True,
+                "method": recommended if requested_explainability in {"auto", "shap"} else requested_explainability,
+                "requested_method": requested_explainability,
+                "recommended_method": recommended,
+                "status": "non_shap_strategy" if recommended != "shap_tree" else "ok",
+            }
+            notes.append(f"Anomaly explainability uses {recommended} for {str(model_name or '').strip() or estimator.__class__.__name__}.")
+            try:
+                anomaly_feature_rows: List[Dict[str, Any]] = []
+                numeric_feature_fields = [
+                    field for field in resolved_fields
+                    if field in feature_df.columns and pd.to_numeric(feature_df[field], errors="coerce").notna().any()
+                ]
+                if numeric_feature_fields:
+                    anomaly_indices = np.where(anomaly_mask)[0].tolist()
+                    reference_df = feature_df
+                    focus_df = feature_df.iloc[anomaly_indices] if anomaly_indices else feature_df
+                    deviations: List[Dict[str, Any]] = []
+                    for field in numeric_feature_fields:
+                        ref_values = pd.to_numeric(reference_df[field], errors="coerce")
+                        focus_values = pd.to_numeric(focus_df[field], errors="coerce")
+                        ref_values = ref_values.loc[ref_values.notna()]
+                        focus_values = focus_values.loc[focus_values.notna()]
+                        if ref_values.empty or focus_values.empty:
+                            continue
+                        baseline = float(ref_values.median())
+                        current = float(focus_values.mean())
+                        spread = float(ref_values.quantile(0.75) - ref_values.quantile(0.25))
+                        if not math.isfinite(spread) or abs(spread) <= 1e-9:
+                            spread = float(ref_values.std() or 1.0)
+                        if not math.isfinite(spread) or abs(spread) <= 1e-9:
+                            spread = 1.0
+                        signed_strength = (current - baseline) / spread
+                        if not math.isfinite(signed_strength) or abs(signed_strength) <= 1e-12:
+                            continue
+                        deviations.append({
+                            "field": field,
+                            "current": current,
+                            "signed_strength": signed_strength,
+                        })
+                    total_abs = sum(abs(float(item["signed_strength"])) for item in deviations) or 1.0
+                    for item in sorted(deviations, key=lambda row: abs(float(row["signed_strength"])), reverse=True)[:10]:
+                        impact = float(item["signed_strength"]) / total_abs * 100.0
+                        anomaly_feature_rows.append({
+                            "feature": str(item["field"]),
+                            "feature_value": _mlops_stage3_to_scalar(item["current"]),
+                            "impact_score": round(impact, 4),
+                            "direction": "Increased Risk" if impact >= 0 else "Reduced Risk",
+                            "business_reason": (
+                                f"{item['field']} differs from normal baseline for anomaly scoring; "
+                                "impact is estimated using feature deviation."
+                            ),
+                            "explainability_method": recommended,
+                            "source": "anomaly_feature_deviation",
+                        })
+                top_influencing_features = anomaly_feature_rows
+            except Exception as exc:
+                notes.append(f"Anomaly influence summary failed: {exc}")
 
     summary = {
         "ran": True,
@@ -6101,6 +6899,8 @@ def _mlops_stage3_train_rows(
         "train_metrics": train_metrics,
         "test_metrics": test_metrics,
         "feature_importance": feature_importance,
+        "top_influencing_features": top_influencing_features,
+        "explainability": explainability,
         "tuning_result": tuning_result,
         "sample_predictions": sample_predictions,
         "runtime_model_bundle": runtime_model_bundle,
@@ -6934,32 +7734,50 @@ async def mlops_node_stage3_train(
         raise HTTPException(status_code=400, detail="No rows were provided for Stage 3 training.")
 
     try:
-        summary = _mlops_stage3_train_rows(
-            rows=input_rows,
-            task_type=str(body.task_type or "classification"),
-            model_name=str(body.model or ""),
-            feature_fields=list(body.feature_fields or []),
-            target_field=body.target_field,
-            target_fields=list(body.target_fields or []),
-            forecast_date_field=body.forecast_date_field,
-            forecast_horizon=int(body.forecast_horizon or 30),
-            forecast_frequency=str(body.forecast_frequency or "D"),
-            arima_order=list(body.arima_order or []),
-            sarima_seasonal_order=list(body.sarima_seasonal_order or []),
-            forecast_auto_tune_orders=bool(body.forecast_auto_tune_orders),
-            forecast_order_search_max_evals=int(body.forecast_order_search_max_evals or 16),
-            train_test_split_ratio=float(body.train_test_split or 0.2),
-            cv_folds=int(body.cv_folds or 5),
-            cluster_count=int(body.cluster_count or 4),
-            epochs=int(body.epochs or 20),
-            batch_size=int(body.batch_size or 32),
-            random_seed=int(body.random_seed or 42),
-            tuning_enabled=bool(body.tuning_enabled),
-            tuning_method=str(body.tuning_method or "random_search"),
-            tuning_params=list(body.tuning_params or []),
-            tracking_enabled=bool(body.tracking_enabled),
-            run_name=body.run_name,
-        )
+        if str(body.model_mode or "single").strip().lower() == "ensemble_pipeline":
+            summary = _mlops_stage3_train_ensemble_rows(
+                rows=input_rows,
+                ensemble_models=list(body.ensemble_models or []),
+                train_test_split_ratio=float(body.train_test_split or 0.2),
+                cv_folds=int(body.cv_folds or 5),
+                cluster_count=int(body.cluster_count or 4),
+                epochs=int(body.epochs or 20),
+                batch_size=int(body.batch_size or 32),
+                random_seed=int(body.random_seed or 42),
+                tuning_enabled=bool(body.tuning_enabled),
+                tuning_method=str(body.tuning_method or "random_search"),
+                tuning_params=list(body.tuning_params or []),
+                tracking_enabled=bool(body.tracking_enabled),
+                run_name=body.run_name,
+            )
+        else:
+            summary = _mlops_stage3_train_rows(
+                rows=input_rows,
+                task_type=str(body.task_type or "classification"),
+                model_name=str(body.model or ""),
+                feature_fields=list(body.feature_fields or []),
+                target_field=body.target_field,
+                target_fields=list(body.target_fields or []),
+                forecast_date_field=body.forecast_date_field,
+                forecast_horizon=int(body.forecast_horizon or 30),
+                forecast_frequency=str(body.forecast_frequency or "D"),
+                arima_order=list(body.arima_order or []),
+                sarima_seasonal_order=list(body.sarima_seasonal_order or []),
+                forecast_auto_tune_orders=bool(body.forecast_auto_tune_orders),
+                forecast_order_search_max_evals=int(body.forecast_order_search_max_evals or 16),
+                train_test_split_ratio=float(body.train_test_split or 0.2),
+                cv_folds=int(body.cv_folds or 5),
+                cluster_count=int(body.cluster_count or 4),
+                epochs=int(body.epochs or 20),
+                batch_size=int(body.batch_size or 32),
+                random_seed=int(body.random_seed or 42),
+                tuning_enabled=bool(body.tuning_enabled),
+                tuning_method=str(body.tuning_method or "random_search"),
+                tuning_params=list(body.tuning_params or []),
+                tracking_enabled=bool(body.tracking_enabled),
+                run_name=body.run_name,
+                explainability_method=str(body.explainability_method or "off"),
+            )
     except HTTPException:
         raise
     except Exception as exc:

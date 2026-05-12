@@ -19112,6 +19112,14 @@ END;"""
             )
 
         bundle = self._load_mlops_runtime_model_bundle(bundle_cfg)
+        predictor_kind = str(bundle.get("predictor_kind") or "pipeline").strip().lower() or "pipeline"
+        if predictor_kind == "ensemble_pipeline":
+            return self._transform_mlops_ensemble_pipeline(
+                rows,
+                bundle,
+                config or {},
+                execution_context=execution_context,
+            )
         raw_feature_fields = bundle.get("feature_fields")
         if not raw_feature_fields:
             raw_feature_fields = (config or {}).get("mlops_stage3_feature_fields")
@@ -19137,11 +19145,59 @@ END;"""
 
         pred_field = str((config or {}).get("mlops_prediction_field") or "prediction").strip() or "prediction"
         score_field = str((config or {}).get("mlops_prediction_score_field") or "prediction_score").strip()
+        influence_field = str((config or {}).get("mlops_top_influencing_features_field") or "top_influencing_features").strip() or "top_influencing_features"
+        try:
+            influence_limit = int(float((config or {}).get("mlops_top_influencing_features_limit") or 10))
+        except Exception:
+            influence_limit = 10
+        influence_limit = max(1, min(influence_limit, 50))
+        influence_key_options = {
+            "feature",
+            "value",
+            "impact_score",
+            "direction",
+            "percentage_of_final_score",
+            "percentage_share_of_total_influence",
+        }
+        raw_influence_keys = (config or {}).get("mlops_top_influencing_features_keys")
+        if isinstance(raw_influence_keys, str):
+            text = raw_influence_keys.strip()
+            if text.startswith("[") and text.endswith("]"):
+                try:
+                    parsed_keys = json.loads(text)
+                except Exception:
+                    parsed_keys = []
+            else:
+                parsed_keys = [part.strip() for part in text.split(",") if part.strip()]
+        elif isinstance(raw_influence_keys, (list, tuple, set)):
+            parsed_keys = list(raw_influence_keys)
+        else:
+            parsed_keys = []
+        influence_output_keys = [
+            str(key or "").strip()
+            for key in parsed_keys
+            if str(key or "").strip() in influence_key_options
+        ]
+        if not influence_output_keys:
+            influence_output_keys = [
+                "feature",
+                "value",
+                "impact_score",
+                "direction",
+                "percentage_of_final_score",
+                "percentage_share_of_total_influence",
+            ]
 
         dict_rows: List[Dict[str, Any]] = [row for row in rows if isinstance(row, dict)]
-        predictor_kind = str(bundle.get("predictor_kind") or "pipeline").strip().lower() or "pipeline"
         task_type = str(bundle.get("task_type") or "").strip().lower()
         runtime_metadata = bundle.get("runtime_metadata") if isinstance(bundle.get("runtime_metadata"), dict) else {}
+        feature_baselines = runtime_metadata.get("feature_baselines") if isinstance(runtime_metadata.get("feature_baselines"), dict) else {}
+        configured_explainability_method = str((config or {}).get("mlops_stage3_explainability_method") or "").strip().lower()
+        if not configured_explainability_method:
+            configured_explainability_method = str(runtime_metadata.get("explainability_method") or "").strip().lower()
+        if not configured_explainability_method and isinstance(runtime_metadata.get("explainability"), dict):
+            configured_explainability_method = str(runtime_metadata.get("explainability", {}).get("method") or "").strip().lower()
+        explainability_enabled = configured_explainability_method not in {"", "off", "none", "disabled", "false", "0"}
 
         def _sanitize_field_suffix(value: Any, fallback: str) -> str:
             text = str(value or "").strip()
@@ -19515,6 +19571,7 @@ END;"""
 
         feature_df = _pd.DataFrame(feature_records, columns=feature_fields)
         predictions: List[Any] = []
+        raw_predictions: List[Any] = []
         scores: List[Any] = []
 
         def _mlops_runtime_dense_matrix(value: Any) -> Any:
@@ -19581,8 +19638,15 @@ END;"""
                 if len(feature_records) < 2:
                     predictions = [0 for _ in feature_records]
                 else:
-                    pred_arr = estimator.fit_predict(transformed)
-                    predictions = pred_arr.tolist() if hasattr(pred_arr, "tolist") else list(pred_arr)
+                    try:
+                        pred_arr = estimator.fit_predict(transformed)
+                        predictions = pred_arr.tolist() if hasattr(pred_arr, "tolist") else list(pred_arr)
+                    except Exception:
+                        requested_clusters = int(getattr(estimator, "n_clusters", 1) or 1)
+                        if len(feature_records) < max(2, requested_clusters):
+                            predictions = [0 for _ in feature_records]
+                        else:
+                            raise
                 if isinstance(execution_context, dict):
                     node_warnings = execution_context.get("node_warnings")
                     warn_msg = (
@@ -19634,6 +19698,8 @@ END;"""
                 else:
                     raise RuntimeError(f"MLOps production scoring failed: {exc}") from exc
 
+        raw_predictions = list(predictions)
+
         class_labels = runtime_metadata.get("classification_class_labels")
         if task_type == "classification" and isinstance(class_labels, list) and class_labels:
             decoded_predictions: List[Any] = []
@@ -19660,6 +19726,370 @@ END;"""
                 f"MLOps prediction row-count mismatch: predicted={len(predictions)} input={len(dict_rows)}"
             )
 
+        def _feature_baseline_for(field_name: str) -> Any:
+            if isinstance(feature_baselines, dict) and field_name in feature_baselines:
+                return feature_baselines.get(field_name)
+            try:
+                if predictor_kind == "components":
+                    preprocessor_obj = bundle.get("preprocessor")
+                else:
+                    pipeline_obj = bundle.get("model_pipeline")
+                    preprocessor_obj = getattr(pipeline_obj, "named_steps", {}).get("prep") if pipeline_obj is not None else None
+                if preprocessor_obj is not None:
+                    for transformer_item in getattr(preprocessor_obj, "transformers_", []) or []:
+                        if len(transformer_item) < 3:
+                            continue
+                        _, transformer_pipeline, columns = transformer_item[:3]
+                        column_list = [str(col) for col in list(columns or [])]
+                        if field_name not in column_list:
+                            continue
+                        field_idx = column_list.index(field_name)
+                        steps = getattr(transformer_pipeline, "named_steps", {}) or {}
+                        imputer_obj = steps.get("imputer")
+                        stats = getattr(imputer_obj, "statistics_", None)
+                        if stats is not None and field_idx < len(stats):
+                            return self._mlops_runtime_to_scalar(stats[field_idx])
+            except Exception:
+                pass
+            series = feature_df[field_name] if field_name in feature_df.columns else None
+            if series is None:
+                return None
+            try:
+                numeric_series = _pd.to_numeric(series, errors="coerce")
+                if float(numeric_series.notna().mean()) >= 0.85 and numeric_series.notna().any():
+                    return float(numeric_series.median())
+                non_missing = series.dropna()
+                if len(non_missing) > 0:
+                    mode_values = non_missing.mode(dropna=True)
+                    return mode_values.iloc[0] if len(mode_values) > 0 else non_missing.iloc[0]
+            except Exception:
+                pass
+            return None
+
+        def _prediction_score_for_frame(frame: Any, target_prediction: Any = None) -> Optional[float]:
+            try:
+                if predictor_kind == "components":
+                    preprocessor = bundle.get("preprocessor")
+                    estimator = bundle.get("estimator")
+                    if preprocessor is None or estimator is None:
+                        return None
+                    transformed_frame = preprocessor.transform(frame)
+                    if task_type == "classification" and hasattr(estimator, "predict_proba"):
+                        proba = estimator.predict_proba(transformed_frame)
+                        raw_classes = getattr(estimator, "classes_", [])
+                        classes = raw_classes.tolist() if hasattr(raw_classes, "tolist") else list(raw_classes or [])
+                        target_idx = -1
+                        for idx, cls in enumerate(classes):
+                            if str(cls) == str(target_prediction):
+                                target_idx = idx
+                                break
+                        if target_idx < 0:
+                            target_idx = int(_np.argmax(proba[0]))
+                        return float(proba[0][target_idx])
+                    if task_type == "anomaly_detection" and hasattr(estimator, "decision_function"):
+                        decision = estimator.decision_function(transformed_frame)
+                        val = decision[0] if hasattr(decision, "__len__") and len(decision) else decision
+                        return -float(val)
+                    pred = estimator.predict(transformed_frame)
+                    val = pred[0] if hasattr(pred, "__len__") and len(pred) else pred
+                    return float(val)
+
+                model_pipeline_local = bundle.get("model_pipeline")
+                if model_pipeline_local is None:
+                    return None
+                if task_type == "classification" and hasattr(model_pipeline_local, "predict_proba"):
+                    proba = model_pipeline_local.predict_proba(frame)
+                    raw_classes = getattr(model_pipeline_local, "classes_", [])
+                    classes = raw_classes.tolist() if hasattr(raw_classes, "tolist") else list(raw_classes or [])
+                    target_idx = -1
+                    for idx, cls in enumerate(classes):
+                        if str(cls) == str(target_prediction):
+                            target_idx = idx
+                            break
+                    if target_idx < 0:
+                        target_idx = int(_np.argmax(proba[0]))
+                    return float(proba[0][target_idx])
+                if task_type == "anomaly_detection" and hasattr(model_pipeline_local, "decision_function"):
+                    decision = model_pipeline_local.decision_function(frame)
+                    val = decision[0] if hasattr(decision, "__len__") and len(decision) else decision
+                    return -float(val)
+                pred = model_pipeline_local.predict(frame)
+                val = pred[0] if hasattr(pred, "__len__") and len(pred) else pred
+                return float(val)
+            except Exception:
+                return None
+
+        def _prediction_scores_for_frame(frame: Any, target_predictions: List[Any]) -> List[Optional[float]]:
+            try:
+                if predictor_kind == "components":
+                    preprocessor = bundle.get("preprocessor")
+                    estimator = bundle.get("estimator")
+                    if preprocessor is None or estimator is None:
+                        return [None for _ in range(len(frame))]
+                    transformed_frame = preprocessor.transform(frame)
+                    if task_type == "classification" and hasattr(estimator, "predict_proba"):
+                        proba = estimator.predict_proba(transformed_frame)
+                        raw_classes = getattr(estimator, "classes_", [])
+                        classes = raw_classes.tolist() if hasattr(raw_classes, "tolist") else list(raw_classes or [])
+                        out_scores: List[Optional[float]] = []
+                        for row_idx, row_proba in enumerate(proba):
+                            target_prediction = target_predictions[row_idx] if row_idx < len(target_predictions) else None
+                            target_idx = -1
+                            for idx, cls in enumerate(classes):
+                                if str(cls) == str(target_prediction):
+                                    target_idx = idx
+                                    break
+                            if target_idx < 0:
+                                target_idx = int(_np.argmax(row_proba))
+                            out_scores.append(float(row_proba[target_idx]))
+                        return out_scores
+                    if task_type == "anomaly_detection" and hasattr(estimator, "decision_function"):
+                        decision = estimator.decision_function(transformed_frame)
+                        return [-float(item) for item in (decision.tolist() if hasattr(decision, "tolist") else list(decision))]
+                    pred = estimator.predict(transformed_frame)
+                    return [float(item) for item in (pred.tolist() if hasattr(pred, "tolist") else list(pred))]
+
+                model_pipeline_local = bundle.get("model_pipeline")
+                if model_pipeline_local is None:
+                    return [None for _ in range(len(frame))]
+                if task_type == "classification" and hasattr(model_pipeline_local, "predict_proba"):
+                    proba = model_pipeline_local.predict_proba(frame)
+                    raw_classes = getattr(model_pipeline_local, "classes_", [])
+                    classes = raw_classes.tolist() if hasattr(raw_classes, "tolist") else list(raw_classes or [])
+                    out_scores = []
+                    for row_idx, row_proba in enumerate(proba):
+                        target_prediction = target_predictions[row_idx] if row_idx < len(target_predictions) else None
+                        target_idx = -1
+                        for idx, cls in enumerate(classes):
+                            if str(cls) == str(target_prediction):
+                                target_idx = idx
+                                break
+                        if target_idx < 0:
+                            target_idx = int(_np.argmax(row_proba))
+                        out_scores.append(float(row_proba[target_idx]))
+                    return out_scores
+                if task_type == "anomaly_detection" and hasattr(model_pipeline_local, "decision_function"):
+                    decision = model_pipeline_local.decision_function(frame)
+                    return [-float(item) for item in (decision.tolist() if hasattr(decision, "tolist") else list(decision))]
+                pred = model_pipeline_local.predict(frame)
+                return [float(item) for item in (pred.tolist() if hasattr(pred, "tolist") else list(pred))]
+            except Exception:
+                return [None for _ in range(len(frame))]
+
+        def _base_feature_name(transformed_name: str) -> str:
+            name = str(transformed_name or "")
+            for prefix in ("num__", "cat__", "remainder__"):
+                if name.startswith(prefix):
+                    name = name[len(prefix):]
+                    break
+            for field in sorted([str(item) for item in feature_fields], key=len, reverse=True):
+                if name == field or name.startswith(f"{field}_"):
+                    return field
+            return name
+
+        def _model_original_feature_importance() -> Dict[str, float]:
+            try:
+                if predictor_kind == "components":
+                    preprocessor_obj = bundle.get("preprocessor")
+                    estimator_obj = bundle.get("estimator")
+                else:
+                    model_pipeline_obj = bundle.get("model_pipeline")
+                    preprocessor_obj = getattr(model_pipeline_obj, "named_steps", {}).get("prep") if model_pipeline_obj is not None else None
+                    estimator_obj = getattr(model_pipeline_obj, "named_steps", {}).get("model") if model_pipeline_obj is not None else None
+                if preprocessor_obj is None or estimator_obj is None:
+                    return {}
+                names = [str(item) for item in preprocessor_obj.get_feature_names_out()]
+                raw_importance = None
+                if hasattr(estimator_obj, "feature_importances_"):
+                    raw_importance = _np.asarray(getattr(estimator_obj, "feature_importances_"), dtype=float).reshape(-1)
+                elif hasattr(estimator_obj, "coef_"):
+                    coef_arr = _np.asarray(getattr(estimator_obj, "coef_"), dtype=float)
+                    raw_importance = _np.mean(_np.abs(coef_arr), axis=0) if coef_arr.ndim > 1 else _np.abs(coef_arr)
+                if raw_importance is None:
+                    return {}
+                out: Dict[str, float] = {}
+                for name, val in zip(names, raw_importance):
+                    field = _base_feature_name(name)
+                    out[field] = out.get(field, 0.0) + abs(float(val))
+                total = sum(out.values()) or 1.0
+                return {key: float(value / total) for key, value in out.items()}
+            except Exception:
+                return {}
+
+        baseline_by_field: Dict[str, Any] = {}
+        model_importance_by_field: Dict[str, float] = {}
+
+        def _as_finite_float(value: Any) -> Optional[float]:
+            try:
+                num = float(value)
+                if math.isfinite(num):
+                    return num
+            except Exception:
+                return None
+            return None
+
+        def _impact_score_from_raw(raw_impact: float) -> float:
+            if task_type == "classification":
+                return raw_impact * 100.0
+            return raw_impact
+
+        try:
+            perturbation_row_limit = int(os.getenv("MLOPS_ROW_PERTURBATION_MAX_ROWS", "500") or 500)
+        except Exception:
+            perturbation_row_limit = 500
+        row_perturbation_impacts: List[List[Dict[str, Any]]] = [[] for _ in range(len(feature_df))]
+        if (
+            explainability_enabled
+            and
+            task_type in {"classification", "regression", "anomaly_detection"}
+            and len(feature_df) > 0
+            and (perturbation_row_limit <= 0 or len(feature_df) <= perturbation_row_limit)
+        ):
+            original_scores = _prediction_scores_for_frame(feature_df, raw_predictions)
+            for field_name in feature_fields:
+                if field_name not in feature_df.columns:
+                    continue
+                baseline_value = _feature_baseline_for(field_name)
+                if baseline_value is None:
+                    continue
+                perturbed_df = feature_df.copy()
+                try:
+                    changed_mask = perturbed_df[field_name].map(lambda value: str(value) != str(baseline_value))
+                except Exception:
+                    changed_mask = [True for _ in range(len(perturbed_df))]
+                perturbed_df[field_name] = baseline_value
+                perturbed_scores = _prediction_scores_for_frame(perturbed_df, raw_predictions)
+                for row_idx in range(len(feature_df)):
+                    if row_idx >= len(original_scores) or row_idx >= len(perturbed_scores):
+                        continue
+                    try:
+                        if not bool(changed_mask.iloc[row_idx] if hasattr(changed_mask, "iloc") else changed_mask[row_idx]):
+                            continue
+                    except Exception:
+                        pass
+                    original_score = original_scores[row_idx]
+                    perturbed_score = perturbed_scores[row_idx]
+                    if original_score is None or perturbed_score is None:
+                        continue
+                    impact = float(original_score - perturbed_score)
+                    if not math.isfinite(impact) or abs(impact) <= 1e-12:
+                        continue
+                    current_value = feature_df.iloc[row_idx].get(field_name)
+                    impact_score = _impact_score_from_raw(impact)
+                    row_perturbation_impacts[row_idx].append({
+                        "feature": str(field_name),
+                        "value": self._mlops_runtime_to_scalar(current_value),
+                        "impact_score": round(float(impact_score), 6),
+                        "direction": "Increased" if impact >= 0 else "Decrease",
+                        "_impact_raw": float(impact),
+                    })
+            for row_impacts in row_perturbation_impacts:
+                row_impacts.sort(key=lambda item: abs(float(item.get("impact_score") or 0.0)), reverse=True)
+
+        if explainability_enabled and task_type in {"classification", "regression", "anomaly_detection", "clustering"} and len(feature_df) > 0:
+            baseline_by_field = {
+                str(field_name): _feature_baseline_for(str(field_name))
+                for field_name in feature_fields
+                if str(field_name) in feature_df.columns
+            }
+            model_importance_by_field = _model_original_feature_importance()
+            if task_type in {"anomaly_detection", "clustering"} and not model_importance_by_field:
+                usable_fields = [str(field_name) for field_name in feature_fields if str(field_name) in feature_df.columns]
+                if usable_fields:
+                    equal_weight = 1.0 / float(len(usable_fields))
+                    model_importance_by_field = {field_name: equal_weight for field_name in usable_fields}
+
+        def _row_influencing_features(row_index: int) -> List[Dict[str, Any]]:
+            if task_type not in {"classification", "regression", "anomaly_detection", "clustering"}:
+                return []
+            if row_index >= len(feature_df):
+                return []
+            row_series = feature_df.iloc[row_index]
+            impacts = row_perturbation_impacts[row_index] if row_index < len(row_perturbation_impacts) else []
+            if impacts:
+                return _format_row_influences(impacts[:influence_limit], row_index)
+
+            fallback_impacts: List[Dict[str, Any]] = []
+            for field_name in feature_fields:
+                if field_name not in feature_df.columns:
+                    continue
+                importance = float(model_importance_by_field.get(field_name) or 0.0)
+                if importance <= 0:
+                    continue
+                baseline_value = baseline_by_field.get(field_name)
+                current_value = row_series.get(field_name)
+                if baseline_value is None:
+                    continue
+                try:
+                    current_num = float(current_value)
+                    baseline_num = float(baseline_value)
+                    delta = current_num - baseline_num
+                    scale = abs(baseline_num) if abs(baseline_num) > 1e-9 else 1.0
+                    signed_strength = importance * (delta / scale)
+                except Exception:
+                    signed_strength = importance if str(current_value) != str(baseline_value) else 0.0
+                if not math.isfinite(float(signed_strength)) or abs(float(signed_strength)) <= 1e-12:
+                    continue
+                impact_score = float(signed_strength) * 100.0
+                fallback_impacts.append({
+                    "feature": str(field_name),
+                    "value": self._mlops_runtime_to_scalar(current_value),
+                    "impact_score": round(float(impact_score), 6),
+                    "direction": "Increased" if signed_strength >= 0 else "Decrease",
+                    "_impact_raw": float(signed_strength),
+                })
+            fallback_impacts.sort(key=lambda item: abs(float(item.get("impact_score") or 0.0)), reverse=True)
+            return _format_row_influences(fallback_impacts[:influence_limit], row_index)
+
+        def _format_row_influences(items: List[Dict[str, Any]], row_index: int) -> List[Dict[str, Any]]:
+            if not items:
+                return []
+            final_score = None
+            if row_index < len(scores):
+                final_score = _as_finite_float(scores[row_index])
+            if final_score is None and row_index < len(raw_predictions):
+                final_score = _as_finite_float(raw_predictions[row_index])
+            total_abs_influence = 0.0
+            raw_values: List[float] = []
+            for item in items:
+                raw_val = _as_finite_float(item.get("_impact_raw"))
+                if raw_val is None:
+                    raw_val = _as_finite_float(item.get("impact_score")) or 0.0
+                raw_values.append(float(raw_val))
+                total_abs_influence += abs(float(raw_val))
+
+            formatted: List[Dict[str, Any]] = []
+            for item, raw_val in zip(items, raw_values):
+                impact_score = _as_finite_float(item.get("impact_score")) or 0.0
+                percentage_of_final_score = None
+                if final_score is not None and abs(final_score) > 1e-12:
+                    percentage_of_final_score = round(abs(float(raw_val)) / abs(final_score) * 100.0, 2)
+                share = 0.0
+                if total_abs_influence > 1e-12:
+                    share = abs(float(raw_val)) / total_abs_influence * 100.0
+                formatted.append({
+                    "feature": str(item.get("feature") or ""),
+                    "value": item.get("value"),
+                    "impact_score": round(float(impact_score), 6),
+                    "direction": "Increased" if float(impact_score) >= 0 else "Decrease",
+                    "percentage_of_final_score": percentage_of_final_score,
+                    "percentage_share_of_total_influence": round(float(share), 2),
+                })
+            return formatted
+
+        def _project_influence_output(items: List[Dict[str, Any]]) -> Any:
+            if not items:
+                return None if len(influence_output_keys) == 1 and influence_limit == 1 else []
+            if len(influence_output_keys) == 1:
+                key = influence_output_keys[0]
+                if influence_limit == 1:
+                    return items[0].get(key)
+                return [item.get(key) for item in items]
+            return [
+                {key: item.get(key) for key in influence_output_keys}
+                for item in items
+            ]
+
         out_rows: List[Any] = []
         dict_index = 0
         for row in rows:
@@ -19674,6 +20104,9 @@ END;"""
                 if dict_index < len(scores):
                     score_value = self._mlops_runtime_to_scalar(scores[dict_index])
                 self._set_mlops_runtime_field(next_row, score_field, score_value)
+            if explainability_enabled:
+                influences = _row_influencing_features(dict_index)
+                self._set_mlops_runtime_field(next_row, influence_field, _project_influence_output(influences))
             out_rows.append(next_row)
             dict_index += 1
 
@@ -19682,11 +20115,186 @@ END;"""
             if isinstance(node_warnings, list):
                 mode_msg = (
                     f"MLOps production scoring applied: rows={len(dict_rows)}, "
-                    f"prediction_field={pred_field}{', score_field=' + score_field if score_field else ''}"
+                    f"prediction_field={pred_field}{', score_field=' + score_field if score_field else ''}, "
+                    f"influence_field={influence_field if explainability_enabled else 'disabled'}"
                 )
                 if mode_msg not in node_warnings:
                     node_warnings.append(mode_msg)
         return out_rows
+
+    def _mlops_runtime_rule_get(self, row: Dict[str, Any], field_path: str) -> Any:
+        path = str(field_path or "").strip()
+        if not path or not isinstance(row, dict):
+            return None
+        value, found = self._extract_row_value_by_path(row, path)
+        if found:
+            return value
+        return row.get(path)
+
+    def _mlops_runtime_rule_set(self, row: Dict[str, Any], field_path: str, value: Any) -> None:
+        self._set_mlops_runtime_field(row, str(field_path or "").strip(), self._mlops_runtime_to_scalar(value))
+
+    def _mlops_runtime_rule_float(self, value: Any) -> Optional[float]:
+        try:
+            if value is None or value == "":
+                return None
+            num = float(value)
+            if math.isfinite(num):
+                return num
+        except Exception:
+            return None
+        return None
+
+    def _mlops_runtime_rule_template(self, template: str, row: Dict[str, Any]) -> str:
+        text = str(template or "")
+
+        def _replace(match: Any) -> str:
+            key = str(match.group(1) or "").strip()
+            value = self._mlops_runtime_rule_get(row, key)
+            return "" if value is None else str(value)
+
+        try:
+            return re.sub(r"\{([^{}]+)\}", _replace, text)
+        except Exception:
+            return text
+
+    def _mlops_runtime_rule_matches(self, left: Any, operator: str, right: Any) -> bool:
+        op = str(operator or "equals").strip().lower()
+        if op in {"empty", "is_empty"}:
+            return left is None or str(left).strip() == ""
+        if op in {"not_empty", "is_not_empty"}:
+            return not (left is None or str(left).strip() == "")
+        if op in {"gt", "gte", "lt", "lte", "greater_than", "less_than"}:
+            left_num = self._mlops_runtime_rule_float(left)
+            right_num = self._mlops_runtime_rule_float(right)
+            if left_num is None or right_num is None:
+                return False
+            if op in {"gt", "greater_than"}:
+                return left_num > right_num
+            if op == "gte":
+                return left_num >= right_num
+            if op in {"lt", "less_than"}:
+                return left_num < right_num
+            return left_num <= right_num
+        if op in {"contains", "not_contains"}:
+            matched = str(right).lower() in str(left).lower()
+            return matched if op == "contains" else not matched
+        if op in {"in", "not_in"}:
+            options = right if isinstance(right, list) else [part.strip() for part in str(right).split(",")]
+            matched = str(left) in {str(item) for item in options}
+            return matched if op == "in" else not matched
+        matched = str(left) == str(right)
+        if op in {"not_equals", "neq", "!="}:
+            return not matched
+        return matched
+
+    def _mlops_runtime_apply_rules(self, rows: List[Dict[str, Any]], rules: Any) -> List[Dict[str, Any]]:
+        if not isinstance(rules, list) or not rules:
+            return rows
+        output_rows: List[Dict[str, Any]] = []
+        for row in rows:
+            next_row = dict(row)
+            keep_row = True
+            for rule in rules:
+                if not isinstance(rule, dict) or rule.get("enabled") is False:
+                    continue
+                conditions = rule.get("conditions") if isinstance(rule.get("conditions"), list) else []
+                join = str(rule.get("join") or rule.get("match") or "all").strip().lower()
+                checks = [
+                    self._mlops_runtime_rule_matches(
+                        self._mlops_runtime_rule_get(next_row, str(condition.get("field") or "")),
+                        str(condition.get("operator") or "equals"),
+                        condition.get("value"),
+                    )
+                    for condition in conditions
+                    if isinstance(condition, dict)
+                ]
+                matched = True if not checks else (any(checks) if join == "any" else all(checks))
+                if not matched:
+                    continue
+                action = str(rule.get("action") or "").strip().lower()
+                if action in {"drop", "exclude", "filter_out"}:
+                    keep_row = False
+                    break
+                actions = rule.get("actions") if isinstance(rule.get("actions"), list) else []
+                for action_cfg in actions:
+                    if not isinstance(action_cfg, dict):
+                        continue
+                    target = str(action_cfg.get("field") or action_cfg.get("target") or "").strip()
+                    if not target:
+                        continue
+                    mode = str(action_cfg.get("mode") or "literal").strip().lower()
+                    raw_value = action_cfg.get("value")
+                    if mode == "field":
+                        value = self._mlops_runtime_rule_get(next_row, str(raw_value or ""))
+                    elif mode == "template":
+                        value = self._mlops_runtime_rule_template(str(raw_value or ""), next_row)
+                    else:
+                        value = raw_value
+                    self._mlops_runtime_rule_set(next_row, target, value)
+            if keep_row:
+                output_rows.append(next_row)
+        return output_rows
+
+    def _mlops_runtime_apply_recommendation(self, rows: List[Dict[str, Any]], recommendation: Any) -> List[Dict[str, Any]]:
+        if not isinstance(recommendation, dict) or recommendation.get("enabled") is False:
+            return rows
+        field = str(recommendation.get("field") or "recommendation").strip() or "recommendation"
+        template = str(recommendation.get("template") or recommendation.get("value") or "").strip()
+        if not template:
+            return rows
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            next_row = dict(row)
+            self._mlops_runtime_rule_set(next_row, field, self._mlops_runtime_rule_template(template, next_row))
+            out.append(next_row)
+        return out
+
+    def _transform_mlops_ensemble_pipeline(
+        self,
+        data: list,
+        bundle: Dict[str, Any],
+        config: dict,
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> list:
+        rows: List[Dict[str, Any]] = [dict(row) for row in (data or []) if isinstance(row, dict)]
+        model_pipeline = bundle.get("model_pipeline")
+        steps = model_pipeline.get("steps") if isinstance(model_pipeline, dict) else None
+        if not isinstance(steps, list) or not steps:
+            raise RuntimeError("MLOps ensemble runtime bundle is missing model steps.")
+        output_rows = rows
+        node_warnings = execution_context.get("node_warnings") if isinstance(execution_context, dict) else None
+        for idx, step in enumerate(steps):
+            if not isinstance(step, dict):
+                continue
+            step_name = str(step.get("name") or step.get("id") or f"Model {idx + 1}")
+            runtime_bundle = step.get("runtime_model_bundle")
+            if not isinstance(runtime_bundle, dict):
+                raise RuntimeError(f"MLOps ensemble step {step_name} is missing a runtime model bundle.")
+            output_rows = self._mlops_runtime_apply_rules(output_rows, step.get("pre_rules"))
+            if not output_rows:
+                break
+            step_config = {
+                "mlops_mode": "production",
+                "mlops_stage3_model_bundle": runtime_bundle,
+                "mlops_prediction_field": str(step.get("prediction_field") or f"model_{idx + 1}_prediction").strip(),
+                "mlops_prediction_score_field": str(step.get("score_field") or f"model_{idx + 1}_prediction_score").strip(),
+                "mlops_top_influencing_features_field": str(step.get("influence_field") or f"model_{idx + 1}_top_influencing_features").strip(),
+                "mlops_top_influencing_features_limit": step.get("influence_limit") or 5,
+                "mlops_top_influencing_features_keys": step.get("influence_keys") or [],
+                "mlops_stage3_explainability_method": str(step.get("explainability_method") or "off"),
+            }
+            output_rows = [
+                row for row in self._transform_mlops(output_rows, step_config, execution_context=execution_context)
+                if isinstance(row, dict)
+            ]
+            output_rows = self._mlops_runtime_apply_rules(output_rows, step.get("post_rules"))
+            output_rows = self._mlops_runtime_apply_recommendation(output_rows, step.get("recommendation"))
+            if isinstance(node_warnings, list):
+                warn_msg = f"MLOps ensemble step applied: {step_name}, rows={len(output_rows)}"
+                if warn_msg not in node_warnings:
+                    node_warnings.append(warn_msg)
+        return output_rows
 
     def _transform_map(
         self,
