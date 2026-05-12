@@ -439,6 +439,7 @@ const api = {
     forecast_order_search_max_evals?: number
     train_test_split?: number
     cv_folds?: number
+    cluster_count?: number
     epochs?: number
     batch_size?: number
     random_seed?: number
@@ -1114,6 +1115,83 @@ const api = {
   updateSqliteCleanupSchedule: async (payload: Record<string, unknown>) => {
     const r = await http.put('/api/settings/sqlite/cleanup-schedule', payload)
     return r.data
+  },
+
+  // ── API Gateway ───────────────────────────────────────────────────────────
+  listGatewayRoutes: () => safeGet(async () => {
+    const r = await http.get('/api/gateway/routes')
+    return r.data
+  }, []),
+
+  createGatewayRoute: async (payload: Record<string, unknown>) => {
+    const r = await http.post('/api/gateway/routes', payload)
+    return r.data
+  },
+
+  updateGatewayRoute: async (id: string, payload: Record<string, unknown>) => {
+    const r = await http.put(`/api/gateway/routes/${id}`, payload)
+    return r.data
+  },
+
+  deleteGatewayRoute: async (id: string) => {
+    await http.delete(`/api/gateway/routes/${id}`)
+  },
+
+  listGatewayRouteLogs: (id: string, limit = 200) => safeGet(async () => {
+    const r = await http.get(`/api/gateway/routes/${id}/logs`, { params: { limit } })
+    return r.data
+  }, []),
+
+  getGatewayRouteMetrics: (id: string) => safeGet(async () => {
+    const r = await http.get(`/api/gateway/routes/${id}/metrics`)
+    return r.data
+  }, {
+    route_id: id,
+    requests: 0,
+    success: 0,
+    failed: 0,
+    success_rate: 0,
+    avg_duration_ms: 0,
+    max_duration_ms: 0,
+    status_counts: {},
+  }),
+
+  sendGatewayTest: async (payload: {
+    method: string
+    path: string
+    query?: Record<string, unknown>
+    headers?: Record<string, string>
+    body?: unknown
+  }) => {
+    const started = Date.now()
+    const r = await http.request({
+      url: payload.path,
+      method: String(payload.method || 'GET').toUpperCase(),
+      params: payload.query || {},
+      headers: payload.headers || {},
+      data: payload.body,
+      responseType: 'text',
+      transformResponse: [(data) => data],
+      validateStatus: () => true,
+    })
+    const duration_ms = Date.now() - started
+    const contentType = String(r.headers?.['content-type'] || '')
+    let data: unknown = r.data
+    if (typeof data === 'string' && contentType.includes('application/json')) {
+      try {
+        data = JSON.parse(data)
+      } catch {
+        // Keep raw response text.
+      }
+    }
+    return {
+      ok: r.status >= 200 && r.status < 300,
+      status: r.status,
+      statusText: r.statusText,
+      duration_ms,
+      headers: r.headers || {},
+      data,
+    }
   },
 
   // ── Credentials ────────────────────────────────────────────────────────────

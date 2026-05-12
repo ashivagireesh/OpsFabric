@@ -12,6 +12,8 @@ import os as _os
 import html as _html
 import re
 import math
+import hmac
+import hashlib
 import base64
 import gzip
 import pickle
@@ -29,9 +31,9 @@ from email.utils import make_msgid
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy.orm import Session, load_only
 from loguru import logger
@@ -69,6 +71,7 @@ async def lifespan(app: FastAPI):
     if not scheduler.running:
         scheduler.start()
     _reload_all_pipeline_schedule_jobs()
+    _sync_all_gateway_routes()
     _sync_sqlite_cleanup_schedule_job()
     logger.info("✅ ETL Flow Platform started")
     yield
@@ -1997,6 +2000,7 @@ class MLOpsNodeStage3TrainRequest(BaseModel):
     forecast_order_search_max_evals: int = 16
     train_test_split: float = 0.2
     cv_folds: int = 5
+    cluster_count: int = 4
     epochs: int = 20
     batch_size: int = 32
     random_seed: int = 42
@@ -2229,6 +2233,55 @@ class SQLiteCleanupScheduleUpdateRequest(BaseModel):
 
 class AppFeatureFlagsUpdateRequest(BaseModel):
     fns_v2_enabled: bool = False
+
+
+class ApiGatewayRouteCreate(BaseModel):
+    id: Optional[str] = None
+    name: str = "Gateway Route"
+    enabled: bool = True
+    protocol: str = "rest"
+    version: str = "v1"
+    method: str = "GET"
+    path: str = "/gateway"
+    status: str = "active"
+    pipeline_id: Optional[str] = None
+    gateway_node_id: Optional[str] = None
+    source_node_id: Optional[str] = None
+    source_type: Optional[str] = None
+    source_config: Dict[str, Any] = Field(default_factory=dict)
+    request_mapping: Dict[str, Any] = Field(default_factory=dict)
+    response_mapping: Dict[str, Any] = Field(default_factory=dict)
+    auth_config: Dict[str, Any] = Field(default_factory=dict)
+    rbac_config: Dict[str, Any] = Field(default_factory=dict)
+    rate_limit_config: Dict[str, Any] = Field(default_factory=dict)
+    standard_response: bool = True
+    audit_enabled: bool = True
+    logging_enabled: bool = True
+    managed_by_pipeline: bool = False
+
+
+class ApiGatewayRouteUpdate(BaseModel):
+    name: Optional[str] = None
+    enabled: Optional[bool] = None
+    protocol: Optional[str] = None
+    version: Optional[str] = None
+    method: Optional[str] = None
+    path: Optional[str] = None
+    status: Optional[str] = None
+    pipeline_id: Optional[str] = None
+    gateway_node_id: Optional[str] = None
+    source_node_id: Optional[str] = None
+    source_type: Optional[str] = None
+    source_config: Optional[Dict[str, Any]] = None
+    request_mapping: Optional[Dict[str, Any]] = None
+    response_mapping: Optional[Dict[str, Any]] = None
+    auth_config: Optional[Dict[str, Any]] = None
+    rbac_config: Optional[Dict[str, Any]] = None
+    rate_limit_config: Optional[Dict[str, Any]] = None
+    standard_response: Optional[bool] = None
+    audit_enabled: Optional[bool] = None
+    logging_enabled: Optional[bool] = None
+    managed_by_pipeline: Optional[bool] = None
 
 
 def _build_pipeline_profile_state_summary(
@@ -2512,6 +2565,7 @@ async def create_pipeline(body: PipelineCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(pipeline)
     _sync_pipeline_schedule_job(pipeline)
+    _sync_gateway_routes_from_pipeline(pipeline, db)
     return {"id": pipeline.id, "name": pipeline.name, "status": pipeline.status}
 
 @app.get("/api/pipelines/{pipeline_id}")
@@ -2577,6 +2631,7 @@ async def update_pipeline(pipeline_id: str, body: PipelineUpdate, db: Session = 
     db.commit()
     db.refresh(p)
     _sync_pipeline_schedule_job(p)
+    _sync_gateway_routes_from_pipeline(p, db)
     return {"id": p.id, "name": p.name, "status": p.status}
 
 @app.delete("/api/pipelines/{pipeline_id}", status_code=204)
@@ -2584,6 +2639,10 @@ async def delete_pipeline(pipeline_id: str, db: Session = Depends(get_db)):
     p = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Pipeline not found")
+    db.query(models.ApiGatewayRoute).filter(
+        models.ApiGatewayRoute.pipeline_id == pipeline_id,
+        models.ApiGatewayRoute.managed_by_pipeline == True,
+    ).delete(synchronize_session=False)
     db.delete(p)
     db.commit()
     job_id = _schedule_job_id(pipeline_id)
@@ -4783,7 +4842,13 @@ def _mlops_stage3_extract_first_scalar(row: Dict[str, Any], path: str) -> Any:
     return None
 
 
-def _mlops_stage3_build_estimator(task: str, model_name: str, random_seed: int, epochs: int) -> Tuple[Any, List[str]]:
+def _mlops_stage3_build_estimator(
+    task: str,
+    model_name: str,
+    random_seed: int,
+    epochs: int,
+    cluster_count: int = 4,
+) -> Tuple[Any, List[str]]:
     from sklearn.linear_model import LogisticRegression, LinearRegression, Ridge, Lasso
     from sklearn.ensemble import (
         RandomForestClassifier,
@@ -4857,11 +4922,12 @@ def _mlops_stage3_build_estimator(task: str, model_name: str, random_seed: int, 
         return LogisticRegression(max_iter=max(500, int(max(1, epochs) * 20)), n_jobs=None), notes
 
     if resolved_task == "clustering":
+        safe_cluster_count = max(2, min(int(cluster_count or 4), 100))
         if "dbscan" in name:
             return DBSCAN(eps=0.5, min_samples=5), notes
         if "hierarchical" in name:
-            return AgglomerativeClustering(n_clusters=2), notes
-        return KMeans(n_clusters=2, n_init="auto", random_state=random_seed), notes
+            return AgglomerativeClustering(n_clusters=safe_cluster_count), notes
+        return KMeans(n_clusters=safe_cluster_count, n_init="auto", random_state=random_seed), notes
 
     if resolved_task == "anomaly_detection":
         if "one-class" in name:
@@ -5041,6 +5107,7 @@ def _mlops_stage3_train_rows(
     forecast_order_search_max_evals: int = 16,
     train_test_split_ratio: float = 0.2,
     cv_folds: int = 5,
+    cluster_count: int = 4,
     epochs: int = 20,
     batch_size: int = 32,
     random_seed: int = 42,
@@ -5089,6 +5156,7 @@ def _mlops_stage3_train_rows(
     safe_seed = int(random_seed)
     safe_test = max(0.05, min(float(train_test_split_ratio or 0.2), 0.5))
     safe_cv = max(2, min(int(cv_folds or 5), 20))
+    safe_cluster_count = max(2, min(int(cluster_count or 4), 100))
     safe_epochs = max(1, int(epochs or 20))
     safe_batch_size = max(1, int(batch_size or 32))
     notes: List[str] = []
@@ -5585,7 +5653,15 @@ def _mlops_stage3_train_rows(
         ))
     preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
 
-    estimator, model_notes = _mlops_stage3_build_estimator(task, model_name, int(random_seed), int(epochs))
+    if task == "clustering":
+        safe_cluster_count = max(2, min(safe_cluster_count, max(2, int(len(feature_df)))))
+    estimator, model_notes = _mlops_stage3_build_estimator(
+        task,
+        model_name,
+        int(random_seed),
+        int(epochs),
+        cluster_count=safe_cluster_count,
+    )
     model_pipeline = Pipeline(steps=[("prep", preprocessor), ("model", estimator)])
     notes.extend(model_notes)
 
@@ -5598,6 +5674,24 @@ def _mlops_stage3_train_rows(
     train_rows = len(usable_rows)
     test_rows = 0
     runtime_model_bundle: Optional[Dict[str, Any]] = None
+    classification_class_labels: List[str] = []
+
+    def _decode_class_prediction_value(value: Any) -> Any:
+        if task == "classification" and classification_class_labels:
+            try:
+                if isinstance(value, (int, np.integer)):
+                    idx = int(value)
+                elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
+                    idx = int(value)
+                elif isinstance(value, str) and re.fullmatch(r"[-+]?\d+", value.strip()):
+                    idx = int(value.strip())
+                else:
+                    idx = -1
+                if 0 <= idx < len(classification_class_labels):
+                    return classification_class_labels[idx]
+            except Exception:
+                pass
+        return _mlops_stage3_to_scalar(value)
 
     if task in {"classification", "regression", "forecasting"}:
         y_series = df[target_path].copy()
@@ -5625,24 +5719,92 @@ def _mlops_stage3_train_rows(
             counts = y_series.value_counts()
             if len(counts.index) < 2:
                 raise HTTPException(400, "Target column requires at least 2 classes for classification.")
+            numeric_label_ratio = float(pd.to_numeric(y_series, errors="coerce").notna().mean()) if len(y_series) else 0.0
+            class_unique_ratio = float(len(counts.index) / max(len(y_series), 1))
+            if numeric_label_ratio >= 0.95 and len(counts.index) > 15:
+                notes.append(
+                    f"Classification target '{target_path}' looks numeric/high-cardinality "
+                    f"({len(counts.index)} classes, unique_ratio={class_unique_ratio:.3f}). "
+                    "For amount/value prediction, Regression with XGBoost Regressor is usually the correct task."
+                )
             target_overview = {
                 "distinct_classes": int(len(counts.index)),
                 "class_distribution": {str(k): int(v) for k, v in counts.to_dict().items()},
             }
+            from sklearn.preprocessing import LabelEncoder
+            label_encoder = LabelEncoder()
+            encoded = label_encoder.fit_transform(y_series.astype(str))
+            y_series = pd.Series(encoded, index=y_series.index, name=target_path)
+            classification_class_labels = [str(item) for item in label_encoder.classes_.tolist()]
+            if "xgboost" in str(model_name or "").strip().lower():
+                notes.append(
+                    f"Classification labels encoded for XGBoost compatibility "
+                    f"({len(classification_class_labels)} classes)."
+                )
 
-        stratify_arg = None
         if task == "classification":
-            counts = y_series.value_counts()
-            if len(counts.index) >= 2 and int(counts.min()) >= 2:
-                stratify_arg = y_series
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            feature_df,
-            y_series,
-            test_size=safe_test,
-            random_state=safe_seed,
-            stratify=stratify_arg,
-        )
+            split_counts = y_series.value_counts()
+            rare_mask = y_series.map(split_counts).fillna(0).astype(int) < 2
+            rare_indices = list(y_series[rare_mask].index)
+            repeat_indices = list(y_series[~rare_mask].index)
+            if rare_indices and len(repeat_indices) >= 12 and y_series.loc[repeat_indices].nunique() >= 2:
+                repeat_y = y_series.loc[repeat_indices]
+                repeat_counts = repeat_y.value_counts()
+                repeat_test_slots = max(1, int(math.ceil(len(repeat_y) * safe_test)))
+                repeat_train_slots = max(1, len(repeat_y) - repeat_test_slots)
+                repeat_stratify = (
+                    repeat_y
+                    if (
+                        len(repeat_counts.index) >= 2
+                        and int(repeat_counts.min()) >= 2
+                        and repeat_test_slots >= len(repeat_counts.index)
+                        and repeat_train_slots >= len(repeat_counts.index)
+                    )
+                    else None
+                )
+                X_train_repeat, X_test, y_train_repeat, y_test = train_test_split(
+                    feature_df.loc[repeat_indices],
+                    repeat_y,
+                    test_size=safe_test,
+                    random_state=safe_seed,
+                    stratify=repeat_stratify,
+                )
+                X_train = pd.concat(
+                    [X_train_repeat, feature_df.loc[rare_indices]],
+                    ignore_index=True,
+                )
+                y_train = pd.concat(
+                    [y_train_repeat, y_series.loc[rare_indices]],
+                    ignore_index=True,
+                )
+                X_test = X_test.reset_index(drop=True)
+                y_test = y_test.reset_index(drop=True)
+                notes.append(
+                    f"{len(rare_indices)} rare classification rows were kept in training only "
+                    "so every class is visible to the estimator."
+                )
+            else:
+                stratify_arg = None
+                if len(split_counts.index) >= 2 and int(split_counts.min()) >= 2:
+                    test_slots = max(1, int(math.ceil(len(y_series) * safe_test)))
+                    train_slots = max(1, len(y_series) - test_slots)
+                    if test_slots >= len(split_counts.index) and train_slots >= len(split_counts.index):
+                        stratify_arg = y_series
+                X_train, X_test, y_train, y_test = train_test_split(
+                    feature_df,
+                    y_series,
+                    test_size=safe_test,
+                    random_state=safe_seed,
+                    stratify=stratify_arg,
+                )
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(
+                feature_df,
+                y_series,
+                test_size=safe_test,
+                random_state=safe_seed,
+                stratify=None,
+            )
         train_rows = int(len(X_train))
         test_rows = int(len(X_test))
 
@@ -5739,8 +5901,8 @@ def _mlops_stage3_train_rows(
 
         for idx in range(min(25, len(y_test))):
             sample_predictions.append({
-                "actual": _mlops_stage3_to_scalar(y_test.iloc[idx] if hasattr(y_test, "iloc") else y_test[idx]),
-                "predicted": _mlops_stage3_to_scalar(y_pred_test[idx]),
+                "actual": _decode_class_prediction_value(y_test.iloc[idx] if hasattr(y_test, "iloc") else y_test[idx]),
+                "predicted": _decode_class_prediction_value(y_pred_test[idx]),
             })
 
         try:
@@ -5772,6 +5934,9 @@ def _mlops_stage3_train_rows(
             target_field=target_path or None,
             predictor_kind="pipeline",
             model_pipeline=model_pipeline,
+            runtime_metadata={
+                "classification_class_labels": classification_class_labels,
+            } if task == "classification" and classification_class_labels else None,
         )
 
     elif task == "clustering":
@@ -5793,17 +5958,73 @@ def _mlops_stage3_train_rows(
             "clusters": cluster_counts,
             "silhouette_score": round(score_value, 6) if score_value is not None else None,
         }
+        cluster_profile_fields = numeric_cols[: min(8, len(numeric_cols))]
+        cluster_profiles: List[Dict[str, Any]] = []
+        if cluster_profile_fields:
+            try:
+                profile_df = feature_df[cluster_profile_fields].copy()
+                profile_df["_cluster"] = [int(v) for v in labels.tolist()]
+                for label in unique_labels:
+                    group = profile_df.loc[profile_df["_cluster"] == int(label)]
+                    profile_item: Dict[str, Any] = {
+                        "cluster": int(label),
+                        "count": int(len(group)),
+                    }
+                    for field in cluster_profile_fields:
+                        values = pd.to_numeric(group[field], errors="coerce")
+                        values = values.loc[values.notna()]
+                        if values.empty:
+                            continue
+                        profile_item[f"{field}_mean"] = round(float(values.mean()), 6)
+                        profile_item[f"{field}_min"] = round(float(values.min()), 6)
+                        profile_item[f"{field}_max"] = round(float(values.max()), 6)
+                    cluster_profiles.append(profile_item)
+            except Exception:
+                cluster_profiles = []
         test_metrics = {}
         target_overview = {
             "distinct_clusters": len(unique_labels),
             "noise_label_present": bool(-1 in unique_labels),
+            "profile_fields": cluster_profile_fields,
+            "cluster_profiles": cluster_profiles,
         }
+        if ("kmeans" in str(model_name or "").strip().lower() or "hierarchical" in str(model_name or "").strip().lower()):
+            non_noise_cluster_count = len([label for label in unique_labels if label != -1])
+            if non_noise_cluster_count < safe_cluster_count:
+                notes.append(
+                    f"Requested {safe_cluster_count} clusters, but fitted data produced "
+                    f"{non_noise_cluster_count} non-noise cluster label(s). Check duplicate/low-variance features."
+                )
         train_rows = int(len(feature_df))
         test_rows = 0
-        for idx in range(min(25, len(labels))):
-            sample_predictions.append({
+        sample_feature_fields = resolved_fields[: min(12, len(resolved_fields))]
+
+        def _cluster_sample_value(value: Any) -> Any:
+            try:
+                if pd.isna(value):
+                    return None
+            except Exception:
+                pass
+            if isinstance(value, np.generic):
+                try:
+                    value = value.item()
+                except Exception:
+                    pass
+            scalar = _mlops_stage3_to_scalar(value)
+            if isinstance(scalar, float) and not math.isfinite(scalar):
+                return None
+            return scalar
+
+        for idx in range(min(200, len(labels))):
+            row_item: Dict[str, Any] = {
                 "cluster": int(labels[idx]),
-            })
+            }
+            for field in sample_feature_fields:
+                try:
+                    row_item[field] = _cluster_sample_value(feature_df.iloc[idx][field])
+                except Exception:
+                    row_item[field] = None
+            sample_predictions.append(row_item)
         runtime_model_bundle = _mlops_stage3_persist_runtime_bundle(
             task_type=task,
             feature_fields=resolved_fields,
@@ -5862,6 +6083,7 @@ def _mlops_stage3_train_rows(
         "train_rows": int(train_rows),
         "test_rows": int(test_rows),
         "cv_folds": int(safe_cv),
+        "cluster_count": int(safe_cluster_count) if task == "clustering" else None,
         "epochs": int(safe_epochs),
         "batch_size": int(safe_batch_size),
         "random_seed": int(safe_seed),
@@ -6711,31 +6933,41 @@ async def mlops_node_stage3_train(
     if len(input_rows) <= 0:
         raise HTTPException(status_code=400, detail="No rows were provided for Stage 3 training.")
 
-    summary = _mlops_stage3_train_rows(
-        rows=input_rows,
-        task_type=str(body.task_type or "classification"),
-        model_name=str(body.model or ""),
-        feature_fields=list(body.feature_fields or []),
-        target_field=body.target_field,
-        target_fields=list(body.target_fields or []),
-        forecast_date_field=body.forecast_date_field,
-        forecast_horizon=int(body.forecast_horizon or 30),
-        forecast_frequency=str(body.forecast_frequency or "D"),
-        arima_order=list(body.arima_order or []),
-        sarima_seasonal_order=list(body.sarima_seasonal_order or []),
-        forecast_auto_tune_orders=bool(body.forecast_auto_tune_orders),
-        forecast_order_search_max_evals=int(body.forecast_order_search_max_evals or 16),
-        train_test_split_ratio=float(body.train_test_split or 0.2),
-        cv_folds=int(body.cv_folds or 5),
-        epochs=int(body.epochs or 20),
-        batch_size=int(body.batch_size or 32),
-        random_seed=int(body.random_seed or 42),
-        tuning_enabled=bool(body.tuning_enabled),
-        tuning_method=str(body.tuning_method or "random_search"),
-        tuning_params=list(body.tuning_params or []),
-        tracking_enabled=bool(body.tracking_enabled),
-        run_name=body.run_name,
-    )
+    try:
+        summary = _mlops_stage3_train_rows(
+            rows=input_rows,
+            task_type=str(body.task_type or "classification"),
+            model_name=str(body.model or ""),
+            feature_fields=list(body.feature_fields or []),
+            target_field=body.target_field,
+            target_fields=list(body.target_fields or []),
+            forecast_date_field=body.forecast_date_field,
+            forecast_horizon=int(body.forecast_horizon or 30),
+            forecast_frequency=str(body.forecast_frequency or "D"),
+            arima_order=list(body.arima_order or []),
+            sarima_seasonal_order=list(body.sarima_seasonal_order or []),
+            forecast_auto_tune_orders=bool(body.forecast_auto_tune_orders),
+            forecast_order_search_max_evals=int(body.forecast_order_search_max_evals or 16),
+            train_test_split_ratio=float(body.train_test_split or 0.2),
+            cv_folds=int(body.cv_folds or 5),
+            cluster_count=int(body.cluster_count or 4),
+            epochs=int(body.epochs or 20),
+            batch_size=int(body.batch_size or 32),
+            random_seed=int(body.random_seed or 42),
+            tuning_enabled=bool(body.tuning_enabled),
+            tuning_method=str(body.tuning_method or "random_search"),
+            tuning_params=list(body.tuning_params or []),
+            tracking_enabled=bool(body.tracking_enabled),
+            run_name=body.run_name,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(f"MLOps Stage 3 training failed: {exc}")
+        detail = str(exc).strip() or exc.__class__.__name__
+        if len(detail) > 1200:
+            detail = f"{detail[:1200]}..."
+        raise HTTPException(status_code=400, detail=f"Stage 3 training failed: {detail}") from exc
     return {
         "status": "success",
         "stage": "model_training",
@@ -12884,6 +13116,7 @@ async def _load_tabular_rows_for_source(
     cfg = config or {}
     safe_cap = max(1, min(int(hard_cap or 2000), 1_000_000))
     limit = max(1, min(int(max_rows or 200), safe_cap))
+    gateway_bind_params = cfg.get("_gateway_bind_params") if isinstance(cfg.get("_gateway_bind_params"), dict) else None
 
     if ntype == "postgres_source":
         import psycopg2
@@ -12904,7 +13137,10 @@ async def _load_tabular_rows_for_source(
                 query = f"SELECT * FROM {table}"
             limited_query = _build_limited_sql_query(query, limit, "postgres")
             with conn.cursor() as cursor:
-                cursor.execute(limited_query)
+                if gateway_bind_params:
+                    cursor.execute(limited_query, gateway_bind_params)
+                else:
+                    cursor.execute(limited_query)
                 cols = [desc[0] for desc in (cursor.description or [])]
                 return [dict(zip(cols, row)) for row in cursor.fetchall()]
         except HTTPException:
@@ -12938,7 +13174,10 @@ async def _load_tabular_rows_for_source(
                 query = f"SELECT * FROM {table}"
             limited_query = _build_limited_sql_query(query, limit, "mysql")
             with conn.cursor() as cursor:
-                cursor.execute(limited_query)
+                if gateway_bind_params:
+                    cursor.execute(limited_query, gateway_bind_params)
+                else:
+                    cursor.execute(limited_query)
                 return list(cursor.fetchall())
         except HTTPException:
             raise
@@ -12981,7 +13220,10 @@ async def _load_tabular_rows_for_source(
                 query = f"SELECT * FROM {table}"
             limited_query = _build_limited_sql_query(query, limit, "oracle")
             cursor = conn.cursor()
-            cursor.execute(limited_query)
+            if gateway_bind_params:
+                cursor.execute(limited_query, gateway_bind_params)
+            else:
+                cursor.execute(limited_query)
             cols = [desc[0] for desc in (cursor.description or [])]
             raw_rows = cursor.fetchall()
 
@@ -20787,6 +21029,2373 @@ def _get_sample_data(dataset: str) -> list:
         ],
     }
     return datasets.get(dataset, datasets["sales"])
+
+
+# ─── UNIVERSAL API GATEWAY ────────────────────────────────────────────────────
+
+_GATEWAY_RATE_LIMIT_BUCKETS: Dict[Tuple[str, str], List[float]] = {}
+_GATEWAY_RATE_LIMIT_LOCK = threading.RLock()
+
+
+class _GatewayControlError(Exception):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = int(status_code)
+        self.message = str(message)
+
+
+def _gateway_normalize_version(value: Any) -> str:
+    text = str(value or "v1").strip().strip("/")
+    return text or "v1"
+
+
+def _gateway_normalize_path(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "/gateway"
+    if not text.startswith("/"):
+        text = f"/{text}"
+    return re.sub(r"/+", "/", text)
+
+
+def _gateway_normalize_method(value: Any) -> str:
+    method = str(value or "GET").strip().upper()
+    return method if method in {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "ANY"} else "GET"
+
+
+def _gateway_normalize_protocol(value: Any) -> str:
+    protocol = str(value or "rest").strip().lower() or "rest"
+    if protocol in {"rest", "graphql", "soap", "tcp", "websocket"}:
+        return protocol
+    return "rest"
+
+
+def _gateway_route_id_for_pipeline_node(pipeline_id: str, node_id: str) -> str:
+    return f"gw_{pipeline_id}_{node_id}"
+
+
+def _gateway_node_type(node: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(node, dict):
+        return ""
+    data_obj = node.get("data") if isinstance(node.get("data"), dict) else {}
+    return str(data_obj.get("nodeType") or node.get("type") or "").strip().lower()
+
+
+def _gateway_node_config(node: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(node, dict):
+        return {}
+    data_obj = node.get("data") if isinstance(node.get("data"), dict) else {}
+    cfg = data_obj.get("config")
+    if not isinstance(cfg, dict):
+        cfg = node.get("config")
+    return dict(cfg) if isinstance(cfg, dict) else {}
+
+
+def _gateway_json_or_default(value: Any, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return dict(default or {})
+    return dict(default or {})
+
+
+def _gateway_split_csv(value: Any) -> List[str]:
+    if isinstance(value, (list, tuple, set)):
+        raw_items = value
+    else:
+        raw_items = str(value or "").split(",")
+    out: List[str] = []
+    seen = set()
+    for item in raw_items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _gateway_route_to_dict(route: models.ApiGatewayRoute) -> Dict[str, Any]:
+    protocol = _gateway_normalize_protocol(route.protocol)
+    protocol_prefix = "" if protocol == "rest" else f"/{protocol}"
+    runtime_path = f"/gw{protocol_prefix}/{_gateway_normalize_version(route.version)}{_gateway_normalize_path(route.path)}"
+    return {
+        "id": route.id,
+        "name": route.name,
+        "enabled": bool(route.enabled),
+        "protocol": protocol,
+        "version": route.version or "v1",
+        "method": route.method or "GET",
+        "path": route.path or "/gateway",
+        "runtime_path": runtime_path,
+        "status": route.status or "active",
+        "pipeline_id": route.pipeline_id,
+        "gateway_node_id": route.gateway_node_id,
+        "source_node_id": route.source_node_id,
+        "source_type": route.source_type,
+        "source_config": route.source_config or {},
+        "request_mapping": route.request_mapping or {},
+        "response_mapping": route.response_mapping or {},
+        "auth_config": route.auth_config or {},
+        "rbac_config": route.rbac_config or {},
+        "rate_limit_config": route.rate_limit_config or {},
+        "standard_response": bool(route.standard_response),
+        "audit_enabled": bool(route.audit_enabled),
+        "logging_enabled": bool(route.logging_enabled),
+        "managed_by_pipeline": bool(route.managed_by_pipeline),
+        "created_at": route.created_at.isoformat() if route.created_at else None,
+        "updated_at": route.updated_at.isoformat() if route.updated_at else None,
+    }
+
+
+def _gateway_apply_route_values(route: models.ApiGatewayRoute, values: Dict[str, Any]) -> None:
+    route.name = str(values.get("name") or route.name or "Gateway Route").strip() or "Gateway Route"
+    route.enabled = bool(values.get("enabled", True))
+    route.protocol = _gateway_normalize_protocol(values.get("protocol"))
+    route.version = _gateway_normalize_version(values.get("version"))
+    route.method = _gateway_normalize_method(values.get("method"))
+    route.path = _gateway_normalize_path(values.get("path"))
+    route.status = str(values.get("status") or "active").strip().lower() or "active"
+    route.pipeline_id = values.get("pipeline_id") or None
+    route.gateway_node_id = values.get("gateway_node_id") or None
+    route.source_node_id = values.get("source_node_id") or None
+    route.source_type = values.get("source_type") or None
+    route.source_config = _gateway_json_or_default(values.get("source_config"))
+    route.request_mapping = _gateway_json_or_default(values.get("request_mapping"))
+    route.response_mapping = _gateway_json_or_default(values.get("response_mapping"))
+    route.auth_config = _gateway_json_or_default(values.get("auth_config"))
+    route.rbac_config = _gateway_json_or_default(values.get("rbac_config"))
+    route.rate_limit_config = _gateway_json_or_default(values.get("rate_limit_config"))
+    route.standard_response = bool(values.get("standard_response", True))
+    route.audit_enabled = bool(values.get("audit_enabled", True))
+    route.logging_enabled = bool(values.get("logging_enabled", True))
+    route.managed_by_pipeline = bool(values.get("managed_by_pipeline", False))
+    route.updated_at = datetime.utcnow()
+
+
+def _gateway_route_values_from_node(
+    pipeline: models.Pipeline,
+    node: Dict[str, Any],
+    source_node_id: Optional[str],
+    route_cfg: Optional[Dict[str, Any]] = None,
+    route_index: int = 0,
+) -> Dict[str, Any]:
+    base_cfg = _gateway_node_config(node)
+    cfg = dict(base_cfg)
+    if isinstance(route_cfg, dict):
+        cfg.update(route_cfg)
+    node_id = str(node.get("id") or "").strip()
+    default_route_id = _gateway_route_id_for_pipeline_node(pipeline.id, node_id)
+    if route_index > 0:
+        default_route_id = f"{default_route_id}_{route_index + 1}"
+    route_id = str(cfg.get("route_id") or default_route_id).strip()
+    protocol = _gateway_normalize_protocol(cfg.get("protocol"))
+    version = _gateway_normalize_version(cfg.get("api_version") or cfg.get("version"))
+    route_path = _gateway_normalize_path(
+        cfg.get("route_path")
+        or cfg.get("path")
+        or f"/pipeline/{pipeline.id}/{node_id}"
+    )
+
+    auth_type = str(cfg.get("auth_type") or "none").strip().lower()
+    auth_config = _gateway_json_or_default(cfg.get("auth_config"))
+    auth_config.update({
+        "type": auth_type,
+        "token": str(cfg.get("auth_token") or auth_config.get("token") or "").strip(),
+        "secret": str(cfg.get("jwt_secret") or auth_config.get("secret") or "").strip(),
+        "algorithm": str(cfg.get("jwt_algorithm") or auth_config.get("algorithm") or "HS256").strip() or "HS256",
+        "issuer": str(cfg.get("jwt_issuer") or auth_config.get("issuer") or "").strip(),
+        "audience": str(cfg.get("jwt_audience") or auth_config.get("audience") or "").strip(),
+    })
+
+    allowed_roles = _gateway_split_csv(cfg.get("rbac_roles"))
+    rbac_config = _gateway_json_or_default(cfg.get("rbac_config"))
+    if allowed_roles:
+        rbac_config["allowed_roles"] = allowed_roles
+
+    rate_limit_config = _gateway_json_or_default(cfg.get("rate_limit_config"))
+    try:
+        rate_limit_config["requests"] = max(0, int(cfg.get("rate_limit_requests") or rate_limit_config.get("requests") or 0))
+    except Exception:
+        rate_limit_config["requests"] = 0
+    try:
+        rate_limit_config["window_seconds"] = max(1, int(cfg.get("rate_limit_window_seconds") or rate_limit_config.get("window_seconds") or 60))
+    except Exception:
+        rate_limit_config["window_seconds"] = 60
+
+    response_mapping = _gateway_json_or_default(cfg.get("response_mapping"))
+    try:
+        response_mapping["limit"] = max(1, min(int(cfg.get("response_limit") or response_mapping.get("limit") or 1000), 50000))
+    except Exception:
+        response_mapping["limit"] = 1000
+    output_fields = _gateway_split_csv(cfg.get("output_fields") or response_mapping.get("output_fields"))
+    if output_fields:
+        response_mapping["output_fields"] = output_fields
+    graphql_field = str(cfg.get("graphql_field") or response_mapping.get("graphql_field") or "").strip()
+    if graphql_field:
+        response_mapping["graphql_field"] = graphql_field
+    request_mapping = _gateway_json_or_default(cfg.get("request_mapping"))
+    input_parameters = cfg.get("input_parameters") or request_mapping.get("input_parameters") or request_mapping.get("parameters")
+    if isinstance(input_parameters, list):
+        request_mapping["input_parameters"] = input_parameters
+    trigger_node_ids = _gateway_split_csv(
+        cfg.get("trigger_node_ids")
+        or request_mapping.get("trigger_node_ids")
+        or request_mapping.get("execution_node_ids")
+        or request_mapping.get("node_ids")
+    )
+    if trigger_node_ids:
+        request_mapping["trigger_node_ids"] = trigger_node_ids
+
+    data_obj = node.get("data") if isinstance(node.get("data"), dict) else {}
+    return {
+        "id": route_id,
+        "name": str(cfg.get("gateway_name") or cfg.get("name") or data_obj.get("label") or "Gateway Route").strip() or "Gateway Route",
+        "enabled": bool(cfg.get("enabled", True)),
+        "protocol": protocol,
+        "version": version,
+        "method": _gateway_normalize_method(cfg.get("route_method") or cfg.get("method")),
+        "path": route_path,
+        "status": "active" if bool(cfg.get("enabled", True)) else "disabled",
+        "pipeline_id": pipeline.id,
+        "gateway_node_id": node_id,
+        "source_node_id": str(cfg.get("source_node_id") or source_node_id or "").strip() or None,
+        "source_type": str(cfg.get("source_type") or "").strip().lower() or None,
+        "source_config": _gateway_json_or_default(cfg.get("source_config")),
+        "request_mapping": request_mapping,
+        "response_mapping": response_mapping,
+        "auth_config": auth_config,
+        "rbac_config": rbac_config,
+        "rate_limit_config": rate_limit_config,
+        "standard_response": bool(cfg.get("standard_response", True)),
+        "audit_enabled": bool(cfg.get("audit_enabled", True)),
+        "logging_enabled": bool(cfg.get("logging_enabled", True)),
+        "managed_by_pipeline": True,
+    }
+
+
+def _sync_gateway_routes_from_pipeline(pipeline: models.Pipeline, db: Session) -> None:
+    nodes = pipeline.nodes if isinstance(pipeline.nodes, list) else []
+    edges = pipeline.edges if isinstance(pipeline.edges, list) else []
+    node_ids = {str(node.get("id") or "").strip() for node in nodes if isinstance(node, dict)}
+    gateway_node_ids: set[str] = set()
+    active_route_ids: set[str] = set()
+
+    for node in nodes:
+        if not isinstance(node, dict) or _gateway_node_type(node) != "api_gateway":
+            continue
+        node_id = str(node.get("id") or "").strip()
+        if not node_id:
+            continue
+        gateway_node_ids.add(node_id)
+        node_cfg = _gateway_node_config(node)
+        incoming = [
+            str(edge.get("source") or "").strip()
+            for edge in edges
+            if isinstance(edge, dict) and str(edge.get("target") or "").strip() == node_id
+        ]
+        source_node_id = next((item for item in incoming if item), None)
+        route_configs_raw = node_cfg.get("gateway_routes")
+        if isinstance(route_configs_raw, list):
+            route_configs = route_configs_raw
+            if not route_configs:
+                continue
+        else:
+            route_configs = [node_cfg]
+        for route_index, route_cfg_raw in enumerate(route_configs):
+            route_cfg = route_cfg_raw if isinstance(route_cfg_raw, dict) else {}
+            values = _gateway_route_values_from_node(
+                pipeline,
+                node,
+                source_node_id,
+                route_cfg=route_cfg,
+                route_index=route_index,
+            )
+            route_id = str(values.pop("id") or _gateway_route_id_for_pipeline_node(pipeline.id, node_id)).strip()
+            if not route_id:
+                continue
+            active_route_ids.add(route_id)
+            route = db.query(models.ApiGatewayRoute).filter(models.ApiGatewayRoute.id == route_id).first()
+            if route is None:
+                route = models.ApiGatewayRoute(id=route_id, name=str(values.get("name") or "Gateway Route"))
+                db.add(route)
+            _gateway_apply_route_values(route, values)
+
+    stale_routes = db.query(models.ApiGatewayRoute).filter(
+        models.ApiGatewayRoute.pipeline_id == pipeline.id,
+        models.ApiGatewayRoute.managed_by_pipeline == True,
+    ).all()
+    for route in stale_routes:
+        if route.gateway_node_id and route.gateway_node_id not in gateway_node_ids:
+            route.enabled = False
+            route.status = "disabled"
+            route.updated_at = datetime.utcnow()
+        elif route.source_node_id and route.source_node_id not in node_ids:
+            route.source_node_id = None
+            route.updated_at = datetime.utcnow()
+    try:
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning(f"Gateway route sync failed for pipeline {pipeline.id}: {exc}")
+
+
+def _sync_all_gateway_routes() -> None:
+    db = SessionLocal()
+    try:
+        pipelines = db.query(models.Pipeline).all()
+        for pipeline in pipelines:
+            _sync_gateway_routes_from_pipeline(pipeline, db)
+    except Exception as exc:
+        logger.warning(f"Gateway route startup sync failed: {exc}")
+    finally:
+        db.close()
+
+
+def _remove_gateway_route_from_pipeline_config(route: models.ApiGatewayRoute, db: Session) -> None:
+    pipeline_id = str(route.pipeline_id or "").strip()
+    gateway_node_id = str(route.gateway_node_id or "").strip()
+    route_id = str(route.id or "").strip()
+    if not pipeline_id or not gateway_node_id or not route_id:
+        return
+
+    pipeline = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
+    if pipeline is None:
+        return
+
+    nodes = pipeline.nodes if isinstance(pipeline.nodes, list) else []
+    next_nodes: List[Dict[str, Any]] = []
+    changed = False
+    for node in nodes:
+        if not isinstance(node, dict):
+            next_nodes.append(node)
+            continue
+        if str(node.get("id") or "").strip() != gateway_node_id:
+            next_nodes.append(node)
+            continue
+
+        next_node = dict(node)
+        data_obj = dict(next_node.get("data") if isinstance(next_node.get("data"), dict) else {})
+        config_obj = data_obj.get("config") if isinstance(data_obj.get("config"), dict) else next_node.get("config")
+        config = dict(config_obj) if isinstance(config_obj, dict) else {}
+        route_configs_raw = config.get("gateway_routes")
+
+        if isinstance(route_configs_raw, list):
+            next_routes = [
+                dict(item)
+                for item in route_configs_raw
+                if not (
+                    isinstance(item, dict)
+                    and str(item.get("route_id") or item.get("id") or "").strip() == route_id
+                )
+            ]
+            if len(next_routes) != len(route_configs_raw):
+                config["gateway_routes"] = next_routes
+                changed = True
+        elif str(config.get("route_id") or "").strip() == route_id:
+            config["gateway_routes"] = []
+            for key in (
+                "route_id",
+                "gateway_name",
+                "route_path",
+                "route_method",
+                "protocol",
+                "api_version",
+                "input_parameters",
+                "output_fields",
+                "request_mapping",
+                "response_mapping",
+            ):
+                config.pop(key, None)
+            changed = True
+
+        if "data" in next_node:
+            data_obj["config"] = config
+            next_node["data"] = data_obj
+        else:
+            next_node["config"] = config
+        next_nodes.append(next_node)
+
+    if changed:
+        pipeline.nodes = next_nodes
+        pipeline.updated_at = datetime.utcnow()
+
+
+def _gateway_match_route_path(route_path: str, request_path: str) -> Optional[Dict[str, str]]:
+    route_parts = [part for part in _gateway_normalize_path(route_path).strip("/").split("/") if part]
+    request_parts = [part for part in _gateway_normalize_path(request_path).strip("/").split("/") if part]
+    if len(route_parts) != len(request_parts):
+        return None
+    params: Dict[str, str] = {}
+    for expected, actual in zip(route_parts, request_parts):
+        if expected.startswith("{") and expected.endswith("}") and len(expected) > 2:
+            params[expected[1:-1]] = actual
+            continue
+        if expected != actual:
+            return None
+    return params
+
+
+def _gateway_find_route(
+    db: Session,
+    version: str,
+    method: str,
+    request_path: str,
+    protocol: str = "rest",
+) -> Tuple[Optional[models.ApiGatewayRoute], Dict[str, str]]:
+    normalized_version = _gateway_normalize_version(version)
+    normalized_method = _gateway_normalize_method(method)
+    normalized_protocol = str(protocol or "rest").strip().lower() or "rest"
+    candidates = db.query(models.ApiGatewayRoute).filter(
+        models.ApiGatewayRoute.enabled == True,
+        models.ApiGatewayRoute.protocol == normalized_protocol,
+        models.ApiGatewayRoute.version == normalized_version,
+    ).all()
+    for route in candidates:
+        route_method = _gateway_normalize_method(route.method)
+        if route_method not in {normalized_method, "ANY"}:
+            continue
+        params = _gateway_match_route_path(route.path or "", request_path)
+        if params is not None:
+            return route, params
+    return None, {}
+
+
+def _gateway_response(
+    route: Optional[models.ApiGatewayRoute],
+    request_id: str,
+    success: bool,
+    status_code: int,
+    data: Any = None,
+    error: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> JSONResponse:
+    standard = True if route is None else bool(route.standard_response)
+    if not standard and success:
+        return JSONResponse(content=_to_json_safe_value(data), status_code=status_code)
+    payload = {
+        "success": bool(success),
+        "request_id": request_id,
+        "data": _to_json_safe_value(data) if success else None,
+        "error": None if success else {"message": str(error or "Gateway request failed")},
+        "meta": _to_json_safe_value(meta or {}),
+    }
+    return JSONResponse(content=payload, status_code=status_code)
+
+
+_GATEWAY_GRAPHQL_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _gateway_graphql_strip_comments(query: str) -> str:
+    lines = []
+    for line in str(query or "").splitlines():
+        in_string = False
+        escaped = False
+        out = []
+        for ch in line:
+            if ch == "\\" and in_string:
+                escaped = not escaped
+                out.append(ch)
+                continue
+            if ch == '"' and not escaped:
+                in_string = not in_string
+            escaped = False
+            if ch == "#" and not in_string:
+                break
+            out.append(ch)
+        lines.append("".join(out))
+    return "\n".join(lines)
+
+
+def _gateway_graphql_skip_ws(text: str, index: int) -> int:
+    i = int(index or 0)
+    while i < len(text) and (text[i].isspace() or text[i] == ","):
+        i += 1
+    return i
+
+
+def _gateway_graphql_read_name(text: str, index: int) -> Tuple[str, int]:
+    match = _GATEWAY_GRAPHQL_NAME_RE.match(text, int(index or 0))
+    if not match:
+        return "", int(index or 0)
+    return match.group(0), match.end()
+
+
+def _gateway_graphql_find_matching(text: str, start: int, open_ch: str, close_ch: str) -> int:
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(int(start or 0), len(text)):
+        ch = text[i]
+        if in_string:
+            if ch == "\\" and not escaped:
+                escaped = True
+                continue
+            if ch == '"' and not escaped:
+                in_string = False
+            escaped = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _gateway_graphql_split_top_level(text: str, sep: str = ",") -> List[str]:
+    parts: List[str] = []
+    start = 0
+    paren = bracket = brace = 0
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(str(text or "")):
+        if in_string:
+            if ch == "\\" and not escaped:
+                escaped = True
+                continue
+            if ch == '"' and not escaped:
+                in_string = False
+            escaped = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "(":
+            paren += 1
+        elif ch == ")":
+            paren = max(0, paren - 1)
+        elif ch == "[":
+            bracket += 1
+        elif ch == "]":
+            bracket = max(0, bracket - 1)
+        elif ch == "{":
+            brace += 1
+        elif ch == "}":
+            brace = max(0, brace - 1)
+        elif ch == sep and paren == 0 and bracket == 0 and brace == 0:
+            parts.append(text[start:i].strip())
+            start = i + 1
+    tail = str(text or "")[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _gateway_graphql_parse_literal(value: str, variables: Dict[str, Any]) -> Any:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("$"):
+        return variables.get(raw[1:].strip())
+    if raw.startswith('"') and raw.endswith('"'):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw[1:-1]
+    lowered = raw.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "null":
+        return None
+    try:
+        if re.match(r"^-?\d+$", raw):
+            return int(raw)
+        if re.match(r"^-?\d+\.\d+$", raw):
+            return float(raw)
+    except Exception:
+        pass
+    if raw.startswith("[") or raw.startswith("{"):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw
+    return raw
+
+
+def _gateway_graphql_parse_args(args_text: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+    args: Dict[str, Any] = {}
+    for part in _gateway_graphql_split_top_level(args_text, ","):
+        if ":" not in part:
+            continue
+        name, _, raw_value = part.partition(":")
+        key = str(name or "").strip()
+        if not key:
+            continue
+        args[key] = _gateway_graphql_parse_literal(raw_value, variables)
+    return args
+
+
+def _gateway_graphql_skip_directives(text: str, index: int) -> int:
+    i = _gateway_graphql_skip_ws(text, index)
+    while i < len(text) and text[i] == "@":
+        i += 1
+        _name, i = _gateway_graphql_read_name(text, i)
+        i = _gateway_graphql_skip_ws(text, i)
+        if i < len(text) and text[i] == "(":
+            end = _gateway_graphql_find_matching(text, i, "(", ")")
+            if end < 0:
+                return i
+            i = end + 1
+        i = _gateway_graphql_skip_ws(text, i)
+    return i
+
+
+def _gateway_graphql_parse_selection_items(
+    selection_text: str,
+    prefix: str = "",
+    alias_prefix: str = "",
+) -> List[Dict[str, str]]:
+    items: List[Dict[str, str]] = []
+    text = str(selection_text or "")
+    i = 0
+    while i < len(text):
+        i = _gateway_graphql_skip_ws(text, i)
+        if i >= len(text):
+            break
+        if text.startswith("...", i):
+            i += 3
+            _frag_name, i = _gateway_graphql_read_name(text, _gateway_graphql_skip_ws(text, i))
+            i = _gateway_graphql_skip_directives(text, i)
+            if i < len(text) and text[i] == "{":
+                end = _gateway_graphql_find_matching(text, i, "{", "}")
+                i = len(text) if end < 0 else end + 1
+            continue
+        first, i = _gateway_graphql_read_name(text, i)
+        if not first:
+            i += 1
+            continue
+        alias = ""
+        i = _gateway_graphql_skip_ws(text, i)
+        if i < len(text) and text[i] == ":":
+            alias = first
+            name, i = _gateway_graphql_read_name(text, _gateway_graphql_skip_ws(text, i + 1))
+        else:
+            name = first
+        if not name or name.startswith("__"):
+            continue
+        i = _gateway_graphql_skip_ws(text, i)
+        if i < len(text) and text[i] == "(":
+            end = _gateway_graphql_find_matching(text, i, "(", ")")
+            i = len(text) if end < 0 else end + 1
+        i = _gateway_graphql_skip_directives(text, i)
+        path = f"{prefix}.{name}" if prefix else name
+        alias_name = alias or name
+        alias_path = f"{alias_prefix}.{alias_name}" if alias_prefix else alias_name
+        if i < len(text) and text[i] == "{":
+            end = _gateway_graphql_find_matching(text, i, "{", "}")
+            if end < 0:
+                break
+            nested = text[i + 1:end]
+            nested_items = _gateway_graphql_parse_selection_items(nested, path, alias_path)
+            if nested_items:
+                items.extend(nested_items)
+            else:
+                items.append({"name": name, "alias": alias_name, "path": path, "alias_path": alias_path})
+            i = end + 1
+            continue
+        items.append({"name": name, "alias": alias_name, "path": path, "alias_path": alias_path})
+    return items
+
+
+def _gateway_graphql_variables_from_payload(body_payload: Any, query_params: Dict[str, Any]) -> Dict[str, Any]:
+    variables: Dict[str, Any] = {}
+    raw_variables = None
+    if isinstance(body_payload, dict):
+        raw_variables = body_payload.get("variables")
+    if raw_variables is None:
+        raw_variables = query_params.get("variables")
+    if isinstance(raw_variables, dict):
+        variables.update(raw_variables)
+    elif isinstance(raw_variables, str) and raw_variables.strip():
+        try:
+            parsed = json.loads(raw_variables)
+            if isinstance(parsed, dict):
+                variables.update(parsed)
+        except Exception:
+            raise _GatewayControlError(400, "GraphQL variables must be a JSON object")
+    return variables
+
+
+def _gateway_parse_graphql_request(
+    route: models.ApiGatewayRoute,
+    query_params: Dict[str, Any],
+    body_payload: Any,
+) -> Dict[str, Any]:
+    if isinstance(body_payload, dict):
+        query_text = str(body_payload.get("query") or query_params.get("query") or "").strip()
+        operation_name = str(body_payload.get("operationName") or query_params.get("operationName") or "").strip()
+    else:
+        query_text = str(query_params.get("query") or body_payload or "").strip()
+        operation_name = str(query_params.get("operationName") or "").strip()
+    if not query_text:
+        raise _GatewayControlError(400, "GraphQL query is required")
+
+    variables = _gateway_graphql_variables_from_payload(body_payload, query_params)
+    if query_text.startswith("{"):
+        try:
+            wrapped_payload = json.loads(query_text)
+        except Exception:
+            wrapped_payload = None
+        if isinstance(wrapped_payload, dict) and isinstance(wrapped_payload.get("query"), str):
+            query_text = str(wrapped_payload.get("query") or "").strip()
+            wrapped_variables = wrapped_payload.get("variables")
+            if isinstance(wrapped_variables, dict):
+                variables = {**wrapped_variables, **variables}
+            elif isinstance(wrapped_variables, str) and wrapped_variables.strip():
+                try:
+                    parsed_wrapped_variables = json.loads(wrapped_variables)
+                    if isinstance(parsed_wrapped_variables, dict):
+                        variables = {**parsed_wrapped_variables, **variables}
+                except Exception:
+                    raise _GatewayControlError(400, "GraphQL variables must be a JSON object")
+            if not query_text:
+                raise _GatewayControlError(400, "GraphQL query is required")
+    cleaned = _gateway_graphql_strip_comments(query_text)
+    root_start = cleaned.find("{")
+    if root_start < 0:
+        raise _GatewayControlError(400, "GraphQL selection set is required")
+    root_end = _gateway_graphql_find_matching(cleaned, root_start, "{", "}")
+    if root_end < 0:
+        raise _GatewayControlError(400, "GraphQL selection set is not balanced")
+    root_text = cleaned[root_start + 1:root_end]
+    i = _gateway_graphql_skip_ws(root_text, 0)
+    while root_text.startswith("__typename", i):
+        _skip_name, i = _gateway_graphql_read_name(root_text, i)
+        i = _gateway_graphql_skip_ws(root_text, i)
+    alias = ""
+    first, i = _gateway_graphql_read_name(root_text, i)
+    if not first:
+        raise _GatewayControlError(400, "GraphQL root field is required")
+    i = _gateway_graphql_skip_ws(root_text, i)
+    if i < len(root_text) and root_text[i] == ":":
+        alias = first
+        field_name, i = _gateway_graphql_read_name(root_text, _gateway_graphql_skip_ws(root_text, i + 1))
+    else:
+        field_name = first
+    if not field_name:
+        raise _GatewayControlError(400, "GraphQL root field is required")
+
+    response_mapping = route.response_mapping if isinstance(route.response_mapping, dict) else {}
+    configured_field = str(response_mapping.get("graphql_field") or response_mapping.get("root_field") or "result").strip() or "result"
+    if field_name != configured_field:
+        raise _GatewayControlError(400, f"Unknown GraphQL field '{field_name}'. Expected '{configured_field}'.")
+
+    i = _gateway_graphql_skip_ws(root_text, i)
+    args: Dict[str, Any] = {}
+    if i < len(root_text) and root_text[i] == "(":
+        args_end = _gateway_graphql_find_matching(root_text, i, "(", ")")
+        if args_end < 0:
+            raise _GatewayControlError(400, "GraphQL arguments are not balanced")
+        args = _gateway_graphql_parse_args(root_text[i + 1:args_end], variables)
+        i = args_end + 1
+    i = _gateway_graphql_skip_directives(root_text, i)
+    selection: List[Dict[str, str]] = []
+    if i < len(root_text) and root_text[i] == "{":
+        sel_end = _gateway_graphql_find_matching(root_text, i, "{", "}")
+        if sel_end < 0:
+            raise _GatewayControlError(400, "GraphQL nested selection is not balanced")
+        selection = _gateway_graphql_parse_selection_items(root_text[i + 1:sel_end])
+
+    return {
+        "operation_name": operation_name or None,
+        "field": field_name,
+        "response_field": alias or field_name,
+        "arguments": args,
+        "variables": variables,
+        "selection": selection,
+    }
+
+
+def _gateway_prepare_graphql_request(
+    route: models.ApiGatewayRoute,
+    query_params: Dict[str, Any],
+    body_payload: Any,
+) -> Tuple[Dict[str, Any], Any, Dict[str, Any]]:
+    graphql_ctx = _gateway_parse_graphql_request(route, query_params, body_payload)
+    graph_inputs = {
+        **(graphql_ctx.get("variables", {}) if isinstance(graphql_ctx.get("variables"), dict) else {}),
+        **(graphql_ctx.get("arguments", {}) if isinstance(graphql_ctx.get("arguments"), dict) else {}),
+    }
+    merged_query = dict(query_params or {})
+    for key, value in graph_inputs.items():
+        if value is not None and key not in merged_query:
+            merged_query[str(key)] = value
+    if isinstance(body_payload, dict):
+        merged_body = dict(body_payload)
+        for key, value in graph_inputs.items():
+            if value is not None and key not in merged_body:
+                merged_body[str(key)] = value
+        merged_body["graphql"] = graphql_ctx
+    else:
+        merged_body = {"query": str(body_payload or ""), **graph_inputs, "graphql": graphql_ctx}
+    return merged_query, merged_body, graphql_ctx
+
+
+def _gateway_add_access_path(out: Dict[str, Any], path: str, value: Any) -> None:
+    text = str(path or "").strip()
+    if not text:
+        return
+    out.setdefault(text, value)
+    parts = [part for part in text.split(".") if part]
+    for idx in range(1, len(parts)):
+        out.setdefault(".".join(parts[idx:]), value)
+
+
+def _gateway_flatten_access_paths(
+    value: Any,
+    prefix: str = "",
+    out: Optional[Dict[str, Any]] = None,
+    depth: int = 0,
+) -> Dict[str, Any]:
+    if out is None:
+        out = {}
+    if depth > 10:
+        return out
+
+    current = value
+    if isinstance(current, str):
+        text = current.strip()
+        if text and text[0] in "{[":
+            try:
+                current = json.loads(text)
+            except Exception:
+                current = value
+
+    if prefix:
+        _gateway_add_access_path(out, prefix, current)
+
+    if isinstance(current, dict):
+        for key, child in current.items():
+            key_text = str(key or "").strip()
+            if not key_text:
+                continue
+            child_path = f"{prefix}.{key_text}" if prefix else key_text
+            _gateway_flatten_access_paths(child, child_path, out, depth + 1)
+    elif isinstance(current, list):
+        for idx, child in enumerate(current[:50]):
+            child_path = f"{prefix}.{idx}" if prefix else str(idx)
+            _gateway_flatten_access_paths(child, child_path, out, depth + 1)
+    return out
+
+
+def _gateway_find_access_path_value(row: Any, path: Any) -> Any:
+    if not isinstance(row, dict):
+        return None
+    text = str(path or "").strip()
+    if not text:
+        return None
+    if text in row:
+        return row.get(text)
+    nested = _gateway_read_path_value(row, text)
+    if nested is not None:
+        return nested
+    flat = _gateway_flatten_access_paths(row)
+    if text in flat:
+        return flat.get(text)
+    source = _gateway_field_source_path(text)
+    if source and source in flat:
+        return flat.get(source)
+    leaf = _gateway_leaf_name_from_field(text)
+    if leaf and leaf in flat:
+        return flat.get(leaf)
+    return None
+
+
+def _gateway_graphql_find_selected_value(row: Any, item: Dict[str, str]) -> Any:
+    if not isinstance(row, dict):
+        return None
+    path = str(item.get("path") or item.get("name") or "").strip()
+    name = str(item.get("name") or path).strip()
+    lookup_candidates = [candidate for candidate in (path, name) if candidate]
+    flat = _gateway_flatten_access_paths(row)
+    for candidate in lookup_candidates:
+        if candidate in row:
+            return row.get(candidate)
+        if candidate in flat:
+            return flat.get(candidate)
+    for candidate in lookup_candidates:
+        source = _gateway_field_source_path(candidate)
+        if source and source in flat:
+            return flat.get(source)
+        leaf = _gateway_leaf_name_from_field(candidate)
+        if leaf and leaf in flat:
+            return flat.get(leaf)
+    return None
+
+
+def _gateway_graphql_project_selection(data: Any, selection: Any) -> Any:
+    if not isinstance(selection, list) or not selection:
+        return data
+
+    def assign_path(target: Dict[str, Any], path: str, value: Any) -> None:
+        parts = [part for part in str(path or "").split(".") if part]
+        if not parts:
+            return
+        current = target
+        for part in parts[:-1]:
+            next_value = current.get(part)
+            if not isinstance(next_value, dict):
+                next_value = {}
+                current[part] = next_value
+            current = next_value
+        current[parts[-1]] = value
+
+    def project_row(row: Any) -> Any:
+        if not isinstance(row, dict):
+            return row
+        projected: Dict[str, Any] = {}
+        for item in selection:
+            if not isinstance(item, dict):
+                continue
+            alias = str(item.get("alias") or item.get("name") or "").strip()
+            if not alias:
+                continue
+            alias_path = str(item.get("alias_path") or alias).strip()
+            assign_path(projected, alias_path, _gateway_graphql_find_selected_value(row, item))
+        return projected
+
+    if isinstance(data, list):
+        return [project_row(row) for row in data]
+    if isinstance(data, dict):
+        return project_row(data)
+    return data
+
+
+def _gateway_protocol_response(
+    route: Optional[models.ApiGatewayRoute],
+    protocol: str,
+    request_id: str,
+    success: bool,
+    status_code: int,
+    data: Any = None,
+    error: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Response:
+    protocol_name = str(protocol or "rest").strip().lower() or "rest"
+    if protocol_name == "rest":
+        return _gateway_response(route, request_id, success, status_code, data=data, error=error, meta=meta)
+
+    safe_meta = _to_json_safe_value(meta or {})
+    safe_data = _to_json_safe_value(data)
+    if protocol_name == "graphql":
+        response_mapping = route.response_mapping if route is not None and isinstance(route.response_mapping, dict) else {}
+        graphql_ctx = (meta or {}).get("graphql") if isinstance(meta, dict) and isinstance((meta or {}).get("graphql"), dict) else {}
+        graphql_field = str(
+            graphql_ctx.get("response_field")
+            or response_mapping.get("graphql_field")
+            or response_mapping.get("root_field")
+            or "result"
+        ).strip() or "result"
+        graphql_data = _gateway_graphql_project_selection(safe_data, graphql_ctx.get("selection"))
+        payload = {
+            "data": {graphql_field: graphql_data} if success else None,
+            "errors": None if success else [{"message": str(error or "Gateway request failed")}],
+        }
+        standard = True if route is None else bool(route.standard_response)
+        if standard or not success:
+            payload["extensions"] = {"request_id": request_id, **(safe_meta if isinstance(safe_meta, dict) else {})}
+        return JSONResponse(content=payload, status_code=status_code)
+
+    if protocol_name == "soap":
+        if success:
+            body_json = _html.escape(json.dumps(safe_data, ensure_ascii=False, default=str))
+            body = f"<gateway:result>{body_json}</gateway:result>"
+        else:
+            body = (
+                "<soap:Fault>"
+                "<faultcode>gateway:error</faultcode>"
+                f"<faultstring>{_html.escape(str(error or 'Gateway request failed'))}</faultstring>"
+                "</soap:Fault>"
+            )
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" '
+            'xmlns:gateway="urn:framework:gateway">'
+            f"<soap:Header><gateway:requestId>{_html.escape(request_id)}</gateway:requestId></soap:Header>"
+            f"<soap:Body>{body}</soap:Body>"
+            "</soap:Envelope>"
+        )
+        return Response(content=xml, media_type="text/xml", status_code=status_code)
+
+    if protocol_name in {"tcp", "websocket"}:
+        payload = {
+            "request_id": request_id,
+            "protocol": protocol_name,
+            "ok": bool(success),
+            "payload": safe_data if success else None,
+            "error": None if success else str(error or "Gateway request failed"),
+            "meta": safe_meta,
+        }
+        return JSONResponse(content=payload, status_code=status_code)
+
+    return _gateway_response(route, request_id, success, status_code, data=data, error=error, meta=meta)
+
+
+def _gateway_b64url_decode(value: str) -> bytes:
+    text = str(value or "")
+    padding = "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode((text + padding).encode("ascii"))
+
+
+def _gateway_b64url_encode(payload: bytes) -> str:
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _gateway_decode_hs256_jwt(token: str, auth_config: Dict[str, Any]) -> Dict[str, Any]:
+    parts = str(token or "").split(".")
+    if len(parts) != 3:
+        raise _GatewayControlError(401, "Invalid JWT format")
+    header_b64, payload_b64, signature_b64 = parts
+    try:
+        header = json.loads(_gateway_b64url_decode(header_b64).decode("utf-8"))
+        payload = json.loads(_gateway_b64url_decode(payload_b64).decode("utf-8"))
+    except Exception:
+        raise _GatewayControlError(401, "Invalid JWT payload")
+    algorithm = str(header.get("alg") or auth_config.get("algorithm") or "HS256").upper()
+    if algorithm != "HS256":
+        raise _GatewayControlError(401, f"Unsupported JWT algorithm: {algorithm}")
+    secret = str(auth_config.get("secret") or "").encode("utf-8")
+    if not secret:
+        raise _GatewayControlError(401, "JWT secret is not configured")
+    signed = f"{header_b64}.{payload_b64}".encode("ascii")
+    expected_sig = _gateway_b64url_encode(hmac.new(secret, signed, hashlib.sha256).digest())
+    if not hmac.compare_digest(expected_sig, signature_b64):
+        raise _GatewayControlError(401, "Invalid JWT signature")
+    now = int(_time.time())
+    if payload.get("exp") is not None and int(payload.get("exp") or 0) < now:
+        raise _GatewayControlError(401, "JWT expired")
+    if payload.get("nbf") is not None and int(payload.get("nbf") or 0) > now:
+        raise _GatewayControlError(401, "JWT not active yet")
+    issuer = str(auth_config.get("issuer") or "").strip()
+    if issuer and str(payload.get("iss") or "") != issuer:
+        raise _GatewayControlError(401, "JWT issuer mismatch")
+    audience = str(auth_config.get("audience") or "").strip()
+    if audience:
+        aud_claim = payload.get("aud")
+        aud_values = aud_claim if isinstance(aud_claim, list) else [aud_claim]
+        if audience not in [str(item) for item in aud_values]:
+            raise _GatewayControlError(401, "JWT audience mismatch")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _gateway_authenticate(route: models.ApiGatewayRoute, request: Request) -> Dict[str, Any]:
+    auth_config = route.auth_config if isinstance(route.auth_config, dict) else {}
+    auth_type = str(auth_config.get("type") or "none").strip().lower()
+    auth_header = str(request.headers.get("authorization") or "").strip()
+    bearer = ""
+    if auth_header.lower().startswith("bearer "):
+        bearer = auth_header[7:].strip()
+
+    claims: Dict[str, Any] = {}
+    if auth_type in {"", "none", "disabled"}:
+        user_id = str(request.headers.get("x-user") or "anonymous").strip() or "anonymous"
+        role_header = str(request.headers.get("x-role") or "").strip()
+        roles = [role_header] if role_header else []
+        return {"user_id": user_id, "roles": roles, "claims": claims}
+    if auth_type in {"bearer", "token", "shared_token"}:
+        expected = str(auth_config.get("token") or "").strip()
+        if not expected:
+            raise _GatewayControlError(401, "Bearer token is not configured")
+        if not bearer or not hmac.compare_digest(bearer, expected):
+            raise _GatewayControlError(401, "Invalid bearer token")
+        return {"user_id": "bearer-client", "roles": [], "claims": {}}
+    if auth_type == "jwt":
+        if not bearer:
+            raise _GatewayControlError(401, "Missing bearer JWT")
+        claims = _gateway_decode_hs256_jwt(bearer, auth_config)
+        raw_roles = claims.get("roles", claims.get("role", []))
+        roles = _gateway_split_csv(raw_roles)
+        user_id = str(claims.get("sub") or claims.get("user_id") or claims.get("email") or "jwt-client")
+        return {"user_id": user_id, "roles": roles, "claims": claims}
+    raise _GatewayControlError(401, f"Unsupported auth type: {auth_type}")
+
+
+def _gateway_enforce_rbac(route: models.ApiGatewayRoute, auth_ctx: Dict[str, Any]) -> None:
+    rbac_config = route.rbac_config if isinstance(route.rbac_config, dict) else {}
+    allowed_roles = _gateway_split_csv(rbac_config.get("allowed_roles"))
+    if not allowed_roles:
+        return
+    actual_roles = set(_gateway_split_csv(auth_ctx.get("roles")))
+    if not actual_roles.intersection(set(allowed_roles)):
+        raise _GatewayControlError(403, "Gateway role is not permitted")
+
+
+def _gateway_enforce_rate_limit(route: models.ApiGatewayRoute, request: Request, auth_ctx: Dict[str, Any]) -> None:
+    cfg = route.rate_limit_config if isinstance(route.rate_limit_config, dict) else {}
+    try:
+        requests_allowed = int(cfg.get("requests") or 0)
+    except Exception:
+        requests_allowed = 0
+    if requests_allowed <= 0:
+        return
+    try:
+        window_seconds = max(1, int(cfg.get("window_seconds") or 60))
+    except Exception:
+        window_seconds = 60
+    client_identity = request.client.host if request.client else "unknown"
+    identity = str(auth_ctx.get("user_id") or client_identity or "unknown").strip() or "unknown"
+    key = (str(route.id), identity)
+    now = _time.time()
+    cutoff = now - float(window_seconds)
+    with _GATEWAY_RATE_LIMIT_LOCK:
+        bucket = [ts for ts in _GATEWAY_RATE_LIMIT_BUCKETS.get(key, []) if ts >= cutoff]
+        if len(bucket) >= requests_allowed:
+            _GATEWAY_RATE_LIMIT_BUCKETS[key] = bucket
+            raise _GatewayControlError(429, "Gateway rate limit exceeded")
+        bucket.append(now)
+        _GATEWAY_RATE_LIMIT_BUCKETS[key] = bucket
+
+
+def _gateway_extract_request_value(context: Dict[str, Any], key: str) -> Any:
+    text = str(key or "").strip()
+    if not text:
+        return ""
+    if "." in text:
+        root, _, tail = text.partition(".")
+        root_obj = context.get(root)
+        if isinstance(root_obj, dict):
+            current: Any = root_obj
+            for part in tail.split("."):
+                if isinstance(current, dict):
+                    current = current.get(part)
+                else:
+                    return ""
+            return current
+    for root in ("path", "query", "headers", "body", "inputs"):
+        root_obj = context.get(root)
+        if isinstance(root_obj, dict) and text in root_obj:
+            return root_obj[text]
+    return context.get(text, "")
+
+
+def _gateway_template_value(value: Any, context: Dict[str, Any]) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _gateway_template_value(v, context) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_gateway_template_value(item, context) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    def replace(match: re.Match) -> str:
+        replacement = _gateway_extract_request_value(context, match.group(1))
+        if replacement is None:
+            return ""
+        if isinstance(replacement, (dict, list)):
+            return json.dumps(replacement, ensure_ascii=False)
+        return str(replacement)
+
+    return re.sub(r"\{\{\s*([^}]+?)\s*\}\}", replace, value)
+
+
+def _gateway_input_specs(route: models.ApiGatewayRoute) -> List[Dict[str, Any]]:
+    request_mapping = route.request_mapping if isinstance(route.request_mapping, dict) else {}
+    specs = request_mapping.get("input_parameters") or request_mapping.get("parameters") or []
+    if not isinstance(specs, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for item in specs:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        location = str(item.get("location") or "query").strip().lower()
+        if location not in {"path", "query", "header", "body"}:
+            location = "query"
+        data_type = str(item.get("data_type") or item.get("type") or "string").strip().lower()
+        if data_type not in {"string", "number", "integer", "boolean", "json"}:
+            data_type = "string"
+        normalized.append({
+            "name": name,
+            "source_field": str(item.get("source_field") or item.get("filter_field") or item.get("field") or "").strip(),
+            "operator": str(item.get("operator") or "equals").strip().lower() or "equals",
+            "location": location,
+            "required": bool(item.get("required", False)),
+            "data_type": data_type,
+            "default_value": item.get("default_value", item.get("default")),
+            "description": str(item.get("description") or "").strip(),
+        })
+    return normalized
+
+
+def _gateway_guess_input_data_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, (dict, list)):
+        return "json"
+    return "string"
+
+
+def _gateway_graphql_inferred_input_specs(
+    route: models.ApiGatewayRoute,
+    body_payload: Any,
+) -> List[Dict[str, Any]]:
+    if not isinstance(body_payload, dict):
+        return []
+    graphql_ctx = body_payload.get("graphql")
+    if not isinstance(graphql_ctx, dict):
+        return []
+    graph_inputs = graphql_ctx.get("arguments")
+    if not isinstance(graph_inputs, dict) or not graph_inputs:
+        graph_inputs = graphql_ctx.get("variables")
+    if not isinstance(graph_inputs, dict) or not graph_inputs:
+        return []
+
+    response_mapping = route.response_mapping if isinstance(route.response_mapping, dict) else {}
+    specs: List[Dict[str, Any]] = []
+    for key, value in graph_inputs.items():
+        name = str(key or "").strip()
+        if not name or value is None:
+            continue
+        specs.append({
+            "name": name,
+            "source_field": _gateway_infer_source_field_for_input(name, response_mapping) or name,
+            "operator": "equals",
+            "location": "query",
+            "required": False,
+            "data_type": _gateway_guess_input_data_type(value),
+            "default_value": None,
+            "description": "Inferred from GraphQL argument",
+        })
+    return specs
+
+
+def _gateway_is_missing_value(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and value == "")
+
+
+def _gateway_cast_input_value(name: str, value: Any, data_type: str) -> Any:
+    kind = str(data_type or "string").strip().lower()
+    try:
+        if kind == "string":
+            text = "" if value is None else str(value).strip()
+            if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+                text = text[1:-1]
+            return text
+        if kind == "number":
+            return float(value)
+        if kind == "integer":
+            if isinstance(value, float) and not value.is_integer():
+                raise ValueError("not an integer")
+            return int(value)
+        if kind == "boolean":
+            if isinstance(value, bool):
+                return value
+            text = str(value).strip().lower()
+            if text in {"true", "1", "yes", "y", "on"}:
+                return True
+            if text in {"false", "0", "no", "n", "off"}:
+                return False
+            raise ValueError("not a boolean")
+        if kind == "json":
+            if isinstance(value, (dict, list)):
+                return value
+            return json.loads(str(value))
+    except Exception:
+        raise _GatewayControlError(400, f"Invalid input parameter '{name}': expected {kind}")
+    return value
+
+
+def _gateway_validate_input_parameters(
+    route: models.ApiGatewayRoute,
+    path_params: Dict[str, Any],
+    query_params: Dict[str, Any],
+    header_params: Dict[str, Any],
+    body_payload: Any,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Any, Dict[str, Any]]:
+    specs = _gateway_input_specs(route)
+    if not specs:
+        specs = _gateway_graphql_inferred_input_specs(route, body_payload)
+    if not specs:
+        return path_params, query_params, header_params, body_payload, {}
+
+    normalized_path = dict(path_params or {})
+    normalized_query = dict(query_params or {})
+    normalized_headers = {str(k).lower(): v for k, v in (header_params or {}).items()}
+    normalized_body = body_payload
+    if isinstance(body_payload, dict):
+        normalized_body = dict(body_payload)
+    inputs: Dict[str, Any] = {}
+
+    for spec in specs:
+        name = str(spec.get("name") or "").strip()
+        location = str(spec.get("location") or "query").strip().lower()
+        data_type = str(spec.get("data_type") or "string").strip().lower()
+        default_value = spec.get("default_value")
+        has_default = default_value is not None and not (isinstance(default_value, str) and default_value == "")
+
+        if location == "path":
+            raw_value = normalized_path.get(name)
+        elif location == "query":
+            raw_value = normalized_query.get(name)
+        elif location == "header":
+            raw_value = normalized_headers.get(name.lower())
+        else:
+            raw_value = _gateway_read_path_value(normalized_body, name) if isinstance(normalized_body, dict) else None
+
+        if _gateway_is_missing_value(raw_value) and has_default:
+            raw_value = default_value
+        if _gateway_is_missing_value(raw_value):
+            if bool(spec.get("required", False)):
+                raise _GatewayControlError(400, f"Missing required input parameter '{name}' in {location}")
+            continue
+
+        cast_value = _gateway_cast_input_value(name, raw_value, data_type)
+        inputs[name] = cast_value
+        if location == "path":
+            normalized_path[name] = cast_value
+        elif location == "query":
+            normalized_query[name] = cast_value
+        elif location == "header":
+            normalized_headers[name.lower()] = cast_value
+        elif isinstance(normalized_body, dict):
+            normalized_body[name] = cast_value
+
+    return normalized_path, normalized_query, normalized_headers, normalized_body, inputs
+
+
+_GATEWAY_SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$#]*$")
+
+
+def _gateway_field_source_path(field: Any) -> str:
+    text = str(field or "").strip()
+    if not text:
+        return ""
+    if ":" in text:
+        return text.split(":", 1)[1].strip()
+    if "=" in text:
+        return text.split("=", 1)[1].strip()
+    return text
+
+
+def _gateway_leaf_name_from_field(field: Any) -> str:
+    text = _gateway_field_source_path(field)
+    text = re.sub(r"\[\d*\]", "", text)
+    parts = [part.strip() for part in text.split(".") if part.strip()]
+    return parts[-1] if parts else text
+
+
+def _gateway_infer_source_field_for_input(name: str, response_mapping: Dict[str, Any]) -> str:
+    wanted = str(name or "").strip().lower()
+    if not wanted:
+        return ""
+    fields = _gateway_split_csv(
+        response_mapping.get("output_fields")
+        or response_mapping.get("select_fields")
+        or response_mapping.get("fields")
+    )
+    for field in fields:
+        source = _gateway_field_source_path(field)
+        if source.lower() == wanted:
+            return source
+    for field in fields:
+        source = _gateway_field_source_path(field)
+        if _gateway_leaf_name_from_field(source).lower() == wanted:
+            return source
+    return ""
+
+
+def _gateway_sql_identifier(name: str) -> str:
+    text = str(name or "").strip()
+    if not text or not _GATEWAY_SQL_IDENTIFIER_RE.match(text):
+        raise _GatewayControlError(400, f"Invalid gateway filter field: {name}")
+    return text
+
+
+def _gateway_sql_field_expression(field_path: str, dialect: str) -> str:
+    source = _gateway_field_source_path(field_path)
+    parts = [part.strip() for part in re.sub(r"\[\d*\]", "", source).split(".") if part.strip()]
+    if not parts:
+        raise _GatewayControlError(400, "Gateway filter field is required")
+    column = _gateway_sql_identifier(parts[0])
+    if len(parts) == 1:
+        return column
+    json_tail = ".".join(_gateway_sql_identifier(part) for part in parts[1:])
+    if dialect == "oracle":
+        return f"JSON_VALUE({column}, '$.{json_tail}')"
+    if dialect == "postgres":
+        json_path = ",".join(_gateway_sql_identifier(part) for part in parts[1:])
+        return f"({column} #>> '{{{json_path}}}')"
+    if dialect == "mysql":
+        return f"JSON_UNQUOTE(JSON_EXTRACT({column}, '$.{json_tail}'))"
+    return column
+
+
+def _gateway_sql_placeholder(dialect: str, bind_name: str) -> str:
+    if dialect == "oracle":
+        return f":{bind_name}"
+    return f"%({bind_name})s"
+
+
+def _gateway_sql_filter_clause(expr: str, placeholder: str, operator: str, bind_name: str, bind_params: Dict[str, Any]) -> str:
+    op = str(operator or "equals").strip().lower()
+    if op in {"contains", "like"}:
+        bind_params[bind_name] = f"%{bind_params[bind_name]}%"
+        return f"{expr} LIKE {placeholder}"
+    if op in {"starts_with", "startswith", "prefix"}:
+        bind_params[bind_name] = f"{bind_params[bind_name]}%"
+        return f"{expr} LIKE {placeholder}"
+    if op in {"gt", ">"}:
+        return f"{expr} > {placeholder}"
+    if op in {"gte", ">="}:
+        return f"{expr} >= {placeholder}"
+    if op in {"lt", "<"}:
+        return f"{expr} < {placeholder}"
+    if op in {"lte", "<="}:
+        return f"{expr} <= {placeholder}"
+    if op in {"not_equals", "neq", "!="}:
+        return f"{expr} <> {placeholder}"
+    return f"{expr} = {placeholder}"
+
+
+def _gateway_sql_dialect_for_source(source_type: str) -> str:
+    text = str(source_type or "").strip().lower()
+    if text == "oracle_source":
+        return "oracle"
+    if text == "postgres_source":
+        return "postgres"
+    if text == "mysql_source":
+        return "mysql"
+    return ""
+
+
+def _gateway_apply_input_filters_to_tabular_config(
+    source_type: str,
+    config: Dict[str, Any],
+    input_specs: List[Dict[str, Any]],
+    input_params: Dict[str, Any],
+    response_mapping: Dict[str, Any],
+) -> Dict[str, Any]:
+    dialect = _gateway_sql_dialect_for_source(source_type)
+    if dialect not in {"oracle", "postgres", "mysql"}:
+        return config
+    if not input_params:
+        return config
+
+    next_cfg = dict(config or {})
+    bind_params: Dict[str, Any] = {}
+    clauses: List[str] = []
+    for idx, spec in enumerate(input_specs or []):
+        name = str(spec.get("name") or "").strip()
+        if not name or name not in input_params:
+            continue
+        source_field = str(spec.get("source_field") or "").strip()
+        if not source_field:
+            source_field = _gateway_infer_source_field_for_input(name, response_mapping)
+        if not source_field:
+            continue
+        bind_name = f"gw_param_{idx}"
+        bind_params[bind_name] = input_params[name]
+        expr = _gateway_sql_field_expression(source_field, dialect)
+        placeholder = _gateway_sql_placeholder(dialect, bind_name)
+        clauses.append(_gateway_sql_filter_clause(expr, placeholder, str(spec.get("operator") or "equals"), bind_name, bind_params))
+
+    if not clauses:
+        return next_cfg
+
+    base_query = _strip_sql_terminator(next_cfg.get("query", ""))
+    table = str(next_cfg.get("table", "") or "").strip()
+    where_sql = " AND ".join(f"({clause})" for clause in clauses)
+    if base_query:
+        next_cfg["query"] = f"SELECT * FROM ({base_query}) gw_src WHERE {where_sql}"
+    elif table:
+        next_cfg["query"] = f"SELECT * FROM {table} WHERE {where_sql}"
+    else:
+        return next_cfg
+    existing_binds = next_cfg.get("_gateway_bind_params")
+    if isinstance(existing_binds, dict):
+        bind_params = {**existing_binds, **bind_params}
+    next_cfg["_gateway_bind_params"] = bind_params
+    next_cfg["_gateway_auto_filters"] = [
+        {
+            "name": str(spec.get("name") or ""),
+            "source_field": str(spec.get("source_field") or _gateway_infer_source_field_for_input(str(spec.get("name") or ""), response_mapping) or ""),
+            "operator": str(spec.get("operator") or "equals"),
+        }
+        for spec in input_specs or []
+        if str(spec.get("name") or "") in input_params
+    ]
+    return next_cfg
+
+
+def _gateway_profile_query_operator(operator: str) -> str:
+    op = str(operator or "equals").strip().lower()
+    mapping = {
+        "eq": "equals",
+        "=": "equals",
+        "equals": "equals",
+        "not_equals": "not_equals",
+        "neq": "not_equals",
+        "!=": "not_equals",
+        "<>": "not_equals",
+        "gt": "greater_than",
+        ">": "greater_than",
+        "gte": "greater_or_equal",
+        ">=": "greater_or_equal",
+        "lt": "less_than",
+        "<": "less_than",
+        "lte": "less_or_equal",
+        "<=": "less_or_equal",
+        "contains": "contains",
+        "like": "contains",
+        "starts_with": "starts_with",
+        "startswith": "starts_with",
+        "ends_with": "ends_with",
+        "endswith": "ends_with",
+        "in": "in",
+        "not_in": "not_in",
+    }
+    return mapping.get(op, "equals")
+
+
+def _gateway_apply_input_filters_to_profile_query_config(
+    node_type: str,
+    config: Dict[str, Any],
+    input_specs: List[Dict[str, Any]],
+    input_params: Dict[str, Any],
+    response_mapping: Dict[str, Any],
+) -> Dict[str, Any]:
+    if str(node_type or "").strip().lower() != "profile_query_transform":
+        return config
+    if not input_params:
+        return config
+    next_cfg = dict(config or {})
+    raw_criteria = next_cfg.get("criteria")
+    if isinstance(raw_criteria, str):
+        try:
+            parsed = json.loads(raw_criteria)
+            raw_criteria = parsed if isinstance(parsed, list) else []
+        except Exception:
+            raw_criteria = []
+    criteria = [dict(item) for item in raw_criteria if isinstance(item, dict)] if isinstance(raw_criteria, list) else []
+    existing_signatures = {
+        (
+            str(item.get("field") or item.get("leftField") or "").strip(),
+            str(item.get("operator") or "equals").strip().lower(),
+            json.dumps(item.get("value", item.get("rightValue")), sort_keys=True, default=str),
+        )
+        for item in criteria
+        if isinstance(item, dict)
+    }
+
+    for spec in input_specs or []:
+        name = str(spec.get("name") or "").strip()
+        if not name or name not in input_params:
+            continue
+        source_field = str(spec.get("source_field") or "").strip()
+        if not source_field:
+            source_field = _gateway_infer_source_field_for_input(name, response_mapping) or name
+        operator = _gateway_profile_query_operator(str(spec.get("operator") or "equals"))
+        value = input_params[name]
+        signature = (
+            source_field,
+            operator,
+            json.dumps(value, sort_keys=True, default=str),
+        )
+        if signature in existing_signatures:
+            continue
+        existing_signatures.add(signature)
+        criteria.append({
+            "field": source_field,
+            "operator": operator,
+            "rightMode": "literal",
+            "value": value,
+        })
+
+    if criteria:
+        next_cfg["criteria"] = criteria
+        if not str(next_cfg.get("criteria_mode") or "").strip():
+            next_cfg["criteria_mode"] = "all"
+        next_cfg["_gateway_auto_filters"] = [
+            {
+                "name": str(spec.get("name") or ""),
+                "source_field": str(spec.get("source_field") or _gateway_infer_source_field_for_input(str(spec.get("name") or ""), response_mapping) or str(spec.get("name") or "")),
+                "operator": _gateway_profile_query_operator(str(spec.get("operator") or "equals")),
+            }
+            for spec in input_specs or []
+            if str(spec.get("name") or "") in input_params
+        ]
+    return next_cfg
+
+
+def _gateway_apply_input_filters_to_node_config(
+    node_type: str,
+    config: Dict[str, Any],
+    input_specs: List[Dict[str, Any]],
+    input_params: Dict[str, Any],
+    response_mapping: Dict[str, Any],
+) -> Dict[str, Any]:
+    next_cfg = _gateway_apply_input_filters_to_tabular_config(
+        node_type,
+        config,
+        input_specs,
+        input_params,
+        response_mapping,
+    )
+    next_cfg = _gateway_apply_input_filters_to_profile_query_config(
+        node_type,
+        next_cfg,
+        input_specs,
+        input_params,
+        response_mapping,
+    )
+    return next_cfg
+
+
+def _gateway_read_path_value(row: Any, path: str) -> Any:
+    text = str(path or "").strip()
+    if not text:
+        return None
+    current = row
+    for part in text.split("."):
+        key = str(part or "").strip()
+        if not key:
+            continue
+        if isinstance(current, dict):
+            current = current.get(key)
+        elif isinstance(current, list):
+            try:
+                current = current[int(key)]
+            except Exception:
+                return None
+        else:
+            return None
+    return current
+
+
+def _gateway_project_data(data: Any, response_mapping: Dict[str, Any]) -> Tuple[Any, List[str]]:
+    raw_fields = (
+        response_mapping.get("output_fields")
+        or response_mapping.get("select_fields")
+        or response_mapping.get("fields")
+        or []
+    )
+    fields = _gateway_split_csv(raw_fields)
+    if not fields:
+        return data, []
+
+    def project_row(row: Any) -> Dict[str, Any]:
+        if not isinstance(row, dict):
+            return {"value": row}
+        projected: Dict[str, Any] = {}
+        for field in fields:
+            alias = field
+            source = field
+            if ":" in field:
+                alias, _, source = field.partition(":")
+            elif "=" in field:
+                alias, _, source = field.partition("=")
+            alias = str(alias or source).strip()
+            source = str(source or alias).strip()
+            projected[alias] = _gateway_find_access_path_value(row, source)
+        return projected
+
+    if isinstance(data, list):
+        return [project_row(item) for item in data], fields
+    if isinstance(data, dict):
+        return project_row(data), fields
+    return data, fields
+
+
+def _gateway_request_seed_rows(
+    path_params: Dict[str, str],
+    query_params: Dict[str, Any],
+    header_params: Optional[Dict[str, Any]],
+    body_payload: Any,
+    input_params: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    base: Dict[str, Any] = {
+        **(path_params or {}),
+        **(query_params or {}),
+        **(input_params or {}),
+        "path": path_params or {},
+        "query": query_params or {},
+        "headers": header_params or {},
+        "inputs": input_params or {},
+    }
+    if isinstance(body_payload, dict):
+        return [{**base, **body_payload, "body": body_payload}]
+    if isinstance(body_payload, list):
+        rows: List[Dict[str, Any]] = []
+        for item in body_payload:
+            if isinstance(item, dict):
+                rows.append({**base, **item, "body": item})
+            else:
+                rows.append({**base, "value": item, "body": item})
+        return rows or [base]
+    if body_payload is not None:
+        return [{**base, "value": body_payload, "body": body_payload}]
+    return [base]
+
+
+def _gateway_node_label(node: Dict[str, Any], node_id: str) -> str:
+    data_obj = node.get("data") if isinstance(node.get("data"), dict) else {}
+    definition = data_obj.get("definition") if isinstance(data_obj.get("definition"), dict) else {}
+    return str(data_obj.get("label") or definition.get("label") or node_id).strip() or node_id
+
+
+def _gateway_trigger_node_ids(route: models.ApiGatewayRoute) -> List[str]:
+    request_mapping = route.request_mapping if isinstance(route.request_mapping, dict) else {}
+    if "trigger_node_ids" in request_mapping:
+        raw = request_mapping.get("trigger_node_ids")
+    elif "execution_node_ids" in request_mapping:
+        raw = request_mapping.get("execution_node_ids")
+    elif "node_ids" in request_mapping:
+        raw = request_mapping.get("node_ids")
+    else:
+        raw = request_mapping.get("trigger_node_id") or []
+    return _gateway_split_csv(raw)
+
+
+async def _gateway_execute_trigger_nodes(
+    route: models.ApiGatewayRoute,
+    db: Session,
+    path_params: Dict[str, str],
+    query_params: Dict[str, Any],
+    header_params: Optional[Dict[str, Any]],
+    body_payload: Any,
+    input_params: Optional[Dict[str, Any]],
+    max_rows: int,
+    response_mapping: Dict[str, Any],
+    input_specs: List[Dict[str, Any]],
+) -> Tuple[Any, Dict[str, Any]]:
+    pipeline_id = str(route.pipeline_id or "").strip()
+    if not pipeline_id:
+        raise _GatewayControlError(400, "Gateway trigger output requires a pipeline_id")
+    pipeline = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
+    if pipeline is None:
+        raise _GatewayControlError(404, "Gateway pipeline not found")
+
+    nodes = pipeline.nodes if isinstance(pipeline.nodes, list) else []
+    edges = pipeline.edges if isinstance(pipeline.edges, list) else []
+    nodes_by_id = {
+        str(node.get("id") or "").strip(): node
+        for node in nodes
+        if isinstance(node, dict) and str(node.get("id") or "").strip()
+    }
+    incoming_by_target: Dict[str, List[str]] = {}
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        source = str(edge.get("source") or "").strip()
+        target = str(edge.get("target") or "").strip()
+        if source and target:
+            incoming_by_target.setdefault(target, []).append(source)
+
+    trigger_ids = [
+        node_id for node_id in _gateway_trigger_node_ids(route)
+        if node_id in nodes_by_id and node_id != str(route.gateway_node_id or "").strip()
+    ]
+    if not trigger_ids:
+        raise _GatewayControlError(400, "Gateway trigger execution requires at least one valid trigger node")
+
+    output_node_id = str(route.source_node_id or "").strip()
+    if not output_node_id or output_node_id not in nodes_by_id:
+        raise _GatewayControlError(400, "Gateway trigger execution requires a valid Backend Source output node")
+
+    request_context = {
+        "path": path_params or {},
+        "query": query_params or {},
+        "headers": header_params or {},
+        "body": body_payload if isinstance(body_payload, dict) else {},
+        "inputs": input_params or {},
+    }
+    seed_rows = _gateway_request_seed_rows(path_params, query_params, header_params, body_payload, input_params)
+    gateway_node_id = str(route.gateway_node_id or "").strip()
+    output_cache: Dict[str, List[Any]] = {}
+    visiting: set[str] = set()
+    tabular_source_types = {
+        "postgres_source",
+        "mysql_source",
+        "oracle_source",
+        "mongodb_source",
+        "redis_source",
+        "elasticsearch_source",
+        "lmdb_source",
+        "rocksdb_source",
+    }
+
+    async def run_node(node_id: str) -> List[Any]:
+        if node_id in output_cache:
+            return output_cache[node_id]
+        if node_id in visiting:
+            raise _GatewayControlError(400, f"Gateway trigger graph has a cycle at node {node_id}")
+        node = nodes_by_id.get(node_id)
+        if not isinstance(node, dict):
+            raise _GatewayControlError(400, f"Gateway trigger node not found: {node_id}")
+
+        visiting.add(node_id)
+        try:
+            node_type = _gateway_node_type(node)
+            if node_type == "api_gateway":
+                raise _GatewayControlError(400, "API Gateway node cannot trigger itself")
+            config = _gateway_node_config(node)
+            if node_id == output_node_id and isinstance(route.source_config, dict) and route.source_config:
+                config.update(route.source_config)
+
+            parent_ids = [
+                pid for pid in incoming_by_target.get(node_id, [])
+                if pid in nodes_by_id and pid != gateway_node_id
+            ]
+            incoming_by_source: Dict[str, List[Any]] = {}
+            upstream_rows: List[Any] = []
+            for parent_id in parent_ids:
+                parent_output = await run_node(parent_id)
+                incoming_by_source[parent_id] = parent_output
+                upstream_rows.extend(parent_output)
+
+            is_source_node = node_type in tabular_source_types or node_type.endswith("_source")
+            if not parent_ids and not is_source_node and node_id == output_node_id:
+                trigger_parent_ids = [trigger_id for trigger_id in trigger_ids if trigger_id != node_id]
+                for trigger_id in trigger_parent_ids:
+                    trigger_output = await run_node(trigger_id)
+                    incoming_by_source[trigger_id] = trigger_output
+                    upstream_rows.extend(trigger_output)
+                parent_ids = trigger_parent_ids
+            elif not parent_ids:
+                upstream_rows = list(seed_rows)
+
+            templated_config = _gateway_template_value(config, request_context)
+            if isinstance(templated_config, dict) and node_type in tabular_source_types:
+                templated_config = _gateway_apply_input_filters_to_node_config(
+                    node_type,
+                    templated_config,
+                    input_specs,
+                    input_params or {},
+                    response_mapping,
+                )
+                raw_output = await _load_tabular_rows_for_source(
+                    node_type,
+                    templated_config if isinstance(templated_config, dict) else {},
+                    max_rows=max_rows,
+                    hard_cap=max_rows,
+                )
+            else:
+                raw_output = await etl_engine._execute_node(
+                    node_type,
+                    templated_config if isinstance(templated_config, dict) else {},
+                    upstream_rows,
+                    incoming_by_source=incoming_by_source,
+                    incoming_order=parent_ids,
+                    execution_context={
+                        "gateway_route_id": route.id,
+                        "gateway_trigger_node_id": node_id,
+                        "gateway_source_node_id": output_node_id,
+                        "gateway_max_rows": max_rows,
+                        "gateway_request": request_context,
+                    },
+                )
+            if isinstance(raw_output, list):
+                rows = _normalize_source_rows(raw_output, max_rows)
+            elif raw_output is None:
+                rows = []
+            else:
+                rows = [_to_json_safe_value(raw_output)]
+            output_cache[node_id] = rows
+            return rows
+        finally:
+            visiting.discard(node_id)
+
+    trigger_outputs: Dict[str, Any] = {}
+    for trigger_id in trigger_ids:
+        rows = await run_node(trigger_id)
+        node = nodes_by_id[trigger_id]
+        trigger_outputs[trigger_id] = {
+            "label": _gateway_node_label(node, trigger_id),
+            "node_type": _gateway_node_type(node),
+            "row_count": len(rows),
+        }
+
+    output_rows = await run_node(output_node_id)
+    output_node = nodes_by_id[output_node_id]
+    return output_rows, {
+        "source_type": _gateway_node_type(output_node),
+        "row_count": len(output_rows),
+        "mode": "triggered_backend_source",
+        "source_node_id": output_node_id,
+        "source_node_label": _gateway_node_label(output_node, output_node_id),
+        "trigger_node_ids": trigger_ids,
+        "trigger_outputs": trigger_outputs,
+    }
+
+
+def _gateway_resolve_source(route: models.ApiGatewayRoute, db: Session) -> Tuple[str, Dict[str, Any]]:
+    if route.pipeline_id and route.source_node_id:
+        pipeline = db.query(models.Pipeline).filter(models.Pipeline.id == route.pipeline_id).first()
+        if pipeline and isinstance(pipeline.nodes, list):
+            for node in pipeline.nodes:
+                if not isinstance(node, dict):
+                    continue
+                if str(node.get("id") or "").strip() == str(route.source_node_id or "").strip():
+                    source_type = _gateway_node_type(node)
+                    source_config = _gateway_node_config(node)
+                    override = route.source_config if isinstance(route.source_config, dict) else {}
+                    if override:
+                        source_config.update(override)
+                    return source_type, source_config
+    source_type = str(route.source_type or "").strip().lower()
+    source_config = route.source_config if isinstance(route.source_config, dict) else {}
+    return source_type, dict(source_config)
+
+
+async def _gateway_execute_route_source(
+    route: models.ApiGatewayRoute,
+    db: Session,
+    path_params: Dict[str, str],
+    query_params: Dict[str, Any],
+    header_params: Optional[Dict[str, Any]],
+    body_payload: Any,
+    input_params: Optional[Dict[str, Any]] = None,
+) -> Tuple[Any, Dict[str, Any]]:
+    response_mapping = route.response_mapping if isinstance(route.response_mapping, dict) else {}
+    input_specs = _gateway_input_specs(route)
+    raw_limit = query_params.get("limit") or response_mapping.get("limit") or 1000
+    try:
+        max_rows = max(1, min(int(raw_limit), 50000))
+    except Exception:
+        max_rows = 1000
+
+    defer_projection = isinstance(body_payload, dict) and isinstance(body_payload.get("graphql"), dict)
+
+    if _gateway_trigger_node_ids(route):
+        triggered_data, trigger_meta = await _gateway_execute_trigger_nodes(
+            route,
+            db,
+            path_params,
+            query_params,
+            header_params,
+            body_payload,
+            input_params,
+            max_rows,
+            response_mapping,
+            input_specs,
+        )
+        if defer_projection:
+            projected_data, selected_fields = triggered_data, []
+        else:
+            projected_data, selected_fields = _gateway_project_data(triggered_data, response_mapping)
+        trigger_meta["output_fields"] = selected_fields
+        return projected_data, trigger_meta
+
+    source_type, source_config = _gateway_resolve_source(route, db)
+    if not source_type:
+        echo_data = {
+            "path": path_params,
+            "query": query_params,
+            "headers": header_params or {},
+            "body": body_payload,
+            "inputs": input_params or {},
+        }
+        if defer_projection:
+            projected_data, selected_fields = echo_data, []
+        else:
+            projected_data, selected_fields = _gateway_project_data(echo_data, response_mapping)
+        return projected_data, {"source_type": None, "row_count": 0, "mode": "echo", "output_fields": selected_fields}
+
+    request_context = {
+        "path": path_params,
+        "query": query_params,
+        "headers": header_params or {},
+        "body": body_payload if isinstance(body_payload, dict) else {},
+        "inputs": input_params or {},
+    }
+    templated_config = _gateway_template_value(source_config, request_context)
+    if isinstance(templated_config, dict):
+        templated_config = _gateway_apply_input_filters_to_node_config(
+            source_type,
+            templated_config,
+            input_specs,
+            input_params or {},
+            response_mapping,
+        )
+
+    tabular_source_types = {
+        "postgres_source",
+        "mysql_source",
+        "oracle_source",
+        "mongodb_source",
+        "redis_source",
+        "elasticsearch_source",
+        "lmdb_source",
+        "rocksdb_source",
+    }
+    if source_type in tabular_source_types:
+        rows = await _load_tabular_rows_for_source(
+            source_type,
+            templated_config if isinstance(templated_config, dict) else {},
+            max_rows=max_rows,
+            hard_cap=max_rows,
+        )
+        normalized_rows = _normalize_source_rows(rows if isinstance(rows, list) else [], max_rows)
+        if defer_projection:
+            projected_rows, selected_fields = normalized_rows, []
+        else:
+            projected_rows, selected_fields = _gateway_project_data(normalized_rows, response_mapping)
+        return projected_rows, {
+            "source_type": source_type,
+            "row_count": len(projected_rows) if isinstance(projected_rows, list) else len(normalized_rows),
+            "mode": "tabular",
+            "output_fields": selected_fields,
+        }
+
+    raw_rows = await etl_engine._execute_node(
+        source_type,
+        templated_config if isinstance(templated_config, dict) else {},
+        [],
+        execution_context={"gateway_route_id": route.id, "gateway_max_rows": max_rows},
+    )
+    if isinstance(raw_rows, list):
+        normalized_rows = _normalize_source_rows(raw_rows, max_rows)
+        if defer_projection:
+            projected_rows, selected_fields = normalized_rows, []
+        else:
+            projected_rows, selected_fields = _gateway_project_data(normalized_rows, response_mapping)
+        return projected_rows, {
+            "source_type": source_type,
+            "row_count": len(projected_rows) if isinstance(projected_rows, list) else len(normalized_rows),
+            "mode": "node",
+            "output_fields": selected_fields,
+        }
+    safe_raw = _to_json_safe_value(raw_rows)
+    if defer_projection:
+        projected_raw, selected_fields = safe_raw, []
+    else:
+        projected_raw, selected_fields = _gateway_project_data(safe_raw, response_mapping)
+    return projected_raw, {"source_type": source_type, "row_count": 1, "mode": "node", "output_fields": selected_fields}
+
+
+def _gateway_log_request(
+    db: Session,
+    route: Optional[models.ApiGatewayRoute],
+    request_id: str,
+    method: str,
+    path: str,
+    version: str,
+    status_code: int,
+    success: bool,
+    duration_ms: int,
+    client_ip: Optional[str],
+    auth_ctx: Optional[Dict[str, Any]],
+    error_message: Optional[str],
+    request_meta: Optional[Dict[str, Any]] = None,
+    response_meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    if route is not None and not bool(route.logging_enabled):
+        return
+    try:
+        roles = _gateway_split_csv((auth_ctx or {}).get("roles")) if auth_ctx else []
+        row = models.ApiGatewayLog(
+            id=str(uuid.uuid4()),
+            route_id=route.id if route else None,
+            request_id=request_id,
+            method=method,
+            path=path,
+            version=version,
+            status_code=int(status_code),
+            success=bool(success),
+            duration_ms=int(duration_ms),
+            client_ip=client_ip,
+            user_id=str((auth_ctx or {}).get("user_id") or "") or None,
+            role=",".join(roles) if roles else None,
+            error_message=error_message,
+            request_meta=request_meta or {},
+            response_meta=response_meta or {},
+        )
+        db.add(row)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+@app.get("/api/gateway/routes")
+async def list_gateway_routes(db: Session = Depends(get_db)):
+    routes = db.query(models.ApiGatewayRoute).order_by(models.ApiGatewayRoute.updated_at.desc()).all()
+    return [_gateway_route_to_dict(route) for route in routes]
+
+
+@app.post("/api/gateway/routes", status_code=201)
+async def create_gateway_route(body: ApiGatewayRouteCreate, db: Session = Depends(get_db)):
+    values = body.model_dump()
+    route_id = str(values.pop("id", "") or "").strip() or str(uuid.uuid4())
+    existing = db.query(models.ApiGatewayRoute).filter(models.ApiGatewayRoute.id == route_id).first()
+    if existing is not None:
+        _gateway_apply_route_values(existing, values)
+        db.commit()
+        db.refresh(existing)
+        _audit(db, "admin", "update", "api_gateway_route", existing.id, existing.name)
+        return _gateway_route_to_dict(existing)
+    route = models.ApiGatewayRoute(id=route_id, name=values.get("name") or "Gateway Route")
+    _gateway_apply_route_values(route, values)
+    db.add(route)
+    db.commit()
+    db.refresh(route)
+    _audit(db, "admin", "create", "api_gateway_route", route.id, route.name)
+    return _gateway_route_to_dict(route)
+
+
+@app.get("/api/gateway/routes/{route_id}")
+async def get_gateway_route(route_id: str, db: Session = Depends(get_db)):
+    route = db.query(models.ApiGatewayRoute).filter(models.ApiGatewayRoute.id == route_id).first()
+    if route is None:
+        raise HTTPException(status_code=404, detail="Gateway route not found")
+    return _gateway_route_to_dict(route)
+
+
+@app.put("/api/gateway/routes/{route_id}")
+async def update_gateway_route(route_id: str, body: ApiGatewayRouteUpdate, db: Session = Depends(get_db)):
+    route = db.query(models.ApiGatewayRoute).filter(models.ApiGatewayRoute.id == route_id).first()
+    if route is None:
+        raise HTTPException(status_code=404, detail="Gateway route not found")
+    values = body.model_dump(exclude_none=True)
+    _gateway_apply_route_values(route, {**_gateway_route_to_dict(route), **values})
+    db.commit()
+    db.refresh(route)
+    _audit(db, "admin", "update", "api_gateway_route", route.id, route.name)
+    return _gateway_route_to_dict(route)
+
+
+@app.delete("/api/gateway/routes/{route_id}", status_code=204)
+async def delete_gateway_route(route_id: str, db: Session = Depends(get_db)):
+    route = db.query(models.ApiGatewayRoute).filter(models.ApiGatewayRoute.id == route_id).first()
+    if route is None:
+        raise HTTPException(status_code=404, detail="Gateway route not found")
+    _remove_gateway_route_from_pipeline_config(route, db)
+    deleted_logs = db.query(models.ApiGatewayLog).filter(
+        models.ApiGatewayLog.route_id == route.id
+    ).delete(synchronize_session=False)
+    _audit(db, "admin", "delete", "api_gateway_route", route.id, route.name, f"purged_logs={deleted_logs}")
+    db.delete(route)
+    db.commit()
+
+
+@app.get("/api/gateway/routes/{route_id}/logs")
+async def list_gateway_route_logs(route_id: str, limit: int = 200, db: Session = Depends(get_db)):
+    safe_limit = max(1, min(int(limit or 200), 1000))
+    rows = db.query(models.ApiGatewayLog).filter(
+        models.ApiGatewayLog.route_id == route_id
+    ).order_by(models.ApiGatewayLog.created_at.desc()).limit(safe_limit).all()
+    return [
+        {
+            "id": row.id,
+            "route_id": row.route_id,
+            "request_id": row.request_id,
+            "method": row.method,
+            "path": row.path,
+            "version": row.version,
+            "status_code": row.status_code,
+            "success": bool(row.success),
+            "duration_ms": row.duration_ms,
+            "client_ip": row.client_ip,
+            "user_id": row.user_id,
+            "role": row.role,
+            "error_message": row.error_message,
+            "request_meta": row.request_meta or {},
+            "response_meta": row.response_meta or {},
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+        for row in rows
+    ]
+
+
+@app.get("/api/gateway/routes/{route_id}/metrics")
+async def get_gateway_route_metrics(route_id: str, db: Session = Depends(get_db)):
+    rows = db.query(models.ApiGatewayLog).filter(models.ApiGatewayLog.route_id == route_id).all()
+    total = len(rows)
+    success = sum(1 for row in rows if bool(row.success))
+    durations = [int(row.duration_ms or 0) for row in rows]
+    status_counts: Dict[str, int] = {}
+    for row in rows:
+        key = str(row.status_code or "unknown")
+        status_counts[key] = status_counts.get(key, 0) + 1
+    return {
+        "route_id": route_id,
+        "requests": total,
+        "success": success,
+        "failed": max(0, total - success),
+        "success_rate": round((success / total) * 100, 2) if total else 0,
+        "avg_duration_ms": round(sum(durations) / total, 2) if total else 0,
+        "max_duration_ms": max(durations) if durations else 0,
+        "status_counts": status_counts,
+    }
+
+
+async def _gateway_runtime_common(
+    protocol: str,
+    version: str,
+    full_path: str,
+    request: Request,
+    db: Session,
+):
+    started = _time.time()
+    request_id = str(request.headers.get("x-request-id") or uuid.uuid4())
+    request_path = _gateway_normalize_path(full_path)
+    method = _gateway_normalize_method(request.method)
+    client_ip = request.client.host if request.client else None
+    route, path_params = _gateway_find_route(db, version, method, request_path, protocol=protocol)
+    if route is None:
+        duration_ms = int((_time.time() - started) * 1000)
+        _gateway_log_request(
+            db, None, request_id, method, request_path, version, 404, False, duration_ms,
+            client_ip, None, "Gateway route not found",
+            request_meta={"protocol": protocol, "path_params": {}, "query": dict(request.query_params)},
+        )
+        return _gateway_protocol_response(
+            None,
+            protocol,
+            request_id,
+            False,
+            404,
+            error="Gateway route not found",
+            meta={"duration_ms": duration_ms, "protocol": protocol},
+        )
+
+    auth_ctx: Dict[str, Any] = {}
+    graphql_ctx: Dict[str, Any] = {}
+    try:
+        body_payload: Any = {}
+        if method not in {"GET", "HEAD", "OPTIONS"}:
+            try:
+                body_payload = await request.json()
+            except Exception:
+                raw_body = await request.body()
+                body_payload = raw_body.decode("utf-8", errors="replace") if raw_body else {}
+        query_params = {str(k): v for k, v in request.query_params.items()}
+        header_params = {str(k).lower(): v for k, v in request.headers.items()}
+        if str(protocol or "").strip().lower() == "graphql":
+            query_params, body_payload, graphql_ctx = _gateway_prepare_graphql_request(route, query_params, body_payload)
+        auth_ctx = _gateway_authenticate(route, request)
+        _gateway_enforce_rbac(route, auth_ctx)
+        _gateway_enforce_rate_limit(route, request, auth_ctx)
+        path_params, query_params, header_params, body_payload, input_params = _gateway_validate_input_parameters(
+            route,
+            path_params=path_params,
+            query_params=query_params,
+            header_params=header_params,
+            body_payload=body_payload,
+        )
+        data, response_meta = await _gateway_execute_route_source(
+            route,
+            db,
+            path_params=path_params,
+            query_params=query_params,
+            header_params=header_params,
+            body_payload=body_payload,
+            input_params=input_params,
+        )
+        duration_ms = int((_time.time() - started) * 1000)
+        response_mapping = route.response_mapping if isinstance(route.response_mapping, dict) else {}
+        meta = {
+            "route_id": route.id,
+            "route_name": route.name,
+            "version": _gateway_normalize_version(version),
+            "protocol": protocol,
+            "duration_ms": duration_ms,
+            **(response_meta or {}),
+        }
+        if graphql_ctx:
+            meta["graphql"] = graphql_ctx
+        _gateway_log_request(
+            db, route, request_id, method, request_path, version, 200, True, duration_ms,
+            client_ip, auth_ctx, None,
+            request_meta={
+                "protocol": protocol,
+                "path_params": path_params,
+                "query": query_params,
+                "input_parameters": list((input_params or {}).keys()),
+                "graphql_field": graphql_ctx.get("field") if graphql_ctx else None,
+                "body_type": type(body_payload).__name__,
+            },
+            response_meta=response_meta or {},
+        )
+        if bool(route.audit_enabled):
+            _audit(db, str(auth_ctx.get("user_id") or "gateway"), "execute", "api_gateway_route", route.id, route.name, f"{protocol.upper()} {method} {request_path}")
+        return _gateway_protocol_response(route, protocol, request_id, True, 200, data=data, meta=meta)
+    except _GatewayControlError as exc:
+        duration_ms = int((_time.time() - started) * 1000)
+        _gateway_log_request(
+            db, route, request_id, method, request_path, version, exc.status_code, False, duration_ms,
+            client_ip, auth_ctx, exc.message,
+            request_meta={
+                "protocol": protocol,
+                "path_params": path_params,
+                "query": dict(request.query_params),
+                "graphql_field": graphql_ctx.get("field") if graphql_ctx else None,
+            },
+        )
+        error_meta = {"route_id": route.id, "duration_ms": duration_ms, "protocol": protocol}
+        if graphql_ctx:
+            error_meta["graphql"] = graphql_ctx
+        return _gateway_protocol_response(route, protocol, request_id, False, exc.status_code, error=exc.message, meta=error_meta)
+    except HTTPException as exc:
+        duration_ms = int((_time.time() - started) * 1000)
+        detail = str(exc.detail)
+        _gateway_log_request(
+            db, route, request_id, method, request_path, version, exc.status_code, False, duration_ms,
+            client_ip, auth_ctx, detail,
+            request_meta={
+                "protocol": protocol,
+                "path_params": path_params,
+                "query": dict(request.query_params),
+                "graphql_field": graphql_ctx.get("field") if graphql_ctx else None,
+            },
+        )
+        error_meta = {"route_id": route.id, "duration_ms": duration_ms, "protocol": protocol}
+        if graphql_ctx:
+            error_meta["graphql"] = graphql_ctx
+        return _gateway_protocol_response(route, protocol, request_id, False, exc.status_code, error=detail, meta=error_meta)
+    except Exception as exc:
+        duration_ms = int((_time.time() - started) * 1000)
+        logger.exception(f"Gateway route {route.id} failed")
+        _gateway_log_request(
+            db, route, request_id, method, request_path, version, 500, False, duration_ms,
+            client_ip, auth_ctx, str(exc),
+            request_meta={
+                "protocol": protocol,
+                "path_params": path_params,
+                "query": dict(request.query_params),
+                "graphql_field": graphql_ctx.get("field") if graphql_ctx else None,
+            },
+        )
+        error_meta = {"route_id": route.id, "duration_ms": duration_ms, "protocol": protocol}
+        if graphql_ctx:
+            error_meta["graphql"] = graphql_ctx
+        return _gateway_protocol_response(route, protocol, request_id, False, 500, error=str(exc), meta=error_meta)
+
+
+@app.api_route("/gw/graphql/{version}/{full_path:path}", methods=["GET", "POST", "OPTIONS"])
+async def gateway_graphql_runtime(version: str, full_path: str, request: Request, db: Session = Depends(get_db)):
+    return await _gateway_runtime_common("graphql", version, full_path, request, db)
+
+
+@app.api_route("/gw/soap/{version}/{full_path:path}", methods=["POST", "OPTIONS"])
+async def gateway_soap_runtime(version: str, full_path: str, request: Request, db: Session = Depends(get_db)):
+    return await _gateway_runtime_common("soap", version, full_path, request, db)
+
+
+@app.api_route("/gw/tcp/{version}/{full_path:path}", methods=["GET", "POST", "OPTIONS"])
+async def gateway_tcp_runtime(version: str, full_path: str, request: Request, db: Session = Depends(get_db)):
+    return await _gateway_runtime_common("tcp", version, full_path, request, db)
+
+
+@app.api_route("/gw/{version}/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+async def gateway_runtime(version: str, full_path: str, request: Request, db: Session = Depends(get_db)):
+    return await _gateway_runtime_common("rest", version, full_path, request, db)
 
 
 # ─── USERS & ADMIN ────────────────────────────────────────────────────────────

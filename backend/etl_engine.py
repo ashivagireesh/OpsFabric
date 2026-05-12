@@ -7762,6 +7762,8 @@ END;"""
             )
         elif node_type == "business_analytics":
             return self._transform_business_analytics(upstream, config)
+        elif node_type == "api_gateway":
+            return self._execute_api_gateway(upstream, config, execution_context=execution_context)
 
         # ─── DESTINATIONS ──────────────────────────────────────
         elif node_type in (
@@ -7779,6 +7781,36 @@ END;"""
             return upstream
 
         return upstream
+
+    def _execute_api_gateway(
+        self,
+        upstream: list,
+        config: dict,
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> list:
+        """
+        Gateway routes are persisted by the FastAPI layer when the pipeline is saved.
+        During pipeline execution this node acts as a non-mutating control point.
+        """
+        cfg = config if isinstance(config, dict) else {}
+        node_stats = execution_context.get("node_stats") if isinstance(execution_context, dict) else None
+        route_path = str(cfg.get("route_path") or cfg.get("path") or "/gateway").strip()
+        if not route_path.startswith("/"):
+            route_path = f"/{route_path}"
+        api_version = str(cfg.get("api_version") or cfg.get("version") or "v1").strip().strip("/") or "v1"
+        method = str(cfg.get("route_method") or cfg.get("method") or "GET").strip().upper() or "GET"
+        if isinstance(node_stats, dict):
+            node_stats["gateway_route"] = f"/gw/{api_version}{route_path}"
+            node_stats["gateway_method"] = method
+            node_stats["gateway_enabled"] = bool(cfg.get("enabled", True))
+        if upstream:
+            return upstream
+        return [{
+            "gateway_route": f"/gw/{api_version}{route_path}",
+            "method": method,
+            "enabled": bool(cfg.get("enabled", True)),
+            "status": "configured",
+        }]
 
     # ─── SOURCE IMPLEMENTATIONS ────────────────────────────────────────────────
 
@@ -19485,14 +19517,83 @@ END;"""
         predictions: List[Any] = []
         scores: List[Any] = []
 
+        def _mlops_runtime_dense_matrix(value: Any) -> Any:
+            if hasattr(value, "toarray"):
+                try:
+                    return value.toarray()
+                except Exception:
+                    pass
+            return _np.asarray(value)
+
+        def _mlops_runtime_predict_dbscan(estimator_obj: Any, transformed_rows: Any) -> List[Any]:
+            core_samples = getattr(estimator_obj, "components_", None)
+            core_indices = getattr(estimator_obj, "core_sample_indices_", None)
+            labels = getattr(estimator_obj, "labels_", None)
+            if core_samples is None or core_indices is None or labels is None:
+                if hasattr(estimator_obj, "fit_predict"):
+                    pred = estimator_obj.fit_predict(transformed_rows)
+                    return pred.tolist() if hasattr(pred, "tolist") else list(pred)
+                return [-1 for _ in range(len(feature_records))]
+
+            try:
+                core_index_arr = _np.asarray(core_indices, dtype=int)
+                labels_arr = _np.asarray(labels)
+                if core_index_arr.size == 0:
+                    return [-1 for _ in range(len(feature_records))]
+                core_labels = labels_arr[core_index_arr]
+                core_matrix = _mlops_runtime_dense_matrix(core_samples)
+                input_matrix = _mlops_runtime_dense_matrix(transformed_rows)
+                eps = float(getattr(estimator_obj, "eps", 0.5) or 0.5)
+                out: List[Any] = []
+                for row in input_matrix:
+                    diff = core_matrix - row
+                    distances = _np.sqrt(_np.sum(diff * diff, axis=1))
+                    if distances.size <= 0:
+                        out.append(-1)
+                        continue
+                    nearest = int(_np.argmin(distances))
+                    out.append(int(core_labels[nearest]) if float(distances[nearest]) <= eps else -1)
+                return out
+            except Exception:
+                if hasattr(estimator_obj, "fit_predict"):
+                    pred = estimator_obj.fit_predict(transformed_rows)
+                    return pred.tolist() if hasattr(pred, "tolist") else list(pred)
+                return [-1 for _ in range(len(feature_records))]
+
         if predictor_kind == "components":
             preprocessor = bundle.get("preprocessor")
             estimator = bundle.get("estimator")
             if preprocessor is None or estimator is None:
                 raise RuntimeError("MLOps runtime model components are missing preprocessor/estimator.")
             transformed = preprocessor.transform(feature_df)
-            pred_arr = estimator.predict(transformed)
-            predictions = pred_arr.tolist() if hasattr(pred_arr, "tolist") else list(pred_arr)
+            estimator_name = estimator.__class__.__name__.lower()
+            if hasattr(estimator, "predict"):
+                pred_arr = estimator.predict(transformed)
+                predictions = pred_arr.tolist() if hasattr(pred_arr, "tolist") else list(pred_arr)
+            elif task_type == "clustering" and estimator_name == "dbscan":
+                predictions = _mlops_runtime_predict_dbscan(estimator, transformed)
+                if isinstance(execution_context, dict):
+                    node_warnings = execution_context.get("node_warnings")
+                    warn_msg = "DBSCAN production scoring used nearest fitted core-sample assignment; unmatched rows are labelled -1."
+                    if isinstance(node_warnings, list) and warn_msg not in node_warnings:
+                        node_warnings.append(warn_msg)
+            elif task_type == "clustering" and hasattr(estimator, "fit_predict"):
+                if len(feature_records) < 2:
+                    predictions = [0 for _ in feature_records]
+                else:
+                    pred_arr = estimator.fit_predict(transformed)
+                    predictions = pred_arr.tolist() if hasattr(pred_arr, "tolist") else list(pred_arr)
+                if isinstance(execution_context, dict):
+                    node_warnings = execution_context.get("node_warnings")
+                    warn_msg = (
+                        "Clustering estimator has no predict method; runtime scoring used fit_predict on the current batch."
+                    )
+                    if isinstance(node_warnings, list) and warn_msg not in node_warnings:
+                        node_warnings.append(warn_msg)
+            else:
+                raise RuntimeError(
+                    f"MLOps runtime estimator {estimator.__class__.__name__} does not support predict."
+                )
             if hasattr(estimator, "predict_proba"):
                 proba = estimator.predict_proba(transformed)
                 if getattr(proba, "ndim", 0) == 2:
@@ -19532,6 +19633,27 @@ END;"""
                         predictions = fallback_pred.tolist() if hasattr(fallback_pred, "tolist") else list(fallback_pred)
                 else:
                     raise RuntimeError(f"MLOps production scoring failed: {exc}") from exc
+
+        class_labels = runtime_metadata.get("classification_class_labels")
+        if task_type == "classification" and isinstance(class_labels, list) and class_labels:
+            decoded_predictions: List[Any] = []
+            for item in predictions:
+                decoded_value = item
+                try:
+                    if isinstance(item, (int, _np.integer)):
+                        class_idx = int(item)
+                    elif isinstance(item, float) and math.isfinite(item) and item.is_integer():
+                        class_idx = int(item)
+                    elif isinstance(item, str) and re.fullmatch(r"[-+]?\d+", item.strip()):
+                        class_idx = int(item.strip())
+                    else:
+                        class_idx = -1
+                    if 0 <= class_idx < len(class_labels):
+                        decoded_value = class_labels[class_idx]
+                except Exception:
+                    decoded_value = item
+                decoded_predictions.append(decoded_value)
+            predictions = decoded_predictions
 
         if len(predictions) != len(dict_rows):
             raise RuntimeError(

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Drawer, Form, Input, Select, Switch, InputNumber,
-  Button, Typography, Space, Tabs, Divider, Tag, Tooltip, Table, notification, Modal, Popover, AutoComplete, Tree
+  Button, Typography, Space, Tabs, Divider, Tag, Tooltip, Table, notification, Modal, Popover, AutoComplete, Tree, Popconfirm
 } from 'antd'
 import { ArrowDownOutlined, ArrowUpOutlined, ArrowsAltOutlined, CloseOutlined, CopyOutlined, DeleteOutlined, InfoCircleOutlined, MinusSquareOutlined, PlusSquareOutlined, ReloadOutlined, SaveOutlined } from '@ant-design/icons'
 import Editor, { type Monaco } from '@monaco-editor/react'
@@ -53,6 +53,27 @@ const SCHEDULE_PRESET_TO_CRON: Record<string, string> = {
 }
 const DEFAULT_SCHEDULE_PRESET = 'hourly'
 const DEFAULT_SCHEDULE_CRON = SCHEDULE_PRESET_TO_CRON[DEFAULT_SCHEDULE_PRESET]
+const GATEWAY_PREFERRED_INPUT_FIELD_NAMES = new Set([
+  'customer_account',
+  'customer_id',
+  'account',
+  'account_no',
+  'account_number',
+  'agentcode',
+  'agent_code',
+  'entity_token',
+  'id',
+])
+const GATEWAY_TEST_HEADER_PRESETS = [
+  { key: 'Accept', label: 'Accept', value: 'application/json' },
+  { key: 'Content-Type', label: 'Content-Type', value: 'application/json' },
+  { key: 'Authorization', label: 'Authorization', value: 'Bearer ' },
+  { key: 'X-API-Key', label: 'X-API-Key', value: '' },
+  { key: 'X-Request-ID', label: 'X-Request-ID', value: '' },
+  { key: 'X-Correlation-ID', label: 'X-Correlation-ID', value: '' },
+  { key: 'SOAPAction', label: 'SOAPAction', value: '' },
+  { key: 'User-Agent', label: 'User-Agent', value: 'FRAMEWORK-Gateway-Tester' },
+]
 
 function getFileType(nodeType: string): string {
   if (nodeType.includes('csv'))    return 'csv'
@@ -163,6 +184,77 @@ type ConditionCaseRouteRightMode = 'literal' | 'field'
 type ConditionCaseRouteMatchMode = 'all' | 'any'
 type DataQueryProfilePatchOpKind = 'set' | 'set_where' | 'unset' | 'inc' | 'append' | 'remove' | 'rename'
 type DataQueryProfilePatchValueMode = 'row' | 'fixed'
+type GatewayProtocol = 'rest' | 'graphql' | 'websocket' | 'soap' | 'tcp'
+type GatewayAuthType = 'none' | 'bearer' | 'jwt'
+type GatewayInputLocation = 'path' | 'query' | 'header' | 'body'
+type GatewayInputDataType = 'string' | 'number' | 'integer' | 'boolean' | 'json'
+
+type GatewayInputParameter = {
+  id: string
+  name: string
+  source_field: string
+  operator: string
+  location: GatewayInputLocation
+  required: boolean
+  data_type: GatewayInputDataType
+  default_value: string
+  description: string
+}
+
+type GatewayStudioDraft = {
+  route_id: string
+  gateway_name: string
+  enabled: boolean
+  protocol: GatewayProtocol
+  api_version: string
+  route_method: string
+  route_path: string
+  source_node_id: string
+  trigger_node_ids: string[]
+  source_config_text: string
+  request_mapping_text: string
+  input_parameters: GatewayInputParameter[]
+  response_mapping_text: string
+  output_fields: string[]
+  response_limit: number
+  graphql_field: string
+  standard_response: boolean
+  auth_type: GatewayAuthType
+  auth_token: string
+  jwt_secret: string
+  jwt_issuer: string
+  jwt_audience: string
+  rbac_roles: string
+  rate_limit_requests: number
+  rate_limit_window_seconds: number
+  audit_enabled: boolean
+  logging_enabled: boolean
+}
+
+type GatewayTestBodyType = 'none' | 'json' | 'graphql' | 'xml' | 'text'
+type GatewayTestResponseView = 'json' | 'raw'
+
+type GatewayTestKeyValue = {
+  id: string
+  key: string
+  value: string
+  enabled: boolean
+}
+
+type GatewayTestConfig = {
+  id: string
+  name: string
+  route_id: string
+  protocol: GatewayProtocol
+  method: string
+  path: string
+  query_params: GatewayTestKeyValue[]
+  headers: GatewayTestKeyValue[]
+  body_type: GatewayTestBodyType
+  body_text: string
+  created_at: string
+  updated_at: string
+}
 
 type UiConditionCluster = {
   id: string
@@ -332,6 +424,7 @@ type MLOpsStage3RunSummary = {
   auto_tune_orders?: boolean
   order_search_budget?: number
   cv_folds: number
+  cluster_count?: number | null
   epochs: number
   batch_size: number
   random_seed: number
@@ -360,6 +453,9 @@ type MLOpsStage3TuningParameter = {
 type MLOpsStage3VizType =
   | 'split_bar'
   | 'metrics_bar'
+  | 'cluster_distribution'
+  | 'cluster_scatter'
+  | 'cluster_profile'
   | 'actual_vs_predicted_scatter'
   | 'actual_vs_predicted_line'
   | 'prediction_error_hist'
@@ -478,11 +574,25 @@ const MLOPS_STAGE3_TUNING_METHOD_OPTIONS: Array<{ value: MLOpsStage3TuningMethod
 const MLOPS_STAGE3_VIZ_OPTIONS: Array<{ value: MLOpsStage3VizType; label: string }> = [
   { value: 'split_bar', label: 'Train vs Test Rows' },
   { value: 'metrics_bar', label: 'Train vs Test Metrics' },
+  { value: 'cluster_distribution', label: 'Cluster Distribution' },
+  { value: 'cluster_scatter', label: 'Cluster Scatter' },
+  { value: 'cluster_profile', label: 'Cluster Feature Profile' },
   { value: 'actual_vs_predicted_scatter', label: 'Actual vs Predicted (Scatter)' },
   { value: 'actual_vs_predicted_line', label: 'Actual vs Predicted (Line)' },
   { value: 'prediction_error_hist', label: 'Prediction Error Histogram' },
   { value: 'feature_importance', label: 'Feature Importance' },
 ]
+const MLOPS_STAGE3_CLUSTER_ONLY_VIZ_TYPES = new Set<MLOpsStage3VizType>([
+  'cluster_distribution',
+  'cluster_scatter',
+  'cluster_profile',
+])
+const MLOPS_STAGE3_SUPERVISED_ONLY_VIZ_TYPES = new Set<MLOpsStage3VizType>([
+  'actual_vs_predicted_scatter',
+  'actual_vs_predicted_line',
+  'prediction_error_hist',
+  'feature_importance',
+])
 const MLOPS_STAGE4_ENV_OPTIONS: Array<{ value: MLOpsStage4Environment; label: string }> = [
   { value: 'dev', label: 'Dev' },
   { value: 'staging', label: 'Staging' },
@@ -716,6 +826,8 @@ type ExpressionCompletionEntry = {
 
 const EXPR_LANGUAGE_ID = 'etl-expr'
 const JSON_TEMPLATE_LANGUAGE_ID = 'etl-json-template'
+const GATEWAY_GRAPHQL_LANGUAGE_ID = 'gateway-graphql'
+const GATEWAY_GRAPHQL_THEME_ID = 'gateway-graphql-dark'
 const EXPR_VALIDATION_OWNER = 'etl-expr-validator'
 const JSON_TEMPLATE_VALIDATION_OWNER = 'etl-json-template-validator'
 const EXPR_INLINE_ERROR_CLASS = 'opsfabric-expr-inline-error'
@@ -758,6 +870,7 @@ const CUSTOM_EDITOR_BEAUTIFY_STYLE_OPTIONS: Array<{ value: CustomBeautifyStyle; 
   { value: 'js_view', label: 'Beautify: JS View' },
 ]
 const CUSTOM_EDITOR_PREFS_STORAGE_KEY = 'opsfabric.custom_editor_prefs.v1'
+const GATEWAY_TEST_CONFIG_STORAGE_KEY = 'opsfabric.gateway_api_tests.v1'
 
 type CustomEditorPrefs = {
   colorProfile: CustomEditorColorProfile
@@ -834,6 +947,7 @@ function resolveEditorFontFamily(preset: CustomEditorFontPreset): string {
 
 let exprLanguageRegistered = false
 let jsonTemplateLanguageRegistered = false
+let gatewayGraphqlLanguageRegistered = false
 let customEditorLastMonaco: Monaco | null = null
 let exprCompletionEntries: ExpressionCompletionEntry[] = []
 let exprFunctionSignatureMap = new Map<string, { name: string; label: string; parameters: string[]; documentation: string }>()
@@ -2836,6 +2950,76 @@ function ensureJsonTemplateLanguage(monaco: Monaco): void {
   jsonTemplateLanguageRegistered = true
 }
 
+function ensureGatewayGraphqlLanguage(monaco: Monaco): void {
+  ensureCustomEditorTheme(monaco)
+  if (gatewayGraphqlLanguageRegistered) return
+  monaco.editor.defineTheme(GATEWAY_GRAPHQL_THEME_ID, {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      { token: 'graphql.keyword', foreground: 'C084FC', fontStyle: 'bold' },
+      { token: 'graphql.operation', foreground: '67E8F9', fontStyle: 'bold' },
+      { token: 'graphql.variable', foreground: 'FDE68A', fontStyle: 'bold' },
+      { token: 'graphql.argument', foreground: '93C5FD' },
+      { token: 'graphql.field', foreground: 'D1FAE5' },
+      { token: 'graphql.string', foreground: 'F9A8D4' },
+      { token: 'graphql.number', foreground: 'FB7185' },
+      { token: 'graphql.operator', foreground: 'F472B6', fontStyle: 'bold' },
+      { token: 'graphql.bracket', foreground: 'F8FAFC', fontStyle: 'bold' },
+      { token: 'graphql.comment', foreground: '64748B', fontStyle: 'italic' },
+    ],
+    colors: {
+      'editor.background': '#0b1020',
+      'editor.foreground': '#e2e8f0',
+      'editorCursor.foreground': '#f8fafc',
+      'editorLineNumber.foreground': '#64748b',
+      'editorLineNumber.activeForeground': '#cbd5e1',
+      'editorBracketMatch.background': '#1d4ed833',
+      'editorBracketMatch.border': '#38bdf8',
+    },
+  })
+  monaco.languages.register({ id: GATEWAY_GRAPHQL_LANGUAGE_ID })
+  monaco.languages.setLanguageConfiguration(GATEWAY_GRAPHQL_LANGUAGE_ID, {
+    comments: {
+      lineComment: '#',
+    },
+    brackets: [['{', '}'], ['[', ']'], ['(', ')']],
+    autoClosingPairs: [
+      { open: '{', close: '}' },
+      { open: '[', close: ']' },
+      { open: '(', close: ')' },
+      { open: '"', close: '"' },
+    ],
+    surroundingPairs: [
+      { open: '{', close: '}' },
+      { open: '[', close: ']' },
+      { open: '(', close: ')' },
+      { open: '"', close: '"' },
+    ],
+  })
+  monaco.languages.setMonarchTokensProvider(GATEWAY_GRAPHQL_LANGUAGE_ID, {
+    tokenizer: {
+      root: [
+        [/#.*$/, 'graphql.comment'],
+        [/\s+/, 'white'],
+        [/\b(query|mutation|subscription|fragment)\b/, 'graphql.operation'],
+        [/\b(on|schema|type|input|interface|union|enum|scalar|extend|directive|implements)\b/, 'graphql.keyword'],
+        [/\b(true|false|null)\b/, 'graphql.keyword'],
+        [/\$[A-Za-z_][\w]*/, 'graphql.variable'],
+        [/[A-Za-z_][\w]*(?=\s*:)/, 'graphql.argument'],
+        [/[A-Za-z_][\w]*(?=\s*\()/, 'graphql.operation'],
+        [/[A-Za-z_][\w]*/, 'graphql.field'],
+        [/"(?:[^"\\]|\\.)*"/, 'graphql.string'],
+        [/-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?/, 'graphql.number'],
+        [/[!:=@|&.]+/, 'graphql.operator'],
+        [/[{}[\]()]/, 'graphql.bracket'],
+        [/[,:]/, 'delimiter'],
+      ],
+    },
+  })
+  gatewayGraphqlLanguageRegistered = true
+}
+
 type ExpressionValidationIssue = {
   startOffset: number
   endOffset: number
@@ -4315,6 +4499,591 @@ function toPreviewJsonText(value: unknown): string {
   }
 }
 
+function normalizeGatewayProtocol(value: unknown): GatewayProtocol {
+  const text = String(value || 'rest').trim().toLowerCase()
+  if (['graphql', 'websocket', 'soap', 'tcp'].includes(text)) return text as GatewayProtocol
+  return 'rest'
+}
+
+function normalizeGatewayAuthType(value: unknown): GatewayAuthType {
+  const text = String(value || 'none').trim().toLowerCase()
+  if (text === 'bearer' || text === 'jwt') return text
+  return 'none'
+}
+
+function normalizeGatewayInputLocation(value: unknown): GatewayInputLocation {
+  const text = String(value || 'query').trim().toLowerCase()
+  if (text === 'path' || text === 'header' || text === 'body') return text
+  return 'query'
+}
+
+function normalizeGatewayInputDataType(value: unknown): GatewayInputDataType {
+  const text = String(value || 'string').trim().toLowerCase()
+  if (text === 'number' || text === 'integer' || text === 'boolean' || text === 'json') return text
+  return 'string'
+}
+
+function gatewayJsonText(value: unknown, fallback: Record<string, unknown> = {}): string {
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed) return JSON.stringify(fallback, null, 2)
+    try {
+      return JSON.stringify(JSON.parse(trimmed), null, 2)
+    } catch {
+      return trimmed
+    }
+  }
+  if (value && typeof value === 'object') return toPreviewJsonText(value)
+  return JSON.stringify(fallback, null, 2)
+}
+
+function createGatewayInputParameter(seed?: Partial<GatewayInputParameter> & Record<string, unknown>): GatewayInputParameter {
+  const stableId = String(seed?.id || '').trim() || `param_${Date.now()}_${Math.random().toString(16).slice(2)}`
+  const sourceField = String(seed?.source_field || seed?.filter_field || seed?.field || '').trim()
+  const name = String(seed?.name || '').trim() || gatewayLeafNameFromField(sourceField)
+  return {
+    id: stableId,
+    name,
+    source_field: sourceField,
+    operator: String(seed?.operator || 'equals').trim().toLowerCase() || 'equals',
+    location: normalizeGatewayInputLocation(seed?.location),
+    required: parseBoolLike(seed?.required, false),
+    data_type: normalizeGatewayInputDataType(seed?.data_type || seed?.type),
+    default_value: String(seed?.default_value ?? seed?.default ?? ''),
+    description: String(seed?.description || ''),
+  }
+}
+
+function parseGatewayInputParameters(value: unknown): GatewayInputParameter[] {
+  const raw = Array.isArray(value) ? value : []
+  return raw
+    .map((item) => createGatewayInputParameter((item && typeof item === 'object' ? item : {}) as Record<string, unknown>))
+    .filter((item) => item.name || item.source_field || item.description || item.default_value)
+}
+
+function gatewayFieldSourcePath(field: string): string {
+  const text = String(field || '').trim()
+  if (!text) return ''
+  if (text.includes(':')) return text.split(':').slice(1).join(':').trim()
+  if (text.includes('=')) return text.split('=').slice(1).join('=').trim()
+  return text
+}
+
+function gatewayLeafNameFromField(field: string): string {
+  const sourcePath = gatewayFieldSourcePath(field)
+  const cleaned = sourcePath.replace(/\[\]/g, '').replace(/\[\d+\]/g, '')
+  const parts = cleaned.split('.').map((item) => item.trim()).filter(Boolean)
+  return parts[parts.length - 1] || cleaned || ''
+}
+
+function inferGatewaySourceFieldForParameter(name: string, outputFields: string[] = []): string {
+  const wanted = String(name || '').trim().toLowerCase()
+  if (!wanted) return ''
+  const exact = outputFields.find((field) => gatewayFieldSourcePath(field).toLowerCase() === wanted)
+  if (exact) return gatewayFieldSourcePath(exact)
+  const suffix = outputFields.find((field) => gatewayLeafNameFromField(field).toLowerCase() === wanted)
+  return suffix ? gatewayFieldSourcePath(suffix) : ''
+}
+
+function gatewayInputParametersToPayload(parameters: GatewayInputParameter[], outputFields: string[] = []): Array<Record<string, unknown>> {
+  return (parameters || [])
+    .map((item) => {
+      const sourceField = String(item.source_field || inferGatewaySourceFieldForParameter(item.name, outputFields)).trim()
+      const name = String(item.name || gatewayLeafNameFromField(sourceField)).trim()
+      return {
+        name,
+        source_field: sourceField,
+        operator: String(item.operator || 'equals').trim().toLowerCase() || 'equals',
+        location: normalizeGatewayInputLocation(item.location),
+        required: Boolean(item.required),
+        data_type: normalizeGatewayInputDataType(item.data_type),
+        default_value: String(item.default_value ?? ''),
+        description: String(item.description || '').trim(),
+      }
+    })
+    .filter((item) => item.name)
+}
+
+function createGatewayStudioDraft(seed?: Record<string, unknown>): GatewayStudioDraft {
+  const cfg = seed || {}
+  const responseLimit = Number(cfg.response_limit ?? 1000)
+  const rateRequests = Number(cfg.rate_limit_requests ?? 0)
+  const rateWindow = Number(cfg.rate_limit_window_seconds ?? 60)
+  const requestMapping = (() => {
+    const raw = cfg.request_mapping
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw as Record<string, unknown>
+    if (typeof raw === 'string' && raw.trim()) {
+      try {
+        const parsed = JSON.parse(raw)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+      } catch {
+        return {}
+      }
+    }
+    return {}
+  })()
+  const responseMapping = (() => {
+    const raw = cfg.response_mapping
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw as Record<string, unknown>
+    if (typeof raw === 'string' && raw.trim()) {
+      try {
+        const parsed = JSON.parse(raw)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+      } catch {
+        return {}
+      }
+    }
+    return {}
+  })()
+  return {
+    route_id: String(cfg.route_id || cfg.id || '').trim(),
+    gateway_name: String(cfg.gateway_name || cfg.name || 'Gateway Route'),
+    enabled: parseBoolLike(cfg.enabled, true),
+    protocol: normalizeGatewayProtocol(cfg.protocol),
+    api_version: String(cfg.api_version || cfg.version || 'v1').trim().replace(/^\/+|\/+$/g, '') || 'v1',
+    route_method: String(cfg.route_method || cfg.method || 'GET').trim().toUpperCase() || 'GET',
+    route_path: String(cfg.route_path || cfg.path || '/gateway').trim() || '/gateway',
+    source_node_id: String(cfg.source_node_id || '').trim(),
+    trigger_node_ids: parseStringList(cfg.trigger_node_ids || requestMapping.trigger_node_ids || requestMapping.execution_node_ids || requestMapping.node_ids),
+    source_config_text: gatewayJsonText(cfg.source_config, {}),
+    request_mapping_text: gatewayJsonText(cfg.request_mapping, {}),
+    input_parameters: parseGatewayInputParameters(cfg.input_parameters || requestMapping.input_parameters || requestMapping.parameters),
+    response_mapping_text: gatewayJsonText(cfg.response_mapping, { limit: Number.isFinite(responseLimit) ? responseLimit : 1000 }),
+    output_fields: parseStringList(cfg.output_fields || responseMapping.output_fields),
+    response_limit: Number.isFinite(responseLimit) ? Math.max(1, Math.floor(responseLimit)) : 1000,
+    graphql_field: String(cfg.graphql_field || responseMapping.graphql_field || 'result').trim() || 'result',
+    standard_response: parseBoolLike(cfg.standard_response, true),
+    auth_type: normalizeGatewayAuthType(cfg.auth_type),
+    auth_token: String(cfg.auth_token || ''),
+    jwt_secret: String(cfg.jwt_secret || ''),
+    jwt_issuer: String(cfg.jwt_issuer || ''),
+    jwt_audience: String(cfg.jwt_audience || ''),
+    rbac_roles: String(cfg.rbac_roles || ''),
+    rate_limit_requests: Number.isFinite(rateRequests) ? Math.max(0, Math.floor(rateRequests)) : 0,
+    rate_limit_window_seconds: Number.isFinite(rateWindow) ? Math.max(1, Math.floor(rateWindow)) : 60,
+    audit_enabled: parseBoolLike(cfg.audit_enabled, true),
+    logging_enabled: parseBoolLike(cfg.logging_enabled, true),
+  }
+}
+
+function gatewayDraftToNodeConfig(draft: GatewayStudioDraft): Record<string, unknown> {
+  return {
+    route_id: draft.route_id,
+    gateway_name: draft.gateway_name,
+    enabled: draft.enabled,
+    protocol: draft.protocol,
+    api_version: draft.api_version || 'v1',
+    route_method: draft.route_method || 'GET',
+    route_path: draft.route_path || '/gateway',
+    source_node_id: draft.source_node_id,
+    trigger_node_ids: draft.trigger_node_ids || [],
+    source_config: draft.source_config_text || '{}',
+    request_mapping: draft.request_mapping_text || '{}',
+    input_parameters: gatewayInputParametersToPayload(draft.input_parameters, draft.output_fields),
+    response_mapping: draft.response_mapping_text || '{}',
+    output_fields: draft.output_fields || [],
+    response_limit: draft.response_limit || 1000,
+    graphql_field: draft.graphql_field || 'result',
+    standard_response: draft.standard_response,
+    auth_type: draft.auth_type,
+    auth_token: draft.auth_token,
+    jwt_secret: draft.jwt_secret,
+    jwt_issuer: draft.jwt_issuer,
+    jwt_audience: draft.jwt_audience,
+    rbac_roles: draft.rbac_roles,
+    rate_limit_requests: draft.rate_limit_requests || 0,
+    rate_limit_window_seconds: draft.rate_limit_window_seconds || 60,
+    audit_enabled: draft.audit_enabled,
+    logging_enabled: draft.logging_enabled,
+  }
+}
+
+function gatewayDraftRuntimePath(draft: GatewayStudioDraft): string {
+  const protocol = normalizeGatewayProtocol(draft.protocol)
+  const apiVersion = String(draft.api_version || 'v1').replace(/^\/+|\/+$/g, '') || 'v1'
+  const routePath = String(draft.route_path || '/gateway').startsWith('/')
+    ? String(draft.route_path || '/gateway')
+    : `/${String(draft.route_path || 'gateway')}`
+  const protocolPrefix = protocol === 'rest' ? '' : `/${protocol}`
+  return `/gw${protocolPrefix}/${apiVersion}${routePath}`
+}
+
+function createGatewayTestKeyValue(seed?: Partial<GatewayTestKeyValue>): GatewayTestKeyValue {
+  return {
+    id: String(seed?.id || `kv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+    key: String(seed?.key || ''),
+    value: String(seed?.value ?? ''),
+    enabled: parseBoolLike(seed?.enabled, true),
+  }
+}
+
+function parseGatewayTestKeyValues(value: unknown): GatewayTestKeyValue[] {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (!item || typeof item !== 'object') return null
+        const row = item as Record<string, unknown>
+        const key = String(row.key || row.name || '').trim()
+        if (!key && !String(row.value ?? '').trim()) return null
+        return createGatewayTestKeyValue({
+          id: String(row.id || ''),
+          key,
+          value: String(row.value ?? row.default_value ?? ''),
+          enabled: parseBoolLike(row.enabled, true),
+        })
+      })
+      .filter((item): item is GatewayTestKeyValue => Boolean(item))
+  }
+  if (value && typeof value === 'object') {
+    return Object.entries(value as Record<string, unknown>).map(([key, raw]) => (
+      createGatewayTestKeyValue({ key, value: String(raw ?? '') })
+    ))
+  }
+  return []
+}
+
+function normalizeGatewayTestBodyType(value: unknown): GatewayTestBodyType {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === 'json' || normalized === 'graphql' || normalized === 'xml' || normalized === 'text') return normalized
+  return 'none'
+}
+
+function gatewayDefaultMethodForProtocol(protocol: GatewayProtocol, fallback?: string): string {
+  const normalized = normalizeGatewayProtocol(protocol)
+  if (normalized === 'graphql' || normalized === 'soap' || normalized === 'tcp') return 'POST'
+  return String(fallback || 'GET').trim().toUpperCase() || 'GET'
+}
+
+function gatewayTestPathForProtocol(path: string, protocol: GatewayProtocol): string {
+  const normalized = normalizeGatewayProtocol(protocol)
+  const protocolPrefix = normalized === 'rest' ? '' : `/${normalized}`
+  const text = String(path || '').trim()
+  const safePath = text.startsWith('/') ? text : `/${text || 'gw/v1/gateway'}`
+  const match = safePath.match(/^\/gw(?:\/(?:graphql|soap|tcp))?\/([^/]+)(\/.*)?$/i)
+  if (match) {
+    const version = String(match[1] || 'v1').replace(/^\/+|\/+$/g, '') || 'v1'
+    const routePath = String(match[2] || '/gateway').startsWith('/') ? String(match[2] || '/gateway') : `/${String(match[2] || 'gateway')}`
+    return `/gw${protocolPrefix}/${version}${routePath}`
+  }
+  return `/gw${protocolPrefix}/v1/gateway`
+}
+
+function gatewayDefaultHeaderRows(bodyType: GatewayTestBodyType): GatewayTestKeyValue[] {
+  if (bodyType === 'json' || bodyType === 'graphql') {
+    return [
+      createGatewayTestKeyValue({ key: 'Content-Type', value: 'application/json' }),
+      createGatewayTestKeyValue({ key: 'Accept', value: 'application/json' }),
+    ]
+  }
+  if (bodyType === 'xml') {
+    return [
+      createGatewayTestKeyValue({ key: 'Content-Type', value: 'text/xml; charset=utf-8' }),
+      createGatewayTestKeyValue({ key: 'Accept', value: 'text/xml, application/xml, application/json' }),
+      createGatewayTestKeyValue({ key: 'SOAPAction', value: '' }),
+    ]
+  }
+  if (bodyType === 'text') {
+    return [
+      createGatewayTestKeyValue({ key: 'Content-Type', value: 'text/plain; charset=utf-8' }),
+      createGatewayTestKeyValue({ key: 'Accept', value: 'application/json' }),
+    ]
+  }
+  return [createGatewayTestKeyValue({ key: 'Accept', value: 'application/json' })]
+}
+
+function gatewayHeadersForBodyType(headers: GatewayTestKeyValue[], bodyType: GatewayTestBodyType): GatewayTestKeyValue[] {
+  const defaults = gatewayDefaultHeaderRows(bodyType)
+  if (!headers || headers.length === 0) return defaults
+  const defaultByKey = new Map(defaults.map((item) => [item.key.toLowerCase(), item.value]))
+  const seen = new Set<string>()
+  const updated = headers.map((item) => {
+    const key = String(item.key || '').trim()
+    const lower = key.toLowerCase()
+    seen.add(lower)
+    if (defaultByKey.has(lower)) {
+      return { ...item, value: String(defaultByKey.get(lower) ?? item.value), enabled: true }
+    }
+    return item
+  })
+  defaults.forEach((item) => {
+    const lower = item.key.toLowerCase()
+    if (!seen.has(lower)) updated.push(item)
+  })
+  return updated
+}
+
+function gatewayTestHeaderPresetValue(key: string, bodyType: GatewayTestBodyType): string {
+  const normalized = String(key || '').trim().toLowerCase()
+  if (normalized === 'content-type') {
+    if (bodyType === 'xml') return 'text/xml; charset=utf-8'
+    if (bodyType === 'text') return 'text/plain; charset=utf-8'
+    return 'application/json'
+  }
+  if (normalized === 'accept') {
+    if (bodyType === 'xml') return 'text/xml, application/xml, application/json'
+    return 'application/json'
+  }
+  const preset = GATEWAY_TEST_HEADER_PRESETS.find((item) => item.key.toLowerCase() === normalized)
+  return preset?.value ?? ''
+}
+
+function gatewayTestHeaderValueOptions(key: string, bodyType: GatewayTestBodyType): Array<{ value: string; label: string }> {
+  const normalized = String(key || '').trim().toLowerCase()
+  const values: string[] = []
+  const add = (value: string) => {
+    const text = String(value || '')
+    if (values.includes(text)) return
+    values.push(text)
+  }
+  const defaultValue = gatewayTestHeaderPresetValue(key, bodyType)
+  if (defaultValue || normalized === 'soapaction' || normalized === 'x-api-key') add(defaultValue)
+  if (normalized === 'content-type') {
+    add('application/json')
+    add('text/xml; charset=utf-8')
+    add('application/xml')
+    add('text/plain; charset=utf-8')
+    add('application/x-www-form-urlencoded')
+    add('multipart/form-data')
+  } else if (normalized === 'accept') {
+    add('application/json')
+    add('text/xml, application/xml, application/json')
+    add('application/xml')
+    add('text/plain')
+    add('*/*')
+  } else if (normalized === 'authorization') {
+    add('Bearer ')
+    add('Basic ')
+    add('ApiKey ')
+  } else if (normalized === 'soapaction') {
+    add('GatewayRequest')
+    add('GetGatewayData')
+    add('urn:framework-gateway#GatewayRequest')
+  } else if (normalized === 'user-agent') {
+    add('FRAMEWORK-Gateway-Tester')
+    add('PostmanRuntime/7.39.0')
+  } else if (normalized === 'x-request-id' || normalized === 'x-correlation-id') {
+    add(`gw-test-${Date.now()}`)
+  }
+  return values.map((value) => ({ value, label: value || '(empty)' }))
+}
+
+function gatewayDefaultQueryRows(route: GatewayStudioDraft): GatewayTestKeyValue[] {
+  return (route.input_parameters || [])
+    .filter((param) => String(param.location || 'query').toLowerCase() !== 'header')
+    .map((param) => createGatewayTestKeyValue({
+      key: String(param.name || gatewayLeafNameFromField(param.source_field) || '').trim(),
+      value: String(param.default_value ?? ''),
+      enabled: true,
+    }))
+    .filter((item) => item.key)
+}
+
+function gatewayDefaultBodyForRoute(route: GatewayStudioDraft): { bodyType: GatewayTestBodyType; bodyText: string; headers: GatewayTestKeyValue[] } {
+  const protocol = normalizeGatewayProtocol(route.protocol)
+  const params = (route.input_parameters || []).filter((param) => String(param.name || '').trim())
+  if (protocol === 'graphql') {
+    const responseField = String(route.graphql_field || 'result').trim() || 'result'
+    const variableDefs = params.map((param) => `$${param.name}: String`).join(', ')
+    const argumentText = params.map((param) => `${param.name}: $${param.name}`).join(', ')
+    const selectedFields = uniqueFieldNames((route.output_fields || []).map((field) => gatewayLeafNameFromField(field)).filter(Boolean)).slice(0, 6)
+    const selection = selectedFields.length > 0 ? selectedFields.join('\n      ') : 'customer_account'
+    const queryArgs = variableDefs ? `(${variableDefs})` : ''
+    const fieldArgs = argumentText ? `(${argumentText})` : ''
+    return {
+      bodyType: 'graphql',
+      bodyText: `query${queryArgs} {\n  ${responseField}${fieldArgs} {\n      ${selection}\n  }\n}`,
+      headers: gatewayDefaultHeaderRows('graphql'),
+    }
+  }
+  if (protocol === 'soap') {
+    const inputXml = params.map((param) => {
+      const name = String(param.name || '').trim()
+      const value = String(param.default_value ?? '')
+      return `      <gw:${name}>${value}</gw:${name}>`
+    }).join('\n')
+    return {
+      bodyType: 'xml',
+      bodyText: [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:gw="urn:framework-gateway">',
+        '  <soapenv:Header/>',
+        '  <soapenv:Body>',
+        '    <gw:GatewayRequest>',
+        inputXml || '      <gw:limit>10</gw:limit>',
+        '    </gw:GatewayRequest>',
+        '  </soapenv:Body>',
+        '</soapenv:Envelope>',
+      ].join('\n'),
+      headers: gatewayDefaultHeaderRows('xml'),
+    }
+  }
+  return { bodyType: 'none', bodyText: '', headers: [] }
+}
+
+function createGatewayTestConfig(
+  seed?: Partial<GatewayTestConfig> & Record<string, unknown>,
+  route?: GatewayStudioDraft,
+): GatewayTestConfig {
+  const routeDraft = route || createGatewayStudioDraft()
+  const defaults = gatewayDefaultBodyForRoute(routeDraft)
+  const now = new Date().toISOString()
+  const bodyType = normalizeGatewayTestBodyType(seed?.body_type || defaults.bodyType)
+  const queryRows = parseGatewayTestKeyValues(seed?.query_params)
+  const headerRows = parseGatewayTestKeyValues(seed?.headers)
+  return {
+    id: String(seed?.id || `test_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+    name: String(seed?.name || `${routeDraft.gateway_name || 'Gateway Route'} test`),
+    route_id: String(seed?.route_id || routeDraft.route_id || ''),
+    protocol: normalizeGatewayProtocol(seed?.protocol || routeDraft.protocol),
+    method: gatewayDefaultMethodForProtocol(normalizeGatewayProtocol(seed?.protocol || routeDraft.protocol), String(seed?.method || routeDraft.route_method || 'GET')),
+    path: String(seed?.path || gatewayDraftRuntimePath(routeDraft)),
+    query_params: queryRows.length > 0 ? queryRows : gatewayDefaultQueryRows(routeDraft),
+    headers: headerRows.length > 0 ? headerRows : (bodyType === defaults.bodyType ? defaults.headers : gatewayDefaultHeaderRows(bodyType)),
+    body_type: bodyType,
+    body_text: String(seed?.body_text ?? defaults.bodyText),
+    created_at: String(seed?.created_at || now),
+    updated_at: String(seed?.updated_at || now),
+  }
+}
+
+function parseGatewayTestConfigs(value: unknown, route?: GatewayStudioDraft): GatewayTestConfig[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null
+      return createGatewayTestConfig(item as Partial<GatewayTestConfig> & Record<string, unknown>, route)
+    })
+    .filter((item): item is GatewayTestConfig => Boolean(item))
+}
+
+function mergeGatewayTestConfigs(...groups: GatewayTestConfig[][]): GatewayTestConfig[] {
+  const out: GatewayTestConfig[] = []
+  const seen = new Set<string>()
+  groups.flat().forEach((item) => {
+    const id = String(item?.id || '').trim()
+    if (!id || seen.has(id)) return
+    seen.add(id)
+    out.push(item)
+  })
+  return out
+}
+
+function gatewayTestConfigStorageKey(pipelineId: string, nodeId: string): string {
+  return `${String(pipelineId || 'pipeline').trim() || 'pipeline'}::${String(nodeId || 'node').trim() || 'node'}`
+}
+
+function readStoredGatewayTestConfigs(pipelineId: string, nodeId: string, route?: GatewayStudioDraft): GatewayTestConfig[] {
+  if (typeof window === 'undefined' || !window.localStorage || !pipelineId || !nodeId) return []
+  try {
+    const raw = window.localStorage.getItem(GATEWAY_TEST_CONFIG_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return []
+    const bucket = (parsed as Record<string, unknown>)[gatewayTestConfigStorageKey(pipelineId, nodeId)]
+    return parseGatewayTestConfigs(bucket, route)
+  } catch {
+    return []
+  }
+}
+
+function writeStoredGatewayTestConfigs(pipelineId: string, nodeId: string, tests: GatewayTestConfig[]): void {
+  if (typeof window === 'undefined' || !window.localStorage || !pipelineId || !nodeId) return
+  try {
+    const raw = window.localStorage.getItem(GATEWAY_TEST_CONFIG_STORAGE_KEY)
+    const parsed = raw ? JSON.parse(raw) : {}
+    const store = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {}
+    store[gatewayTestConfigStorageKey(pipelineId, nodeId)] = tests.map(gatewayTestToPayload)
+    window.localStorage.setItem(GATEWAY_TEST_CONFIG_STORAGE_KEY, JSON.stringify(store))
+  } catch {
+    // Local backup is best-effort; node config remains the source of truth.
+  }
+}
+
+function gatewayTestToPayload(test: GatewayTestConfig): Record<string, unknown> {
+  return {
+    id: test.id,
+    name: test.name,
+    route_id: test.route_id,
+    protocol: test.protocol,
+    method: test.method,
+    path: test.path,
+    query_params: test.query_params.map((item) => ({ id: item.id, key: item.key, value: item.value, enabled: item.enabled })),
+    headers: test.headers.map((item) => ({ id: item.id, key: item.key, value: item.value, enabled: item.enabled })),
+    body_type: test.body_type,
+    body_text: test.body_text,
+    created_at: test.created_at,
+    updated_at: test.updated_at,
+  }
+}
+
+function gatewayTestKeyValuesToObject(rows: GatewayTestKeyValue[]): Record<string, string> {
+  return (rows || []).reduce<Record<string, string>>((acc, row) => {
+    const key = String(row.key || '').trim()
+    if (!key || row.enabled === false) return acc
+    acc[key] = String(row.value ?? '')
+    return acc
+  }, {})
+}
+
+function gatewayTestResponseText(value: unknown): string {
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'string') return value
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
+function gatewayTestResponseBodyText(result: Record<string, unknown> | null, view: GatewayTestResponseView): string {
+  if (!result) return ''
+  const payload = (result as any).data ?? result
+  if (view === 'raw') return gatewayTestResponseText(payload)
+  if (typeof payload === 'string') {
+    try {
+      return JSON.stringify(JSON.parse(payload), null, 2)
+    } catch {
+      return payload
+    }
+  }
+  return gatewayTestResponseText(payload)
+}
+
+function gatewayTestEditorLanguage(bodyType: GatewayTestBodyType, responseView?: GatewayTestResponseView): string {
+  if (responseView === 'raw') return 'plaintext'
+  if (bodyType === 'graphql') return GATEWAY_GRAPHQL_LANGUAGE_ID
+  if (bodyType === 'json') return 'json'
+  if (bodyType === 'xml') return 'xml'
+  return 'plaintext'
+}
+
+function gatewayGraphqlTextFromBody(value: string): string {
+  const text = String(value || '')
+  if (!text.trim()) return ''
+  try {
+    const parsed = JSON.parse(text)
+    if (parsed && typeof parsed === 'object' && typeof (parsed as Record<string, unknown>).query === 'string') {
+      return String((parsed as Record<string, unknown>).query)
+    }
+  } catch {
+    return text
+  }
+  return text
+}
+
+function gatewayJsonValidationMessage(value: string): string {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  try {
+    JSON.parse(text)
+    return ''
+  } catch (err: any) {
+    return String(err?.message || 'Invalid JSON')
+  }
+}
+
 function detectJsonValueKind(value: unknown): JsonTagMappingItem['kind'] {
   if (value === null || value === undefined) return 'null'
   if (Array.isArray(value)) return 'array'
@@ -4719,6 +5488,79 @@ function parseStringList(value: unknown): string[] {
     return out
   }
   return []
+}
+
+function gatewayNumber(value: unknown, fallback = 0): number {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : fallback
+}
+
+function gatewayPercent(value: unknown): number {
+  return Math.max(0, Math.min(100, gatewayNumber(value, 0)))
+}
+
+function gatewayTimestampText(value: unknown): string {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  const date = new Date(raw)
+  if (Number.isNaN(date.getTime())) return raw
+  return date.toLocaleString()
+}
+
+function gatewayProtocolColor(protocol: unknown): string {
+  const text = String(protocol || '').trim().toLowerCase()
+  if (text === 'graphql') return '#a855f7'
+  if (text === 'soap') return '#f59e0b'
+  if (text === 'tcp') return '#06b6d4'
+  if (text === 'websocket') return '#ec4899'
+  return '#6366f1'
+}
+
+function gatewayRouteDraftFromRegisteredRoute(route: Record<string, unknown>): GatewayStudioDraft {
+  const requestMapping = route.request_mapping && typeof route.request_mapping === 'object' && !Array.isArray(route.request_mapping)
+    ? route.request_mapping as Record<string, unknown>
+    : {}
+  const responseMapping = route.response_mapping && typeof route.response_mapping === 'object' && !Array.isArray(route.response_mapping)
+    ? route.response_mapping as Record<string, unknown>
+    : {}
+  const authConfig = route.auth_config && typeof route.auth_config === 'object' && !Array.isArray(route.auth_config)
+    ? route.auth_config as Record<string, unknown>
+    : {}
+  const rbacConfig = route.rbac_config && typeof route.rbac_config === 'object' && !Array.isArray(route.rbac_config)
+    ? route.rbac_config as Record<string, unknown>
+    : {}
+  const rateLimitConfig = route.rate_limit_config && typeof route.rate_limit_config === 'object' && !Array.isArray(route.rate_limit_config)
+    ? route.rate_limit_config as Record<string, unknown>
+    : {}
+  return createGatewayStudioDraft({
+    route_id: route.id,
+    gateway_name: route.name,
+    enabled: route.enabled,
+    protocol: route.protocol,
+    api_version: route.version,
+    route_method: route.method,
+    route_path: route.path,
+    source_node_id: route.source_node_id,
+    trigger_node_ids: requestMapping.trigger_node_ids || requestMapping.execution_node_ids || requestMapping.node_ids,
+    source_config: route.source_config,
+    request_mapping: requestMapping,
+    input_parameters: requestMapping.input_parameters || requestMapping.parameters,
+    response_mapping: responseMapping,
+    output_fields: responseMapping.output_fields,
+    response_limit: responseMapping.limit,
+    graphql_field: responseMapping.graphql_field,
+    standard_response: route.standard_response,
+    auth_type: authConfig.type,
+    auth_token: authConfig.token,
+    jwt_secret: authConfig.secret,
+    jwt_issuer: authConfig.issuer,
+    jwt_audience: authConfig.audience,
+    rbac_roles: parseStringList(rbacConfig.allowed_roles).join(', '),
+    rate_limit_requests: rateLimitConfig.requests,
+    rate_limit_window_seconds: rateLimitConfig.window_seconds,
+    audit_enabled: route.audit_enabled,
+    logging_enabled: route.logging_enabled,
+  })
 }
 
 function normalizeDataQueryPickerPath(value: unknown): string {
@@ -5646,6 +6488,28 @@ function collectUpstreamNodeIds(
   return out
 }
 
+function readableNodeTypeLabel(nodeType: unknown): string {
+  const text = String(nodeType || 'node').trim()
+  if (!text) return 'Node'
+  return text
+    .split(/[_\s-]+/g)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
+}
+
+function isGatewaySelectableSourceNode(node: ETLNode | undefined, targetNodeId?: string): boolean {
+  if (!node) return false
+  if (targetNodeId && node.id === targetNodeId) return false
+  const data = node.data || {}
+  const nodeType = String(data.nodeType || node.type || '').trim().toLowerCase()
+  const category = String(data.definition?.category || '').trim().toLowerCase()
+  if (!nodeType || nodeType === 'api_gateway') return false
+  if (category === 'destination' || category === 'trigger') return false
+  if (category === 'source' || category === 'transform') return true
+  return nodeType.endsWith('_source') || nodeType.endsWith('_transform')
+}
+
 function inferUpstreamInputFields(
   targetNodeId: string,
   nodes: ETLNode[],
@@ -5694,32 +6558,56 @@ function inferUpstreamInputFields(
 function inferUpstreamSources(
   targetNodeId: string,
   nodes: ETLNode[],
-  edges: Array<{ source: string; target: string }>
-): Array<{ id: string; label: string; fields: string[]; nodeType: string }> {
+  edges: Array<{ source: string; target: string }>,
+  options?: { includeAllUpstream?: boolean },
+): Array<{ id: string; label: string; fields: string[]; nodeType: string; isDirect: boolean; isConnected: boolean; depth: number }> {
   const nodesById = new Map(nodes.map((n) => [n.id, n] as const))
   const incomingByTarget = buildIncomingByTarget(edges)
   const incomingIds = uniqueFieldNames((incomingByTarget.get(targetNodeId) || []).map((id) => id))
-  if (incomingIds.length === 0) return []
+  if (incomingIds.length === 0 && !options?.includeAllUpstream) return []
 
   const memo = new Map<string, string[]>()
   const buildSourceDescriptor = (
     srcId: string,
     labelOverride?: string,
-  ): { id: string; label: string; fields: string[]; nodeType: string } => {
+    isDirect = incomingIds.includes(srcId),
+    depth = isDirect ? 1 : 2,
+    isConnected = true,
+  ): { id: string; label: string; fields: string[]; nodeType: string; isDirect: boolean; isConnected: boolean; depth: number } => {
     const srcNode = nodesById.get(srcId)
     const label = String(labelOverride || srcNode?.data?.label || srcNode?.data?.definition?.label || srcId)
     const nodeType = String(srcNode?.data?.nodeType || '').trim().toLowerCase()
     const inferredFields = inferNodeOutputFields(srcId, nodesById, incomingByTarget, memo, new Set<string>())
     const directFields = extractDirectNodeFields(srcNode)
     const fields = uniqueFieldNames([...inferredFields, ...directFields])
-    return { id: srcId, label, fields, nodeType }
+    return { id: srcId, label, fields, nodeType, isDirect, isConnected, depth }
   }
 
-  const list: Array<{ id: string; label: string; fields: string[]; nodeType: string }> = incomingIds.map((srcId) =>
+  const list: Array<{ id: string; label: string; fields: string[]; nodeType: string; isDirect: boolean; isConnected: boolean; depth: number }> = incomingIds.map((srcId) =>
     buildSourceDescriptor(srcId)
   )
   const seenIds = new Set(list.map((item) => String(item.id || '').trim()).filter(Boolean))
   const incomingSet = new Set(incomingIds)
+
+  if (options?.includeAllUpstream) {
+    collectUpstreamNodeIds(targetNodeId, incomingByTarget, 1500).forEach((upId) => {
+      const nid = String(upId || '').trim()
+      if (!nid || nid === targetNodeId || seenIds.has(nid)) return
+      list.push(buildSourceDescriptor(nid, undefined, incomingSet.has(nid), incomingSet.has(nid) ? 1 : 2, true))
+      seenIds.add(nid)
+    })
+    nodes.forEach((node) => {
+      const nid = String(node.id || '').trim()
+      if (!nid || seenIds.has(nid) || !isGatewaySelectableSourceNode(node, targetNodeId)) return
+      list.push(buildSourceDescriptor(nid, undefined, false, 999, false))
+      seenIds.add(nid)
+    })
+    return list.sort((a, b) => {
+      if (a.isDirect !== b.isDirect) return a.isDirect ? -1 : 1
+      if (a.isConnected !== b.isConnected) return a.isConnected ? -1 : 1
+      return a.label.localeCompare(b.label)
+    })
+  }
 
   incomingIds.forEach((directId) => {
     const upstreamIds = collectUpstreamNodeIds(directId, incomingByTarget, 1500)
@@ -5730,7 +6618,7 @@ function inferUpstreamSources(
       const upType = String(upNode?.data?.nodeType || '').trim().toLowerCase()
       if (upType !== 'profile_query_transform') return
       const baseLabel = String(upNode?.data?.label || upNode?.data?.definition?.label || nid)
-      list.push(buildSourceDescriptor(nid, `${baseLabel} (Data Query)`))
+      list.push(buildSourceDescriptor(nid, `${baseLabel} (Data Query)`, false, 2, true))
       seenIds.add(nid)
     })
   })
@@ -6390,6 +7278,30 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [dataQueryRemoteFieldHints, setDataQueryRemoteFieldHints] = useState<string[]>([])
   const [dataQueryRemoteFieldHintsBySource, setDataQueryRemoteFieldHintsBySource] = useState<Record<string, string[]>>({})
   const [dataQueryRemotePreviewRows, setDataQueryRemotePreviewRows] = useState<Array<Record<string, unknown>>>([])
+  const [gatewayStudioOpen, setGatewayStudioOpen] = useState(false)
+  const [gatewayStudioDraft, setGatewayStudioDraft] = useState<GatewayStudioDraft>(() => createGatewayStudioDraft())
+  const [gatewayRouteDrafts, setGatewayRouteDrafts] = useState<GatewayStudioDraft[]>(() => [createGatewayStudioDraft()])
+  const [gatewayActiveRouteIndex, setGatewayActiveRouteIndex] = useState(0)
+  const [gatewayRouteEditorOpen, setGatewayRouteEditorOpen] = useState(false)
+  const [gatewayTransientRouteId, setGatewayTransientRouteId] = useState<string | null>(null)
+  const [gatewayRoutes, setGatewayRoutes] = useState<any[]>([])
+  const [gatewayRoutesLoading, setGatewayRoutesLoading] = useState(false)
+  const [gatewayMetrics, setGatewayMetrics] = useState<Record<string, unknown> | null>(null)
+  const [gatewayRouteMetricsById, setGatewayRouteMetricsById] = useState<Record<string, Record<string, unknown>>>({})
+  const [gatewayLogs, setGatewayLogs] = useState<any[]>([])
+  const [gatewayMonitorLoading, setGatewayMonitorLoading] = useState(false)
+  const [gatewayDashboardSearch, setGatewayDashboardSearch] = useState('')
+  const [gatewayDashboardProtocol, setGatewayDashboardProtocol] = useState<string>('all')
+  const [gatewayStudioSaving, setGatewayStudioSaving] = useState(false)
+  const [gatewayStudioError, setGatewayStudioError] = useState<string | null>(null)
+  const [gatewayTesterOpen, setGatewayTesterOpen] = useState(false)
+  const [gatewayTestConfigs, setGatewayTestConfigs] = useState<GatewayTestConfig[]>([])
+  const [gatewayActiveTestId, setGatewayActiveTestId] = useState('')
+  const [gatewayTestDraft, setGatewayTestDraft] = useState<GatewayTestConfig>(() => createGatewayTestConfig())
+  const [gatewayTestSending, setGatewayTestSending] = useState(false)
+  const [gatewayTestResult, setGatewayTestResult] = useState<Record<string, unknown> | null>(null)
+  const [gatewayTestError, setGatewayTestError] = useState<string | null>(null)
+  const [gatewayTestResponseView, setGatewayTestResponseView] = useState<GatewayTestResponseView>('json')
   const [mlopsStudioOpen, setMLOpsStudioOpen] = useState(false)
   const [mlopsProfileLoading, setMLOpsProfileLoading] = useState(false)
   const [mlopsProfileError, setMLOpsProfileError] = useState<string | null>(null)
@@ -6445,6 +7357,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [mlopsStage3SARIMASDraft, setMLOpsStage3SARIMASDraft] = useState<number>(7)
   const [mlopsStage3TrainTestSplitDraft, setMLOpsStage3TrainTestSplitDraft] = useState<number>(0.2)
   const [mlopsStage3CvFoldsDraft, setMLOpsStage3CvFoldsDraft] = useState<number>(5)
+  const [mlopsStage3ClusterCountDraft, setMLOpsStage3ClusterCountDraft] = useState<number>(4)
   const [mlopsStage3EpochsDraft, setMLOpsStage3EpochsDraft] = useState<number>(20)
   const [mlopsStage3BatchSizeDraft, setMLOpsStage3BatchSizeDraft] = useState<number>(32)
   const [mlopsStage3RandomSeedDraft, setMLOpsStage3RandomSeedDraft] = useState<number>(42)
@@ -6797,6 +7710,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setConditionFalseTargetNodeId('')
     dataQueryStudioInitialConfigRef.current = null
     setDataQueryStudioOpen(false)
+    setGatewayStudioOpen(false)
+    setGatewayStudioDraft(createGatewayStudioDraft())
+    setGatewayRouteDrafts([createGatewayStudioDraft()])
+    setGatewayActiveRouteIndex(0)
+    setGatewayRoutes([])
+    setGatewayLogs([])
+    setGatewayMetrics(null)
+    setGatewayStudioError(null)
+    setGatewayRoutesLoading(false)
+    setGatewayMonitorLoading(false)
+    setGatewayStudioSaving(false)
     setDataQueryCriteriaDraft([])
     setDataQueryModeDraft('hybrid')
     setDataQueryMatchModeDraft('all')
@@ -7730,6 +8654,968 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     [conditionStudioEditingActive, selectedNodeId, nodes, edges, conditionResolvedSourceNodeIds, conditionAllUpstreamSources, isAnyNodeDragging]
   )
   const activePipelineId = String(pipeline?.id || '').trim()
+  const gatewayAllUpstreamSources = useMemo(
+    () => {
+      if (nodeType !== 'api_gateway' || !selectedNodeId) return []
+      return inferUpstreamSources(selectedNodeId, nodes, edges, { includeAllUpstream: true })
+    },
+    [nodeType, selectedNodeId, nodes, edges]
+  )
+  const gatewaySourceOptions = useMemo(
+    () => gatewayAllUpstreamSources.map((src) => {
+      const nodeTypeLabel = readableNodeTypeLabel(src.nodeType)
+      const connectionLabel = src.isConnected ? 'Connected' : 'Disconnected'
+      const scopeLabel = src.isDirect ? 'Direct' : src.isConnected ? 'Upstream' : 'Available'
+      const title = `${src.label} - ${nodeTypeLabel} - ${connectionLabel} - ${scopeLabel}`
+      return {
+        value: src.id,
+        title,
+        searchText: `${src.label} ${nodeTypeLabel} ${src.id} ${connectionLabel} ${scopeLabel}`.toLowerCase(),
+        label: (
+          <div style={{ display: 'grid', gap: 2, lineHeight: 1.15 }}>
+            <Space size={6} wrap>
+              <Text style={{ color: 'var(--app-text)', fontSize: 12, fontWeight: 700 }}>{src.label}</Text>
+              <Tag color={src.isConnected ? 'green' : 'red'} style={{ marginInlineEnd: 0, fontSize: 10 }}>
+                {connectionLabel}
+              </Tag>
+              <Tag color={src.isDirect ? 'cyan' : 'blue'} style={{ marginInlineEnd: 0, fontSize: 10 }}>
+                {scopeLabel}
+              </Tag>
+            </Space>
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+              {nodeTypeLabel} • {src.fields.length} fields • {src.id.slice(0, 8)}
+            </Text>
+          </div>
+        ),
+        nodeType: src.nodeType,
+        nodeTypeLabel,
+        fields: src.fields,
+        isDirect: src.isDirect,
+        isConnected: src.isConnected,
+      }
+    }),
+    [gatewayAllUpstreamSources]
+  )
+  const gatewayDefaultSourceNodeId = gatewaySourceOptions[0]?.value || ''
+  const resolveGatewayRouteId = useCallback((draft: GatewayStudioDraft, index: number) => {
+    const explicit = String(draft.route_id || '').trim()
+    if (explicit) return explicit
+    if (!activePipelineId || !selectedNodeId) return ''
+    return `gw_${activePipelineId}_${selectedNodeId}${index > 0 ? `_${index + 1}` : ''}`
+  }, [activePipelineId, selectedNodeId])
+  const gatewayRouteId = useMemo(
+    () => resolveGatewayRouteId(gatewayStudioDraft, gatewayActiveRouteIndex),
+    [gatewayStudioDraft, gatewayActiveRouteIndex, resolveGatewayRouteId]
+  )
+  const gatewaySelectedSourceNodeId = gatewayStudioDraft.source_node_id || gatewayDefaultSourceNodeId
+  const gatewayOutputFieldOptions = useMemo(
+    () => {
+      if (nodeType !== 'api_gateway' || !gatewaySelectedSourceNodeId) return [] as Array<{ value: string; label: string }>
+      return filterUserFacingFieldNames(
+        uniqueFieldNames([
+          ...inferUpstreamInputFields(gatewaySelectedSourceNodeId, nodes, edges),
+          ...extractDirectNodeFields(nodes.find((item) => item.id === gatewaySelectedSourceNodeId)),
+        ])
+      ).map((name) => ({ value: name, label: name }))
+    },
+    [nodeType, gatewaySelectedSourceNodeId, nodes, edges]
+  )
+  const gatewayActiveRoute = useMemo(
+    () => gatewayRoutes.find((route) => String(route?.id || '') === gatewayRouteId) || null,
+    [gatewayRoutes, gatewayRouteId]
+  )
+  const gatewayVisibleRoutes = useMemo(
+    () => gatewayRoutes.filter((route) => (
+      String(route?.gateway_node_id || '') === String(selectedNodeId || '')
+      || String(route?.pipeline_id || '') === String(activePipelineId || '')
+    )),
+    [gatewayRoutes, selectedNodeId, activePipelineId]
+  )
+  const gatewayDashboardRoutes = useMemo(
+    () => {
+      const search = gatewayDashboardSearch.trim().toLowerCase()
+      const protocol = String(gatewayDashboardProtocol || 'all').toLowerCase()
+      return gatewayVisibleRoutes.filter((route) => {
+        const routeProtocol = String(route?.protocol || '').toLowerCase()
+        if (protocol !== 'all' && routeProtocol !== protocol) return false
+        if (!search) return true
+        const haystack = [
+          route?.name,
+          route?.id,
+          route?.runtime_path,
+          route?.path,
+          route?.protocol,
+          route?.method,
+          route?.source_node_id,
+          route?.source_type,
+        ].map((item) => String(item || '').toLowerCase()).join(' ')
+        return haystack.includes(search)
+      })
+    },
+    [gatewayVisibleRoutes, gatewayDashboardSearch, gatewayDashboardProtocol]
+  )
+  const gatewayDashboardStats = useMemo(() => {
+    const protocolCounts = gatewayVisibleRoutes.reduce<Record<string, number>>((acc, route) => {
+      const key = String(route?.protocol || 'rest').trim().toLowerCase() || 'rest'
+      acc[key] = (acc[key] || 0) + 1
+      return acc
+    }, {})
+    const routeMetricRows = gatewayVisibleRoutes.map((route) => {
+      const routeId = String(route?.id || '').trim()
+      const metrics = gatewayRouteMetricsById[routeId] || (routeId && routeId === gatewayRouteId && gatewayMetrics ? gatewayMetrics : {})
+      return {
+        id: routeId,
+        name: String(route?.name || route?.path || routeId || 'API'),
+        protocol: String(route?.protocol || 'rest'),
+        requests: gatewayNumber(metrics?.requests, 0),
+        success: gatewayNumber(metrics?.success, 0),
+        failed: gatewayNumber(metrics?.failed, 0),
+        successRate: gatewayPercent(metrics?.success_rate),
+        avgDuration: gatewayNumber(metrics?.avg_duration_ms, 0),
+        maxDuration: gatewayNumber(metrics?.max_duration_ms, 0),
+        statusCounts: metrics?.status_counts && typeof metrics.status_counts === 'object'
+          ? metrics.status_counts as Record<string, unknown>
+          : {},
+      }
+    })
+    const statusCounts = routeMetricRows.reduce<Record<string, number>>((acc, row) => {
+      Object.entries(row.statusCounts).forEach(([key, value]) => {
+        acc[key] = (acc[key] || 0) + gatewayNumber(value, 0)
+      })
+      return acc
+    }, {})
+    const latencyPoints = [...gatewayLogs].reverse().slice(-30).map((log, index) => ({
+      x: gatewayTimestampText(log?.created_at) || `#${index + 1}`,
+      y: gatewayNumber(log?.duration_ms, 0),
+      status: String(log?.status_code || ''),
+    }))
+    const recentFailures = gatewayLogs.filter((log) => gatewayNumber(log?.status_code, 0) >= 400 || String(log?.error_message || '').trim()).length
+    const totalRequests = routeMetricRows.reduce((sum, row) => sum + row.requests, 0)
+    const totalSuccess = routeMetricRows.reduce((sum, row) => sum + row.success, 0)
+    const totalFailed = routeMetricRows.reduce((sum, row) => sum + row.failed, 0)
+    const weightedDurationNumerator = routeMetricRows.reduce((sum, row) => sum + (row.avgDuration * Math.max(row.requests, 0)), 0)
+    const avgDuration = totalRequests > 0 ? weightedDurationNumerator / totalRequests : gatewayNumber(gatewayMetrics?.avg_duration_ms, 0)
+    const maxDuration = Math.max(0, ...routeMetricRows.map((row) => row.maxDuration), gatewayNumber(gatewayMetrics?.max_duration_ms, 0))
+    return {
+      totalRoutes: gatewayVisibleRoutes.length,
+      enabledRoutes: gatewayVisibleRoutes.filter((route) => route?.enabled !== false).length,
+      disabledRoutes: gatewayVisibleRoutes.filter((route) => route?.enabled === false).length,
+      activeDrafts: gatewayRouteDrafts.length,
+      requests: totalRequests || gatewayNumber(gatewayMetrics?.requests, 0),
+      success: totalSuccess || gatewayNumber(gatewayMetrics?.success, 0),
+      failed: totalFailed || gatewayNumber(gatewayMetrics?.failed, 0),
+      successRate: totalRequests > 0 ? gatewayPercent((totalSuccess / totalRequests) * 100) : gatewayPercent(gatewayMetrics?.success_rate),
+      avgDuration,
+      maxDuration,
+      recentFailures,
+      protocolChart: Object.entries(protocolCounts).map(([name, value]) => ({ name, value })),
+      statusChart: Object.entries(statusCounts).map(([name, value]) => ({ name, value })),
+      latencyPoints,
+      apiTrafficChart: routeMetricRows
+        .slice()
+        .sort((a, b) => b.requests - a.requests)
+        .slice(0, 12),
+      apiLatencyChart: routeMetricRows
+        .filter((row) => row.requests > 0 || row.avgDuration > 0)
+        .slice()
+        .sort((a, b) => b.avgDuration - a.avgDuration)
+        .slice(0, 12),
+    }
+  }, [gatewayVisibleRoutes, gatewayRouteMetricsById, gatewayRouteId, gatewayMetrics, gatewayLogs, gatewayRouteDrafts.length])
+  const gatewaySelectedRouteRuntimeStats = useMemo(() => {
+    const orderedLogs = [...gatewayLogs].reverse().slice(-50)
+    const derivedSuccess = gatewayLogs.filter((log) => Boolean(log?.success)).length
+    const derivedFailed = gatewayLogs.filter((log) => !Boolean(log?.success)).length
+    const statusCountsRaw = gatewayMetrics?.status_counts && typeof gatewayMetrics.status_counts === 'object'
+      ? gatewayMetrics.status_counts as Record<string, unknown>
+      : gatewayLogs.reduce<Record<string, number>>((acc, log) => {
+        const key = String(log?.status_code || 'unknown')
+        acc[key] = (acc[key] || 0) + 1
+        return acc
+      }, {})
+    return {
+      latencyPoints: orderedLogs.map((log, index) => ({
+        x: gatewayTimestampText(log?.created_at) || `#${index + 1}`,
+        y: gatewayNumber(log?.duration_ms, 0),
+      })),
+      requestBars: [
+        {
+          name: 'Success',
+          value: gatewayNumber(gatewayMetrics?.success, derivedSuccess),
+          color: '#22c55e',
+        },
+        {
+          name: 'Failed',
+          value: gatewayNumber(gatewayMetrics?.failed, derivedFailed),
+          color: '#ef4444',
+        },
+      ],
+      statusBars: Object.entries(statusCountsRaw).map(([name, value]) => ({
+        name,
+        value: gatewayNumber(value, 0),
+        color: gatewayNumber(name, 0) >= 400 ? '#ef4444' : '#22c55e',
+      })),
+    }
+  }, [gatewayLogs, gatewayMetrics])
+  const loadGatewayRouteMonitor = useCallback(async (routeId: string) => {
+    const safeRouteId = String(routeId || '').trim()
+    if (!safeRouteId) {
+      setGatewayMetrics(null)
+      setGatewayLogs([])
+      return
+    }
+    setGatewayMonitorLoading(true)
+    try {
+      const [metrics, logs] = await Promise.all([
+        api.getGatewayRouteMetrics(safeRouteId),
+        api.listGatewayRouteLogs(safeRouteId, 100),
+      ])
+      setGatewayMetrics(metrics && typeof metrics === 'object' ? metrics as Record<string, unknown> : null)
+      setGatewayLogs(Array.isArray(logs) ? logs : [])
+    } catch (err: any) {
+      setGatewayMetrics(null)
+      setGatewayLogs([])
+      setGatewayStudioError(String(err?.message || 'Failed to load route monitoring'))
+    } finally {
+      setGatewayMonitorLoading(false)
+    }
+  }, [])
+  const loadGatewayRegisteredRouteIntoDraft = useCallback((route: Record<string, unknown>) => {
+    const draft = gatewayRouteDraftFromRegisteredRoute(route)
+    setGatewayRouteDrafts((prev) => {
+      const current = prev.length > 0 ? prev.map((item, idx) => (idx === gatewayActiveRouteIndex ? gatewayStudioDraft : item)) : [gatewayStudioDraft]
+      const idx = current.findIndex((item) => String(item.route_id || '') === String(draft.route_id || ''))
+      if (idx >= 0) {
+        const next = current.map((item, itemIdx) => (itemIdx === idx ? draft : item))
+        setGatewayActiveRouteIndex(idx)
+        setGatewayStudioDraft(draft)
+        return next
+      }
+      const next = [...current, draft]
+      setGatewayActiveRouteIndex(next.length - 1)
+      setGatewayStudioDraft(draft)
+      return next
+    })
+    setGatewayTransientRouteId(null)
+    setGatewayRouteEditorOpen(true)
+    void loadGatewayRouteMonitor(String(route?.id || draft.route_id || ''))
+  }, [gatewayActiveRouteIndex, gatewayStudioDraft, loadGatewayRouteMonitor])
+  const copyGatewayRoutePath = useCallback((route: Record<string, unknown>) => {
+    const path = String(route?.runtime_path || '').trim()
+    if (!path || typeof navigator === 'undefined' || !navigator.clipboard) return
+    void navigator.clipboard.writeText(path)
+    notification.success({ message: 'Runtime path copied' })
+  }, [])
+  const refreshGatewayStudioRoutes = useCallback(async () => {
+    setGatewayRoutesLoading(true)
+    setGatewayStudioError(null)
+    try {
+      const routes = await api.listGatewayRoutes()
+      const list = Array.isArray(routes) ? routes : []
+      setGatewayRoutes(list)
+      const visibleList = list.filter((route: any) => (
+        String(route?.gateway_node_id || '') === String(selectedNodeId || '')
+        || String(route?.pipeline_id || '') === String(activePipelineId || '')
+      ))
+      const metricPairs = await Promise.all(
+        visibleList.slice(0, 50).map(async (route: any) => {
+          const routeId = String(route?.id || '').trim()
+          if (!routeId) return null
+          const metrics = await api.getGatewayRouteMetrics(routeId)
+          return [routeId, metrics && typeof metrics === 'object' ? metrics as Record<string, unknown> : {}] as const
+        })
+      )
+      const metricsById = metricPairs.reduce<Record<string, Record<string, unknown>>>((acc, pair) => {
+        if (pair && pair[0]) acc[pair[0]] = pair[1]
+        return acc
+      }, {})
+      setGatewayRouteMetricsById(metricsById)
+      if (gatewayRouteId) {
+        setGatewayMonitorLoading(true)
+        try {
+          const [logs] = await Promise.all([
+            api.listGatewayRouteLogs(gatewayRouteId, 100),
+          ])
+          setGatewayMetrics(metricsById[gatewayRouteId] || null)
+          setGatewayLogs(Array.isArray(logs) ? logs : [])
+        } finally {
+          setGatewayMonitorLoading(false)
+        }
+      } else {
+        setGatewayMetrics(null)
+        setGatewayLogs([])
+      }
+    } catch (err: any) {
+      setGatewayStudioError(String(err?.message || 'Failed to load gateway routes'))
+      setGatewayRoutes([])
+      setGatewayRouteMetricsById({})
+      setGatewayMetrics(null)
+      setGatewayLogs([])
+    } finally {
+      setGatewayRoutesLoading(false)
+    }
+  }, [activePipelineId, gatewayRouteId, selectedNodeId])
+  const toggleGatewayRegisteredRoute = useCallback(async (route: Record<string, unknown>) => {
+    const routeId = String(route?.id || '').trim()
+    if (!routeId) return
+    const nextEnabled = route?.enabled === false
+    setGatewayStudioError(null)
+    try {
+      await api.updateGatewayRoute(routeId, {
+        enabled: nextEnabled,
+        status: nextEnabled ? 'active' : 'disabled',
+      })
+      await refreshGatewayStudioRoutes()
+    } catch (err: any) {
+      const msg = String(err?.message || 'Failed to update gateway route')
+      setGatewayStudioError(msg)
+      notification.error({ message: msg })
+    }
+  }, [refreshGatewayStudioRoutes])
+  const deleteGatewayRegisteredRoute = useCallback(async (route: Record<string, unknown>) => {
+    const routeId = String(route?.id || '').trim()
+    if (!routeId) return
+    setGatewayStudioError(null)
+    try {
+      await api.deleteGatewayRoute(routeId)
+      const currentDrafts = (gatewayRouteDrafts || []).map((draft, index) => (
+        index === gatewayActiveRouteIndex ? gatewayStudioDraft : draft
+      ))
+      const remainingDrafts = currentDrafts.filter((draft) => String(draft.route_id || '') !== routeId)
+      const nextTestConfigs = gatewayTestConfigs.filter((test) => String(test.route_id || '') !== routeId)
+      setGatewayTestConfigs(nextTestConfigs)
+      writeStoredGatewayTestConfigs(activePipelineId, selectedNodeId || '', nextTestConfigs)
+      setGatewayRouteDrafts(remainingDrafts)
+      if (remainingDrafts.length === 0) {
+        const emptyDraft = createGatewayStudioDraft()
+        setGatewayActiveRouteIndex(0)
+        setGatewayStudioDraft(emptyDraft)
+        setGatewayRouteEditorOpen(false)
+        setGatewayMetrics(null)
+        setGatewayLogs([])
+        if (selectedNodeId) {
+          updateNodeConfig(selectedNodeId, {
+            gateway_routes: [],
+            gateway_test_configs: nextTestConfigs.map(gatewayTestToPayload),
+          })
+        }
+      } else {
+        const safeIndex = Math.max(0, Math.min(gatewayActiveRouteIndex, remainingDrafts.length - 1))
+        setGatewayActiveRouteIndex(safeIndex)
+        setGatewayStudioDraft(remainingDrafts[safeIndex])
+        if (String(gatewayRouteId || '') === routeId) {
+          setGatewayRouteEditorOpen(false)
+          setGatewayMetrics(null)
+          setGatewayLogs([])
+        }
+        if (selectedNodeId) {
+          updateNodeConfig(selectedNodeId, {
+            ...gatewayDraftToNodeConfig(remainingDrafts[0]),
+            gateway_routes: remainingDrafts.map(gatewayDraftToNodeConfig),
+            gateway_test_configs: nextTestConfigs.map(gatewayTestToPayload),
+          })
+        }
+      }
+      await refreshGatewayStudioRoutes()
+      notification.success({ message: 'API route and logs deleted' })
+    } catch (err: any) {
+      const msg = String(err?.message || 'Failed to delete gateway route')
+      setGatewayStudioError(msg)
+      notification.error({ message: msg })
+    }
+  }, [
+    activePipelineId,
+    gatewayActiveRouteIndex,
+    gatewayRouteDrafts,
+    gatewayRouteId,
+    gatewayStudioDraft,
+    gatewayTestConfigs,
+    refreshGatewayStudioRoutes,
+    selectedNodeId,
+    updateNodeConfig,
+  ])
+  const openGatewayStudio = useCallback(() => {
+    const configuredRoutesRaw = Array.isArray(nodeConfig.gateway_routes) ? nodeConfig.gateway_routes : []
+    const drafts = (configuredRoutesRaw.length > 0 ? configuredRoutesRaw : [nodeConfig])
+      .map((raw, index) => {
+        const draft = createGatewayStudioDraft((raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>)
+        if (!draft.source_node_id && gatewayDefaultSourceNodeId) draft.source_node_id = gatewayDefaultSourceNodeId
+        if (!draft.route_id && activePipelineId && selectedNodeId) {
+          draft.route_id = `gw_${activePipelineId}_${selectedNodeId}${index > 0 ? `_${index + 1}` : ''}`
+        }
+        return draft
+      })
+    const safeDrafts = drafts.length > 0 ? drafts : [createGatewayStudioDraft(nodeConfig)]
+    const savedTests = mergeGatewayTestConfigs(
+      parseGatewayTestConfigs(nodeConfig.gateway_test_configs, safeDrafts[0]),
+      readStoredGatewayTestConfigs(activePipelineId, selectedNodeId || '', safeDrafts[0]),
+    )
+    setGatewayRouteDrafts(safeDrafts)
+    setGatewayActiveRouteIndex(0)
+    setGatewayStudioDraft(safeDrafts[0])
+    setGatewayTestConfigs(savedTests)
+    setGatewayActiveTestId(savedTests[0]?.id || '')
+    setGatewayTestDraft(savedTests[0] || createGatewayTestConfig({}, safeDrafts[0]))
+    setGatewayTestResult(null)
+    setGatewayTestError(null)
+    setGatewayStudioError(null)
+    setGatewayRouteEditorOpen(false)
+    setGatewayTransientRouteId(null)
+    setGatewayStudioOpen(true)
+    void refreshGatewayStudioRoutes()
+  }, [nodeConfig, gatewayDefaultSourceNodeId, activePipelineId, selectedNodeId, refreshGatewayStudioRoutes])
+  const requestCloseGatewayStudio = useCallback(() => {
+    setGatewayRouteEditorOpen(false)
+    setGatewayTransientRouteId(null)
+    setGatewayStudioOpen(false)
+  }, [])
+  const closeGatewayRouteEditor = useCallback(() => {
+    const transientRouteId = String(gatewayTransientRouteId || '').trim()
+    if (!transientRouteId) {
+      setGatewayRouteEditorOpen(false)
+      return
+    }
+    const deployedRouteIds = new Set(gatewayRoutes.map((route) => String(route?.id || '').trim()).filter(Boolean))
+    if (deployedRouteIds.has(transientRouteId)) {
+      setGatewayTransientRouteId(null)
+      setGatewayRouteEditorOpen(false)
+      return
+    }
+    setGatewayRouteDrafts((prev) => {
+      const current = prev.length > 0 ? prev : [gatewayStudioDraft]
+      const next = current.filter((draft) => String(draft.route_id || '').trim() !== transientRouteId)
+      const safeDrafts = next.length > 0 ? next : [createGatewayStudioDraft(nodeConfig)]
+      const safeIndex = Math.max(0, Math.min(gatewayActiveRouteIndex, safeDrafts.length - 1))
+      setGatewayActiveRouteIndex(safeIndex)
+      setGatewayStudioDraft(safeDrafts[safeIndex])
+      return safeDrafts
+    })
+    setGatewayTransientRouteId(null)
+    setGatewayRouteEditorOpen(false)
+  }, [gatewayActiveRouteIndex, gatewayRoutes, gatewayStudioDraft, gatewayTransientRouteId, nodeConfig])
+  const addGatewayRouteDraft = useCallback(() => {
+    setGatewayRouteDrafts((prev) => {
+      const current = prev.length > 0 ? prev.map((item, idx) => (idx === gatewayActiveRouteIndex ? gatewayStudioDraft : item)) : [gatewayStudioDraft]
+      const nextIndex = current.length
+      const nextRouteId = activePipelineId && selectedNodeId ? `gw_${activePipelineId}_${selectedNodeId}_${nextIndex + 1}` : ''
+      const nextDraft = createGatewayStudioDraft({
+        route_id: nextRouteId,
+        gateway_name: `Gateway Route ${nextIndex + 1}`,
+        protocol: 'rest',
+        api_version: 'v1',
+        route_method: 'GET',
+        route_path: `/gateway-${nextIndex + 1}`,
+        source_node_id: '',
+        trigger_node_ids: [],
+        source_config: {},
+        request_mapping: {},
+        input_parameters: [],
+        response_mapping: { limit: 1000 },
+        output_fields: [],
+        response_limit: 1000,
+        auth_type: 'none',
+        auth_token: '',
+        jwt_secret: '',
+        jwt_issuer: '',
+        jwt_audience: '',
+        rbac_roles: '',
+        rate_limit_requests: 0,
+        rate_limit_window_seconds: 60,
+        standard_response: true,
+        audit_enabled: true,
+        logging_enabled: true,
+      })
+      const next = [...current, nextDraft]
+      setGatewayActiveRouteIndex(nextIndex)
+      setGatewayStudioDraft(nextDraft)
+      setGatewayTransientRouteId(nextRouteId || null)
+      return next
+    })
+    setGatewayStudioError(null)
+    setGatewayMetrics(null)
+    setGatewayLogs([])
+    setGatewayRouteEditorOpen(true)
+  }, [activePipelineId, gatewayActiveRouteIndex, gatewayStudioDraft, selectedNodeId])
+  const addGatewayInputParameter = useCallback(() => {
+    setGatewayStudioDraft((prev) => ({
+      ...prev,
+      input_parameters: [
+        ...(prev.input_parameters || []),
+        createGatewayInputParameter({
+          required: true,
+          source_field: uniqueFieldNames([
+            ...(prev.output_fields || []).map((field) => gatewayFieldSourcePath(field)),
+            ...gatewayOutputFieldOptions.map((option) => String(option.value || '').trim()),
+          ]).find((field) => {
+            const normalized = String(field || '').trim().toLowerCase()
+            if (!normalized) return false
+            if (!GATEWAY_PREFERRED_INPUT_FIELD_NAMES.has(gatewayLeafNameFromField(normalized).toLowerCase())) return false
+            return !(prev.input_parameters || []).some((item) => (
+              String(item.source_field || item.name || '').trim().toLowerCase() === normalized
+            ))
+          }) || '',
+        }),
+      ],
+    }))
+  }, [gatewayOutputFieldOptions])
+  const addGatewayInputParametersFromOutputFields = useCallback(() => {
+    const selectedOutputFields = (gatewayStudioDraft.output_fields || []).map((field) => gatewayFieldSourcePath(field)).filter(Boolean)
+    const availableSourceFields = gatewayOutputFieldOptions.map((option) => String(option.value || '').trim()).filter(Boolean)
+    const preferredAvailableFields = availableSourceFields.filter((field) => (
+      GATEWAY_PREFERRED_INPUT_FIELD_NAMES.has(gatewayLeafNameFromField(field).toLowerCase())
+    ))
+    const candidateFields = uniqueFieldNames(selectedOutputFields.length > 0 ? selectedOutputFields : preferredAvailableFields)
+    if (candidateFields.length === 0) {
+      notification.warning({ message: 'Select output fields first, or expose a key field such as customer_account.' })
+      return
+    }
+    const existing = new Set((gatewayStudioDraft.input_parameters || []).map((item) => String(item.source_field || item.name || '').trim().toLowerCase()).filter(Boolean))
+    const additions = candidateFields
+      .map((field) => gatewayFieldSourcePath(field))
+      .filter((field) => field && !existing.has(field.toLowerCase()))
+      .map((field) => createGatewayInputParameter({
+        name: gatewayLeafNameFromField(field),
+        source_field: field,
+        location: 'query',
+        required: true,
+        data_type: 'string',
+      }))
+    if (additions.length === 0) {
+      notification.info({ message: 'Input parameters already exist for selected output fields' })
+      return
+    }
+    setGatewayStudioDraft((prev) => {
+      return {
+        ...prev,
+        input_parameters: [
+          ...(prev.input_parameters || []),
+          ...additions,
+        ],
+      }
+    })
+  }, [gatewayOutputFieldOptions, gatewayStudioDraft.input_parameters, gatewayStudioDraft.output_fields])
+  const updateGatewayInputParameter = useCallback((id: string, patch: Partial<GatewayInputParameter>) => {
+    setGatewayStudioDraft((prev) => ({
+      ...prev,
+      input_parameters: (prev.input_parameters || []).map((item) => (
+        item.id === id ? { ...item, ...patch } : item
+      )),
+    }))
+  }, [])
+  const removeGatewayInputParameter = useCallback((id: string) => {
+    setGatewayStudioDraft((prev) => ({
+      ...prev,
+      input_parameters: (prev.input_parameters || []).filter((item) => item.id !== id),
+    }))
+  }, [])
+  const getGatewayDraftsForTester = useCallback(() => {
+    const current = (gatewayRouteDrafts.length > 0 ? gatewayRouteDrafts : [gatewayStudioDraft])
+      .map((draft, index) => {
+        const next = index === gatewayActiveRouteIndex ? gatewayStudioDraft : draft
+        return {
+          ...next,
+          route_id: resolveGatewayRouteId(next, index),
+          source_node_id: next.source_node_id || gatewayDefaultSourceNodeId,
+        }
+      })
+    return current.length > 0 ? current : [createGatewayStudioDraft(nodeConfig)]
+  }, [
+    gatewayActiveRouteIndex,
+    gatewayDefaultSourceNodeId,
+    gatewayRouteDrafts,
+    gatewayStudioDraft,
+    nodeConfig,
+    resolveGatewayRouteId,
+  ])
+  const persistGatewayTestConfigs = useCallback((next: GatewayTestConfig[]) => {
+    const normalized = next.map((item) => ({
+      ...item,
+      updated_at: item.updated_at || new Date().toISOString(),
+    }))
+    setGatewayTestConfigs(normalized)
+    writeStoredGatewayTestConfigs(activePipelineId, selectedNodeId || '', normalized)
+    if (selectedNodeId) {
+      updateNodeConfig(selectedNodeId, { gateway_test_configs: normalized.map(gatewayTestToPayload) })
+    }
+  }, [activePipelineId, selectedNodeId, updateNodeConfig])
+  const applyGatewayTestRoute = useCallback((routeId: string) => {
+    const route = getGatewayDraftsForTester().find((item) => String(item.route_id || '') === String(routeId || ''))
+    if (!route) return
+    const defaults = createGatewayTestConfig({
+      id: gatewayTestDraft.id,
+      name: gatewayTestDraft.name || `${route.gateway_name || 'Gateway Route'} test`,
+      created_at: gatewayTestDraft.created_at,
+    }, route)
+    setGatewayTestDraft((prev) => ({
+      ...prev,
+      route_id: defaults.route_id,
+      protocol: defaults.protocol,
+      method: defaults.method,
+      path: defaults.path,
+      query_params: defaults.query_params,
+      headers: defaults.headers,
+      body_type: defaults.body_type,
+      body_text: defaults.body_text,
+      updated_at: new Date().toISOString(),
+    }))
+    setGatewayTestResult(null)
+    setGatewayTestError(null)
+  }, [gatewayTestDraft.created_at, gatewayTestDraft.id, gatewayTestDraft.name, getGatewayDraftsForTester])
+  const applyGatewayTestProtocol = useCallback((value: unknown) => {
+    const protocol = normalizeGatewayProtocol(value)
+    const currentRoute = getGatewayDraftsForTester().find((route) => String(route.route_id || '') === String(gatewayTestDraft.route_id || ''))
+    const fallbackRoute = currentRoute || gatewayStudioDraft
+    const protocolRoute = {
+      ...fallbackRoute,
+      protocol,
+    }
+    const defaults = gatewayDefaultBodyForRoute(protocolRoute)
+    setGatewayTestDraft((prev) => ({
+      ...prev,
+      protocol,
+      method: gatewayDefaultMethodForProtocol(protocol, prev.method),
+      path: gatewayTestPathForProtocol(prev.path, protocol),
+      body_type: defaults.bodyType,
+      body_text: defaults.bodyText,
+      headers: gatewayHeadersForBodyType(prev.headers, defaults.bodyType),
+      updated_at: new Date().toISOString(),
+    }))
+    setGatewayTestResult(null)
+    setGatewayTestError(null)
+  }, [gatewayStudioDraft, gatewayTestDraft.route_id, getGatewayDraftsForTester])
+  const openGatewayTester = useCallback(() => {
+    const draftRoutes = getGatewayDraftsForTester()
+    const currentRoute = draftRoutes[gatewayActiveRouteIndex] || draftRoutes[0] || gatewayStudioDraft
+    const existing = mergeGatewayTestConfigs(
+      parseGatewayTestConfigs(nodeConfig.gateway_test_configs, currentRoute),
+      readStoredGatewayTestConfigs(activePipelineId, selectedNodeId || '', currentRoute),
+      gatewayTestConfigs,
+    )
+    const safeConfigs = existing.length > 0 ? existing : [createGatewayTestConfig({}, currentRoute)]
+    setGatewayTestConfigs(safeConfigs)
+    setGatewayActiveTestId(safeConfigs[0].id)
+    setGatewayTestDraft(safeConfigs[0])
+    setGatewayTestResult(null)
+    setGatewayTestError(null)
+    setGatewayTestResponseView('json')
+    setGatewayTesterOpen(true)
+  }, [
+    activePipelineId,
+    gatewayActiveRouteIndex,
+    gatewayStudioDraft,
+    gatewayTestConfigs,
+    getGatewayDraftsForTester,
+    nodeConfig.gateway_test_configs,
+    selectedNodeId,
+  ])
+  const selectGatewayTestConfig = useCallback((id: string) => {
+    const test = gatewayTestConfigs.find((item) => item.id === id)
+    if (!test) return
+    setGatewayActiveTestId(test.id)
+    setGatewayTestDraft(test)
+    setGatewayTestResult(null)
+    setGatewayTestError(null)
+    setGatewayTestResponseView('json')
+  }, [gatewayTestConfigs])
+  const createGatewayTesterNewTest = useCallback(() => {
+    const draftRoutes = getGatewayDraftsForTester()
+    const route = draftRoutes[gatewayActiveRouteIndex] || draftRoutes[0] || gatewayStudioDraft
+    const next = createGatewayTestConfig({ name: `${route.gateway_name || 'Gateway Route'} test ${gatewayTestConfigs.length + 1}` }, route)
+    const configs = [...gatewayTestConfigs, next]
+    persistGatewayTestConfigs(configs)
+    setGatewayActiveTestId(next.id)
+    setGatewayTestDraft(next)
+    setGatewayTestResult(null)
+    setGatewayTestError(null)
+    setGatewayTestResponseView('json')
+  }, [
+    gatewayActiveRouteIndex,
+    gatewayStudioDraft,
+    gatewayTestConfigs,
+    getGatewayDraftsForTester,
+    persistGatewayTestConfigs,
+  ])
+  const saveGatewayTestConfig = useCallback(() => {
+    const now = new Date().toISOString()
+    const normalized: GatewayTestConfig = {
+      ...gatewayTestDraft,
+      id: gatewayTestDraft.id || `test_${Date.now()}`,
+      name: gatewayTestDraft.name.trim() || 'Gateway test',
+      method: String(gatewayTestDraft.method || 'GET').trim().toUpperCase(),
+      path: String(gatewayTestDraft.path || '').trim() || '/gw/v1/gateway',
+      updated_at: now,
+      created_at: gatewayTestDraft.created_at || now,
+    }
+    const baseConfigs = mergeGatewayTestConfigs(
+      parseGatewayTestConfigs(nodeConfig.gateway_test_configs, gatewayStudioDraft),
+      readStoredGatewayTestConfigs(activePipelineId, selectedNodeId || '', gatewayStudioDraft),
+      gatewayTestConfigs,
+    )
+    const exists = baseConfigs.some((item) => item.id === normalized.id)
+    const next = exists
+      ? baseConfigs.map((item) => (item.id === normalized.id ? normalized : item))
+      : [...baseConfigs, normalized]
+    persistGatewayTestConfigs(next)
+    setGatewayActiveTestId(normalized.id)
+    setGatewayTestDraft(normalized)
+    notification.success({ message: 'API test configuration saved' })
+  }, [
+    activePipelineId,
+    gatewayStudioDraft,
+    gatewayTestConfigs,
+    gatewayTestDraft,
+    nodeConfig.gateway_test_configs,
+    persistGatewayTestConfigs,
+    selectedNodeId,
+  ])
+  const deleteGatewayTestConfig = useCallback((id: string) => {
+    const next = gatewayTestConfigs.filter((item) => item.id !== id)
+    persistGatewayTestConfigs(next)
+    const replacement = next[0] || createGatewayTestConfig({}, getGatewayDraftsForTester()[0] || gatewayStudioDraft)
+    setGatewayActiveTestId(replacement.id)
+    setGatewayTestDraft(replacement)
+    setGatewayTestResult(null)
+    setGatewayTestError(null)
+    setGatewayTestResponseView('json')
+  }, [gatewayStudioDraft, gatewayTestConfigs, getGatewayDraftsForTester, persistGatewayTestConfigs])
+  const updateGatewayTestKeyValue = useCallback((
+    group: 'query_params' | 'headers',
+    id: string,
+    patch: Partial<GatewayTestKeyValue>,
+  ) => {
+    setGatewayTestDraft((prev) => ({
+      ...prev,
+      [group]: (prev[group] || []).map((item) => (item.id === id ? { ...item, ...patch } : item)),
+      updated_at: new Date().toISOString(),
+    }))
+  }, [])
+  const addGatewayTestKeyValue = useCallback((group: 'query_params' | 'headers') => {
+    setGatewayTestDraft((prev) => ({
+      ...prev,
+      [group]: [...(prev[group] || []), createGatewayTestKeyValue()],
+      updated_at: new Date().toISOString(),
+    }))
+  }, [])
+  const removeGatewayTestKeyValue = useCallback((group: 'query_params' | 'headers', id: string) => {
+    setGatewayTestDraft((prev) => ({
+      ...prev,
+      [group]: (prev[group] || []).filter((item) => item.id !== id),
+      updated_at: new Date().toISOString(),
+    }))
+  }, [])
+  const addGatewayTestHeaderPreset = useCallback((key: string) => {
+    const headerKey = String(key || '').trim()
+    if (!headerKey) return
+    setGatewayTestDraft((prev) => {
+      const value = gatewayTestHeaderPresetValue(headerKey, prev.body_type)
+      const existingIndex = (prev.headers || []).findIndex((item) => String(item.key || '').trim().toLowerCase() === headerKey.toLowerCase())
+      const nextHeaders = existingIndex >= 0
+        ? prev.headers.map((item, index) => (index === existingIndex ? { ...item, enabled: true, value } : item))
+        : [...prev.headers, createGatewayTestKeyValue({ key: headerKey, value, enabled: true })]
+      return {
+        ...prev,
+        headers: nextHeaders,
+        updated_at: new Date().toISOString(),
+      }
+    })
+  }, [])
+  const formatGatewayTestBodyJson = useCallback(() => {
+    const bodyText = String(gatewayTestDraft.body_text || '')
+    if (!bodyText.trim()) return
+    try {
+      const formatted = JSON.stringify(JSON.parse(bodyText), null, 2)
+      setGatewayTestDraft((prev) => ({
+        ...prev,
+        body_text: formatted,
+        updated_at: new Date().toISOString(),
+      }))
+    } catch (err: any) {
+      notification.error({ message: 'Request body is not valid JSON', description: String(err?.message || err || '') })
+    }
+  }, [gatewayTestDraft.body_text])
+  const gatewayTestBodyJsonError = useMemo(
+    () => (gatewayTestDraft.body_type === 'json' ? gatewayJsonValidationMessage(gatewayTestDraft.body_text) : ''),
+    [gatewayTestDraft.body_text, gatewayTestDraft.body_type],
+  )
+  const sendGatewayTestRequest = useCallback(async () => {
+    setGatewayTestSending(true)
+    setGatewayTestError(null)
+    setGatewayTestResult(null)
+    try {
+      const method = String(gatewayTestDraft.method || 'GET').trim().toUpperCase()
+      const headers = gatewayTestKeyValuesToObject(gatewayTestDraft.headers)
+      let body: unknown = undefined
+      const bodyText = String(gatewayTestDraft.body_text || '')
+      if (gatewayTestDraft.body_type === 'json' && bodyText.trim()) {
+        if (!Object.keys(headers).some((key) => key.toLowerCase() === 'content-type')) {
+          headers['Content-Type'] = 'application/json'
+        }
+        try {
+          body = JSON.parse(bodyText)
+        } catch {
+          throw new Error(`Request body is not valid JSON: ${gatewayJsonValidationMessage(bodyText) || 'parse failed'}`)
+        }
+      } else if (gatewayTestDraft.body_type === 'graphql' && bodyText.trim()) {
+        if (!Object.keys(headers).some((key) => key.toLowerCase() === 'content-type')) {
+          headers['Content-Type'] = 'application/json'
+        }
+        body = {
+          query: bodyText,
+          variables: gatewayTestKeyValuesToObject(gatewayTestDraft.query_params),
+        }
+      } else if (gatewayTestDraft.body_type === 'xml' && bodyText.trim()) {
+        if (!Object.keys(headers).some((key) => key.toLowerCase() === 'content-type')) {
+          headers['Content-Type'] = 'text/xml; charset=utf-8'
+        }
+        body = bodyText
+      } else if (gatewayTestDraft.body_type === 'text' && bodyText.trim()) {
+        body = bodyText
+      }
+      const result = await api.sendGatewayTest({
+        method,
+        path: gatewayTestDraft.path,
+        query: gatewayTestKeyValuesToObject(gatewayTestDraft.query_params),
+        headers,
+        body,
+      })
+      setGatewayTestResult(result as Record<string, unknown>)
+      setGatewayTestResponseView('json')
+      void refreshGatewayStudioRoutes()
+      const selectedRouteId = String(gatewayTestDraft.route_id || '').trim()
+      if (selectedRouteId) void loadGatewayRouteMonitor(selectedRouteId)
+    } catch (err: any) {
+      const msg = String(err?.message || 'API test request failed')
+      setGatewayTestError(msg)
+      setGatewayTestResult({ ok: false, error: msg })
+    } finally {
+      setGatewayTestSending(false)
+    }
+  }, [gatewayTestDraft, loadGatewayRouteMonitor, refreshGatewayStudioRoutes])
+  const gatewayTesterRouteOptions = useMemo(
+    () => getGatewayDraftsForTester().map((route, index) => ({
+      value: String(route.route_id || ''),
+      label: `${route.gateway_name || `Gateway Route ${index + 1}`} - ${gatewayDraftRuntimePath(route)}`,
+      route,
+    })).filter((item) => item.value),
+    [getGatewayDraftsForTester]
+  )
+  const saveGatewayStudioConfig = useCallback(async () => {
+    if (!selectedNodeId) return
+    setGatewayStudioSaving(true)
+    setGatewayStudioError(null)
+    try {
+      const effectiveDrafts = (gatewayRouteDrafts.length > 0 ? gatewayRouteDrafts : [gatewayStudioDraft])
+        .map((draft, index) => {
+          const next = index === gatewayActiveRouteIndex ? gatewayStudioDraft : draft
+          return {
+            ...next,
+            route_id: resolveGatewayRouteId(next, index),
+            source_node_id: next.source_node_id || gatewayDefaultSourceNodeId,
+          }
+        })
+      setGatewayRouteDrafts(effectiveDrafts)
+      const primaryConfig = gatewayDraftToNodeConfig(effectiveDrafts[0])
+      updateNodeConfig(selectedNodeId, {
+        ...primaryConfig,
+        gateway_routes: effectiveDrafts.map(gatewayDraftToNodeConfig),
+        gateway_test_configs: gatewayTestConfigs.map(gatewayTestToPayload),
+      })
+
+      if (activePipelineId) {
+        const existingRouteIds = new Set(gatewayRoutes.map((route) => String(route?.id || '').trim()).filter(Boolean))
+        for (const draft of effectiveDrafts) {
+          if (!draft.route_id) continue
+          let sourceConfig: Record<string, unknown> = {}
+          let requestMapping: Record<string, unknown> = {}
+          let responseMapping: Record<string, unknown> = {}
+          try {
+            sourceConfig = JSON.parse(draft.source_config_text || '{}')
+            requestMapping = JSON.parse(draft.request_mapping_text || '{}')
+            responseMapping = JSON.parse(draft.response_mapping_text || '{}')
+          } catch {
+            throw new Error(`Route "${draft.gateway_name || draft.route_path}" has invalid JSON mapping.`)
+          }
+          const inputParameters = gatewayInputParametersToPayload(draft.input_parameters, draft.output_fields)
+          const triggerNodeIds = parseStringList(draft.trigger_node_ids)
+          const routeRequestMapping = {
+            ...requestMapping,
+            trigger_node_ids: triggerNodeIds,
+            input_parameters: inputParameters,
+          }
+          const outputFields = Array.isArray(draft.output_fields) ? draft.output_fields : []
+          const sourceNodeId = draft.source_node_id || gatewayDefaultSourceNodeId
+          const routeResponseMapping = {
+            ...responseMapping,
+            limit: draft.response_limit || responseMapping.limit || 1000,
+            output_fields: outputFields,
+            graphql_field: draft.graphql_field || 'result',
+          }
+        const payload = {
+          id: draft.route_id,
+          name: draft.gateway_name || 'Gateway Route',
+          enabled: draft.enabled,
+          protocol: draft.protocol,
+          version: draft.api_version || 'v1',
+          method: draft.route_method || 'GET',
+          path: draft.route_path || '/gateway',
+          status: draft.enabled ? 'active' : 'disabled',
+          pipeline_id: activePipelineId,
+          gateway_node_id: selectedNodeId,
+          source_node_id: sourceNodeId || null,
+          source_config: sourceConfig,
+          request_mapping: routeRequestMapping,
+          response_mapping: routeResponseMapping,
+          auth_config: {
+            type: draft.auth_type,
+            token: draft.auth_token,
+            secret: draft.jwt_secret,
+            algorithm: 'HS256',
+            issuer: draft.jwt_issuer,
+            audience: draft.jwt_audience,
+          },
+          rbac_config: {
+            allowed_roles: parseStringList(draft.rbac_roles),
+          },
+          rate_limit_config: {
+            requests: draft.rate_limit_requests || 0,
+            window_seconds: draft.rate_limit_window_seconds || 60,
+          },
+          standard_response: draft.standard_response,
+          audit_enabled: draft.audit_enabled,
+          logging_enabled: draft.logging_enabled,
+          managed_by_pipeline: true,
+        }
+        if (existingRouteIds.has(draft.route_id)) {
+          await api.updateGatewayRoute(draft.route_id, payload)
+        } else {
+          await api.createGatewayRoute(payload)
+        }
+        }
+        await refreshGatewayStudioRoutes()
+      }
+      notification.success({ message: 'Gateway Studio saved' })
+      setGatewayTransientRouteId(null)
+      setGatewayRouteEditorOpen(false)
+    } catch (err: any) {
+      const msg = String(err?.message || 'Failed to save gateway studio')
+      setGatewayStudioError(msg)
+      notification.error({ message: msg })
+    } finally {
+      setGatewayStudioSaving(false)
+    }
+  }, [
+    activePipelineId,
+    gatewayDefaultSourceNodeId,
+    gatewayRouteDrafts,
+    gatewayActiveRouteIndex,
+    gatewayRoutes,
+    gatewayStudioDraft,
+    gatewayTestConfigs,
+    refreshGatewayStudioRoutes,
+    resolveGatewayRouteId,
+    selectedNodeId,
+    updateNodeConfig,
+  ])
   const conditionFieldOptions = useMemo(
     () => {
       if (!conditionStudioEditingActive) return conditionFieldOptionsCacheRef.current
@@ -9233,6 +11119,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     },
     [nodeConfig.mlops_stage3_cv_folds],
   )
+  const mlopsStage3ClusterCountConfigured = useMemo(
+    () => {
+      const n = Number(nodeConfig.mlops_stage3_cluster_count ?? 4)
+      if (!Number.isFinite(n)) return 4
+      return Math.max(2, Math.min(Math.trunc(n), 100))
+    },
+    [nodeConfig.mlops_stage3_cluster_count],
+  )
   const mlopsStage3EpochsConfigured = useMemo(
     () => {
       const n = Number(nodeConfig.mlops_stage3_epochs ?? 20)
@@ -10402,6 +12296,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => (MLOPS_STAGE3_MODEL_CATALOG[mlopsStage3TaskTypeDraft] || []).map((model) => ({ value: model, label: model })),
     [mlopsStage3TaskTypeDraft],
   )
+  const mlopsStage3VizOptions = useMemo(
+    () => MLOPS_STAGE3_VIZ_OPTIONS.filter((option) => {
+      if (mlopsStage3TaskTypeDraft === 'clustering') {
+        return !MLOPS_STAGE3_SUPERVISED_ONLY_VIZ_TYPES.has(option.value)
+      }
+      return !MLOPS_STAGE3_CLUSTER_ONLY_VIZ_TYPES.has(option.value)
+    }),
+    [mlopsStage3TaskTypeDraft],
+  )
   const mlopsStage3SelectedFeatureFields = useMemo(
     () => uniqueFieldNames(mlopsStage3FeatureFieldsDraft.filter((item) => mlopsStage3AvailableFields.includes(item))),
     [mlopsStage3FeatureFieldsDraft, mlopsStage3AvailableFields],
@@ -10424,6 +12327,36 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       const n = Number(v)
       return Number.isFinite(n) ? n : null
     }
+    const clusterPalette = ['#38bdf8', '#a78bfa', '#22c55e', '#f59e0b', '#f472b6', '#14b8a6', '#fb7185', '#c084fc', '#84cc16', '#60a5fa']
+    const clusterSort = (a: string, b: string): number => {
+      const na = Number(a)
+      const nb = Number(b)
+      if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb
+      return a.localeCompare(b)
+    }
+    const sampleRows = (Array.isArray(summary.sample_predictions) ? summary.sample_predictions : [])
+      .map((row) => ({ ...(row as Record<string, unknown>) }))
+    const clusterLabelOf = (row: Record<string, unknown>): string => String(row.cluster ?? row.Cluster ?? 'unknown')
+    const clusterDistribution = (): Array<{ label: string; count: number }> => {
+      const trainMetrics = (summary.train_metrics || {}) as Record<string, unknown>
+      const rawClusters = (trainMetrics.clusters || {}) as Record<string, unknown>
+      const fromMetrics = Object.entries(rawClusters)
+        .map(([label, value]) => ({ label: String(label), count: Number(value || 0) }))
+        .filter((item) => Number.isFinite(item.count))
+      if (fromMetrics.length > 0) return fromMetrics.sort((a, b) => clusterSort(a.label, b.label))
+      const counts: Record<string, number> = {}
+      sampleRows.forEach((row) => {
+        const label = clusterLabelOf(row)
+        counts[label] = (counts[label] || 0) + 1
+      })
+      return Object.entries(counts)
+        .map(([label, count]) => ({ label, count }))
+        .sort((a, b) => clusterSort(a.label, b.label))
+    }
+    const numericSampleFields = (): string[] => uniqueFieldNames([
+      ...((Array.isArray(summary.feature_fields) ? summary.feature_fields : []) as string[]),
+      ...sampleRows.flatMap((row) => Object.keys(row).filter((key) => key !== 'cluster')),
+    ]).filter((field) => sampleRows.some((row) => toNum(row[field]) != null))
 
     if (mlopsStage3VizTypeDraft === 'split_bar') {
       return {
@@ -10491,6 +12424,114 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           },
         ],
         layout: { ...layoutBase, title: 'Feature Importance', height: 360 },
+      }
+    }
+
+    if (mlopsStage3VizTypeDraft === 'cluster_distribution') {
+      const items = clusterDistribution()
+      if (items.length <= 0) return null
+      return {
+        data: [
+          {
+            type: 'bar',
+            x: items.map((item) => item.label === '-1' ? 'Noise (-1)' : `Cluster ${item.label}`),
+            y: items.map((item) => item.count),
+            marker: { color: items.map((_, idx) => clusterPalette[idx % clusterPalette.length]) },
+            text: items.map((item) => String(item.count)),
+            textposition: 'auto',
+          },
+        ],
+        layout: { ...layoutBase, title: 'Cluster Distribution', xaxis: { title: 'Cluster' }, yaxis: { title: 'Rows' } },
+      }
+    }
+
+    if (mlopsStage3VizTypeDraft === 'cluster_scatter') {
+      const fields = numericSampleFields()
+      const xField = fields[0]
+      const yField = fields[1] || fields[0]
+      if (!xField || !yField) return null
+      const labels = uniqueFieldNames(sampleRows.map((row) => clusterLabelOf(row))).sort(clusterSort)
+      const traces = labels.map((label, labelIdx) => {
+        const points = sampleRows
+          .map((row, rowIdx) => ({
+            row,
+            rowIdx,
+            x: fields.length >= 2 ? toNum(row[xField]) : rowIdx + 1,
+            y: toNum(row[yField]),
+          }))
+          .filter((point) => clusterLabelOf(point.row) === label && point.x != null && point.y != null)
+        return {
+          type: 'scatter',
+          mode: 'markers',
+          name: label === '-1' ? 'Noise (-1)' : `Cluster ${label}`,
+          x: points.map((point) => point.x as number),
+          y: points.map((point) => point.y as number),
+          marker: {
+            color: clusterPalette[labelIdx % clusterPalette.length],
+            size: 8,
+            opacity: 0.78,
+            line: { color: 'rgba(15,23,42,0.8)', width: 1 },
+          },
+          text: points.map((point) => {
+            const row = point.row
+            return [
+              label === '-1' ? 'Noise (-1)' : `Cluster ${label}`,
+              `${xField}: ${String(row[xField] ?? '')}`,
+              `${yField}: ${String(row[yField] ?? '')}`,
+            ].join('<br>')
+          }),
+          hoverinfo: 'text',
+        }
+      }).filter((trace) => (trace.x as number[]).length > 0)
+      if (traces.length <= 0) return null
+      return {
+        data: traces,
+        layout: {
+          ...layoutBase,
+          title: fields.length >= 2 ? 'Cluster Scatter by Feature' : 'Cluster Feature Spread',
+          xaxis: { title: fields.length >= 2 ? xField : 'Sample' },
+          yaxis: { title: yField },
+        },
+      }
+    }
+
+    if (mlopsStage3VizTypeDraft === 'cluster_profile') {
+      const overview = (summary.target_overview || {}) as Record<string, unknown>
+      const rawProfiles = Array.isArray(overview.cluster_profiles)
+        ? overview.cluster_profiles.map((item) => ({ ...(item as Record<string, unknown>) }))
+        : []
+      const overviewFields = Array.isArray(overview.profile_fields)
+        ? (overview.profile_fields as unknown[]).map((item) => String(item || '').trim()).filter(Boolean)
+        : []
+      const fields = uniqueFieldNames([...overviewFields, ...numericSampleFields()]).slice(0, 4)
+      if (fields.length <= 0) return null
+      const profiles = rawProfiles.length > 0
+        ? rawProfiles
+        : clusterDistribution().map((item) => {
+            const rows = sampleRows.filter((row) => clusterLabelOf(row) === item.label)
+            const profile: Record<string, unknown> = { cluster: item.label, count: rows.length }
+            fields.forEach((field) => {
+              const values = rows.map((row) => toNum(row[field])).filter((value): value is number => value != null)
+              if (values.length > 0) {
+                profile[`${field}_mean`] = values.reduce((sum, value) => sum + value, 0) / values.length
+              }
+            })
+            return profile
+          })
+      const sortedProfiles: Array<Record<string, unknown> & { cluster: string }> = profiles
+        .map((item) => ({ ...item, cluster: String(item.cluster ?? 'unknown') }))
+        .sort((a, b) => clusterSort(String(a.cluster), String(b.cluster)))
+      if (sortedProfiles.length <= 0) return null
+      const traces = fields.map((field, idx) => ({
+        type: 'bar',
+        name: field,
+        x: sortedProfiles.map((item) => String(item.cluster) === '-1' ? 'Noise (-1)' : `Cluster ${String(item.cluster)}`),
+        y: sortedProfiles.map((item) => toNum(item[`${field}_mean`]) ?? 0),
+        marker: { color: clusterPalette[idx % clusterPalette.length] },
+      }))
+      return {
+        data: traces,
+        layout: { ...layoutBase, barmode: 'group', title: 'Cluster Feature Profile (Mean)', xaxis: { title: 'Cluster' }, yaxis: { title: 'Mean value' } },
       }
     }
 
@@ -10616,6 +12657,40 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       ? summary.sample_predictions.map((item, idx) => ({ _key: `pred_${idx}`, ...(item as Record<string, unknown>) }))
       : []
   }, [mlopsStage3RunSummary, mlopsStage3TableViewDraft])
+  const mlopsStage3ClusterHighlights = useMemo(() => {
+    const summary = mlopsStage3RunSummary
+    if (!summary || summary.task_type !== 'clustering') return [] as Array<{ label: string; value: string; color: string }>
+    const metrics = (summary.train_metrics || {}) as Record<string, unknown>
+    const clusters = (metrics.clusters || {}) as Record<string, unknown>
+    const entries = Object.entries(clusters)
+      .map(([label, value]) => ({ label, count: Number(value || 0) }))
+      .filter((item) => Number.isFinite(item.count))
+    const totalRows = entries.reduce((sum, item) => sum + item.count, 0)
+    const largest = entries.reduce<{ label: string; count: number } | null>(
+      (best, item) => (!best || item.count > best.count ? item : best),
+      null,
+    )
+    const noiseCount = entries.find((item) => String(item.label) === '-1')?.count || 0
+    const silhouette = Number(metrics.silhouette_score)
+    return [
+      { label: 'requested', value: String(summary.cluster_count ?? '-'), color: 'blue' },
+      { label: 'clusters', value: String(entries.filter((item) => String(item.label) !== '-1').length), color: 'purple' },
+      { label: 'rows', value: String(totalRows || summary.train_rows || 0), color: 'green' },
+      { label: 'largest', value: largest ? `${largest.label}: ${largest.count}` : '-', color: 'gold' },
+      { label: 'noise', value: String(noiseCount), color: noiseCount > 0 ? 'red' : 'default' },
+      { label: 'silhouette', value: Number.isFinite(silhouette) ? silhouette.toFixed(4) : '-', color: 'cyan' },
+    ]
+  }, [mlopsStage3RunSummary])
+  useEffect(() => {
+    if (!mlopsStudioOpen || nodeType !== 'mlops_transform') return
+    if (mlopsStage3TaskTypeDraft === 'clustering' && MLOPS_STAGE3_SUPERVISED_ONLY_VIZ_TYPES.has(mlopsStage3VizTypeDraft)) {
+      setMLOpsStage3VizTypeDraft('cluster_distribution')
+      return
+    }
+    if (mlopsStage3TaskTypeDraft !== 'clustering' && MLOPS_STAGE3_CLUSTER_ONLY_VIZ_TYPES.has(mlopsStage3VizTypeDraft)) {
+      setMLOpsStage3VizTypeDraft('split_bar')
+    }
+  }, [mlopsStudioOpen, nodeType, mlopsStage3TaskTypeDraft, mlopsStage3VizTypeDraft])
   useEffect(() => {
     if (!mlopsStudioOpen || nodeType !== 'mlops_transform') return
     const modelCatalog = MLOPS_STAGE3_MODEL_CATALOG[mlopsStage3TaskTypeDraft] || []
@@ -10986,6 +13061,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_stage3_sarima_seasonal_order: [mlopsStage3SARIMAPPDraft, mlopsStage3SARIMAPDDraft, mlopsStage3SARIMAQDraft, mlopsStage3SARIMASDraft],
       mlops_stage3_train_test_split: mlopsStage3TrainTestSplitDraft,
       mlops_stage3_cv_folds: mlopsStage3CvFoldsDraft,
+      mlops_stage3_cluster_count: mlopsStage3ClusterCountDraft,
       mlops_stage3_epochs: mlopsStage3EpochsDraft,
       mlops_stage3_batch_size: mlopsStage3BatchSizeDraft,
       mlops_stage3_random_seed: mlopsStage3RandomSeedDraft,
@@ -14667,6 +16743,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           : undefined,
         train_test_split: Math.max(0.05, Math.min(Number(mlopsStage3TrainTestSplitDraft || 0.2), 0.5)),
         cv_folds: Math.max(2, Math.min(Math.trunc(Number(mlopsStage3CvFoldsDraft || 5)), 20)),
+        cluster_count: Math.max(2, Math.min(Math.trunc(Number(mlopsStage3ClusterCountDraft || 4)), 100)),
         epochs: Math.max(1, Math.trunc(Number(mlopsStage3EpochsDraft || 20))),
         batch_size: Math.max(1, Math.trunc(Number(mlopsStage3BatchSizeDraft || 32))),
         random_seed: Math.trunc(Number(mlopsStage3RandomSeedDraft || 42)),
@@ -14706,6 +16783,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         auto_tune_orders: Boolean(backendSummary.auto_tune_orders ?? mlopsStage3ForecastAutoTuneOrdersDraft),
         order_search_budget: Number(backendSummary.order_search_budget || mlopsStage3ForecastOrderSearchMaxEvalsDraft || 0),
         cv_folds: Number(backendSummary.cv_folds || Math.max(2, Math.min(Math.trunc(Number(mlopsStage3CvFoldsDraft || 5)), 20))),
+        cluster_count: Number(backendSummary.cluster_count || Math.max(2, Math.min(Math.trunc(Number(mlopsStage3ClusterCountDraft || 4)), 100))),
         epochs: Number(backendSummary.epochs || Math.max(1, Math.trunc(Number(mlopsStage3EpochsDraft || 20)))),
         batch_size: Number(backendSummary.batch_size || Math.max(1, Math.trunc(Number(mlopsStage3BatchSizeDraft || 32)))),
         random_seed: Number(backendSummary.random_seed || Math.trunc(Number(mlopsStage3RandomSeedDraft || 42))),
@@ -14780,6 +16858,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage3SARIMASDraft,
     mlopsStage3TrainTestSplitDraft,
     mlopsStage3CvFoldsDraft,
+    mlopsStage3ClusterCountDraft,
     mlopsStage3EpochsDraft,
     mlopsStage3BatchSizeDraft,
     mlopsStage3RandomSeedDraft,
@@ -14959,6 +17038,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       ],
       mlops_stage3_train_test_split: mlopsStage3TrainTestSplitDraft,
       mlops_stage3_cv_folds: mlopsStage3CvFoldsDraft,
+      mlops_stage3_cluster_count: mlopsStage3ClusterCountDraft,
       mlops_stage3_epochs: mlopsStage3EpochsDraft,
       mlops_stage3_batch_size: mlopsStage3BatchSizeDraft,
       mlops_stage3_random_seed: mlopsStage3RandomSeedDraft,
@@ -15039,6 +17119,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage3SARIMASDraft,
     mlopsStage3TrainTestSplitDraft,
     mlopsStage3CvFoldsDraft,
+    mlopsStage3ClusterCountDraft,
     mlopsStage3EpochsDraft,
     mlopsStage3BatchSizeDraft,
     mlopsStage3RandomSeedDraft,
@@ -15134,6 +17215,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setMLOpsStage3SARIMASDraft(mlopsStage3SARIMASeasonalOrderConfigured[3])
     setMLOpsStage3TrainTestSplitDraft(mlopsStage3TrainTestSplitConfigured)
     setMLOpsStage3CvFoldsDraft(mlopsStage3CvFoldsConfigured)
+    setMLOpsStage3ClusterCountDraft(mlopsStage3ClusterCountConfigured)
     setMLOpsStage3EpochsDraft(mlopsStage3EpochsConfigured)
     setMLOpsStage3BatchSizeDraft(mlopsStage3BatchSizeConfigured)
     setMLOpsStage3RandomSeedDraft(mlopsStage3RandomSeedConfigured)
@@ -15239,6 +17321,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_stage3_sarima_seasonal_order: [...mlopsStage3SARIMASeasonalOrderConfigured],
       mlops_stage3_train_test_split: mlopsStage3TrainTestSplitConfigured,
       mlops_stage3_cv_folds: mlopsStage3CvFoldsConfigured,
+      mlops_stage3_cluster_count: mlopsStage3ClusterCountConfigured,
       mlops_stage3_epochs: mlopsStage3EpochsConfigured,
       mlops_stage3_batch_size: mlopsStage3BatchSizeConfigured,
       mlops_stage3_random_seed: mlopsStage3RandomSeedConfigured,
@@ -15314,6 +17397,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage3SARIMASeasonalOrderConfigured,
     mlopsStage3TrainTestSplitConfigured,
     mlopsStage3CvFoldsConfigured,
+    mlopsStage3ClusterCountConfigured,
     mlopsStage3EpochsConfigured,
     mlopsStage3BatchSizeConfigured,
     mlopsStage3RandomSeedConfigured,
@@ -19424,12 +21508,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         )
       case 'code':
       case 'json':
+        {
+          const editorValue = typeof val === 'string'
+            ? val
+            : val === undefined
+              ? String(field.defaultValue ?? '')
+              : toPreviewJsonText(val)
         return (
           <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 6, overflow: 'hidden' }}>
             <Editor
               height={field.language === 'python' ? '200px' : field.language === 'sql' ? '100px' : '120px'}
               language={field.language || (field.type === 'json' ? 'json' : 'plaintext')}
-              value={(val as string) ?? (field.defaultValue as string) ?? ''}
+              value={editorValue}
               onChange={v => handleFieldChange(field.name, v || '')}
               theme="vs-dark"
               options={{
@@ -19445,6 +21535,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             />
           </div>
         )
+        }
       default:
         return (
           <Input
@@ -19463,6 +21554,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
   const visibleFields = definition.configFields.filter((f) => {
     if (f.name.startsWith('_')) return false
+    if (nodeType === 'api_gateway' && (
+      f.name === 'input_parameters'
+      || f.name === 'output_fields'
+    )) {
+      return false
+    }
     if (nodeType === 'condition_node' && (f.name === 'field' || f.name === 'operator' || f.name === 'value')) {
       return false
     }
@@ -19492,6 +21589,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     return true
   })
   const canUseCustomFieldStudio = nodeType === 'map_transform'
+  const gatewayRuntimePath = gatewayDraftRuntimePath(gatewayStudioDraft)
 
   return (
     <>
@@ -19778,6 +21876,51 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       </Tag>
                     ) : null}
                   </Space>
+                </Space>
+              </div>
+            ) : null}
+
+            {nodeType === 'api_gateway' ? (
+              <div style={{
+                background: '#06b6d40f',
+                border: '1px solid #06b6d430',
+                borderRadius: 10,
+                padding: '10px 12px',
+                marginBottom: 12,
+              }}>
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  <Text style={{ color: '#06b6d4', fontSize: 12, fontWeight: 700 }}>
+                    Universal API Gateway
+                  </Text>
+                  <Space size={6} wrap>
+                    <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>
+                      {String(nodeConfig.route_method || 'GET').toUpperCase()}
+                    </Tag>
+                    <Tag style={{ background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1' }}>
+                      /gw/{String(nodeConfig.api_version || 'v1').replace(/^\/+|\/+$/g, '') || 'v1'}{String(nodeConfig.route_path || '/gateway').startsWith('/') ? String(nodeConfig.route_path || '/gateway') : `/${String(nodeConfig.route_path || 'gateway')}`}
+                    </Tag>
+                    <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b' }}>
+                      auth: {String(nodeConfig.auth_type || 'none')}
+                    </Tag>
+                    <Tag style={{ background: '#ec489914', border: '1px solid #ec489930', color: '#ec4899' }}>
+                      rate: {Number(nodeConfig.rate_limit_requests || 0) || 'off'}
+                    </Tag>
+                  </Space>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Connected upstream source becomes the route backend when the pipeline is saved.
+                  </Text>
+                  <Button
+                    size="small"
+                    onClick={openGatewayStudio}
+                    style={{
+                      width: '100%',
+                      background: '#06b6d41a',
+                      border: '1px solid #06b6d440',
+                      color: '#06b6d4',
+                    }}
+                  >
+                    Open Gateway Studio
+                  </Button>
                 </Space>
               </div>
             ) : null}
@@ -20080,6 +22223,1410 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       </div>
       </div>
     </Drawer>
+    <Modal
+      open={gatewayStudioOpen && nodeType === 'api_gateway'}
+      onCancel={requestCloseGatewayStudio}
+      footer={null}
+      closable={false}
+      centered
+          width="96vw"
+      styles={{
+        content: {
+          padding: 0,
+          borderRadius: 12,
+          overflow: 'hidden',
+          border: '1px solid var(--app-border-strong)',
+          background: 'var(--app-panel-bg)',
+          height: '90vh',
+          display: 'flex',
+          flexDirection: 'column',
+        },
+        body: {
+          padding: 0,
+          flex: 1,
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+        },
+      }}
+    >
+      <div
+        style={{
+          borderBottom: '1px solid var(--app-border-strong)',
+          background: 'var(--app-card-bg)',
+          padding: '12px 16px',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: 12,
+        }}
+      >
+        <div>
+          <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 16 }}>
+            Gateway Studio
+          </Text>
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+            Configure route creation, controls, deployment, and live monitoring for this API Gateway node.
+          </Text>
+        </div>
+        <Space size={8} wrap>
+          <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>
+            {gatewayStudioDraft.route_method || 'GET'}
+          </Tag>
+          <Tag style={{ background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1' }}>
+            {gatewayRuntimePath}
+          </Tag>
+          <Button size="small" icon={<ReloadOutlined />} loading={gatewayRoutesLoading || gatewayMonitorLoading} onClick={() => { void refreshGatewayStudioRoutes() }}>
+            Refresh
+          </Button>
+          <Button size="small" icon={<ArrowsAltOutlined />} onClick={openGatewayTester}>
+            API Tester
+          </Button>
+          <Button size="small" icon={<PlusSquareOutlined />} onClick={addGatewayRouteDraft}>
+            Add Route
+          </Button>
+          <Button type="primary" icon={<SaveOutlined />} loading={gatewayStudioSaving} onClick={() => { void saveGatewayStudioConfig() }}>
+            Save & Deploy
+          </Button>
+          <Button onClick={requestCloseGatewayStudio}>Close</Button>
+        </Space>
+      </div>
+
+      <div style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: 16 }}>
+        {gatewayStudioError ? (
+          <div style={{
+            border: '1px solid #ef444440',
+            background: '#ef444410',
+            borderRadius: 8,
+            padding: '8px 10px',
+            marginBottom: 12,
+          }}>
+            <Text style={{ color: '#ef4444', fontSize: 12 }}>{gatewayStudioError}</Text>
+          </div>
+        ) : null}
+
+        <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 10, marginBottom: 12 }}>
+          <Space style={{ width: '100%', justifyContent: 'space-between', alignItems: 'center' }} wrap>
+            <div>
+              <Text style={{ color: '#38bdf8', fontWeight: 700 }}>API Dashboard</Text>
+              <br />
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                Manage deployed routes, runtime health, protocol mix, and recent traffic for this gateway.
+              </Text>
+            </div>
+            <Space size={8} wrap>
+              <Input
+                allowClear
+                value={gatewayDashboardSearch}
+                onChange={(event) => setGatewayDashboardSearch(event.target.value)}
+                placeholder="Search APIs"
+                style={{ ...commonInputStyle, width: 200 }}
+              />
+              <Select
+                value={gatewayDashboardProtocol}
+                onChange={(value) => setGatewayDashboardProtocol(String(value || 'all'))}
+                style={{ width: 150 }}
+                options={[
+                  { value: 'all', label: 'All protocols' },
+                  { value: 'rest', label: 'REST' },
+                  { value: 'graphql', label: 'GraphQL' },
+                  { value: 'soap', label: 'SOAP' },
+                  { value: 'tcp', label: 'TCP/IP' },
+                ]}
+              />
+            </Space>
+          </Space>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(118px, 1fr))', gap: 8, marginTop: 10 }}>
+            {[
+              { label: 'APIs', value: gatewayDashboardStats.totalRoutes, color: '#38bdf8' },
+              { label: 'Enabled', value: gatewayDashboardStats.enabledRoutes, color: '#22c55e' },
+              { label: 'Disabled', value: gatewayDashboardStats.disabledRoutes, color: '#ef4444' },
+              { label: 'Requests', value: gatewayDashboardStats.requests, color: '#a855f7' },
+              { label: 'Success %', value: `${gatewayDashboardStats.successRate.toFixed(1)}%`, color: '#14b8a6' },
+              { label: 'Avg ms', value: gatewayDashboardStats.avgDuration.toFixed(1), color: '#f59e0b' },
+            ].map((item) => (
+              <div
+                key={item.label}
+                style={{
+                  border: '1px solid var(--app-border-strong)',
+                  borderRadius: 8,
+                  padding: '8px 10px',
+                  background: 'var(--app-panel-bg)',
+                  minHeight: 58,
+                }}
+              >
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{item.label}</Text>
+                <div style={{ color: item.color, fontWeight: 800, fontSize: 20, lineHeight: '24px', marginTop: 3 }}>
+                  {String(item.value)}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(420px, 1.1fr) minmax(320px, 0.9fr)', gap: 8, marginTop: 10, alignItems: 'start' }}>
+            <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8, minHeight: 222 }}>
+              <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                <Text style={{ color: '#22c55e', fontWeight: 700, fontSize: 12 }}>API Management</Text>
+                <Tag style={{ marginInlineEnd: 0, background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e' }}>
+                  {gatewayDashboardRoutes.length}/{gatewayVisibleRoutes.length}
+                </Tag>
+              </Space>
+              <Table
+                size="small"
+                rowKey={(record) => String(record?.id || record?.runtime_path || '')}
+                loading={gatewayRoutesLoading}
+                dataSource={gatewayDashboardRoutes}
+                pagination={{ pageSize: 4, size: 'small', showSizeChanger: false }}
+                tableLayout="fixed"
+                style={{ marginTop: 6 }}
+                onRow={(record) => ({
+                  onDoubleClick: () => loadGatewayRegisteredRouteIntoDraft(record as Record<string, unknown>),
+                })}
+                columns={[
+                  {
+                    title: 'API',
+                    key: 'api',
+                    width: 260,
+                    sorter: (a: any, b: any) => String(a?.name || a?.runtime_path || '').localeCompare(String(b?.name || b?.runtime_path || '')),
+                    render: (_value: unknown, record: any) => (
+                      <Space direction="vertical" size={1} style={{ width: '100%' }}>
+                        <Space size={4} style={{ width: '100%' }}>
+                          <Text ellipsis style={{ color: 'var(--app-text)', fontSize: 12, fontWeight: 700, maxWidth: 145 }}>{String(record?.name || 'Gateway Route')}</Text>
+                          <Tag style={{ marginInlineEnd: 0, background: `${gatewayProtocolColor(record?.protocol)}18`, border: `1px solid ${gatewayProtocolColor(record?.protocol)}50`, color: gatewayProtocolColor(record?.protocol), fontSize: 10 }}>
+                            {String(record?.protocol || 'rest').toUpperCase()}
+                          </Tag>
+                          <Tag color={record?.enabled === false ? 'red' : 'green'} style={{ marginInlineEnd: 0, fontSize: 10 }}>
+                            {record?.enabled === false ? 'off' : 'on'}
+                          </Tag>
+                        </Space>
+                        <Text copyable={{ text: String(record?.runtime_path || '') }} ellipsis style={{ color: 'var(--app-text-subtle)', fontSize: 11, width: '100%' }}>
+                          {String(record?.runtime_path || '-')}
+                        </Text>
+                      </Space>
+                    ),
+                  },
+                  {
+                    title: 'Calls',
+                    key: 'calls',
+                    width: 92,
+                    sorter: (a: any, b: any) => {
+                      const aMetrics = gatewayRouteMetricsById[String(a?.id || '')] || {}
+                      const bMetrics = gatewayRouteMetricsById[String(b?.id || '')] || {}
+                      return gatewayNumber(aMetrics.requests, 0) - gatewayNumber(bMetrics.requests, 0)
+                    },
+                    render: (_value: unknown, record: any) => {
+                      const metrics = gatewayRouteMetricsById[String(record?.id || '')] || {}
+                      return (
+                        <Space direction="vertical" size={0}>
+                          <Text style={{ color: '#a855f7', fontWeight: 700, fontSize: 12 }}>{gatewayNumber(metrics.requests, 0)}</Text>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10 }}>{gatewayPercent(metrics.success_rate).toFixed(0)}% ok</Text>
+                        </Space>
+                      )
+                    },
+                  },
+                  {
+                    title: '',
+                    key: 'actions',
+                    width: 152,
+                    filters: [
+                      { text: 'REST', value: 'protocol:rest' },
+                      { text: 'GraphQL', value: 'protocol:graphql' },
+                      { text: 'SOAP', value: 'protocol:soap' },
+                      { text: 'TCP/IP', value: 'protocol:tcp' },
+                      { text: 'Enabled', value: 'state:on' },
+                      { text: 'Disabled', value: 'state:off' },
+                    ],
+                    onFilter: (value, record: any) => {
+                      const text = String(value || '')
+                      if (text.startsWith('protocol:')) return String(record?.protocol || '').toLowerCase() === text.slice('protocol:'.length)
+                      if (text === 'state:on') return record?.enabled !== false
+                      if (text === 'state:off') return record?.enabled === false
+                      return true
+                    },
+                    render: (_value: unknown, record: any) => (
+                      <Space size={4}>
+                        <Button size="small" onClick={() => loadGatewayRegisteredRouteIntoDraft(record)}>Select</Button>
+                        <Button size="small" icon={<CopyOutlined />} onClick={() => copyGatewayRoutePath(record)} />
+                        <Button size="small" danger={record?.enabled !== false} onClick={() => { void toggleGatewayRegisteredRoute(record) }}>
+                          {record?.enabled === false ? 'On' : 'Off'}
+                        </Button>
+                        <Popconfirm
+                          title="Permanently delete API route?"
+                          description="This removes the deployed route, pipeline route config, and route logs."
+                          okText="Delete Permanently"
+                          okButtonProps={{ danger: true }}
+                          onConfirm={() => { void deleteGatewayRegisteredRoute(record) }}
+                        >
+                          <Button size="small" danger icon={<DeleteOutlined />} />
+                        </Popconfirm>
+                      </Space>
+                    ),
+                  },
+                ]}
+              />
+            </div>
+            <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8, minHeight: 222 }}>
+              <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 12 }}>API Traffic</Text>
+              <Plot
+                data={[
+                  {
+                    type: 'bar',
+                    orientation: 'h',
+                    y: gatewayDashboardStats.apiTrafficChart.map((item) => item.name),
+                    x: gatewayDashboardStats.apiTrafficChart.map((item) => item.requests),
+                    marker: { color: gatewayDashboardStats.apiTrafficChart.map((item) => gatewayProtocolColor(item.protocol)) },
+                    name: 'requests',
+                  } as any,
+                  {
+                    type: 'bar',
+                    orientation: 'h',
+                    y: gatewayDashboardStats.apiTrafficChart.map((item) => item.name),
+                    x: gatewayDashboardStats.apiTrafficChart.map((item) => item.failed),
+                    marker: { color: '#ef4444' },
+                    name: 'failed',
+                  } as any,
+                ]}
+                layout={{
+                  autosize: true,
+                  height: 178,
+                  barmode: 'overlay',
+                  margin: { l: 96, r: 12, t: 8, b: 26 },
+                  paper_bgcolor: 'rgba(0,0,0,0)',
+                  plot_bgcolor: 'rgba(0,0,0,0)',
+                  font: { color: '#cbd5e1', size: 10 },
+                  xaxis: { gridcolor: '#33415555', rangemode: 'tozero' },
+                  yaxis: { gridcolor: '#33415555', automargin: true },
+                  showlegend: false,
+                } as any}
+                config={{ displayModeBar: false, responsive: true }}
+                style={{ width: '100%', height: 178 }}
+                useResizeHandler
+              />
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 8, marginTop: 10 }}>
+            <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8, minHeight: 146 }}>
+              <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 12 }}>Protocol Mix</Text>
+              <Plot
+                data={[{
+                  type: 'bar',
+                  x: gatewayDashboardStats.protocolChart.map((item) => item.name.toUpperCase()),
+                  y: gatewayDashboardStats.protocolChart.map((item) => item.value),
+                  marker: { color: gatewayDashboardStats.protocolChart.map((item) => gatewayProtocolColor(item.name)) },
+                } as any]}
+                layout={{
+                  autosize: true,
+                  height: 112,
+                  margin: { l: 34, r: 10, t: 8, b: 34 },
+                  paper_bgcolor: 'rgba(0,0,0,0)',
+                  plot_bgcolor: 'rgba(0,0,0,0)',
+                  font: { color: '#cbd5e1', size: 10 },
+                  xaxis: { gridcolor: '#33415555' },
+                  yaxis: { gridcolor: '#33415555', rangemode: 'tozero' },
+                } as any}
+                config={{ displayModeBar: false, responsive: true }}
+                style={{ width: '100%', height: 112 }}
+                useResizeHandler
+              />
+            </div>
+            <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8, minHeight: 146 }}>
+              <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 12 }}>Status Codes</Text>
+              <Plot
+                data={[{
+                  type: 'bar',
+                  x: gatewayDashboardStats.statusChart.map((item) => item.name),
+                  y: gatewayDashboardStats.statusChart.map((item) => item.value),
+                  marker: { color: gatewayDashboardStats.statusChart.map((item) => gatewayNumber(item.name, 0) >= 400 ? '#ef4444' : '#22c55e') },
+                } as any]}
+                layout={{
+                  autosize: true,
+                  height: 112,
+                  margin: { l: 34, r: 10, t: 8, b: 34 },
+                  paper_bgcolor: 'rgba(0,0,0,0)',
+                  plot_bgcolor: 'rgba(0,0,0,0)',
+                  font: { color: '#cbd5e1', size: 10 },
+                  xaxis: { gridcolor: '#33415555' },
+                  yaxis: { gridcolor: '#33415555', rangemode: 'tozero' },
+                } as any}
+                config={{ displayModeBar: false, responsive: true }}
+                style={{ width: '100%', height: 112 }}
+                useResizeHandler
+              />
+            </div>
+            <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8, minHeight: 146 }}>
+              <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 12 }}>Latency Trend</Text>
+                <Tag style={{ marginInlineEnd: 0, background: '#f59e0b14', border: '1px solid #f59e0b40', color: '#f59e0b' }}>
+                  max {gatewayDashboardStats.maxDuration.toFixed(1)} ms
+                </Tag>
+              </Space>
+              <Plot
+                data={[{
+                  type: 'scatter',
+                  mode: 'lines+markers',
+                  x: gatewayDashboardStats.latencyPoints.map((item) => item.x),
+                  y: gatewayDashboardStats.latencyPoints.map((item) => item.y),
+                  line: { color: '#06b6d4', width: 2 },
+                  marker: { color: '#38bdf8', size: 5 },
+                } as any]}
+                layout={{
+                  autosize: true,
+                  height: 112,
+                  margin: { l: 42, r: 10, t: 8, b: 34 },
+                  paper_bgcolor: 'rgba(0,0,0,0)',
+                  plot_bgcolor: 'rgba(0,0,0,0)',
+                  font: { color: '#cbd5e1', size: 10 },
+                  xaxis: { gridcolor: '#33415555', showticklabels: false },
+                  yaxis: { gridcolor: '#33415555', rangemode: 'tozero', title: 'ms' },
+                } as any}
+                config={{ displayModeBar: false, responsive: true }}
+                style={{ width: '100%', height: 112 }}
+                useResizeHandler
+              />
+            </div>
+          </div>
+        </div>
+
+        {gatewayRouteEditorOpen ? (
+          <div
+            style={{
+              position: 'fixed',
+              inset: '6vh 3vw',
+              zIndex: 2400,
+              display: 'flex',
+              flexDirection: 'column',
+              background: 'var(--app-panel-bg)',
+              border: '1px solid var(--app-border-strong)',
+              borderRadius: 12,
+              overflow: 'hidden',
+              boxShadow: '0 24px 80px rgba(0, 0, 0, 0.48)',
+            }}
+          >
+            <div
+              style={{
+                borderBottom: '1px solid var(--app-border-strong)',
+                background: 'var(--app-card-bg)',
+                padding: '10px 14px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 12,
+              }}
+            >
+              <div>
+                <Text style={{ color: 'var(--app-text)', fontWeight: 800, fontSize: 15 }}>
+                  Route Management
+                </Text>
+                <br />
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                  Configure the selected API route, request parameters, backend binding, controls, and response mapping.
+                </Text>
+              </div>
+              <Space size={8} wrap>
+                <Tag style={{ marginInlineEnd: 0, background: `${gatewayProtocolColor(gatewayStudioDraft.protocol)}18`, border: `1px solid ${gatewayProtocolColor(gatewayStudioDraft.protocol)}50`, color: gatewayProtocolColor(gatewayStudioDraft.protocol) }}>
+                  {String(gatewayStudioDraft.protocol || 'rest').toUpperCase()}
+                </Tag>
+                <Tag style={{ marginInlineEnd: 0, background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1' }}>
+                  {gatewayRuntimePath}
+                </Tag>
+                <Button
+                  size="small"
+                  icon={<ReloadOutlined />}
+                  loading={gatewayRoutesLoading || gatewayMonitorLoading}
+                  onClick={() => {
+                    void refreshGatewayStudioRoutes()
+                    void loadGatewayRouteMonitor(gatewayRouteId)
+                  }}
+                >
+                  Refresh
+                </Button>
+                <Button size="small" icon={<SaveOutlined />} type="primary" loading={gatewayStudioSaving} onClick={() => { void saveGatewayStudioConfig() }}>
+                  Save Route
+                </Button>
+                <Button size="small" icon={<CloseOutlined />} onClick={closeGatewayRouteEditor}>
+                  Close
+                </Button>
+              </Space>
+            </div>
+            <div style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: 12 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(330px, 0.82fr) minmax(430px, 1.18fr)', gap: 12 }}>
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 12 }}>
+              <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                <Text style={{ color: '#06b6d4', fontWeight: 700 }}>Route Configuration</Text>
+                <Tag style={{ marginInlineEnd: 0, background: '#06b6d414', border: '1px solid #06b6d440', color: '#06b6d4' }}>
+                  editing {gatewayActiveRouteIndex + 1}/{Math.max(1, gatewayRouteDrafts.length)}
+                </Tag>
+              </Space>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', marginTop: 6 }}>
+                Use API Management above to search, sort, filter, and select deployed routes for editing.
+              </Text>
+              <Input
+                value={gatewayRouteId}
+                disabled
+                addonBefore="Route ID"
+                style={{ ...commonInputStyle, marginTop: 10 }}
+              />
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 96px', gap: 8, marginTop: 10 }}>
+                <Input
+                  value={gatewayStudioDraft.gateway_name}
+                  placeholder="Gateway route name"
+                  onChange={(event) => setGatewayStudioDraft((prev) => ({ ...prev, gateway_name: event.target.value }))}
+                  style={commonInputStyle}
+                />
+                <Switch
+                  checked={gatewayStudioDraft.enabled}
+                  checkedChildren="Enabled"
+                  unCheckedChildren="Disabled"
+                  onChange={(checked) => setGatewayStudioDraft((prev) => ({ ...prev, enabled: checked }))}
+                />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginTop: 8 }}>
+                <Select
+                  value={gatewayStudioDraft.protocol}
+                  onChange={(value) => setGatewayStudioDraft((prev) => {
+                    const protocol = normalizeGatewayProtocol(value)
+                    const defaultMethod = ['graphql', 'soap', 'tcp'].includes(protocol) ? 'POST' : prev.route_method
+                    return { ...prev, protocol, route_method: defaultMethod }
+                  })}
+                  options={[
+                    { value: 'rest', label: 'REST' },
+                    { value: 'graphql', label: 'GraphQL' },
+                    { value: 'soap', label: 'SOAP' },
+                    { value: 'tcp', label: 'TCP/IP Adapter' },
+                  ]}
+                />
+                <Input
+                  value={gatewayStudioDraft.api_version}
+                  placeholder="v1"
+                  onChange={(event) => setGatewayStudioDraft((prev) => ({ ...prev, api_version: event.target.value }))}
+                  style={commonInputStyle}
+                />
+                <Select
+                  value={gatewayStudioDraft.route_method}
+                  onChange={(value) => setGatewayStudioDraft((prev) => ({ ...prev, route_method: String(value || 'GET') }))}
+                  options={['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'ANY'].map((value) => ({ value, label: value }))}
+                />
+              </div>
+              <Input
+                value={gatewayStudioDraft.route_path}
+                placeholder="/customers/{customer_id}"
+                onChange={(event) => setGatewayStudioDraft((prev) => ({ ...prev, route_path: event.target.value }))}
+                style={{ ...commonInputStyle, marginTop: 8 }}
+              />
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', marginTop: 6 }}>
+                Runtime path: {gatewayRuntimePath}
+              </Text>
+            </div>
+
+            <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 12 }}>
+              <Text style={{ color: '#14b8a6', fontWeight: 700 }}>Backend Source</Text>
+              <Select
+                showSearch
+                allowClear
+                placeholder="Select connected or available source"
+                value={gatewayStudioDraft.source_node_id || undefined}
+                options={gatewaySourceOptions}
+                optionFilterProp="searchText"
+                optionLabelProp="title"
+                onChange={(value) => setGatewayStudioDraft((prev) => ({ ...prev, source_node_id: String(value || '') }))}
+                style={{ width: '100%', marginTop: 10 }}
+              />
+              <Text style={{ color: '#f59e0b', fontWeight: 700, fontSize: 12, display: 'block', marginTop: 10 }}>
+                Execution Trigger (optional)
+              </Text>
+              <Select
+                mode="multiple"
+                showSearch
+                allowClear
+                placeholder="Select one or more trigger/start nodes"
+                value={gatewayStudioDraft.trigger_node_ids}
+                options={gatewaySourceOptions}
+                optionFilterProp="searchText"
+                optionLabelProp="title"
+                onChange={(values) => setGatewayStudioDraft((prev) => ({
+                  ...prev,
+                  trigger_node_ids: values.map((item) => String(item || '').trim()).filter(Boolean),
+                }))}
+                style={{ width: '100%', marginTop: 6 }}
+              />
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', marginTop: 6 }}>
+                Leave trigger empty to return source output. Select trigger nodes to execute the pipeline first; API still returns the selected Backend Source output.
+              </Text>
+              <div
+                style={{
+                  border: '1px solid var(--app-border-strong)',
+                  borderRadius: 8,
+                  background: 'var(--app-panel-bg)',
+                  padding: 8,
+                  marginTop: 8,
+                  maxHeight: 170,
+                  overflow: 'auto',
+                }}
+              >
+                <Space style={{ width: '100%', justifyContent: 'space-between', marginBottom: 6 }}>
+                  <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 12 }}>
+                    Available Source / Trigger Nodes
+                  </Text>
+                  <Tag style={{ marginInlineEnd: 0 }}>{gatewayAllUpstreamSources.length}</Tag>
+                </Space>
+                {gatewayAllUpstreamSources.length === 0 ? (
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                    No connected or available source/transform node was found in this pipeline.
+                  </Text>
+                ) : (
+                  <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                    {gatewayAllUpstreamSources.map((src) => {
+                      const selected = String(gatewaySelectedSourceNodeId || '') === String(src.id || '')
+                      const triggerSelected = parseStringList(gatewayStudioDraft.trigger_node_ids).includes(String(src.id || ''))
+                      const connectionLabel = src.isConnected ? 'Connected' : 'Disconnected'
+                      const scopeLabel = src.isDirect ? 'Direct' : src.isConnected ? 'Upstream' : 'Available'
+                      return (
+                        <button
+                          key={src.id}
+                          type="button"
+                          onClick={() => setGatewayStudioDraft((prev) => ({ ...prev, source_node_id: src.id }))}
+                          style={{
+                            width: '100%',
+                            textAlign: 'left',
+                            border: selected || triggerSelected ? '1px solid #14b8a6' : '1px solid var(--app-border-strong)',
+                            borderRadius: 8,
+                            background: selected || triggerSelected ? '#14b8a614' : 'var(--app-card-bg)',
+                            padding: '7px 9px',
+                            cursor: 'pointer',
+                          }}
+                        >
+                          <Space style={{ width: '100%', justifyContent: 'space-between' }} align="start">
+                            <div style={{ minWidth: 0 }}>
+                              <Text ellipsis style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 12, display: 'block' }}>
+                                {src.label}
+                              </Text>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                                {readableNodeTypeLabel(src.nodeType)} • {src.fields.length} fields • {src.id.slice(0, 8)}
+                              </Text>
+                            </div>
+                            <Tag color={src.isDirect ? 'green' : 'blue'} style={{ marginInlineEnd: 0, fontSize: 10 }}>
+                              {scopeLabel}
+                            </Tag>
+                            <Tag color={src.isConnected ? 'green' : 'red'} style={{ marginInlineEnd: 0, fontSize: 10 }}>
+                              {connectionLabel}
+                            </Tag>
+                            {triggerSelected ? (
+                              <Tag color="orange" style={{ marginInlineEnd: 0, fontSize: 10 }}>
+                                Trigger
+                              </Tag>
+                            ) : null}
+                          </Space>
+                        </button>
+                      )
+                    })}
+                  </Space>
+                )}
+              </div>
+              <Input.TextArea
+                value={gatewayStudioDraft.source_config_text}
+                onChange={(event) => setGatewayStudioDraft((prev) => ({ ...prev, source_config_text: event.target.value }))}
+                rows={5}
+                style={{ ...commonInputStyle, fontFamily: 'monospace', fontSize: 12, marginTop: 8 }}
+                placeholder="{}"
+              />
+            </div>
+
+            <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 12 }}>
+              <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                <Text style={{ color: '#38bdf8', fontWeight: 700 }}>Input Parameters</Text>
+                <Space size={6}>
+                  <Button size="small" onClick={addGatewayInputParametersFromOutputFields}>Add From Output</Button>
+                  <Button size="small" onClick={addGatewayInputParameter}>Add Parameter</Button>
+                </Space>
+              </Space>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', marginTop: 6 }}>
+                Bind request values to source fields. The backend generates the filter before the source is called.
+              </Text>
+              {(gatewayStudioDraft.input_parameters || []).length === 0 ? (
+                <div style={{
+                  border: '1px dashed var(--app-border-strong)',
+                  borderRadius: 8,
+                  padding: 10,
+                  marginTop: 10,
+                  color: 'var(--app-text-subtle)',
+                  fontSize: 12,
+                }}>
+                  No input parameters configured.
+                </div>
+              ) : (
+                <Space direction="vertical" size={10} style={{ width: '100%', marginTop: 10 }}>
+                  {(gatewayStudioDraft.input_parameters || []).map((param) => (
+                    <div
+                      key={param.id}
+                      style={{
+                        border: '1px solid var(--app-border-strong)',
+                        borderRadius: 8,
+                        padding: 10,
+                        background: 'var(--app-panel-bg)',
+                      }}
+                    >
+                      <Space style={{ width: '100%', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <Space size={6} wrap>
+                          <Tag style={{ marginInlineEnd: 0, background: '#38bdf814', border: '1px solid #38bdf840', color: '#38bdf8' }}>
+                            {param.name || 'new_parameter'}
+                          </Tag>
+                          <Tag style={{ marginInlineEnd: 0 }}>
+                            {param.location}
+                          </Tag>
+                          <Tag color={param.required ? 'red' : 'default'} style={{ marginInlineEnd: 0 }}>
+                            {param.required ? 'required' : 'optional'}
+                          </Tag>
+                        </Space>
+                        <Button
+                          size="small"
+                          danger
+                          icon={<DeleteOutlined />}
+                          onClick={() => removeGatewayInputParameter(param.id)}
+                        />
+                      </Space>
+
+                      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(160px, 0.9fr) minmax(220px, 1.2fr)', gap: 8, marginTop: 10 }}>
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Parameter name</Text>
+                          <Input
+                            value={param.name}
+                            placeholder="customer_account"
+                            onChange={(event) => updateGatewayInputParameter(param.id, { name: event.target.value })}
+                            style={{ ...commonInputStyle, marginTop: 4 }}
+                          />
+                        </div>
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Backend filter field</Text>
+                          <Select
+                            showSearch
+                            allowClear
+                            value={param.source_field || undefined}
+                            placeholder="DOCUMENT_JSON.CUSTOMER_PROFILE.customer_account"
+                            options={gatewayOutputFieldOptions}
+                            onChange={(value) => {
+                              const sourceField = String(value || '').trim()
+                              updateGatewayInputParameter(param.id, {
+                                source_field: sourceField,
+                                name: param.name || gatewayLeafNameFromField(sourceField),
+                              })
+                            }}
+                            style={{ width: '100%', marginTop: 4 }}
+                          />
+                        </div>
+                      </div>
+
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginTop: 8 }}>
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Request source</Text>
+                          <Select
+                            value={param.location}
+                            onChange={(value) => updateGatewayInputParameter(param.id, { location: normalizeGatewayInputLocation(value) })}
+                            options={[
+                              { value: 'path', label: 'Path' },
+                              { value: 'query', label: 'Query' },
+                              { value: 'header', label: 'Header' },
+                              { value: 'body', label: 'Body' },
+                            ]}
+                            style={{ width: '100%', marginTop: 4 }}
+                          />
+                        </div>
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Data type</Text>
+                          <Select
+                            value={param.data_type}
+                            onChange={(value) => updateGatewayInputParameter(param.id, { data_type: normalizeGatewayInputDataType(value) })}
+                            options={[
+                              { value: 'string', label: 'String' },
+                              { value: 'number', label: 'Number' },
+                              { value: 'integer', label: 'Integer' },
+                              { value: 'boolean', label: 'Boolean' },
+                              { value: 'json', label: 'JSON' },
+                            ]}
+                            style={{ width: '100%', marginTop: 4 }}
+                          />
+                        </div>
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Filter operator</Text>
+                          <Select
+                            value={param.operator || 'equals'}
+                            onChange={(value) => updateGatewayInputParameter(param.id, { operator: String(value || 'equals') })}
+                            options={[
+                              { value: 'equals', label: 'Equals' },
+                              { value: 'contains', label: 'Contains' },
+                              { value: 'gt', label: 'Greater than' },
+                              { value: 'gte', label: 'Greater/equal' },
+                              { value: 'lt', label: 'Less than' },
+                              { value: 'lte', label: 'Less/equal' },
+                            ]}
+                            style={{ width: '100%', marginTop: 4 }}
+                          />
+                        </div>
+                      </div>
+
+                      <div style={{ display: 'grid', gridTemplateColumns: '118px 1fr', gap: 8, marginTop: 8, alignItems: 'end' }}>
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Required</Text>
+                          <div style={{ marginTop: 6 }}>
+                            <Switch
+                              checked={param.required}
+                              checkedChildren="Required"
+                              unCheckedChildren="Optional"
+                              onChange={(checked) => updateGatewayInputParameter(param.id, { required: checked })}
+                            />
+                          </div>
+                        </div>
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Default value</Text>
+                          <Input
+                            value={param.default_value}
+                            placeholder="Used when request value is missing"
+                            onChange={(event) => updateGatewayInputParameter(param.id, { default_value: event.target.value })}
+                            style={{ ...commonInputStyle, marginTop: 4 }}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </Space>
+              )}
+            </div>
+
+            <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 12 }}>
+              <Text style={{ color: '#f59e0b', fontWeight: 700 }}>Controls</Text>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 10 }}>
+                <Select
+                  value={gatewayStudioDraft.auth_type}
+                  onChange={(value) => setGatewayStudioDraft((prev) => ({ ...prev, auth_type: normalizeGatewayAuthType(value) }))}
+                  options={[
+                    { value: 'none', label: 'No Auth' },
+                    { value: 'bearer', label: 'Bearer Token' },
+                    { value: 'jwt', label: 'JWT HS256' },
+                  ]}
+                />
+                <Input
+                  value={gatewayStudioDraft.rbac_roles}
+                  placeholder="Allowed roles: admin,service"
+                  onChange={(event) => setGatewayStudioDraft((prev) => ({ ...prev, rbac_roles: event.target.value }))}
+                  style={commonInputStyle}
+                />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 8 }}>
+                <Input.Password
+                  value={gatewayStudioDraft.auth_token}
+                  placeholder="Bearer token"
+                  onChange={(event) => setGatewayStudioDraft((prev) => ({ ...prev, auth_token: event.target.value }))}
+                  style={commonInputStyle}
+                />
+                <Input.Password
+                  value={gatewayStudioDraft.jwt_secret}
+                  placeholder="JWT secret"
+                  onChange={(event) => setGatewayStudioDraft((prev) => ({ ...prev, jwt_secret: event.target.value }))}
+                  style={commonInputStyle}
+                />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 8 }}>
+                <Input
+                  value={gatewayStudioDraft.jwt_issuer}
+                  placeholder="JWT issuer"
+                  onChange={(event) => setGatewayStudioDraft((prev) => ({ ...prev, jwt_issuer: event.target.value }))}
+                  style={commonInputStyle}
+                />
+                <Input
+                  value={gatewayStudioDraft.jwt_audience}
+                  placeholder="JWT audience"
+                  onChange={(event) => setGatewayStudioDraft((prev) => ({ ...prev, jwt_audience: event.target.value }))}
+                  style={commonInputStyle}
+                />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 8 }}>
+                <InputNumber
+                  value={gatewayStudioDraft.rate_limit_requests}
+                  min={0}
+                  placeholder="Rate limit requests"
+                  onChange={(value) => setGatewayStudioDraft((prev) => ({ ...prev, rate_limit_requests: Number(value || 0) }))}
+                  style={{ width: '100%' }}
+                />
+                <InputNumber
+                  value={gatewayStudioDraft.rate_limit_window_seconds}
+                  min={1}
+                  placeholder="Rate window seconds"
+                  onChange={(value) => setGatewayStudioDraft((prev) => ({ ...prev, rate_limit_window_seconds: Number(value || 60) }))}
+                  style={{ width: '100%' }}
+                />
+              </div>
+              <Space size={14} wrap style={{ marginTop: 10 }}>
+                <Space size={6}><Switch checked={gatewayStudioDraft.standard_response} onChange={(checked) => setGatewayStudioDraft((prev) => ({ ...prev, standard_response: checked }))} /><Text style={{ color: 'var(--app-text-muted)', fontSize: 12 }}>Standard response</Text></Space>
+                <Space size={6}><Switch checked={gatewayStudioDraft.audit_enabled} onChange={(checked) => setGatewayStudioDraft((prev) => ({ ...prev, audit_enabled: checked }))} /><Text style={{ color: 'var(--app-text-muted)', fontSize: 12 }}>Audit</Text></Space>
+                <Space size={6}><Switch checked={gatewayStudioDraft.logging_enabled} onChange={(checked) => setGatewayStudioDraft((prev) => ({ ...prev, logging_enabled: checked }))} /><Text style={{ color: 'var(--app-text-muted)', fontSize: 12 }}>Logging</Text></Space>
+              </Space>
+            </div>
+          </Space>
+
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 12 }}>
+              <Text style={{ color: '#a855f7', fontWeight: 700 }}>Mapping & Response</Text>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 160px', gap: 8, marginTop: 10 }}>
+                <Input.TextArea
+                  value={gatewayStudioDraft.request_mapping_text}
+                  onChange={(event) => setGatewayStudioDraft((prev) => ({ ...prev, request_mapping_text: event.target.value }))}
+                  rows={4}
+                  style={{ ...commonInputStyle, fontFamily: 'monospace', fontSize: 12 }}
+                  placeholder="{}"
+                />
+                <InputNumber
+                  value={gatewayStudioDraft.response_limit}
+                  min={1}
+                  max={50000}
+                  onChange={(value) => setGatewayStudioDraft((prev) => ({ ...prev, response_limit: Number(value || 1000) }))}
+                  style={{ width: '100%' }}
+                  addonBefore="Limit"
+                />
+              </div>
+              <Input.TextArea
+                value={gatewayStudioDraft.response_mapping_text}
+                onChange={(event) => setGatewayStudioDraft((prev) => ({ ...prev, response_mapping_text: event.target.value }))}
+                rows={4}
+                style={{ ...commonInputStyle, fontFamily: 'monospace', fontSize: 12, marginTop: 8 }}
+                placeholder={'{"limit":1000}'}
+              />
+              <Select
+                mode="tags"
+                allowClear
+                placeholder="Select output fields to expose"
+                value={gatewayStudioDraft.output_fields}
+                options={gatewayOutputFieldOptions}
+                onChange={(values) => setGatewayStudioDraft((prev) => ({ ...prev, output_fields: values.map((item) => String(item || '').trim()).filter(Boolean) }))}
+                style={{ width: '100%', marginTop: 8 }}
+              />
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 8, marginTop: 8 }}>
+                <Input
+                  value={gatewayStudioDraft.graphql_field}
+                  placeholder="GraphQL root field"
+                  addonBefore="GraphQL"
+                  onChange={(event) => setGatewayStudioDraft((prev) => ({ ...prev, graphql_field: event.target.value }))}
+                  style={commonInputStyle}
+                />
+              </div>
+            </div>
+
+            <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 12 }}>
+              <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+                <Text style={{ color: '#22c55e', fontWeight: 700 }}>Selected API Runtime</Text>
+                <Space size={6} wrap>
+                  <Tag style={{ marginInlineEnd: 0 }}>requests: {String(gatewayMetrics?.requests ?? 0)}</Tag>
+                  <Tag style={{ marginInlineEnd: 0 }}>avg ms: {String(gatewayMetrics?.avg_duration_ms ?? 0)}</Tag>
+                  <Tag style={{ marginInlineEnd: 0 }}>logs: {gatewayLogs.length}</Tag>
+                </Space>
+              </Space>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 10 }}>
+                <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8, minHeight: 210 }}>
+                  <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 12 }}>API Latency</Text>
+                  <Plot
+                    data={[{
+                      type: 'scatter',
+                      mode: 'lines+markers',
+                      x: gatewaySelectedRouteRuntimeStats.latencyPoints.map((item) => item.x),
+                      y: gatewaySelectedRouteRuntimeStats.latencyPoints.map((item) => item.y),
+                      line: { color: '#06b6d4', width: 2 },
+                      marker: { color: '#38bdf8', size: 5 },
+                      name: 'duration_ms',
+                    } as any]}
+                    layout={{
+                      autosize: true,
+                      height: 176,
+                      margin: { l: 42, r: 10, t: 8, b: 30 },
+                      paper_bgcolor: 'rgba(0,0,0,0)',
+                      plot_bgcolor: 'rgba(0,0,0,0)',
+                      font: { color: '#cbd5e1', size: 10 },
+                      xaxis: { gridcolor: '#33415555', showticklabels: false },
+                      yaxis: { gridcolor: '#33415555', rangemode: 'tozero', title: 'ms' },
+                    } as any}
+                    config={{ displayModeBar: false, responsive: true }}
+                    style={{ width: '100%', height: 176, marginTop: 6 }}
+                    useResizeHandler
+                  />
+                </div>
+                <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8, minHeight: 210 }}>
+                  <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 12 }}>Request Counts</Text>
+                  <Plot
+                    data={[
+                      {
+                        type: 'bar',
+                        x: gatewaySelectedRouteRuntimeStats.requestBars.map((item) => item.name),
+                        y: gatewaySelectedRouteRuntimeStats.requestBars.map((item) => item.value),
+                        marker: { color: gatewaySelectedRouteRuntimeStats.requestBars.map((item) => item.color) },
+                        name: 'requests',
+                      } as any,
+                      {
+                        type: 'bar',
+                        x: gatewaySelectedRouteRuntimeStats.statusBars.map((item) => item.name),
+                        y: gatewaySelectedRouteRuntimeStats.statusBars.map((item) => item.value),
+                        marker: { color: gatewaySelectedRouteRuntimeStats.statusBars.map((item) => item.color) },
+                        name: 'status',
+                        visible: 'legendonly',
+                      } as any,
+                    ]}
+                    layout={{
+                      autosize: true,
+                      height: 176,
+                      margin: { l: 38, r: 10, t: 8, b: 34 },
+                      paper_bgcolor: 'rgba(0,0,0,0)',
+                      plot_bgcolor: 'rgba(0,0,0,0)',
+                      font: { color: '#cbd5e1', size: 10 },
+                      xaxis: { gridcolor: '#33415555' },
+                      yaxis: { gridcolor: '#33415555', rangemode: 'tozero' },
+                      showlegend: false,
+                    } as any}
+                    config={{ displayModeBar: false, responsive: true }}
+                    style={{ width: '100%', height: 176, marginTop: 6 }}
+                    useResizeHandler
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '220px 1fr', gap: 12 }}>
+              <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 12 }}>
+                <Text style={{ color: '#0ea5e9', fontWeight: 700 }}>Metrics</Text>
+                <Space direction="vertical" size={6} style={{ width: '100%', marginTop: 10 }}>
+                  <Tag style={{ width: '100%', marginInlineEnd: 0 }}>requests: {String(gatewayMetrics?.requests ?? 0)}</Tag>
+                  <Tag style={{ width: '100%', marginInlineEnd: 0 }}>success: {String(gatewayMetrics?.success ?? 0)}</Tag>
+                  <Tag style={{ width: '100%', marginInlineEnd: 0 }}>failed: {String(gatewayMetrics?.failed ?? 0)}</Tag>
+                  <Tag style={{ width: '100%', marginInlineEnd: 0 }}>avg ms: {String(gatewayMetrics?.avg_duration_ms ?? 0)}</Tag>
+                </Space>
+              </div>
+              <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 12 }}>
+                <Text style={{ color: '#ec4899', fontWeight: 700 }}>Recent Logs</Text>
+                <Table
+                  size="small"
+                  rowKey={(record) => String(record?.id || record?.request_id || Math.random())}
+                  loading={gatewayMonitorLoading}
+                  dataSource={gatewayLogs}
+                  pagination={{ pageSize: 5, size: 'small' }}
+                  style={{ marginTop: 8 }}
+                  columns={[
+                    { title: 'Status', dataIndex: 'status_code', key: 'status_code', width: 80 },
+                    { title: 'Path', dataIndex: 'path', key: 'path' },
+                    { title: 'Duration', dataIndex: 'duration_ms', key: 'duration_ms', width: 90, render: (value: unknown) => `${String(value ?? 0)} ms` },
+                    { title: 'Error', dataIndex: 'error_message', key: 'error_message', ellipsis: true },
+                  ]}
+                />
+              </div>
+            </div>
+          </Space>
+              </div>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </Modal>
+    <Modal
+      open={gatewayTesterOpen && nodeType === 'api_gateway'}
+      onCancel={() => setGatewayTesterOpen(false)}
+      zIndex={2600}
+      footer={null}
+      closable={false}
+      maskClosable={false}
+      centered
+      width="98vw"
+      styles={{
+        content: {
+          padding: 0,
+          borderRadius: 12,
+          overflow: 'hidden',
+          border: '1px solid var(--app-border-strong)',
+          background: 'var(--app-panel-bg)',
+          height: '94vh',
+          display: 'flex',
+          flexDirection: 'column',
+        },
+        body: {
+          padding: 0,
+          flex: 1,
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+        },
+      }}
+    >
+      <div
+        style={{
+          borderBottom: '1px solid var(--app-border-strong)',
+          background: 'var(--app-card-bg)',
+          padding: '12px 16px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 12,
+        }}
+      >
+        <div>
+          <Text style={{ color: 'var(--app-text)', fontWeight: 800, fontSize: 16 }}>
+            API Testing Environment
+          </Text>
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+            Build, run, and save gateway API test requests from this node.
+          </Text>
+        </div>
+        <Space size={8} wrap>
+          <Tag style={{ marginInlineEnd: 0, background: `${gatewayProtocolColor(gatewayTestDraft.protocol)}18`, border: `1px solid ${gatewayProtocolColor(gatewayTestDraft.protocol)}50`, color: gatewayProtocolColor(gatewayTestDraft.protocol) }}>
+            {String(gatewayTestDraft.protocol || 'rest').toUpperCase()}
+          </Tag>
+          <Tag style={{ marginInlineEnd: 0, background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1' }}>
+            {gatewayTestDraft.method || 'GET'}
+          </Tag>
+          <Button size="small" icon={<PlusSquareOutlined />} onClick={createGatewayTesterNewTest}>
+            New Test
+          </Button>
+          <Button size="small" icon={<SaveOutlined />} onClick={saveGatewayTestConfig}>
+            Save Test
+          </Button>
+          <Button type="primary" loading={gatewayTestSending} disabled={Boolean(gatewayTestBodyJsonError)} onClick={() => { void sendGatewayTestRequest() }}>
+            Send
+          </Button>
+          <Button onClick={() => setGatewayTesterOpen(false)}>Close</Button>
+        </Space>
+      </div>
+
+      <div style={{ flex: 1, minHeight: 0, display: 'grid', gridTemplateColumns: '280px minmax(430px, 1fr) minmax(380px, 0.82fr)', gap: 12, padding: 12, overflow: 'hidden' }}>
+        <div style={{ minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column', border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)' }}>
+          <div style={{ padding: 10, borderBottom: '1px solid var(--app-border-strong)' }}>
+            <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+              <Text style={{ color: '#38bdf8', fontWeight: 700 }}>Saved Tests</Text>
+              <Tag style={{ marginInlineEnd: 0 }}>{gatewayTestConfigs.length}</Tag>
+            </Space>
+          </div>
+          <div style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: 8 }}>
+            <Table
+              size="small"
+              rowKey="id"
+              dataSource={gatewayTestConfigs}
+              pagination={false}
+              tableLayout="fixed"
+              onRow={(record) => ({
+                onClick: () => selectGatewayTestConfig(String(record.id || '')),
+              })}
+              rowClassName={(record) => (record.id === gatewayActiveTestId ? 'ant-table-row-selected' : '')}
+              columns={[
+                {
+                  title: 'Test',
+                  key: 'name',
+                  render: (_value: unknown, record: GatewayTestConfig) => (
+                    <Space direction="vertical" size={1} style={{ width: '100%' }}>
+                      <Text ellipsis style={{ color: 'var(--app-text)', fontSize: 12, fontWeight: 700 }}>{record.name || 'Gateway test'}</Text>
+                      <Text ellipsis style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{record.method} {record.path}</Text>
+                    </Space>
+                  ),
+                },
+                {
+                  title: '',
+                  key: 'delete',
+                  width: 42,
+                  render: (_value: unknown, record: GatewayTestConfig) => (
+                    <Popconfirm
+                      title="Delete saved test?"
+                      okText="Delete"
+                      okButtonProps={{ danger: true }}
+                      onConfirm={(event) => {
+                        event?.stopPropagation()
+                        deleteGatewayTestConfig(record.id)
+                      }}
+                    >
+                      <Button
+                        size="small"
+                        danger
+                        icon={<DeleteOutlined />}
+                        onClick={(event) => event.stopPropagation()}
+                      />
+                    </Popconfirm>
+                  ),
+                },
+              ]}
+            />
+          </div>
+        </div>
+
+        <div style={{ minHeight: 0, overflow: 'auto', display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {gatewayTestError ? (
+            <div style={{ border: '1px solid #ef444440', background: '#ef444410', borderRadius: 8, padding: '8px 10px' }}>
+              <Text style={{ color: '#ef4444', fontSize: 12 }}>{gatewayTestError}</Text>
+            </div>
+          ) : null}
+
+          <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 12 }}>
+            <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+              <Text style={{ color: '#a855f7', fontWeight: 700 }}>Request</Text>
+              <Text copyable={{ text: gatewayTestDraft.path }} ellipsis style={{ color: 'var(--app-text-subtle)', maxWidth: 420, fontSize: 12 }}>
+                {gatewayTestDraft.path || '/gw/v1/gateway'}
+              </Text>
+            </Space>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 10 }}>
+              <Input
+                value={gatewayTestDraft.name}
+                addonBefore="Name"
+                onChange={(event) => setGatewayTestDraft((prev) => ({ ...prev, name: event.target.value, updated_at: new Date().toISOString() }))}
+                style={commonInputStyle}
+              />
+              <Select
+                value={gatewayTestDraft.route_id || undefined}
+                placeholder="Select gateway route"
+                options={gatewayTesterRouteOptions.map((item) => ({ value: item.value, label: item.label }))}
+                onChange={(value) => applyGatewayTestRoute(String(value || ''))}
+              />
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '150px 120px 1fr', gap: 8, marginTop: 8 }}>
+              <Select
+                value={gatewayTestDraft.protocol}
+                onChange={applyGatewayTestProtocol}
+                options={[
+                  { value: 'rest', label: 'REST' },
+                  { value: 'graphql', label: 'GraphQL' },
+                  { value: 'soap', label: 'SOAP' },
+                  { value: 'tcp', label: 'TCP/IP' },
+                ]}
+              />
+              <Select
+                value={gatewayTestDraft.method}
+                onChange={(value) => setGatewayTestDraft((prev) => ({ ...prev, method: String(value || 'GET'), updated_at: new Date().toISOString() }))}
+                options={['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].map((method) => ({ value: method, label: method }))}
+              />
+              <Input
+                value={gatewayTestDraft.path}
+                onChange={(event) => setGatewayTestDraft((prev) => ({ ...prev, path: event.target.value, updated_at: new Date().toISOString() }))}
+                placeholder="/gw/v1/gateway"
+                style={commonInputStyle}
+              />
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 12 }}>
+            <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+              <Text style={{ color: '#14b8a6', fontWeight: 700 }}>Query Parameters</Text>
+              <Button size="small" icon={<PlusSquareOutlined />} onClick={() => addGatewayTestKeyValue('query_params')}>
+                Add Param
+              </Button>
+            </Space>
+            <div style={{ display: 'grid', gap: 6, marginTop: 8 }}>
+              {(gatewayTestDraft.query_params || []).map((row) => (
+                <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px minmax(140px, 0.9fr) minmax(180px, 1fr) 34px', gap: 6 }}>
+                  <Switch size="small" checked={row.enabled} onChange={(checked) => updateGatewayTestKeyValue('query_params', row.id, { enabled: checked })} />
+                  <Input
+                    value={row.key}
+                    placeholder="parameter"
+                    onChange={(event) => updateGatewayTestKeyValue('query_params', row.id, { key: event.target.value })}
+                    style={commonInputStyle}
+                  />
+                  <Input
+                    value={row.value}
+                    placeholder="value"
+                    onChange={(event) => updateGatewayTestKeyValue('query_params', row.id, { value: event.target.value })}
+                    style={commonInputStyle}
+                  />
+                  <Button size="small" danger icon={<DeleteOutlined />} onClick={() => removeGatewayTestKeyValue('query_params', row.id)} />
+                </div>
+              ))}
+              {gatewayTestDraft.query_params.length === 0 ? (
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>No query parameters configured.</Text>
+              ) : null}
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 12 }}>
+            <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+              <Text style={{ color: '#f59e0b', fontWeight: 700 }}>Headers</Text>
+              <Space size={6}>
+                <Select
+                  size="small"
+                  value={undefined}
+                  placeholder="Prefill header"
+                  style={{ width: 190 }}
+                  options={GATEWAY_TEST_HEADER_PRESETS.map((item) => ({ value: item.key, label: item.label }))}
+                  onSelect={(value) => addGatewayTestHeaderPreset(String(value || ''))}
+                />
+                <Button size="small" icon={<PlusSquareOutlined />} onClick={() => addGatewayTestKeyValue('headers')}>
+                  Add Header
+                </Button>
+              </Space>
+            </Space>
+            <div style={{ display: 'grid', gap: 6, marginTop: 8 }}>
+              {(gatewayTestDraft.headers || []).map((row) => (
+                <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px minmax(140px, 0.9fr) minmax(180px, 1fr) 34px', gap: 6 }}>
+                  <Switch size="small" checked={row.enabled} onChange={(checked) => updateGatewayTestKeyValue('headers', row.id, { enabled: checked })} />
+                  <AutoComplete
+                    value={row.key}
+                    options={GATEWAY_TEST_HEADER_PRESETS.map((item) => ({ value: item.key, label: item.label }))}
+                    placeholder="header"
+                    onChange={(value) => updateGatewayTestKeyValue('headers', row.id, { key: String(value || '') })}
+                    onSelect={(value) => updateGatewayTestKeyValue('headers', row.id, {
+                      key: String(value || ''),
+                      value: row.value || gatewayTestHeaderPresetValue(String(value || ''), gatewayTestDraft.body_type),
+                    })}
+                    filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(inputValue.toLowerCase())}
+                    style={commonInputStyle}
+                  />
+                  <AutoComplete
+                    value={row.value}
+                    options={gatewayTestHeaderValueOptions(row.key, gatewayTestDraft.body_type)}
+                    placeholder="value"
+                    onChange={(value) => updateGatewayTestKeyValue('headers', row.id, { value: String(value || '') })}
+                    onSelect={(value) => updateGatewayTestKeyValue('headers', row.id, { value: String(value || '') })}
+                    filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(inputValue.toLowerCase())}
+                    style={commonInputStyle}
+                  />
+                  <Button size="small" danger icon={<DeleteOutlined />} onClick={() => removeGatewayTestKeyValue('headers', row.id)} />
+                </div>
+              ))}
+              {gatewayTestDraft.headers.length === 0 ? (
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>No headers configured.</Text>
+              ) : null}
+            </div>
+          </div>
+
+          <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 12 }}>
+            <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+              <Space size={8}>
+                <Text style={{ color: '#ec4899', fontWeight: 700 }}>Body</Text>
+                {gatewayTestDraft.body_type === 'json' ? (
+                  <Tag color={gatewayTestBodyJsonError ? 'red' : 'green'} style={{ marginInlineEnd: 0 }}>
+                    {gatewayTestBodyJsonError ? 'invalid JSON' : 'valid JSON'}
+                  </Tag>
+                ) : null}
+              </Space>
+              <Space size={6}>
+                {gatewayTestDraft.body_type === 'json' ? (
+                  <Button size="small" disabled={Boolean(gatewayTestBodyJsonError) || !gatewayTestDraft.body_text.trim()} onClick={formatGatewayTestBodyJson}>
+                    Format JSON
+                  </Button>
+                ) : null}
+                <Select
+                  value={gatewayTestDraft.body_type}
+                  onChange={(value) => {
+                    const bodyType = normalizeGatewayTestBodyType(value)
+                    setGatewayTestDraft((prev) => ({
+                      ...prev,
+                      body_type: bodyType,
+                      body_text: bodyType === 'graphql' ? gatewayGraphqlTextFromBody(prev.body_text) : prev.body_text,
+                      headers: gatewayHeadersForBodyType(prev.headers, bodyType),
+                      updated_at: new Date().toISOString(),
+                    }))
+                  }}
+                  style={{ width: 140 }}
+                  options={[
+                    { value: 'none', label: 'No Body' },
+                    { value: 'json', label: 'JSON' },
+                    { value: 'graphql', label: 'GraphQL' },
+                    { value: 'xml', label: 'XML/SOAP' },
+                    { value: 'text', label: 'Text' },
+                  ]}
+                />
+              </Space>
+            </Space>
+            {gatewayTestBodyJsonError ? (
+              <Text style={{ color: '#ef4444', fontSize: 11, display: 'block', marginTop: 6 }}>
+                {gatewayTestBodyJsonError}
+              </Text>
+            ) : null}
+            <div style={{ marginTop: 8, height: 260, border: '1px solid var(--app-border-strong)', borderRadius: 8, overflow: 'hidden', background: '#0f172a' }}>
+              <Editor
+                key={`gateway-test-body-${gatewayTestDraft.body_type}`}
+                height="260px"
+                language={gatewayTestEditorLanguage(gatewayTestDraft.body_type)}
+                beforeMount={(monaco) => {
+                  if (gatewayTestDraft.body_type === 'graphql') ensureGatewayGraphqlLanguage(monaco)
+                }}
+                value={gatewayTestDraft.body_type === 'none' ? '' : gatewayTestDraft.body_text}
+                onChange={(value) => setGatewayTestDraft((prev) => ({ ...prev, body_text: String(value || ''), updated_at: new Date().toISOString() }))}
+                theme={gatewayTestDraft.body_type === 'graphql' ? GATEWAY_GRAPHQL_THEME_ID : 'vs-dark'}
+                options={{
+                  readOnly: gatewayTestDraft.body_type === 'none',
+                  minimap: { enabled: false },
+                  fontSize: 12,
+                  lineNumbers: 'on',
+                  wordWrap: 'on',
+                  scrollBeyondLastLine: false,
+                  automaticLayout: true,
+                  tabSize: 2,
+                  formatOnPaste: true,
+                  formatOnType: gatewayTestDraft.body_type === 'json',
+                }}
+              />
+            </div>
+          </div>
+        </div>
+
+        <div style={{ minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column', border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)' }}>
+          <div style={{ padding: 12, borderBottom: '1px solid var(--app-border-strong)' }}>
+            <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+              <Text style={{ color: '#22c55e', fontWeight: 700 }}>Response</Text>
+              <Space size={6} wrap>
+                <Select
+                  size="small"
+                  value={gatewayTestResponseView}
+                  onChange={(value) => setGatewayTestResponseView(value as GatewayTestResponseView)}
+                  style={{ width: 112 }}
+                  options={[
+                    { value: 'json', label: 'JSON View' },
+                    { value: 'raw', label: 'Raw' },
+                  ]}
+                />
+                <Tag color={Number(gatewayTestResult?.status || 0) >= 400 ? 'red' : Number(gatewayTestResult?.status || 0) > 0 ? 'green' : 'default'} style={{ marginInlineEnd: 0 }}>
+                  {gatewayTestResult?.status ? `${String(gatewayTestResult.status)} ${String(gatewayTestResult.statusText || '')}` : 'not sent'}
+                </Tag>
+                <Tag style={{ marginInlineEnd: 0 }}>{gatewayTestResult?.duration_ms ? `${String(gatewayTestResult.duration_ms)} ms` : '0 ms'}</Tag>
+              </Space>
+            </Space>
+          </div>
+          <div style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Body</Text>
+              <div style={{ marginTop: 6, height: 420, border: '1px solid var(--app-border-strong)', borderRadius: 8, overflow: 'hidden', background: '#0f172a' }}>
+                <Editor
+                  height="420px"
+                  language={gatewayTestResponseView === 'json' ? 'json' : 'plaintext'}
+                  value={gatewayTestResponseBodyText(gatewayTestResult, gatewayTestResponseView)}
+                  theme="vs-dark"
+                  options={{
+                    readOnly: true,
+                    minimap: { enabled: false },
+                    fontSize: 12,
+                    lineNumbers: 'on',
+                    wordWrap: 'on',
+                    scrollBeyondLastLine: false,
+                    automaticLayout: true,
+                    tabSize: 2,
+                  }}
+                />
+              </div>
+            </div>
+            <div>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Headers</Text>
+              <div style={{ marginTop: 6, height: 150, border: '1px solid var(--app-border-strong)', borderRadius: 8, overflow: 'hidden', background: '#0f172a' }}>
+                <Editor
+                  height="150px"
+                  language="json"
+                  value={gatewayTestResponseText(gatewayTestResult?.headers || {})}
+                  theme="vs-dark"
+                  options={{
+                    readOnly: true,
+                    minimap: { enabled: false },
+                    fontSize: 12,
+                    lineNumbers: 'off',
+                    wordWrap: 'on',
+                    scrollBeyondLastLine: false,
+                    automaticLayout: true,
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Modal>
     {canUseCustomFieldStudio && (
       <Modal
         open={customFieldStudioOpen}
@@ -24922,8 +28469,21 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         <InputNumber size="small" min={0.05} max={0.5} step={0.01} value={mlopsStage3TrainTestSplitDraft} onChange={(v) => setMLOpsStage3TrainTestSplitDraft(Number.isFinite(Number(v)) ? Number(v) : 0.2)} style={{ width: '100%', marginTop: 4 }} />
                       </div>
                       <div>
-                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Cross Validation Folds</Text>
-                        <InputNumber size="small" min={2} max={20} value={mlopsStage3CvFoldsDraft} onChange={(v) => setMLOpsStage3CvFoldsDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 5)} style={{ width: '100%', marginTop: 4 }} />
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                          {mlopsStage3TaskTypeDraft === 'clustering' ? 'Cluster Count' : 'Cross Validation Folds'}
+                        </Text>
+                        {mlopsStage3TaskTypeDraft === 'clustering' ? (
+                          <InputNumber
+                            size="small"
+                            min={2}
+                            max={100}
+                            value={mlopsStage3ClusterCountDraft}
+                            onChange={(v) => setMLOpsStage3ClusterCountDraft(Number.isFinite(Number(v)) ? Math.max(2, Math.min(Math.trunc(Number(v)), 100)) : 4)}
+                            style={{ width: '100%', marginTop: 4 }}
+                          />
+                        ) : (
+                          <InputNumber size="small" min={2} max={20} value={mlopsStage3CvFoldsDraft} onChange={(v) => setMLOpsStage3CvFoldsDraft(Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 5)} style={{ width: '100%', marginTop: 4 }} />
+                        )}
                       </div>
                       <div>
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Epochs</Text>
@@ -25217,7 +28777,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         <Select
                           size="small"
                           value={mlopsStage3VizTypeDraft}
-                          options={MLOPS_STAGE3_VIZ_OPTIONS}
+                          options={mlopsStage3VizOptions}
                           onChange={(value) => setMLOpsStage3VizTypeDraft(String(value || 'split_bar') as MLOpsStage3VizType)}
                           style={{ minWidth: 220 }}
                         />
@@ -25226,7 +28786,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           value={mlopsStage3TableViewDraft}
                           onChange={(value) => setMLOpsStage3TableViewDraft(String(value || 'predictions') as 'predictions' | 'feature_importance' | 'metrics')}
                           options={[
-                            { value: 'predictions', label: 'Prediction Table' },
+                            { value: 'predictions', label: mlopsStage3TaskTypeDraft === 'clustering' ? 'Cluster Sample Table' : 'Prediction Table' },
                             { value: 'feature_importance', label: 'Feature Importance Table' },
                             { value: 'metrics', label: 'Metrics Table' },
                           ]}
@@ -25234,6 +28794,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         />
                       </Space>
                     </div>
+                    {mlopsStage3ClusterHighlights.length > 0 ? (
+                      <Space size={6} wrap style={{ marginTop: 8 }}>
+                        {mlopsStage3ClusterHighlights.map((item) => (
+                          <Tag key={item.label} color={item.color}>
+                            {item.label}: {item.value}
+                          </Tag>
+                        ))}
+                      </Space>
+                    ) : null}
                     <div style={{ marginTop: 8, border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-input-bg)', height: mlopsCompactView ? 280 : 360 }}>
                       {mlopsStage3VizFigure ? (
                         <Plot

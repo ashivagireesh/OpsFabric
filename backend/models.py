@@ -221,3 +221,53 @@ class AuditLog(Base):
     detail = Column(Text, nullable=True)
     ip_address = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ApiGatewayRoute(Base):
+    __tablename__ = "api_gateway_routes"
+
+    id = Column(String, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    enabled = Column(Boolean, default=True)
+    protocol = Column(String, default="rest")
+    version = Column(String, default="v1")
+    method = Column(String, default="GET")
+    path = Column(String, nullable=False)
+    status = Column(String, default="active")
+    pipeline_id = Column(String, nullable=True, index=True)
+    gateway_node_id = Column(String, nullable=True, index=True)
+    source_node_id = Column(String, nullable=True, index=True)
+    source_type = Column(String, nullable=True)
+    source_config = Column(JSON, default={})
+    request_mapping = Column(JSON, default={})
+    response_mapping = Column(JSON, default={})
+    auth_config = Column(JSON, default={})
+    rbac_config = Column(JSON, default={})
+    rate_limit_config = Column(JSON, default={})
+    standard_response = Column(Boolean, default=True)
+    audit_enabled = Column(Boolean, default=True)
+    logging_enabled = Column(Boolean, default=True)
+    managed_by_pipeline = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+
+
+class ApiGatewayLog(Base):
+    __tablename__ = "api_gateway_logs"
+
+    id = Column(String, primary_key=True, index=True)
+    route_id = Column(String, ForeignKey("api_gateway_routes.id"), nullable=True, index=True)
+    request_id = Column(String, nullable=False, index=True)
+    method = Column(String, nullable=True)
+    path = Column(Text, nullable=True)
+    version = Column(String, nullable=True)
+    status_code = Column(Integer, nullable=True)
+    success = Column(Boolean, default=False)
+    duration_ms = Column(Integer, default=0)
+    client_ip = Column(String, nullable=True)
+    user_id = Column(String, nullable=True)
+    role = Column(String, nullable=True)
+    error_message = Column(Text, nullable=True)
+    request_meta = Column(JSON, default={})
+    response_meta = Column(JSON, default={})
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

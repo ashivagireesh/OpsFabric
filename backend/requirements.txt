@@ -48,6 +48,7 @@ uuid==1.30
 loguru==0.7.2
 rapidfuzz==3.14.3
 scikit-learn==1.8.0
+xgboost==3.2.0
 statsmodels==0.14.4
 h2o==3.46.0.8
 lmdb==1.5.1
