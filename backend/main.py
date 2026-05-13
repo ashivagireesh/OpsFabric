@@ -14632,6 +14632,118 @@ async def _load_tabular_rows_for_source(
         except Exception as exc:
             raise HTTPException(400, f"Elasticsearch metadata detection failed: {exc}")
 
+    if ntype in {"csv_source", "json_source", "excel_source", "xml_source", "parquet_source"}:
+        import pandas as pd
+
+        file_path = etl_engine._resolve_input_file_path(str(cfg.get("file_path") or ""))
+        if not _os.path.isfile(file_path):
+            raise HTTPException(404, f"Source file not found: {file_path}")
+
+        def _bool_like(value: Any, default: bool = True) -> bool:
+            if isinstance(value, bool):
+                return value
+            text = str(value if value is not None else "").strip().lower()
+            if not text:
+                return default
+            return text in {"1", "true", "yes", "on", "y"}
+
+        def _clean_frame_rows(frame: Any) -> List[Dict[str, Any]]:
+            try:
+                frame = frame.head(limit)
+            except Exception:
+                pass
+            try:
+                frame = frame.astype(object).where(pd.notna(frame), None)
+            except Exception:
+                pass
+            rows = frame.to_dict(orient="records")
+            return [row for row in rows if isinstance(row, dict)]
+
+        try:
+            if ntype == "csv_source":
+                delimiter = str(cfg.get("delimiter", ",") or ",")
+                if delimiter == "\\t":
+                    delimiter = "\t"
+                has_header = _bool_like(cfg.get("has_header"), True)
+                requested_encoding = str(cfg.get("encoding", "utf-8") or "utf-8").strip() or "utf-8"
+                try:
+                    import polars as pl  # type: ignore
+
+                    if requested_encoding.lower().replace("_", "-") not in {"utf-8", "utf8"}:
+                        raise RuntimeError("Use pandas fallback for non-UTF8 CSV encodings.")
+                    pl_df = pl.read_csv(
+                        file_path,
+                        separator=delimiter,
+                        has_header=has_header,
+                        n_rows=limit,
+                        encoding="utf8",
+                        infer_schema_length=min(1000, limit),
+                    )
+                    return pl_df.to_dicts()
+                except Exception:
+                    frame = pd.read_csv(
+                        file_path,
+                        delimiter=delimiter,
+                        header=0 if has_header else None,
+                        encoding=requested_encoding,
+                        nrows=limit,
+                        low_memory=True,
+                    )
+                    return _clean_frame_rows(frame)
+
+            if ntype == "json_source":
+                payload = await _load_json_payload_for_source(ntype, cfg)
+                selected = _extract_json_path_value(payload, cfg.get("json_path"))
+                rows = _rows_from_json_value(selected)
+                if not rows:
+                    rows = _rows_from_json_value(payload)
+                return [row for row in rows[:limit] if isinstance(row, dict)]
+
+            if ntype == "excel_source":
+                sheet = cfg.get("sheet", 0)
+                try:
+                    sheet = int(sheet)
+                except Exception:
+                    sheet = str(sheet or 0)
+                frame = pd.read_excel(
+                    file_path,
+                    sheet_name=sheet,
+                    header=0 if _bool_like(cfg.get("has_header"), True) else None,
+                    nrows=limit,
+                )
+                return _clean_frame_rows(frame)
+
+            if ntype == "xml_source":
+                xpath = str(cfg.get("xpath") or "").strip()
+                kwargs: Dict[str, Any] = {}
+                if xpath:
+                    kwargs["xpath"] = xpath
+                frame = pd.read_xml(file_path, **kwargs)
+                return _clean_frame_rows(frame)
+
+            if ntype == "parquet_source":
+                raw_columns = str(cfg.get("columns") or "").strip()
+                columns = [part.strip() for part in raw_columns.split(",") if part.strip()] if raw_columns else None
+                try:
+                    import polars as pl  # type: ignore
+
+                    pl_df = pl.read_parquet(file_path, columns=columns, n_rows=limit)
+                    return pl_df.to_dicts()
+                except Exception:
+                    frame = pd.read_parquet(file_path, columns=columns)
+                    return _clean_frame_rows(frame)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            label = {
+                "csv_source": "CSV",
+                "json_source": "JSON",
+                "excel_source": "Excel",
+                "xml_source": "XML",
+                "parquet_source": "Parquet",
+            }.get(ntype, "file")
+            raise HTTPException(400, f"{label} source read failed: {exc}") from exc
+
     if ntype == "lmdb_source":
         preview = await _load_lmdb_rows_for_preview(cfg, limit, page=1, preview_rows=limit)
         rows = preview.get("rows", []) if isinstance(preview, dict) else []
@@ -20518,7 +20630,11 @@ async def run_query(body: dict, db: Session = Depends(get_db)):
             "elasticsearch_source",
             "rest_api_source",
             "graphql_source",
+            "csv_source",
             "json_source",
+            "excel_source",
+            "xml_source",
+            "parquet_source",
         }
         if node_type in direct_source_types:
             try:
@@ -24099,6 +24215,11 @@ async def _gateway_execute_trigger_nodes(
         "mongodb_source",
         "redis_source",
         "elasticsearch_source",
+        "csv_source",
+        "json_source",
+        "excel_source",
+        "xml_source",
+        "parquet_source",
         "lmdb_source",
         "rocksdb_source",
     }
@@ -24304,6 +24425,11 @@ async def _gateway_execute_route_source(
         "mongodb_source",
         "redis_source",
         "elasticsearch_source",
+        "csv_source",
+        "json_source",
+        "excel_source",
+        "xml_source",
+        "parquet_source",
         "lmdb_source",
         "rocksdb_source",
     }
