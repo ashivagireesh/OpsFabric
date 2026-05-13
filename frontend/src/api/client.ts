@@ -449,6 +449,10 @@ const api = {
     tuning_method?: 'grid_search' | 'random_search' | 'bayesian_optimization'
     tuning_params?: Array<{ name?: string; values?: string }>
     tracking_enabled?: boolean
+    track_versions?: boolean
+    track_params?: boolean
+    track_metrics?: boolean
+    track_logs?: boolean
     run_name?: string
     explainability_method?: 'off' | 'auto' | 'shap' | 'shap_tree' | 'shap_linear' | string
   }) => {

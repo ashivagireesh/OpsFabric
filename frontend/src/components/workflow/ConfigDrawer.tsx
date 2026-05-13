@@ -451,6 +451,7 @@ type MLOpsStage3RunSummary = {
   tuning_result?: Record<string, unknown>
   sample_predictions?: Array<Record<string, unknown>>
   run_name?: string | null
+  experiment_tracking?: Record<string, unknown>
   runtime_model_bundle?: Record<string, unknown> | null
   model_mode?: 'single' | 'ensemble_pipeline' | string
   model_summaries?: Array<Record<string, unknown>>
@@ -7574,7 +7575,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [mlopsSampleSizeDraft, setMLOpsSampleSizeDraft] = useState(2000)
   const [mlopsPreviewRowsDraft, setMLOpsPreviewRowsDraft] = useState(25)
   const [mlopsMaxChartColumnsDraft, setMLOpsMaxChartColumnsDraft] = useState(6)
-  const [mlopsIncludeYDataDraft, setMLOpsIncludeYDataDraft] = useState(true)
+  const [mlopsIncludeYDataDraft, setMLOpsIncludeYDataDraft] = useState(false)
   const [mlopsChartTypesDraft, setMLOpsChartTypesDraft] = useState<string[]>(MLOPS_DEFAULT_CHART_TYPES)
   const [mlopsChartThemeDraft, setMLOpsChartThemeDraft] = useState<MLOpsChartTheme>('auto')
   const [mlopsExpandedChart, setMLOpsExpandedChart] = useState<MLOpsStage1Chart | null>(null)
@@ -7603,7 +7604,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [mlopsStage2ArtifactDraft, setMLOpsStage2ArtifactDraft] = useState<Record<string, unknown> | null>(null)
   const [mlopsStage3TaskTypeDraft, setMLOpsStage3TaskTypeDraft] = useState<MLOpsStage3TaskType>('classification')
   const [mlopsStage3ModelDraft, setMLOpsStage3ModelDraft] = useState('')
-  const [mlopsStage3ModelModeDraft, setMLOpsStage3ModelModeDraft] = useState<MLOpsStage3ModelMode>('single')
+  const [mlopsStage3ModelModeDraft, setMLOpsStage3ModelModeDraft] = useState<MLOpsStage3ModelMode>('ensemble_pipeline')
   const [mlopsStage3EnsembleModelsDraft, setMLOpsStage3EnsembleModelsDraft] = useState<MLOpsEnsembleModelConfig[]>([])
   const [mlopsStage3EnsembleModelModalId, setMLOpsStage3EnsembleModelModalId] = useState<string | null>(null)
   const [mlopsStage3NewEnsembleModelDraft, setMLOpsStage3NewEnsembleModelDraft] = useState<MLOpsEnsembleModelConfig | null>(null)
@@ -7655,6 +7656,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [mlopsStage3ModelBundleDraft, setMLOpsStage3ModelBundleDraft] = useState<Record<string, unknown> | null>(null)
   const [mlopsStage3VizTypeDraft, setMLOpsStage3VizTypeDraft] = useState<MLOpsStage3VizType>('split_bar')
   const [mlopsStage3TableViewDraft, setMLOpsStage3TableViewDraft] = useState<'predictions' | 'feature_importance' | 'influencing_features' | 'metrics'>('predictions')
+  const [mlopsStage3VizXFieldDraft, setMLOpsStage3VizXFieldDraft] = useState('')
+  const [mlopsStage3VizYFieldDraft, setMLOpsStage3VizYFieldDraft] = useState('')
   const [mlopsStage3ModelVizTypeDraft, setMLOpsStage3ModelVizTypeDraft] = useState<MLOpsStage3VizType>('split_bar')
   const [mlopsStage3ModelTableViewDraft, setMLOpsStage3ModelTableViewDraft] = useState<'predictions' | 'feature_importance' | 'influencing_features' | 'metrics'>('predictions')
   const [mlopsStage3ModelVizXFieldDraft, setMLOpsStage3ModelVizXFieldDraft] = useState('')
@@ -11174,7 +11177,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => {
       const n = Number(nodeConfig.mlops_sample_size ?? 2000)
       if (!Number.isFinite(n)) return 2000
-      return Math.max(100, Math.min(Math.trunc(n), 20000))
+      return Math.max(100, Math.min(Math.trunc(n), 50000))
     },
     [nodeConfig.mlops_sample_size]
   )
@@ -11195,7 +11198,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     [nodeConfig.mlops_max_chart_columns]
   )
   const mlopsIncludeYDataConfigured = useMemo(
-    () => parseBoolLike(nodeConfig.mlops_include_ydata, true),
+    () => parseBoolLike(nodeConfig.mlops_include_ydata, false),
     [nodeConfig.mlops_include_ydata]
   )
   const mlopsChartTypesConfigured = useMemo(() => {
@@ -11263,10 +11266,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const mlopsStage3ModelConfigured = useMemo(
     () => String(nodeConfig.mlops_stage3_model || '').trim(),
     [nodeConfig.mlops_stage3_model],
-  )
-  const mlopsStage3ModelModeConfigured = useMemo<MLOpsStage3ModelMode>(
-    () => String(nodeConfig.mlops_stage3_model_mode || '').trim().toLowerCase() === 'ensemble_pipeline' ? 'ensemble_pipeline' : 'single',
-    [nodeConfig.mlops_stage3_model_mode],
   )
   const mlopsStage3EnsembleModelsConfigured = useMemo<MLOpsEnsembleModelConfig[]>(
     () => {
@@ -12644,10 +12643,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => mlopsStage3AvailableFields.map((path) => ({ value: path, label: path })),
     [mlopsStage3AvailableFields],
   )
-  const mlopsStage3ModelOptions = useMemo(
-    () => (MLOPS_STAGE3_MODEL_CATALOG[mlopsStage3TaskTypeDraft] || []).map((model) => ({ value: model, label: model })),
-    [mlopsStage3TaskTypeDraft],
-  )
   const ensembleModelOptionsForTask = useCallback(
     (taskType: MLOpsEnsembleModelConfig['task_type']) => (MLOPS_STAGE3_MODEL_CATALOG[taskType] || []).map((model) => ({ value: model, label: model })),
     [],
@@ -12715,6 +12710,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       ...sampleRows.flatMap((row) => Object.keys(row)),
     ]).map((field) => ({ value: field, label: field }))
   }, [selectedMLOpsEnsembleModel?.feature_fields, selectedMLOpsEnsembleModelSummary])
+  const mlopsStage3VizFieldOptions = useMemo(() => {
+    const summary = mlopsStage3RunSummary as MLOpsStage3RunSummary | null
+    const sampleRows = Array.isArray(summary?.sample_predictions) ? summary?.sample_predictions as Array<Record<string, unknown>> : []
+    return uniqueFieldNames([
+      ...(Array.isArray(summary?.feature_fields) ? summary?.feature_fields as string[] : []),
+      ...sampleRows.flatMap((row) => Object.keys(row)),
+    ]).map((field) => ({ value: field, label: field }))
+  }, [mlopsStage3RunSummary])
   const selectedMLOpsEnsembleModelVizFigure = useMemo(() => {
     const summary = selectedMLOpsEnsembleModelSummary as Record<string, unknown> | null
     if (!summary) return null
@@ -12953,28 +12956,30 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     }
     const preds = sampleRows.map((row, idx) => ({
       idx: idx + 1,
+      x: toNum(row[preferredXField || 'actual'] ?? row.actual),
+      y: toNum(row[preferredYField || 'predicted'] ?? row.predicted),
       actual: toNum(row.actual),
       predicted: toNum(row.predicted),
-    })).filter((row) => row.actual != null && row.predicted != null)
+    })).filter((row) => row.x != null && row.y != null)
     if (preds.length > 0 && mlopsStage3ModelVizTypeDraft === 'actual_vs_predicted_scatter') {
       return {
-        data: [{ type: 'scatter', mode: 'markers', x: preds.map((row) => row.actual), y: preds.map((row) => row.predicted), marker: { color: '#38bdf8', size: 8 } }],
-        layout: { ...layoutBase, title: 'Actual vs Predicted', xaxis: { title: 'Actual' }, yaxis: { title: 'Predicted' } },
+        data: [{ type: 'scatter', mode: 'markers', x: preds.map((row) => row.x), y: preds.map((row) => row.y), marker: { color: '#38bdf8', size: 8 } }],
+        layout: { ...layoutBase, title: 'Actual vs Predicted', xaxis: { title: preferredXField || 'Actual' }, yaxis: { title: preferredYField || 'Predicted' } },
       }
     }
     if (preds.length > 0 && mlopsStage3ModelVizTypeDraft === 'actual_vs_predicted_line') {
       return {
         data: [
-          { type: 'scatter', mode: 'lines+markers', name: 'Actual', x: preds.map((row) => row.idx), y: preds.map((row) => row.actual), line: { color: '#22c55e' } },
-          { type: 'scatter', mode: 'lines+markers', name: 'Predicted', x: preds.map((row) => row.idx), y: preds.map((row) => row.predicted), line: { color: '#f59e0b' } },
+          { type: 'scatter', mode: 'lines+markers', name: preferredXField || 'Actual', x: preds.map((row) => row.idx), y: preds.map((row) => row.x), line: { color: '#22c55e' } },
+          { type: 'scatter', mode: 'lines+markers', name: preferredYField || 'Predicted', x: preds.map((row) => row.idx), y: preds.map((row) => row.y), line: { color: '#f59e0b' } },
         ],
         layout: { ...layoutBase, title: 'Actual vs Predicted', xaxis: { title: 'Sample' }, yaxis: { title: 'Value' } },
       }
     }
     if (preds.length > 0 && mlopsStage3ModelVizTypeDraft === 'prediction_error_hist') {
       return {
-        data: [{ type: 'histogram', x: preds.map((row) => Number(row.predicted) - Number(row.actual)), marker: { color: '#ef4444' } }],
-        layout: { ...layoutBase, title: 'Prediction Error', xaxis: { title: 'Predicted - Actual' } },
+        data: [{ type: 'histogram', x: preds.map((row) => Number(row.y) - Number(row.x)), marker: { color: '#ef4444' } }],
+        layout: { ...layoutBase, title: 'Prediction Error', xaxis: { title: `${preferredYField || 'Predicted'} - ${preferredXField || 'Actual'}` } },
       }
     }
     return {
@@ -13088,11 +13093,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const mlopsStage3TrainingJsonView = useMemo(() => {
     if (!mlopsStage3RunSummary && mlopsStage3DisplayModelSummaries.length <= 0) return ''
     return JSON.stringify({
-      active_pipeline: mlopsStage3ModelModeDraft,
+      active_pipeline: 'ensemble_pipeline',
       training_summary: mlopsStage3RunSummary || null,
       model_test_summaries: mlopsStage3DisplayModelSummaries,
     }, null, 2)
-  }, [mlopsStage3DisplayModelSummaries, mlopsStage3ModelModeDraft, mlopsStage3RunSummary])
+  }, [mlopsStage3DisplayModelSummaries, mlopsStage3RunSummary])
   const mlopsStage3DisplayOutcomeSummary = useMemo(() => {
     if (mlopsStage3RunSummary?.ran) {
       return {
@@ -13206,23 +13211,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       return createMLOpsEnsembleModel({ ...model, [scope]: nextRules }, modelIndex)
     }))
   }, [mlopsStage3EnsembleModelsDraft.length])
-  const activateMLOpsStage3ModelMode = useCallback((mode: MLOpsStage3ModelMode) => {
-    setMLOpsStage3ModelModeDraft(mode)
-    if (mode === 'ensemble_pipeline' && mlopsStage3EnsembleModelsDraft.length <= 0) {
-      const seed = createMLOpsEnsembleModel({
-        feature_fields: uniqueFieldNames(mlopsStage3FeatureFieldsDraft.filter((item) => mlopsStage3AvailableFields.includes(item))),
-        target_field: mlopsStage3TargetFieldDraft,
-        explainability_method: mlopsStage3ExplainabilityMethodDraft,
-      }, 0)
-      setMLOpsStage3EnsembleModelsDraft([seed])
-    }
-  }, [
-    mlopsStage3EnsembleModelsDraft.length,
-    mlopsStage3FeatureFieldsDraft,
-    mlopsStage3AvailableFields,
-    mlopsStage3TargetFieldDraft,
-    mlopsStage3ExplainabilityMethodDraft,
-  ])
   const mlopsStage3VizOptions = useMemo(
     () => MLOPS_STAGE3_VIZ_OPTIONS.filter((option) => {
       if (mlopsStage3TaskTypeDraft === 'clustering') {
@@ -13284,6 +13272,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       ...((Array.isArray(summary.feature_fields) ? summary.feature_fields : []) as string[]),
       ...sampleRows.flatMap((row) => Object.keys(row).filter((key) => key !== 'cluster')),
     ]).filter((field) => sampleRows.some((row) => toNum(row[field]) != null))
+    const preferredXField = String(mlopsStage3VizXFieldDraft || '').trim()
+    const preferredYField = String(mlopsStage3VizYFieldDraft || '').trim()
+    const scoreFieldCandidates = uniqueFieldNames([
+      preferredYField,
+      'prediction_score',
+      'score',
+      'anomaly_score',
+      'decision_score',
+    ].filter(Boolean))
+    const resolveScoreField = (): string => scoreFieldCandidates.find((field) => sampleRows.some((row) => toNum(row[field]) != null)) || ''
 
     if (mlopsStage3VizTypeDraft === 'split_bar') {
       return {
@@ -13374,8 +13372,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
     if (mlopsStage3VizTypeDraft === 'cluster_scatter') {
       const fields = numericSampleFields()
-      const xField = fields[0]
-      const yField = fields[1] || fields[0]
+      const xField = preferredXField && fields.includes(preferredXField) ? preferredXField : fields[0]
+      const yField = preferredYField && fields.includes(preferredYField) ? preferredYField : (fields.find((field) => field !== xField) || fields[1] || fields[0])
       if (!xField || !yField) return null
       const labels = uniqueFieldNames(sampleRows.map((row) => clusterLabelOf(row))).sort(clusterSort)
       const traces = labels.map((label, labelIdx) => {
@@ -13422,6 +13420,48 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       }
     }
 
+    if (mlopsStage3VizTypeDraft === 'anomaly_score_distribution') {
+      const scoreField = resolveScoreField()
+      const values = scoreField ? sampleRows.map((row) => toNum(row[scoreField])).filter((value): value is number => value != null) : []
+      if (values.length <= 0) return null
+      return {
+        data: [{ type: 'histogram', x: values, marker: { color: '#f97316' }, nbinsx: 24 }],
+        layout: { ...layoutBase, title: `Anomaly Score Distribution (${scoreField})`, xaxis: { title: scoreField }, yaxis: { title: 'Rows' } },
+      }
+    }
+
+    if (mlopsStage3VizTypeDraft === 'anomaly_score_scatter') {
+      const fields = numericSampleFields()
+      const scoreField = resolveScoreField()
+      const xField = preferredXField && fields.includes(preferredXField) ? preferredXField : fields.find((field) => field !== scoreField) || fields[0]
+      if (!xField || !scoreField) return null
+      const points = sampleRows
+        .map((row, rowIdx) => ({
+          x: toNum(row[xField]) ?? rowIdx + 1,
+          y: toNum(row[scoreField]),
+          prediction: String(row.prediction ?? row.anomaly_flag ?? ''),
+        }))
+        .filter((point) => point.y != null)
+      if (points.length <= 0) return null
+      return {
+        data: [{
+          type: 'scatter',
+          mode: 'markers',
+          x: points.map((point) => point.x),
+          y: points.map((point) => point.y),
+          marker: {
+            color: points.map((point) => ['-1', 'true', '1'].includes(String(point.prediction).toLowerCase()) ? '#ef4444' : '#38bdf8'),
+            size: 8,
+            opacity: 0.82,
+            line: { color: 'rgba(15,23,42,0.8)', width: 1 },
+          },
+          text: points.map((point) => `prediction: ${point.prediction || 'n/a'}<br>${xField}: ${point.x}<br>${scoreField}: ${point.y}`),
+          hoverinfo: 'text',
+        }],
+        layout: { ...layoutBase, title: 'Anomaly Score Scatter', xaxis: { title: xField || 'Sample' }, yaxis: { title: scoreField } },
+      }
+    }
+
     if (mlopsStage3VizTypeDraft === 'cluster_profile') {
       const overview = (summary.target_overview || {}) as Record<string, unknown>
       const rawProfiles = Array.isArray(overview.cluster_profiles)
@@ -13465,10 +13505,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const preds = (Array.isArray(summary.sample_predictions) ? summary.sample_predictions : [])
       .map((row, idx) => ({
         idx: idx + 1,
-        actual: toNum((row as Record<string, unknown>)?.actual),
-        predicted: toNum((row as Record<string, unknown>)?.predicted),
+        x: toNum((row as Record<string, unknown>)?.[preferredXField || 'actual'] ?? (row as Record<string, unknown>)?.actual),
+        y: toNum((row as Record<string, unknown>)?.[preferredYField || 'predicted'] ?? (row as Record<string, unknown>)?.predicted),
       }))
-      .filter((row) => row.actual != null && row.predicted != null)
+      .filter((row) => row.x != null && row.y != null)
     if (preds.length <= 0) return null
 
     if (mlopsStage3VizTypeDraft === 'actual_vs_predicted_scatter') {
@@ -13477,13 +13517,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           {
             type: 'scatter',
             mode: 'markers',
-            x: preds.map((row) => row.actual as number),
-            y: preds.map((row) => row.predicted as number),
+            x: preds.map((row) => row.x as number),
+            y: preds.map((row) => row.y as number),
             marker: { color: '#38bdf8', size: 8 },
             name: 'Predictions',
           },
         ],
-        layout: { ...layoutBase, title: 'Actual vs Predicted (Scatter)', xaxis: { title: 'Actual' }, yaxis: { title: 'Predicted' } },
+        layout: { ...layoutBase, title: 'Actual vs Predicted (Scatter)', xaxis: { title: preferredXField || 'Actual' }, yaxis: { title: preferredYField || 'Predicted' } },
       }
     }
 
@@ -13494,24 +13534,24 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             type: 'scatter',
             mode: 'lines+markers',
             x: preds.map((row) => row.idx),
-            y: preds.map((row) => row.actual as number),
+            y: preds.map((row) => row.x as number),
             line: { color: '#22c55e' },
-            name: 'Actual',
+            name: preferredXField || 'Actual',
           },
           {
             type: 'scatter',
             mode: 'lines+markers',
             x: preds.map((row) => row.idx),
-            y: preds.map((row) => row.predicted as number),
+            y: preds.map((row) => row.y as number),
             line: { color: '#f59e0b' },
-            name: 'Predicted',
+            name: preferredYField || 'Predicted',
           },
         ],
         layout: { ...layoutBase, title: 'Actual vs Predicted (Line)', xaxis: { title: 'Sample' }, yaxis: { title: 'Value' } },
       }
     }
 
-    const errors = preds.map((row) => (row.predicted as number) - (row.actual as number))
+    const errors = preds.map((row) => (row.y as number) - (row.x as number))
     return {
       data: [
         {
@@ -13522,9 +13562,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           name: 'Prediction Error',
         },
       ],
-      layout: { ...layoutBase, title: 'Prediction Error Histogram', xaxis: { title: 'Predicted - Actual' }, yaxis: { title: 'Frequency' } },
+      layout: { ...layoutBase, title: 'Prediction Error Histogram', xaxis: { title: `${preferredYField || 'Predicted'} - ${preferredXField || 'Actual'}` }, yaxis: { title: 'Frequency' } },
     }
-  }, [mlopsStage3RunSummary, mlopsStage3VizTypeDraft])
+  }, [mlopsStage3RunSummary, mlopsStage3VizTypeDraft, mlopsStage3VizXFieldDraft, mlopsStage3VizYFieldDraft])
   const mlopsStage3TableColumns = useMemo(() => {
     const summary = mlopsStage3RunSummary
     if (!summary) return [] as any[]
@@ -13977,7 +14017,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_stage2_target_field: mlopsStage2TargetFieldDraft,
       mlops_stage2_label_field: mlopsStage2LabelFieldDraft,
       mlops_stage2_field_configs: mlopsStage2SerializedConfig,
-      mlops_stage3_model_mode: mlopsStage3ModelModeDraft,
+      mlops_stage3_model_mode: 'ensemble_pipeline',
       mlops_stage3_ensemble_models: serializeMLOpsEnsembleModels(mlopsStage3EnsembleModelsDraft),
       mlops_stage3_task_type: mlopsStage3TaskTypeDraft,
       mlops_stage3_model: mlopsStage3ModelDraft,
@@ -14048,7 +14088,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlopsStage2TargetFieldDraft,
       mlopsStage2LabelFieldDraft,
       mlopsStage2SerializedConfig,
-      mlopsStage3ModelModeDraft,
       mlopsStage3EnsembleModelsDraft,
       mlopsStage3TaskTypeDraft,
       mlopsStage3ModelDraft,
@@ -17046,8 +17085,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
   const resolveMLOpsFullSourceRows = useCallback(async (
     fallbackInputRows?: Array<Record<string, unknown>>,
+    requestedRowCap?: number,
   ): Promise<Array<Record<string, unknown>>> => {
-    const hardCap = 500000
+    const rawCap = Number(requestedRowCap ?? 500000)
+    const hardCap = Number.isFinite(rawCap)
+      ? Math.max(100, Math.min(Math.trunc(rawCap), 500000))
+      : 500000
     const fallbackRows = (Array.isArray(fallbackInputRows) ? fallbackInputRows : mlopsPreviewRows)
       .slice(0, hardCap)
       .filter((row) => row && typeof row === 'object') as Array<Record<string, unknown>>
@@ -17099,8 +17142,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           pipeline_node_id: sourceNodeId,
           strict_node_output: true,
           prefer_source_scan: true,
-          limit: 0,
-          return_all: true,
+          limit: hardCap,
+          return_all: false,
         })
       } catch {
         continue
@@ -17129,7 +17172,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setMLOpsProfileLoading(true)
     setMLOpsProfileError(null)
     try {
-      const inputRows = await resolveMLOpsFullSourceRows()
+      const profileRowCapRaw = Number(mlopsSampleSizeDraft || mlopsSampleSizeConfigured || 5000)
+      const profileRowCap = Number.isFinite(profileRowCapRaw)
+        ? Math.max(100, Math.min(Math.trunc(profileRowCapRaw), 50000))
+        : 5000
+      const inputRows = await resolveMLOpsFullSourceRows(undefined, profileRowCap)
       if (inputRows.length === 0) {
         setMLOpsProfileError('No Data Query output rows detected. Run the pipeline once with Data Query connected directly to MLOps.')
         setMLOpsProfileResult(null)
@@ -17137,7 +17184,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       }
       const response = await api.getMLOpsNodeStage1Profile({
         rows: inputRows,
-        sample_size: inputRows.length,
+        sample_size: Math.min(inputRows.length, profileRowCap),
         preview_rows: mlopsPreviewRowsDraft,
         max_chart_columns: mlopsMaxChartColumnsDraft,
         include_ydata: mlopsIncludeYDataDraft,
@@ -17159,6 +17206,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     nodeType,
     selectedNodeId,
     resolveMLOpsFullSourceRows,
+    mlopsSampleSizeDraft,
+    mlopsSampleSizeConfigured,
     mlopsPreviewRowsDraft,
     mlopsMaxChartColumnsDraft,
     mlopsIncludeYDataDraft,
@@ -17627,7 +17676,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     if (nodeType !== 'mlops_transform' || !selectedNodeId) return
 
     const taskType = mlopsStage3TaskTypeDraft
-    const modelMode = mlopsStage3ModelModeDraft
+    const modelMode: MLOpsStage3ModelMode = 'ensemble_pipeline'
     const featureFields = uniqueFieldNames(
       (mlopsStage3SelectedFeatureFields.length > 0
         ? mlopsStage3SelectedFeatureFields
@@ -17710,6 +17759,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           .filter((item) => item.name)
           .map((item) => ({ name: item.name, values: item.values })),
         tracking_enabled: Boolean(mlopsStage3TrackingEnabledDraft),
+        track_versions: Boolean(mlopsStage3TrackVersionsDraft),
+        track_params: Boolean(mlopsStage3TrackParamsDraft),
+        track_metrics: Boolean(mlopsStage3TrackMetricsDraft),
+        track_logs: Boolean(mlopsStage3TrackLogsDraft),
         run_name: String(mlopsStage3RunNameDraft || '').trim() || undefined,
         explainability_method: mlopsStage3ExplainabilityMethodDraft,
       })
@@ -17782,6 +17835,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           ? backendSummary.sample_predictions as Array<Record<string, unknown>>
           : undefined,
         run_name: backendSummary.run_name == null ? null : String(backendSummary.run_name),
+        experiment_tracking: backendSummary.experiment_tracking && typeof backendSummary.experiment_tracking === 'object'
+          ? backendSummary.experiment_tracking as Record<string, unknown>
+          : undefined,
         runtime_model_bundle: backendSummary.runtime_model_bundle && typeof backendSummary.runtime_model_bundle === 'object'
           ? backendSummary.runtime_model_bundle as Record<string, unknown>
           : null,
@@ -17809,7 +17865,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     resolveMLOpsTrainingRows,
     mlopsStage3SelectedFeatureFields,
     mlopsStage3AvailableFields,
-    mlopsStage3ModelModeDraft,
     mlopsStage3EnsembleModelsDraft,
     mlopsStage3TaskTypeDraft,
     mlopsStage3TargetFieldDraft,
@@ -17889,6 +17944,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           .filter((item) => item.name)
           .map((item) => ({ name: item.name, values: item.values })),
         tracking_enabled: Boolean(mlopsStage3TrackingEnabledDraft),
+        track_versions: Boolean(mlopsStage3TrackVersionsDraft),
+        track_params: Boolean(mlopsStage3TrackParamsDraft),
+        track_metrics: Boolean(mlopsStage3TrackMetricsDraft),
+        track_logs: Boolean(mlopsStage3TrackLogsDraft),
         run_name: `${String(mlopsStage3RunNameDraft || 'model_test').trim() || 'model_test'}:${model.name}`,
         explainability_method: model.explainability_method,
       })
@@ -18056,7 +18115,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       ? Math.max(10, Math.min(Math.trunc(mlopsStage2PreviewLimitDraft), 5000))
       : 200
     updateNodeConfig(selectedNodeId, {
-      mlops_sample_size: Math.max(100, Math.min(Math.trunc(Number(mlopsSampleSizeDraft || 2000)), 20000)),
+      mlops_sample_size: Math.max(100, Math.min(Math.trunc(Number(mlopsSampleSizeDraft || 2000)), 50000)),
       mlops_preview_rows: Math.max(5, Math.min(Math.trunc(Number(mlopsPreviewRowsDraft || 25)), 200)),
       mlops_max_chart_columns: Math.max(1, Math.min(Math.trunc(Number(mlopsMaxChartColumnsDraft || 6)), 12)),
       mlops_include_ydata: Boolean(mlopsIncludeYDataDraft),
@@ -18067,7 +18126,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_stage2_label_field: String(mlopsStage2LabelFieldDraft || '').trim(),
       mlops_stage2_field_configs: mlopsStage2SerializedConfig,
       mlops_stage2_artifact: mlopsStage2ArtifactDraft || null,
-      mlops_stage3_model_mode: mlopsStage3ModelModeDraft,
+      mlops_stage3_model_mode: 'ensemble_pipeline',
       mlops_stage3_ensemble_models: serializeMLOpsEnsembleModels(mlopsStage3EnsembleModelsDraft),
       mlops_stage3_task_type: mlopsStage3TaskTypeDraft,
       mlops_stage3_model: String(mlopsStage3ModelDraft || '').trim(),
@@ -18164,7 +18223,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage2LabelFieldDraft,
     mlopsStage2SerializedConfig,
     mlopsStage2ArtifactDraft,
-    mlopsStage3ModelModeDraft,
     mlopsStage3EnsembleModelsDraft,
     mlopsStage3TaskTypeDraft,
     mlopsStage3ModelDraft,
@@ -18291,7 +18349,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setMLOpsStage2PreviewLimitDraft(mlopsStage2PreviewLimitConfigured)
     setMLOpsStage2TargetFieldDraft(mlopsStage2TargetFieldConfigured)
     setMLOpsStage2LabelFieldDraft(mlopsStage2LabelFieldConfigured)
-    setMLOpsStage3ModelModeDraft(mlopsStage3ModelModeConfigured)
+    setMLOpsStage3ModelModeDraft('ensemble_pipeline')
     setMLOpsStage3EnsembleModelsDraft(mlopsStage3EnsembleModelsConfigured)
     setMLOpsStage3TaskTypeDraft(mlopsStage3TaskTypeConfigured)
     setMLOpsStage3ModelDraft(
@@ -18418,7 +18476,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_stage2_target_field: mlopsStage2TargetFieldConfigured,
       mlops_stage2_label_field: mlopsStage2LabelFieldConfigured,
       mlops_stage2_field_configs: serializeMLOpsStage2FieldConfigMap(stage2ConfigMap),
-      mlops_stage3_model_mode: mlopsStage3ModelModeConfigured,
+      mlops_stage3_model_mode: 'ensemble_pipeline',
       mlops_stage3_ensemble_models: serializeMLOpsEnsembleModels(mlopsStage3EnsembleModelsConfigured),
       mlops_stage3_task_type: mlopsStage3TaskTypeConfigured,
       mlops_stage3_model: mlopsStage3ModelConfigured || MLOPS_STAGE3_MODEL_CATALOG[mlopsStage3TaskTypeConfigured]?.[0] || '',
@@ -18507,7 +18565,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage2PreviewLimitConfigured,
     mlopsStage2TargetFieldConfigured,
     mlopsStage2LabelFieldConfigured,
-    mlopsStage3ModelModeConfigured,
     mlopsStage3EnsembleModelsConfigured,
     mlopsStage3TaskTypeConfigured,
     mlopsStage3ModelConfigured,
@@ -28476,7 +28533,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   ? mlopsStage3RunLoading
                   : (mlopsStudioTab === 'deploy_monitor' ? mlopsStage4RunLoading : mlopsProfileLoading))
             }
-            disabled={mlopsPreviewRows.length <= 0}
+            disabled={
+              mlopsStudioTab === 'eda'
+                ? (mlopsPreviewRows.length <= 0 && !(String(activePipelineId || '').trim() && mlopsPreferredSourceNodeIds.length > 0))
+                : mlopsPreviewRows.length <= 0
+            }
           >
             {mlopsStudioTab === 'pre_processing'
               ? 'Run Preview'
@@ -28593,13 +28654,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             }}
           >
             <Space size={10} wrap align="end">
-              <div>
-                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Profile rows</Text>
-                <br />
-                <Tag style={{ marginTop: 6, background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>
-                  full source
-                </Tag>
-              </div>
+	              <div>
+	                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Profile sample rows</Text>
+	                <InputNumber
+	                  size="small"
+	                  min={100}
+	                  max={50000}
+	                  value={mlopsSampleSizeDraft}
+	                  onChange={(value) => setMLOpsSampleSizeDraft(Number.isFinite(Number(value)) ? Number(value) : 2000)}
+	                  style={{ width: 150, marginTop: 4 }}
+	                />
+	              </div>
               <div>
                 <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Preview rows</Text>
                 <InputNumber
@@ -28696,6 +28761,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               </Tag>
               <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e' }}>
                 polars: {Boolean(mlopsProfileResult?.polars?.available) ? 'ready' : 'not available'}
+                {mlopsProfileResult?.polars?.profile_engine ? ` (${String(mlopsProfileResult.polars.profile_engine)})` : ''}
               </Tag>
               <Tag style={{ background: '#ec489914', border: '1px solid #ec489930', color: '#ec4899' }}>
                 ydata: {Boolean(mlopsProfileResult?.ydata?.available) ? 'ready' : (mlopsIncludeYDataDraft ? 'not available' : 'off')}
@@ -29496,57 +29562,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 </div>
 
                 <div style={{ minWidth: 0, display: 'grid', gap: 10 }}>
-                  <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
-                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Model Selection</Text>
-                    <Tabs
-                      size="small"
-                      activeKey={mlopsStage3ModelModeDraft}
-                      onChange={(key) => activateMLOpsStage3ModelMode(String(key || 'single') === 'ensemble_pipeline' ? 'ensemble_pipeline' : 'single')}
-                      items={[
-                        { key: 'single', label: 'Single Pipeline' },
-                        { key: 'ensemble_pipeline', label: 'Ensemble Pipeline' },
-                      ]}
-                      style={{ marginTop: 4 }}
-                    />
-                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
-                      Test run and Save use only the active pipeline tab.
-                    </Text>
-                    <Space size={8} wrap style={{ marginTop: 8 }}>
-                      <Tag color={mlopsStage3ModelModeDraft === 'single' ? 'blue' : undefined} style={{ marginInlineEnd: 0 }}>
-                        Single: {mlopsStage3ModelModeDraft === 'single' ? 'active' : 'inactive'}
-                      </Tag>
-                      <Tag color={mlopsStage3ModelModeDraft === 'ensemble_pipeline' ? 'purple' : undefined} style={{ marginInlineEnd: 0 }}>
-                        Ensemble: {mlopsStage3ModelModeDraft === 'ensemble_pipeline' ? 'active' : 'inactive'}
-                      </Tag>
-                    </Space>
-                    {mlopsStage3ModelModeDraft === 'single' ? (
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 8 }}>
-                      <div>
-                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Task Type</Text>
-                        <Select
-                          size="small"
-                          value={mlopsStage3TaskTypeDraft}
-                          options={MLOPS_STAGE3_TASK_OPTIONS}
-                          onChange={(value) => setMLOpsStage3TaskTypeDraft(String(value || 'classification') as MLOpsStage3TaskType)}
-                          style={{ width: '100%', marginTop: 4 }}
-                        />
-                      </div>
-                      <div>
-                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Model</Text>
-                        <Select
-                          size="small"
-                          value={mlopsStage3ModelDraft || undefined}
-                          options={mlopsStage3ModelOptions}
-                          onChange={(value) => setMLOpsStage3ModelDraft(String(value || '').trim())}
-                          style={{ width: '100%', marginTop: 4 }}
-                          placeholder="Select model"
-                        />
-                      </div>
-                    </div>
-                    ) : null}
-                  </div>
-
-                  {mlopsStage3ModelModeDraft === 'ensemble_pipeline' ? (
+                  {(
                     <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
                         <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Ensemble Model Pipeline</Text>
@@ -29834,7 +29850,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         </div>
                       ) : null}
                     </div>
-                  ) : null}
+                  )}
 
                   <Modal
                     open={Boolean(selectedMLOpsEnsembleModel)}
@@ -30337,6 +30353,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                               <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Training logs</Text>
                             </div>
                           </div>
+                          {selectedMLOpsEnsembleModelSummary && (selectedMLOpsEnsembleModelSummary as Record<string, unknown>).experiment_tracking ? (
+                            <Space size={6} wrap style={{ marginTop: 10 }}>
+                              <Tag color="green" style={{ marginInlineEnd: 0 }}>tracked</Tag>
+                              <Tag style={{ marginInlineEnd: 0 }}>
+                                run: {String(((selectedMLOpsEnsembleModelSummary as Record<string, unknown>).experiment_tracking as Record<string, unknown>)?.run_id || '-')}
+                              </Tag>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, fontFamily: 'monospace' }}>
+                                {String(((selectedMLOpsEnsembleModelSummary as Record<string, unknown>).experiment_tracking as Record<string, unknown>)?.path || '')}
+                              </Text>
+                            </Space>
+                          ) : null}
                         </div>
                         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(420px, 1fr))', gap: 12 }}>
                           {(['pre_rules', 'post_rules'] as const).map((scope) => (
@@ -30938,6 +30965,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Training logs</Text>
                       </div>
                     </div>
+                    {mlopsStage3RunSummary?.experiment_tracking ? (
+                      <Space size={6} wrap style={{ marginTop: 8 }}>
+                        <Tag color="green" style={{ marginInlineEnd: 0 }}>tracked</Tag>
+                        <Tag style={{ marginInlineEnd: 0 }}>run: {String(mlopsStage3RunSummary.experiment_tracking.run_id || '-')}</Tag>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, fontFamily: 'monospace' }}>
+                          {String(mlopsStage3RunSummary.experiment_tracking.path || '')}
+                        </Text>
+                      </Space>
+                    ) : null}
                     <Input.TextArea
                       readOnly
                       rows={mlopsCompactView ? 5 : 7}
@@ -30975,7 +31011,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         },
                         runtime: {
                           mode: mlopsRuntimeModeDraft,
-                          model_mode: mlopsStage3ModelModeDraft,
+                          model_mode: 'ensemble_pipeline',
                           ensemble_models: [],
                           prediction_field: String(mlopsPredictionFieldDraft || '').trim() || 'prediction',
                           prediction_score_field: String(mlopsPredictionScoreFieldDraft || '').trim() || 'prediction_score',
@@ -31027,6 +31063,36 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         ))}
                       </Space>
                     ) : null}
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 8, marginTop: 8 }}>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Optional X field</Text>
+                        <Select
+                          size="small"
+                          allowClear
+                          showSearch
+                          optionFilterProp="label"
+                          value={mlopsStage3VizXFieldDraft || undefined}
+                          options={mlopsStage3VizFieldOptions}
+                          onChange={(value) => setMLOpsStage3VizXFieldDraft(String(value || '').trim())}
+                          placeholder="Auto"
+                          style={{ width: '100%', marginTop: 4 }}
+                        />
+                      </div>
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Optional Y / score field</Text>
+                        <Select
+                          size="small"
+                          allowClear
+                          showSearch
+                          optionFilterProp="label"
+                          value={mlopsStage3VizYFieldDraft || undefined}
+                          options={mlopsStage3VizFieldOptions}
+                          onChange={(value) => setMLOpsStage3VizYFieldDraft(String(value || '').trim())}
+                          placeholder="Auto"
+                          style={{ width: '100%', marginTop: 4 }}
+                        />
+                      </div>
+                    </div>
                     <div style={{ marginTop: 8, border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-input-bg)', height: mlopsCompactView ? 280 : 360 }}>
                       {mlopsStage3VizFigure ? (
                         <Plot
