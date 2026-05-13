@@ -1983,7 +1983,7 @@ class MLOpsNodeStage1ProfileRequest(BaseModel):
     sample_size: int = 0
     preview_rows: int = 25
     max_chart_columns: int = 6
-    include_ydata: bool = True
+    include_ydata: bool = False
     chart_types: List[str] = Field(default_factory=list)
     chart_theme: str = "auto"
 
@@ -2016,6 +2016,10 @@ class MLOpsNodeStage3TrainRequest(BaseModel):
     tuning_method: str = "random_search"  # grid_search|random_search|bayesian_optimization
     tuning_params: List[Dict[str, Any]] = Field(default_factory=list)
     tracking_enabled: bool = True
+    track_versions: bool = True
+    track_params: bool = True
+    track_metrics: bool = True
+    track_logs: bool = True
     run_name: Optional[str] = None
     explainability_method: str = "off"  # off|auto|shap|shap_tree|shap_linear
 
@@ -2803,6 +2807,28 @@ def _mlops_sanitize_sample_rows(rows: list, limit: Optional[int] = None) -> List
     return out
 
 
+def _mlops_profile_scalar(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="replace")
+        except Exception:
+            return str(value)
+    try:
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+    except Exception:
+        pass
+    if isinstance(value, (dict, list, tuple, set)):
+        try:
+            normalized = list(value) if isinstance(value, (tuple, set)) else value
+            return json.dumps(normalized, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
 def _mlops_feature_operation_catalog() -> List[dict]:
     return [
         {"value": "impute_mean", "label": "Impute Mean", "category": "missing", "requires_column": True},
@@ -2840,7 +2866,263 @@ def _mlops_feature_operation_catalog() -> List[dict]:
     ]
 
 
+def _mlops_infer_column_profile_polars(rows: List[dict], sample_size: int = 2000) -> Dict[str, Any]:
+    import math
+    from collections import Counter
+    import polars as pl  # type: ignore
+
+    tabular_rows = [r for r in rows if isinstance(r, dict)]
+    if not tabular_rows:
+        return {
+            "row_count": 0,
+            "sample_size": 0,
+            "column_count": 0,
+            "duplicate_rows": 0,
+            "columns": [],
+            "recommendations": [],
+            "engine": "polars",
+        }
+
+    sample_rows = tabular_rows[:max(50, min(int(sample_size or len(tabular_rows)), len(tabular_rows)))]
+    column_names = sorted({str(key) for row in sample_rows for key in row.keys()})
+    if not column_names:
+        return {
+            "row_count": len(tabular_rows),
+            "sample_size": len(sample_rows),
+            "column_count": 0,
+            "duplicate_rows": 0,
+            "columns": [],
+            "recommendations": [],
+            "engine": "polars",
+        }
+
+    normalized_columns: Dict[str, List[Any]] = {name: [] for name in column_names}
+    duplicate_rows = 0
+    seen_signatures: set[str] = set()
+    for row in sample_rows:
+        normalized_row = {name: _mlops_profile_scalar(row.get(name)) for name in column_names}
+        for name in column_names:
+            normalized_columns[name].append(normalized_row.get(name))
+        try:
+            signature = json.dumps(normalized_row, sort_keys=True, default=str, ensure_ascii=False)
+        except Exception:
+            signature = str(normalized_row)
+        if signature in seen_signatures:
+            duplicate_rows += 1
+        else:
+            seen_signatures.add(signature)
+
+    df = pl.DataFrame(normalized_columns, strict=False)
+    cols: List[dict] = []
+    recommendations: List[dict] = []
+
+    def _num(v: Any) -> Optional[float]:
+        try:
+            if v is None:
+                return None
+            val = float(v)
+            if math.isfinite(val):
+                return val
+        except Exception:
+            return None
+        return None
+
+    for col in df.columns:
+        series = df.get_column(col)
+        total = max(int(series.len()), 1)
+        missing_count = int(series.null_count())
+        missing_pct = float(missing_count) / total * 100.0
+        non_null_count = int(total - missing_count)
+        non_null_series = series.drop_nulls()
+        try:
+            unique_count = int(non_null_series.cast(pl.Utf8, strict=False).n_unique()) if non_null_count else 0
+        except Exception:
+            unique_count = int(len({str(v) for v in non_null_series.to_list()})) if non_null_count else 0
+        unique_ratio = float(unique_count / max(non_null_count, 1))
+
+        numeric_series = series.cast(pl.Float64, strict=False)
+        numeric_valid = numeric_series.drop_nulls()
+        try:
+            numeric_valid = numeric_valid.filter(numeric_valid.is_finite())
+        except Exception:
+            pass
+        numeric_ratio = float(numeric_valid.len() / max(non_null_count, 1))
+
+        datetime_ratio = 0.0
+        if non_null_count:
+            try:
+                dt_valid = series.cast(pl.Utf8, strict=False).str.strptime(pl.Datetime, strict=False).drop_nulls()
+                datetime_ratio = float(dt_valid.len() / max(non_null_count, 1))
+            except Exception:
+                datetime_ratio = 0.0
+
+        dtype = "text"
+        if numeric_ratio >= 0.85:
+            dtype = "numeric"
+        elif datetime_ratio >= 0.85:
+            dtype = "datetime"
+        elif unique_count <= 40 or unique_ratio <= 0.35:
+            dtype = "categorical"
+
+        sample_values = [str(v)[:120] for v in non_null_series.head(4).to_list()]
+        stats: Dict[str, Any] = {}
+        quality_flags: List[str] = []
+        suggested_ops: List[str] = []
+
+        if missing_pct >= 35.0:
+            quality_flags.append("mostly_missing")
+        if unique_count <= 1 and non_null_count > 0:
+            quality_flags.append("constant_value")
+        if unique_ratio >= 0.98 and unique_count > 20 and dtype in {"categorical", "text"}:
+            quality_flags.append("likely_identifier")
+        if dtype in {"categorical", "text"} and unique_count > 100:
+            quality_flags.append("high_cardinality")
+
+        if dtype == "numeric":
+            valid_values = numeric_valid.to_list()
+            if valid_values:
+                valid = pl.Series(valid_values, dtype=pl.Float64)
+                p01 = float(valid.quantile(0.01) or 0.0)
+                p05 = float(valid.quantile(0.05) or 0.0)
+                p25 = float(valid.quantile(0.25) or 0.0)
+                p50 = float(valid.quantile(0.50) or 0.0)
+                p75 = float(valid.quantile(0.75) or 0.0)
+                p95 = float(valid.quantile(0.95) or 0.0)
+                p99 = float(valid.quantile(0.99) or 0.0)
+                iqr = p75 - p25
+                low = p25 - 1.5 * iqr
+                high = p75 + 1.5 * iqr
+                outlier_count = sum(1 for value in valid_values if iqr > 0 and (float(value) < low or float(value) > high))
+                outlier_pct = float(outlier_count / max(len(valid_values), 1)) * 100.0
+                zero_pct = float(sum(1 for value in valid_values if float(value) == 0.0) / max(len(valid_values), 1)) * 100.0
+                negative_pct = float(sum(1 for value in valid_values if float(value) < 0.0) / max(len(valid_values), 1)) * 100.0
+                mean_value = float(valid.mean() or 0.0)
+                std_value = float(valid.std(ddof=0) or 0.0)
+                skew = 0.0
+                kurtosis = 0.0
+                if len(valid_values) > 2 and std_value > 0:
+                    centered = [(float(value) - mean_value) / std_value for value in valid_values]
+                    skew = float(sum(value ** 3 for value in centered) / len(centered))
+                    if len(valid_values) > 3:
+                        kurtosis = float(sum(value ** 4 for value in centered) / len(centered) - 3.0)
+                stats = {
+                    "min": round(float(valid.min() or 0.0), 6),
+                    "max": round(float(valid.max() or 0.0), 6),
+                    "mean": round(mean_value, 6),
+                    "median": round(p50, 6),
+                    "std": round(std_value, 6),
+                    "p01": round(p01, 6),
+                    "p05": round(p05, 6),
+                    "p25": round(p25, 6),
+                    "p75": round(p75, 6),
+                    "p95": round(p95, 6),
+                    "p99": round(p99, 6),
+                    "skew": round(skew, 6),
+                    "kurtosis": round(kurtosis, 6),
+                    "outlier_pct": round(outlier_pct, 4),
+                    "zero_pct": round(zero_pct, 4),
+                    "negative_pct": round(negative_pct, 4),
+                }
+                suggested_ops.extend(["impute_median", "scale_robust"])
+                if abs(skew) >= 1.0:
+                    suggested_ops.append("log1p")
+                if outlier_pct >= 3.0:
+                    suggested_ops.append("winsorize")
+                if unique_count >= 30:
+                    suggested_ops.append("bin_quantile")
+                if iqr == 0:
+                    quality_flags.append("low_variance")
+            else:
+                quality_flags.append("non_numeric_values")
+        elif dtype == "categorical":
+            values = ["" if value is None else str(value) for value in series.to_list()]
+            top_values = Counter(values).most_common(5)
+            stats = {
+                "top_values": [{"value": str(key), "count": int(count)} for key, count in top_values],
+                "mode": str(top_values[0][0]) if top_values else "",
+            }
+            suggested_ops.append("impute_mode")
+            suggested_ops.append("one_hot_encode" if unique_count <= 20 else "frequency_encode")
+            if unique_count > 200:
+                suggested_ops.append("label_encode")
+        elif dtype == "datetime":
+            try:
+                dt_series = series.cast(pl.Utf8, strict=False).str.strptime(pl.Datetime, strict=False).drop_nulls()
+                if dt_series.len() > 0:
+                    min_dt = dt_series.min()
+                    max_dt = dt_series.max()
+                    span_days = 0
+                    try:
+                        span_days = int((max_dt - min_dt).days)  # type: ignore[operator]
+                    except Exception:
+                        span_days = 0
+                    stats = {
+                        "min": min_dt.isoformat() if hasattr(min_dt, "isoformat") else str(min_dt),
+                        "max": max_dt.isoformat() if hasattr(max_dt, "isoformat") else str(max_dt),
+                        "span_days": span_days,
+                    }
+                    if span_days <= 1:
+                        quality_flags.append("narrow_time_span")
+            except Exception:
+                stats = {}
+            suggested_ops.extend(["datetime_parts", "cyclical_encode"])
+        else:
+            values = ["" if value is None else str(value) for value in series.to_list()]
+            lengths = [len(value) for value in values]
+            sorted_lengths = sorted(lengths)
+            median_length = sorted_lengths[len(sorted_lengths) // 2] if sorted_lengths else 0
+            word_counts = [len([w for w in value.strip().split() if w]) for value in values]
+            stats = {
+                "avg_length": round(float(sum(lengths) / max(len(lengths), 1)), 4),
+                "median_length": round(float(median_length), 4),
+                "max_length": int(max(lengths) if lengths else 0),
+                "avg_word_count": round(float(sum(word_counts) / max(len(word_counts), 1)), 4),
+            }
+            suggested_ops.extend(["text_lower", "text_length", "text_word_count"])
+
+        if missing_pct >= 5.0 and "impute_median" not in suggested_ops and "impute_mode" not in suggested_ops:
+            suggested_ops.insert(0, "impute_mode" if dtype in {"categorical", "text"} else "impute_median")
+        if "likely_identifier" in quality_flags and "drop_column" not in suggested_ops:
+            suggested_ops.append("drop_column")
+
+        col_obj = {
+            "name": str(col),
+            "type": dtype,
+            "missing_count": missing_count,
+            "missing_pct": round(missing_pct, 4),
+            "non_null_count": non_null_count,
+            "unique_count": unique_count,
+            "unique_ratio": round(unique_ratio, 4),
+            "uniqueness_score": round(unique_ratio * 100.0, 4),
+            "sample_values": sample_values,
+            "stats": stats,
+            "quality_flags": sorted(list(dict.fromkeys(quality_flags))),
+            "suggested_operations": list(dict.fromkeys(suggested_ops))[:10],
+        }
+        cols.append(col_obj)
+        recommendations.append({
+            "column": str(col),
+            "type": dtype,
+            "operations": col_obj["suggested_operations"][:6],
+            "quality_flags": col_obj["quality_flags"],
+        })
+
+    return {
+        "row_count": len(tabular_rows),
+        "sample_size": len(sample_rows),
+        "column_count": len(df.columns),
+        "duplicate_rows": duplicate_rows,
+        "columns": cols,
+        "recommendations": recommendations,
+        "engine": "polars",
+    }
+
+
 def _mlops_infer_column_profile(rows: List[dict], sample_size: int = 2000) -> Dict[str, Any]:
+    try:
+        return _mlops_infer_column_profile_polars(rows, sample_size=sample_size)
+    except Exception as polars_exc:
+        logger.warning(f"MLOps Stage 1 Polars profile fallback to pandas: {polars_exc}")
     import math
     import pandas as pd
 
@@ -3099,7 +3381,7 @@ def _mlops_stage1_profile_rows(
     sample_size: int = 2000,
     preview_rows: int = 25,
     max_chart_columns: int = 6,
-    include_ydata: bool = True,
+    include_ydata: bool = False,
     chart_types: Optional[List[str]] = None,
     chart_theme: str = "auto",
 ) -> Dict[str, Any]:
@@ -3203,7 +3485,22 @@ def _mlops_stage1_profile_rows(
     try:
         import polars as pl  # type: ignore
 
-        pl_df = pl.DataFrame(sampled_rows)
+        polars_columns: Dict[str, List[Any]] = {}
+        for row in sampled_rows:
+            if not isinstance(row, dict):
+                continue
+            for key, value in row.items():
+                name = str(key)
+                if name not in polars_columns:
+                    polars_columns[name] = [None] * len(polars_columns.get("__row_index__", []))
+                polars_columns[name].append(_mlops_profile_scalar(value))
+            row_count_seen = len(polars_columns.get("__row_index__", []))
+            polars_columns.setdefault("__row_index__", []).append(row_count_seen)
+            for name in list(polars_columns.keys()):
+                if name != "__row_index__" and len(polars_columns[name]) < len(polars_columns["__row_index__"]):
+                    polars_columns[name].append(None)
+        polars_columns.pop("__row_index__", None)
+        pl_df = pl.DataFrame(polars_columns, strict=False) if polars_columns else pl.DataFrame()
         estimated = None
         try:
             estimated = float(pl_df.estimated_size("mb"))  # type: ignore[arg-type]
@@ -3214,6 +3511,7 @@ def _mlops_stage1_profile_rows(
             "rows": int(pl_df.height),
             "columns": int(pl_df.width),
             "estimated_memory_mb": round(float(estimated), 4) if isinstance(estimated, (int, float)) else None,
+            "profile_engine": str(profile.get("engine") or "polars"),
         }
     except Exception as exc:
         polars_meta = {
@@ -3222,7 +3520,9 @@ def _mlops_stage1_profile_rows(
         }
 
     charts: List[Dict[str, Any]] = []
-    df = pd.DataFrame(sampled_rows)
+    chart_row_cap = _stage1_env_int("MLOPS_STAGE1_CHART_MAX_ROWS", 5000)
+    chart_rows = sampled_rows if chart_row_cap <= 0 else sampled_rows[: min(len(sampled_rows), chart_row_cap)]
+    df = pd.DataFrame(chart_rows)
     df.columns = [str(c) for c in df.columns]
     safe_max_charts = max(1, min(int(max_chart_columns or 6), 12))
 
@@ -3471,7 +3771,7 @@ def _mlops_stage1_profile_rows(
                         return str(value)
                 return str(value)
 
-            ydata_row_cap = _stage1_env_int("MLOPS_STAGE1_YDATA_MAX_ROWS", eda_row_cap or len(sampled_rows))
+            ydata_row_cap = _stage1_env_int("MLOPS_STAGE1_YDATA_MAX_ROWS", 5000)
             ydata_limit = len(sampled_rows) if ydata_row_cap <= 0 else min(len(sampled_rows), ydata_row_cap)
             ydata_rows: List[dict] = []
             for row in sampled_rows[:ydata_limit]:
@@ -3484,7 +3784,7 @@ def _mlops_stage1_profile_rows(
             ydata_df = pd.DataFrame(ydata_rows)
             report = ProfileReport(
                 ydata_df,
-                minimal=False,
+                minimal=True,
                 explorative=True,
                 progress_bar=False,
                 title="MLOps Stage-1 Profile",
@@ -3673,6 +3973,8 @@ def _mlops_stage1_profile_rows(
             "profile_limited": bool(profile_limited),
             "profile_scope": "sampled" if profile_limited else "full",
             "eda_row_cap": int(eda_row_cap) if eda_row_cap > 0 else None,
+            "chart_row_cap": int(chart_row_cap) if chart_row_cap > 0 else None,
+            "chart_sampled_rows": int(len(chart_rows)),
             "column_count": int(profile.get("column_count") or 0),
             "duplicate_rows": int(profile.get("duplicate_rows") or 0),
             "type_counts": type_counts,
@@ -5341,6 +5643,103 @@ def _mlops_stage3_persist_runtime_bundle(
         return None
 
 
+def _mlops_stage3_persist_experiment_tracking(
+    summary: Dict[str, Any],
+    *,
+    track_versions: bool = True,
+    track_params: bool = True,
+    track_metrics: bool = True,
+    track_logs: bool = True,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(summary, dict) or not bool(summary.get("tracking_enabled")):
+        return None
+    try:
+        output_dir = _BACKEND_DIR / "outputs" / "mlops_experiments"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        run_id = uuid.uuid4().hex
+        artifact_path = output_dir / f"mlops_experiment_{run_id}.json"
+        runtime_bundle = summary.get("runtime_model_bundle") if isinstance(summary.get("runtime_model_bundle"), dict) else {}
+        record: Dict[str, Any] = {
+            "version": 1,
+            "run_id": run_id,
+            "created_at": datetime.utcnow().isoformat(),
+            "run_name": str(summary.get("run_name") or "").strip() or None,
+            "task_type": summary.get("task_type"),
+            "model": summary.get("model"),
+            "model_mode": summary.get("model_mode", "single"),
+            "included": {
+                "model_versions": bool(track_versions),
+                "parameters": bool(track_params),
+                "metrics_history": bool(track_metrics),
+                "training_logs": bool(track_logs),
+            },
+        }
+        if track_versions:
+            record["model_version"] = {
+                "runtime_artifact_path": runtime_bundle.get("path"),
+                "runtime_artifact_type": runtime_bundle.get("artifact_type"),
+                "predictor_kind": runtime_bundle.get("predictor_kind"),
+                "created_at": runtime_bundle.get("created_at"),
+            }
+        if track_params:
+            record["parameters"] = {
+                "feature_fields": summary.get("feature_fields") or [],
+                "target_field": summary.get("target_field"),
+                "target_fields": summary.get("target_fields") or [],
+                "train_test": {
+                    "train_rows": summary.get("train_rows"),
+                    "validate_rows": summary.get("validate_rows"),
+                    "test_rows": summary.get("test_rows"),
+                    "cv_folds": summary.get("cv_folds"),
+                },
+                "training": {
+                    "epochs": summary.get("epochs"),
+                    "batch_size": summary.get("batch_size"),
+                    "random_seed": summary.get("random_seed"),
+                    "cluster_count": summary.get("cluster_count"),
+                },
+                "tuning": {
+                    "enabled": summary.get("tuning_enabled"),
+                    "method": summary.get("tuning_method"),
+                    "params": summary.get("tuning_params") or [],
+                    "result": summary.get("tuning_result") or {},
+                },
+                "explainability": summary.get("explainability") or {},
+            }
+        if track_metrics:
+            record["metrics_history"] = {
+                "executed_at": summary.get("executed_at"),
+                "input_rows": summary.get("input_rows"),
+                "usable_rows": summary.get("usable_rows"),
+                "dropped_rows": summary.get("dropped_rows"),
+                "train_metrics": summary.get("train_metrics") or {},
+                "test_metrics": summary.get("test_metrics") or {},
+                "model_summaries": summary.get("model_summaries") or [],
+            }
+        if track_logs:
+            record["training_logs"] = {
+                "notes": summary.get("notes") or [],
+                "sample_predictions": summary.get("sample_predictions") or [],
+            }
+        safe_record = json.loads(json.dumps(record, default=str, ensure_ascii=False))
+        artifact_path.write_text(json.dumps(safe_record, indent=2, ensure_ascii=False), encoding="utf-8")
+        return {
+            "enabled": True,
+            "run_id": run_id,
+            "artifact_type": "json_file",
+            "path": str(artifact_path),
+            "created_at": record["created_at"],
+            "included": record["included"],
+        }
+    except Exception as exc:
+        logger.warning(f"MLOps Stage 3 experiment tracking persist failed: {exc}")
+        return {
+            "enabled": True,
+            "status": "failed",
+            "error": str(exc),
+        }
+
+
 def _mlops_rule_scalar(value: Any) -> Any:
     if isinstance(value, dict):
         return value
@@ -5525,6 +5924,10 @@ def _mlops_stage3_train_ensemble_rows(
     tuning_method: str = "random_search",
     tuning_params: Optional[List[Dict[str, Any]]] = None,
     tracking_enabled: bool = True,
+    track_versions: bool = True,
+    track_params: bool = True,
+    track_metrics: bool = True,
+    track_logs: bool = True,
     run_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     from etl_engine import ETLEngine
@@ -5588,6 +5991,10 @@ def _mlops_stage3_train_ensemble_rows(
             tuning_method=tuning_method,
             tuning_params=tuning_params,
             tracking_enabled=tracking_enabled,
+            track_versions=track_versions,
+            track_params=track_params,
+            track_metrics=track_metrics,
+            track_logs=track_logs,
             run_name=f"{run_name or 'ensemble'}:{step_name}",
             explainability_method=str(step.get("explainability_method") or "off"),
         )
@@ -5659,7 +6066,7 @@ def _mlops_stage3_train_ensemble_rows(
             "run_name": run_name,
         },
     )
-    return {
+    summary = {
         "ran": True,
         "executed_at": datetime.utcnow().isoformat(),
         "mode": "real_train",
@@ -5689,6 +6096,18 @@ def _mlops_stage3_train_ensemble_rows(
         "run_name": run_name,
         "runtime_model_bundle": runtime_bundle,
     }
+    tracking_artifact = _mlops_stage3_persist_experiment_tracking(
+        summary,
+        track_versions=track_versions,
+        track_params=track_params,
+        track_metrics=track_metrics,
+        track_logs=track_logs,
+    )
+    if tracking_artifact:
+        summary["experiment_tracking"] = tracking_artifact
+        if tracking_artifact.get("path"):
+            summary["notes"] = list(summary.get("notes") or []) + [f"Experiment tracking artifact: {tracking_artifact.get('path')}"]
+    return summary
 
 
 def _mlops_stage3_train_rows(
@@ -5715,6 +6134,10 @@ def _mlops_stage3_train_rows(
     tuning_method: str = "random_search",
     tuning_params: Optional[List[Dict[str, Any]]] = None,
     tracking_enabled: bool = True,
+    track_versions: bool = True,
+    track_params: bool = True,
+    track_metrics: bool = True,
+    track_logs: bool = True,
     run_name: Optional[str] = None,
     explainability_method: str = "off",
 ) -> Dict[str, Any]:
@@ -6115,7 +6538,7 @@ def _mlops_stage3_train_rows(
             "Runtime scoring bundle generated for production forecasting mode.",
         ])
 
-        return {
+        summary = {
             "ran": True,
             "executed_at": datetime.utcnow().isoformat(),
             "mode": "real_train",
@@ -6174,6 +6597,18 @@ def _mlops_stage3_train_rows(
             "sample_predictions": sample_predictions,
             "runtime_model_bundle": runtime_bundle,
         }
+        tracking_artifact = _mlops_stage3_persist_experiment_tracking(
+            summary,
+            track_versions=track_versions,
+            track_params=track_params,
+            track_metrics=track_metrics,
+            track_logs=track_logs,
+        )
+        if tracking_artifact:
+            summary["experiment_tracking"] = tracking_artifact
+            if tracking_artifact.get("path"):
+                summary["notes"] = list(summary.get("notes") or []) + [f"Experiment tracking artifact: {tracking_artifact.get('path')}"]
+        return summary
 
     resolved_fields = [
         str(item or "").strip()
@@ -6905,6 +7340,17 @@ def _mlops_stage3_train_rows(
         "sample_predictions": sample_predictions,
         "runtime_model_bundle": runtime_model_bundle,
     }
+    tracking_artifact = _mlops_stage3_persist_experiment_tracking(
+        summary,
+        track_versions=track_versions,
+        track_params=track_params,
+        track_metrics=track_metrics,
+        track_logs=track_logs,
+    )
+    if tracking_artifact:
+        summary["experiment_tracking"] = tracking_artifact
+        if tracking_artifact.get("path"):
+            summary["notes"] = list(summary.get("notes") or []) + [f"Experiment tracking artifact: {tracking_artifact.get('path')}"]
     return summary
 
 
@@ -7748,6 +8194,10 @@ async def mlops_node_stage3_train(
                 tuning_method=str(body.tuning_method or "random_search"),
                 tuning_params=list(body.tuning_params or []),
                 tracking_enabled=bool(body.tracking_enabled),
+                track_versions=bool(body.track_versions),
+                track_params=bool(body.track_params),
+                track_metrics=bool(body.track_metrics),
+                track_logs=bool(body.track_logs),
                 run_name=body.run_name,
             )
         else:
@@ -7775,6 +8225,10 @@ async def mlops_node_stage3_train(
                 tuning_method=str(body.tuning_method or "random_search"),
                 tuning_params=list(body.tuning_params or []),
                 tracking_enabled=bool(body.tracking_enabled),
+                track_versions=bool(body.track_versions),
+                track_params=bool(body.track_params),
+                track_metrics=bool(body.track_metrics),
+                track_logs=bool(body.track_logs),
                 run_name=body.run_name,
                 explainability_method=str(body.explainability_method or "off"),
             )
