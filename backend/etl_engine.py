@@ -15950,6 +15950,18 @@ END;"""
         profile_emit_mode = str(config.get("custom_profile_emit_mode") or "changed_only").strip().lower()
         if profile_emit_mode not in {"changed_only", "all_entities"}:
             profile_emit_mode = "changed_only"
+        profile_emit_no_change_policy = str(
+            config.get("custom_profile_emit_no_change_policy") or "current_entities"
+        ).strip().lower()
+        profile_emit_no_change_enabled = profile_emit_no_change_policy not in {
+            "0",
+            "false",
+            "no",
+            "none",
+            "off",
+            "disabled",
+            "empty",
+        }
         profile_required_fields = self._parse_selected_fields(config.get("custom_profile_required_fields", ""))
         profile_event_time_field = str(config.get("custom_profile_event_time_field") or "").strip()
         profile_default_windows = self._parse_profile_windows(config.get("custom_profile_window_days"), [1, 7, 30])
@@ -18011,6 +18023,47 @@ END;"""
                 # "running/progress counter" message once processing is complete.
                 _emit_profile_progress(force=True, emit_progress_event=False)
                 if emit_incremental_rows:
+                    if (
+                        not result
+                        and not changed_tokens
+                        and profile_emit_mode == "changed_only"
+                        and profile_emit_no_change_enabled
+                        and len(base_rows) > 0
+                        and seen_entity_tokens
+                    ):
+                        stats_store["custom_fields_no_change_emit_fallback"] = True
+                        stats_store["custom_fields_no_change_emit_policy"] = "current_entities"
+                        stats_store["custom_fields_no_change_emit_tokens"] = int(len(seen_entity_tokens))
+                        _record_custom_field_warning(
+                            "Custom profile emitted current-run entity profiles because processed rows "
+                            "produced no changed entities; downstream nodes would otherwise receive no rows."
+                        )
+                        for token in seen_entity_tokens:
+                            _raise_if_aborted()
+                            profile_doc = documents_store.get(token)
+                            if not isinstance(profile_doc, dict):
+                                continue
+                            profile_meta = meta_store.get(token)
+                            if not isinstance(profile_meta, dict):
+                                profile_meta = {}
+                            resolved_profile_doc = _resolve_profile_dynamic_value(profile_doc, profile_meta)
+                            if not isinstance(resolved_profile_doc, dict):
+                                continue
+                            out_row: Dict[str, Any] = {}
+                            if include_source:
+                                source_row = last_source_by_token.get(token)
+                                if isinstance(source_row, dict):
+                                    out_row.update(source_row)
+                            out_row.update(resolved_profile_doc)
+                            if primary_key_field and self._get_profile_path_value(out_row, primary_key_field, None) is None:
+                                self._set_profile_path_value(
+                                    out_row,
+                                    primary_key_field,
+                                    self._json_safe_value(entity_value_by_token.get(token)),
+                                )
+                            if profile_include_change_fields:
+                                out_row["_profile_changed_fields"] = changed_fields_by_token.get(token, [])
+                            result.append(self._json_safe_value(out_row))
                     return result
 
                 emit_tokens: List[str]
@@ -18024,6 +18077,20 @@ END;"""
                         emit_tokens.append(token)
                 else:
                     emit_tokens = list(changed_tokens)
+                    if (
+                        not emit_tokens
+                        and profile_emit_no_change_enabled
+                        and len(base_rows) > 0
+                        and seen_entity_tokens
+                    ):
+                        emit_tokens = list(seen_entity_tokens)
+                        stats_store["custom_fields_no_change_emit_fallback"] = True
+                        stats_store["custom_fields_no_change_emit_policy"] = "current_entities"
+                        stats_store["custom_fields_no_change_emit_tokens"] = int(len(emit_tokens))
+                        _record_custom_field_warning(
+                            "Custom profile emitted current-run entity profiles because processed rows "
+                            "produced no changed entities; downstream nodes would otherwise receive no rows."
+                        )
 
                 for token in emit_tokens:
                     _raise_if_aborted()
@@ -18064,6 +18131,20 @@ END;"""
                     emit_tokens.append(token)
             else:
                 emit_tokens = list(changed_tokens)
+                if (
+                    not emit_tokens
+                    and profile_emit_no_change_enabled
+                    and len(base_rows) > 0
+                    and seen_entity_tokens
+                ):
+                    emit_tokens = list(seen_entity_tokens)
+                    stats_store["custom_fields_no_change_emit_fallback"] = True
+                    stats_store["custom_fields_no_change_emit_policy"] = "current_entities"
+                    stats_store["custom_fields_no_change_emit_tokens"] = int(len(emit_tokens))
+                    _record_custom_field_warning(
+                        "Custom profile emitted current-run entity profiles because processed rows "
+                        "produced no changed entities; downstream nodes would otherwise receive no rows."
+                    )
 
             for token in emit_tokens:
                 _raise_if_aborted()

@@ -6635,20 +6635,47 @@ def _mlops_stage3_train_rows(
 
     usable_rows: List[Dict[str, Any]] = []
     dropped_rows = 0
+    rows_with_any_feature = 0
+    rows_with_target = 0
+    feature_present_counts: Dict[str, int] = {field: 0 for field in resolved_fields}
     for row in projected_rows:
-        present_features = sum(0 if _mlops_stage3_is_missing(row.get(field)) else 1 for field in resolved_fields)
+        present_features = 0
+        for field in resolved_fields:
+            if not _mlops_stage3_is_missing(row.get(field)):
+                present_features += 1
+                feature_present_counts[field] = feature_present_counts.get(field, 0) + 1
         if present_features <= 0:
             dropped_rows += 1
             continue
+        rows_with_any_feature += 1
         if target_required and _mlops_stage3_is_missing(row.get(target_path)):
             dropped_rows += 1
             continue
+        if target_required:
+            rows_with_target += 1
         usable_rows.append(row)
 
     if len(usable_rows) < 12:
+        missing_or_empty_features = [
+            field for field, count in feature_present_counts.items()
+            if int(count or 0) <= 0
+        ][:10]
+        diagnostic_parts = [
+            f"rows_with_features={rows_with_any_feature}",
+        ]
+        if target_required:
+            diagnostic_parts.extend([
+                f"rows_with_target={rows_with_target}",
+                f"target_field='{target_path}'",
+            ])
+        if missing_or_empty_features:
+            diagnostic_parts.append(f"empty_feature_fields={missing_or_empty_features}")
         raise HTTPException(
             400,
-            f"Insufficient usable rows after feature/target checks. required>=12, got={len(usable_rows)}",
+            "Insufficient usable rows after feature/target checks. "
+            f"required>=12, got={len(usable_rows)}. "
+            + ", ".join(diagnostic_parts)
+            + ". Check that selected feature and label fields exist in the rows reaching this model.",
         )
 
     df = pd.DataFrame(usable_rows)
@@ -15912,10 +15939,17 @@ async def validate_custom_fields(body: CustomFieldValidationRequest):
         else:
             try:
                 if is_rocks_validation:
-                    lmdb_rows = await _load_rocksdb_rows_for_preview(lmdb_cfg, max_rows=max_rows)
+                    preview_payload = await _load_rocksdb_rows_for_preview(lmdb_cfg, max_rows=max_rows)
                 else:
-                    lmdb_rows = await _load_lmdb_rows_for_preview(lmdb_cfg, max_rows=max_rows)
-                for row in lmdb_rows[:max_rows]:
+                    preview_payload = await _load_lmdb_rows_for_preview(lmdb_cfg, max_rows=max_rows)
+                preview_rows = (
+                    preview_payload.get("rows")
+                    if isinstance(preview_payload, dict)
+                    else preview_payload
+                )
+                if not isinstance(preview_rows, list):
+                    preview_rows = []
+                for row in preview_rows[:max_rows]:
                     if isinstance(row, dict):
                         normalized_rows.append(row)
             except HTTPException as exc:
@@ -15923,11 +15957,21 @@ async def validate_custom_fields(body: CustomFieldValidationRequest):
             except Exception as exc:
                 errors.append(str(exc))
             if not normalized_rows and not errors:
-                errors.append(
-                    "No rows found in RocksDB for validation. Adjust key/path/filter settings."
-                    if is_rocks_validation
-                    else "No rows found in LMDB for validation. Adjust db/filter settings."
-                )
+                input_rows_fallback = body.rows if isinstance(body.rows, list) else []
+                fallback_rows = [row for row in input_rows_fallback if isinstance(row, dict)]
+                if fallback_rows:
+                    warnings.append(
+                        f"No rows found in {'RocksDB' if is_rocks_validation else 'LMDB'} for validation. "
+                        "Validation automatically used sample rows mode."
+                    )
+                    validation_source = "rows"
+                    normalized_rows.extend(fallback_rows[:max_rows])
+                else:
+                    errors.append(
+                        "No rows found in RocksDB for validation. Adjust key/path/filter settings."
+                        if is_rocks_validation
+                        else "No rows found in LMDB for validation. Adjust db/filter settings."
+                    )
 
     if validation_source == "rows" and not normalized_rows:
         input_rows = body.rows if isinstance(body.rows, list) else []
