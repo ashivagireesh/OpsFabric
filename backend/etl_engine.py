@@ -10160,7 +10160,7 @@ END;"""
             safe_config.get("array_match_mode", "all_elements")
         )
         case_sensitive = bool(safe_config.get("case_sensitive", False))
-        include_original_row = self._parse_bool_like(safe_config.get("include_original_row", True), True)
+        include_original_row = self._parse_bool_like(safe_config.get("include_original_row", False), False)
         array_rules_by_root = self._group_profile_query_rules_by_array_root(rules)
         profile_patch_enabled = self._parse_bool_like(safe_config.get("profile_patch_enabled"), False)
         profile_patch_stage = str(safe_config.get("profile_patch_stage") or "post").strip().lower()
@@ -10330,7 +10330,7 @@ END;"""
             if idx == 0 or idx % 500 == 0:
                 _raise_if_aborted()
             out_row: Dict[str, Any] = {}
-            if include_original_row:
+            if include_original_row and not selected_fields:
                 if isinstance(row, dict):
                     out_row.update(dict(row))
                 else:
@@ -10362,8 +10362,8 @@ END;"""
                 projected_rows.append(out_row)
 
         if matched_projection_count == 0 and sliced_rows:
-            logger.warning("Data Query select_fields matched zero fields; returning filtered rows unchanged")
-            result_rows = sliced_rows if include_original_row else []
+            logger.warning("Data Query select_fields matched zero fields; returning strict projected rows without source fields")
+            result_rows = projected_rows
         else:
             result_rows = projected_rows
 

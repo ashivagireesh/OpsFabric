@@ -326,6 +326,7 @@ _EXECUTION_HISTORY_PRUNE_DELETE_LIMIT = _env_int("EXECUTION_HISTORY_PRUNE_DELETE
 
 _SYSTEM_SETTING_SQLITE_CLEANUP_SCHEDULE_KEY = "sqlite_cleanup_schedule_v1"
 _SYSTEM_SETTING_APP_FEATURE_FLAGS_KEY = "app_feature_flags_v1"
+_SYSTEM_SETTING_DEV_CHAT_KEY = "dev_chat_provider_profiles_v1"
 _SQLITE_CLEANUP_SCHEDULE_JOB_ID = "system:sqlite_cleanup_schedule"
 _DEFAULT_SQLITE_CLEANUP_SCHEDULE_CONFIG: Dict[str, Any] = {
     "enabled": False,
@@ -339,6 +340,14 @@ _DEFAULT_SQLITE_CLEANUP_SCHEDULE_CONFIG: Dict[str, Any] = {
 _DEFAULT_APP_FEATURE_FLAGS_CONFIG: Dict[str, Any] = {
     "fns_v2_enabled": _env_bool("FNS_V2_ENABLED", False),
 }
+_DEV_CHAT_SECRET_KEY_RE = re.compile(r"(api[_-]?key|token|secret|password|passwd|pwd|credential|auth)", re.I)
+_DEV_CHAT_DEFAULT_SYSTEM_PROMPT = (
+    "You are Framework Copilot, a context-aware development assistant embedded inside an "
+    "ETL, MLOps, business workflow, and analytics platform. Use the supplied environment, "
+    "pipeline, node configuration, error, and data-sample context first. Be concrete, "
+    "configuration-aware, data-aware, and safe. Never reveal secrets. Prefer exact field names, "
+    "node IDs, config paths, and next actions."
+)
 
 
 def _schedule_job_id(pipeline_id: str) -> str:
@@ -446,6 +455,423 @@ def _apply_runtime_feature_flags(
     except Exception:
         pass
     return cfg
+
+
+def _dev_chat_default_provider_profiles() -> List[Dict[str, Any]]:
+    return [
+        {
+            "id": "openai_default",
+            "name": "OpenAI / ChatGPT",
+            "provider": "openai",
+            "model": _os.getenv("OPENAI_MODEL") or _os.getenv("OPENAI_WORKFLOW_CHAT_MODEL") or "gpt-4o-mini",
+            "base_url": _os.getenv("OPENAI_API_BASE") or _os.getenv("OPENAI_API_BASE_URL") or "https://api.openai.com/v1",
+            "api_key": "",
+            "enabled": True,
+            "is_default": True,
+            "temperature": 0.2,
+            "max_tokens": 1400,
+            "timeout_seconds": 60,
+            "streaming": False,
+            "system_prompt": _DEV_CHAT_DEFAULT_SYSTEM_PROMPT,
+        },
+        {
+            "id": "ollama_local",
+            "name": "Ollama Local",
+            "provider": "ollama",
+            "model": _os.getenv("OLLAMA_MODEL") or "llama3.1:8b",
+            "base_url": _os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434",
+            "api_key": "",
+            "enabled": True,
+            "is_default": False,
+            "temperature": 0.2,
+            "max_tokens": 1400,
+            "timeout_seconds": 90,
+            "streaming": False,
+            "system_prompt": _DEV_CHAT_DEFAULT_SYSTEM_PROMPT,
+        },
+        {
+            "id": "gemini_default",
+            "name": "Gemini",
+            "provider": "gemini",
+            "model": _os.getenv("GEMINI_MODEL") or "gemini-1.5-flash",
+            "base_url": "https://generativelanguage.googleapis.com/v1beta",
+            "api_key": "",
+            "enabled": False,
+            "is_default": False,
+            "temperature": 0.2,
+            "max_tokens": 1400,
+            "timeout_seconds": 60,
+            "streaming": False,
+            "system_prompt": _DEV_CHAT_DEFAULT_SYSTEM_PROMPT,
+        },
+    ]
+
+
+def _dev_chat_provider_to_dict(profile: Any, include_secret: bool = False) -> Dict[str, Any]:
+    raw = profile.model_dump() if hasattr(profile, "model_dump") else dict(profile or {})
+    provider = str(raw.get("provider") or "openai").strip().lower()
+    if provider in {"chatgpt", "codex", "openai-compatible", "openai_compatible"}:
+        provider = "openai"
+    if provider not in {"openai", "gemini", "ollama", "mistral", "custom"}:
+        provider = "openai"
+    profile_id = str(raw.get("id") or "").strip() or f"{provider}_{uuid.uuid4().hex[:8]}"
+    name = str(raw.get("name") or provider.title()).strip() or provider.title()
+    model = str(raw.get("model") or "").strip()
+    if not model:
+        model = "llama3.1:8b" if provider == "ollama" else "gpt-4o-mini"
+    try:
+        temperature = float(raw.get("temperature", 0.2))
+    except Exception:
+        temperature = 0.2
+    try:
+        max_tokens = int(raw.get("max_tokens", 1200))
+    except Exception:
+        max_tokens = 1200
+    try:
+        timeout_seconds = int(raw.get("timeout_seconds", 60))
+    except Exception:
+        timeout_seconds = 60
+    out = {
+        "id": profile_id,
+        "name": name,
+        "provider": provider,
+        "model": model,
+        "base_url": str(raw.get("base_url") or "").strip(),
+        "api_key": str(raw.get("api_key") or "").strip() if include_secret else "",
+        "has_api_key": bool(str(raw.get("api_key") or "").strip()),
+        "enabled": _coerce_bool(raw.get("enabled"), True),
+        "is_default": _coerce_bool(raw.get("is_default"), False),
+        "temperature": max(0.0, min(temperature, 2.0)),
+        "max_tokens": max(128, min(max_tokens, 16000)),
+        "timeout_seconds": max(5, min(timeout_seconds, 300)),
+        "streaming": _coerce_bool(raw.get("streaming"), False),
+        "system_prompt": str(raw.get("system_prompt") or _DEV_CHAT_DEFAULT_SYSTEM_PROMPT).strip() or _DEV_CHAT_DEFAULT_SYSTEM_PROMPT,
+    }
+    if not out["base_url"]:
+        if provider == "ollama":
+            out["base_url"] = "http://localhost:11434"
+        elif provider == "gemini":
+            out["base_url"] = "https://generativelanguage.googleapis.com/v1beta"
+        elif provider == "mistral":
+            out["base_url"] = "https://api.mistral.ai/v1"
+        else:
+            out["base_url"] = "https://api.openai.com/v1"
+    return out
+
+
+def _dev_chat_load_provider_profiles(db: Session, include_secret: bool = False) -> List[Dict[str, Any]]:
+    row = db.query(models.SystemSetting).filter(
+        models.SystemSetting.key == _SYSTEM_SETTING_DEV_CHAT_KEY
+    ).first()
+    raw = row.value if row and isinstance(row.value, dict) else {}
+    providers = raw.get("providers") if isinstance(raw, dict) else None
+    if not isinstance(providers, list) or not providers:
+        providers = _dev_chat_default_provider_profiles()
+    normalized = [_dev_chat_provider_to_dict(item, include_secret=include_secret) for item in providers if isinstance(item, dict)]
+    if normalized and not any(item.get("is_default") and item.get("enabled") for item in normalized):
+        normalized[0]["is_default"] = True
+    return normalized
+
+
+def _dev_chat_save_provider_profiles(db: Session, providers: List[Any]) -> List[Dict[str, Any]]:
+    row = db.query(models.SystemSetting).filter(
+        models.SystemSetting.key == _SYSTEM_SETTING_DEV_CHAT_KEY
+    ).first()
+    raw = row.value if row and isinstance(row.value, dict) else {}
+    existing_items = raw.get("providers") if isinstance(raw, dict) else []
+    if not isinstance(existing_items, list):
+        existing_items = []
+    existing_by_id = {
+        str(item.get("id")): item
+        for item in existing_items
+        if isinstance(item, dict) and item.get("id")
+    }
+
+    normalized = []
+    for item in providers:
+        next_item = _dev_chat_provider_to_dict(item, include_secret=True)
+        incoming = item.model_dump() if hasattr(item, "model_dump") else dict(item or {})
+        if not str(incoming.get("api_key") or "").strip():
+            existing = existing_by_id.get(str(next_item.get("id")))
+            if isinstance(existing, dict) and str(existing.get("api_key") or "").strip():
+                next_item["api_key"] = str(existing.get("api_key") or "").strip()
+                next_item["has_api_key"] = True
+        normalized.append(next_item)
+
+    if not normalized:
+        normalized = [_dev_chat_provider_to_dict(item, include_secret=True) for item in _dev_chat_default_provider_profiles()]
+    default_seen = False
+    for item in normalized:
+        if item.get("is_default") and not default_seen:
+            default_seen = True
+        elif item.get("is_default"):
+            item["is_default"] = False
+    if not default_seen and normalized:
+        normalized[0]["is_default"] = True
+    payload = {"providers": normalized, "updated_at": datetime.utcnow().isoformat()}
+    if row is None:
+        row = models.SystemSetting(key=_SYSTEM_SETTING_DEV_CHAT_KEY, value=payload)
+        db.add(row)
+    else:
+        row.value = payload
+    db.commit()
+    return [_dev_chat_provider_to_dict(item, include_secret=False) for item in normalized]
+
+
+def _dev_chat_redact(value: Any, depth: int = 0) -> Any:
+    if depth > 8:
+        return "...truncated..."
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key, item in list(value.items())[:200]:
+            key_text = str(key)
+            if _DEV_CHAT_SECRET_KEY_RE.search(key_text):
+                out[key_text] = "***REDACTED***" if item not in {None, ""} else ""
+            else:
+                out[key_text] = _dev_chat_redact(item, depth + 1)
+        return out
+    if isinstance(value, list):
+        return [_dev_chat_redact(item, depth + 1) for item in value[:80]]
+    if isinstance(value, str) and len(value) > 4000:
+        return value[:4000] + "...truncated..."
+    return _json_safe_value(value)
+
+
+def _dev_chat_redact_text(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    text = re.sub(r"sk-[A-Za-z0-9_\-]{12,}", "***REDACTED***", text)
+    text = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9_\-\.]{12,}", r"\1***REDACTED***", text)
+    text = re.sub(
+        r"(?i)(incorrect api key provided:\s*)([^\".\n\r]+)",
+        r"\1***REDACTED***",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(api[_-]?key|token|secret|password|passwd|pwd)([\"'\s:=]+)([^\"',\s}{]{6,})",
+        r"\1\2***REDACTED***",
+        text,
+    )
+    return text[:4000] + ("...truncated..." if len(text) > 4000 else "")
+
+
+def _dev_chat_node_summary(node: Any) -> Dict[str, Any]:
+    if not isinstance(node, dict):
+        return {}
+    data = node.get("data") if isinstance(node.get("data"), dict) else {}
+    config = node.get("config") if isinstance(node.get("config"), dict) else data.get("config")
+    return {
+        "id": node.get("id"),
+        "type": node.get("type") or node.get("nodeType") or data.get("nodeType"),
+        "label": data.get("label") or node.get("label"),
+        "position": node.get("position"),
+        "config": _dev_chat_redact(config if isinstance(config, dict) else {}),
+        "status": data.get("status"),
+        "executionRows": data.get("executionRows"),
+        "sampleInput": _dev_chat_redact(data.get("executionSampleInput") or []),
+        "sampleOutput": _dev_chat_redact(data.get("executionSampleOutput") or []),
+    }
+
+
+def _dev_chat_build_context(
+    db: Session,
+    *,
+    pipeline_id: Optional[str],
+    selected_node_id: Optional[str],
+    client_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    context = _dev_chat_redact(client_context if isinstance(client_context, dict) else {})
+    context.setdefault("environment", {})
+    env = context["environment"] if isinstance(context.get("environment"), dict) else {}
+    env.update({
+        "backend": "FastAPI",
+        "database_url_kind": "sqlite" if "sqlite" in str(DATABASE_URL).lower() else "external",
+        "fns_v2_enabled": _os.getenv("FNS_V2_ENABLED", "0") in {"1", "true", "yes", "on"},
+        "backend_dir": str(_BACKEND_DIR),
+        "outputs_dir": str(_BACKEND_DIR / "outputs"),
+    })
+    context["environment"] = env
+
+    if pipeline_id:
+        pipeline = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
+        if pipeline:
+            nodes = pipeline.nodes if isinstance(pipeline.nodes, list) else []
+            edges = pipeline.edges if isinstance(pipeline.edges, list) else []
+            selected = next((node for node in nodes if isinstance(node, dict) and str(node.get("id")) == str(selected_node_id)), None)
+            context["pipeline"] = {
+                "id": pipeline.id,
+                "name": pipeline.name,
+                "description": pipeline.description,
+                "status": pipeline.status,
+                "node_count": len(nodes),
+                "edge_count": len(edges),
+                "tags": pipeline.tags if isinstance(pipeline.tags, list) else [],
+                "nodes": [_dev_chat_node_summary(node) for node in nodes[:80] if isinstance(node, dict)],
+                "edges": _dev_chat_redact(edges[:160]),
+            }
+            if selected:
+                context["selected_node"] = _dev_chat_node_summary(selected)
+    return context
+
+
+def _dev_chat_extract_openai_text(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        message = first.get("message") if isinstance(first.get("message"), dict) else {}
+        text = str(message.get("content") or first.get("text") or "").strip()
+        if text:
+            return text
+    output = payload.get("output")
+    if isinstance(output, list):
+        chunks: List[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("text"):
+                        chunks.append(str(part.get("text")))
+        return "\n".join(chunks).strip()
+    return ""
+
+
+async def _dev_chat_call_provider(
+    provider_profile: Dict[str, Any],
+    messages: List[Dict[str, str]],
+) -> Dict[str, Any]:
+    import httpx
+
+    provider = str(provider_profile.get("provider") or "openai").strip().lower()
+    model = str(provider_profile.get("model") or "").strip()
+    base_url = str(provider_profile.get("base_url") or "").strip().rstrip("/")
+    api_key = str(provider_profile.get("api_key") or "").strip()
+    timeout = float(provider_profile.get("timeout_seconds") or 60)
+    temperature = float(provider_profile.get("temperature") or 0.2)
+    max_tokens = int(provider_profile.get("max_tokens") or 1200)
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    if api_key and provider != "gemini":
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    if provider == "ollama":
+        payload = {
+            "model": model or "llama3.1:8b",
+            "messages": messages,
+            "stream": False,
+            "options": {"temperature": temperature, "num_predict": max_tokens},
+        }
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(f"{base_url or 'http://localhost:11434'}/api/chat", json=payload)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Ollama HTTP {resp.status_code}: {resp.text[:300]}")
+            data = resp.json()
+            message = data.get("message") if isinstance(data, dict) else {}
+            return {"text": str((message or {}).get("content") or "").strip(), "raw": data}
+
+    if provider == "gemini":
+        if not api_key:
+            raise RuntimeError("Gemini provider requires an API key.")
+        prompt_parts: List[str] = []
+        for msg in messages:
+            role = str(msg.get("role") or "user")
+            prompt_parts.append(f"{role.upper()}:\n{msg.get('content') or ''}")
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": "\n\n".join(prompt_parts)}]}],
+            "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+        }
+        url = f"{base_url or 'https://generativelanguage.googleapis.com/v1beta'}/models/{model or 'gemini-1.5-flash'}:generateContent?key={api_key}"
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Gemini HTTP {resp.status_code}: {resp.text[:300]}")
+            data = resp.json()
+            candidates = data.get("candidates") if isinstance(data, dict) else []
+            parts = []
+            if isinstance(candidates, list) and candidates:
+                content = candidates[0].get("content") if isinstance(candidates[0], dict) else {}
+                raw_parts = content.get("parts") if isinstance(content, dict) else []
+                if isinstance(raw_parts, list):
+                    parts = [str(part.get("text") or "") for part in raw_parts if isinstance(part, dict)]
+            return {"text": "\n".join(parts).strip(), "raw": data}
+
+    # OpenAI, Codex, ChatGPT, Mistral, OpenRouter, and custom OpenAI-compatible APIs.
+    if not api_key and provider not in {"custom"}:
+        env_key = _os.getenv("OPENAI_API_KEY") if provider == "openai" else ""
+        api_key = str(env_key or "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+    if not api_key and provider != "custom":
+        raise RuntimeError(f"{provider} provider requires an API key.")
+    payload = {
+        "model": model or "gpt-4o-mini",
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(f"{base_url or 'https://api.openai.com/v1'}/chat/completions", headers=headers, json=payload)
+        if resp.status_code >= 400:
+            error_text = resp.text[:1200]
+            if (
+                provider in {"openai", "custom"}
+                and resp.status_code in {400, 404}
+                and (
+                    "not a chat model" in error_text.lower()
+                    or "/v1/completions" in error_text
+                    or "v1/completions" in error_text
+                )
+            ):
+                prompt = "\n\n".join(
+                    f"{str(msg.get('role') or 'user').upper()}:\n{msg.get('content') or ''}"
+                    for msg in messages
+                )
+                completion_payload = {
+                    "model": model or "gpt-4o-mini",
+                    "prompt": f"{prompt}\n\nASSISTANT:\n",
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                }
+                completion_resp = await client.post(
+                    f"{base_url or 'https://api.openai.com/v1'}/completions",
+                    headers=headers,
+                    json=completion_payload,
+                )
+                if completion_resp.status_code < 400:
+                    data = completion_resp.json()
+                    return {"text": _dev_chat_extract_openai_text(data), "raw": data}
+                raise RuntimeError(f"{provider} HTTP {completion_resp.status_code}: {completion_resp.text[:300]}")
+            raise RuntimeError(f"{provider} HTTP {resp.status_code}: {error_text[:300]}")
+        data = resp.json()
+        return {"text": _dev_chat_extract_openai_text(data), "raw": data}
+
+
+def _dev_chat_local_answer(message: str, context: Dict[str, Any], reason: str = "") -> str:
+    selected = context.get("selected_node") if isinstance(context.get("selected_node"), dict) else {}
+    pipeline = context.get("pipeline") if isinstance(context.get("pipeline"), dict) else {}
+    parts = [
+        "I can answer from local framework context, but no external chat provider completed the request.",
+    ]
+    if reason:
+        parts.append(f"Provider status: {reason}")
+    if pipeline:
+        parts.append(
+            f"Pipeline: {pipeline.get('name') or pipeline.get('id')} with "
+            f"{pipeline.get('node_count', 0)} node(s) and {pipeline.get('edge_count', 0)} edge(s)."
+        )
+    if selected:
+        parts.append(
+            f"Selected node: {selected.get('label') or selected.get('id')} "
+            f"({selected.get('type') or 'unknown type'})."
+        )
+        cfg = selected.get("config") if isinstance(selected.get("config"), dict) else {}
+        if cfg:
+            parts.append("Relevant config keys: " + ", ".join(list(cfg.keys())[:20]))
+    parts.append("Ask me to inspect a specific node, field, error message, or output file for a more targeted answer.")
+    return "\n\n".join(parts)
 
 
 def _load_sqlite_cleanup_schedule_config(db: Optional[Session] = None) -> Dict[str, Any]:
@@ -2202,6 +2628,45 @@ class CustomFieldValidationRequest(BaseModel):
     validation_source: str = "lmdb"  # lmdb|rocksdb (rows mode deprecated)
     lmdb_config: Dict[str, Any] = Field(default_factory=dict)
     rocksdb_config: Dict[str, Any] = Field(default_factory=dict)
+
+
+class DevChatProviderProfile(BaseModel):
+    id: Optional[str] = None
+    name: str = "OpenAI"
+    provider: str = "openai"
+    model: str = "gpt-4o-mini"
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    enabled: bool = True
+    is_default: bool = False
+    temperature: float = 0.2
+    max_tokens: int = 1200
+    timeout_seconds: int = 60
+    streaming: bool = False
+    system_prompt: Optional[str] = None
+
+
+class DevChatProvidersSaveRequest(BaseModel):
+    providers: List[DevChatProviderProfile] = Field(default_factory=list)
+
+
+class DevChatProviderTestRequest(BaseModel):
+    provider: DevChatProviderProfile
+
+
+class DevChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class DevChatRequest(BaseModel):
+    message: str
+    provider_id: Optional[str] = None
+    provider: Optional[DevChatProviderProfile] = None
+    history: List[DevChatMessage] = Field(default_factory=list)
+    context: Dict[str, Any] = Field(default_factory=dict)
+    pipeline_id: Optional[str] = None
+    selected_node_id: Optional[str] = None
 
 
 class ConditionValidationRequest(BaseModel):
@@ -6624,6 +7089,23 @@ def _mlops_stage3_train_rows(
     if not resolved_fields:
         raise HTTPException(400, "No feature fields selected for Stage 3 training.")
 
+    feature_availability: Dict[str, int] = {field: 0 for field in resolved_fields}
+    for source_row in normalized_rows:
+        for field_path in resolved_fields:
+            if not _mlops_stage3_is_missing(_mlops_stage3_extract_first_scalar(source_row, field_path)):
+                feature_availability[field_path] = int(feature_availability.get(field_path, 0) or 0) + 1
+    pruned_fields = [field for field in resolved_fields if int(feature_availability.get(field, 0) or 0) > 0]
+    dropped_stale_fields = [field for field in resolved_fields if int(feature_availability.get(field, 0) or 0) <= 0]
+    if pruned_fields:
+        resolved_fields = pruned_fields
+    elif dropped_stale_fields:
+        raise HTTPException(
+            400,
+            "No selected feature fields exist in the rows reaching this model. "
+            f"stale_feature_fields={dropped_stale_fields[:10]}. "
+            "Run Stage 2 preview again and reselect model feature fields.",
+        )
+
     projected_rows: List[Dict[str, Any]] = []
     for row in normalized_rows:
         record: Dict[str, Any] = {}
@@ -6655,7 +7137,12 @@ def _mlops_stage3_train_rows(
             rows_with_target += 1
         usable_rows.append(row)
 
-    if len(usable_rows) < 12:
+    try:
+        min_stage3_rows = int(_os.getenv("MLOPS_STAGE3_MIN_USABLE_ROWS", "4") or 4)
+    except Exception:
+        min_stage3_rows = 4
+    min_stage3_rows = max(3, min(min_stage3_rows, 12))
+    if len(usable_rows) < min_stage3_rows:
         missing_or_empty_features = [
             field for field, count in feature_present_counts.items()
             if int(count or 0) <= 0
@@ -6673,9 +7160,14 @@ def _mlops_stage3_train_rows(
         raise HTTPException(
             400,
             "Insufficient usable rows after feature/target checks. "
-            f"required>=12, got={len(usable_rows)}. "
+            f"required>={min_stage3_rows}, got={len(usable_rows)}. "
             + ", ".join(diagnostic_parts)
             + ". Check that selected feature and label fields exist in the rows reaching this model.",
+        )
+    if len(usable_rows) < 12:
+        notes.append(
+            f"Small training sample accepted with {len(usable_rows)} usable rows. "
+            "Metrics may be unstable; add more rows or relax preprocessing filters for production use."
         )
 
     df = pd.DataFrame(usable_rows)
@@ -6909,7 +7401,7 @@ def _mlops_stage3_train_rows(
             if param_grid:
                 from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
                 search_method = str(tuning_method or "random_search").strip().lower()
-                cv_for_search = safe_cv
+                cv_for_search = max(2, min(safe_cv, int(len(X_train))))
                 if task == "classification":
                     class_counts = y_train.value_counts()
                     if len(class_counts.index) > 0:
@@ -13053,6 +13545,8 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
                 int(str(_os.getenv("EXECUTION_CANCEL_FORCE_FINALIZE_SECONDS", "25")).strip() or "25"),
             )
             abort_age_s = _get_execution_abort_age_seconds(execution, logs)
+            if abort_age_s is None and age_s is not None and age_s >= force_cancel_after_s:
+                abort_age_s = age_s
             if abort_age_s is not None and abort_age_s >= force_cancel_after_s:
                 cancel_message = (
                     f"Execution cancelled by user (auto-finalized after {force_cancel_after_s}s)."
@@ -13143,10 +13637,66 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
                     now_for_log = datetime.now(latest_log_ts.tzinfo)
                 else:
                     now_for_log = now
-                if (now_for_log - latest_log_ts).total_seconds() < stale_after_s:
+                latest_log_age_s = (now_for_log - latest_log_ts).total_seconds()
+                if latest_log_age_s < stale_after_s:
                     return
             except Exception:
-                pass
+                latest_log_age_s = None
+        else:
+            latest_log_age_s = None
+
+        if worker_alive and status_norm == "running":
+            prepare_stale_after_s = max(
+                stale_after_s,
+                int(str(_os.getenv("EXECUTION_PREPARE_STALE_AUTOFINALIZE_SECONDS", "120")).strip() or "120"),
+            )
+            startup_messages = [
+                str((entry or {}).get("message") or "").strip()
+                for entry in logs
+                if isinstance(entry, dict)
+            ]
+            only_system_logs = bool(logs) and all(
+                isinstance(entry, dict)
+                and str(entry.get("nodeId") or "").strip() == "__system__"
+                for entry in logs
+            )
+            startup_context_stuck = (
+                only_system_logs
+                and not execution.node_results
+                and any(
+                    "preparing execution context" in msg.lower()
+                    or "validating profile store connectivity" in msg.lower()
+                    for msg in startup_messages
+                )
+                and (
+                    (latest_log_age_s is not None and latest_log_age_s >= prepare_stale_after_s)
+                    or (age_s is not None and age_s >= prepare_stale_after_s)
+                )
+            )
+            if startup_context_stuck:
+                abort_event = execution_abort_events.get(str(execution.id or ""))
+                if abort_event is not None:
+                    abort_event.set()
+                stale_message = (
+                    "Execution auto-finalized as failed: startup/profile-store setup made no progress."
+                )
+                execution.status = "failed"
+                execution.finished_at = execution.finished_at or datetime.utcnow()
+                if not execution.error_message:
+                    execution.error_message = stale_message
+                stale_log = {
+                    "nodeId": "__system__",
+                    "nodeLabel": "System",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "status": "error",
+                    "message": f"✗ {stale_message}",
+                    "rows": 0,
+                }
+                merged_logs = logs if isinstance(logs, list) else []
+                merged_logs.append(stale_log)
+                execution.logs = merged_logs
+                db.commit()
+                return
 
         has_running_log = any(
             str((entry or {}).get("status") or "").strip().lower() == "running"
@@ -13582,6 +14132,149 @@ async def update_app_feature_flags(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to save app feature flags: {exc}")
     return _apply_runtime_feature_flags(saved)
+
+
+@app.get("/api/dev-chat/providers")
+async def list_dev_chat_providers(db: Session = Depends(get_db)):
+    return {
+        "providers": _dev_chat_load_provider_profiles(db, include_secret=False),
+        "supported_providers": [
+            {"value": "openai", "label": "OpenAI / ChatGPT / Codex / OpenAI-compatible"},
+            {"value": "gemini", "label": "Google Gemini"},
+            {"value": "ollama", "label": "Ollama Local"},
+            {"value": "mistral", "label": "Mistral"},
+            {"value": "custom", "label": "Custom OpenAI-compatible"},
+        ],
+    }
+
+
+@app.put("/api/dev-chat/providers")
+async def save_dev_chat_providers(
+    body: DevChatProvidersSaveRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        providers = _dev_chat_save_provider_profiles(db, list(body.providers or []))
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to save dev chat providers: {exc}")
+    return {"providers": providers}
+
+
+@app.post("/api/dev-chat/providers/test")
+async def test_dev_chat_provider(body: DevChatProviderTestRequest):
+    profile = _dev_chat_provider_to_dict(body.provider, include_secret=True)
+    messages = [
+        {"role": "system", "content": "Reply with one concise sentence confirming the provider works."},
+        {"role": "user", "content": "Connection test from Framework Copilot."},
+    ]
+    try:
+        result = await _dev_chat_call_provider(profile, messages)
+        text = str(result.get("text") or "").strip()
+        return {
+            "ok": bool(text),
+            "provider": profile.get("provider"),
+            "model": profile.get("model"),
+            "message": text or "Provider returned an empty response.",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "provider": profile.get("provider"),
+            "model": profile.get("model"),
+            "message": _dev_chat_redact_text(exc),
+        }
+
+
+@app.post("/api/dev-chat/message")
+async def send_dev_chat_message(
+    body: DevChatRequest,
+    db: Session = Depends(get_db),
+):
+    message = str(body.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required.")
+
+    saved_profiles = _dev_chat_load_provider_profiles(db, include_secret=True)
+    selected_profile: Optional[Dict[str, Any]] = None
+    if body.provider is not None:
+        selected_profile = _dev_chat_provider_to_dict(body.provider, include_secret=True)
+    elif body.provider_id:
+        selected_profile = next(
+            (item for item in saved_profiles if str(item.get("id")) == str(body.provider_id)),
+            None,
+        )
+    if selected_profile is None:
+        selected_profile = next(
+            (item for item in saved_profiles if item.get("enabled") and item.get("is_default")),
+            None,
+        )
+    if selected_profile is None:
+        selected_profile = next((item for item in saved_profiles if item.get("enabled")), None)
+
+    context = _dev_chat_build_context(
+        db,
+        pipeline_id=body.pipeline_id,
+        selected_node_id=body.selected_node_id,
+        client_context=body.context if isinstance(body.context, dict) else {},
+    )
+    context_json = json.dumps(context, ensure_ascii=False, indent=2, default=str)
+    if len(context_json) > 30000:
+        context_json = context_json[:30000] + "\n...context truncated..."
+
+    system_prompt = str(
+        (selected_profile or {}).get("system_prompt") or _DEV_CHAT_DEFAULT_SYSTEM_PROMPT
+    ).strip() or _DEV_CHAT_DEFAULT_SYSTEM_PROMPT
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": f"Current framework context JSON:\n{context_json}"},
+    ]
+    for item in (body.history or [])[-12:]:
+        role = str(item.role or "").strip().lower()
+        if role not in {"user", "assistant", "system"}:
+            continue
+        content = str(item.content or "").strip()
+        if content:
+            messages.append({"role": role, "content": content[:6000]})
+    messages.append({"role": "user", "content": message})
+
+    provider_status = "local"
+    text = ""
+    error = ""
+    if selected_profile is not None:
+        try:
+            result = await _dev_chat_call_provider(selected_profile, messages)
+            text = str(result.get("text") or "").strip()
+            provider_status = "remote" if text else "empty_response"
+        except Exception as exc:
+            error = _dev_chat_redact_text(exc)
+            provider_status = "provider_error"
+    if not text:
+        text = _dev_chat_local_answer(message, context, reason=error or provider_status)
+
+    safe_profile = (
+        _dev_chat_provider_to_dict(selected_profile or {}, include_secret=False)
+        if selected_profile
+        else {}
+    )
+    return {
+        "answer": text,
+        "provider": safe_profile.get("provider") or "local",
+        "provider_id": safe_profile.get("id"),
+        "provider_name": safe_profile.get("name") or "Local context fallback",
+        "model": safe_profile.get("model") or "local-context",
+        "status": provider_status,
+        "error": error,
+        "context_used": {
+            "pipeline": bool(context.get("pipeline")),
+            "selected_node": bool(context.get("selected_node")),
+            "client_context_keys": (
+                list((body.context or {}).keys())[:30]
+                if isinstance(body.context, dict)
+                else []
+            ),
+        },
+    }
 
 
 @app.get("/api/settings/sqlite/usage")
@@ -20393,7 +21086,7 @@ def _build_query_filter_only_config_for_scan(
         "select_fields": "",
         "select_field_sorts": {},
         "select_field_aliases": {},
-        "include_original_row": True,
+        "include_original_row": False,
         "array_output_mode": "list",
         "array_match_mode": "all_elements",
         "profile_patch_enabled": False,
