@@ -321,6 +321,15 @@ class ETLEngine:
         if not file_path:
             raise RuntimeError("File path is empty. Select a source file.")
 
+        # Browser-only destination placeholder. Destination nodes write these
+        # files under backend/outputs, so let preview/read paths find them.
+        if file_path.startswith("__local__://"):
+            original_name = file_path.replace("__local__://", "", 1).strip().strip("/")
+            output_name = self._safe_filename(original_name.rsplit("/", 1)[-1] or original_name)
+            output_path = os.path.join(os.path.dirname(__file__), "outputs", output_name)
+            if os.path.isfile(output_path):
+                return output_path
+
         # Browser-only placeholder path. Try to recover from uploads cache.
         if file_path.startswith("local://"):
             original_name = file_path.replace("local://", "", 1).strip().strip("/")

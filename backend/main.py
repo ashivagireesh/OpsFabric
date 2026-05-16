@@ -2566,6 +2566,10 @@ class SourceFieldOptionsRequest(BaseModel):
     max_rows: int = 200
     page: int = 1
     preview_rows: int = 50
+    search: Optional[str] = None
+    filters: List[Dict[str, Any]] = []
+    sort_by: Optional[str] = None
+    sort_dir: str = "asc"
     include_schema_scan: bool = True
     schema_scan_limit: int = 5000
     preview_compact: bool = True
@@ -14803,7 +14807,8 @@ def _to_json_safe_value(value: Any, depth: int = 0) -> Any:
 
 def _normalize_source_rows(rows: list, max_rows: int) -> list:
     out: list = []
-    for item in rows[:max_rows]:
+    row_slice = rows if int(max_rows or 0) <= 0 else rows[:max_rows]
+    for item in row_slice:
         if isinstance(item, dict):
             out.append(_to_json_safe_value(item))
         else:
@@ -15107,7 +15112,10 @@ async def _load_tabular_rows_for_source(
     ntype = (node_type or "").strip().lower()
     cfg = config or {}
     safe_cap = max(1, min(int(hard_cap or 2000), 1_000_000))
-    limit = max(1, min(int(max_rows or 200), safe_cap))
+    file_source_types = {"csv_source", "json_source", "excel_source", "xml_source", "parquet_source"}
+    requested_limit = int(max_rows if max_rows is not None else 200)
+    full_file_scan = ntype in file_source_types and requested_limit <= 0
+    limit = None if full_file_scan else max(1, min(requested_limit or 200, safe_cap))
     gateway_bind_params = cfg.get("_gateway_bind_params") if isinstance(cfg.get("_gateway_bind_params"), dict) else None
 
     if ntype == "postgres_source":
@@ -15352,10 +15360,23 @@ async def _load_tabular_rows_for_source(
         except Exception as exc:
             raise HTTPException(400, f"Elasticsearch metadata detection failed: {exc}")
 
-    if ntype in {"csv_source", "json_source", "excel_source", "xml_source", "parquet_source"}:
+    if ntype in file_source_types:
         import pandas as pd
 
         file_path = etl_engine._resolve_input_file_path(str(cfg.get("file_path") or ""))
+        if not _os.path.isfile(file_path):
+            raw_file_path = str(cfg.get("file_path") or "").strip()
+            if raw_file_path.startswith("__local__://"):
+                relative_path = raw_file_path.replace("__local__://", "", 1).strip().lstrip("/")
+                output_name = _os.path.basename(relative_path)
+                output_candidate = _BACKEND_DIR / "outputs" / output_name
+                if output_name and output_candidate.is_file():
+                    file_path = str(output_candidate)
+            else:
+                output_name = _os.path.basename(raw_file_path)
+                output_candidate = _BACKEND_DIR / "outputs" / output_name
+                if output_name and output_candidate.is_file():
+                    file_path = str(output_candidate)
         if not _os.path.isfile(file_path):
             raise HTTPException(404, f"Source file not found: {file_path}")
 
@@ -15368,10 +15389,11 @@ async def _load_tabular_rows_for_source(
             return text in {"1", "true", "yes", "on", "y"}
 
         def _clean_frame_rows(frame: Any) -> List[Dict[str, Any]]:
-            try:
-                frame = frame.head(limit)
-            except Exception:
-                pass
+            if limit is not None:
+                try:
+                    frame = frame.head(limit)
+                except Exception:
+                    pass
             try:
                 frame = frame.astype(object).where(pd.notna(frame), None)
             except Exception:
@@ -15397,7 +15419,7 @@ async def _load_tabular_rows_for_source(
                         has_header=has_header,
                         n_rows=limit,
                         encoding="utf8",
-                        infer_schema_length=min(1000, limit),
+                        infer_schema_length=min(1000, limit) if limit is not None else 1000,
                     )
                     return pl_df.to_dicts()
                 except Exception:
@@ -15417,7 +15439,8 @@ async def _load_tabular_rows_for_source(
                 rows = _rows_from_json_value(selected)
                 if not rows:
                     rows = _rows_from_json_value(payload)
-                return [row for row in rows[:limit] if isinstance(row, dict)]
+                selected_rows = rows if limit is None else rows[:limit]
+                return [row for row in selected_rows if isinstance(row, dict)]
 
             if ntype == "excel_source":
                 sheet = cfg.get("sheet", 0)
@@ -15640,6 +15663,72 @@ async def detect_source_json_field_options(body: JsonFieldOptionsRequest):
     }
 
 
+def _source_preview_search_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _apply_source_preview_query(
+    rows: List[Dict[str, Any]],
+    search: Optional[str],
+    filters: List[Dict[str, Any]],
+    sort_by: Optional[str],
+    sort_dir: str,
+) -> List[Dict[str, Any]]:
+    result = list(rows or [])
+    search_text = str(search or "").strip().lower()
+    if search_text:
+        result = [
+            row for row in result
+            if search_text in " ".join(_source_preview_search_text(value) for value in (row or {}).values()).lower()
+        ]
+
+    for item in filters or []:
+        if not isinstance(item, dict):
+            continue
+        field = str(item.get("field") or "").strip()
+        if not field:
+            continue
+        operator = str(item.get("operator") or "contains").strip().lower()
+        expected = str(item.get("value") if item.get("value") is not None else "").strip().lower()
+
+        def _matches(row: Dict[str, Any]) -> bool:
+            actual_raw = row.get(field)
+            actual = _source_preview_search_text(actual_raw).strip().lower()
+            if operator in {"empty", "is_empty"}:
+                return actual == ""
+            if operator in {"not_empty", "is_not_empty"}:
+                return actual != ""
+            if operator in {"equals", "eq", "="}:
+                return actual == expected
+            if operator in {"not_equals", "ne", "!="}:
+                return actual != expected
+            if operator in {"starts_with", "startswith"}:
+                return actual.startswith(expected)
+            if operator in {"ends_with", "endswith"}:
+                return actual.endswith(expected)
+            return expected in actual
+
+        result = [row for row in result if _matches(row or {})]
+
+    sort_field = str(sort_by or "").strip()
+    if sort_field:
+        reverse = str(sort_dir or "asc").strip().lower() == "desc"
+
+        def _sort_key(row: Dict[str, Any]) -> Tuple[int, str]:
+            value = (row or {}).get(sort_field)
+            return (1 if value is None else 0, _source_preview_search_text(value).lower())
+
+        result = sorted(result, key=_sort_key, reverse=reverse)
+    return result
+
+
 @app.post("/api/source/field-options")
 async def detect_source_field_options(body: SourceFieldOptionsRequest):
     node_type = (body.node_type or "").strip().lower()
@@ -15651,7 +15740,13 @@ async def detect_source_field_options(body: SourceFieldOptionsRequest):
         # max_rows <= 0 means no LMDB max-row cap for scan window.
         max_rows = 2_147_483_647 if requested_max_rows <= 0 else max(1, requested_max_rows)
     else:
-        max_rows = max(1, min(int(body.max_rows or 200), 2000))
+        file_source_types = {"csv_source", "json_source", "excel_source", "xml_source", "parquet_source"}
+        requested_max_rows = int(body.max_rows if body.max_rows is not None else 200)
+        if node_type in file_source_types and requested_max_rows <= 0:
+            max_rows = 0
+        else:
+            row_cap = 200000 if node_type in file_source_types else 2000
+            max_rows = max(1, min(requested_max_rows or 200, row_cap))
     if node_type in {"lmdb_source", "rocksdb_source"}:
         request_page = max(1, int(body.page or 1))
         request_preview_rows = max(1, min(int(body.preview_rows or 50), 500))
@@ -15893,11 +15988,23 @@ async def detect_source_field_options(body: SourceFieldOptionsRequest):
             "schema_scan_limited": bool(include_schema_scan and schema_has_more),
         }
 
-    rows = await _load_tabular_rows_for_source(body.node_type, body.config, max_rows=max_rows)
+    rows = await _load_tabular_rows_for_source(body.node_type, body.config, max_rows=max_rows, hard_cap=max_rows)
     normalized_rows = _normalize_source_rows(rows, max_rows)
+    normalized_rows = _apply_source_preview_query(
+        normalized_rows,
+        body.search,
+        body.filters or [],
+        body.sort_by,
+        body.sort_dir,
+    )
     columns = _collect_source_columns(normalized_rows)
     field_paths = _collect_source_field_paths(normalized_rows)
-    preview_rows = max(1, min(int(body.preview_rows or 50), 500))
+    preview_cap = (
+        len(normalized_rows)
+        if node_type in {"csv_source", "json_source", "excel_source", "xml_source", "parquet_source"} and max_rows <= 0
+        else (max_rows if node_type in {"csv_source", "json_source", "excel_source", "xml_source", "parquet_source"} else 500)
+    )
+    preview_rows = max(1, min(int(body.preview_rows or 50), preview_cap))
     preview = normalized_rows[:preview_rows]
     return {
         "node_type": body.node_type,
@@ -17326,11 +17433,25 @@ import urllib.parse
 async def download_file(path: str):
     """Download a file by absolute server path (output files from destinations)."""
     decoded = urllib.parse.unquote(path)
-    if not _os.path.isfile(decoded):
+    resolved = decoded
+    if not _os.path.isfile(resolved):
+        try:
+            resolved = etl_engine._resolve_input_file_path(decoded)
+        except Exception:
+            resolved = decoded
+    if not _os.path.isfile(resolved):
+        raw_file_path = str(decoded or "").strip()
+        if raw_file_path.startswith("__local__://"):
+            relative_path = raw_file_path.replace("__local__://", "", 1).strip().lstrip("/")
+            output_name = _os.path.basename(relative_path)
+            output_candidate = _BACKEND_DIR / "outputs" / output_name
+            if output_name and output_candidate.is_file():
+                resolved = str(output_candidate)
+    if not _os.path.isfile(resolved):
         raise HTTPException(status_code=404, detail=f"File not found: {decoded!r}")
-    filename = _os.path.basename(decoded)
+    filename = _os.path.basename(resolved)
     return FileResponse(
-        decoded,
+        resolved,
         filename=filename,
         media_type="application/octet-stream"
     )
