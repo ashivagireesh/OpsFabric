@@ -113,6 +113,40 @@ _H2O_ALGO_CANONICAL = {
 _H2O_ALLOWED_ALGOS = sorted(set(_H2O_ALGO_CANONICAL.values()))
 
 
+def _resolve_backend_source_file_path(raw_path: str) -> str:
+    raw_file_path = str(raw_path or "").strip()
+    if not raw_file_path:
+        return raw_file_path
+
+    candidates: List[Path] = []
+    if raw_file_path.startswith("__local__://"):
+        relative_path = raw_file_path.replace("__local__://", "", 1).strip().lstrip("/")
+        output_name = _os.path.basename(relative_path)
+        if output_name:
+            candidates.append(_BACKEND_DIR / "outputs" / output_name)
+    else:
+        candidates.append(Path(raw_file_path))
+        output_name = _os.path.basename(raw_file_path)
+        if output_name:
+            candidates.append(_BACKEND_DIR / "outputs" / output_name)
+
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return str(candidate)
+        except Exception:
+            continue
+
+    try:
+        resolved = etl_engine._resolve_input_file_path(raw_file_path)
+        if _os.path.isfile(resolved):
+            return resolved
+    except Exception:
+        pass
+
+    return raw_file_path
+
+
 def _recover_stale_running_executions() -> int:
     """
     Mark executions that were left in 'running'/'cancelling' (typically after backend restart/crash)
@@ -15363,20 +15397,9 @@ async def _load_tabular_rows_for_source(
     if ntype in file_source_types:
         import pandas as pd
 
-        file_path = etl_engine._resolve_input_file_path(str(cfg.get("file_path") or ""))
+        file_path = _resolve_backend_source_file_path(str(cfg.get("file_path") or ""))
         if not _os.path.isfile(file_path):
-            raw_file_path = str(cfg.get("file_path") or "").strip()
-            if raw_file_path.startswith("__local__://"):
-                relative_path = raw_file_path.replace("__local__://", "", 1).strip().lstrip("/")
-                output_name = _os.path.basename(relative_path)
-                output_candidate = _BACKEND_DIR / "outputs" / output_name
-                if output_name and output_candidate.is_file():
-                    file_path = str(output_candidate)
-            else:
-                output_name = _os.path.basename(raw_file_path)
-                output_candidate = _BACKEND_DIR / "outputs" / output_name
-                if output_name and output_candidate.is_file():
-                    file_path = str(output_candidate)
+            file_path = _resolve_backend_source_file_path(str(cfg.get("file_path") or ""))
         if not _os.path.isfile(file_path):
             raise HTTPException(404, f"Source file not found: {file_path}")
 
@@ -15563,7 +15586,7 @@ async def _load_json_payload_for_source(node_type: str, config: dict) -> Any:
             raise HTTPException(400, "GraphQL response is not valid JSON")
 
     if ntype == "json_source":
-        file_path = str(cfg.get("file_path") or "").strip()
+        file_path = _resolve_backend_source_file_path(str(cfg.get("file_path") or ""))
         if not file_path:
             raise HTTPException(400, "JSON source requires 'file_path'")
         if not _os.path.isfile(file_path):
@@ -17433,20 +17456,7 @@ import urllib.parse
 async def download_file(path: str):
     """Download a file by absolute server path (output files from destinations)."""
     decoded = urllib.parse.unquote(path)
-    resolved = decoded
-    if not _os.path.isfile(resolved):
-        try:
-            resolved = etl_engine._resolve_input_file_path(decoded)
-        except Exception:
-            resolved = decoded
-    if not _os.path.isfile(resolved):
-        raw_file_path = str(decoded or "").strip()
-        if raw_file_path.startswith("__local__://"):
-            relative_path = raw_file_path.replace("__local__://", "", 1).strip().lstrip("/")
-            output_name = _os.path.basename(relative_path)
-            output_candidate = _BACKEND_DIR / "outputs" / output_name
-            if output_name and output_candidate.is_file():
-                resolved = str(output_candidate)
+    resolved = _resolve_backend_source_file_path(decoded)
     if not _os.path.isfile(resolved):
         raise HTTPException(status_code=404, detail=f"File not found: {decoded!r}")
     filename = _os.path.basename(resolved)
