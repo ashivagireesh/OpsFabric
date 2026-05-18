@@ -20,7 +20,14 @@ import pickle
 import smtplib
 import ssl
 import sqlite3 as _sqlite3
-import fcntl as _fcntl
+try:
+    import fcntl as _fcntl  # type: ignore
+except Exception:  # pragma: no cover - Windows fallback
+    _fcntl = None
+try:
+    import msvcrt as _msvcrt  # type: ignore
+except Exception:  # pragma: no cover - non-Windows fallback
+    _msvcrt = None
 from datetime import datetime, timedelta, date, time
 from decimal import Decimal
 from pathlib import Path
@@ -2381,7 +2388,13 @@ def _try_acquire_blw_async_worker_lock() -> bool:
     lock_path = lock_dir / "blw_async_worker.lock"
     try:
         lock_fh = open(lock_path, "a+", encoding="utf-8")
-        _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        if _fcntl is not None:
+            _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        elif _msvcrt is not None:
+            lock_fh.seek(0)
+            _msvcrt.locking(lock_fh.fileno(), _msvcrt.LK_NBLCK, 1)
+        else:
+            raise RuntimeError("No file locking module available for BLW async worker lock.")
         lock_fh.seek(0)
         lock_fh.truncate()
         lock_fh.write(f"pid={_os.getpid()} acquired_at={datetime.utcnow().isoformat()}Z\n")
@@ -2389,7 +2402,7 @@ def _try_acquire_blw_async_worker_lock() -> bool:
         _BLW_ASYNC_WORKER_LOCK_FH = lock_fh
         _BLW_ASYNC_WORKER_LOCK_HELD = True
         return True
-    except BlockingIOError:
+    except (BlockingIOError, OSError):
         try:
             lock_fh.close()  # type: ignore[name-defined]
         except Exception:
