@@ -18,6 +18,7 @@ export const DEFAULT_EXPRESSION_FUNCTION_NAMES = new Set(
     'str(value)',
     'length(value)',
     'abs(value)',
+    'sum(values)',
     'sqrt(value)',
     'log(value)',
     'exp(value)',

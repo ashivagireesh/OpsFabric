@@ -21,6 +21,7 @@ import MLOpsEditor from './pages/mlops/MLOpsEditor'
 import BusinessWorkflowList from './pages/business/BusinessWorkflowList'
 import BusinessWorkflowEditor from './pages/business/BusinessWorkflowEditor'
 import AdminPanel from './pages/AdminPanel'
+import DevAssistant from './components/DevAssistant'
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: string | null }> {
   state = { error: null }
@@ -69,6 +70,7 @@ export default function App() {
           <Route path="/admin" element={<AdminPanel />} />
         </Route>
       </Routes>
+      <DevAssistant />
     </BrowserRouter>
   )
 }

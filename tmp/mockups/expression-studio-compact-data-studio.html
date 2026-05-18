@@ -1,0 +1,547 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Expression Studio Compact Data Studio Mockup</title>
+  <style>
+    :root {
+      --bg: #080d18;
+      --panel: #101725;
+      --panel2: #0f172a;
+      --card: #151d2e;
+      --card2: #111827;
+      --line: #263248;
+      --line2: #334155;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --faint: #64748b;
+      --accent: #6366f1;
+      --accent2: #8b5cf6;
+      --green: #22c55e;
+      --amber: #f59e0b;
+      --cyan: #06b6d4;
+      --red: #ef4444;
+      --blue: #38bdf8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #020617;
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    .canvas {
+      width: 1600px;
+      height: 900px;
+      padding: 28px;
+      background:
+        radial-gradient(circle at 18% 4%, rgba(6, 182, 212, 0.12), transparent 28%),
+        radial-gradient(circle at 84% 0%, rgba(99, 102, 241, 0.12), transparent 24%),
+        linear-gradient(180deg, #0b1020 0%, #060913 100%);
+    }
+    .studio {
+      height: 844px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 30px 88px rgba(0, 0, 0, 0.5);
+      display: flex;
+      flex-direction: column;
+    }
+    .topbar {
+      height: 72px;
+      border-bottom: 1px solid var(--line);
+      background: #111827;
+      padding: 13px 18px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+    }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: 18px; font-weight: 800; }
+    h2 { font-size: 14px; font-weight: 780; }
+    h3 { font-size: 12px; font-weight: 760; }
+    .sub { color: var(--muted); font-size: 12px; margin-top: 4px; line-height: 1.35; }
+    .actions, .chips, .tabs, .inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .btn {
+      height: 32px;
+      padding: 0 12px;
+      border: 1px solid var(--line2);
+      background: #172033;
+      color: var(--text);
+      border-radius: 7px;
+      font-size: 12px;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      white-space: nowrap;
+    }
+    .btn.primary {
+      border: 0;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+    }
+    .btn.ghost { color: #c7d2fe; border-color: rgba(99,102,241,.45); background: rgba(99,102,241,.12); }
+    .tag {
+      border: 1px solid var(--line);
+      background: #0f172a;
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 4px 9px;
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .tag.green { color: #86efac; border-color: rgba(34,197,94,.34); background: rgba(34,197,94,.10); }
+    .tag.cyan { color: #67e8f9; border-color: rgba(6,182,212,.36); background: rgba(6,182,212,.10); }
+    .tag.amber { color: #fcd34d; border-color: rgba(245,158,11,.36); background: rgba(245,158,11,.10); }
+    .workspace {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 290px minmax(0, 1fr) 330px;
+    }
+    .left, .right {
+      min-height: 0;
+      overflow: hidden;
+      background: #0f172a;
+      padding: 14px;
+    }
+    .left { border-right: 1px solid var(--line); }
+    .right { border-left: 1px solid var(--line); }
+    .main {
+      min-width: 0;
+      min-height: 0;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      overflow: hidden;
+    }
+    .card {
+      border: 1px solid var(--line);
+      background: var(--card);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .hint { color: var(--muted); font-size: 11px; line-height: 1.42; margin-top: 4px; }
+    .role-grid {
+      margin-top: 10px;
+      display: grid;
+      gap: 8px;
+    }
+    .role {
+      border: 1px solid var(--line);
+      background: var(--card2);
+      border-radius: 7px;
+      padding: 9px;
+      display: grid;
+      gap: 5px;
+    }
+    .role-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+    }
+    .role-name { font-size: 12px; font-weight: 760; color: var(--text); }
+    .role-field { font-size: 12px; color: #c7d2fe; font-family: "JetBrains Mono", Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .role-score { font-size: 10px; color: #86efac; }
+    .select, .input {
+      min-height: 30px;
+      border: 1px solid var(--line2);
+      background: #111827;
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 8px;
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+      width: 100%;
+    }
+    .select { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .select::after { content: "⌄"; color: var(--muted); flex: 0 0 auto; }
+    .builder-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: start;
+      gap: 12px;
+    }
+    .tab {
+      height: 30px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 0 11px;
+      color: var(--muted);
+      background: #0f172a;
+      font-size: 12px;
+      font-weight: 750;
+      display: inline-flex;
+      align-items: center;
+    }
+    .tab.active { color: #c7d2fe; border-color: rgba(99,102,241,.55); background: rgba(99,102,241,.16); }
+    .metric-strip {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      background: #0f172a;
+      border-radius: 8px;
+      padding: 8px;
+      min-height: 58px;
+    }
+    .metric strong { display: block; font-size: 12px; margin-bottom: 5px; }
+    .metric span { display: block; color: var(--muted); font-size: 11px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    .rule-table {
+      margin-top: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #0f172a;
+    }
+    .rule-head, .rule-row {
+      display: grid;
+      grid-template-columns: 46px 138px 132px 128px minmax(185px, .9fr) minmax(230px, 1.1fr) 92px;
+    }
+    .rule-head {
+      min-height: 36px;
+      color: var(--muted);
+      background: #111827;
+      border-bottom: 1px solid var(--line);
+      font-size: 10px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    .cell {
+      min-width: 0;
+      padding: 8px;
+      border-right: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .cell:last-child { border-right: 0; }
+    .rule-row { min-height: 66px; border-bottom: 1px solid var(--line); }
+    .rule-row:last-child { border-bottom: 0; }
+    .toggle {
+      width: 32px;
+      height: 18px;
+      border-radius: 999px;
+      background: var(--accent);
+      position: relative;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.14);
+    }
+    .toggle::after {
+      content: "";
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: white;
+      position: absolute;
+      top: 2px;
+      right: 2px;
+    }
+    .mini-stack { display: grid; gap: 5px; width: 100%; }
+    .expr, .cond, .json {
+      font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 11px;
+      line-height: 1.35;
+      white-space: normal;
+    }
+    .expr { color: #a7f3d0; }
+    .cond { color: #fde68a; }
+    .json { color: #c4b5fd; }
+    .icon {
+      width: 28px;
+      height: 28px;
+      display: inline-flex;
+      justify-content: center;
+      align-items: center;
+      border: 1px solid var(--line2);
+      background: #111827;
+      border-radius: 6px;
+      color: var(--muted);
+      font-weight: 800;
+    }
+    .bottom {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 340px;
+      gap: 12px;
+    }
+    .preview {
+      height: 190px;
+      border: 1px solid var(--line);
+      background: #0b1220;
+      border-radius: 8px;
+      padding: 10px;
+      overflow: hidden;
+      color: #c4b5fd;
+      font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 11px;
+      line-height: 1.5;
+      white-space: pre;
+    }
+    .palette {
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .palette-card {
+      border: 1px solid var(--line);
+      background: var(--card2);
+      border-radius: 8px;
+      padding: 9px;
+    }
+    .palette-card strong { font-size: 12px; display: block; margin-bottom: 5px; }
+    .palette-card span { color: var(--muted); font-size: 11px; line-height: 1.35; }
+    .pipeline {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .step {
+      border: 1px solid var(--line);
+      background: #0f172a;
+      border-radius: 8px;
+      padding: 8px;
+      min-height: 58px;
+    }
+    .step strong { font-size: 12px; display: block; margin-bottom: 4px; }
+    .step span { color: var(--muted); font-size: 11px; display: block; }
+    .json-declare {
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .decl-row {
+      display: grid;
+      grid-template-columns: 1fr 98px;
+      gap: 8px;
+    }
+  </style>
+</head>
+<body>
+  <main class="canvas">
+    <section class="studio">
+      <header class="topbar">
+        <div>
+          <h1>Expression Studio</h1>
+          <p class="sub">Compact Data Studio style workaround: auto field roles, row-wise expressions, declarations, preview, validation, and JSON output in one screen.</p>
+        </div>
+        <div class="actions">
+          <span class="tag cyan">fields detected: 24</span>
+          <span class="tag green">auto suggest ready</span>
+          <span class="tag amber">v1 + v2 compatible</span>
+          <button class="btn">Run Preview</button>
+          <button class="btn primary">Apply to Custom Fields</button>
+        </div>
+      </header>
+
+      <div class="workspace">
+        <aside class="left">
+          <h2>Field Intelligence</h2>
+          <p class="hint">Auto suggested roles from source schema, sample values, names, and type inference.</p>
+          <div class="role-grid">
+            <div class="role">
+              <div class="role-head"><span class="role-name">Unique ID</span><span class="role-score">98%</span></div>
+              <span class="role-field">TRANSACTIONID</span>
+            </div>
+            <div class="role">
+              <div class="role-head"><span class="role-name">Date / Time</span><span class="role-score">95%</span></div>
+              <span class="role-field">MIS_TXNDATE</span>
+            </div>
+            <div class="role">
+              <div class="role-head"><span class="role-name">Aggregate Numeric</span><span class="role-score">99%</span></div>
+              <span class="role-field">AMOUNT</span>
+            </div>
+            <div class="role">
+              <div class="role-head"><span class="role-name">Grouping Field</span><span class="role-score">92%</span></div>
+              <span class="role-field">AGENTCODE</span>
+            </div>
+            <div class="role">
+              <div class="role-head"><span class="role-name">Status Field</span><span class="role-score">89%</span></div>
+              <span class="role-field">GATEWAYRESPONSECODE</span>
+            </div>
+            <div class="role">
+              <div class="role-head"><span class="role-name">Category / Segment</span><span class="role-score">86%</span></div>
+              <span class="role-field">SERVICENAME</span>
+            </div>
+          </div>
+
+          <div class="card" style="margin-top:12px;">
+            <h2>Field Declarations</h2>
+            <p class="hint">Create reusable field aliases before building expressions.</p>
+            <div class="json-declare">
+              <div class="decl-row">
+                <div class="input">amount_number</div>
+                <div class="select">Number</div>
+              </div>
+              <div class="input expr">num(field('AMOUNT'),0)</div>
+              <div class="decl-row">
+                <div class="input">success_flag</div>
+                <div class="select">If / Else</div>
+              </div>
+              <div class="input expr">if_(field('GATEWAYRESPONSECODE')=='00',1,0)</div>
+            </div>
+          </div>
+        </aside>
+
+        <section class="main">
+          <div class="card">
+            <div class="builder-header">
+              <div>
+                <h2>Compact Data Studio Workbench</h2>
+                <p class="hint">Use suggested roles as defaults, then tune any field, rule type, output, condition, or JSON key row-wise.</p>
+              </div>
+              <div class="tabs">
+                <span class="tab active">Rules</span>
+                <span class="tab">Fields</span>
+                <span class="tab">JSON Object</span>
+                <span class="tab">Preview</span>
+                <button class="btn ghost">+ Rule</button>
+              </div>
+            </div>
+
+            <div class="metric-strip">
+              <div class="metric"><strong>Date</strong><span>MIS_TXNDATE</span><span>editable</span></div>
+              <div class="metric"><strong>Unique ID</strong><span>TRANSACTIONID</span><span>dedupe key</span></div>
+              <div class="metric"><strong>Aggregate</strong><span>AMOUNT</span><span>sum/avg/min/max</span></div>
+              <div class="metric"><strong>Grouping</strong><span>AGENTCODE</span><span>entity key</span></div>
+              <div class="metric"><strong>Status</strong><span>GATEWAYRESPONSECODE</span><span>success='00'</span></div>
+            </div>
+
+            <div class="rule-table">
+              <div class="rule-head">
+                <div class="cell">On</div>
+                <div class="cell">Rule Type</div>
+                <div class="cell">Output</div>
+                <div class="cell">Mode</div>
+                <div class="cell">Inputs</div>
+                <div class="cell">Condition / Expression</div>
+                <div class="cell">Edit</div>
+              </div>
+              <div class="rule-row">
+                <div class="cell"><span class="toggle"></span></div>
+                <div class="cell"><div class="select">Direct Field</div></div>
+                <div class="cell"><div class="input">agentcode</div></div>
+                <div class="cell"><div class="select">Value</div></div>
+                <div class="cell"><div class="select">field: AGENTCODE</div></div>
+                <div class="cell"><div class="mini-stack"><span class="cond">always</span><span class="expr">=field('AGENTCODE')</span></div></div>
+                <div class="cell"><span class="icon">⧉</span><span class="icon">×</span></div>
+              </div>
+              <div class="rule-row">
+                <div class="cell"><span class="toggle"></span></div>
+                <div class="cell"><div class="select">Unique Count</div></div>
+                <div class="cell"><div class="input">total_txn_count</div></div>
+                <div class="cell"><div class="select">Value</div></div>
+                <div class="cell"><div class="mini-stack"><div class="select">unique id: TRANSACTIONID</div><div class="select">group: AGENTCODE</div></div></div>
+                <div class="cell"><div class="mini-stack"><span class="cond">dedupe duplicate txn id</span><span class="expr">=unique_count('total_txn_count', field('TRANSACTIONID'))</span></div></div>
+                <div class="cell"><span class="icon">⧉</span><span class="icon">×</span></div>
+              </div>
+              <div class="rule-row">
+                <div class="cell"><span class="toggle"></span></div>
+                <div class="cell"><div class="select">Aggregate Sum</div></div>
+                <div class="cell"><div class="input">total_amount</div></div>
+                <div class="cell"><div class="select">Value</div></div>
+                <div class="cell"><div class="mini-stack"><div class="select">amount: AMOUNT</div><div class="select">date: MIS_TXNDATE</div></div></div>
+                <div class="cell"><div class="mini-stack"><span class="cond">where success_flag == 1</span><span class="expr">=unique_sum('total_amount', field('TRANSACTIONID'), amount_number)</span></div></div>
+                <div class="cell"><span class="icon">⧉</span><span class="icon">×</span></div>
+              </div>
+              <div class="rule-row">
+                <div class="cell"><span class="toggle"></span></div>
+                <div class="cell"><div class="select">If / Else</div></div>
+                <div class="cell"><div class="input">risk_band</div></div>
+                <div class="cell"><div class="select">Value</div></div>
+                <div class="cell"><div class="mini-stack"><div class="select">field: amount_number</div><div class="select">threshold: 10000</div></div></div>
+                <div class="cell"><div class="mini-stack"><span class="cond">if amount_number &gt;= 10000 then HIGH else NORMAL</span><span class="expr">=if_(amount_number &gt;= 10000,'HIGH','NORMAL')</span></div></div>
+                <div class="cell"><span class="icon">⧉</span><span class="icon">×</span></div>
+              </div>
+              <div class="rule-row">
+                <div class="cell"><span class="toggle"></span></div>
+                <div class="cell"><div class="select">JSON Object</div></div>
+                <div class="cell"><div class="input">amount_profile</div></div>
+                <div class="cell"><div class="select">JSON</div></div>
+                <div class="cell"><div class="mini-stack"><div class="select">keys: avg,max,velocity</div><div class="select">source: Amount Pack</div></div></div>
+                <div class="cell"><div class="mini-stack"><span class="cond">inline nested object declaration</span><span class="json">{ avg_amount, max_amount, txn_velocity }</span></div></div>
+                <div class="cell"><span class="icon">⧉</span><span class="icon">×</span></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="bottom">
+            <div class="card">
+              <div class="builder-header">
+                <div>
+                  <h2>Generated Output</h2>
+                  <p class="hint">This is what will be saved into Custom Fields after Apply.</p>
+                </div>
+                <div class="chips"><span class="tag green">valid</span><span class="tag cyan">5 outputs</span></div>
+              </div>
+              <div class="preview">{
+  "agentcode": "=field('AGENTCODE')",
+  "total_txn_count": "=unique_count('total_txn_count', field('TRANSACTIONID'))",
+  "total_amount": "=unique_sum('total_amount', field('TRANSACTIONID'), amount_number)",
+  "risk_band": "=if_(amount_number >= 10000,'HIGH','NORMAL')",
+  "amount_profile": {
+    "avg_amount": "=unique_avg('avg_amount', field('TRANSACTIONID'), amount_number)",
+    "max_amount": "=unique_max('max_amount', field('TRANSACTIONID'), amount_number)",
+    "velocity": "=unique_velocity('txn_velocity', field('TRANSACTIONID'), obj(time=field('MIS_TXNDATE'),window_min=5))"
+  }
+}</div>
+            </div>
+            <div class="card">
+              <h2>Validation Snapshot</h2>
+              <p class="hint">Preview row runs before saving.</p>
+              <div class="pipeline">
+                <div class="step"><strong>1</strong><span>field roles</span></div>
+                <div class="step"><strong>2</strong><span>compile expressions</span></div>
+                <div class="step"><strong>3</strong><span>sample validate</span></div>
+                <div class="step"><strong>4</strong><span>save fields</span></div>
+              </div>
+              <div class="json-declare">
+                <div class="decl-row"><div class="input">errors</div><div class="tag green">0</div></div>
+                <div class="decl-row"><div class="input">warnings</div><div class="tag amber">1</div></div>
+                <div class="decl-row"><div class="input">sample rows</div><div class="tag cyan">50</div></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <aside class="right">
+          <h2>Expression Workaround</h2>
+          <p class="hint">Compact data-studio pattern: configure by rows first, inspect compiled expression second.</p>
+          <div class="palette">
+            <div class="palette-card"><strong>Field Role Wizard</strong><span>Auto-suggest date, unique id, aggregate, group, status, entity fields.</span></div>
+            <div class="palette-card"><strong>Rule Type Rows</strong><span>Each row switches inputs based on Direct, Aggregate, Unique, If/Else, JSON, Advanced.</span></div>
+            <div class="palette-card"><strong>Inline Field Alias</strong><span>Declare reusable fields like amount_number and success_flag inside compact UI.</span></div>
+            <div class="palette-card"><strong>JSON Object Builder</strong><span>Add nested object keys without opening Monaco editor.</span></div>
+            <div class="palette-card"><strong>Expression Preview</strong><span>Compiled expressions remain visible and editable for advanced cases.</span></div>
+          </div>
+          <div class="card" style="margin-top:12px;">
+            <h2>JSON Object Declaration</h2>
+            <p class="hint">Compact declaration, no raw JSON required.</p>
+            <div class="json-declare">
+              <div class="decl-row"><div class="input">amount_profile.avg_amount</div><div class="select">Unique Avg</div></div>
+              <div class="decl-row"><div class="input">amount_profile.max_amount</div><div class="select">Unique Max</div></div>
+              <div class="decl-row"><div class="input">amount_profile.velocity</div><div class="select">Velocity</div></div>
+              <button class="btn primary" style="width:100%;">+ JSON Key</button>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

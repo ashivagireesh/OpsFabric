@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Card, Typography, Space, Switch, Select, Input, InputNumber, Button, Divider, Tag, Row, Col, Checkbox, Popconfirm, message } from 'antd'
 import { SettingOutlined, BellOutlined, SecurityScanOutlined, DatabaseOutlined, ApiOutlined } from '@ant-design/icons'
-import { useThemeStore } from '../store/themeStore'
+import { useThemeStore, type AppThemeMode } from '../store/themeStore'
 import api from '../api/client'
 import {
   EDITOR_AUTOSAVE_MAX_INTERVAL_MS,
@@ -286,13 +286,14 @@ export default function Settings() {
       <Space direction="vertical" style={{ width: '100%' }} size={16}>
         {/* General */}
         <SettingsSection icon={<SettingOutlined />} title="General">
-          <SettingRow label="Application Theme" description="Choose dark or light mode for the complete product">
+          <SettingRow label="Application Theme" description="Choose the product theme for the complete application">
             <Select
               value={mode}
-              onChange={(value) => setMode(value as 'dark' | 'light')}
-              style={{ width: 180 }}
+              onChange={(value) => setMode(value as AppThemeMode)}
+              style={{ width: 220 }}
               options={[
                 { value: 'dark', label: 'Dark Mode' },
+                { value: 'enterprise-dark', label: 'Enterprise dark' },
                 { value: 'light', label: 'Light Mode' },
               ]}
               dropdownStyle={{ background: 'var(--app-card-bg)' }}

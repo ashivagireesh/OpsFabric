@@ -10,7 +10,8 @@ import {
   CloseCircleFilled, EllipsisOutlined, ScheduleOutlined,
   StopOutlined,
   HistoryOutlined, CodeOutlined, CopyOutlined,
-  UndoOutlined, RedoOutlined, UploadOutlined, ClearOutlined, CloseOutlined
+  UndoOutlined, RedoOutlined, UploadOutlined, ClearOutlined, CloseOutlined,
+  MessageOutlined, FullscreenOutlined, FullscreenExitOutlined, BranchesOutlined
 } from '@ant-design/icons'
 import { ReactFlowProvider } from 'reactflow'
 import { useWorkflowStore } from '../store'
@@ -184,6 +185,71 @@ function normalizeSampleRowsForCanvas(value: unknown, maxRows = 80): Array<Recor
   return out
 }
 
+function uniqueCanvasFieldNames(values: unknown[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  values.forEach((value) => {
+    const field = String(value || '').trim()
+    if (!field || seen.has(field)) return
+    seen.add(field)
+    out.push(field)
+  })
+  return out
+}
+
+function collectSampleFieldNames(rows: Array<Record<string, unknown>>): string[] {
+  const fields: string[] = []
+  rows.forEach((row) => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return
+    Object.keys(row).forEach((key) => fields.push(key))
+  })
+  return uniqueCanvasFieldNames(fields)
+}
+
+function parseCanvasFieldList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return uniqueCanvasFieldNames(value)
+  }
+  if (typeof value === 'string') {
+    const text = value.trim()
+    if (!text) return []
+    try {
+      const parsed = JSON.parse(text)
+      if (Array.isArray(parsed)) return uniqueCanvasFieldNames(parsed)
+    } catch {
+      // comma/newline list fallback
+    }
+    return uniqueCanvasFieldNames(text.split(/[,\n]/g))
+  }
+  return []
+}
+
+function collectBusinessWorkflowConfiguredInputFields(node: ETLNode | undefined): string[] {
+  if (!node?.data) return []
+  const cfg = toRecord(node.data.config)
+  const studio = toRecord(cfg.blw_studio_config)
+  const mappings = Array.isArray(studio.inputFieldMappings)
+    ? studio.inputFieldMappings
+    : Array.isArray(cfg.inputFieldMappings)
+      ? cfg.inputFieldMappings
+      : []
+  const mappedFields = mappings.flatMap((item) => {
+    const row = toRecord(item)
+    return [
+      row.field,
+      row.alias,
+      row.name,
+    ]
+  })
+  return uniqueCanvasFieldNames([
+    ...parseCanvasFieldList(studio.inputFields),
+    ...parseCanvasFieldList(cfg.inputFields),
+    ...parseCanvasFieldList(studio.sourceFields),
+    ...parseCanvasFieldList(cfg._detected_columns),
+    ...mappedFields,
+  ])
+}
+
 function collectBusinessNodeParentSampleRows(node: ETLNode | undefined): Array<Record<string, unknown>> {
   if (!node?.data) return []
   const cfg = toRecord(node.data.config)
@@ -241,10 +307,16 @@ function hydrateRootEmbeddedNodesWithParentSamples(
   nodes: ETLNode[],
   edges: ETLEdge[],
   parentRows: Array<Record<string, unknown>>,
+  parentFields: string[] = [],
 ): ETLNode[] {
-  if (!Array.isArray(nodes) || nodes.length === 0 || !Array.isArray(parentRows) || parentRows.length === 0) {
+  if (!Array.isArray(nodes) || nodes.length === 0) {
     return nodes
   }
+  const detectedColumns = uniqueCanvasFieldNames([
+    ...parentFields,
+    ...collectSampleFieldNames(Array.isArray(parentRows) ? parentRows : []),
+  ])
+  if ((!Array.isArray(parentRows) || parentRows.length === 0) && detectedColumns.length === 0) return nodes
   const incomingTargets = new Set((Array.isArray(edges) ? edges : []).map((edge) => String(edge?.target || '').trim()))
   return nodes.map((node) => {
     const nodeId = String(node?.id || '').trim()
@@ -267,9 +339,17 @@ function hydrateRootEmbeddedNodesWithParentSamples(
       ...node,
       data: {
         ...prevData,
-        executionSampleInput: cloneStructured(parentRows),
-        executionSampleOutput: shouldMirrorParentToOutput || existingOutput.length === 0
+        config: shouldMirrorParentToOutput
+          ? {
+            ...toRecord(prevData.config),
+            _detected_columns: detectedColumns,
+          }
+          : prevData.config,
+        executionSampleInput: Array.isArray(parentRows) && parentRows.length > 0
           ? cloneStructured(parentRows)
+          : prevData.executionSampleInput,
+        executionSampleOutput: shouldMirrorParentToOutput || existingOutput.length === 0
+          ? (Array.isArray(parentRows) && parentRows.length > 0 ? cloneStructured(parentRows) : prevData.executionSampleOutput)
           : prevData.executionSampleOutput,
       },
     } as ETLNode
@@ -486,7 +566,7 @@ function normalizeEmbeddedEdges(rawEdges: unknown, nodes: ETLNode[], connectorTy
       updatable: true,
       animated: true,
       interactionWidth: 44,
-      style: { stroke: '#6366f1', strokeWidth: 2 },
+      style: { stroke: 'var(--app-accent)', strokeWidth: 2 },
     } as ETLEdge)
   })
   return applyConnectorTypeToEdges(base, connectorType) as ETLEdge[]
@@ -828,6 +908,8 @@ export default function PipelineEditor() {
     getPersistedEditorAutoSaveSettings()
   ))
   const [scheduleModal, setScheduleModal] = useState(false)
+  const [canvasFullscreen, setCanvasFullscreen] = useState(false)
+  const [executionPanelHeight, setExecutionPanelHeight] = useState(260)
   const [pipelineName, setPipelineName] = useState('')
   const [form] = Form.useForm()
   const selectedSchedulePreset = Form.useWatch('schedulePreset', form)
@@ -858,6 +940,15 @@ export default function PipelineEditor() {
       window.removeEventListener(EDITOR_AUTOSAVE_SETTINGS_CHANGED_EVENT, syncEditorAutoSaveSettings as EventListener)
     }
   }, [])
+
+  useEffect(() => {
+    if (!canvasFullscreen) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setCanvasFullscreen(false)
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [canvasFullscreen])
 
   const captureActiveCanvasSnapshot = useCallback((): WorkflowCanvasSnapshot => {
     const state = useWorkflowStore.getState()
@@ -913,7 +1004,8 @@ export default function PipelineEditor() {
       ...collectBusinessNodeParentSampleRows(hit as ETLNode),
       ...collectUpstreamSampleRowsForNode(String(nodeId), mainNodes as ETLNode[], (mainSnapshot.edges || []) as ETLEdge[]),
     ], 80)
-    const hydratedNodes = hydrateRootEmbeddedNodesWithParentSamples(runtimeNodes, embeddedEdges, parentInputSamples)
+    const parentInputFields = collectBusinessWorkflowConfiguredInputFields(hit as ETLNode)
+    const hydratedNodes = hydrateRootEmbeddedNodesWithParentSamples(runtimeNodes, embeddedEdges, parentInputSamples, parentInputFields)
     return {
       snapshot: {
         nodes: hydratedNodes,
@@ -1001,10 +1093,12 @@ export default function PipelineEditor() {
       const parentNode = (Array.isArray(latestMainSnapshot?.nodes) ? latestMainSnapshot.nodes : [])
         .find((node: any) => String(node?.id || '') === parentNodeId) as ETLNode | undefined
       const parentInputSamples = collectBusinessNodeParentSampleRows(parentNode)
+      const parentInputFields = collectBusinessWorkflowConfiguredInputFields(parentNode)
       const parentHydratedNodes = hydrateRootEmbeddedNodesWithParentSamples(
         snapshot.nodes as ETLNode[],
         Array.isArray(snapshot.edges) ? snapshot.edges : [],
         parentInputSamples,
+        parentInputFields,
       )
       const runtimeByChildNode = deriveEmbeddedRuntimeFromLogs(executionLogs as any[], parentNodeId)
       const nextNodes = runtimeByChildNode.size > 0
@@ -1063,6 +1157,7 @@ export default function PipelineEditor() {
         const parentNode = (Array.isArray(mainSnapshot.nodes) ? mainSnapshot.nodes : [])
           .find((node: any) => String(node?.id || '') === nodeId) as ETLNode | undefined
         const parentInputSamples = collectBusinessNodeParentSampleRows(parentNode)
+        const parentInputFields = collectBusinessWorkflowConfiguredInputFields(parentNode)
         const existingSnapshot = canvasSnapshotsRef.current[tabKey]
         canvasSnapshotsRef.current[tabKey] = {
           ...existingSnapshot,
@@ -1070,6 +1165,7 @@ export default function PipelineEditor() {
             (existingSnapshot?.nodes || []) as ETLNode[],
             (existingSnapshot?.edges || []) as ETLEdge[],
             parentInputSamples,
+            parentInputFields,
           ),
         }
         setCanvasTabs((prev) => prev.map((tab) => (tab.key === tabKey ? { ...tab, nodeId } : tab)))
@@ -1204,6 +1300,25 @@ export default function PipelineEditor() {
     [activeCanvasTabKey, canvasTabs]
   )
   const isChildCanvasTabActive = activeCanvasTab.kind === 'business'
+  const openBlwStudioFromChildCanvas = useCallback(async () => {
+    if (!isChildCanvasTabActive || !activeCanvasTab.nodeId) return
+    const parentNodeId = String(activeCanvasTab.nodeId)
+    try {
+      await saveActiveCanvas({ silent: true })
+    } catch {
+      // Navigation can still proceed; the user may save from BLW Studio.
+    }
+    switchCanvasTab(MAIN_CANVAS_TAB_KEY)
+    setSelectedNode(parentNodeId)
+    window.setTimeout(() => {
+      window.dispatchEvent(new CustomEvent('pipeline:open-blw-studio', {
+        detail: {
+          pipelineId: String(id || ''),
+          nodeId: parentNodeId,
+        },
+      }))
+    }, 0)
+  }, [activeCanvasTab.nodeId, id, isChildCanvasTabActive, saveActiveCanvas, setSelectedNode, switchCanvasTab])
   const isAnyNodeDragging = useMemo(
     () => nodes.some((node) => Boolean((node as any)?.dragging) || Boolean((node as any)?.resizing)),
     [nodes]
@@ -1950,7 +2065,7 @@ export default function PipelineEditor() {
               }}
               onMouseEnter={e => (e.currentTarget.style.borderColor = 'var(--app-border-strong)')}
               onMouseLeave={e => (e.currentTarget.style.borderColor = 'transparent')}
-              onFocus={e => (e.currentTarget.style.borderColor = '#6366f1')}
+              onFocus={e => (e.currentTarget.style.borderColor = 'var(--app-accent)')}
             />
 
           </Space>
@@ -1970,7 +2085,7 @@ export default function PipelineEditor() {
                 style={{
                   background: 'var(--app-card-bg)',
                   border: isExecuting ? '1px solid rgba(239,68,68,0.45)' : '1px solid rgba(34,197,94,0.55)',
-                  color: isExecuting ? '#ef4444' : '#22c55e',
+                  color: isExecuting ? '#f48771' : '#89d185',
                   boxShadow: isExecuting ? 'none' : '0 0 0 1px rgba(34,197,94,0.12) inset',
                 }}
               />
@@ -1985,16 +2100,16 @@ export default function PipelineEditor() {
                 style={{
                   background: 'var(--app-card-bg)',
                   border: saving
-                    ? '1px solid rgba(99,102,241,0.55)'
+                    ? '1px solid var(--app-accent-border-strong)'
                     : isDirty
-                      ? '1px solid rgba(245,158,11,0.65)'
-                      : '1px solid rgba(34,197,94,0.55)',
-                  color: saving ? '#6366f1' : isDirty ? '#f59e0b' : '#22c55e',
+                      ? '1px solid rgba(215,186,125,0.65)'
+                      : '1px solid rgba(137,209,133,0.55)',
+                  color: saving ? 'var(--app-accent)' : isDirty ? '#d7ba7d' : '#89d185',
                   boxShadow: saving
-                    ? '0 0 0 1px rgba(99,102,241,0.12) inset'
+                    ? '0 0 0 1px var(--app-accent-border) inset'
                     : isDirty
-                      ? '0 0 0 1px rgba(245,158,11,0.14) inset'
-                      : '0 0 0 1px rgba(34,197,94,0.12) inset',
+                      ? '0 0 0 1px rgba(215,186,125,0.14) inset'
+                      : '0 0 0 1px rgba(137,209,133,0.12) inset',
                 }}
               />
             </Tooltip>
@@ -2028,7 +2143,7 @@ export default function PipelineEditor() {
                 icon={<ClearOutlined />}
                 onClick={handleResetCanvasTop}
                 disabled={isExecuting}
-                style={{ background: 'var(--app-card-bg)', border: '1px solid rgba(239,68,68,0.45)', color: '#ef4444' }}
+                style={{ background: 'var(--app-card-bg)', border: '1px solid rgba(244,135,113,0.45)', color: '#f48771' }}
               />
             </Tooltip>
             <Tooltip title="Connector style">
@@ -2049,6 +2164,13 @@ export default function PipelineEditor() {
                 size="small"
                 style={{ width: 122 }}
                 dropdownStyle={{ background: 'var(--app-card-bg)' }}
+              />
+            </Tooltip>
+            <Tooltip title="Fullscreen canvas">
+              <Button
+                icon={<FullscreenOutlined />}
+                onClick={() => setCanvasFullscreen(true)}
+                style={{ background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)', color: 'var(--app-text-muted)' }}
               />
             </Tooltip>
 
@@ -2081,7 +2203,7 @@ export default function PipelineEditor() {
             {hasError && (
               <Tag
                 icon={<CloseCircleFilled />}
-                style={{ background: '#ef444415', border: '1px solid #ef444430', color: '#ef4444', borderRadius: 6 }}
+                style={{ background: 'rgba(244,135,113,0.14)', border: '1px solid rgba(244,135,113,0.4)', color: '#f48771', borderRadius: 6 }}
               >
                 Failed
               </Tag>
@@ -2089,20 +2211,20 @@ export default function PipelineEditor() {
             {hasSuccess && (
               <Tag
                 icon={<CheckCircleFilled />}
-                style={{ background: '#22c55e15', border: '1px solid #22c55e30', color: '#22c55e', borderRadius: 6 }}
+                style={{ background: 'rgba(137,209,133,0.14)', border: '1px solid rgba(137,209,133,0.34)', color: '#89d185', borderRadius: 6 }}
               >
                 {executionLogs.reduce((s, l) => s + (l.rows || 0), 0).toLocaleString()} rows
               </Tag>
             )}
 
             {isDirty && !saving && (
-              <Tag style={{ background: '#f59e0b15', border: '1px solid #f59e0b30', color: '#f59e0b', fontSize: 11, borderRadius: 4 }}>
+              <Tag style={{ background: 'rgba(215,186,125,0.12)', border: '1px solid rgba(215,186,125,0.34)', color: '#d7ba7d', fontSize: 11, borderRadius: 4 }}>
                 Unsaved
               </Tag>
             )}
-            {saving && <LoadingOutlined style={{ color: '#6366f1', fontSize: 12 }} spin />}
+            {saving && <LoadingOutlined style={{ color: 'var(--app-accent)', fontSize: 12 }} spin />}
             {!isDirty && !saving && (
-              <Tag style={{ background: '#22c55e10', border: '1px solid #22c55e20', color: '#22c55e', fontSize: 11, borderRadius: 4 }}>
+              <Tag style={{ background: 'rgba(137,209,133,0.12)', border: '1px solid rgba(137,209,133,0.28)', color: '#89d185', fontSize: 11, borderRadius: 4 }}>
                 Saved
               </Tag>
             )}
@@ -2110,6 +2232,24 @@ export default function PipelineEditor() {
 
           {/* Right-side status/meta actions */}
           <Space size={8} style={{ marginLeft: 'auto' }}>
+            <Tooltip title="Open Framework Copilot">
+              <Button
+                icon={<MessageOutlined />}
+                onClick={() => window.dispatchEvent(new CustomEvent('framework-copilot:open'))}
+                aria-label="Open Framework Copilot"
+                style={{
+                  height: 32,
+                  paddingInline: 12,
+                  border: '1px solid var(--app-accent-border-strong)',
+                  background: 'var(--app-accent-soft)',
+                  color: 'var(--app-accent-text-soft)',
+                  fontWeight: 700,
+                  boxShadow: '0 0 0 1px var(--app-accent-border) inset',
+                }}
+              >
+                AI Chat
+              </Button>
+            </Tooltip>
             <Dropdown
               menu={{
                 items: moreMenuItems,
@@ -2183,9 +2323,9 @@ export default function PipelineEditor() {
                   height: 28,
                   padding: '0 10px',
                   borderRadius: 8,
-                  border: active ? '1px solid #6366f1aa' : '1px solid var(--app-border-strong)',
-                  background: active ? '#6366f11a' : 'var(--app-card-bg)',
-                  color: active ? '#c4b5fd' : 'var(--app-text-muted)',
+                  border: active ? '1px solid var(--app-accent-border-strong)' : '1px solid var(--app-border-strong)',
+                  background: active ? 'var(--app-accent-soft-strong)' : 'var(--app-card-bg)',
+                  color: active ? 'var(--app-accent-text-soft)' : 'var(--app-text-muted)',
                   cursor: 'pointer',
                   userSelect: 'none',
                   maxWidth: 280,
@@ -2208,7 +2348,7 @@ export default function PipelineEditor() {
                       width: 16,
                       height: 16,
                       padding: 0,
-                      color: active ? '#ddd6fe' : 'var(--app-text-subtle)',
+                      color: active ? 'var(--app-accent-text-soft)' : 'var(--app-text-subtle)',
                     }}
                   />
                 ) : null}
@@ -2216,9 +2356,12 @@ export default function PipelineEditor() {
             )
           })}
           {isChildCanvasTabActive ? (
-            <Tag style={{ marginInlineStart: 4, marginInlineEnd: 0, borderRadius: 6, background: '#6366f112', border: '1px solid #6366f155', color: '#a5b4fc' }}>
-              Child Workflow Canvas
-            </Tag>
+            <Space.Compact style={{ marginInlineStart: 4 }}>
+              <Button size="small" type="primary" icon={<MessageOutlined />}>Child Canvas</Button>
+              <Button size="small" icon={<BranchesOutlined />} onClick={openBlwStudioFromChildCanvas}>
+                BLW Studio
+              </Button>
+            </Space.Compact>
           ) : null}
         </div>
 
@@ -2229,8 +2372,12 @@ export default function PipelineEditor() {
 
           {/* Center: Canvas + Execution Panel */}
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-            <WorkflowCanvas />
-            <ExecutionPanel />
+            {!canvasFullscreen ? (
+              <>
+                <WorkflowCanvas />
+                <ExecutionPanel height={executionPanelHeight} onHeightChange={setExecutionPanelHeight} />
+              </>
+            ) : null}
           </div>
 
           {/* Right: Config Drawer (inline, not overlay) */}
@@ -2241,6 +2388,56 @@ export default function PipelineEditor() {
             />
           </ConfigDrawerErrorBoundary>
         </div>
+        {canvasFullscreen ? (
+          <div
+            style={{
+              position: 'fixed',
+              inset: 0,
+              zIndex: 900,
+              background: 'var(--app-shell-bg)',
+              display: 'flex',
+              flexDirection: 'column',
+            }}
+          >
+            <div
+              style={{
+                height: 42,
+                flexShrink: 0,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 12,
+                padding: '0 12px',
+                background: 'var(--app-panel-bg)',
+                borderBottom: '1px solid var(--app-border)',
+              }}
+            >
+              <Space size={8}>
+                <Tag style={{ marginInlineEnd: 0, background: 'var(--app-accent-soft)', border: '1px solid var(--app-accent-border)', color: 'var(--app-accent-text-soft)' }}>
+                  Fullscreen Canvas
+                </Tag>
+                <Text style={{ color: 'var(--app-text-muted)', fontSize: 12 }}>
+                  {pipelineName || 'Pipeline'}
+                </Text>
+              </Space>
+              <Space size={8}>
+                <Tooltip title="Exit fullscreen (Esc)">
+                  <Button
+                    icon={<FullscreenExitOutlined />}
+                    onClick={() => setCanvasFullscreen(false)}
+                    style={{ background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)', color: 'var(--app-text-muted)' }}
+                  >
+                    Exit
+                  </Button>
+                </Tooltip>
+              </Space>
+            </div>
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+              <WorkflowCanvas />
+              <ExecutionPanel height={executionPanelHeight} onHeightChange={setExecutionPanelHeight} />
+            </div>
+          </div>
+        ) : null}
       </div>
 
       <input
@@ -2312,7 +2509,7 @@ export default function PipelineEditor() {
         }}
         onCancel={() => setScheduleModal(false)}
         okText="Save Schedule"
-        okButtonProps={{ style: { background: 'linear-gradient(135deg, #6366f1, #a855f7)', border: 'none' } }}
+        okButtonProps={{ style: { background: 'var(--app-accent)', border: 'none' } }}
         styles={{ content: { background: 'var(--app-card-bg)', border: '1px solid var(--app-border-strong)' }, header: { background: 'var(--app-card-bg)', borderBottom: '1px solid var(--app-border-strong)' }, footer: { background: 'var(--app-card-bg)', borderTop: '1px solid var(--app-border-strong)' }, mask: { backdropFilter: 'blur(4px)' } }}
       >
         <Form

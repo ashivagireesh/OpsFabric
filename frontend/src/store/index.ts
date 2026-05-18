@@ -24,6 +24,7 @@ function randomRows(category: string, upstream: number): number {
 const TERMINAL_EXECUTION_STATUSES = new Set(['success', 'failed', 'cancelled'])
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 const EXECUTION_POLL_INTERVAL_MS = 1500
+const EXECUTION_FALLBACK_POLL_INTERVAL_MS = 10000
 const MAX_UI_EXECUTION_LOG_ENTRIES = 1200
 const MAX_RUNTIME_SNAPSHOT_LOG_SCAN = 2500
 const EXECUTION_FINAL_LOG_TAIL = 1200
@@ -883,6 +884,11 @@ import api from '../api/client'
 
 // ─── WORKFLOW STORE (Canvas State) ────────────────────────────────────────────
 
+function isEmbeddedChildWorkflowSnapshot(nodes: ETLNode[]): boolean {
+  const hasWorkflowInputNode = nodes.some((node) => String(node?.data?.nodeType || '') === 'workflow_input_source')
+  return hasWorkflowInputNode
+}
+
 interface WorkflowState {
   nodes: ETLNode[]
   edges: ETLEdge[]
@@ -1423,6 +1429,10 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   savePipeline: async () => {
     const { pipeline, nodes, edges } = get()
     if (!pipeline?.id) return
+    if (isEmbeddedChildWorkflowSnapshot(nodes)) {
+      console.error('Blocked generic save for embedded child workflow canvas; use the child workflow save handler.')
+      return
+    }
     try {
       await api.updatePipeline(pipeline.id, { nodes, edges })
       set({ isDirty: false })
@@ -1607,6 +1617,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       let wsConnected = false
       let wsMessageSeen = false
       let pollIteration = 0
+      let lastSeenLogIndex = -1
       const forceStopRunningNodes = (fallbackStatus: 'success' | 'error' = 'error') => {
         const nowMs = Date.now()
         const nowIso = new Date(nowMs).toISOString()
@@ -1696,6 +1707,11 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
           includeLogSamples: false,
         })
         if (Array.isArray(boot.logs) && boot.logs.length > 0) {
+          if (typeof boot.log_count === 'number') {
+            lastSeenLogIndex = Math.max(lastSeenLogIndex, Number(boot.log_count) - 1)
+          } else {
+            lastSeenLogIndex = Math.max(lastSeenLogIndex, boot.logs.length - 1)
+          }
           const bootStatus = String(boot.status || '').trim().toLowerCase()
           const nextLogs = normalizeExecutionLogsForDisplay(
             boot.logs as Array<Record<string, any>>,
@@ -1893,18 +1909,21 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       while (true) {
         pollIteration += 1
         const startupOrNoWsSignal = !wsConnected || !wsMessageSeen
-        await sleep(
-          startupOrNoWsSignal
-            ? Math.max(250, Math.floor(EXECUTION_POLL_INTERVAL_MS / 4))
-            : EXECUTION_POLL_INTERVAL_MS,
-        )
+        const prePollState = get()
+        if (!prePollState.isExecuting || prePollState.executionId !== execId) break
+        if (!startupOrNoWsSignal) {
+          await sleep(EXECUTION_POLL_INTERVAL_MS)
+          continue
+        }
+        await sleep(EXECUTION_FALLBACK_POLL_INTERVAL_MS)
         const state = get()
         if (!state.isExecuting || state.executionId !== execId) break
         try {
-          const includeLogsInPoll = startupOrNoWsSignal || (pollIteration % 8 === 0)
+          const includeLogsInPoll = pollIteration % 6 === 0
           const exec = await api.getExecution(execId, {
             includeLogs: includeLogsInPoll,
             logTail: includeLogsInPoll ? 120 : 80,
+            logAfter: includeLogsInPoll ? lastSeenLogIndex : -1,
             includeLogSamples: false,
           })
           consecutivePollErrors = 0
@@ -1916,15 +1935,21 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
             )
             : rawExecStatus
           if (includeLogsInPoll && Array.isArray(exec.logs) && exec.logs.length > 0) {
-            const nextLogs = normalizeExecutionLogsForDisplay(
+            if (typeof exec.log_count === 'number') {
+              lastSeenLogIndex = Math.max(lastSeenLogIndex, Number(exec.log_count) - 1)
+            } else {
+              lastSeenLogIndex += exec.logs.length
+            }
+            const incomingLogs = normalizeExecutionLogsForDisplay(
               exec.logs as Array<Record<string, any>>,
               effectiveExecStatus,
             )
-            set((state) => (
-              executionLogsShallowEqual(state.executionLogs, nextLogs)
+            set((state) => {
+              const nextLogs = trimExecutionLogsForUi([...state.executionLogs, ...incomingLogs])
+              return executionLogsShallowEqual(state.executionLogs, nextLogs)
                 ? {}
                 : { executionLogs: nextLogs }
-            ))
+            })
             applyLiveNodeStatusFromLogs(exec.logs as Array<Record<string, any>>, effectiveExecStatus)
           }
           if (effectiveExecStatus === 'cancelling') {
@@ -2212,11 +2237,11 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         let pollIteration = 0
         while (true) {
           pollIteration += 1
-          await sleep(EXECUTION_POLL_INTERVAL_MS)
+          await sleep(EXECUTION_FALLBACK_POLL_INTERVAL_MS)
           const state = get()
           if (!state.isExecuting || state.executionId !== executionId) break
           try {
-            const includeLogsInPoll = pollIteration % 4 === 0
+            const includeLogsInPoll = pollIteration % 6 === 0
             const exec = await api.getExecution(executionId, {
               includeLogs: includeLogsInPoll,
               logTail: includeLogsInPoll ? 120 : 80,

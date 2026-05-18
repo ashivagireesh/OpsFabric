@@ -5,6 +5,7 @@ Supports: Databases, Files, APIs, Cloud Storage, Message Queues
 import asyncio
 import ast
 import base64
+import contextlib
 import csv
 import gzip
 import hashlib
@@ -15,6 +16,7 @@ import pickle
 import queue as _queue
 import random
 import re
+import sqlite3
 import smtplib
 import ssl
 import threading
@@ -24,9 +26,14 @@ import uuid
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
 from datetime import date, datetime, time, timedelta
 from email.message import EmailMessage
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 from loguru import logger
+
+_BUSINESS_MAIL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(1, min(int(os.getenv("BUSINESS_MAIL_ASYNC_WORKERS", "8") or "8"), 32))
+)
 try:
     import lmdb  # type: ignore
 except Exception:  # pragma: no cover - optional dependency fallback
@@ -51,6 +58,16 @@ except Exception:  # pragma: no cover - optional dependency fallback
 
 class ExecutionAbortedError(Exception):
     """Raised when an execution is aborted by user request."""
+
+
+class BLWDelaySuspended(Exception):
+    """Raised by BLW async runs when a delay should be persisted instead of slept."""
+
+    def __init__(self, node_id: str, delay_seconds: float, rows_count: int = 0):
+        self.node_id = str(node_id or "")
+        self.delay_seconds = max(0.0, float(delay_seconds or 0.0))
+        self.rows_count = int(rows_count or 0)
+        super().__init__(f"BLW delay suspended at {self.node_id} for {self.delay_seconds:.3f}s")
 
 
 class NodeDisabledDuringExecutionError(Exception):
@@ -264,6 +281,7 @@ class ETLEngine:
         self._oracle_full_scan_block_until: Dict[str, float] = {}
         self._oracle_profile_schema_lock = threading.Lock()
         self._oracle_profile_schema_checked_tables: set = set()
+        self._blw_tracker_ensured_tables: set[str] = set()
         self._oracle_profile_write_queue_lock = threading.Lock()
         self._oracle_profile_write_queues: Dict[str, Dict[str, Any]] = {}
         self._oracle_destination_write_queue_lock = threading.Lock()
@@ -6522,6 +6540,16 @@ END;"""
                     # Action nodes default to single dispatch per batch for performance.
                     if invoke_mode in {"once_per_batch", "batch", "single", "once"}:
                         effective_row_fanout_input = False
+                if effective_row_fanout_input and node_type == "business_workflow":
+                    workflow_execution_mode = str(
+                        config.get("workflow_execution_mode")
+                        or config.get("execution_mode")
+                        or "inline"
+                    ).strip().lower()
+                    if workflow_execution_mode in {"async", "async_tracker", "background", "queue"}:
+                        # Async BLW is already a queue boundary. Keeping inherited row fan-out
+                        # would execute the node once per row and insert tracker rows one by one.
+                        effective_row_fanout_input = False
 
                 input_sample_rows = _sample_rows_for_log(upstream_data, limit=node_sample_rows_limit)
 
@@ -7769,6 +7797,10 @@ END;"""
                 incoming_order=incoming_order or [],
                 execution_context=execution_context,
             )
+        elif node_type == "blw_runtime_step":
+            return self._transform_blw_runtime_step(upstream, config)
+        elif node_type == "blw_condition_node":
+            return upstream
         elif node_type == "business_analytics":
             return self._transform_business_analytics(upstream, config)
         elif node_type == "api_gateway":
@@ -20753,6 +20785,14 @@ END;"""
         delay_seconds = self._resolve_delay_seconds(config)
         max_delay_seconds = 7.0 * 86400.0
         delay_seconds = max(0.0, min(float(delay_seconds), max_delay_seconds))
+        if len(data) == 0:
+            _emit(
+                "⟳ Delay Transform… no incoming rows, forwarding immediately",
+                0,
+                0,
+                0,
+            )
+            return data
         if delay_seconds <= 0:
             _emit(
                 "⟳ Delay Transform… delay=0, forwarding immediately",
@@ -20761,6 +20801,29 @@ END;"""
                 len(data),
             )
             return data
+
+        if isinstance(execution_context, dict) and self._parse_bool_like(
+            execution_context.get("blw_async_persist_wait", False),
+            False,
+        ):
+            runtime_node_id = str(execution_context.get("node_id") or config.get("blw_node_id") or "").strip()
+            delay_node_id = runtime_node_id.split("::", 1)[1] if "::" in runtime_node_id else runtime_node_id
+            completed_delay_ids_raw = execution_context.get("blw_completed_delay_node_ids")
+            completed_delay_ids = {
+                str(item)
+                for item in completed_delay_ids_raw
+                if str(item or "").strip()
+            } if isinstance(completed_delay_ids_raw, list) else set()
+            if delay_node_id and delay_node_id in completed_delay_ids:
+                _emit(
+                    f"✓ Delay Transform — resumed after persisted wait for {delay_seconds:.6f}s",
+                    len(data),
+                    len(data),
+                    len(data),
+                )
+                return data
+            if delay_node_id and delay_node_id not in completed_delay_ids:
+                raise BLWDelaySuspended(delay_node_id, delay_seconds, len(data))
 
         if delay_scope == "message":
             output: List[Any] = []
@@ -21122,6 +21185,1378 @@ END;"""
             })
         return normalized
 
+    def _blw_studio_to_embedded_runtime(self, raw_config: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+        cfg = self._blw_parse_json_object(raw_config)
+        graph_nodes = cfg.get("graphNodes")
+        graph_edges = cfg.get("graphEdges")
+        embedded_workflow_nodes = cfg.get("embedded_workflow_nodes")
+        embedded_workflow_edges = cfg.get("embedded_workflow_edges")
+        if not isinstance(graph_nodes, list):
+            graph_nodes = []
+        if not isinstance(graph_edges, list):
+            graph_edges = []
+
+        def _action(raw: Any) -> Dict[str, Any]:
+            return self._blw_parse_json_object(raw)
+
+        def _rule_expression(rule: Dict[str, Any]) -> str:
+            source = str(rule.get("source") or "field").strip().lower()
+            field = str(rule.get("field") or "").strip()
+            operator = str(rule.get("operator") or "==").strip()
+            value = str(rule.get("value") or "")
+            if not field:
+                return ""
+            left = f"var('{field}')" if source == "variable" else f"field('{field}')"
+            if operator == "exists":
+                return f"{left} != None"
+            if operator == "empty":
+                return f"{left} == ''"
+            if operator == "contains":
+                escaped = value.replace("'", "\\'")
+                return f"contains({left}, '{escaped}')"
+            if operator in {">", "<", ">=", "<="}:
+                return f"{left} {operator} {value or '0'}"
+            escaped = value.replace("'", "\\'")
+            return f"{left} {operator or '=='} '{escaped}'"
+
+        def _condition_config(expression: str, action_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            action_obj = action_cfg if isinstance(action_cfg, dict) else {}
+            if not str(expression or "").strip() and isinstance(action_obj.get("conditionRules"), list):
+                expressions = [
+                    _rule_expression(rule)
+                    for rule in action_obj.get("conditionRules", [])
+                    if isinstance(rule, dict)
+                ]
+                expressions = [item for item in expressions if item]
+                joiner = " or " if str(action_obj.get("conditionMatchMode") or "all").strip().lower() == "any" else " and "
+                expression = joiner.join(f"({item})" for item in expressions)
+            raw = str(expression or "").strip()
+            match = re.match(r"^([A-Za-z_][A-Za-z0-9_.]*)\s*(==|=|!=|>=|<=|>|<)\s*['\"]?(.+?)['\"]?$", raw)
+            out: Dict[str, Any] = {
+                "blw_condition_expression": raw or "true",
+                "condition_routing_mode": "blw_expression",
+            }
+            if match:
+                op_map = {
+                    "=": "equals",
+                    "==": "equals",
+                    "!=": "not_equals",
+                    ">": "greater_than",
+                    "<": "less_than",
+                    ">=": "greater_or_equal",
+                    "<=": "less_or_equal",
+                }
+                out.update({
+                    "field": match.group(1),
+                    "operator": op_map.get(match.group(2), "equals"),
+                    "value": match.group(3),
+                })
+            if isinstance(action_obj.get("conditionGroups"), list):
+                out["blw_condition_groups"] = action_obj.get("conditionGroups")
+            return out
+
+        nodes: List[Dict[str, Any]] = []
+        condition_node_ids: set[str] = set()
+        grouped_condition_node_ids: set[str] = set()
+        for idx, node in enumerate(graph_nodes):
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("id") or f"blw_{idx + 1}").strip()
+            if not node_id:
+                continue
+            data = node.get("data") if isinstance(node.get("data"), dict) else {}
+            blw_type = str(data.get("blwType") or "activity").strip().lower()
+            action = _action(data.get("actionJson"))
+            base_config: Dict[str, Any] = {
+                "blw_type": blw_type,
+                "blw_node_id": node_id,
+                "node_enabled": self._parse_bool_like(data.get("enabled", True), True),
+                "blw_status": str(data.get("status") or "draft"),
+                "blw_input_contract": data.get("inputContract") or "{}",
+                "blw_validation_rules": data.get("validationRules") or "{}",
+                "blw_output_contract": data.get("outputContract") or "{}",
+                "blw_instance_variables": cfg.get("instanceVariables") if isinstance(cfg.get("instanceVariables"), list) else [],
+                "blw_input_fields": cfg.get("inputFields") if isinstance(cfg.get("inputFields"), list) else [],
+                "blw_retry": data.get("retry") if isinstance(data.get("retry"), dict) else {},
+                "blw_iteration": data.get("iteration") if isinstance(data.get("iteration"), dict) else {},
+                "blw_escalation": data.get("escalation") if isinstance(data.get("escalation"), dict) else {},
+                "blw_action": action,
+                "blw_tracker_table": cfg.get("trackerTable") or "BLW_WORKFLOW_TRACKER",
+                "blw_unique_id_field": cfg.get("uniqueIdField") or "TRANSACTIONID",
+                "blw_child_node_id": str(data.get("childNodeId") or action.get("childNodeId") or "").strip(),
+                "blw_embedded_workflow_nodes": embedded_workflow_nodes if isinstance(embedded_workflow_nodes, list) else [],
+                "blw_embedded_workflow_edges": embedded_workflow_edges if isinstance(embedded_workflow_edges, list) else [],
+            }
+            node_type = "blw_runtime_step"
+            node_config = dict(base_config)
+            if blw_type == "condition":
+                condition_node_ids.add(node_id)
+                node_type = "blw_condition_node"
+                node_config.update(_condition_config(str(action.get("condition") or ""), action))
+                node_config["true_label"] = str(action.get("trueLabel") or "approved")
+                node_config["false_label"] = str(action.get("falseLabel") or "rejected")
+                if isinstance(node_config.get("blw_condition_groups"), list) and node_config.get("blw_condition_groups"):
+                    grouped_condition_node_ids.add(node_id)
+            elif blw_type == "wait":
+                node_type = "delay_transform"
+                wait_cfg = data.get("wait") if isinstance(data.get("wait"), dict) else {}
+                try:
+                    timeout_minutes = float(wait_cfg.get("timeoutMinutes") or cfg.get("waitTimeoutMinutes") or 1)
+                except Exception:
+                    timeout_minutes = 1.0
+                node_config.update({
+                    "delay_value": max(1.0, timeout_minutes),
+                    "delay_unit": "m",
+                    "delay_scope": "batch",
+                    "passthrough_on_receive": False,
+                })
+            elif blw_type == "delay":
+                node_type = "delay_transform"
+                delay_cfg = data.get("delay") if isinstance(data.get("delay"), dict) else {}
+                try:
+                    delay_seconds = float(delay_cfg.get("seconds") or action.get("seconds") or 0)
+                except Exception:
+                    delay_seconds = 0.0
+                node_config.update({
+                    "delay_value": max(0.0, delay_seconds),
+                    "delay_unit": "s",
+                    "delay_scope": "batch",
+                    "passthrough_on_receive": False,
+                })
+            elif blw_type == "email":
+                node_type = "business_mail_writer"
+                node_config.update({
+                    "to_email": str(action.get("recipient") or "team@example.com"),
+                    "body_template": str(action.get("template") or ""),
+                    "send_mode": str(action.get("sendMode") or "draft"),
+                })
+            nodes.append({
+                "id": node_id,
+                "node_type": node_type,
+                "label": str(data.get("label") or blw_type or node_id),
+                "config": node_config,
+            })
+
+        edges: List[Dict[str, str]] = []
+        def _runtime_source_handle(raw_handle: Any) -> str:
+            handle = str(raw_handle or "output").strip() or "output"
+            if handle == "true":
+                return "output"
+            if handle == "false":
+                return "output_false"
+            if handle.startswith("out-") or handle in {"source", "default"}:
+                return "output"
+            return handle
+
+        for idx, edge in enumerate(graph_edges):
+            if not isinstance(edge, dict):
+                continue
+            source = str(edge.get("source") or "").strip()
+            target = str(edge.get("target") or "").strip()
+            if not source or not target:
+                continue
+            raw_source_handle = str(edge.get("sourceHandle") or edge.get("source_handle") or "output").strip() or "output"
+            if (
+                source in grouped_condition_node_ids
+                and not raw_source_handle.startswith("group_")
+                and raw_source_handle not in {"false", "out-left", "left", "output_false"}
+            ):
+                # Grouped condition routing owns its output handles. Older generic
+                # true/default edges are ignored to avoid sending every matching
+                # row down multiple stale routes. The generic false handle is
+                # still the CASE-style default/else route.
+                continue
+            if source in condition_node_ids and raw_source_handle in {"false", "out-left", "left"}:
+                source_handle = "output_false"
+            elif source in condition_node_ids and raw_source_handle in {"true", "out-right", "right", "out-bottom"}:
+                source_handle = "output"
+            else:
+                source_handle = _runtime_source_handle(raw_source_handle)
+            edges.append({
+                "id": str(edge.get("id") or f"blw_edge_{idx + 1}_{source}_{target}"),
+                "source": source,
+                "target": target,
+                "source_handle": source_handle,
+                "target_handle": str(edge.get("targetHandle") or edge.get("target_handle") or "input").strip() or "input",
+            })
+        return nodes, edges
+
+    def _blw_parse_json_object(self, raw_value: Any) -> Dict[str, Any]:
+        if isinstance(raw_value, dict):
+            return dict(raw_value)
+        if isinstance(raw_value, str):
+            text = raw_value.strip()
+            if not text:
+                return {}
+            try:
+                parsed = json.loads(text)
+                return dict(parsed) if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _blw_field_value(self, row: Any, field: str) -> Any:
+        if not isinstance(row, dict):
+            return None
+        key = str(field or "").strip()
+        if not key:
+            return None
+        value, found = self._extract_row_value_by_path(row, key)
+        if found:
+            return value
+        return row.get(key)
+
+    def _blw_compare(self, left: Any, operator: str, right: Any) -> bool:
+        op = str(operator or "equals").strip().lower()
+        if op in {"=", "=="}:
+            op = "equals"
+        elif op in {"!=", "<>"}:
+            op = "not_equals"
+        elif op == ">":
+            op = "greater_than"
+        elif op == "<":
+            op = "less_than"
+        elif op == ">=":
+            op = "greater_or_equal"
+        elif op == "<=":
+            op = "less_or_equal"
+
+        if op in {"is_null", "null"}:
+            return left is None or str(left).strip() == ""
+        if op in {"is_not_null", "not_null"}:
+            return not (left is None or str(left).strip() == "")
+
+        left_num = self._business_to_number(left)
+        right_num = self._business_to_number(right)
+        if left_num is not None and right_num is not None:
+            if op == "greater_than":
+                return left_num > right_num
+            if op == "less_than":
+                return left_num < right_num
+            if op == "greater_or_equal":
+                return left_num >= right_num
+            if op == "less_or_equal":
+                return left_num <= right_num
+            if op == "equals":
+                return left_num == right_num
+            if op == "not_equals":
+                return left_num != right_num
+
+        left_text = "" if left is None else str(left)
+        right_text = "" if right is None else str(right)
+        if op == "contains":
+            return right_text in left_text
+        if op == "not_contains":
+            return right_text not in left_text
+        if op == "equals":
+            return left_text == right_text
+        if op == "not_equals":
+            return left_text != right_text
+        return bool(left)
+
+    def _blw_eval_expression(self, row: Any, expression: str) -> bool:
+        raw = str(expression or "").strip()
+        if not raw or raw.lower() in {"true", "always", "1"}:
+            return True
+        if raw.lower() in {"false", "never", "0"}:
+            return False
+        function_match = re.match(
+            r"^\s*(field|var)\(\s*['\"]([^'\"]+)['\"]\s*\)\s*(==|=|!=|<>|>=|<=|>|<)\s*['\"]?(.+?)['\"]?\s*$",
+            raw,
+        )
+        if function_match:
+            source, key, operator, compare_value = function_match.groups()
+            if source == "var" and isinstance(row, dict):
+                blw_vars = row.get("_blw_vars")
+                left_value = blw_vars.get(key) if isinstance(blw_vars, dict) else None
+            else:
+                left_value = self._blw_field_value(row, key)
+            return self._blw_compare(left_value, operator, compare_value)
+        match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_.]*)\s*(==|=|!=|<>|>=|<=|>|<)\s*['\"]?(.+?)['\"]?\s*$", raw)
+        if match:
+            return self._blw_compare(
+                self._blw_field_value(row, match.group(1)),
+                match.group(2),
+                match.group(3),
+            )
+        # Minimal safe expression support for common formulas.
+        if isinstance(row, dict):
+            blw_vars = row.get("_blw_vars")
+            if not isinstance(blw_vars, dict):
+                blw_vars = {}
+            safe_locals: Dict[str, Any] = {
+                k: v for k, v in row.items()
+                if isinstance(k, str) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", k)
+            }
+            for key, value in blw_vars.items():
+                if isinstance(key, str) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+                    safe_locals.setdefault(key, value)
+            safe_locals.update({
+                "field": lambda name, default=None: self._blw_field_value(row, str(name)) if self._blw_field_value(row, str(name)) is not None else default,
+                "var": lambda name, default=None: blw_vars.get(str(name), default),
+                "contains": lambda value, needle: str(needle or "") in str(value or ""),
+                "len": len,
+                "int": int,
+                "float": float,
+                "str": str,
+                "True": True,
+                "False": False,
+                "None": None,
+            })
+            try:
+                parsed = ast.parse(raw, mode="eval")
+                for node in ast.walk(parsed):
+                    if isinstance(node, (ast.Import, ast.ImportFrom, ast.Lambda, ast.Attribute, ast.Subscript, ast.Call)):
+                        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"field", "var", "contains", "len", "int", "float", "str"}:
+                            continue
+                        return False
+                return bool(eval(compile(parsed, "<blw-condition>", "eval"), {"__builtins__": {}}, safe_locals))
+            except Exception:
+                return False
+        return False
+
+    def _blw_condition_split(self, rows: List[Any], config: Dict[str, Any]) -> Tuple[List[Any], List[Any]]:
+        expression = str(config.get("blw_condition_expression") or "").strip()
+        field = str(config.get("field") or "").strip()
+        operator = str(config.get("operator") or "equals").strip()
+        compare_value = config.get("value")
+        true_rows: List[Any] = []
+        false_rows: List[Any] = []
+        for row in rows if isinstance(rows, list) else []:
+            if expression:
+                matched = self._blw_eval_expression(row, expression)
+            elif field:
+                matched = self._blw_compare(self._blw_field_value(row, field), operator, compare_value)
+            else:
+                matched = True
+            (true_rows if matched else false_rows).append(row)
+        return true_rows, false_rows
+
+    def _blw_condition_group_split(self, rows: List[Any], config: Dict[str, Any]) -> Dict[str, List[Any]]:
+        groups = config.get("blw_condition_groups")
+        if not isinstance(groups, list) or not groups:
+            true_rows, false_rows = self._blw_condition_split(rows, config)
+            return {"output": true_rows, "output_false": false_rows}
+
+        def _rule_matches(row: Any, raw_rule: Dict[str, Any]) -> bool:
+            source = str(raw_rule.get("source") or "field").strip().lower()
+            field = str(raw_rule.get("field") or "").strip()
+            operator = str(raw_rule.get("operator") or "==").strip()
+            value = raw_rule.get("value")
+            if not field:
+                return False
+            if source == "variable" and isinstance(row, dict):
+                blw_vars = row.get("_blw_vars")
+                left_value = blw_vars.get(field) if isinstance(blw_vars, dict) else None
+            else:
+                left_value = self._blw_field_value(row, field)
+            if operator == "exists":
+                return not (left_value is None or str(left_value).strip() == "")
+            if operator == "empty":
+                return left_value is None or str(left_value).strip() == ""
+            return self._blw_compare(left_value, operator, value)
+
+        bundles: Dict[str, List[Any]] = {"output": [], "output_false": []}
+        row_list = rows if isinstance(rows, list) else []
+        matched_ids: set[int] = set()
+        group_ids: List[str] = []
+        for group_index, raw_group in enumerate(groups):
+            if not isinstance(raw_group, dict):
+                continue
+            if not self._parse_bool_like(raw_group.get("enabled", True), True):
+                continue
+            group_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(raw_group.get("id") or f"group_{group_index + 1}").strip())
+            group_ids.append(group_id)
+            group_rules = raw_group.get("rules") if isinstance(raw_group.get("rules"), list) else []
+            group_match_mode = str(raw_group.get("matchMode") or "all").strip().lower()
+            normalized_rules = [rule for rule in group_rules if isinstance(rule, dict)]
+            true_rows: List[Any] = []
+            for row_index, row in enumerate(row_list):
+                if row_index in matched_ids:
+                    continue
+                if not normalized_rules:
+                    matched = False
+                else:
+                    results = [_rule_matches(row, rule) for rule in normalized_rules]
+                    matched = any(results) if group_match_mode == "any" else all(results)
+                if matched:
+                    true_rows.append(row)
+                    matched_ids.add(row_index)
+            bundles[f"group_{group_id}_true"] = true_rows
+        unmatched_rows = [row for idx, row in enumerate(row_list) if idx not in matched_ids]
+        for group_id in group_ids:
+            # CASE-style routing uses one shared output_false/default route.
+            # Per-group false handles are kept empty so older saved edges cannot
+            # duplicate unmatched rows into the same downstream node.
+            bundles[f"group_{group_id}_false"] = []
+        bundles["output"] = [row for idx, row in enumerate(row_list) if idx in matched_ids]
+        bundles["output_false"] = unmatched_rows
+        return bundles
+
+    def _transform_blw_runtime_step(self, data: list, config: Dict[str, Any]) -> list:
+        rows = data if isinstance(data, list) else []
+        cfg = config if isinstance(config, dict) else {}
+        blw_type = str(cfg.get("blw_type") or "activity").strip().lower()
+        validation = self._blw_parse_json_object(cfg.get("blw_validation_rules"))
+        required = validation.get("required")
+        if not isinstance(required, list):
+            required = []
+        rules = validation.get("rules")
+        if not isinstance(rules, list):
+            rules = []
+        on_invalid = str(validation.get("on_invalid") or "fail").strip().lower()
+        valid_rows: List[Any] = []
+        invalid_rows: List[Any] = []
+        for row in rows:
+            missing = [
+                str(field)
+                for field in required
+                if str(field or "").strip() and self._blw_field_value(row, str(field)) in (None, "")
+            ]
+            failed_rules = []
+            for rule in rules:
+                rule_obj = rule if isinstance(rule, dict) else {"expression": str(rule or "")}
+                expression = str(rule_obj.get("expression") or "").strip()
+                if expression and not self._blw_eval_expression(row, expression):
+                    failed_rules.append(expression)
+            if missing or failed_rules:
+                if isinstance(row, dict):
+                    invalid = dict(row)
+                    invalid["_blw_validation_status"] = "invalid"
+                    invalid["_blw_validation_missing"] = missing
+                    invalid["_blw_validation_failed_rules"] = failed_rules
+                    invalid_rows.append(invalid)
+                else:
+                    invalid_rows.append(row)
+            else:
+                valid_rows.append(row)
+        if invalid_rows and on_invalid == "fail":
+            raise ValueError(f"BLW validation failed for {len(invalid_rows)} row(s): missing required fields")
+        active_rows = valid_rows if invalid_rows else rows
+        if invalid_rows and on_invalid in {"skip", "ignore"}:
+            active_rows = valid_rows
+        elif invalid_rows:
+            active_rows = valid_rows + invalid_rows
+
+        now = datetime.utcnow().isoformat()
+        output_contract = self._blw_parse_json_object(cfg.get("blw_output_contract"))
+        write_path = str(output_contract.get("write_path") or "").strip()
+        action = cfg.get("blw_action") if isinstance(cfg.get("blw_action"), dict) else {}
+        global_variables = cfg.get("blw_instance_variables") if isinstance(cfg.get("blw_instance_variables"), list) else []
+        node_variables = action.get("variableAssignments") if isinstance(action.get("variableAssignments"), list) else []
+        variable_assignments = [item for item in [*global_variables, *node_variables] if isinstance(item, dict)]
+        out: List[Any] = []
+        for row in active_rows:
+            row_obj = dict(row) if isinstance(row, dict) else {"value": row}
+            blw_vars = row_obj.get("_blw_vars")
+            if not isinstance(blw_vars, dict):
+                blw_vars = {}
+            for assignment in variable_assignments:
+                name = str(assignment.get("name") or "").strip()
+                if not name:
+                    continue
+                source = str(assignment.get("source") or "input_field").strip().lower()
+                if source == "static":
+                    value = assignment.get("defaultValue")
+                elif source == "expression":
+                    expression = str(assignment.get("expression") or "").strip()
+                    value = bool(self._blw_eval_expression(row_obj, expression)) if expression else assignment.get("defaultValue")
+                else:
+                    field = str(assignment.get("field") or "").strip()
+                    value = self._blw_field_value(row_obj, field) if field else assignment.get("defaultValue")
+                    if value in (None, "") and assignment.get("defaultValue") not in (None, ""):
+                        value = assignment.get("defaultValue")
+                blw_vars[name] = value
+            row_obj["_blw_vars"] = blw_vars
+            trace = row_obj.get("_blw_trace")
+            if not isinstance(trace, list):
+                trace = []
+            status = "success"
+            if blw_type == "pause":
+                status = "paused"
+                row_obj["_blw_paused"] = True
+            elif blw_type == "terminate":
+                status = "terminated"
+                row_obj["_blw_terminated"] = True
+            elif blw_type == "sms":
+                row_obj["_blw_sms"] = {
+                    "recipient": str(cfg.get("recipient") or action.get("recipient") or ""),
+                    "template": str(cfg.get("template") or action.get("template") or ""),
+                    "status": "draft",
+                    "generated_at": now,
+                }
+            elif blw_type == "oracle_update":
+                row_obj["_blw_oracle_update"] = {
+                    "table": str(action.get("table") or cfg.get("blw_tracker_table") or ""),
+                    "key_field": str(action.get("keyField") or cfg.get("blw_unique_id_field") or ""),
+                    "status_field": str(action.get("statusField") or "CURRENT_STATUS"),
+                    "status": "prepared",
+                    "generated_at": now,
+                }
+            if write_path:
+                row_obj["_blw_last_write_path"] = write_path
+            trace.append({
+                "node_id": str(cfg.get("blw_node_id") or ""),
+                "type": blw_type,
+                "status": status,
+                "at": now,
+            })
+            row_obj["_blw_trace"] = trace
+            row_obj["_blw_current_step"] = str(cfg.get("blw_node_id") or "")
+            row_obj["_blw_current_status"] = status
+            out.append(row_obj)
+        return out
+
+    def _resolve_blw_tracker_oracle_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        cfg = config if isinstance(config, dict) else {}
+
+        def _pick(key: str, env_name: str, default: Any = "") -> Any:
+            value = cfg.get(key)
+            if value not in (None, ""):
+                return value
+            env_value = os.getenv(env_name)
+            if env_value not in (None, ""):
+                return env_value
+            return default
+
+        try:
+            port = int(_pick("workflow_oracle_port", "BLW_ORACLE_PORT", 1521) or 1521)
+        except Exception:
+            port = 1521
+        table = self._sanitize_oracle_identifier(
+            str(cfg.get("workflow_tracking_table") or cfg.get("trackerTable") or "BLW_WORKFLOW_TRACKER"),
+            "BLW_WORKFLOW_TRACKER",
+        )
+        schema = str(_pick("workflow_oracle_schema", "BLW_ORACLE_SCHEMA", "") or "").strip()
+        if schema:
+            schema = self._sanitize_oracle_identifier(schema, "")
+            table = f"{schema}.{table}"
+        return {
+            "host": str(_pick("workflow_oracle_host", "BLW_ORACLE_HOST", "localhost") or "localhost").strip(),
+            "port": port,
+            "service_name": str(_pick("workflow_oracle_service_name", "BLW_ORACLE_SERVICE_NAME", "") or "").strip(),
+            "sid": str(_pick("workflow_oracle_sid", "BLW_ORACLE_SID", "") or "").strip(),
+            "dsn": str(_pick("workflow_oracle_dsn", "BLW_ORACLE_DSN", "") or "").strip(),
+            "user": str(_pick("workflow_oracle_user", "BLW_ORACLE_USER", "") or "").strip(),
+            "password": str(_pick("workflow_oracle_password", "BLW_ORACLE_PASSWORD", "") or "").strip(),
+            "table": table,
+        }
+
+    def _blw_tracker_connect(self, config: Dict[str, Any]):
+        try:
+            import oracledb  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("BLW Oracle tracker requires python-oracledb.") from exc
+        cfg = self._resolve_blw_tracker_oracle_config(config)
+        user = str(cfg.get("user") or "").strip()
+        password = str(cfg.get("password") or "")
+        if not user:
+            raise RuntimeError("BLW Oracle tracker user is not configured.")
+        dsn = str(cfg.get("dsn") or "").strip() or self._build_oracle_dsn(cfg)
+        return oracledb.connect(user=user, password=password, dsn=dsn), cfg
+
+    def _ensure_blw_tracker_table(self, conn: Any, table_name: str) -> None:
+        table_sql = str(table_name or "BLW_WORKFLOW_TRACKER").strip()
+        if not table_sql:
+            table_sql = "BLW_WORKFLOW_TRACKER"
+        ensure_key = table_sql.upper()
+        if ensure_key in self._blw_tracker_ensured_tables:
+            return
+        if "." in table_sql:
+            table_owner, table_base = table_sql.split(".", 1)
+        else:
+            table_owner = ""
+            table_base = table_sql
+        table_owner = re.sub(r"[^A-Za-z0-9_]", "", table_owner).upper()
+        table_base = re.sub(r"[^A-Za-z0-9_]", "", table_base).upper()
+        create_sql = f"""
+CREATE TABLE {table_sql} (
+  RUN_ID                 VARCHAR2(64) PRIMARY KEY,
+  WORKFLOW_ID            VARCHAR2(64),
+  WORKFLOW_NAME          VARCHAR2(255),
+  PIPELINE_ID            VARCHAR2(64),
+  BUSINESS_NODE_ID       VARCHAR2(64),
+  INPUT_UNIQUE_ID        VARCHAR2(255),
+  INPUT_SOURCE           VARCHAR2(255),
+  INPUT_PAYLOAD_JSON     CLOB,
+  CURRENT_STAGE          VARCHAR2(255),
+  CURRENT_STEP_ID        VARCHAR2(255),
+  CURRENT_STATUS         VARCHAR2(50),
+  ITERATION_NO           NUMBER DEFAULT 1,
+  MAX_ITERATIONS         NUMBER DEFAULT 1,
+  RETRY_COUNT            NUMBER DEFAULT 0,
+  MAX_RETRY_ATTEMPTS     NUMBER DEFAULT 0,
+  LAST_RETRY_AT          TIMESTAMP,
+  ESCALATION_LEVEL       NUMBER DEFAULT 0,
+  ESCALATION_STATUS      VARCHAR2(50),
+  ESCALATED_TO           VARCHAR2(255),
+  ESCALATED_AT           TIMESTAMP,
+  WAIT_UNTIL             TIMESTAMP,
+  PAUSED_AT              TIMESTAMP,
+  RESUMED_AT             TIMESTAMP,
+  TERMINATED_AT          TIMESTAMP,
+  STARTED_AT             TIMESTAMP DEFAULT CAST(SYSTIMESTAMP AS TIMESTAMP),
+  LAST_UPDATED_AT        TIMESTAMP DEFAULT SYSTIMESTAMP,
+  ENDED_AT               TIMESTAMP,
+  ERROR_CODE             VARCHAR2(255),
+  ERROR_MESSAGE          CLOB,
+  WORKFLOW_CONFIG_JSON   CLOB,
+  STEP_TRACK_JSON        CLOB,
+  ROUTING_HISTORY_JSON   CLOB,
+  RETRY_HISTORY_JSON     CLOB,
+  ESCALATION_JSON        CLOB,
+  PARALLEL_BRANCH_JSON   CLOB,
+  CONTEXT_JSON           CLOB
+)"""
+        cur = conn.cursor()
+        try:
+            table_exists = False
+            try:
+                if table_owner:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM ALL_TABLES WHERE OWNER=:owner AND TABLE_NAME=:table_name",
+                        {"owner": table_owner, "table_name": table_base},
+                    )
+                else:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM USER_TABLES WHERE TABLE_NAME=:table_name",
+                        {"table_name": table_base},
+                    )
+                table_exists = int(cur.fetchone()[0] or 0) > 0
+            except Exception:
+                table_exists = False
+            if not table_exists:
+                cur.execute(create_sql)
+                conn.commit()
+        except Exception as exc:
+            text = str(exc or "")
+            if "ORA-00955" not in text and "ORA-00054" not in text:
+                raise
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        safe_suffix = table_sql.split(".")[-1].upper()
+        safe_suffix = re.sub(r"[^A-Z0-9_]", "_", safe_suffix)[-18:] or "BLW_TRACKER"
+        index_statements = [
+            (
+                f"IDX_{safe_suffix}_QUEUE",
+                f"CREATE INDEX IDX_{safe_suffix}_QUEUE ON {table_sql} (CURRENT_STATUS, LAST_UPDATED_AT)",
+            ),
+            (
+                f"IDX_{safe_suffix}_STAGE",
+                f"CREATE INDEX IDX_{safe_suffix}_STAGE ON {table_sql} (CURRENT_STATUS, CURRENT_STAGE)",
+            ),
+            (
+                f"IDX_{safe_suffix}_INPUT",
+                f"CREATE INDEX IDX_{safe_suffix}_INPUT ON {table_sql} (INPUT_UNIQUE_ID)",
+            ),
+            (
+                f"IDX_{safe_suffix}_PIPE_NODE",
+                f"CREATE INDEX IDX_{safe_suffix}_PIPE_NODE ON {table_sql} (PIPELINE_ID, BUSINESS_NODE_ID)",
+            ),
+        ]
+        cur = conn.cursor()
+        try:
+            existing_indexes: set[str] = set()
+            try:
+                if table_owner:
+                    cur.execute(
+                        """
+                        SELECT INDEX_NAME
+                        FROM ALL_INDEXES
+                        WHERE OWNER=:owner AND TABLE_NAME=:table_name
+                        """,
+                        {"owner": table_owner, "table_name": table_base},
+                    )
+                else:
+                    cur.execute(
+                        "SELECT INDEX_NAME FROM USER_INDEXES WHERE TABLE_NAME=:table_name",
+                        {"table_name": table_base},
+                    )
+                existing_indexes = {str(row[0] or "").upper() for row in cur.fetchall()}
+            except Exception:
+                existing_indexes = set()
+            for index_name, index_sql in index_statements:
+                if index_name.upper() in existing_indexes:
+                    continue
+                try:
+                    cur.execute(index_sql)
+                except Exception as exc:
+                    text = str(exc or "")
+                    if "ORA-00955" not in text and "ORA-01408" not in text and "ORA-00054" not in text:
+                        raise
+            conn.commit()
+            self._blw_tracker_ensured_tables.add(ensure_key)
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+    def _blw_tracker_clob_keys(self) -> List[str]:
+        return [
+            "input_payload_json",
+            "workflow_config_json",
+            "step_track_json",
+            "routing_history_json",
+            "retry_history_json",
+            "escalation_json",
+            "parallel_branch_json",
+            "context_json",
+            "error_message",
+        ]
+
+    def _blw_tracker_safe_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        safe = dict(payload)
+        for key in self._blw_tracker_clob_keys():
+            value = safe.get(key)
+            if isinstance(value, (dict, list)):
+                safe[key] = json.dumps(self._json_safe_value(value), ensure_ascii=False, default=str)
+            elif value is None:
+                safe[key] = None
+            else:
+                safe[key] = str(value)
+        for key in [
+            "run_id", "workflow_id", "workflow_name", "pipeline_id", "business_node_id",
+            "input_unique_id", "input_source", "current_stage", "current_step_id",
+            "current_status", "escalation_status", "escalated_to", "error_code",
+        ]:
+            safe[key] = str(safe.get(key) or "")[:255]
+        safe["run_id"] = safe["run_id"][:64]
+        safe["workflow_id"] = safe["workflow_id"][:64]
+        safe["pipeline_id"] = safe["pipeline_id"][:64]
+        safe["business_node_id"] = safe["business_node_id"][:64]
+        for key in [
+            "step_track_json",
+            "routing_history_json",
+            "retry_history_json",
+            "escalation_json",
+            "parallel_branch_json",
+        ]:
+            value = safe.get(key)
+            if isinstance(value, str) and len(value) > 3900:
+                safe[key] = value[:3900]
+        try:
+            safe["iteration_no"] = int(safe.get("iteration_no") or 1)
+        except Exception:
+            safe["iteration_no"] = 1
+        try:
+            safe["max_iterations"] = int(safe.get("max_iterations") or 1)
+        except Exception:
+            safe["max_iterations"] = 1
+        try:
+            safe["retry_count"] = int(safe.get("retry_count") or 0)
+        except Exception:
+            safe["retry_count"] = 0
+        try:
+            safe["max_retry_attempts"] = int(safe.get("max_retry_attempts") or 0)
+        except Exception:
+            safe["max_retry_attempts"] = 0
+        try:
+            safe["escalation_level"] = int(safe.get("escalation_level") or 0)
+        except Exception:
+            safe["escalation_level"] = 0
+        return safe
+
+    def _blw_tracker_apply_clob_inputsizes(self, cur: Any) -> None:
+        try:
+            import oracledb  # type: ignore
+            # Keep very small JSON fields as normal strings. Binding every JSON
+            # field as CLOB makes async enqueue much slower for thousands of rows.
+            cur.setinputsizes(
+                input_payload_json=oracledb.DB_TYPE_CLOB,
+                workflow_config_json=oracledb.DB_TYPE_CLOB,
+                context_json=oracledb.DB_TYPE_CLOB,
+                error_message=oracledb.DB_TYPE_CLOB,
+            )
+        except Exception:
+            pass
+
+    def _blw_tracker_merge(self, conn: Any, table_name: str, payload: Dict[str, Any]) -> None:
+        safe = self._blw_tracker_safe_payload(payload)
+        sql = f"""
+MERGE INTO {table_name} t
+USING (SELECT :run_id AS run_id FROM dual) s
+ON (t.RUN_ID = s.run_id)
+WHEN MATCHED THEN UPDATE SET
+  WORKFLOW_ID=:workflow_id,
+  WORKFLOW_NAME=:workflow_name,
+  PIPELINE_ID=:pipeline_id,
+  BUSINESS_NODE_ID=:business_node_id,
+  INPUT_UNIQUE_ID=:input_unique_id,
+  INPUT_SOURCE=:input_source,
+  INPUT_PAYLOAD_JSON=:input_payload_json,
+  CURRENT_STAGE=:current_stage,
+  CURRENT_STEP_ID=:current_step_id,
+  CURRENT_STATUS=:current_status,
+  ITERATION_NO=:iteration_no,
+  MAX_ITERATIONS=:max_iterations,
+  RETRY_COUNT=:retry_count,
+  MAX_RETRY_ATTEMPTS=:max_retry_attempts,
+  ESCALATION_LEVEL=:escalation_level,
+  ESCALATION_STATUS=:escalation_status,
+  ESCALATED_TO=:escalated_to,
+  ERROR_CODE=:error_code,
+  ERROR_MESSAGE=:error_message,
+  WORKFLOW_CONFIG_JSON=:workflow_config_json,
+  STEP_TRACK_JSON=:step_track_json,
+  ROUTING_HISTORY_JSON=:routing_history_json,
+  RETRY_HISTORY_JSON=:retry_history_json,
+  ESCALATION_JSON=:escalation_json,
+  PARALLEL_BRANCH_JSON=:parallel_branch_json,
+  CONTEXT_JSON=:context_json,
+  LAST_UPDATED_AT=CAST(SYSTIMESTAMP AS TIMESTAMP),
+  ENDED_AT=CASE WHEN :current_status IN ('success','failed','terminated') THEN SYSTIMESTAMP ELSE ENDED_AT END,
+  PAUSED_AT=CASE WHEN :current_status = 'paused' THEN SYSTIMESTAMP ELSE PAUSED_AT END,
+  TERMINATED_AT=CASE WHEN :current_status = 'terminated' THEN SYSTIMESTAMP ELSE TERMINATED_AT END,
+  ESCALATED_AT=CASE WHEN :current_status = 'escalated' THEN SYSTIMESTAMP ELSE ESCALATED_AT END,
+  LAST_RETRY_AT=CASE WHEN :current_status = 'retrying' THEN SYSTIMESTAMP ELSE LAST_RETRY_AT END
+WHEN NOT MATCHED THEN INSERT (
+  RUN_ID, WORKFLOW_ID, WORKFLOW_NAME, PIPELINE_ID, BUSINESS_NODE_ID,
+  INPUT_UNIQUE_ID, INPUT_SOURCE, INPUT_PAYLOAD_JSON, CURRENT_STAGE,
+  CURRENT_STEP_ID, CURRENT_STATUS, ITERATION_NO, MAX_ITERATIONS,
+  RETRY_COUNT, MAX_RETRY_ATTEMPTS, ESCALATION_LEVEL, ESCALATION_STATUS,
+  ESCALATED_TO, ERROR_CODE, ERROR_MESSAGE, WORKFLOW_CONFIG_JSON,
+  STEP_TRACK_JSON, ROUTING_HISTORY_JSON, RETRY_HISTORY_JSON, ESCALATION_JSON,
+  PARALLEL_BRANCH_JSON, CONTEXT_JSON
+) VALUES (
+  :run_id, :workflow_id, :workflow_name, :pipeline_id, :business_node_id,
+  :input_unique_id, :input_source, :input_payload_json, :current_stage,
+  :current_step_id, :current_status, :iteration_no, :max_iterations,
+  :retry_count, :max_retry_attempts, :escalation_level, :escalation_status,
+  :escalated_to, :error_code, :error_message, :workflow_config_json,
+  :step_track_json, :routing_history_json, :retry_history_json, :escalation_json,
+  :parallel_branch_json, :context_json
+)"""
+        cur = conn.cursor()
+        try:
+            self._blw_tracker_apply_clob_inputsizes(cur)
+            cur.execute(sql, safe)
+            conn.commit()
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+    def _blw_tracker_insert_many(self, conn: Any, table_name: str, payloads: List[Dict[str, Any]]) -> None:
+        if not payloads:
+            return
+        safe_payloads = [self._blw_tracker_safe_payload(payload) for payload in payloads]
+        sql = f"""
+INSERT INTO {table_name} (
+  RUN_ID, WORKFLOW_ID, WORKFLOW_NAME, PIPELINE_ID, BUSINESS_NODE_ID,
+  INPUT_UNIQUE_ID, INPUT_SOURCE, INPUT_PAYLOAD_JSON, CURRENT_STAGE,
+  CURRENT_STEP_ID, CURRENT_STATUS, ITERATION_NO, MAX_ITERATIONS,
+  RETRY_COUNT, MAX_RETRY_ATTEMPTS, ESCALATION_LEVEL, ESCALATION_STATUS,
+  ESCALATED_TO, ERROR_CODE, ERROR_MESSAGE, WORKFLOW_CONFIG_JSON,
+  STEP_TRACK_JSON, ROUTING_HISTORY_JSON, RETRY_HISTORY_JSON, ESCALATION_JSON,
+  PARALLEL_BRANCH_JSON, CONTEXT_JSON
+) VALUES (
+  :run_id, :workflow_id, :workflow_name, :pipeline_id, :business_node_id,
+  :input_unique_id, :input_source, :input_payload_json, :current_stage,
+  :current_step_id, :current_status, :iteration_no, :max_iterations,
+  :retry_count, :max_retry_attempts, :escalation_level, :escalation_status,
+  :escalated_to, :error_code, :error_message, :workflow_config_json,
+  :step_track_json, :routing_history_json, :retry_history_json, :escalation_json,
+  :parallel_branch_json, :context_json
+)"""
+        cur = conn.cursor()
+        try:
+            self._blw_tracker_apply_clob_inputsizes(cur)
+            cur.executemany(sql, safe_payloads, batcherrors=True)
+            batch_errors = cur.getbatcherrors() if hasattr(cur, "getbatcherrors") else []
+            if batch_errors:
+                duplicate_errors = [
+                    err for err in batch_errors
+                    if "ORA-00001" in str(getattr(err, "message", err))
+                    or "unique constraint" in str(getattr(err, "message", err)).lower()
+                ]
+                if len(duplicate_errors) != len(batch_errors):
+                    raise RuntimeError("; ".join(str(getattr(err, "message", err)) for err in batch_errors[:5]))
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            text = str(exc or "")
+            if "ORA-00001" not in text and "unique constraint" not in text.lower():
+                raise
+            for payload in payloads:
+                self._blw_tracker_merge(conn, table_name, payload)
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+    def _build_blw_async_run_id(
+        self,
+        workflow_config: Dict[str, Any],
+        input_rows: List[Any],
+        execution_context: Optional[Dict[str, Any]] = None,
+        node_id_prefix: str = "business_workflow",
+        instance_index: int = 1,
+    ) -> str:
+        unique_field = str(
+            workflow_config.get("workflow_unique_id_field")
+            or workflow_config.get("uniqueIdField")
+            or "TRANSACTIONID"
+        ).strip()
+        unique_value = ""
+        for row in input_rows if isinstance(input_rows, list) else []:
+            if isinstance(row, dict) and unique_field:
+                value = self._blw_field_value(row, unique_field)
+                if value not in (None, ""):
+                    unique_value = str(value)
+                    break
+        if not unique_value:
+            unique_value = f"instance_{instance_index}"
+        exec_id = ""
+        pipeline_id = ""
+        if isinstance(execution_context, dict):
+            exec_id = str(execution_context.get("execution_id") or "").strip()
+            pipeline_id = str(execution_context.get("pipeline_id") or "").strip()
+        seed = f"async:{exec_id}:{pipeline_id}:{node_id_prefix}:{instance_index}:{unique_value}:{datetime.utcnow().isoformat()}"
+        return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:40]
+
+    def _compact_blw_async_workflow_config(self, wf_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep only the fields the async BLW worker needs for runtime execution."""
+        if not isinstance(wf_cfg, dict):
+            return {"workflow_execution_mode": "inline"}
+        keep_keys = [
+            "workflow_id", "id", "workflowName", "workflow_name",
+            "workflow_execution_mode", "execution_mode",
+            "invoke_mode", "include_input_payload", "wait_for_completion",
+            "completion_timeout_seconds", "workflow_tracking_enabled",
+            "workflow_tracking_table", "workflow_unique_id_field",
+            "workflow_parallel_enabled", "workflow_max_parallel_branches",
+            "workflow_max_iterations", "workflow_max_retry_attempts",
+            "custom_variables_json", "profile_store", "profile_namespace",
+            "blw_studio_config",
+            "embedded_workflow_nodes", "embedded_workflow_edges",
+        ]
+        compact = {key: wf_cfg.get(key) for key in keep_keys if key in wf_cfg}
+        compact["workflow_execution_mode"] = "inline"
+        # Oracle connection credentials are resolved from env by the worker; do not
+        # repeat them in every queued row.
+        for key in list(compact.keys()):
+            lowered = key.lower()
+            if "password" in lowered or "secret" in lowered or "token" in lowered:
+                compact.pop(key, None)
+        return compact
+
+    def _enqueue_blw_async_instances(
+        self,
+        input_rows: List[Any],
+        workflow_config: Dict[str, Any],
+        execution_context: Optional[Dict[str, Any]] = None,
+        node_id_prefix: str = "business_workflow",
+        per_row_mode: bool = False,
+        max_instances: int = 10000,
+        include_input_payload: bool = True,
+    ) -> List[Dict[str, Any]]:
+        wf_cfg = workflow_config if isinstance(workflow_config, dict) else {}
+        if not self._parse_bool_like(wf_cfg.get("workflow_tracking_enabled", wf_cfg.get("enabled", True)), True):
+            raise RuntimeError("Async BLW requires Oracle tracking to be enabled.")
+        conn, tracker_cfg = self._blw_tracker_connect(wf_cfg)
+        table_name = str(tracker_cfg.get("table") or wf_cfg.get("workflow_tracking_table") or "BLW_WORKFLOW_TRACKER")
+        self._ensure_blw_tracker_table(conn, table_name)
+        rows = input_rows if isinstance(input_rows, list) else []
+        if per_row_mode:
+            instances = [[row] for row in rows[:max_instances]]
+        else:
+            instances = [rows if include_input_payload else [{}]]
+        pipeline_id = ""
+        business_node_id = node_id_prefix
+        if isinstance(execution_context, dict):
+            pipeline_id = str(execution_context.get("pipeline_id") or "").strip()
+            business_node_id = str(execution_context.get("node_id") or node_id_prefix or "").strip()
+        enqueued: List[Dict[str, Any]] = []
+        queue_payloads: List[Dict[str, Any]] = []
+        try:
+            compact_wf_cfg_json = json.dumps(
+                self._json_safe_value(self._compact_blw_async_workflow_config(wf_cfg)),
+                ensure_ascii=False,
+                default=str,
+                separators=(",", ":"),
+            )
+            for idx, instance_rows in enumerate(instances, start=1):
+                instance_payload = [dict(row) if isinstance(row, dict) else {"value": row} for row in instance_rows]
+                run_id = self._build_blw_async_run_id(
+                    wf_cfg,
+                    instance_payload,
+                    execution_context=execution_context,
+                    node_id_prefix=node_id_prefix,
+                    instance_index=idx,
+                )
+                unique_field = str(wf_cfg.get("workflow_unique_id_field") or wf_cfg.get("uniqueIdField") or "TRANSACTIONID").strip()
+                unique_value = ""
+                if instance_payload and isinstance(instance_payload[0], dict) and unique_field:
+                    value = self._blw_field_value(instance_payload[0], unique_field)
+                    if value not in (None, ""):
+                        unique_value = str(value)
+                queue_payloads.append({
+                    "run_id": run_id,
+                    "workflow_id": str(wf_cfg.get("workflow_id") or wf_cfg.get("id") or ""),
+                    "workflow_name": str(wf_cfg.get("workflowName") or wf_cfg.get("workflow_name") or "Business Logic Workflow"),
+                    "pipeline_id": pipeline_id,
+                    "business_node_id": business_node_id,
+                    "input_unique_id": unique_value or f"instance_{idx}",
+                    "input_source": "async_tracker",
+                    "input_payload_json": self._json_safe_value(instance_payload),
+                    "current_stage": "Queued",
+                    "current_step_id": "__queued__",
+                    "current_status": "pending",
+                    "iteration_no": 1,
+                    "max_iterations": int(wf_cfg.get("workflow_max_iterations") or wf_cfg.get("maxIterations") or 1),
+                    "retry_count": 0,
+                    "max_retry_attempts": int(wf_cfg.get("workflow_max_retry_attempts") or wf_cfg.get("maxRetryAttempts") or 0),
+                    "escalation_level": 0,
+                    "escalation_status": "",
+                    "escalated_to": "",
+                    "error_code": "",
+                    "error_message": "",
+                    "workflow_config_json": compact_wf_cfg_json,
+                    "step_track_json": [{"node_id": "__queued__", "label": "Queued", "status": "pending", "rows": len(instance_payload), "at": datetime.utcnow().isoformat()}],
+                    "routing_history_json": [],
+                    "retry_history_json": [],
+                    "escalation_json": [],
+                    "parallel_branch_json": [],
+                    "context_json": {"node_id_prefix": node_id_prefix, "async": True, "instance_index": idx},
+                })
+                enqueued.append({"run_id": run_id, "rows": len(instance_payload), "input_unique_id": unique_value or f"instance_{idx}"})
+            self._blw_tracker_insert_many(conn, table_name, queue_payloads)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return enqueued
+
+    def _blw_read_lob_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if hasattr(value, "read"):
+            try:
+                return str(value.read() or "")
+            except Exception:
+                return str(value)
+        return str(value)
+
+    def _load_current_blw_node_config(self, pipeline_id: str, business_node_id: str) -> Dict[str, Any]:
+        """Reload the latest BLW node config from SQLite for old queued tracker rows."""
+        pid = str(pipeline_id or "").strip()
+        node_id = str(business_node_id or "").strip()
+        if not pid or not node_id:
+            return {}
+        db_url = str(os.getenv("DATABASE_URL", "sqlite:///./etl_platform.db") or "").strip()
+        if not db_url.lower().startswith("sqlite"):
+            return {}
+        if db_url.startswith("sqlite:///"):
+            raw_path = db_url[len("sqlite:///"):]
+        elif db_url.startswith("sqlite://"):
+            raw_path = db_url[len("sqlite://"):]
+        else:
+            raw_path = "./etl_platform.db"
+        db_path = Path(raw_path)
+        if not db_path.is_absolute():
+            db_path = Path(__file__).resolve().parent / db_path
+        if not db_path.exists():
+            return {}
+        try:
+            conn = sqlite3.connect(str(db_path))
+            try:
+                row = conn.execute("SELECT nodes FROM pipelines WHERE id=?", (pid,)).fetchone()
+            finally:
+                conn.close()
+            if not row:
+                return {}
+            nodes_raw = json.loads(str(row[0] or "[]"))
+            if not isinstance(nodes_raw, list):
+                return {}
+            for node in nodes_raw:
+                if not isinstance(node, dict) or str(node.get("id") or "").strip() != node_id:
+                    continue
+                data = node.get("data") if isinstance(node.get("data"), dict) else {}
+                cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
+                return dict(cfg)
+        except Exception as exc:
+            logger.warning(f"Unable to reload BLW node config from SQLite for {pid}/{node_id}: {exc}")
+        return {}
+
+    async def process_blw_async_tracker_queue(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        limit: int = 5,
+        stale_running_seconds: int = 60,
+    ) -> Dict[str, Any]:
+        cfg = dict(config or {})
+        conn, tracker_cfg = self._blw_tracker_connect(cfg)
+        table_name = str(tracker_cfg.get("table") or cfg.get("workflow_tracking_table") or "BLW_WORKFLOW_TRACKER")
+        self._ensure_blw_tracker_table(conn, table_name)
+        safe_limit = max(1, min(int(limit or 50), 500))
+        try:
+            stale_seconds = max(10, min(int(stale_running_seconds or 60), 86400))
+        except Exception:
+            stale_seconds = 60
+        cur = conn.cursor()
+        claimed: List[Dict[str, Any]] = []
+        try:
+            cur.execute(f"""
+                SELECT RUN_ID, INPUT_PAYLOAD_JSON, WORKFLOW_CONFIG_JSON, BUSINESS_NODE_ID, RETRY_COUNT,
+                       CONTEXT_JSON, CURRENT_STATUS
+                       , PIPELINE_ID
+                FROM {table_name}
+                WHERE CURRENT_STATUS IN ('pending', 'retry_requested', 'resume_requested')
+                   OR (
+                        CURRENT_STATUS = 'waiting'
+                        AND WAIT_UNTIL <= CAST(SYSTIMESTAMP AS TIMESTAMP)
+                   )
+                   OR (
+                        CURRENT_STATUS = 'running'
+                        AND LAST_UPDATED_AT < CAST(SYSTIMESTAMP AS TIMESTAMP) - NUMTODSINTERVAL(:stale_seconds, 'SECOND')
+                   )
+                ORDER BY LAST_UPDATED_AT ASC
+                FETCH FIRST {safe_limit} ROWS ONLY
+            """, {"stale_seconds": stale_seconds})
+            rows = cur.fetchall()
+            for row in rows:
+                run_id = str(row[0] or "").strip()
+                if not run_id:
+                    continue
+                cur.execute(f"""
+                    UPDATE {table_name}
+                    SET CURRENT_STATUS='running',
+                        CURRENT_STAGE='Async Worker',
+                        CURRENT_STEP_ID='__worker__',
+                        WAIT_UNTIL=NULL,
+                        LAST_UPDATED_AT=CAST(SYSTIMESTAMP AS TIMESTAMP)
+                    WHERE RUN_ID=:run_id
+                      AND (
+                            CURRENT_STATUS IN ('pending', 'retry_requested', 'resume_requested')
+                            OR (
+                                CURRENT_STATUS = 'waiting'
+                                AND WAIT_UNTIL <= CAST(SYSTIMESTAMP AS TIMESTAMP)
+                            )
+                            OR (
+                                CURRENT_STATUS = 'running'
+                                AND LAST_UPDATED_AT < CAST(SYSTIMESTAMP AS TIMESTAMP) - NUMTODSINTERVAL(:stale_seconds, 'SECOND')
+                            )
+                      )
+                """, {"run_id": run_id, "stale_seconds": stale_seconds})
+                if int(getattr(cur, "rowcount", 0) or 0) <= 0:
+                    continue
+                claimed.append({
+                    "run_id": run_id,
+                    "input_payload_json": self._blw_read_lob_text(row[1]),
+                    "workflow_config_json": self._blw_read_lob_text(row[2]),
+                    "business_node_id": str(row[3] or "business_workflow"),
+                    "retry_count": int(row[4] or 0),
+                    "context_json": self._blw_read_lob_text(row[5]),
+                    "current_status": str(row[6] or ""),
+                    "pipeline_id": str(row[7] or ""),
+                })
+            conn.commit()
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        async def _process_claimed_item(item: Dict[str, Any]) -> Dict[str, Any]:
+            run_id = str(item.get("run_id") or "")
+            try:
+                input_rows_raw = json.loads(str(item.get("input_payload_json") or "[]"))
+                input_rows = input_rows_raw if isinstance(input_rows_raw, list) else [input_rows_raw]
+            except Exception:
+                input_rows = []
+            try:
+                wf_cfg_raw = json.loads(str(item.get("workflow_config_json") or "{}"))
+                wf_cfg = wf_cfg_raw if isinstance(wf_cfg_raw, dict) else {}
+            except Exception:
+                wf_cfg = {}
+            if not isinstance(wf_cfg.get("embedded_workflow_nodes"), list):
+                current_cfg = self._load_current_blw_node_config(
+                    str(item.get("pipeline_id") or wf_cfg.get("pipeline_id") or ""),
+                    str(item.get("business_node_id") or ""),
+                )
+                if current_cfg:
+                    if isinstance(current_cfg.get("embedded_workflow_nodes"), list):
+                        wf_cfg["embedded_workflow_nodes"] = current_cfg.get("embedded_workflow_nodes")
+                    if isinstance(current_cfg.get("embedded_workflow_edges"), list):
+                        wf_cfg["embedded_workflow_edges"] = current_cfg.get("embedded_workflow_edges")
+                    if not isinstance(wf_cfg.get("blw_studio_config"), dict) and isinstance(current_cfg.get("blw_studio_config"), dict):
+                        wf_cfg["blw_studio_config"] = current_cfg.get("blw_studio_config")
+            try:
+                context_raw = json.loads(str(item.get("context_json") or "{}"))
+                run_context = context_raw if isinstance(context_raw, dict) else {}
+            except Exception:
+                run_context = {}
+            completed_delay_node_ids = [
+                str(value)
+                for value in run_context.get("completed_delay_node_ids", [])
+                if str(value or "").strip()
+            ] if isinstance(run_context.get("completed_delay_node_ids"), list) else []
+            wf_cfg = {
+                **wf_cfg,
+                "workflow_execution_mode": "inline",
+                "workflow_run_id": run_id,
+                # The async tracker worker already owns tracker status writes.
+                # Per-row embedded tracker writes create thousands of Oracle
+                # CLOB updates and can leave claimed rows running for minutes.
+                "workflow_tracking_enabled": False,
+            }
+            blw_runtime_cfg = self._blw_parse_json_object(wf_cfg.get("blw_studio_config"))
+            if isinstance(wf_cfg.get("embedded_workflow_nodes"), list):
+                blw_runtime_cfg["embedded_workflow_nodes"] = wf_cfg.get("embedded_workflow_nodes")
+            if isinstance(wf_cfg.get("embedded_workflow_edges"), list):
+                blw_runtime_cfg["embedded_workflow_edges"] = wf_cfg.get("embedded_workflow_edges")
+            child_nodes, child_edges = self._blw_studio_to_embedded_runtime(blw_runtime_cfg)
+            if not child_nodes:
+                return {
+                    "status": "failed",
+                    "run_id": run_id,
+                    "error_code": "BLWConfigError",
+                    "error_message": "Async BLW run has no BLW Studio graph to execute.",
+                }
+            try:
+                await self._run_business_workflow_embedded(
+                    input_rows=input_rows,
+                    child_nodes=child_nodes,
+                    child_edges=child_edges,
+                    workflow_config=wf_cfg,
+                    execution_context={
+                        "node_id": str(item.get("business_node_id") or "business_workflow"),
+                        "node_label": "BLW Async Worker",
+                        "blw_async_persist_wait": True,
+                        "blw_completed_delay_node_ids": completed_delay_node_ids,
+                    },
+                    node_id_prefix=str(item.get("business_node_id") or "business_workflow"),
+                )
+                return {"status": "processed", "run_id": run_id}
+            except BLWDelaySuspended as wait_exc:
+                next_completed = list(dict.fromkeys([*completed_delay_node_ids, wait_exc.node_id]))
+                wait_until = datetime.utcnow() + timedelta(seconds=wait_exc.delay_seconds)
+                next_context = {
+                    **run_context,
+                    "completed_delay_node_ids": next_completed,
+                    "last_wait_node_id": wait_exc.node_id,
+                    "last_wait_seconds": wait_exc.delay_seconds,
+                    "last_wait_until": wait_until.isoformat(),
+                }
+                return {
+                    "status": "waiting",
+                    "run_id": run_id,
+                    "wait_node_id": wait_exc.node_id,
+                    "wait_seconds": wait_exc.delay_seconds,
+                    "rows": wait_exc.rows_count,
+                    "context_json": self._json_safe_value(next_context),
+                }
+            except Exception as exc:
+                logger.warning(f"BLW async worker failed for run {run_id}: {exc}")
+                return {
+                    "status": "failed",
+                    "run_id": run_id,
+                    "error_code": type(exc).__name__,
+                    "error_message": str(exc),
+                }
+
+        if claimed:
+            try:
+                max_concurrency = int(os.getenv("BLW_ASYNC_WORKER_CONCURRENCY", "500") or "500")
+            except Exception:
+                max_concurrency = 500
+            max_concurrency = max(1, min(safe_limit, max_concurrency))
+            semaphore = asyncio.Semaphore(max_concurrency)
+
+            async def _guarded_process(item: Dict[str, Any]) -> Dict[str, Any]:
+                async with semaphore:
+                    return await _process_claimed_item(item)
+
+            results = await asyncio.gather(*[_guarded_process(item) for item in claimed])
+        else:
+            results = []
+        processed_items = [result for result in results if isinstance(result, dict) and result.get("status") == "processed"]
+        waiting_items = [result for result in results if isinstance(result, dict) and result.get("status") == "waiting"]
+        failed_items = [result for result in results if isinstance(result, dict) and result.get("status") == "failed"]
+        if processed_items or waiting_items or failed_items:
+            conn3, tracker_cfg3 = self._blw_tracker_connect(cfg)
+            table3 = str(tracker_cfg3.get("table") or cfg.get("workflow_tracking_table") or table_name)
+            cur3 = conn3.cursor()
+            try:
+                if processed_items:
+                    cur3.executemany(f"""
+                        UPDATE {table3}
+                        SET CURRENT_STATUS='success',
+                            CURRENT_STAGE='Workflow Complete',
+                            CURRENT_STEP_ID='__workflow__',
+                            ERROR_CODE=NULL,
+                            ERROR_MESSAGE=NULL,
+                            WAIT_UNTIL=NULL,
+                            ENDED_AT=CAST(SYSTIMESTAMP AS TIMESTAMP),
+                            LAST_UPDATED_AT=CAST(SYSTIMESTAMP AS TIMESTAMP)
+                        WHERE RUN_ID=:run_id
+                    """, [{"run_id": str(item.get("run_id") or "")} for item in processed_items])
+                if waiting_items:
+                    cur3.executemany(f"""
+                        UPDATE {table3}
+                        SET CURRENT_STATUS='waiting',
+                            CURRENT_STAGE='Waiting',
+                            CURRENT_STEP_ID=:wait_node_id,
+                            WAIT_UNTIL=CAST(SYSTIMESTAMP AS TIMESTAMP) + NUMTODSINTERVAL(:wait_seconds, 'SECOND'),
+                            CONTEXT_JSON=:context_json,
+                            ERROR_CODE=NULL,
+                            ERROR_MESSAGE=NULL,
+                            LAST_UPDATED_AT=CAST(SYSTIMESTAMP AS TIMESTAMP)
+                        WHERE RUN_ID=:run_id
+                    """, [
+                        {
+                            "run_id": str(item.get("run_id") or ""),
+                            "wait_node_id": str(item.get("wait_node_id") or "")[:255],
+                            "wait_seconds": max(0.0, float(item.get("wait_seconds") or 0.0)),
+                            "context_json": json.dumps(self._json_safe_value(item.get("context_json") or {}), ensure_ascii=False, default=str),
+                        }
+                        for item in waiting_items
+                    ])
+                if failed_items:
+                    cur3.executemany(f"""
+                        UPDATE {table3}
+                        SET CURRENT_STATUS='failed',
+                            CURRENT_STAGE='Workflow Failed',
+                            CURRENT_STEP_ID='__workflow__',
+                            ERROR_CODE=:error_code,
+                            ERROR_MESSAGE=:error_message,
+                            ENDED_AT=CAST(SYSTIMESTAMP AS TIMESTAMP),
+                            LAST_UPDATED_AT=CAST(SYSTIMESTAMP AS TIMESTAMP)
+                        WHERE RUN_ID=:run_id
+                    """, [
+                        {
+                            "run_id": str(item.get("run_id") or ""),
+                            "error_code": str(item.get("error_code") or "BLWAsyncError")[:255],
+                            "error_message": str(item.get("error_message") or "")[:4000],
+                        }
+                        for item in failed_items
+                    ])
+                conn3.commit()
+            finally:
+                try:
+                    cur3.close()
+                except Exception:
+                    pass
+                try:
+                    conn3.close()
+                except Exception:
+                    pass
+        processed = len(processed_items)
+        waiting = len(waiting_items)
+        failed = len(failed_items)
+        return {"claimed": len(claimed), "processed": processed, "waiting": waiting, "failed": failed}
+
     async def _transform_business_workflow(
         self,
         data: list,
@@ -21156,10 +22591,27 @@ END;"""
         if not embedded_enabled:
             return rows
 
-        child_nodes = self._normalize_business_workflow_nodes(node_cfg.get("embedded_workflow_nodes"))
-        child_edges = self._normalize_business_workflow_edges(node_cfg.get("embedded_workflow_edges"))
+        blw_studio_cfg = node_cfg.get("blw_studio_config")
+        child_nodes: List[Dict[str, Any]]
+        child_edges: List[Dict[str, str]]
+        if blw_studio_cfg:
+            blw_runtime_cfg = self._blw_parse_json_object(blw_studio_cfg)
+            if isinstance(node_cfg.get("embedded_workflow_nodes"), list):
+                blw_runtime_cfg["embedded_workflow_nodes"] = node_cfg.get("embedded_workflow_nodes")
+            if isinstance(node_cfg.get("embedded_workflow_edges"), list):
+                blw_runtime_cfg["embedded_workflow_edges"] = node_cfg.get("embedded_workflow_edges")
+            child_nodes, child_edges = self._blw_studio_to_embedded_runtime(blw_runtime_cfg)
+        else:
+            child_nodes = self._normalize_business_workflow_nodes(node_cfg.get("embedded_workflow_nodes"))
+            child_edges = self._normalize_business_workflow_edges(node_cfg.get("embedded_workflow_edges"))
         if not child_nodes:
             return rows
+
+        workflow_execution_mode = str(
+            node_cfg.get("workflow_execution_mode")
+            or node_cfg.get("execution_mode")
+            or "inline"
+        ).strip().lower()
 
         include_input_payload = self._parse_bool_like(
             node_cfg.get("include_input_payload", True),
@@ -21172,6 +22624,63 @@ END;"""
         except Exception:
             max_instances = 10000
         max_instances = max(1, min(max_instances, 100000))
+
+        parent_node_id = ""
+        parent_node_label = "Business Workflow"
+        if isinstance(execution_context, dict):
+            parent_node_id = str(execution_context.get("node_id") or "").strip()
+            parent_node_label = str(
+                execution_context.get("node_label")
+                or execution_context.get("node_id")
+                or parent_node_label
+            ).strip() or parent_node_label
+
+        if workflow_execution_mode in {"async", "async_tracker", "background", "queue"}:
+            base_rows_for_queue = rows if include_input_payload else ([{} for _ in rows] if rows else [{}])
+            enqueued = self._enqueue_blw_async_instances(
+                input_rows=base_rows_for_queue,
+                workflow_config=node_cfg,
+                execution_context=execution_context,
+                node_id_prefix=parent_node_id or "business_workflow",
+                per_row_mode=per_row_mode,
+                max_instances=max_instances,
+                include_input_payload=include_input_payload,
+            )
+            try:
+                run_id_return_limit = int(
+                    node_cfg.get("workflow_async_return_run_ids_limit")
+                    or os.getenv("BLW_ASYNC_RETURN_RUN_IDS_LIMIT", "25")
+                    or 25
+                )
+            except Exception:
+                run_id_return_limit = 25
+            run_id_return_limit = max(0, min(run_id_return_limit, 1000))
+            run_ids = [item.get("run_id") for item in enqueued]
+            async_summary = {
+                "_blw_async_enqueued": True,
+                "_blw_async_instances": len(enqueued),
+                "_blw_async_run_ids": run_ids[:run_id_return_limit],
+                "_blw_async_run_ids_total": len(run_ids),
+                "_blw_async_run_ids_truncated": len(run_ids) > run_id_return_limit,
+                "_blw_async_mode": workflow_execution_mode,
+            }
+            if rows and isinstance(rows[0], dict):
+                return [{**row, **async_summary} if isinstance(row, dict) else {"value": row, **async_summary} for row in rows]
+            return [async_summary]
+
+        workflow_parallel_enabled = self._parse_bool_like(
+            node_cfg.get("workflow_parallel_enabled", node_cfg.get("parallel_enabled", False)),
+            False,
+        )
+        try:
+            workflow_max_parallel_branches = int(
+                node_cfg.get("workflow_max_parallel_branches")
+                or node_cfg.get("max_parallel_branches")
+                or 4
+            )
+        except Exception:
+            workflow_max_parallel_branches = 4
+        workflow_max_parallel_branches = max(1, min(workflow_max_parallel_branches, 64))
 
         custom_vars_raw = node_cfg.get("custom_variables_json")
         custom_vars: Dict[str, Any] = {}
@@ -21186,16 +22695,6 @@ END;"""
                         custom_vars = parsed_vars
                 except Exception:
                     _warn("Business workflow custom variables JSON is invalid; ignored.")
-
-        parent_node_id = ""
-        parent_node_label = "Business Workflow"
-        if isinstance(execution_context, dict):
-            parent_node_id = str(execution_context.get("node_id") or "").strip()
-            parent_node_label = str(
-                execution_context.get("node_label")
-                or execution_context.get("node_id")
-                or parent_node_label
-            ).strip() or parent_node_label
 
         emit_node_progress = (
             execution_context.get("emit_node_progress")
@@ -21228,8 +22727,10 @@ END;"""
                     f"Business workflow invoke_mode=per_row hit max_instances={max_instances}. "
                     f"Processed {total_instances} row instance(s), skipped {len(iterable_rows) - total_instances}."
                 )
-            out_rows: List[Any] = []
-            for idx in range(total_instances):
+            completed_instances = 0
+            completed_output_rows = 0
+
+            async def _run_row_instance(idx: int) -> List[Any]:
                 if callable(raise_if_aborted):
                     raise_if_aborted()
                 input_rows = _build_input_rows([iterable_rows[idx]], idx + 1, total_instances)
@@ -21240,26 +22741,55 @@ END;"""
                     input_rows=input_rows,
                     child_nodes=child_nodes,
                     child_edges=child_edges,
+                    workflow_config=node_cfg,
                     execution_context=execution_context,
                     node_id_prefix=node_id_prefix,
                 )
+                instance_rows: List[Any] = []
                 if isinstance(child_output, list):
-                    out_rows.extend(child_output)
+                    instance_rows.extend(child_output)
                 elif child_output is not None:
-                    out_rows.append(child_output)
+                    instance_rows.append(child_output)
+                return instance_rows
+
+            async def _run_row_instance_with_progress(idx: int, semaphore: Optional[asyncio.Semaphore] = None) -> List[Any]:
+                nonlocal completed_instances, completed_output_rows
+                if semaphore is None:
+                    instance_rows = await _run_row_instance(idx)
+                else:
+                    async with semaphore:
+                        instance_rows = await _run_row_instance(idx)
+                completed_instances += 1
+                completed_output_rows += len(instance_rows)
                 if callable(emit_node_progress):
                     try:
                         emit_node_progress({
-                            "processed_rows": idx + 1,
-                            "validated_rows": idx + 1,
-                            "output_rows": len(out_rows),
+                            "processed_rows": completed_instances,
+                            "validated_rows": completed_instances,
+                            "output_rows": completed_output_rows,
                             "message": (
                                 f"⟳ Running {parent_node_label}… child instances "
-                                f"{idx + 1:,}/{total_instances:,}"
+                                f"{completed_instances:,}/{total_instances:,}"
                             ),
                         })
                     except Exception:
                         pass
+                return instance_rows
+
+            out_rows: List[Any] = []
+            if workflow_parallel_enabled and workflow_max_parallel_branches > 1 and total_instances > 1:
+                semaphore = asyncio.Semaphore(workflow_max_parallel_branches)
+                results = await asyncio.gather(*[
+                    _run_row_instance_with_progress(idx, semaphore)
+                    for idx in range(total_instances)
+                ])
+                for instance_rows in results:
+                    if isinstance(instance_rows, list):
+                        out_rows.extend(instance_rows)
+            else:
+                for idx in range(total_instances):
+                    instance_rows = await _run_row_instance_with_progress(idx)
+                    out_rows.extend(instance_rows)
             return out_rows
 
         if include_input_payload:
@@ -21273,6 +22803,7 @@ END;"""
             input_rows=input_rows,
             child_nodes=child_nodes,
             child_edges=child_edges,
+            workflow_config=node_cfg,
             execution_context=execution_context,
             node_id_prefix=node_id_prefix,
         )
@@ -21282,6 +22813,7 @@ END;"""
         input_rows: List[Any],
         child_nodes: List[Dict[str, Any]],
         child_edges: List[Dict[str, str]],
+        workflow_config: Optional[Dict[str, Any]] = None,
         execution_context: Optional[Dict[str, Any]] = None,
         node_id_prefix: str = "business_workflow",
     ) -> list:
@@ -21350,6 +22882,62 @@ END;"""
                 if node_id and node_id not in seen:
                     topo_order.append(node_id)
 
+        execute_child_targets: set[str] = set()
+        for node_payload in child_nodes_by_id.values():
+            node_cfg = node_payload.get("config") if isinstance(node_payload.get("config"), dict) else {}
+            if str(node_cfg.get("blw_type") or "").strip().lower() != "execute_child_node":
+                continue
+            child_target = str(node_cfg.get("blw_child_node_id") or "").strip()
+            if child_target and child_target in child_nodes_by_id:
+                execute_child_targets.add(child_target)
+
+        wf_cfg = workflow_config if isinstance(workflow_config, dict) else {}
+        embedded_raw_nodes = wf_cfg.get("embedded_workflow_nodes")
+        embedded_raw_edges = wf_cfg.get("embedded_workflow_edges")
+        if not isinstance(embedded_raw_nodes, list):
+            for node_payload in child_nodes_by_id.values():
+                node_cfg = node_payload.get("config") if isinstance(node_payload.get("config"), dict) else {}
+                candidate = node_cfg.get("blw_embedded_workflow_nodes")
+                if isinstance(candidate, list):
+                    embedded_raw_nodes = candidate
+                    break
+        if not isinstance(embedded_raw_edges, list):
+            for node_payload in child_nodes_by_id.values():
+                node_cfg = node_payload.get("config") if isinstance(node_payload.get("config"), dict) else {}
+                candidate = node_cfg.get("blw_embedded_workflow_edges")
+                if isinstance(candidate, list):
+                    embedded_raw_edges = candidate
+                    break
+        embedded_child_nodes = self._normalize_business_workflow_nodes(embedded_raw_nodes)
+        embedded_child_edges = self._normalize_business_workflow_edges(embedded_raw_edges)
+        embedded_child_nodes_by_id = {
+            str(node.get("id") or "").strip(): node
+            for node in embedded_child_nodes
+            if str(node.get("id") or "").strip()
+        }
+
+        def _embedded_child_subgraph(start_node_id: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+            start_id = str(start_node_id or "").strip()
+            if not start_id or start_id not in embedded_child_nodes_by_id:
+                return [], []
+            reachable = {start_id}
+            queue = [start_id]
+            while queue:
+                current = queue.pop(0)
+                for edge in embedded_child_edges:
+                    source = str(edge.get("source") or "").strip()
+                    target = str(edge.get("target") or "").strip()
+                    if source == current and target in embedded_child_nodes_by_id and target not in reachable:
+                        reachable.add(target)
+                        queue.append(target)
+            sub_nodes = [node for node in embedded_child_nodes if str(node.get("id") or "").strip() in reachable]
+            sub_edges = [
+                edge for edge in embedded_child_edges
+                if str(edge.get("source") or "").strip() in reachable
+                and str(edge.get("target") or "").strip() in reachable
+            ]
+            return sub_nodes, sub_edges
+
         child_results: Dict[str, list] = {}
         child_results_by_handle: Dict[str, Dict[str, list]] = {}
         emit_embedded_node_event = (
@@ -21357,6 +22945,134 @@ END;"""
             if isinstance(execution_context, dict) and callable(execution_context.get("emit_embedded_node_event"))
             else None
         )
+        workflow_tracking_enabled = self._parse_bool_like(
+            wf_cfg.get("workflow_tracking_enabled", wf_cfg.get("enabled", True)),
+            True,
+        )
+        final_tracker_only = self._parse_bool_like(
+            wf_cfg.get("_blw_async_worker_final_tracker_only", False),
+            False,
+        )
+        tracker_conn = None
+        tracker_table = ""
+        tracker_events: List[Dict[str, Any]] = []
+        tracker_retry_events: List[Dict[str, Any]] = []
+        tracker_routing_events: List[Dict[str, Any]] = []
+        tracker_escalation_events: List[Dict[str, Any]] = []
+        tracker_parallel_events: List[Dict[str, Any]] = []
+        tracker_available = False
+        if workflow_tracking_enabled:
+            try:
+                tracker_conn, tracker_cfg = self._blw_tracker_connect(wf_cfg)
+                tracker_table = str(tracker_cfg.get("table") or wf_cfg.get("workflow_tracking_table") or "BLW_WORKFLOW_TRACKER")
+                self._ensure_blw_tracker_table(tracker_conn, tracker_table)
+                tracker_available = True
+            except Exception as tracker_exc:
+                tracker_conn = None
+                tracker_available = False
+                node_warnings = execution_context.get("node_warnings") if isinstance(execution_context, dict) else None
+                msg = f"BLW Oracle tracker disabled for this run: {tracker_exc}"
+                if isinstance(node_warnings, list) and msg not in node_warnings:
+                    node_warnings.append(msg)
+                logger.warning(msg)
+
+        def _first_input_row() -> Dict[str, Any]:
+            if isinstance(input_rows, list):
+                for row in input_rows:
+                    if isinstance(row, dict):
+                        return row
+            return {}
+
+        def _tracker_unique_id() -> str:
+            unique_field = str(
+                wf_cfg.get("workflow_unique_id_field")
+                or wf_cfg.get("uniqueIdField")
+                or "TRANSACTIONID"
+            ).strip()
+            row = _first_input_row()
+            if unique_field and row:
+                value = self._blw_field_value(row, unique_field)
+                if value not in (None, ""):
+                    return str(value)
+            return str(node_id_prefix or "business_workflow")
+
+        def _tracker_run_id() -> str:
+            forced = str(wf_cfg.get("workflow_run_id") or "").strip()
+            if forced:
+                return forced[:64]
+            exec_id = ""
+            pipeline_id = ""
+            if isinstance(execution_context, dict):
+                exec_id = str(execution_context.get("execution_id") or "").strip()
+                pipeline_id = str(execution_context.get("pipeline_id") or "").strip()
+            seed = f"{exec_id}:{pipeline_id}:{node_id_prefix}:{_tracker_unique_id()}"
+            return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:40]
+
+        def _tracker_payload(status: str, current_step_id: str, current_stage: str, error: Optional[Exception] = None) -> Dict[str, Any]:
+            pipeline_id = ""
+            business_node_id = node_id_prefix
+            if isinstance(execution_context, dict):
+                pipeline_id = str(execution_context.get("pipeline_id") or "").strip()
+                business_node_id = str(execution_context.get("node_id") or node_id_prefix or "").strip()
+            return {
+                "run_id": _tracker_run_id(),
+                "workflow_id": str(wf_cfg.get("workflow_id") or wf_cfg.get("id") or ""),
+                "workflow_name": str(wf_cfg.get("workflowName") or wf_cfg.get("workflow_name") or "Business Logic Workflow"),
+                "pipeline_id": pipeline_id,
+                "business_node_id": business_node_id,
+                "input_unique_id": _tracker_unique_id(),
+                "input_source": str(wf_cfg.get("input_source") or "pipeline"),
+                "input_payload_json": self._json_safe_value(input_rows[:5] if isinstance(input_rows, list) else []),
+                "current_stage": current_stage,
+                "current_step_id": current_step_id,
+                "current_status": status,
+                "iteration_no": 1,
+                "max_iterations": int(wf_cfg.get("workflow_max_iterations") or wf_cfg.get("maxIterations") or 1),
+                "retry_count": len(tracker_retry_events),
+                "max_retry_attempts": int(wf_cfg.get("workflow_max_retry_attempts") or wf_cfg.get("maxRetryAttempts") or 0),
+                "escalation_level": len(tracker_escalation_events),
+                "escalation_status": "escalated" if tracker_escalation_events else "",
+                "escalated_to": str((tracker_escalation_events[-1] or {}).get("to") if tracker_escalation_events else ""),
+                "error_code": type(error).__name__ if error else "",
+                "error_message": str(error or ""),
+                "workflow_config_json": self._json_safe_value(wf_cfg),
+                "step_track_json": self._json_safe_value(tracker_events),
+                "routing_history_json": self._json_safe_value(tracker_routing_events),
+                "retry_history_json": self._json_safe_value(tracker_retry_events),
+                "escalation_json": self._json_safe_value(tracker_escalation_events),
+                "parallel_branch_json": self._json_safe_value(tracker_parallel_events),
+                "context_json": self._json_safe_value({
+                    "node_id_prefix": node_id_prefix,
+                    "completed_nodes": list(child_results.keys()),
+                    "latest_rows": input_rows[:3] if isinstance(input_rows, list) else [],
+                }),
+            }
+
+        def _track(status: str, node_id: str, node_label: str, rows_count: int = 0, error: Optional[Exception] = None) -> None:
+            event = {
+                "node_id": node_id,
+                "label": node_label,
+                "status": status,
+                "rows": int(rows_count or 0),
+                "at": datetime.utcnow().isoformat(),
+                "error": str(error or ""),
+            }
+            tracker_events.append(event)
+            if not tracker_available or tracker_conn is None:
+                return
+            if final_tracker_only:
+                is_workflow_final = node_id == "__workflow__"
+                is_error_final = status in {"failed", "terminated", "paused", "escalated"}
+                if not is_workflow_final and not is_error_final:
+                    return
+            try:
+                self._blw_tracker_merge(
+                    tracker_conn,
+                    tracker_table,
+                    _tracker_payload(status, node_id, node_label, error=error),
+                )
+            except Exception as exc:
+                logger.warning(f"BLW Oracle tracker merge failed for {node_id}: {exc}")
 
         raise_if_aborted = (
             execution_context.get("raise_if_aborted")
@@ -21379,6 +23095,8 @@ END;"""
             return sample
 
         for node_id in topo_order:
+            if node_id in execute_child_targets:
+                continue
             if callable(raise_if_aborted):
                 raise_if_aborted()
             node_payload = child_nodes_by_id.get(node_id) or {}
@@ -21444,6 +23162,29 @@ END;"""
             child_exec_ctx["business_workflow_depth"] = depth + 1
             child_exec_ctx["business_workflow_parent_node_id"] = node_id_prefix
             child_runtime_node_id = str(child_exec_ctx.get("node_id") or "").strip() or f"{node_id_prefix}::{node_id}"
+            if not self._parse_bool_like(node_cfg.get("node_enabled", True), True):
+                output = upstream_data if isinstance(upstream_data, list) else []
+                child_results_by_handle[node_id] = {
+                    "output": output,
+                    "output_false": [],
+                }
+                child_results[node_id] = output
+                _track("skipped", node_id, node_label, len(output))
+                if callable(emit_embedded_node_event):
+                    maybe_coro = emit_embedded_node_event({
+                        "type": "node_skipped",
+                        "node_id": child_runtime_node_id,
+                        "node_label": node_label,
+                        "status": "skipped",
+                        "rows": len(output),
+                        "message": f"⏭ {node_label} disabled, skipped",
+                        "input_sample": _sample_rows(upstream_data),
+                        "output_sample": _sample_rows(output),
+                    })
+                    if asyncio.iscoroutine(maybe_coro):
+                        await maybe_coro
+                continue
+            _track("running", node_id, node_label, len(upstream_data) if isinstance(upstream_data, list) else 0)
 
             if callable(emit_embedded_node_event):
                 maybe_coro = emit_embedded_node_event({
@@ -21459,16 +23200,231 @@ END;"""
                 if asyncio.iscoroutine(maybe_coro):
                     await maybe_coro
 
+            retry_cfg = node_cfg.get("blw_retry") if isinstance(node_cfg.get("blw_retry"), dict) else {}
+            retry_enabled = self._parse_bool_like(retry_cfg.get("enabled", True), True)
             try:
-                output = await self._execute_node(
-                    node_type,
-                    node_cfg,
-                    upstream_data,
-                    incoming_by_source=incoming_by_source,
-                    incoming_order=incoming_order,
-                    execution_context=child_exec_ctx,
-                )
+                max_attempts = int(retry_cfg.get("maxAttempts") or retry_cfg.get("max_attempts") or 1)
+            except Exception:
+                max_attempts = 1
+            if not retry_enabled:
+                max_attempts = 1
+            max_attempts = max(1, min(max_attempts, 100))
+            try:
+                retry_delay_seconds = float(retry_cfg.get("delaySeconds") or retry_cfg.get("delay_seconds") or 0)
+            except Exception:
+                retry_delay_seconds = 0.0
+            retry_delay_seconds = max(0.0, min(retry_delay_seconds, 86400.0))
+
+            try:
+                output: Any = []
+                last_exc: Optional[Exception] = None
+                for attempt_no in range(1, max_attempts + 1):
+                    try:
+                        if (
+                            node_type == "blw_runtime_step"
+                            and str(node_cfg.get("blw_type") or "").strip().lower() == "execute_child_node"
+                        ):
+                            action_cfg = node_cfg.get("blw_action") if isinstance(node_cfg.get("blw_action"), dict) else {}
+                            child_execution_mode = str(action_cfg.get("childExecutionMode") or "downstream").strip().lower()
+                            sequence_child_ids = [
+                                str(item).strip()
+                                for item in action_cfg.get("childNodeIds", [])
+                                if str(item or "").strip()
+                            ] if isinstance(action_cfg.get("childNodeIds"), list) else []
+                            target_child_id = str(
+                                node_cfg.get("blw_child_node_id")
+                                or action_cfg.get("childNodeId")
+                                or (sequence_child_ids[0] if sequence_child_ids else "")
+                                or ""
+                            ).strip()
+                            target_payload = child_nodes_by_id.get(target_child_id)
+                            embedded_sub_nodes: List[Dict[str, Any]] = []
+                            embedded_sub_edges: List[Dict[str, str]] = []
+                            if child_execution_mode == "sequence" and sequence_child_ids:
+                                missing_sequence = [
+                                    child_id for child_id in sequence_child_ids
+                                    if child_id not in embedded_child_nodes_by_id
+                                ]
+                                if missing_sequence:
+                                    raise ValueError(
+                                        "Execute Child Node sequence has unknown child canvas node(s): "
+                                        + ", ".join(missing_sequence[:5])
+                                    )
+                                embedded_sub_nodes = [
+                                    embedded_child_nodes_by_id[child_id]
+                                    for child_id in sequence_child_ids
+                                ]
+                                embedded_sub_edges = [
+                                    {
+                                        "id": f"blw_sequence_{idx}_{sequence_child_ids[idx]}_{sequence_child_ids[idx + 1]}",
+                                        "source": sequence_child_ids[idx],
+                                        "target": sequence_child_ids[idx + 1],
+                                        "source_handle": "output",
+                                        "target_handle": "input",
+                                    }
+                                    for idx in range(len(sequence_child_ids) - 1)
+                                ]
+                            elif target_payload is None and target_child_id:
+                                embedded_sub_nodes, embedded_sub_edges = _embedded_child_subgraph(target_child_id)
+                            if not target_child_id or (target_payload is None and not embedded_sub_nodes):
+                                raise ValueError("Execute Child Node requires a selected child workflow canvas node.")
+                            if target_child_id == node_id:
+                                raise ValueError("Execute Child Node cannot invoke itself.")
+                            input_mode = str(action_cfg.get("inputMode") or "pass_all").strip().lower()
+                            selected_fields = [
+                                str(item)
+                                for item in action_cfg.get("selectedFields", [])
+                                if str(item or "").strip()
+                            ] if isinstance(action_cfg.get("selectedFields"), list) else []
+                            target_input = upstream_data if isinstance(upstream_data, list) else []
+                            if input_mode == "selected_fields" and selected_fields:
+                                target_input = [
+                                    {
+                                        field: self._blw_field_value(row, field)
+                                        for field in selected_fields
+                                    }
+                                    for row in target_input
+                                    if isinstance(row, dict)
+                                ]
+                            elif input_mode == "context_path":
+                                context_paths = [
+                                    str(item).strip()
+                                    for item in action_cfg.get("contextPaths", [])
+                                    if str(item or "").strip()
+                                ] if isinstance(action_cfg.get("contextPaths"), list) else []
+                                context_path = str(action_cfg.get("contextPath") or "").strip()
+                                if not context_paths and context_path:
+                                    context_paths = [context_path]
+                                if len(context_paths) == 1:
+                                    context_path = context_paths[0]
+                                    target_input = [
+                                        self._blw_field_value(row, context_path)
+                                        for row in target_input
+                                    ]
+                                elif len(context_paths) > 1:
+                                    target_input = [
+                                        {
+                                            path: self._blw_field_value(row, path)
+                                            for path in context_paths
+                                        }
+                                        for row in target_input
+                                        if isinstance(row, dict)
+                                    ]
+                            target_exec_ctx = dict(child_exec_ctx)
+                            target_exec_ctx["node_id"] = f"{node_id_prefix}::{node_id}::{target_child_id}"
+                            if embedded_sub_nodes:
+                                embedded_start = embedded_child_nodes_by_id.get(target_child_id) or {}
+                                embedded_label = str(embedded_start.get("label") or target_child_id).strip() or target_child_id
+                                target_exec_ctx["node_label"] = embedded_label
+                                nested_cfg = dict(wf_cfg)
+                                nested_cfg["workflow_tracking_enabled"] = False
+                                output = await self._run_business_workflow_embedded(
+                                    input_rows=target_input,
+                                    child_nodes=embedded_sub_nodes,
+                                    child_edges=embedded_sub_edges,
+                                    workflow_config=nested_cfg,
+                                    execution_context=target_exec_ctx,
+                                    node_id_prefix=f"{node_id_prefix}::{node_id}::{target_child_id}",
+                                )
+                            else:
+                                target_node_type = str(target_payload.get("node_type") or "").strip()
+                                target_node_label = str(target_payload.get("label") or target_child_id).strip() or target_child_id
+                                target_node_cfg = (
+                                    target_payload.get("config")
+                                    if isinstance(target_payload.get("config"), dict)
+                                    else {}
+                                )
+                                target_exec_ctx["node_label"] = target_node_label
+                                output = await self._execute_node(
+                                    target_node_type,
+                                    target_node_cfg,
+                                    target_input,
+                                    incoming_by_source={node_id: target_input},
+                                    incoming_order=[node_id],
+                                    execution_context=target_exec_ctx,
+                                )
+                                if target_node_type in {"condition_node", "blw_condition_node"}:
+                                    condition_input_rows = target_input if isinstance(target_input, list) else []
+                                    condition_bundle = self._blw_condition_group_split(condition_input_rows, target_node_cfg)
+                                    true_rows = condition_bundle.get("output", [])
+                                    output = true_rows
+                                    child_results_by_handle[node_id] = condition_bundle
+                            output_path = str(action_cfg.get("outputPath") or "").strip()
+                            if output_path and isinstance(output, list):
+                                normalized_output_path = self._normalize_json_path_expr(output_path)
+                                mapped_rows: List[Any] = []
+                                if len(output) == 1 and len(upstream_data) != 1:
+                                    paired_output = [output[0] for _ in upstream_data]
+                                else:
+                                    paired_output = output
+                                for original, produced in zip(upstream_data, paired_output):
+                                    row_obj = dict(original) if isinstance(original, dict) else {"value": original}
+                                    safe_produced = self._json_safe_value(produced)
+                                    if normalized_output_path:
+                                        self._set_profile_path_value(row_obj, normalized_output_path, safe_produced)
+                                    row_obj["_blw_child_output_path"] = output_path
+                                    row_obj["_blw_child_output"] = safe_produced
+                                    row_obj["_blw_child_node_id"] = target_child_id
+                                    mapped_rows.append(row_obj)
+                                output = mapped_rows
+                        else:
+                            output = await self._execute_node(
+                                node_type,
+                                node_cfg,
+                                upstream_data,
+                                incoming_by_source=incoming_by_source,
+                                incoming_order=incoming_order,
+                                execution_context=child_exec_ctx,
+                            )
+                        last_exc = None
+                        break
+                    except BLWDelaySuspended:
+                        raise
+                    except Exception as attempt_exc:
+                        last_exc = attempt_exc
+                        if attempt_no >= max_attempts:
+                            raise
+                        retry_event = {
+                            "node_id": node_id,
+                            "label": node_label,
+                            "attempt": attempt_no,
+                            "max_attempts": max_attempts,
+                            "delay_seconds": retry_delay_seconds,
+                            "error": str(attempt_exc),
+                            "at": datetime.utcnow().isoformat(),
+                        }
+                        tracker_retry_events.append(retry_event)
+                        _track("retrying", node_id, node_label, len(upstream_data) if isinstance(upstream_data, list) else 0, error=attempt_exc)
+                        if callable(emit_embedded_node_event):
+                            maybe_coro = emit_embedded_node_event({
+                                "type": "node_retry",
+                                "node_id": child_runtime_node_id,
+                                "node_label": node_label,
+                                "status": "retrying",
+                                "rows": len(upstream_data) if isinstance(upstream_data, list) else 0,
+                                "message": f"↻ {node_label} retry {attempt_no}/{max_attempts} after error: {attempt_exc}",
+                                "input_sample": _sample_rows(upstream_data),
+                                "output_sample": [],
+                            })
+                            if asyncio.iscoroutine(maybe_coro):
+                                await maybe_coro
+                        if retry_delay_seconds > 0:
+                            await self._sleep_abortable(retry_delay_seconds, execution_context=execution_context)
+                if last_exc is not None:
+                    raise last_exc
+            except BLWDelaySuspended:
+                raise
             except Exception as child_exc:
+                escalation_cfg = node_cfg.get("blw_escalation") if isinstance(node_cfg.get("blw_escalation"), dict) else {}
+                if self._parse_bool_like(escalation_cfg.get("enabled", False), False):
+                    tracker_escalation_events.append({
+                        "node_id": node_id,
+                        "label": node_label,
+                        "to": str(escalation_cfg.get("to") or "operations"),
+                        "error": str(child_exc),
+                        "at": datetime.utcnow().isoformat(),
+                    })
+                _track("failed", node_id, node_label, 0, error=child_exc)
                 if callable(emit_embedded_node_event):
                     maybe_coro = emit_embedded_node_event({
                         "type": "node_error",
@@ -21482,18 +23438,54 @@ END;"""
                     })
                     if asyncio.iscoroutine(maybe_coro):
                         await maybe_coro
+                if tracker_conn is not None:
+                    try:
+                        tracker_conn.close()
+                    except Exception:
+                        pass
                 raise
 
-            if node_type == "condition_node":
+            if node_type in {"condition_node", "blw_condition_node"}:
                 routing_mode = str(node_cfg.get("condition_routing_mode") or "").strip().lower()
                 condition_input_rows = upstream_data if isinstance(upstream_data, list) else []
-                if routing_mode == "case":
+                if node_type == "blw_condition_node" or routing_mode == "blw_expression":
+                    condition_bundle = self._blw_condition_group_split(condition_input_rows, node_cfg)
+                    true_rows = condition_bundle.get("output", [])
+                    false_rows = condition_bundle.get("output_false", [])
+                    tracker_routing_events.append({
+                        "node_id": node_id,
+                        "label": node_label,
+                        "mode": "blw_expression",
+                        "true_rows": len(true_rows),
+                        "false_rows": len(false_rows),
+                        "expression": str(node_cfg.get("blw_condition_expression") or ""),
+                        "handles": {str(k): len(v) for k, v in condition_bundle.items() if isinstance(v, list)},
+                        "at": datetime.utcnow().isoformat(),
+                    })
+                    output = true_rows
+                    child_results_by_handle[node_id] = condition_bundle
+                elif routing_mode == "case":
                     case_split = self._flow_condition_case_routes_split(condition_input_rows, node_cfg)
                     output_rows = case_split.get("output")
                     output = output_rows if isinstance(output_rows, list) else []
+                    tracker_routing_events.append({
+                        "node_id": node_id,
+                        "label": node_label,
+                        "mode": "case",
+                        "handles": {str(k): len(v) for k, v in case_split.items() if isinstance(v, list)},
+                        "at": datetime.utcnow().isoformat(),
+                    })
                     child_results_by_handle[node_id] = case_split
                 else:
                     true_rows, false_rows = self._flow_condition_split(condition_input_rows, node_cfg)
+                    tracker_routing_events.append({
+                        "node_id": node_id,
+                        "label": node_label,
+                        "mode": "condition_node",
+                        "true_rows": len(true_rows),
+                        "false_rows": len(false_rows),
+                        "at": datetime.utcnow().isoformat(),
+                    })
                     output = true_rows
                     child_results_by_handle[node_id] = {
                         "output": true_rows,
@@ -21505,6 +23497,34 @@ END;"""
                     "output_false": [],
                 }
             child_results[node_id] = output if isinstance(output, list) else []
+            if node_type == "blw_runtime_step":
+                blw_type = str(node_cfg.get("blw_type") or "").strip().lower()
+                if blw_type in {"parallel_start", "parallel_join"}:
+                    tracker_parallel_events.append({
+                        "node_id": node_id,
+                        "label": node_label,
+                        "type": blw_type,
+                        "incoming_rows": len(upstream_data) if isinstance(upstream_data, list) else 0,
+                        "output_rows": len(child_results[node_id]),
+                        "at": datetime.utcnow().isoformat(),
+                    })
+                if blw_type == "pause":
+                    _track("paused", node_id, node_label, len(child_results[node_id]))
+                elif blw_type == "terminate":
+                    _track("terminated", node_id, node_label, len(child_results[node_id]))
+                elif blw_type == "escalation":
+                    escalation_cfg = node_cfg.get("blw_escalation") if isinstance(node_cfg.get("blw_escalation"), dict) else {}
+                    tracker_escalation_events.append({
+                        "node_id": node_id,
+                        "label": node_label,
+                        "to": str(escalation_cfg.get("to") or "operations"),
+                        "at": datetime.utcnow().isoformat(),
+                    })
+                    _track("escalated", node_id, node_label, len(child_results[node_id]))
+                else:
+                    _track("success", node_id, node_label, len(child_results[node_id]))
+            else:
+                _track("success", node_id, node_label, len(child_results[node_id]))
 
             if callable(emit_embedded_node_event):
                 output_rows = output if isinstance(output, list) else []
@@ -21538,6 +23558,17 @@ END;"""
             sink_rows = child_results.get(sink_id)
             if isinstance(sink_rows, list):
                 final_rows.extend(sink_rows)
+        terminal_status = "success"
+        if any(isinstance(row, dict) and row.get("_blw_terminated") for row in final_rows):
+            terminal_status = "terminated"
+        elif any(isinstance(row, dict) and row.get("_blw_paused") for row in final_rows):
+            terminal_status = "paused"
+        _track(terminal_status, "__workflow__", "Workflow Complete", len(final_rows))
+        if tracker_conn is not None:
+            try:
+                tracker_conn.close()
+            except Exception:
+                pass
         return final_rows
 
     def _business_to_number(self, value: Any) -> Optional[float]:
@@ -21625,6 +23656,78 @@ END;"""
             if env_value not in (None, ""):
                 return env_value
         return default
+
+    def _business_send_mail_via_smtp(
+        self,
+        config: dict,
+        recipients: List[str],
+        subject: str,
+        body_text: str,
+    ) -> Dict[str, Any]:
+        smtp_host = str(self._business_config_value(config, "smtp_host", ["BUSINESS_SMTP_HOST", "SMTP_HOST"], "")).strip()
+        smtp_user = str(self._business_config_value(config, "smtp_username", ["BUSINESS_SMTP_USERNAME", "SMTP_USERNAME"], "")).strip()
+        smtp_password = str(self._business_config_value(config, "smtp_password", ["BUSINESS_SMTP_PASSWORD", "SMTP_PASSWORD"], "")).strip()
+        from_email = str(
+            self._business_config_value(
+                config,
+                "from_email",
+                ["BUSINESS_SMTP_FROM_EMAIL", "SMTP_FROM_EMAIL", "BUSINESS_MAIL_FROM_EMAIL"],
+                smtp_user,
+            )
+        ).strip()
+        smtp_security = str(
+            self._business_config_value(config, "smtp_security", ["BUSINESS_SMTP_SECURITY", "SMTP_SECURITY"], "tls")
+        ).strip().lower() or "tls"
+        if smtp_security not in {"tls", "ssl", "none"}:
+            smtp_security = "tls"
+        port_default = 465 if smtp_security == "ssl" else 587
+        smtp_port_num = self._business_to_number(
+            self._business_config_value(config, "smtp_port", ["BUSINESS_SMTP_PORT", "SMTP_PORT"], port_default)
+        )
+        smtp_port = int(smtp_port_num) if smtp_port_num else int(port_default)
+        timeout_num = self._business_to_number(
+            self._business_config_value(config, "smtp_timeout_sec", ["BUSINESS_SMTP_TIMEOUT_SEC", "SMTP_TIMEOUT_SEC"], 30)
+        )
+        timeout_sec = max(5, min(int(timeout_num or 30), 300))
+
+        if not smtp_host:
+            raise ValueError("SMTP host is not configured.")
+        if not from_email:
+            raise ValueError("Sender email is not configured.")
+        if smtp_user and not smtp_password:
+            raise ValueError("SMTP password is required when SMTP username is provided.")
+        if smtp_host.lower() == "smtp.gmail.com" and smtp_password:
+            smtp_password = re.sub(r"\s+", "", smtp_password)
+
+        message = EmailMessage()
+        message["From"] = from_email
+        message["To"] = ", ".join(recipients)
+        message["Subject"] = subject
+        message.set_content(body_text)
+
+        if smtp_security == "ssl":
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=timeout_sec, context=ssl.create_default_context()) as server:
+                if smtp_user:
+                    server.login(smtp_user, smtp_password)
+                server.send_message(message)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=timeout_sec) as server:
+                server.ehlo()
+                if smtp_security == "tls":
+                    server.starttls(context=ssl.create_default_context())
+                    server.ehlo()
+                if smtp_user:
+                    server.login(smtp_user, smtp_password)
+                server.send_message(message)
+        return {
+            "transport": "smtp",
+            "smtp_host": smtp_host,
+            "smtp_port": smtp_port,
+            "smtp_security": smtp_security,
+            "from_email": from_email,
+            "recipients": recipients,
+            "timeout_sec": timeout_sec,
+        }
 
     def _business_prepare_whatsapp_text(self, content: str) -> str:
         text = str(content or "").strip()
@@ -21730,61 +23833,27 @@ END;"""
 
         send_mode = str(config.get("send_mode") or "draft").strip().lower() or "draft"
         should_send = send_mode in {"send", "enabled", "on"}
+        delivery_mode = str(config.get("email_delivery_mode") or config.get("delivery_mode") or "sync").strip().lower() or "sync"
+        async_delivery = delivery_mode in {"async", "async_background", "background", "queued", "queue"}
         generated_at = datetime.utcnow().isoformat()
+        job_id = f"mail_{uuid.uuid4().hex}"
 
         if should_send:
-            smtp_host = str(self._business_config_value(config, "smtp_host", ["BUSINESS_SMTP_HOST", "SMTP_HOST"], "")).strip()
-            smtp_user = str(self._business_config_value(config, "smtp_username", ["BUSINESS_SMTP_USERNAME", "SMTP_USERNAME"], "")).strip()
-            smtp_password = str(self._business_config_value(config, "smtp_password", ["BUSINESS_SMTP_PASSWORD", "SMTP_PASSWORD"], "")).strip()
-            from_email = str(
-                self._business_config_value(
-                    config,
-                    "from_email",
-                    ["BUSINESS_SMTP_FROM_EMAIL", "SMTP_FROM_EMAIL", "BUSINESS_MAIL_FROM_EMAIL"],
-                    smtp_user,
-                )
-            ).strip()
-            smtp_security = str(
-                self._business_config_value(config, "smtp_security", ["BUSINESS_SMTP_SECURITY", "SMTP_SECURITY"], "tls")
-            ).strip().lower() or "tls"
-            if smtp_security not in {"tls", "ssl", "none"}:
-                smtp_security = "tls"
-            port_default = 465 if smtp_security == "ssl" else 587
-            smtp_port_num = self._business_to_number(
-                self._business_config_value(config, "smtp_port", ["BUSINESS_SMTP_PORT", "SMTP_PORT"], port_default)
-            )
-            smtp_port = int(smtp_port_num) if smtp_port_num else int(port_default)
+            if async_delivery:
+                safe_config = dict(config or {})
 
-            if not smtp_host:
-                raise ValueError("SMTP host is not configured.")
-            if not from_email:
-                raise ValueError("Sender email is not configured.")
-            if smtp_user and not smtp_password:
-                raise ValueError("SMTP password is required when SMTP username is provided.")
-            if smtp_host.lower() == "smtp.gmail.com" and smtp_password:
-                smtp_password = re.sub(r"\s+", "", smtp_password)
+                def _send_async_mail() -> None:
+                    try:
+                        self._business_send_mail_via_smtp(safe_config, recipients, subject, body_text)
+                        logger.info(f"Async Mail Writer job {job_id} sent to {', '.join(recipients)}")
+                    except Exception as exc:
+                        logger.warning(f"Async Mail Writer job {job_id} failed: {exc}")
 
-            message = EmailMessage()
-            message["From"] = from_email
-            message["To"] = ", ".join(recipients)
-            message["Subject"] = subject
-            message.set_content(body_text)
-
-            if smtp_security == "ssl":
-                with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30, context=ssl.create_default_context()) as server:
-                    if smtp_user:
-                        server.login(smtp_user, smtp_password)
-                    server.send_message(message)
+                _BUSINESS_MAIL_EXECUTOR.submit(_send_async_mail)
+                status = "queued"
             else:
-                with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
-                    server.ehlo()
-                    if smtp_security == "tls":
-                        server.starttls(context=ssl.create_default_context())
-                        server.ehlo()
-                    if smtp_user:
-                        server.login(smtp_user, smtp_password)
-                    server.send_message(message)
-            status = "sent"
+                self._business_send_mail_via_smtp(config, recipients, subject, body_text)
+                status = "sent"
         else:
             status = "draft"
 
@@ -21793,6 +23862,8 @@ END;"""
             "subject": subject,
             "body": body_text,
             "status": status,
+            "delivery_mode": delivery_mode,
+            "mail_job_id": job_id if status == "queued" else None,
             "generated_at": generated_at,
             "source_rows": len([row for row in data if isinstance(row, dict)]),
         }]
@@ -21996,6 +24067,29 @@ END;"""
         fname = os.path.basename(expanded) or f"output_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}{default_ext}"
         return os.path.join(OUTPUTS_DIR, fname)
 
+    @contextlib.contextmanager
+    def _destination_file_lock(self, out_path: str):
+        """Cross-process lock for destination file writes."""
+        lock_path = f"{out_path}.lock"
+        os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+        handle = open(lock_path, "a", encoding="utf-8")
+        try:
+            try:
+                import fcntl  # type: ignore
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                # Best effort on platforms without fcntl. The open handle still
+                # keeps a visible lock sentinel for diagnostics.
+                pass
+            yield
+        finally:
+            try:
+                import fcntl  # type: ignore
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            handle.close()
+
     # ─── DESTINATION IMPLEMENTATIONS ──────────────────────────────────────────
 
     async def _execute_destination(
@@ -22033,6 +24127,10 @@ END;"""
                     pass
 
         _raise_if_aborted()
+        is_blw_async_child_write = isinstance(execution_context, dict) and self._parse_bool_like(
+            execution_context.get("blw_async_persist_wait", False),
+            False,
+        )
 
         if not data:
             return [{"status": "loaded", "rows": 0, "destination": node_type, "note": "No data to write"}]
@@ -22049,50 +24147,53 @@ END;"""
             flush_mode = str(config.get("flush_mode", "batch") or "batch").strip().lower()
             if write_mode not in {"replace", "append"}:
                 write_mode = "replace"
+            if is_blw_async_child_write and write_mode == "replace":
+                write_mode = "append"
             if flush_mode not in {"batch", "row"}:
                 flush_mode = "batch"
 
-            file_exists = os.path.exists(out_path)
-            file_non_empty = False
-            if file_exists:
-                try:
-                    file_non_empty = os.path.getsize(out_path) > 0
-                except Exception:
-                    file_non_empty = False
+            with self._destination_file_lock(out_path):
+                file_exists = os.path.exists(out_path)
+                file_non_empty = False
+                if file_exists:
+                    try:
+                        file_non_empty = os.path.getsize(out_path) > 0
+                    except Exception:
+                        file_non_empty = False
 
-            append_mode = write_mode == "append"
-            open_mode = "a" if append_mode else "w"
-            write_header = include_header and (not append_mode or not file_non_empty)
+                append_mode = write_mode == "append"
+                open_mode = "a" if append_mode else "w"
+                write_header = include_header and (not append_mode or not file_non_empty)
 
-            if flush_mode == "row":
-                columns = [str(col) for col in df.columns]
-                records = df.to_dict(orient="records")
-                with open(out_path, open_mode, encoding=encoding, newline="") as handle:
-                    writer = csv.DictWriter(handle, fieldnames=columns, delimiter=delimiter, extrasaction="ignore")
-                    if write_header:
-                        writer.writeheader()
-                    for row in records:
-                        _raise_if_aborted()
-                        if isinstance(row, dict):
-                            normalized_row: Dict[str, Any] = {}
-                            for col in columns:
-                                value = row.get(col)
-                                try:
-                                    normalized_row[col] = "" if pd.isna(value) else value
-                                except Exception:
-                                    normalized_row[col] = value
-                            writer.writerow(normalized_row)
-                        else:
-                            writer.writerow({col: "" for col in columns})
-            else:
-                df.to_csv(
-                    out_path,
-                    index=False,
-                    sep=delimiter,
-                    mode=open_mode,
-                    header=write_header,
-                    encoding=encoding,
-                )
+                if flush_mode == "row":
+                    columns = [str(col) for col in df.columns]
+                    records = df.to_dict(orient="records")
+                    with open(out_path, open_mode, encoding=encoding, newline="") as handle:
+                        writer = csv.DictWriter(handle, fieldnames=columns, delimiter=delimiter, extrasaction="ignore")
+                        if write_header:
+                            writer.writeheader()
+                        for row in records:
+                            _raise_if_aborted()
+                            if isinstance(row, dict):
+                                normalized_row: Dict[str, Any] = {}
+                                for col in columns:
+                                    value = row.get(col)
+                                    try:
+                                        normalized_row[col] = "" if pd.isna(value) else value
+                                    except Exception:
+                                        normalized_row[col] = value
+                                writer.writerow(normalized_row)
+                            else:
+                                writer.writerow({col: "" for col in columns})
+                else:
+                    df.to_csv(
+                        out_path,
+                        index=False,
+                        sep=delimiter,
+                        mode=open_mode,
+                        header=write_header,
+                        encoding=encoding,
+                    )
             logger.info(f"✅ CSV written: {out_path} ({len(df)} rows)")
             return [{
                 "status": "written",
@@ -22100,6 +24201,7 @@ END;"""
                 "path": out_path,
                 "write_mode": write_mode,
                 "flush_mode": flush_mode,
+                "async_safe_append": is_blw_async_child_write,
             }]
 
         elif node_type == "json_destination":
@@ -22182,17 +24284,50 @@ END;"""
 
                         df_json[col] = series.map(_normalize_temporal_obj)
 
-            df_json.to_json(
-                out_path,
-                orient=orient,
-                indent=indent,
-                force_ascii=False,
-                date_format=date_format,
-                date_unit=date_unit,
-                default_handler=str,
-            )
+            with self._destination_file_lock(out_path):
+                if is_blw_async_child_write:
+                    new_records = json.loads(
+                        df_json.to_json(
+                            orient="records",
+                            force_ascii=False,
+                            date_format=date_format,
+                            date_unit=date_unit,
+                            default_handler=str,
+                        )
+                    )
+                    if not isinstance(new_records, list):
+                        new_records = [new_records]
+                    existing_records: List[Any] = []
+                    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                        try:
+                            with open(out_path, "r", encoding="utf-8") as existing_handle:
+                                existing_json = json.load(existing_handle)
+                            if isinstance(existing_json, list):
+                                existing_records = existing_json
+                            elif existing_json is not None:
+                                existing_records = [existing_json]
+                        except Exception as exc:
+                            logger.warning(f"Unable to read existing async JSON destination {out_path}; appending from empty file: {exc}")
+                    with open(out_path, "w", encoding="utf-8") as handle:
+                        json.dump(
+                            self._json_safe_value([*existing_records, *new_records]),
+                            handle,
+                            ensure_ascii=False,
+                            indent=indent,
+                            default=str,
+                        )
+                else:
+                    df_json.to_json(
+                        out_path,
+                        orient=orient,
+                        indent=indent,
+                        force_ascii=False,
+                        date_format=date_format,
+                        date_unit=date_unit,
+                        default_handler=str,
+                    )
             logger.info(f"✅ JSON written: {out_path} ({len(df)} rows)")
-            return [{"status": "written", "rows": len(df), "path": out_path}]
+            return [{"status": "written", "rows": len(df), "path": out_path, "async_safe_append": is_blw_async_child_write}]
 
         elif node_type == "excel_destination":
             raw = config.get("file_path", "")
@@ -22200,9 +24335,19 @@ END;"""
                 raw += ".xlsx"
             out_path = self._resolve_output_path(raw, ".xlsx")
             sheet = config.get("sheet", "Sheet1") or "Sheet1"
-            df.to_excel(out_path, index=False, sheet_name=str(sheet))
+            with self._destination_file_lock(out_path):
+                if is_blw_async_child_write and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    try:
+                        existing_df = pd.read_excel(out_path, sheet_name=str(sheet))
+                        df_to_write = pd.concat([existing_df, df], ignore_index=True)
+                    except Exception as exc:
+                        logger.warning(f"Unable to merge existing async Excel destination {out_path}; rewriting current batch only: {exc}")
+                        df_to_write = df
+                else:
+                    df_to_write = df
+                df_to_write.to_excel(out_path, index=False, sheet_name=str(sheet))
             logger.info(f"✅ Excel written: {out_path} ({len(df)} rows)")
-            return [{"status": "written", "rows": len(df), "path": out_path}]
+            return [{"status": "written", "rows": len(df), "path": out_path, "async_safe_append": is_blw_async_child_write}]
 
         # ── Database destinations ───────────────────────────────────────────
         elif node_type == "postgres_destination":

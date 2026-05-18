@@ -444,14 +444,14 @@ export default function NLPChatStudio() {
               data: values,
               smooth: true,
               symbol: 'circle',
-              lineStyle: { width: 2, color: '#2563eb' },
-              itemStyle: { color: '#2563eb' },
-              areaStyle: { color: 'rgba(37, 99, 235, 0.18)' },
+              lineStyle: { width: 2, color: 'var(--app-accent)' },
+              itemStyle: { color: 'var(--app-accent)' },
+              areaStyle: { color: 'color-mix(in srgb, var(--app-accent) 18%, transparent)' },
             }
           : {
               type: 'bar',
               data: values,
-              itemStyle: { color: '#2563eb', borderRadius: [4, 4, 0, 0] },
+              itemStyle: { color: 'var(--app-accent)', borderRadius: [4, 4, 0, 0] },
               barMaxWidth: 42,
             },
       ],
@@ -582,7 +582,7 @@ export default function NLPChatStudio() {
                 icon={<SearchOutlined />}
                 onClick={() => { void loadSchema() }}
                 loading={schemaLoading}
-                style={{ background: 'linear-gradient(135deg, #2563eb, #1d4ed8)', border: 'none' }}
+                style={{ background: 'var(--app-accent-gradient)', border: 'none' }}
               >
                 Connect Datasource & Load Fields
               </Button>
@@ -702,9 +702,9 @@ export default function NLPChatStudio() {
                         style={{
                           marginLeft: turn.role === 'assistant' ? 0 : 'auto',
                           maxWidth: '88%',
-                          background: turn.role === 'assistant' ? 'var(--app-card-bg)' : '#2563eb',
+                          background: turn.role === 'assistant' ? 'var(--app-card-bg)' : 'var(--app-accent)',
                           color: turn.role === 'assistant' ? 'var(--app-text)' : '#fff',
-                          border: turn.role === 'assistant' ? '1px solid var(--app-border)' : '1px solid #1d4ed8',
+                          border: turn.role === 'assistant' ? '1px solid var(--app-border)' : '1px solid var(--app-accent-border-strong)',
                           borderRadius: 10,
                           padding: '10px 12px',
                           whiteSpace: 'pre-wrap',
@@ -751,7 +751,7 @@ export default function NLPChatStudio() {
                   onClick={() => { void askQuestion() }}
                   loading={asking}
                   disabled={!schema}
-                  style={{ background: 'linear-gradient(135deg, #16a34a, #15803d)', border: 'none' }}
+                  style={{ background: 'var(--app-accent-gradient)', border: 'none' }}
                 >
                   Ask Chatbot
                 </Button>

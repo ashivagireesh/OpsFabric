@@ -271,14 +271,19 @@ function buildFlowChartOption(meta?: WorkflowChatResponse | null) {
 }
 
 function turnAccentColor(turn: WorkflowChatTurn): string {
-  if (turn.role === 'user') return '#3b82f6'
+  if (turn.role === 'user') return 'var(--app-accent)'
   const ctx = String(turn.meta?.context_type || '').toLowerCase()
   if (ctx === 'etl') return '#3b82f6'
   if (ctx === 'mlops') return '#22c55e'
   if (ctx === 'business') return '#f59e0b'
-  if (ctx === 'visualization') return '#a855f7'
+  if (ctx === 'visualization') return 'var(--app-accent-strong)'
   if (ctx === 'application') return '#06b6d4'
-  return '#8b5cf6'
+  return 'var(--app-accent)'
+}
+
+function alphaAccent(color: string, percent: number): string {
+  if (color.startsWith('var(')) return `color-mix(in srgb, ${color} ${percent}%, transparent)`
+  return `${color}${Math.round((percent / 100) * 255).toString(16).padStart(2, '0')}`
 }
 
 const BLUEPRINT_WIDGET_STYLE = {
@@ -625,7 +630,7 @@ export default function WorkflowChatStudio() {
                         transition: 'border-color 0.2s ease',
                       }}
                       onClick={() => jumpToTurn(event.id, event.role)}
-                      onMouseEnter={(e) => { e.currentTarget.style.borderColor = '#6366f1' }}
+                      onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--app-accent)' }}
                       onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--app-border-strong)' }}
                     >
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
@@ -742,8 +747,8 @@ export default function WorkflowChatStudio() {
                                 <div style={{
                                   width: 36,
                                   height: 36,
-                                  background: `${accent}18`,
-                                  border: `1px solid ${accent}40`,
+                                  background: alphaAccent(accent, 10),
+                                  border: `1px solid ${alphaAccent(accent, 25)}`,
                                   borderRadius: 9,
                                   display: 'flex',
                                   alignItems: 'center',

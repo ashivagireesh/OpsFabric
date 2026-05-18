@@ -358,6 +358,10 @@ const api = {
       previewCompact?: boolean
       previewMaxCellChars?: number
       previewMaxCollectionItems?: number
+      search?: string
+      filters?: Array<{ field: string; operator?: string; value?: string }>
+      sortBy?: string
+      sortDir?: 'asc' | 'desc'
       timeoutMs?: number
     },
   ) => {
@@ -373,6 +377,10 @@ const api = {
         preview_compact: options?.previewCompact ?? true,
         preview_max_cell_chars: Math.max(200, Number(options?.previewMaxCellChars || 2000)),
         preview_max_collection_items: Math.max(8, Number(options?.previewMaxCollectionItems || 64)),
+        search: String(options?.search || ''),
+        filters: Array.isArray(options?.filters) ? options.filters : [],
+        sort_by: String(options?.sortBy || ''),
+        sort_dir: options?.sortDir === 'desc' ? 'desc' : 'asc',
       }
       const timeoutMs = Number(options?.timeoutMs || 0)
       const r = await http.post(
@@ -1099,6 +1107,26 @@ const api = {
     return r.data
   },
 
+  listDevChatProviders: () => safeGet(async () => {
+    const r = await http.get('/api/dev-chat/providers')
+    return r.data
+  }, { providers: [], supported_providers: [] }),
+
+  saveDevChatProviders: async (providers: Array<Record<string, unknown>>) => {
+    const r = await http.put('/api/dev-chat/providers', { providers })
+    return r.data
+  },
+
+  testDevChatProvider: async (provider: Record<string, unknown>) => {
+    const r = await http.post('/api/dev-chat/providers/test', { provider })
+    return r.data
+  },
+
+  sendDevChatMessage: async (payload: Record<string, unknown>) => {
+    const r = await http.post('/api/dev-chat/message', payload)
+    return r.data
+  },
+
   cleanupSqliteData: async (payload: Record<string, unknown>) => {
     const r = await http.post('/api/settings/sqlite/cleanup', payload)
     return r.data
@@ -1199,6 +1227,26 @@ const api = {
       headers: r.headers || {},
       data,
     }
+  },
+
+  getBlwTrackerSummary: (payload: { config: Record<string, unknown>; limit?: number }) => safeGet(async () => {
+    const r = await http.post('/api/blw/tracker/summary', payload)
+    return r.data
+  }, {
+    ok: false,
+    table: String(payload?.config?.workflow_tracking_table || 'BLW_WORKFLOW_TRACKER'),
+    summary: { total: 0, status_counts: {}, stage_counts: {} },
+    rows: [],
+  }),
+
+  getBlwTrackerDetail: async (payload: { config: Record<string, unknown>; run_id: string }) => {
+    const r = await http.post('/api/blw/tracker/detail', payload)
+    return r.data
+  },
+
+  applyBlwTrackerAction: async (payload: { config: Record<string, unknown>; run_id: string; action: 'resume' | 'retry' | 'pause' | 'terminate' }) => {
+    const r = await http.post('/api/blw/tracker/action', payload)
+    return r.data
   },
 
   // ── Credentials ────────────────────────────────────────────────────────────

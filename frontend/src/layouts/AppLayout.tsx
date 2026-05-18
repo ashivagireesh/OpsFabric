@@ -34,15 +34,20 @@ export default function AppLayout() {
   const mode = useThemeStore((state) => state.mode)
   const navigate = useNavigate()
   const location = useLocation()
-  const isDark = mode === 'dark'
+  const isDark = mode === 'dark' || mode === 'enterprise-dark'
+  const isEnterpriseDark = mode === 'enterprise-dark'
 
   const shellBg = isDark ? 'var(--app-shell-bg)' : '#f5f7fb'
   const panelBg = isDark ? 'var(--app-panel-bg)' : '#ffffff'
   const borderColor = isDark ? 'var(--app-border)' : '#dbe4f0'
-  const mutedText = isDark ? '#888' : 'var(--app-text-subtle)'
-  const brandTitle = isDark ? '#ffffff' : '#0f172a'
-  const collapseIconColor = isDark ? '#666' : 'var(--app-text-muted)'
-  const githubColor = isDark ? '#666' : 'var(--app-text-subtle)'
+  const accentColor = isEnterpriseDark ? '#007acc' : '#6366f1'
+  const logoGradient = isEnterpriseDark
+    ? 'linear-gradient(135deg, #007acc, #3794ff)'
+    : 'linear-gradient(135deg, #6366f1, #a855f7)'
+  const mutedText = isDark ? 'var(--app-text-subtle)' : 'var(--app-text-subtle)'
+  const brandTitle = isDark ? 'var(--app-text)' : '#0f172a'
+  const collapseIconColor = isDark ? 'var(--app-text-dim)' : 'var(--app-text-muted)'
+  const githubColor = isDark ? 'var(--app-text-dim)' : 'var(--app-text-subtle)'
 
   return (
     <Layout style={{ height: '100vh', background: shellBg }}>
@@ -71,7 +76,7 @@ export default function AppLayout() {
         }} onClick={() => navigate('/dashboard')}>
           <div style={{
             width: 32, height: 32,
-            background: 'linear-gradient(135deg, #6366f1, #a855f7)',
+            background: logoGradient,
             borderRadius: 8,
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             fontSize: 16, flexShrink: 0,
@@ -81,7 +86,7 @@ export default function AppLayout() {
           {!collapsed && (
             <div>
               <div style={{ color: brandTitle, fontWeight: 700, fontSize: 15, lineHeight: 1.2 }}>ETL Flow</div>
-              <div style={{ color: '#6366f1', fontSize: 10, letterSpacing: '0.05em' }}>PIPELINE PLATFORM</div>
+              <div style={{ color: accentColor, fontSize: 10, letterSpacing: '0.05em' }}>PIPELINE PLATFORM</div>
             </div>
           )}
         </div>
@@ -109,7 +114,7 @@ export default function AppLayout() {
             transition: 'color 0.2s',
           }}
           onClick={() => setCollapsed(!collapsed)}
-          onMouseEnter={(e) => (e.currentTarget.style.color = '#6366f1')}
+          onMouseEnter={(e) => (e.currentTarget.style.color = accentColor)}
           onMouseLeave={(e) => (e.currentTarget.style.color = collapseIconColor)}
         >
           {collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
@@ -144,7 +149,7 @@ export default function AppLayout() {
             </Tooltip>
             <Avatar
               size={28}
-              style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)', cursor: 'pointer', fontSize: 12 }}
+              style={{ background: logoGradient, cursor: 'pointer', fontSize: 12 }}
             >
               U
             </Avatar>

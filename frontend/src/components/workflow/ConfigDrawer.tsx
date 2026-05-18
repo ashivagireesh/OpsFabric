@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import {
   Drawer, Form, Input, Select, Switch, InputNumber,
-  Button, Typography, Space, Tabs, Divider, Tag, Tooltip, Table, notification, Modal, Popover, AutoComplete, Tree, Popconfirm
+  Button, Typography, Space, Tabs, Divider, Tag, Tooltip, Table, notification, Modal, Popover, AutoComplete, Tree, Popconfirm, Collapse
 } from 'antd'
 import { ArrowDownOutlined, ArrowUpOutlined, ArrowsAltOutlined, CloseOutlined, CopyOutlined, DeleteOutlined, InfoCircleOutlined, MinusSquareOutlined, PlusSquareOutlined, ReloadOutlined, SaveOutlined } from '@ant-design/icons'
 import Editor, { type Monaco } from '@monaco-editor/react'
@@ -10,6 +10,7 @@ import { useWorkflowStore } from '../../store'
 import { SourceFilePicker, DestinationPathPicker } from './FilePicker'
 import ConditionBuilderModal from './ConditionBuilderModal'
 import FieldBuilderModal from './FieldBuilderModal'
+import BLWStudio, { type BlwStudioConfig } from './BLWStudio'
 import {
   CUSTOM_FIELD_EXAMPLE_REPOSITORY,
   CUSTOM_FIELD_TIPS_TEXT,
@@ -93,6 +94,56 @@ function getFileType(nodeType: string): string {
   return 'all'
 }
 
+function normalizeViewerFileKind(value: unknown, filePath = ''): 'auto' | 'csv' | 'excel' | 'json' {
+  const raw = String(value || '').trim().toLowerCase()
+  if (raw === 'csv' || raw === 'excel' || raw === 'json') return raw
+  const path = String(filePath || '').trim().toLowerCase()
+  if (path.endsWith('.csv') || path.endsWith('.tsv')) return 'csv'
+  if (path.endsWith('.xlsx') || path.endsWith('.xls')) return 'excel'
+  if (path.endsWith('.json')) return 'json'
+  return 'auto'
+}
+
+function viewerSourceNodeType(kind: string, filePath = ''): 'csv_source' | 'excel_source' | 'json_source' {
+  const normalized = normalizeViewerFileKind(kind, filePath)
+  if (normalized === 'excel') return 'excel_source'
+  if (normalized === 'json') return 'json_source'
+  return 'csv_source'
+}
+
+function jsonViewerText(rows: Record<string, unknown>[], fallback: unknown): string {
+  try {
+    return JSON.stringify(rows.length > 0 ? rows : fallback || [], null, 2)
+  } catch {
+    return '[]'
+  }
+}
+
+type FileViewerTab = {
+  key: string
+  label: string
+  path: string
+  kind: 'csv' | 'excel' | 'json'
+  rows: Record<string, unknown>[]
+  columns: string[]
+  meta: Record<string, unknown>
+  error?: string | null
+  loading?: boolean
+}
+
+type FileViewerFilter = {
+  field: string
+  operator: string
+  value: string
+}
+
+type FileViewerSelectedCell = {
+  tabKey: string
+  rowIndex: number
+  column: string
+  value: unknown
+} | null
+
 interface ConfigDrawerProps {
   open: boolean
   onClose: () => void
@@ -171,7 +222,111 @@ type SnippetPlaceholder = {
   options: string[]
 }
 
-type UiExpressionParameterMode = 'field' | 'values' | 'variable' | 'literal' | 'raw'
+type UiExpressionParameterMode = 'field' | 'number_field' | 'values' | 'declared' | 'metric_path' | 'variable' | 'literal' | 'condition' | 'raw'
+type CustomFieldStudioView = 'workbench' | 'manual'
+type ExpressionStudioTab = 'rules' | 'fields' | 'json'
+type ExpressionStudioRuleType =
+  | 'direct_field'
+  | 'aggregate'
+  | 'unique_profile'
+  | 'if_else'
+  | 'json_object'
+  | 'advanced_function'
+type ExpressionStudioOutputMode = 'value' | 'json'
+type ExpressionStudioFieldDeclMode = 'field' | 'number' | 'expression' | 'literal'
+type ExpressionStudioRecordRow = {
+  key: string
+  section: ExpressionStudioTab
+  sectionLabel: string
+  name: string
+  type: string
+  output: string
+  summary: string
+  enabled?: boolean
+  objectEnabled?: boolean
+  objectName?: string
+  keyName?: string
+  objectRowSpan?: number
+}
+type ExpressionStudioConfigDraft =
+  | { kind: 'field'; isNew: boolean; item: ExpressionStudioFieldDeclaration }
+  | { kind: 'rule'; isNew: boolean; item: ExpressionStudioRule }
+  | { kind: 'json'; isNew: boolean; item: ExpressionStudioJsonDeclaration }
+
+type ExpressionStudioRoleSuggestions = {
+  date: string
+  uniqueId: string
+  aggregate: string
+  grouping: string
+  status: string
+  entity: string
+}
+type ExpressionStudioRoleKey = keyof ExpressionStudioRoleSuggestions
+type ExpressionStudioPersistedConfig = {
+  version: number
+  view: CustomFieldStudioView
+  tab: ExpressionStudioTab
+  roleSelections: Record<ExpressionStudioRoleKey, string[]>
+  fieldDeclarations: ExpressionStudioFieldDeclaration[]
+  rules: ExpressionStudioRule[]
+  jsonDeclarations: ExpressionStudioJsonDeclaration[]
+  lastAppliedSignature: string
+}
+
+type ExpressionStudioRule = {
+  id: string
+  enabled: boolean
+  ruleType: ExpressionStudioRuleType
+  outputName: string
+  outputMode: ExpressionStudioOutputMode
+  sourceField: string
+  aggregate: string
+  uniqueIdField: string
+  groupField: string
+  dateField: string
+  statusField: string
+  successValue: string
+  conditionField: string
+  operator: string
+  compareValue: string
+  thenValue: string
+  elseValue: string
+  templateLabel: string
+  paramValues: Record<number, string>
+  paramModes: Record<number, UiExpressionParameterMode>
+  rawExpression: string
+}
+
+type ExpressionStudioFieldDeclaration = {
+  id: string
+  enabled: boolean
+  name: string
+  mode: ExpressionStudioFieldDeclMode
+  sourceField: string
+  expression: string
+  literalValue: string
+}
+
+type ExpressionStudioJsonDeclaration = {
+  id: string
+  enabled: boolean
+  objectEnabled: boolean
+  objectName: string
+  keyName: string
+  ruleType: ExpressionStudioRuleType
+  sourceField: string
+  aggregate: string
+  uniqueIdField: string
+  conditionField: string
+  operator: string
+  compareValue: string
+  thenValue: string
+  elseValue: string
+  templateLabel: string
+  paramValues: Record<number, string>
+  paramModes: Record<number, UiExpressionParameterMode>
+  expression: string
+}
 
 type UiExpressionVariableSpec = {
   id: string
@@ -185,6 +340,20 @@ type UiGroupAggregateMetric = {
   path: string
   agg: string
 }
+
+const EXPRESSION_STUDIO_GROUP_AGG_KEY_PARAM_INDEX = 9001
+const EXPRESSION_STUDIO_GROUP_AGG_METRICS_PARAM_INDEX = 9002
+const EXPRESSION_STUDIO_GROUP_AGG_NAME_PARAM_INDEX = 9003
+
+type UiAppendUniqueObjectField = {
+  id: string
+  key: string
+  mode: UiExpressionParameterMode
+  value: string
+}
+
+const EXPRESSION_STUDIO_APPEND_OBJECT_PATH_PARAM_INDEX = 9101
+const EXPRESSION_STUDIO_APPEND_OBJECT_FIELDS_PARAM_INDEX = 9102
 
 type UiConditionClauseRightMode = 'literal' | 'field' | 'values' | 'variable' | 'raw'
 type UiConditionLogicalJoin = 'and' | 'or'
@@ -385,6 +554,7 @@ type MLOpsStage2EncodingOperation =
   | 'label_encoding'
   | 'one_hot_encoding'
   | 'ordinal_encoding'
+  | 'binary_encoding'
   | 'target_encoding'
   | 'rare_category_grouping'
 type MLOpsStage2ScalingOperation =
@@ -401,6 +571,9 @@ type MLOpsStage2FieldConfig = {
   missing_values: MLOpsStage2MissingOperation[]
   encoding: MLOpsStage2EncodingOperation[]
   scaling: MLOpsStage2ScalingOperation[]
+  ordinal_mapping: Record<string, number>
+  binary_mapping: Record<string, number>
+  target_encoding_smoothing: number
 }
 
 type MLOpsStage2PreviewSummary = {
@@ -584,7 +757,8 @@ const MLOPS_STAGE2_ENCODING_OPTIONS: Array<{ value: MLOpsStage2EncodingOperation
   { value: 'label_encoding', label: 'Label Encoding' },
   { value: 'one_hot_encoding', label: 'One-Hot Encoding' },
   { value: 'ordinal_encoding', label: 'Ordinal Encoding' },
-  { value: 'target_encoding', label: 'Target Encoding (frequency)' },
+  { value: 'binary_encoding', label: 'Binary Encoding' },
+  { value: 'target_encoding', label: 'Target Encoding' },
   { value: 'rare_category_grouping', label: 'Rare Category Grouping' },
 ]
 const MLOPS_STAGE2_SCALING_OPTIONS: Array<{ value: MLOpsStage2ScalingOperation; label: string }> = [
@@ -1751,6 +1925,11 @@ function normalizeExpressionValue(text: string): string {
   return `=${raw}`
 }
 
+function stripExpressionPrefix(text: string): string {
+  const raw = String(text || '').trim()
+  return raw.startsWith('=') ? raw.slice(1).trim() : raw
+}
+
 function createBreClause(seed?: Partial<BreClause>): BreClause {
   return {
     id: String(seed?.id || `bre_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
@@ -2215,10 +2394,63 @@ function stripEnclosingQuotes(token: string): string {
   return text
 }
 
+function isExpressionPathLikeValue(value: string): boolean {
+  const clean = unwrapOuterExpressionQuotes(stripEnclosingQuotes(String(value || '').trim()))
+  if (!clean || clean.includes('(') || clean.includes(')')) return false
+  return /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(clean)
+}
+
+function isExpressionSimplePathToken(value: string): boolean {
+  const clean = unwrapOuterExpressionQuotes(stripEnclosingQuotes(String(value || '').trim()))
+  if (!clean || clean.includes('(') || clean.includes(')')) return false
+  return /^[A-Za-z_$][\w$]*(?:[.[\]][A-Za-z0-9_$]+)*$/.test(clean)
+}
+
+function isExpressionCallableToken(value: string): boolean {
+  return /^[A-Za-z_$][\w$]*\s*\(/.test(String(value || '').trim())
+}
+
+function parseMetricGetPathToken(token: string): string {
+  const text = stripExpressionPrefix(String(token || '').trim())
+  if (!text) return ''
+  const call = parseTopLevelFunctionCallSource(text)
+  if (!call || String(call.name || '').trim().toLowerCase() !== 'metric_get') return ''
+  const path = stripEnclosingQuotes(String(call.args[0] || '').trim())
+  const metric = stripEnclosingQuotes(String(call.args[1] || '').trim()) || 'value'
+  if (!path) return ''
+  return `${path}.${metric}`
+}
+
+function splitMetricPathReference(value: string): { path: string; metric: string } {
+  const normalized = parseMetricGetPathToken(value)
+    || unwrapOuterExpressionQuotes(stripEnclosingQuotes(stripExpressionPrefix(String(value || '').trim())))
+  const clean = String(normalized || '').trim()
+  if (!clean) return { path: '', metric: 'value' }
+  const lastDot = clean.lastIndexOf('.')
+  if (lastDot > 0 && lastDot < clean.length - 1) {
+    return {
+      path: clean.slice(0, lastDot),
+      metric: clean.slice(lastDot + 1) || 'value',
+    }
+  }
+  return { path: clean, metric: 'value' }
+}
+
+function buildMetricGetTokenFromPath(value: string): string {
+  const { path, metric } = splitMetricPathReference(value)
+  const safePath = path.replace(/'/g, "\\'")
+  const safeMetric = (metric || 'value').replace(/'/g, "\\'")
+  return `metric_get('${safePath}','${safeMetric}')`
+}
+
 function inferUiExpressionModeAndValue(token: string): { mode: UiExpressionParameterMode; value: string } {
   const text = String(token || '').trim()
   if (!text) {
     return { mode: 'literal', value: '' }
+  }
+  const numberFieldValue = unwrapExpressionNumberFieldReference(text)
+  if (numberFieldValue !== text) {
+    return { mode: 'number_field', value: numberFieldValue }
   }
   const fieldMatch = text.match(/^field\(\s*(['"])([\s\S]*)\1\s*\)$/i)
   if (fieldMatch) {
@@ -2227,6 +2459,14 @@ function inferUiExpressionModeAndValue(token: string): { mode: UiExpressionParam
   const valuesMatch = text.match(/^values\(\s*(['"])([\s\S]*)\1\s*\)$/i)
   if (valuesMatch) {
     return { mode: 'values', value: stripEnclosingQuotes(valuesMatch[1] + valuesMatch[2] + valuesMatch[1]) }
+  }
+  const metricPathValue = parseMetricGetPathToken(text)
+  if (metricPathValue) {
+    return { mode: 'metric_path', value: metricPathValue }
+  }
+  const call = parseTopLevelFunctionCallSource(text)
+  if (call && String(call.name || '').trim().toLowerCase() === 'if_') {
+    return { mode: 'condition', value: stripExpressionPrefix(text) }
   }
   if (/^-?\d+(\.\d+)?$/.test(text) || /^(true|false|null)$/i.test(text) || /^(['"]).*\1$/.test(text)) {
     return { mode: 'literal', value: text }
@@ -2279,6 +2519,96 @@ function parseGroupAggregateMetricsFromArg(metricsArg: string): UiGroupAggregate
     )
   })
   return parsed
+}
+
+function parseGroupAggregateExpressionParts(expression: string): {
+  keyField: string
+  keyName: string
+  metrics: UiGroupAggregateMetric[]
+} | null {
+  const body = stripExpressionPrefix(normalizeExpressionValue(expression))
+  const call = parseTopLevelFunctionCallSource(body)
+  if (!call || String(call.name || '').trim().toLowerCase() !== 'group_aggregate') return null
+  const keyField = stripEnclosingQuotes(String(call.args[0] || ''))
+  const metrics = parseGroupAggregateMetricsFromArg(String(call.args[1] || ''))
+  const keyName = stripEnclosingQuotes(String(call.args[2] || '')) || 'group'
+  return { keyField, keyName, metrics }
+}
+
+function serializeGroupAggregateMetrics(metrics: UiGroupAggregateMetric[]): string {
+  try {
+    return JSON.stringify((metrics || []).map((metric) => ({
+      outputName: normalizeUiGroupAggregateOutputName(metric.outputName),
+      path: String(metric.path || ''),
+      agg: EXPR_ALLOWED_AGG_VALUES.has(String(metric.agg || '').toLowerCase())
+        ? String(metric.agg || '').toLowerCase()
+        : 'sum',
+    })))
+  } catch {
+    return '[]'
+  }
+}
+
+function parseSerializedGroupAggregateMetrics(raw: string): UiGroupAggregateMetric[] {
+  const text = String(raw || '').trim()
+  if (!text) return []
+  try {
+    const parsed = JSON.parse(text)
+    if (!Array.isArray(parsed)) return []
+    return parsed.map((item, idx) => createUiGroupAggregateMetric({
+      outputName: normalizeUiGroupAggregateOutputName(String(item?.outputName || `metric_${idx + 1}`)),
+      path: String(item?.path || ''),
+      agg: EXPR_ALLOWED_AGG_VALUES.has(String(item?.agg || '').toLowerCase())
+        ? String(item?.agg || '').toLowerCase()
+        : 'sum',
+    }))
+  } catch {
+    return []
+  }
+}
+
+function buildGroupAggregateExpressionFromParts(
+  keyField: string,
+  keyName: string,
+  metrics: UiGroupAggregateMetric[],
+): string {
+  const safeKeyField = String(keyField || '').trim().replace(/'/g, "\\'")
+  const safeKeyName = (String(keyName || '').trim() || 'group').replace(/'/g, "\\'")
+  const effectiveMetrics = (metrics || [])
+    .map((metric) => ({
+      outputName: normalizeUiGroupAggregateOutputName(String(metric.outputName || '').trim()),
+      path: String(metric.path || '').trim(),
+      agg: String(metric.agg || '').trim().toLowerCase(),
+    }))
+    .filter((metric) => metric.outputName)
+  const metricRows = effectiveMetrics.length > 0
+    ? effectiveMetrics
+    : [{ outputName: 'metric', path: '', agg: 'sum' }]
+  const metricFragments = metricRows.map((metric) => {
+    const metricPath = metric.path.replace(/'/g, "\\'")
+    const metricAgg = EXPR_ALLOWED_AGG_VALUES.has(metric.agg) ? metric.agg : 'sum'
+    return `${metric.outputName}=obj(path='${metricPath}',agg='${metricAgg}')`
+  })
+  return `=group_aggregate('${safeKeyField}', obj(${metricFragments.join(', ')}), '${safeKeyName}')`
+}
+
+function expressionStudioGroupAggregateMetricsFromPlaceholderValues(
+  paramValues: Record<number, string>,
+  fallbackMetrics: UiGroupAggregateMetric[] = [],
+): UiGroupAggregateMetric[] {
+  const serializedMetrics = parseSerializedGroupAggregateMetrics(String(paramValues?.[EXPRESSION_STUDIO_GROUP_AGG_METRICS_PARAM_INDEX] || ''))
+  if (serializedMetrics.length > 0) return serializedMetrics
+  if (fallbackMetrics.length > 0) return fallbackMetrics
+  const outputName = normalizeUiGroupAggregateOutputName(String(paramValues?.[2] || paramValues?.[4] || 'metric'))
+  const path = String(paramValues?.[3] || paramValues?.[6] || '').trim()
+  const aggCandidate = String(paramValues?.[4] || 'sum').trim().toLowerCase()
+  const agg = EXPR_ALLOWED_AGG_VALUES.has(aggCandidate) ? aggCandidate : 'sum'
+  return [createUiGroupAggregateMetric({ outputName, path, agg })]
+}
+
+function isExpressionStudioGroupAggregateTemplate(templateLabel: string, snippet: string): boolean {
+  return extractSnippetFunctionName(snippet).toLowerCase() === 'group_aggregate'
+    || /group_aggregate/i.test(String(templateLabel || ''))
 }
 
 function isFieldLikePlaceholder(placeholder: SnippetPlaceholder): boolean {
@@ -2421,10 +2751,157 @@ function createUiGroupAggregateMetric(seed?: Partial<UiGroupAggregateMetric>): U
   }
 }
 
-function defaultUiExpressionParameterMode(placeholder: SnippetPlaceholder): UiExpressionParameterMode {
-  if (placeholder.kind === 'choice') return 'raw'
-  if (isFieldLikePlaceholder(placeholder)) return 'field'
-  return 'literal'
+function createUiAppendUniqueObjectField(seed?: Partial<UiAppendUniqueObjectField>): UiAppendUniqueObjectField {
+  const rand = Math.random().toString(36).slice(2, 9)
+  const now = Date.now().toString(36)
+  return {
+    id: String(seed?.id || `uiappend_${now}_${rand}`),
+    key: toExpressionKeywordIdentifier(String(seed?.key || 'field')),
+    mode: normalizeUiExpressionParameterMode(seed?.mode || 'literal'),
+    value: String(seed?.value || ''),
+  }
+}
+
+function findTopLevelEqualsIndex(source: string): number {
+  const text = String(source || '')
+  let depthRound = 0
+  let depthSquare = 0
+  let depthCurly = 0
+  let quote: "'" | '"' | null = null
+  let escaped = false
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    if (quote) {
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        continue
+      }
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      continue
+    }
+    if (ch === '(') depthRound += 1
+    else if (ch === ')') depthRound = Math.max(0, depthRound - 1)
+    else if (ch === '[') depthSquare += 1
+    else if (ch === ']') depthSquare = Math.max(0, depthSquare - 1)
+    else if (ch === '{') depthCurly += 1
+    else if (ch === '}') depthCurly = Math.max(0, depthCurly - 1)
+    if (depthRound !== 0 || depthSquare !== 0 || depthCurly !== 0) continue
+    if (ch === '=' && text[i - 1] !== '=' && text[i + 1] !== '=') return i
+  }
+  return -1
+}
+
+function parseObjLiteralEntries(objArg: string): UiAppendUniqueObjectField[] {
+  const raw = String(objArg || '').trim()
+  const objCall = parseTopLevelFunctionCallSource(raw)
+  if (!objCall || String(objCall.name || '').toLowerCase() !== 'obj') return []
+  return (objCall.args || []).map((segment, index) => {
+    const equalIndex = findTopLevelEqualsIndex(segment)
+    if (equalIndex <= 0) return null
+    const key = toExpressionKeywordIdentifier(segment.slice(0, equalIndex).trim() || `field_${index + 1}`)
+    const rhs = String(segment.slice(equalIndex + 1) || '').trim()
+    const inferred = inferUiExpressionModeAndValue(rhs)
+    return createUiAppendUniqueObjectField({
+      key,
+      mode: inferred.mode,
+      value: normalizeUiExpressionParameterValueForMode(inferred.mode, inferred.value),
+    })
+  }).filter((item): item is UiAppendUniqueObjectField => Boolean(item))
+}
+
+function parseAppendUniqueObjectExpressionParts(expression: string): {
+  profilePath: string
+  fields: UiAppendUniqueObjectField[]
+} | null {
+  const body = stripExpressionPrefix(normalizeExpressionValue(expression))
+  const call = parseTopLevelFunctionCallSource(body)
+  if (!call || String(call.name || '').trim().toLowerCase() !== 'append_unique') return null
+  const firstArg = String(call.args[0] || '').trim()
+  const valueArg = String(call.args[1] || '').trim()
+  const prevCall = parseTopLevelFunctionCallSource(firstArg)
+  const profilePath = prevCall && String(prevCall.name || '').toLowerCase() === 'prev'
+    ? stripEnclosingQuotes(String(prevCall.args[0] || '').trim())
+    : stripEnclosingQuotes(firstArg)
+  const fields = parseObjLiteralEntries(valueArg)
+  if (!profilePath || fields.length === 0) return null
+  return { profilePath, fields }
+}
+
+function serializeAppendUniqueObjectFields(fields: UiAppendUniqueObjectField[]): string {
+  try {
+    return JSON.stringify((fields || []).map((field) => ({
+      key: toExpressionKeywordIdentifier(field.key),
+      mode: normalizeUiExpressionParameterMode(field.mode),
+      value: String(field.value || ''),
+    })))
+  } catch {
+    return '[]'
+  }
+}
+
+function parseSerializedAppendUniqueObjectFields(raw: string): UiAppendUniqueObjectField[] {
+  const text = String(raw || '').trim()
+  if (!text) return []
+  try {
+    const parsed = JSON.parse(text)
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .map((item, index) => createUiAppendUniqueObjectField({
+        key: String(item?.key || `field_${index + 1}`),
+        mode: normalizeUiExpressionParameterMode(item?.mode),
+        value: String(item?.value || ''),
+      }))
+      .filter((item) => String(item.key || '').trim())
+  } catch {
+    return []
+  }
+}
+
+function expressionStudioAppendUniqueObjectFieldsFromPlaceholderValues(
+  paramValues: Record<number, string>,
+  fallbackFields: UiAppendUniqueObjectField[] = [],
+): UiAppendUniqueObjectField[] {
+  const parsedFields = parseSerializedAppendUniqueObjectFields(String(paramValues?.[EXPRESSION_STUDIO_APPEND_OBJECT_FIELDS_PARAM_INDEX] || ''))
+  if (parsedFields.length > 0) return parsedFields
+  if (fallbackFields.length > 0) return fallbackFields
+  return [
+    createUiAppendUniqueObjectField({ key: 'workflow_id', mode: 'raw', value: 'str(randint(100000000000000,999999999999999))' }),
+    createUiAppendUniqueObjectField({ key: 'startdate', mode: 'raw', value: 'now()' }),
+    createUiAppendUniqueObjectField({ key: 'enddate', mode: 'literal', value: 'null' }),
+    createUiAppendUniqueObjectField({ key: 'status', mode: 'literal', value: 'active' }),
+  ]
+}
+
+function buildAppendUniqueObjectExpressionFromParts(
+  profilePath: string,
+  fields: UiAppendUniqueObjectField[],
+  variables: UiExpressionVariableSpec[] = [],
+): string {
+  const safeProfilePath = String(profilePath || '').trim().replace(/'/g, "\\'")
+  const effectiveFields = (fields || []).filter((field) => String(field.key || '').trim())
+  const objFields = (effectiveFields.length > 0 ? effectiveFields : expressionStudioAppendUniqueObjectFieldsFromPlaceholderValues({}))
+    .map((field) => {
+      const key = toExpressionKeywordIdentifier(field.key)
+      const mode = normalizeUiExpressionParameterMode(field.mode)
+      const value = resolveUiExpressionParameterToken(mode, String(field.value || ''), variables)
+      return `${key}=${value}`
+    })
+  return `=append_unique(prev('${safeProfilePath}', array()), obj(${objFields.join(', ')}))`
+}
+
+function isExpressionStudioAppendUniqueObjectTemplate(templateLabel: string, snippet: string): boolean {
+  const label = String(templateLabel || '').toLowerCase()
+  const source = String(snippet || '').toLowerCase()
+  return label.includes('append_unique(prev_path,obj)')
+    || (source.includes('append_unique') && source.includes('prev(') && source.includes('obj('))
 }
 
 function toExpressionLiteralToken(value: string): string {
@@ -2438,17 +2915,91 @@ function toExpressionLiteralToken(value: string): string {
   return `'${raw.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`
 }
 
+function unwrapOuterExpressionQuotes(value: string): string {
+  const raw = String(value || '').trim()
+  if (raw.length >= 2) {
+    const first = raw[0]
+    const last = raw[raw.length - 1]
+    if ((first === "'" && last === "'") || (first === '"' && last === '"')) {
+      return raw.slice(1, -1)
+    }
+  }
+  return raw
+}
+
+function unwrapExpressionCallSingleArg(value: string, functionName: string): string {
+  const raw = String(value || '').trim()
+  const escapedName = functionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = raw.match(new RegExp(`^${escapedName}\\(\\s*(['"])(.*?)\\1\\s*\\)$`))
+  return match ? match[2] : raw
+}
+
+function unwrapExpressionFieldReference(value: string): string {
+  return unwrapExpressionCallSingleArg(value, 'field')
+}
+
+function unwrapExpressionValuesReference(value: string): string {
+  return unwrapExpressionCallSingleArg(value, 'values')
+}
+
+function unwrapExpressionNumberFieldReference(value: string, allowPlainFieldFallback = false): string {
+  const raw = String(value || '').trim()
+  const match = raw.match(/^num\(\s*field\(\s*(['"])(.*?)\1\s*\)\s*,\s*[^)]*\)$/i)
+  if (match) return match[2]
+  return allowPlainFieldFallback ? unwrapExpressionFieldReference(raw) : raw
+}
+
+function defaultUiExpressionParameterMode(placeholder: SnippetPlaceholder): UiExpressionParameterMode {
+  const raw = String(placeholder.defaultValue || '').trim()
+  if (placeholder.kind === 'choice') return 'literal'
+  if (raw && unwrapExpressionNumberFieldReference(raw) !== raw) return 'number_field'
+  if (raw && unwrapExpressionValuesReference(raw) !== raw) return 'values'
+  if (raw && unwrapExpressionFieldReference(raw) !== raw) return 'field'
+  if (raw && parseMetricGetPathToken(raw)) return 'metric_path'
+  if (raw && parseTopLevelFunctionCallSource(raw)?.name.toLowerCase() === 'if_') return 'condition'
+  if (raw && isExpressionCallableToken(raw)) return 'raw'
+  if (isFieldLikePlaceholder(placeholder)) return 'field'
+  return 'literal'
+}
+
+function normalizeUiExpressionParameterValueForMode(
+  mode: UiExpressionParameterMode,
+  rawValue: string,
+): string {
+  const raw = String(rawValue || '').trim()
+  if (mode === 'number_field') return unwrapOuterExpressionQuotes(unwrapExpressionNumberFieldReference(raw, true))
+  if (mode === 'field' || mode === 'declared') return unwrapOuterExpressionQuotes(unwrapExpressionFieldReference(raw))
+  if (mode === 'values') return unwrapOuterExpressionQuotes(unwrapExpressionValuesReference(raw))
+  if (mode === 'metric_path') {
+    return parseMetricGetPathToken(raw) || unwrapOuterExpressionQuotes(stripEnclosingQuotes(stripExpressionPrefix(raw)))
+  }
+  if (mode === 'condition') return stripExpressionPrefix(raw)
+  if (mode === 'raw') return raw
+  return unwrapOuterExpressionQuotes(raw)
+}
+
+function defaultUiExpressionParameterValue(placeholder: SnippetPlaceholder): string {
+  const mode = defaultUiExpressionParameterMode(placeholder)
+  return normalizeUiExpressionParameterValueForMode(mode, placeholder.defaultValue || '')
+}
+
 function resolveUiExpressionParameterToken(
   mode: UiExpressionParameterMode,
   rawValue: string,
   variables: UiExpressionVariableSpec[]
 ): string {
-  const value = String(rawValue || '').trim()
-  if (mode === 'field') {
+  const value = normalizeUiExpressionParameterValueForMode(mode, rawValue)
+  if (mode === 'field' || mode === 'declared') {
     return value ? `field('${value.replace(/'/g, "\\'")}')` : "field('')"
+  }
+  if (mode === 'number_field') {
+    return value ? `num(field('${value.replace(/'/g, "\\'")}'),0)` : "num(field(''),0)"
   }
   if (mode === 'values') {
     return value ? `values('${value.replace(/'/g, "\\'")}')` : "values('')"
+  }
+  if (mode === 'metric_path') {
+    return value ? buildMetricGetTokenFromPath(value) : "metric_get('','value')"
   }
   if (mode === 'variable') {
     const variableName = value
@@ -2456,10 +3007,1203 @@ function resolveUiExpressionParameterToken(
     const variableValue = String(variable?.value || '').trim()
     return variableValue || "''"
   }
+  if (mode === 'condition') {
+    return stripExpressionPrefix(value) || 'if_(true, 1, 0)'
+  }
   if (mode === 'raw') {
     return value || "''"
   }
   return toExpressionLiteralToken(value)
+}
+
+function resolveUiExpressionQuotedParameterValue(
+  mode: UiExpressionParameterMode,
+  rawValue: string,
+  variables: UiExpressionVariableSpec[],
+): string {
+  const value = normalizeUiExpressionParameterValueForMode(mode, rawValue)
+  if (mode === 'variable') {
+    const variable = (variables || []).find((item) => String(item.name || '').trim() === value)
+    return String(variable?.value || value || '').trim()
+  }
+  return value
+}
+
+function toExpressionKeywordIdentifier(value: string): string {
+  const raw = unwrapOuterExpressionQuotes(String(value || '').trim())
+  const normalized = raw
+    .replace(/[^A-Za-z0-9_]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+  const safe = normalized || 'key'
+  return /^[A-Za-z_]/.test(safe) ? safe : `k_${safe}`
+}
+
+function isSnippetPlaceholderQuoted(source: string, offset: number, tokenLength: number): boolean {
+  const before = source[offset - 1]
+  const after = source[offset + tokenLength]
+  return (before === "'" && after === "'") || (before === '"' && after === '"')
+}
+
+function isSnippetPlaceholderKeywordArgument(source: string, offset: number, tokenLength: number): boolean {
+  const after = String(source || '').slice(offset + tokenLength)
+  return /^\s*=/.test(after)
+}
+
+function buildExpressionFromSnippetWithUiParameters(
+  snippet: string,
+  placeholders: SnippetPlaceholder[],
+  paramValues: Record<number, string>,
+  paramModes: Record<number, UiExpressionParameterMode>,
+  variables: UiExpressionVariableSpec[] = [],
+): string {
+  const text = String(snippet || '')
+  if (!text) return ''
+  const placeholderByIndex = new Map(placeholders.map((item) => [item.index, item]))
+  const replacePlaceholder = (
+    full: string,
+    indexRaw: string,
+    fallbackRaw: string,
+    offset: number,
+    source: string,
+  ) => {
+    const index = Number(indexRaw)
+    const placeholder = placeholderByIndex.get(index)
+    const fallback = String(fallbackRaw || placeholder?.defaultValue || '')
+    const mode = (paramModes?.[index] || (placeholder ? defaultUiExpressionParameterMode(placeholder) : 'literal')) as UiExpressionParameterMode
+    const raw = String(paramValues?.[index] ?? fallback)
+    if (isSnippetPlaceholderKeywordArgument(source, offset, full.length)) {
+      return toExpressionKeywordIdentifier(resolveUiExpressionQuotedParameterValue(mode, raw, variables))
+    }
+    if (isSnippetPlaceholderQuoted(source, offset, full.length)) {
+      return resolveUiExpressionQuotedParameterValue(mode, raw, variables).replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+    }
+    return resolveUiExpressionParameterToken(mode, raw, variables)
+  }
+  return text
+    .replace(/\$\{(\d+):([^}]+)\}/g, (full, indexRaw, fallbackRaw, offset, source) => (
+      replacePlaceholder(String(full || ''), String(indexRaw || ''), String(fallbackRaw || ''), offset, String(source || ''))
+    ))
+    .replace(/\$\{(\d+)\|([^}]*)\|\}/g, (full, indexRaw, choicesRaw, offset, source) => {
+      const choices = splitSnippetChoiceValues(String(choicesRaw || ''))
+      return replacePlaceholder(String(full || ''), String(indexRaw || ''), String(choices[0] || ''), offset, String(source || ''))
+    })
+    .replace(/\$\d+/g, '')
+}
+
+function expressionStudioParameterMeta(templateLabel: string, placeholder: SnippetPlaceholder): { label: string; description: string } {
+  const template = String(templateLabel || '').toLowerCase()
+  const idx = placeholder.index
+  if (template.includes('anomaly_detection')) {
+    const byIndex: Record<number, { label: string; description: string }> = {
+      1: { label: 'Profile Path', description: 'State path used to store anomaly history.' },
+      2: { label: 'Unique Transaction ID', description: 'Dedupe key for one transaction/event.' },
+      3: { label: 'Amount / Measure Field', description: 'Numeric field evaluated for anomaly score.' },
+      4: { label: 'Event Time Field', description: 'Timestamp used for the rolling window.' },
+      5: { label: 'Partition Field 1', description: 'First grouping dimension, usually account/customer.' },
+      6: { label: 'Partition Field 2', description: 'Second grouping dimension, usually service/channel.' },
+      7: { label: 'Partition Field 3', description: 'Third grouping dimension, usually transaction type.' },
+      8: { label: 'Window', description: 'Lookback period for baseline calculation.' },
+      9: { label: 'Minimum Count', description: 'Minimum events before anomaly evaluation starts.' },
+      10: { label: 'Method', description: 'Anomaly method, for example zscore.' },
+      11: { label: 'Z Threshold', description: 'Score threshold for anomaly flag.' },
+      12: { label: 'Very High Threshold', description: 'Higher score threshold for severe anomaly.' },
+      13: { label: 'Allowed Lateness', description: 'Late-arriving event tolerance.' },
+    }
+    if (byIndex[idx]) return byIndex[idx]
+  }
+  const mode = defaultUiExpressionParameterMode(placeholder)
+  const cleanDefault = normalizeUiExpressionParameterValueForMode(mode, placeholder.defaultValue || '')
+  const modeDescription = mode === 'number_field'
+    ? 'Numeric source field; saved as num(field(...),0).'
+    : mode === 'field'
+      ? 'Source field; saved as field(...).'
+      : mode === 'values'
+        ? 'Grouped values/list field; saved as values(...).'
+        : mode === 'declared'
+          ? 'Previously declared custom field.'
+          : mode === 'metric_path'
+            ? 'Profile metric path; saved as metric_get(...).'
+            : mode === 'condition'
+              ? 'Condition builder; saved as if_(condition, yes, no).'
+              : placeholder.kind === 'choice'
+                ? 'Choose one allowed value.'
+                : 'Function parameter value.'
+  return {
+    label: cleanDefault || `Parameter ${placeholder.index}`,
+    description: modeDescription,
+  }
+}
+
+const EXPRESSION_STUDIO_RULE_TYPE_OPTIONS: Array<{ value: ExpressionStudioRuleType; label: string }> = [
+  { value: 'direct_field', label: 'Direct Field' },
+  { value: 'aggregate', label: 'Aggregate' },
+  { value: 'unique_profile', label: 'Unique Profile' },
+  { value: 'if_else', label: 'If / Else' },
+  { value: 'json_object', label: 'JSON Object' },
+  { value: 'advanced_function', label: 'Advanced Function' },
+]
+
+const EXPRESSION_STUDIO_OUTPUT_MODE_OPTIONS: Array<{ value: ExpressionStudioOutputMode; label: string }> = [
+  { value: 'value', label: 'Single Value' },
+  { value: 'json', label: 'JSON Object' },
+]
+
+const EXPRESSION_STUDIO_FIELD_DECL_MODE_OPTIONS: Array<{ value: ExpressionStudioFieldDeclMode; label: string }> = [
+  { value: 'field', label: 'Field Alias' },
+  { value: 'number', label: 'Number Field' },
+  { value: 'expression', label: 'Expression' },
+  { value: 'literal', label: 'Literal' },
+]
+
+const EXPRESSION_STUDIO_AGG_OPTIONS = [
+  'count',
+  'sum',
+  'avg',
+  'min',
+  'max',
+  'distinct',
+  'count_non_null',
+]
+
+const EXPRESSION_STUDIO_OPERATOR_OPTIONS = [
+  { value: '==', label: 'equals' },
+  { value: '!=', label: 'not equals' },
+  { value: '>', label: 'greater than' },
+  { value: '>=', label: 'greater/equal' },
+  { value: '<', label: 'less than' },
+  { value: '<=', label: 'less/equal' },
+  { value: 'contains', label: 'contains' },
+]
+
+const EXPRESSION_STUDIO_PARAM_MODE_OPTIONS: Array<{ value: UiExpressionParameterMode; label: string }> = [
+  { value: 'field', label: 'Field' },
+  { value: 'number_field', label: 'Number Field' },
+  { value: 'values', label: 'Values/List' },
+  { value: 'declared', label: 'Declared Field' },
+  { value: 'metric_path', label: 'Metric Path' },
+  { value: 'literal', label: 'Literal' },
+  { value: 'condition', label: 'Condition Result' },
+  { value: 'variable', label: 'Variable' },
+  { value: 'raw', label: 'Raw Expression' },
+]
+
+const EXPRESSION_STUDIO_ROLE_CONFIG: Array<{ key: ExpressionStudioRoleKey; label: string }> = [
+  { key: 'uniqueId', label: 'Unique ID' },
+  { key: 'date', label: 'Date/Time' },
+  { key: 'aggregate', label: 'Aggregate' },
+  { key: 'grouping', label: 'Grouping' },
+  { key: 'status', label: 'Status' },
+  { key: 'entity', label: 'Entity' },
+]
+
+function expressionStudioId(prefix: string): string {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+}
+
+function expressionStudioFindField(fields: string[], candidates: string[], fallback = ''): string {
+  const options = uniqueFieldNames(fields || [])
+  if (options.length === 0) return fallback
+  const normalizedCandidates = candidates.map((candidate) => candidate.toLowerCase())
+  const exact = options.find((field) => normalizedCandidates.includes(field.toLowerCase()))
+  if (exact) return exact
+  const compactHit = options.find((field) => {
+    const normalizedField = field.toLowerCase().replace(/[^a-z0-9]/g, '')
+    return normalizedCandidates.some((candidate) => {
+      const compactCandidate = candidate.replace(/[^a-z0-9]/g, '')
+      return compactCandidate && normalizedField.includes(compactCandidate)
+    })
+  })
+  return compactHit || fallback || options[0] || ''
+}
+
+function inferExpressionStudioRoles(fields: string[]): ExpressionStudioRoleSuggestions {
+  return {
+    date: expressionStudioFindField(fields, ['MIS_TXNDATE', 'TXNDATE', 'SERVERTIME', 'created_at', 'event_time', 'txn_date', 'date']),
+    uniqueId: expressionStudioFindField(fields, ['TRANSACTIONID', 'TRANSACTION_ID', 'txn_id', 'RRN', 'id']),
+    aggregate: expressionStudioFindField(fields, ['AMOUNT', 'txn_amount', 'total_amount', 'value', 'price']),
+    grouping: expressionStudioFindField(fields, ['AGENTCODE', 'agent_code', 'SERVICENAME', 'service_name', 'group', 'category']),
+    status: expressionStudioFindField(fields, ['GATEWAYRESPONSECODE', 'RESPTOCLIENT', 'status', 'response_code', 'result']),
+    entity: expressionStudioFindField(fields, ['CUSTACCOUNTNUMBER', 'customer_account', 'customer_id', 'account', 'entity']),
+  }
+}
+
+function expressionStudioRoleSelectionDefaults(roles: ExpressionStudioRoleSuggestions): Record<ExpressionStudioRoleKey, string[]> {
+  return EXPRESSION_STUDIO_ROLE_CONFIG.reduce((acc, item) => {
+    const value = String(roles[item.key] || '').trim()
+    acc[item.key] = value ? [value] : []
+    return acc
+  }, {} as Record<ExpressionStudioRoleKey, string[]>)
+}
+
+function expressionStudioPrimaryRoleField(
+  selections: Record<ExpressionStudioRoleKey, string[]>,
+  autoRoles: ExpressionStudioRoleSuggestions,
+  role: ExpressionStudioRoleKey,
+): string {
+  return String((selections?.[role] || []).find((item) => String(item || '').trim()) || autoRoles[role] || '').trim()
+}
+
+function exprStudioField(field: string): string {
+  const cleaned = String(field || '').trim()
+  return cleaned ? `field('${escapeExprPath(cleaned)}')` : "field('')"
+}
+
+function exprStudioValues(field: string): string {
+  const cleaned = String(field || '').trim()
+  return cleaned ? `values('${escapeExprPath(cleaned)}')` : "values('')"
+}
+
+function exprStudioNumberField(field: string): string {
+  return `num(${exprStudioField(field)},0)`
+}
+
+function exprStudioComparison(leftExpression: string, operator: string, rightValue: string): string {
+  const op = String(operator || '==').trim()
+  const right = toExpressionLiteralToken(rightValue)
+  if (op === 'contains') {
+    return `contains(str(${leftExpression}), ${right})`
+  }
+  return `${leftExpression} ${op || '=='} ${right}`
+}
+
+function expressionStudioDefaultRule(seed?: Partial<ExpressionStudioRule>): ExpressionStudioRule {
+  return {
+    id: seed?.id || expressionStudioId('es_rule'),
+    enabled: seed?.enabled ?? true,
+    ruleType: seed?.ruleType || 'direct_field',
+    outputName: seed?.outputName || 'new_field',
+    outputMode: seed?.outputMode || 'value',
+    sourceField: seed?.sourceField || '',
+    aggregate: seed?.aggregate || 'sum',
+    uniqueIdField: seed?.uniqueIdField || '',
+    groupField: seed?.groupField || '',
+    dateField: seed?.dateField || '',
+    statusField: seed?.statusField || '',
+    successValue: seed?.successValue || '00',
+    conditionField: seed?.conditionField || '',
+    operator: seed?.operator || '==',
+    compareValue: seed?.compareValue || '',
+    thenValue: seed?.thenValue || 'YES',
+    elseValue: seed?.elseValue || 'NO',
+    templateLabel: seed?.templateLabel || EXPRESSION_FUNCTION_SNIPPETS[0]?.label || 'field(path)',
+    paramValues: seed?.paramValues || {},
+    paramModes: seed?.paramModes || {},
+    rawExpression: seed?.rawExpression || '',
+  }
+}
+
+function expressionStudioDefaultFieldDeclaration(seed?: Partial<ExpressionStudioFieldDeclaration>): ExpressionStudioFieldDeclaration {
+  return {
+    id: seed?.id || expressionStudioId('es_field'),
+    enabled: parseBoolLike(seed?.enabled, true),
+    name: seed?.name || 'field_alias',
+    mode: seed?.mode || 'field',
+    sourceField: seed?.sourceField || '',
+    expression: seed?.expression || '',
+    literalValue: seed?.literalValue || '',
+  }
+}
+
+function expressionStudioDefaultJsonDeclaration(seed?: Partial<ExpressionStudioJsonDeclaration>): ExpressionStudioJsonDeclaration {
+  return {
+    id: seed?.id || expressionStudioId('es_json'),
+    enabled: parseBoolLike(seed?.enabled, true),
+    objectEnabled: parseBoolLike(seed?.objectEnabled, true),
+    objectName: seed?.objectName || 'json_profile',
+    keyName: seed?.keyName || 'value',
+    ruleType: seed?.ruleType || 'direct_field',
+    sourceField: seed?.sourceField || '',
+    aggregate: seed?.aggregate || 'sum',
+    uniqueIdField: seed?.uniqueIdField || '',
+    conditionField: seed?.conditionField || '',
+    operator: seed?.operator || '==',
+    compareValue: seed?.compareValue || '',
+    thenValue: seed?.thenValue || 'YES',
+    elseValue: seed?.elseValue || 'NO',
+    templateLabel: seed?.templateLabel || EXPRESSION_FUNCTION_SNIPPETS[0]?.label || 'field(path)',
+    paramValues: seed?.paramValues || {},
+    paramModes: seed?.paramModes || {},
+    expression: seed?.expression || '',
+  }
+}
+
+function normalizeUiExpressionParameterMode(value: unknown): UiExpressionParameterMode {
+  const raw = String(value || '').trim()
+  return raw === 'field'
+    || raw === 'number_field'
+    || raw === 'values'
+    || raw === 'declared'
+    || raw === 'metric_path'
+    || raw === 'variable'
+    || raw === 'literal'
+    || raw === 'condition'
+    || raw === 'raw'
+    ? raw
+    : 'literal'
+}
+
+function parseUiExpressionParamValues(value: unknown): Record<number, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return Object.entries(value as Record<string, unknown>).reduce<Record<number, string>>((acc, [key, raw]) => {
+    const index = Number(key)
+    if (Number.isFinite(index)) acc[index] = String(raw || '')
+    return acc
+  }, {})
+}
+
+function parseUiExpressionParamModes(value: unknown): Record<number, UiExpressionParameterMode> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return Object.entries(value as Record<string, unknown>).reduce<Record<number, UiExpressionParameterMode>>((acc, [key, raw]) => {
+    const index = Number(key)
+    if (Number.isFinite(index)) acc[index] = normalizeUiExpressionParameterMode(raw)
+    return acc
+  }, {})
+}
+
+function parseExpressionStudioFieldDeclarations(value: unknown): ExpressionStudioFieldDeclaration[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null
+      const rec = item as Record<string, unknown>
+      const modeRaw = String(rec.mode || '').trim()
+      const mode: ExpressionStudioFieldDeclMode = (
+        modeRaw === 'number' || modeRaw === 'expression' || modeRaw === 'literal' ? modeRaw : 'field'
+      )
+      return expressionStudioDefaultFieldDeclaration({
+        id: String(rec.id || ''),
+        enabled: parseBoolLike(rec.enabled, true),
+        name: String(rec.name || ''),
+        mode,
+        sourceField: String(rec.sourceField || rec.source_field || ''),
+        expression: String(rec.expression || ''),
+        literalValue: String(rec.literalValue || rec.literal_value || ''),
+      })
+    })
+    .filter((item): item is ExpressionStudioFieldDeclaration => !!item)
+}
+
+function parseExpressionStudioRules(value: unknown): ExpressionStudioRule[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null
+      const rec = item as Record<string, unknown>
+      const ruleTypeRaw = String(rec.ruleType || rec.rule_type || '').trim()
+      const ruleType: ExpressionStudioRuleType = (
+        ruleTypeRaw === 'aggregate'
+        || ruleTypeRaw === 'unique_profile'
+        || ruleTypeRaw === 'if_else'
+        || ruleTypeRaw === 'json_object'
+        || ruleTypeRaw === 'advanced_function'
+          ? ruleTypeRaw
+          : 'direct_field'
+      )
+      const outputModeRaw = String(rec.outputMode || rec.output_mode || '').trim()
+      return expressionStudioDefaultRule({
+        id: String(rec.id || ''),
+        enabled: parseBoolLike(rec.enabled, true),
+        ruleType,
+        outputName: String(rec.outputName || rec.output_name || ''),
+        outputMode: outputModeRaw === 'json' ? 'json' : 'value',
+        sourceField: String(rec.sourceField || rec.source_field || ''),
+        aggregate: String(rec.aggregate || 'sum'),
+        uniqueIdField: String(rec.uniqueIdField || rec.unique_id_field || ''),
+        groupField: String(rec.groupField || rec.group_field || ''),
+        dateField: String(rec.dateField || rec.date_field || ''),
+        statusField: String(rec.statusField || rec.status_field || ''),
+        successValue: String(rec.successValue || rec.success_value || '00'),
+        conditionField: String(rec.conditionField || rec.condition_field || ''),
+        operator: String(rec.operator || '=='),
+        compareValue: String(rec.compareValue || rec.compare_value || ''),
+        thenValue: String(rec.thenValue || rec.then_value || 'YES'),
+        elseValue: String(rec.elseValue || rec.else_value || 'NO'),
+        templateLabel: String(rec.templateLabel || rec.template_label || EXPRESSION_FUNCTION_SNIPPETS[0]?.label || ''),
+        paramValues: parseUiExpressionParamValues(rec.paramValues || rec.param_values),
+        paramModes: parseUiExpressionParamModes(rec.paramModes || rec.param_modes),
+        rawExpression: String(rec.rawExpression || rec.raw_expression || ''),
+      })
+    })
+    .filter((item): item is ExpressionStudioRule => !!item)
+}
+
+function parseExpressionStudioJsonDeclarations(value: unknown): ExpressionStudioJsonDeclaration[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null
+      const rec = item as Record<string, unknown>
+      const ruleTypeRaw = String(rec.ruleType || rec.rule_type || '').trim()
+      const ruleType: ExpressionStudioRuleType = (
+        ruleTypeRaw === 'aggregate'
+        || ruleTypeRaw === 'unique_profile'
+        || ruleTypeRaw === 'if_else'
+        || ruleTypeRaw === 'json_object'
+        || ruleTypeRaw === 'advanced_function'
+          ? ruleTypeRaw
+          : 'direct_field'
+      )
+      return expressionStudioDefaultJsonDeclaration({
+        id: String(rec.id || ''),
+        enabled: parseBoolLike(rec.enabled, true),
+        objectEnabled: parseBoolLike(rec.objectEnabled ?? rec.object_enabled, true),
+        objectName: String(rec.objectName || rec.object_name || 'json_profile'),
+        keyName: String(rec.keyName || rec.key_name || 'value'),
+        ruleType,
+        sourceField: String(rec.sourceField || rec.source_field || ''),
+        aggregate: String(rec.aggregate || 'sum'),
+        uniqueIdField: String(rec.uniqueIdField || rec.unique_id_field || ''),
+        conditionField: String(rec.conditionField || rec.condition_field || ''),
+        operator: String(rec.operator || '=='),
+        compareValue: String(rec.compareValue || rec.compare_value || ''),
+        thenValue: String(rec.thenValue || rec.then_value || 'YES'),
+        elseValue: String(rec.elseValue || rec.else_value || 'NO'),
+        templateLabel: String(rec.templateLabel || rec.template_label || EXPRESSION_FUNCTION_SNIPPETS[0]?.label || ''),
+        paramValues: parseUiExpressionParamValues(rec.paramValues || rec.param_values),
+        paramModes: parseUiExpressionParamModes(rec.paramModes || rec.param_modes),
+        expression: String(rec.expression || ''),
+      })
+    })
+    .filter((item): item is ExpressionStudioJsonDeclaration => !!item)
+}
+
+function parseExpressionStudioRoleSelections(value: unknown, fallbackRoles: ExpressionStudioRoleSuggestions): Record<ExpressionStudioRoleKey, string[]> {
+  const fallback = expressionStudioRoleSelectionDefaults(fallbackRoles)
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return fallback
+  const rec = value as Record<string, unknown>
+  return EXPRESSION_STUDIO_ROLE_CONFIG.reduce((acc, item) => {
+    const parsed = parseStringList(rec[item.key])
+    acc[item.key] = parsed.length > 0 ? parsed : fallback[item.key]
+    return acc
+  }, {} as Record<ExpressionStudioRoleKey, string[]>)
+}
+
+function parseExpressionStudioPersistedConfig(
+  value: unknown,
+  fallbackRoles: ExpressionStudioRoleSuggestions,
+): ExpressionStudioPersistedConfig | null {
+  let raw = value
+  if (typeof raw === 'string') {
+    const text = raw.trim()
+    if (!text) return null
+    try {
+      raw = JSON.parse(text)
+    } catch {
+      return null
+    }
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const rec = raw as Record<string, unknown>
+  const viewRaw = String(rec.view || '').trim()
+  const tabRaw = String(rec.tab || '').trim()
+  return {
+    version: Number(rec.version || 1),
+    view: viewRaw === 'manual' ? 'manual' : 'workbench',
+    tab: tabRaw === 'rules' || tabRaw === 'json' ? tabRaw : 'fields',
+    roleSelections: parseExpressionStudioRoleSelections(rec.roleSelections || rec.role_selections, fallbackRoles),
+    fieldDeclarations: parseExpressionStudioFieldDeclarations(rec.fieldDeclarations || rec.field_declarations),
+    rules: parseExpressionStudioRules(rec.rules),
+    jsonDeclarations: parseExpressionStudioJsonDeclarations(rec.jsonDeclarations || rec.json_declarations),
+    lastAppliedSignature: String(rec.lastAppliedSignature || rec.last_applied_signature || ''),
+  }
+}
+
+function isLegacyDefaultJsonObjectName(value: string): boolean {
+  return String(value || '').trim().toLowerCase() === 'custom_profile'
+}
+
+function removeUnappliedLegacyExpressionStudioJsonDeclarations(
+  rows: ExpressionStudioJsonDeclaration[],
+  appliedCustomFields: CustomFieldSpec[],
+): ExpressionStudioJsonDeclaration[] {
+  const appliedNames = new Set(
+    (appliedCustomFields || [])
+      .map((item) => String(item.name || '').trim().toLowerCase())
+      .filter(Boolean)
+  )
+  if (appliedNames.has('custom_profile')) return rows
+  return (rows || []).filter((row) => !isLegacyDefaultJsonObjectName(row.objectName))
+}
+
+function serializeExpressionStudioPersistedConfig(config: ExpressionStudioPersistedConfig): Record<string, unknown> {
+  return {
+    version: 1,
+    view: config.view,
+    tab: config.tab,
+    roleSelections: config.roleSelections,
+    fieldDeclarations: config.fieldDeclarations,
+    rules: config.rules,
+    jsonDeclarations: config.jsonDeclarations,
+    lastAppliedSignature: config.lastAppliedSignature,
+  }
+}
+
+function expressionStudioDefaultRules(roles: ExpressionStudioRoleSuggestions): ExpressionStudioRule[] {
+  return [
+    expressionStudioDefaultRule({
+      ruleType: 'direct_field',
+      outputName: 'agentcode',
+      sourceField: roles.grouping || roles.entity,
+    }),
+    expressionStudioDefaultRule({
+      ruleType: 'unique_profile',
+      outputName: 'total_txn_count',
+      aggregate: 'count',
+      sourceField: roles.aggregate,
+      uniqueIdField: roles.uniqueId,
+      groupField: roles.grouping,
+    }),
+    expressionStudioDefaultRule({
+      ruleType: 'unique_profile',
+      outputName: 'total_amount',
+      aggregate: 'sum',
+      sourceField: roles.aggregate,
+      uniqueIdField: roles.uniqueId,
+      groupField: roles.grouping,
+    }),
+    expressionStudioDefaultRule({
+      ruleType: 'if_else',
+      outputName: 'risk_band',
+      sourceField: roles.aggregate,
+      operator: '>=',
+      compareValue: '10000',
+      thenValue: 'HIGH',
+      elseValue: 'NORMAL',
+    }),
+  ]
+}
+
+function expressionStudioTemplateExpression(
+  templateLabel: string,
+  paramValues: Record<number, string>,
+  paramModes: Record<number, UiExpressionParameterMode>,
+): string {
+  const template = EXPRESSION_FUNCTION_SNIPPETS.find((item) => item.label === templateLabel) || EXPRESSION_FUNCTION_SNIPPETS[0]
+  const snippet = String(template?.snippet || '')
+  const placeholders = parseSnippetPlaceholders(snippet)
+  if (isExpressionStudioGroupAggregateTemplate(String(template?.label || templateLabel || ''), snippet)) {
+    const defaultParts = parseGroupAggregateExpressionParts(
+      buildExpressionFromSnippetWithUiParameters(snippet, placeholders, paramValues, paramModes)
+    )
+    const keyField = String(
+      paramValues?.[EXPRESSION_STUDIO_GROUP_AGG_KEY_PARAM_INDEX]
+      || defaultParts?.keyField
+      || paramValues?.[1]
+      || ''
+    )
+    const keyName = String(
+      paramValues?.[EXPRESSION_STUDIO_GROUP_AGG_NAME_PARAM_INDEX]
+      || defaultParts?.keyName
+      || paramValues?.[5]
+      || paramValues?.[7]
+      || 'group'
+    )
+    return normalizeExpressionValue(buildGroupAggregateExpressionFromParts(
+      keyField,
+      keyName,
+      expressionStudioGroupAggregateMetricsFromPlaceholderValues(paramValues || {}, defaultParts?.metrics || []),
+    ))
+  }
+  if (isExpressionStudioAppendUniqueObjectTemplate(String(template?.label || templateLabel || ''), snippet)) {
+    const defaultParts = parseAppendUniqueObjectExpressionParts(
+      buildExpressionFromSnippetWithUiParameters(snippet, placeholders, paramValues, paramModes)
+    )
+    const profilePath = String(
+      paramValues?.[EXPRESSION_STUDIO_APPEND_OBJECT_PATH_PARAM_INDEX]
+      || defaultParts?.profilePath
+      || paramValues?.[1]
+      || 'workflow'
+    )
+    return normalizeExpressionValue(buildAppendUniqueObjectExpressionFromParts(
+      profilePath,
+      expressionStudioAppendUniqueObjectFieldsFromPlaceholderValues(paramValues || {}, defaultParts?.fields || []),
+    ))
+  }
+  return normalizeExpressionValue(buildExpressionFromSnippetWithUiParameters(snippet, placeholders, paramValues, paramModes))
+}
+
+function expressionStudioRuleExpression(rule: ExpressionStudioRule, fnsVersion: CustomFnsVersion): string {
+  const source = String(rule.sourceField || '').trim()
+  const uniqueId = String(rule.uniqueIdField || '').trim()
+  const outputName = String(rule.outputName || 'metric').trim() || 'metric'
+  const agg = String(rule.aggregate || 'sum').trim().toLowerCase()
+
+  if (rule.ruleType === 'advanced_function') {
+    return normalizeExpressionValue(rule.rawExpression || expressionStudioTemplateExpression(rule.templateLabel, rule.paramValues, rule.paramModes))
+  }
+  if (rule.ruleType === 'if_else') {
+    const left = source ? exprStudioNumberField(source) : '0'
+    const condition = exprStudioComparison(left, rule.operator, rule.compareValue || '0')
+    return `=if_(${condition}, ${toExpressionLiteralToken(rule.thenValue)}, ${toExpressionLiteralToken(rule.elseValue)})`
+  }
+  if (rule.ruleType === 'aggregate') {
+    if (agg === 'distinct') return `=count(agg(${exprStudioValues(source)}, 'distinct'))`
+    const aggName = agg === 'count_non_null' ? 'count' : agg
+    return `=agg(${exprStudioValues(source)}, '${escapeExprPath(aggName)}')`
+  }
+  if (rule.ruleType === 'unique_profile') {
+    const keyExpr = exprStudioField(uniqueId)
+    if (fnsVersion === 'v2' && uniqueId) {
+      if (agg === 'count') return `=unique_count('${escapeExprPath(outputName)}', ${keyExpr})`
+      if (agg === 'avg' || agg === 'mean') return `=unique_avg('${escapeExprPath(outputName)}', ${keyExpr}, ${exprStudioNumberField(source)})`
+      if (agg === 'min') return `=unique_min('${escapeExprPath(outputName)}', ${keyExpr}, ${exprStudioNumberField(source)})`
+      if (agg === 'max') return `=unique_max('${escapeExprPath(outputName)}', ${keyExpr}, ${exprStudioNumberField(source)})`
+      if (agg === 'distinct') return `=unique_metric('${escapeExprPath(outputName)}', ${keyExpr}, 'distinct_count', ${exprStudioField(source)})`
+      return `=unique_sum('${escapeExprPath(outputName)}', ${keyExpr}, ${exprStudioNumberField(source)})`
+    }
+    if (agg === 'distinct') return `=count(agg(${exprStudioValues(source)}, 'distinct'))`
+    const fallbackAgg = agg === 'count_non_null' ? 'count' : agg
+    return `=agg(${exprStudioValues(agg === 'count' ? (uniqueId || source) : source)}, '${escapeExprPath(fallbackAgg)}')`
+  }
+  if (rule.ruleType === 'json_object') {
+    return rule.rawExpression || '{}'
+  }
+  return `=${exprStudioField(source)}`
+}
+
+function expressionStudioFieldDeclarationSpec(decl: ExpressionStudioFieldDeclaration): Partial<CustomFieldSpec> | null {
+  if (!decl.enabled) return null
+  const name = String(decl.name || '').trim()
+  if (!name) return null
+  const expression = expressionStudioFieldDeclarationExpression(decl)
+  if (!expression.trim()) return null
+  return {
+    name,
+    mode: 'value',
+    singleValueOutput: 'json',
+    expression,
+  }
+}
+
+function expressionStudioFieldDeclarationExpression(decl: ExpressionStudioFieldDeclaration): string {
+  if (decl.mode === 'field') return `=${exprStudioField(decl.sourceField)}`
+  if (decl.mode === 'number') return `=${exprStudioNumberField(decl.sourceField)}`
+  if (decl.mode === 'literal') return `=${toExpressionLiteralToken(decl.literalValue)}`
+  return normalizeExpressionValue(decl.expression)
+}
+
+function expressionStudioJsonKeyExpression(row: ExpressionStudioJsonDeclaration, fnsVersion: CustomFnsVersion): string {
+  const effectiveRow = expressionStudioStructuredJsonDeclaration(row)
+  if (String(effectiveRow.expression || '').trim()) return normalizeExpressionValue(effectiveRow.expression)
+  const tempRule = expressionStudioDefaultRule({
+    ruleType: effectiveRow.ruleType,
+    outputName: effectiveRow.keyName || 'value',
+    sourceField: effectiveRow.sourceField,
+    aggregate: effectiveRow.aggregate,
+    uniqueIdField: effectiveRow.uniqueIdField,
+    conditionField: effectiveRow.conditionField,
+    operator: effectiveRow.operator,
+    compareValue: effectiveRow.compareValue,
+    thenValue: effectiveRow.thenValue,
+    elseValue: effectiveRow.elseValue,
+    templateLabel: effectiveRow.templateLabel,
+    paramValues: effectiveRow.paramValues,
+    paramModes: effectiveRow.paramModes,
+  })
+  return expressionStudioRuleExpression(tempRule, fnsVersion)
+}
+
+function expressionStudioJsonSpecs(rows: ExpressionStudioJsonDeclaration[], fnsVersion: CustomFnsVersion): Array<Partial<CustomFieldSpec>> {
+  const grouped = new Map<string, Record<string, string>>()
+  ;(rows || []).forEach((row) => {
+    if (!row.objectEnabled || !row.enabled) return
+    const objectName = String(row.objectName || '').trim()
+    const keyName = String(row.keyName || '').trim()
+    if (!objectName || !keyName) return
+    const current = grouped.get(objectName) || {}
+    current[keyName] = expressionStudioJsonKeyExpression(row, fnsVersion)
+    grouped.set(objectName, current)
+  })
+  return Array.from(grouped.entries()).map(([name, template]) => ({
+    name,
+    mode: 'json' as CustomFieldMode,
+    jsonTemplate: JSON.stringify(template, null, 2),
+    enabled: true,
+  }))
+}
+
+function expressionStudioRuleSpec(rule: ExpressionStudioRule, fnsVersion: CustomFnsVersion): Partial<CustomFieldSpec> | null {
+  if (!rule.enabled) return null
+  const name = String(rule.outputName || '').trim()
+  if (!name) return null
+  const expression = normalizeExpressionValue(expressionStudioRuleExpression(rule, fnsVersion))
+  if (!expression.trim()) return null
+  if (rule.outputMode === 'json') {
+    return {
+      name,
+      mode: 'json',
+      jsonTemplate: JSON.stringify({ value: expression }, null, 2),
+      enabled: true,
+    }
+  }
+  return {
+    name,
+    mode: 'value',
+    singleValueOutput: 'json',
+    expression,
+    enabled: true,
+  }
+}
+
+function expressionStudioBuildSpecs(
+  fieldDeclarations: ExpressionStudioFieldDeclaration[],
+  rules: ExpressionStudioRule[],
+  jsonDeclarations: ExpressionStudioJsonDeclaration[],
+  fnsVersion: CustomFnsVersion,
+): Array<Partial<CustomFieldSpec>> {
+  const fieldSpecs = (fieldDeclarations || [])
+    .map((decl) => expressionStudioFieldDeclarationSpec(decl))
+    .filter((item): item is Partial<CustomFieldSpec> => Boolean(item))
+  const ruleSpecs = (rules || [])
+    .map((rule) => expressionStudioRuleSpec(rule, fnsVersion))
+    .filter((item): item is Partial<CustomFieldSpec> => Boolean(item))
+  return [
+    ...fieldSpecs,
+    ...ruleSpecs,
+    ...expressionStudioJsonSpecs(jsonDeclarations || [], fnsVersion),
+  ]
+}
+
+function expressionStudioPreviewOutputValue(item: Partial<CustomFieldSpec>): unknown {
+  if (item.mode !== 'json') return item.expression || ''
+  const template = String(item.jsonTemplate || '').trim()
+  if (!template) return {}
+  try {
+    return JSON.parse(template)
+  } catch {
+    return template
+  }
+}
+
+function expressionStudioJsonTemplateValueToExpression(value: unknown): string {
+  if (typeof value === 'string') {
+    const text = String(value || '').trim()
+    if (text.startsWith('=')) return normalizeExpressionValue(text)
+    return `=${toExpressionLiteralToken(value)}`
+  }
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? `=${value}` : '=null'
+  }
+  if (typeof value === 'boolean') {
+    return value ? '=true' : '=false'
+  }
+  if (value === null || value === undefined) {
+    return '=null'
+  }
+  if (Array.isArray(value)) {
+    const items = value.map((item) => stripExpressionPrefix(expressionStudioJsonTemplateValueToExpression(item)))
+    return `=array(${items.join(', ')})`
+  }
+  if (typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .map(([key, child]) => `${toExpressionKeywordIdentifier(key)}=${stripExpressionPrefix(expressionStudioJsonTemplateValueToExpression(child))}`)
+    return `=obj(${entries.join(', ')})`
+  }
+  return `=${toExpressionLiteralToken(String(value ?? ''))}`
+}
+
+function expressionStudioFlexibleRegexStatic(text: string): string {
+  return String(text || '')
+    .split(/(\s+)/)
+    .map((part) => {
+      if (!part) return ''
+      if (/^\s+$/.test(part)) return '\\s*'
+      return part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    })
+    .join('')
+}
+
+type ExpressionStudioSnippetParamMapping = {
+  paramValues: Record<number, string>
+  paramModes: Record<number, UiExpressionParameterMode>
+}
+
+function expressionStudioMappedPlaceholderMode(
+  raw: string,
+  placeholder: SnippetPlaceholder,
+  preferDeclaredPath = false,
+): { mode: UiExpressionParameterMode; value: string } {
+  const rawText = String(raw || '').trim()
+  const defaultMode = defaultUiExpressionParameterMode(placeholder)
+  const inferred = inferUiExpressionModeAndValue(rawText)
+  const fieldWrappingMode = defaultMode === 'field' || defaultMode === 'number_field' || defaultMode === 'values'
+  const wantsDeclaredPath = (
+    !fieldWrappingMode
+    && (
+      isExpressionPathLikeValue(placeholder.defaultValue)
+      || isExpressionPathLikeValue(rawText)
+      || (preferDeclaredPath && isExpressionSimplePathToken(rawText))
+    )
+  )
+  const mode = wantsDeclaredPath
+    ? 'declared'
+    : (
+      inferred.mode === 'field'
+      || inferred.mode === 'number_field'
+      || inferred.mode === 'values'
+      || defaultMode === 'field'
+      || defaultMode === 'number_field'
+      || defaultMode === 'values'
+        ? (inferred.mode === 'raw' || inferred.mode === 'literal' ? defaultMode : inferred.mode)
+        : inferred.mode
+    )
+  return {
+    mode,
+    value: normalizeUiExpressionParameterValueForMode(mode, rawText),
+  }
+}
+
+function expressionStudioSetMappedPlaceholder(
+  mapping: ExpressionStudioSnippetParamMapping,
+  index: number,
+  raw: string,
+  placeholderByIndex: Map<number, SnippetPlaceholder>,
+  preferDeclaredPath = false,
+): boolean {
+  if (!Number.isFinite(index) || mapping.paramValues[index] !== undefined) return true
+  const placeholder = placeholderByIndex.get(index)
+  if (!placeholder) return false
+  const rawText = String(raw || '').trim()
+  if (!rawText) return false
+  const defaultMode = defaultUiExpressionParameterMode(placeholder)
+  if (
+    preferDeclaredPath
+    && defaultMode !== 'field'
+    && defaultMode !== 'number_field'
+    && defaultMode !== 'values'
+    && isExpressionCallableToken(rawText)
+    && !/^(['"]).*\1$/.test(rawText)
+  ) {
+    return false
+  }
+  const mapped = expressionStudioMappedPlaceholderMode(rawText, placeholder, preferDeclaredPath)
+  mapping.paramModes[index] = mapped.mode
+  mapping.paramValues[index] = mapped.value
+  return true
+}
+
+function expressionStudioMapSnippetPatternPart(
+  templatePart: string,
+  actualPart: string,
+  placeholderByIndex: Map<number, SnippetPlaceholder>,
+  mapping: ExpressionStudioSnippetParamMapping,
+): boolean {
+  const templateText = String(templatePart || '').trim()
+  const actualText = String(actualPart || '').trim()
+  if (!templateText || !actualText) return false
+
+  const placeholderRegex = /\$\{(\d+):([^}]+)\}|\$\{(\d+)\|([^}]*)\|\}/g
+  const placeholderMatches = Array.from(templateText.matchAll(placeholderRegex))
+  if (placeholderMatches.length === 0) return false
+
+  if (placeholderMatches.length === 1) {
+    const only = placeholderMatches[0]
+    const token = String(only[0] || '')
+    const before = templateText.slice(0, Number(only.index || 0)).trim()
+    const after = templateText.slice(Number(only.index || 0) + token.length).trim()
+    const quotedDirect = before.length === 1 && after === before && (before === "'" || before === '"')
+    const bareDirect = !before && !after
+    if (bareDirect || quotedDirect) {
+      const index = Number(only[1] || only[3])
+      return expressionStudioSetMappedPlaceholder(
+        mapping,
+        index,
+        actualText,
+        placeholderByIndex,
+        quotedDirect,
+      )
+    }
+  }
+
+  const captures: Array<{ index: number; preferDeclaredPath: boolean }> = []
+  let pattern = '^\\s*'
+  let lastIndex = 0
+  let match = placeholderRegex.exec(templateText)
+  while (match) {
+    pattern += expressionStudioFlexibleRegexStatic(templateText.slice(lastIndex, match.index))
+    const index = Number(match[1] || match[3])
+    captures.push({
+      index,
+      preferDeclaredPath: isSnippetPlaceholderQuoted(templateText, match.index, String(match[0] || '').length),
+    })
+    pattern += '([\\s\\S]*?)'
+    lastIndex = match.index + String(match[0] || '').length
+    match = placeholderRegex.exec(templateText)
+  }
+  pattern += expressionStudioFlexibleRegexStatic(templateText.slice(lastIndex))
+  pattern += '\\s*$'
+
+  let regex: RegExp
+  try {
+    regex = new RegExp(pattern, 'i')
+  } catch {
+    return false
+  }
+  const result = actualText.match(regex)
+  if (!result) return false
+  return captures.every((capture, idx) => (
+    expressionStudioSetMappedPlaceholder(
+      mapping,
+      capture.index,
+      String(result[idx + 1] || '').trim(),
+      placeholderByIndex,
+      capture.preferDeclaredPath,
+    )
+  ))
+}
+
+function expressionStudioMapExpressionToSnippetParameters(
+  expression: string,
+  snippet: string,
+): { paramValues: Record<number, string>; paramModes: Record<number, UiExpressionParameterMode> } | null {
+  const body = stripExpressionPrefix(expression)
+  const template = String(snippet || '').trim()
+  if (!body || !template) return null
+  const placeholderByIndex = new Map<number, SnippetPlaceholder>()
+  parseSnippetPlaceholders(template).forEach((placeholder) => {
+    placeholderByIndex.set(placeholder.index, placeholder)
+  })
+
+  const mapping: ExpressionStudioSnippetParamMapping = { paramValues: {}, paramModes: {} }
+  const bodyCall = parseTopLevelFunctionCallSource(body)
+  const templateCall = parseTopLevelFunctionCallSource(template)
+  if (
+    bodyCall
+    && templateCall
+    && String(bodyCall.name || '').trim().toLowerCase() === String(templateCall.name || '').trim().toLowerCase()
+  ) {
+    let mappingFailed = false
+    templateCall.args.forEach((templateArg, index) => {
+      const actualArg = bodyCall.args[index]
+      if (actualArg === undefined) return
+      const hasPlaceholder = /\$\{(\d+):([^}]+)\}|\$\{(\d+)\|([^}]*)\|\}/.test(String(templateArg || ''))
+      if (!hasPlaceholder) return
+      const mapped = expressionStudioMapSnippetPatternPart(templateArg, actualArg, placeholderByIndex, mapping)
+      if (!mapped) mappingFailed = true
+    })
+    if (!mappingFailed && Object.keys(mapping.paramValues).length > 0) return mapping
+    if (mappingFailed) return null
+  }
+
+  const captures: number[] = []
+  const placeholderRegex = /\$\{(\d+):([^}]+)\}|\$\{(\d+)\|([^}]*)\|\}/g
+  let pattern = '^\\s*'
+  let lastIndex = 0
+  let match = placeholderRegex.exec(template)
+  while (match) {
+    pattern += expressionStudioFlexibleRegexStatic(template.slice(lastIndex, match.index))
+    const index = Number(match[1] || match[3])
+    captures.push(index)
+    pattern += '([\\s\\S]*?)'
+    lastIndex = match.index + String(match[0] || '').length
+    match = placeholderRegex.exec(template)
+  }
+  pattern += expressionStudioFlexibleRegexStatic(template.slice(lastIndex))
+  pattern += '\\s*$'
+
+  let regex: RegExp
+  try {
+    regex = new RegExp(pattern, 'i')
+  } catch {
+    return null
+  }
+  const result = body.match(regex)
+  if (!result) return null
+
+  captures.forEach((index, idx) => {
+    const raw = String(result[idx + 1] || '').trim()
+    expressionStudioSetMappedPlaceholder(mapping, index, raw, placeholderByIndex)
+  })
+
+  return Object.keys(mapping.paramValues).length > 0 ? mapping : null
+}
+
+function expressionStudioAdvancedSeedFromExpression(
+  expression: string,
+): Pick<ExpressionStudioRule, 'templateLabel' | 'paramValues' | 'paramModes' | 'rawExpression'> | null {
+  const normalized = normalizeExpressionValue(expression)
+  const body = stripExpressionPrefix(normalized)
+  const call = parseTopLevelFunctionCallSource(body)
+  if (!call) return null
+  const fnName = String(call.name || '').trim().toLowerCase()
+  if (!fnName) return null
+  const candidates = EXPRESSION_FUNCTION_SNIPPETS
+    .filter((item) => extractSnippetFunctionName(String(item.snippet || '')).toLowerCase() === fnName)
+    .sort((left, right) => String(right.snippet || '').length - String(left.snippet || '').length)
+  if (fnName === 'group_aggregate') {
+    const parsed = parseGroupAggregateExpressionParts(normalized)
+    const candidate = candidates.find((item) => String(item.label || '') === 'group_aggregate(key,metrics,name)')
+      || candidates.find((item) => String(item.label || '').toLowerCase().includes('group_aggregate'))
+      || candidates[0]
+    if (parsed && candidate) {
+      return {
+        templateLabel: String(candidate.label || ''),
+        paramValues: {
+          [EXPRESSION_STUDIO_GROUP_AGG_KEY_PARAM_INDEX]: parsed.keyField,
+          [EXPRESSION_STUDIO_GROUP_AGG_METRICS_PARAM_INDEX]: serializeGroupAggregateMetrics(parsed.metrics),
+          [EXPRESSION_STUDIO_GROUP_AGG_NAME_PARAM_INDEX]: parsed.keyName,
+        },
+        paramModes: {
+          [EXPRESSION_STUDIO_GROUP_AGG_KEY_PARAM_INDEX]: 'field',
+          [EXPRESSION_STUDIO_GROUP_AGG_NAME_PARAM_INDEX]: 'literal',
+        },
+        rawExpression: '',
+      }
+    }
+  }
+  if (fnName === 'append_unique') {
+    const parsed = parseAppendUniqueObjectExpressionParts(normalized)
+    const candidate = candidates.find((item) => isExpressionStudioAppendUniqueObjectTemplate(String(item.label || ''), String(item.snippet || '')))
+    if (parsed && candidate) {
+      return {
+        templateLabel: String(candidate.label || ''),
+        paramValues: {
+          [EXPRESSION_STUDIO_APPEND_OBJECT_PATH_PARAM_INDEX]: parsed.profilePath,
+          [EXPRESSION_STUDIO_APPEND_OBJECT_FIELDS_PARAM_INDEX]: serializeAppendUniqueObjectFields(parsed.fields),
+        },
+        paramModes: {
+          [EXPRESSION_STUDIO_APPEND_OBJECT_PATH_PARAM_INDEX]: 'literal',
+        },
+        rawExpression: '',
+      }
+    }
+  }
+  for (const candidate of candidates) {
+    const mapped = expressionStudioMapExpressionToSnippetParameters(normalized, String(candidate.snippet || ''))
+    if (!mapped) continue
+    return {
+      templateLabel: String(candidate.label || ''),
+      paramValues: mapped.paramValues,
+      paramModes: mapped.paramModes,
+      rawExpression: '',
+    }
+  }
+  const fallback = candidates[0]
+  if (fallback) {
+    const snippet = String(fallback.snippet || '')
+    const placeholders = parseSnippetPlaceholders(snippet)
+    return {
+      templateLabel: String(fallback.label || ''),
+      paramValues: placeholders.reduce<Record<number, string>>((acc, placeholder) => {
+        acc[placeholder.index] = defaultUiExpressionParameterValue(placeholder)
+        return acc
+      }, {}),
+      paramModes: placeholders.reduce<Record<number, UiExpressionParameterMode>>((acc, placeholder) => {
+        acc[placeholder.index] = defaultUiExpressionParameterMode(placeholder)
+        return acc
+      }, {}),
+      rawExpression: normalized,
+    }
+  }
+  return null
+}
+
+function expressionStudioStructuredJsonDeclaration(row: ExpressionStudioJsonDeclaration): ExpressionStudioJsonDeclaration {
+  const expression = String(row.expression || '').trim()
+  if (!expression || row.ruleType !== 'advanced_function') return row
+  const advancedSeed = expressionStudioAdvancedSeedFromExpression(expression)
+  if (!advancedSeed || String(advancedSeed.rawExpression || '').trim()) return row
+  return {
+    ...row,
+    templateLabel: advancedSeed.templateLabel,
+    paramValues: advancedSeed.paramValues,
+    paramModes: advancedSeed.paramModes,
+    expression: '',
+  }
+}
+
+function expressionStudioExpressionHasEmptyFieldReference(expression: string): boolean {
+  return /\b(?:field|values)\(''\)/.test(String(expression || ''))
+}
+
+function expressionStudioCollectBuildIssues(
+  fieldDeclarations: ExpressionStudioFieldDeclaration[],
+  rules: ExpressionStudioRule[],
+  jsonDeclarations: ExpressionStudioJsonDeclaration[],
+  fnsVersion: CustomFnsVersion,
+): string[] {
+  const issues: string[] = []
+  const addIssue = (message: string) => {
+    const clean = String(message || '').trim()
+    if (clean && !issues.includes(clean)) issues.push(clean)
+  }
+
+  ;(fieldDeclarations || []).forEach((decl, index) => {
+    if (!decl.enabled) return
+    const label = String(decl.name || '').trim() || `Field declaration #${index + 1}`
+    if (!String(decl.name || '').trim()) addIssue(`${label}: field name is required.`)
+    if ((decl.mode === 'field' || decl.mode === 'number') && !String(decl.sourceField || '').trim()) {
+      addIssue(`${label}: source field is required.`)
+    }
+    if (decl.mode === 'expression' && !String(decl.expression || '').trim()) {
+      addIssue(`${label}: expression is required.`)
+    }
+    const spec = expressionStudioFieldDeclarationSpec(decl)
+    const expression = String(spec?.expression || '')
+    if (expressionStudioExpressionHasEmptyFieldReference(expression)) {
+      addIssue(`${label}: generated expression contains empty field reference.`)
+    }
+  })
+
+  ;(rules || []).forEach((rule, index) => {
+    if (!rule.enabled) return
+    const label = String(rule.outputName || '').trim() || `Rule #${index + 1}`
+    if (!String(rule.outputName || '').trim()) addIssue(`${label}: output field name is required.`)
+    if (rule.ruleType === 'direct_field' && !String(rule.sourceField || '').trim()) {
+      addIssue(`${label}: source field is required.`)
+    }
+    if (rule.ruleType === 'aggregate' && !String(rule.sourceField || '').trim()) {
+      addIssue(`${label}: aggregate source field is required.`)
+    }
+    if (rule.ruleType === 'unique_profile') {
+      if (!String(rule.uniqueIdField || '').trim()) addIssue(`${label}: unique id field is required.`)
+      if (String(rule.aggregate || '').toLowerCase() !== 'count' && !String(rule.sourceField || '').trim()) {
+        addIssue(`${label}: metric source field is required for ${rule.aggregate || 'aggregate'}.`)
+      }
+    }
+    if (rule.ruleType === 'if_else' && !String(rule.sourceField || '').trim()) {
+      addIssue(`${label}: condition field is required.`)
+    }
+    if (rule.ruleType === 'advanced_function') {
+      const expression = expressionStudioRuleExpression(rule, fnsVersion)
+      if (!String(expression || '').trim()) addIssue(`${label}: advanced function expression is empty.`)
+    }
+    const expression = expressionStudioRuleExpression(rule, fnsVersion)
+    if (expressionStudioExpressionHasEmptyFieldReference(expression)) {
+      addIssue(`${label}: generated expression contains empty field reference.`)
+    }
+  })
+
+  ;(jsonDeclarations || []).forEach((row, index) => {
+    if (!row.objectEnabled || !row.enabled) return
+    const label = `${String(row.objectName || '').trim() || `JSON object #${index + 1}`}.${String(row.keyName || '').trim() || 'key'}`
+    if (!String(row.objectName || '').trim()) addIssue(`${label}: object name is required.`)
+    if (!String(row.keyName || '').trim()) addIssue(`${label}: JSON key name is required.`)
+    if (!String(row.expression || '').trim()) {
+      if (row.ruleType === 'direct_field' && !String(row.sourceField || '').trim()) {
+        addIssue(`${label}: source field is required.`)
+      }
+      if (row.ruleType === 'aggregate' && !String(row.sourceField || '').trim()) {
+        addIssue(`${label}: aggregate source field is required.`)
+      }
+      if (row.ruleType === 'unique_profile') {
+        if (!String(row.uniqueIdField || '').trim()) addIssue(`${label}: unique id field is required.`)
+        if (String(row.aggregate || '').toLowerCase() !== 'count' && !String(row.sourceField || '').trim()) {
+          addIssue(`${label}: metric source field is required for ${row.aggregate || 'aggregate'}.`)
+        }
+      }
+      if (row.ruleType === 'if_else' && !String(row.sourceField || '').trim()) {
+        addIssue(`${label}: condition field is required.`)
+      }
+    }
+    const expression = expressionStudioJsonKeyExpression(row, fnsVersion)
+    if (expressionStudioExpressionHasEmptyFieldReference(expression)) {
+      addIssue(`${label}: generated expression contains empty field reference.`)
+    }
+  })
+
+  return issues
 }
 
 function enrichFunctionSnippetWithFieldChoices(snippet: string, fieldNames: string[]): string {
@@ -5385,11 +7129,14 @@ function parseCustomFieldSpecs(value: unknown): CustomFieldSpec[] {
       })
     )
   })
-  return out
+  return out.filter((item) => !isLegacyDefaultJsonObjectName(item.name))
 }
 
 function serializeCustomFieldSpecs(items: CustomFieldSpec[]): Array<Record<string, unknown>> {
   return items
+    // custom_profile is reserved for the profile-engine config prefix; older
+    // Expression Studio drafts used it as a default object name.
+    .filter((item) => !isLegacyDefaultJsonObjectName(item.name))
     .map((item) => ({
       id: String(item.id || '').trim(),
       name: String(item.name || '').trim(),
@@ -5475,13 +7222,98 @@ function extractJsonTemplateKeyPaths(jsonTemplate: string): string[] {
   }
 }
 
+function expressionStudioProfilePathFirstArg(expression: string): { fnName: string; pathName: string; args: string[] } | null {
+  const call = parseTopLevelFunctionCallSource(stripExpressionPrefix(expression))
+  if (!call || call.args.length === 0) return null
+  const pathName = stripEnclosingQuotes(call.args[0])
+  if (!pathName) return null
+  return { fnName: String(call.name || '').trim().toLowerCase(), pathName, args: call.args }
+}
+
+function expressionStudioWindowNamesFromObjArg(objArg: string, fallback: string[] = ['1d', '7d', '30d']): string[] {
+  const call = parseTopLevelFunctionCallSource(String(objArg || '').trim())
+  if (!call || String(call.name || '').toLowerCase() !== 'obj') return fallback
+  const windows = stripEnclosingQuotes(parseNamedObjLiteralArg(call.args, 'windows'))
+  const names = windows.split(',').map((item) => item.trim()).filter(Boolean)
+  return names.length > 0 ? names : fallback
+}
+
+function inferMetricGetPathSuggestionsFromExpression(expression: string): string[] {
+  const text = stripExpressionPrefix(String(expression || '').trim())
+  if (!text) return []
+  const out = new Set<string>()
+  const matcher = /metric_get\s*\(\s*(['"])(.*?)\1\s*,\s*(['"])(.*?)\3\s*\)/gi
+  let match = matcher.exec(text)
+  while (match) {
+    const pathName = stripEnclosingQuotes(match[1] + String(match[2] || '') + match[1])
+    const metricName = stripEnclosingQuotes(match[3] + String(match[4] || '') + match[3]) || 'value'
+    if (pathName) out.add(`${pathName}.${metricName}`)
+    match = matcher.exec(text)
+  }
+  return uniqueFieldNames(Array.from(out))
+}
+
+function inferProfilePathSuggestionsFromExpression(expression: string): string[] {
+  const metricPathSuggestions = inferMetricGetPathSuggestionsFromExpression(expression)
+  const parsed = expressionStudioProfilePathFirstArg(expression)
+  if (!parsed) return metricPathSuggestions
+  const { fnName, pathName, args } = parsed
+  const out = new Set<string>([pathName, ...metricPathSuggestions])
+  if (fnName === 'unique_velocity') {
+    out.add(`${pathName}.per_min`)
+    out.add(`${pathName}.per_hour`)
+    out.add(`${pathName}.count`)
+  } else if (fnName === 'unique_rolling' || fnName === 'unique_window') {
+    expressionStudioWindowNamesFromObjArg(args[2] || '').forEach((windowName) => {
+      const windowPath = `${pathName}.w_${windowName.replace(/[^A-Za-z0-9_]/g, '_')}`
+      ;['count', 'sum', 'avg', 'min', 'max'].forEach((metric) => out.add(`${windowPath}.${metric}`))
+    })
+  } else if (fnName === 'unique_stats') {
+    ;['count', 'sum', 'avg', 'min', 'max', 'std', 'stddev'].forEach((metric) => out.add(`${pathName}.${metric}`))
+  } else if (fnName === 'unique_ratio' || fnName === 'unique_rate') {
+    out.add(`${pathName}.ratio`)
+    out.add(`${pathName}.rate`)
+  } else if (fnName === 'unique_flag' || fnName.endsWith('_flag')) {
+    out.add(`${pathName}.flag`)
+  } else if (fnName === 'partition_zscore') {
+    out.add(`${pathName}.value`)
+    out.add(`${pathName}.zscore`)
+  } else if (fnName === 'metric_get') {
+    const metric = stripEnclosingQuotes(String(args[1] || '').trim()) || 'value'
+    out.add(`${pathName}.${metric}`)
+  }
+  return uniqueFieldNames(Array.from(out))
+}
+
+function collectProfilePathSuggestionsFromJsonValue(value: unknown, out: Set<string>, rootName = ''): void {
+  if (typeof value === 'string') {
+    inferProfilePathSuggestionsFromExpression(value).forEach((pathName) => {
+      out.add(pathName)
+      if (rootName) out.add(`${rootName}.${pathName}`)
+    })
+    return
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectProfilePathSuggestionsFromJsonValue(item, out, rootName))
+    return
+  }
+  if (value && typeof value === 'object') {
+    Object.values(value as Record<string, unknown>).forEach((child) => {
+      collectProfilePathSuggestionsFromJsonValue(child, out, rootName)
+    })
+  }
+}
+
 function buildCustomProfilePathSuggestions(specs: CustomFieldSpec[]): string[] {
   const out = new Set<string>()
   ;(specs || []).forEach((spec) => {
     const rootName = String(spec.name || '').trim()
     if (!rootName) return
     out.add(rootName)
-    if (spec.mode !== 'json') return
+    if (spec.mode !== 'json') {
+      inferProfilePathSuggestionsFromExpression(spec.expression).forEach((pathName) => out.add(pathName))
+      return
+    }
     const keyPaths = extractJsonTemplateKeyPaths(spec.jsonTemplate)
     keyPaths.forEach((path) => {
       const normalized = String(path || '').trim()
@@ -5489,6 +7321,12 @@ function buildCustomProfilePathSuggestions(specs: CustomFieldSpec[]): string[] {
       out.add(normalized)
       out.add(`${rootName}.${normalized}`)
     })
+    try {
+      const parsed = parseJsonTemplateLikeValue(spec.jsonTemplate)
+      collectProfilePathSuggestionsFromJsonValue(parsed, out, rootName)
+    } catch {
+      // Keep best-effort key suggestions even while the JSON template is being edited.
+    }
   })
   return uniqueFieldNames(Array.from(out))
 }
@@ -5682,6 +7520,18 @@ function createMLOpsStage2FieldConfig(seed?: Partial<MLOpsStage2FieldConfig>): M
   const missingAllowed = new Set(MLOPS_STAGE2_MISSING_OPTIONS.map((item) => item.value))
   const encodingAllowed = new Set(MLOPS_STAGE2_ENCODING_OPTIONS.map((item) => item.value))
   const scalingAllowed = new Set(MLOPS_STAGE2_SCALING_OPTIONS.map((item) => item.value))
+  const normalizeNumericMap = (value: unknown): Record<string, number> => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+    const out: Record<string, number> = {}
+    Object.entries(value as Record<string, unknown>).forEach(([key, raw]) => {
+      const cleanKey = String(key || '').trim()
+      if (!cleanKey) return
+      const num = Number(raw)
+      if (Number.isFinite(num)) out[cleanKey] = num
+    })
+    return out
+  }
+  const smoothing = Number(seed?.target_encoding_smoothing ?? 10)
   return {
     field_path: String(seed?.field_path || '').trim(),
     enabled: Boolean(seed?.enabled),
@@ -5689,6 +7539,9 @@ function createMLOpsStage2FieldConfig(seed?: Partial<MLOpsStage2FieldConfig>): M
     missing_values: normalizePick<MLOpsStage2MissingOperation>(seed?.missing_values || [], missingAllowed),
     encoding: normalizePick<MLOpsStage2EncodingOperation>(seed?.encoding || [], encodingAllowed),
     scaling: normalizePick<MLOpsStage2ScalingOperation>(seed?.scaling || [], scalingAllowed),
+    ordinal_mapping: normalizeNumericMap(seed?.ordinal_mapping),
+    binary_mapping: normalizeNumericMap(seed?.binary_mapping),
+    target_encoding_smoothing: Number.isFinite(smoothing) ? Math.max(0, Math.min(smoothing, 100000)) : 10,
   }
 }
 
@@ -5713,6 +7566,9 @@ function parseMLOpsStage2FieldConfigs(value: unknown): MLOpsStage2FieldConfig[] 
       missing_values: (rec.missing_values as any) || (rec.missing as any) || [],
       encoding: (rec.encoding as any) || [],
       scaling: (rec.scaling as any) || [],
+      ordinal_mapping: (rec.ordinal_mapping as any) || {},
+      binary_mapping: (rec.binary_mapping as any) || {},
+      target_encoding_smoothing: Number(rec.target_encoding_smoothing ?? 10),
     })
     if (!normalized.field_path) return
     out.push(normalized)
@@ -5757,7 +7613,12 @@ function mlopsStage2ToNumber(value: unknown): number | null {
 
 function mlopsStage2IsMissing(value: unknown): boolean {
   if (value == null) return true
-  if (typeof value === 'string') return String(value).trim().length <= 0
+  if (typeof value === 'number') return !Number.isFinite(value)
+  if (typeof value === 'string') {
+    const text = String(value).trim()
+    if (!text) return true
+    return ['na', 'n/a', 'null', 'none', 'nan', 'undefined', '-'].includes(text.toLowerCase())
+  }
   return false
 }
 
@@ -6626,6 +8487,40 @@ function parseSelectFieldAliases(value: unknown): Record<string, string> {
   return out
 }
 
+function extractMLOpsOutputFieldsFromConfig(cfg: Record<string, unknown>): string[] {
+  const fields: string[] = []
+  const add = (value: unknown) => {
+    const field = String(value || '').trim()
+    if (field) fields.push(field)
+  }
+  add(cfg.mlops_prediction_field)
+  add(cfg.mlops_prediction_score_field)
+  const ensembleRaw = cfg.mlops_stage3_ensemble_models
+  let ensembleModels: unknown[] = []
+  if (Array.isArray(ensembleRaw)) {
+    ensembleModels = ensembleRaw
+  } else if (typeof ensembleRaw === 'string' && ensembleRaw.trim()) {
+    try {
+      const parsed = JSON.parse(ensembleRaw)
+      if (Array.isArray(parsed)) ensembleModels = parsed
+    } catch {
+      ensembleModels = []
+    }
+  }
+  ensembleModels.forEach((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return
+    const model = item as Record<string, unknown>
+    const modelId = String(model.id || `model_${index + 1}`).trim()
+    add(model.prediction_field)
+    add(model.score_field)
+    if (modelId) {
+      fields.push(`${modelId}_prediction`)
+      fields.push(`${modelId}_prediction_score`)
+    }
+  })
+  return uniqueFieldNames(fields)
+}
+
 function normalizeCronExpr(value: unknown): string {
   return String(value || '').trim().split(/\s+/).join(' ')
 }
@@ -6690,7 +8585,9 @@ function inferNodeOutputFields(
         .filter(Boolean)
     )
     const selectedWithAliases = uniqueFieldNames([...selected, ...aliasNames])
-    const includeOriginal = parseBoolLike(cfg.include_original_row, true)
+    const includeOriginal = selectedWithAliases.length > 0
+      ? false
+      : parseBoolLike(cfg.include_original_row, false)
     if (selectedWithAliases.length > 0) {
       result = includeOriginal
         ? uniqueFieldNames([...passthroughFields, ...selectedWithAliases])
@@ -6712,6 +8609,11 @@ function inferNodeOutputFields(
     const aggField = String(cfg.agg_field || '').trim()
     const out = uniqueFieldNames([...groupBy, ...(aggField ? [aggField] : [])])
     result = out.length > 0 ? out : passthroughFields
+  } else if (nodeType === 'mlops_transform') {
+    result = uniqueFieldNames([
+      ...passthroughFields,
+      ...extractMLOpsOutputFieldsFromConfig(cfg),
+    ])
   }
 
   result = filterUserFacingFieldNames(result)
@@ -7401,6 +9303,30 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [jsonPathDetectError, setJsonPathDetectError] = useState<string | null>(null)
   const [sourceFieldDetectLoading, setSourceFieldDetectLoading] = useState(false)
   const [sourceFieldDetectError, setSourceFieldDetectError] = useState<string | null>(null)
+  const [fileViewerLoading, setFileViewerLoading] = useState(false)
+  const [fileViewerError, setFileViewerError] = useState<string | null>(null)
+  const [fileViewerRows, setFileViewerRows] = useState<Record<string, unknown>[]>([])
+  const [fileViewerColumns, setFileViewerColumns] = useState<string[]>([])
+  const [fileViewerMeta, setFileViewerMeta] = useState<Record<string, unknown> | null>(null)
+  const [fileViewerStudioOpen, setFileViewerStudioOpen] = useState(false)
+  const [fileViewerTabs, setFileViewerTabs] = useState<FileViewerTab[]>([])
+  const [fileViewerActiveTabKey, setFileViewerActiveTabKey] = useState('')
+  const [fileViewerSearchText, setFileViewerSearchText] = useState('')
+  const [fileViewerFilterField, setFileViewerFilterField] = useState('')
+  const [fileViewerFilterOperator, setFileViewerFilterOperator] = useState('contains')
+  const [fileViewerFilterValue, setFileViewerFilterValue] = useState('')
+  const [fileViewerFilters, setFileViewerFilters] = useState<FileViewerFilter[]>([])
+  const [fileViewerSortBy, setFileViewerSortBy] = useState('')
+  const [fileViewerSortDir, setFileViewerSortDir] = useState<'asc' | 'desc'>('asc')
+  const [fileViewerSelectedCell, setFileViewerSelectedCell] = useState<FileViewerSelectedCell>(null)
+  const [fileViewerToolsCollapsed, setFileViewerToolsCollapsed] = useState(false)
+  const [fileViewerVisibleFields, setFileViewerVisibleFields] = useState<string[]>([])
+  const [fileViewerColumnOrder, setFileViewerColumnOrder] = useState<string[]>([])
+  const [fileViewerDatasetView, setFileViewerDatasetView] = useState<'data' | 'summary'>('data')
+  const [fileViewerTableResetKey, setFileViewerTableResetKey] = useState(0)
+  const [fileViewerVisibleTableRows, setFileViewerVisibleTableRows] = useState<Record<string, unknown>[]>([])
+  const fileViewerBrowseInputRef = useRef<HTMLInputElement>(null)
+  const [fileViewerBrowseUploading, setFileViewerBrowseUploading] = useState(false)
   const [customFieldStudioOpen, setCustomFieldStudioOpen] = useState(false)
   const [customFieldDraft, setCustomFieldDraft] = useState<CustomFieldSpec[]>([])
   const [customFieldBeautifyUndoById, setCustomFieldBeautifyUndoById] = useState<Record<string, CustomFieldBeautifyBackup>>({})
@@ -7491,6 +9417,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [uiBreJsonKey, setUiBreJsonKey] = useState<string>('value')
   const [uiBreModel, setUiBreModel] = useState<BreModel>(() => parseBreModelFromExpression("=if_(true, 'YES', 'NO')"))
   const [uiExpressionRows, setUiExpressionRows] = useState<UiExpressionBuilderRow[]>([])
+  const [customFieldStudioView, setCustomFieldStudioView] = useState<CustomFieldStudioView>('workbench')
+  const [expressionStudioTab, setExpressionStudioTab] = useState<ExpressionStudioTab>('fields')
+  const [expressionStudioRoleSelections, setExpressionStudioRoleSelections] = useState<Record<ExpressionStudioRoleKey, string[]>>(
+    () => expressionStudioRoleSelectionDefaults({ date: '', uniqueId: '', aggregate: '', grouping: '', status: '', entity: '' })
+  )
+  const [expressionStudioRules, setExpressionStudioRules] = useState<ExpressionStudioRule[]>([])
+  const [expressionStudioFieldDeclarations, setExpressionStudioFieldDeclarations] = useState<ExpressionStudioFieldDeclaration[]>([])
+  const [expressionStudioJsonDeclarations, setExpressionStudioJsonDeclarations] = useState<ExpressionStudioJsonDeclaration[]>([])
+  const [expressionStudioLastAppliedSignature, setExpressionStudioLastAppliedSignature] = useState('')
+  const [expressionStudioConfigRecordKey, setExpressionStudioConfigRecordKey] = useState<string | null>(null)
+  const [expressionStudioConfigDraft, setExpressionStudioConfigDraft] = useState<ExpressionStudioConfigDraft | null>(null)
+  const [expressionStudioPreviewOpen, setExpressionStudioPreviewOpen] = useState(false)
   const uiBreLastAppliedExpressionRef = useRef<string>('')
   const uiConditionBuilderByIndexRef = useRef<Record<number, UiConditionBuilderState>>({})
   const uiConditionUndoByIndexRef = useRef<Record<number, UiConditionBuilderState[]>>({})
@@ -7545,6 +9483,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [dataQueryRemoteFieldHintsBySource, setDataQueryRemoteFieldHintsBySource] = useState<Record<string, string[]>>({})
   const [dataQueryRemotePreviewRows, setDataQueryRemotePreviewRows] = useState<Array<Record<string, unknown>>>([])
   const [gatewayStudioOpen, setGatewayStudioOpen] = useState(false)
+  const [blwStudioOpen, setBlwStudioOpen] = useState(false)
   const [gatewayStudioDraft, setGatewayStudioDraft] = useState<GatewayStudioDraft>(() => createGatewayStudioDraft())
   const [gatewayRouteDrafts, setGatewayRouteDrafts] = useState<GatewayStudioDraft[]>(() => [createGatewayStudioDraft()])
   const [gatewayActiveRouteIndex, setGatewayActiveRouteIndex] = useState(0)
@@ -7690,7 +9629,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [dataQuerySelectFieldAliasesDraft, setDataQuerySelectFieldAliasesDraft] = useState<Record<string, string>>({})
   const [dataQueryArrayOutputModeDraft, setDataQueryArrayOutputModeDraft] = useState<'list' | 'explode_rows'>('list')
   const [dataQueryArrayMatchModeDraft, setDataQueryArrayMatchModeDraft] = useState<'all_elements' | 'matched_elements_only'>('all_elements')
-  const [dataQueryIncludeOriginalRowDraft, setDataQueryIncludeOriginalRowDraft] = useState(true)
+  const [dataQueryIncludeOriginalRowDraft, setDataQueryIncludeOriginalRowDraft] = useState(false)
   const [dataQueryOffsetDraft, setDataQueryOffsetDraft] = useState<number>(0)
   const [dataQueryLimitDraft, setDataQueryLimitDraft] = useState<number>(0)
   const [dataQueryPreviewSourceModeDraft, setDataQueryPreviewSourceModeDraft] = useState<'sample' | 'full'>('sample')
@@ -7958,6 +9897,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   useEffect(() => {
     setJsonPathDetectError(null)
     setSourceFieldDetectError(null)
+    setFileViewerError(null)
+    setFileViewerRows([])
+    setFileViewerColumns([])
+    setFileViewerMeta(null)
+    setFileViewerLoading(false)
+    setFileViewerStudioOpen(false)
+    setFileViewerTabs([])
+    setFileViewerActiveTabKey('')
     setCustomFieldStudioOpen(false)
     setOracleStudioOpen(false)
     setLmdbStudioOpen(false)
@@ -7994,6 +9941,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     dataQueryStudioInitialConfigRef.current = null
     setDataQueryStudioOpen(false)
     setGatewayStudioOpen(false)
+    setBlwStudioOpen(false)
     setGatewayStudioDraft(createGatewayStudioDraft())
     setGatewayRouteDrafts([createGatewayStudioDraft()])
     setGatewayActiveRouteIndex(0)
@@ -8012,7 +9960,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setDataQuerySelectFieldAliasesDraft({})
     setDataQueryArrayOutputModeDraft('list')
     setDataQueryArrayMatchModeDraft('all_elements')
-    setDataQueryIncludeOriginalRowDraft(true)
+    setDataQueryIncludeOriginalRowDraft(false)
     setDataQueryOffsetDraft(0)
     setDataQueryLimitDraft(0)
     setDataQueryActiveRuleId(null)
@@ -8073,6 +10021,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
   const definition = data?.definition
   const nodeType = data?.nodeType || ''
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = ((event as CustomEvent)?.detail || {}) as Record<string, unknown>
+      const detailNodeId = String(detail.nodeId || '').trim()
+      if (!detailNodeId || detailNodeId !== String(selectedNodeId || '')) return
+      if (String(nodeType || '').trim().toLowerCase() !== 'business_workflow') return
+      setBlwStudioOpen(true)
+    }
+    window.addEventListener('pipeline:open-blw-studio', handler as EventListener)
+    return () => window.removeEventListener('pipeline:open-blw-studio', handler as EventListener)
+  }, [nodeType, selectedNodeId])
   const isFileSource = FILE_SOURCE_TYPES.includes(nodeType)
   const isFileDest   = FILE_DEST_TYPES.includes(nodeType)
   const isDatabaseSource = DB_SOURCE_TYPES.includes(nodeType)
@@ -8086,6 +10045,508 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const fileType     = getFileType(nodeType)
   const isApiJsonNode = nodeType === 'rest_api_source' || nodeType === 'graphql_source'
   const nodeConfig = (data?.config && typeof data.config === 'object' ? data.config : {}) as Record<string, unknown>
+  const fileViewerDirectNodeTypes = useMemo(() => new Set([
+    'csv_source',
+    'json_source',
+    'excel_source',
+    'csv_destination',
+    'json_destination',
+    'excel_destination',
+  ]), [])
+  const isDirectFileViewerNode = fileViewerDirectNodeTypes.has(nodeType)
+  const canOpenFileViewerStudio = nodeType === 'file_viewer' || isDirectFileViewerNode
+  const fileViewerNodeOptions = useMemo(() => {
+    return nodes
+      .map((item) => {
+        const cfg = (item.data?.config && typeof item.data.config === 'object')
+          ? item.data.config as Record<string, unknown>
+          : {}
+        const ntype = String(item.data?.nodeType || '')
+        const path = String(cfg.file_path || '').trim()
+        const rawEnabled = cfg.node_enabled
+        const enabled = rawEnabled === undefined || rawEnabled === null
+          ? true
+          : !['false', '0', 'no', 'off', 'disabled', 'disable'].includes(String(rawEnabled).trim().toLowerCase())
+        if (item.id === selectedNodeId || !fileViewerDirectNodeTypes.has(ntype) || !enabled || !path) return null
+        const kind = getFileType(ntype)
+        const label = String(item.data?.label || item.data?.definition?.label || ntype || item.id)
+        return {
+          value: item.id,
+          label: `${label} · ${kind.toUpperCase()}${path ? ` · ${path.split('/').pop()}` : ''}`,
+          path,
+          kind,
+          nodeType: ntype,
+          config: cfg,
+        }
+      })
+      .filter((item): item is NonNullable<typeof item> => Boolean(item))
+  }, [fileViewerDirectNodeTypes, nodes, selectedNodeId])
+  const selectedFileViewerPath = String(nodeConfig.file_path || '').trim()
+  const selectedFileViewerKind = isDirectFileViewerNode
+    ? normalizeViewerFileKind(getFileType(nodeType), selectedFileViewerPath)
+    : normalizeViewerFileKind(nodeConfig.file_kind, selectedFileViewerPath)
+  const effectiveFileViewerMaxRows = useMemo(() => {
+    const numeric = Number(nodeConfig.max_rows)
+    if (!Number.isFinite(numeric) || numeric <= 0 || numeric === 50000) return 1000
+    return Math.max(1, Math.min(Math.trunc(numeric), 200000))
+  }, [nodeConfig.max_rows])
+  const selectedFileViewerSourceNodeId = useMemo(() => {
+    const current = String(nodeConfig.source_node_id || '').trim()
+    if (!current) return undefined
+    return fileViewerNodeOptions.some((item) => item.value === current) ? current : undefined
+  }, [fileViewerNodeOptions, nodeConfig.source_node_id])
+  const fileViewerGridColumns = useMemo(() => {
+    const columns = fileViewerColumns.length > 0
+      ? fileViewerColumns
+      : Array.from(new Set(fileViewerRows.flatMap((row) => Object.keys(row || {}))))
+    return columns.slice(0, 160).map((key) => ({
+      title: key,
+      dataIndex: key,
+      key,
+      width: 132,
+      ellipsis: true,
+      render: (value: unknown) => {
+        if (value === null || value === undefined || value === '') return <Text style={{ color: 'var(--app-text-dim)', fontSize: 11 }}>-</Text>
+        const text = typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+          ? String(value)
+          : JSON.stringify(value)
+        return (
+          <Tooltip title={text.length > 80 ? text : undefined}>
+            <Text style={{ color: 'var(--app-text)', fontSize: 11, fontFamily: 'monospace' }} ellipsis>
+              {text}
+            </Text>
+          </Tooltip>
+        )
+      },
+    }))
+  }, [fileViewerColumns, fileViewerRows])
+  const activeFileViewerTab = useMemo(
+    () => fileViewerTabs.find((tab) => tab.key === fileViewerActiveTabKey) || fileViewerTabs[0] || null,
+    [fileViewerTabs, fileViewerActiveTabKey],
+  )
+  const activeFileViewerBaseColumns = useMemo(() => {
+    const rows = activeFileViewerTab?.rows || []
+    return (activeFileViewerTab?.columns || []).length > 0
+      ? activeFileViewerTab?.columns || []
+      : Array.from(new Set(rows.flatMap((row) => Object.keys(row || {}))))
+  }, [activeFileViewerTab])
+  useEffect(() => {
+    if (activeFileViewerBaseColumns.length <= 0) {
+      setFileViewerColumnOrder([])
+      setFileViewerVisibleFields([])
+      return
+    }
+    setFileViewerColumnOrder((prev) => {
+      const next = [
+        ...prev.filter((column) => activeFileViewerBaseColumns.includes(column)),
+        ...activeFileViewerBaseColumns.filter((column) => !prev.includes(column)),
+      ]
+      return next.length === prev.length && next.every((column, idx) => column === prev[idx]) ? prev : next
+    })
+    setFileViewerVisibleFields((prev) => prev.filter((column) => activeFileViewerBaseColumns.includes(column)))
+  }, [activeFileViewerTab?.key, activeFileViewerBaseColumns.join('|')])
+  const activeFileViewerDisplayColumns = useMemo(() => {
+    const ordered = [
+      ...fileViewerColumnOrder.filter((column) => activeFileViewerBaseColumns.includes(column)),
+      ...activeFileViewerBaseColumns.filter((column) => !fileViewerColumnOrder.includes(column)),
+    ]
+    if (fileViewerVisibleFields.length <= 0) return ordered
+    const visible = new Set(fileViewerVisibleFields)
+    return ordered.filter((column) => visible.has(column))
+  }, [activeFileViewerBaseColumns, fileViewerColumnOrder, fileViewerVisibleFields])
+  const formatFileViewerCellText = useCallback((value: unknown): string => {
+    if (value === null || value === undefined) return ''
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value)
+    try {
+      return JSON.stringify(value)
+    } catch {
+      return String(value)
+    }
+  }, [])
+  const activeFileViewerGridColumns = useMemo(() => {
+    const tabKey = activeFileViewerTab?.key || ''
+    return activeFileViewerDisplayColumns.slice(0, 180).map((key) => ({
+      title: key,
+      dataIndex: key,
+      key,
+      width: 160,
+      ellipsis: true,
+      sorter: (a: Record<string, unknown>, b: Record<string, unknown>) => String(a?.[key] ?? '').localeCompare(String(b?.[key] ?? ''), undefined, { numeric: true }),
+      filterSearch: true,
+      filters: Array.from(new Set((activeFileViewerTab?.rows || [])
+        .map((row) => formatFileViewerCellText(row?.[key]).trim())
+        .filter(Boolean))).slice(0, 100).map((value) => ({ text: value, value })),
+      onFilter: (value: boolean | string | number, record: Record<string, unknown>) => formatFileViewerCellText(record?.[key]) === String(value),
+      onCell: (record: Record<string, unknown>, rowIndex?: number) => {
+        const index = Number(rowIndex ?? -1)
+        const selected = fileViewerSelectedCell?.tabKey === tabKey
+          && fileViewerSelectedCell.rowIndex === index
+          && fileViewerSelectedCell.column === key
+        return {
+          onClick: () => setFileViewerSelectedCell({ tabKey, rowIndex: index, column: key, value: record?.[key] }),
+          style: {
+            cursor: 'cell',
+            background: selected ? '#0ea5e924' : undefined,
+            boxShadow: selected ? 'inset 0 0 0 1px #0ea5e9' : undefined,
+          },
+        }
+      },
+      render: (value: unknown) => {
+        if (value === null || value === undefined || value === '') return <Text style={{ color: 'var(--app-text-dim)', fontSize: 11 }}>-</Text>
+        const text = formatFileViewerCellText(value)
+        return (
+          <Tooltip title={text.length > 80 ? text : undefined}>
+            <Text style={{ color: 'var(--app-text)', fontSize: 11, fontFamily: 'monospace' }} ellipsis>
+              {text}
+            </Text>
+          </Tooltip>
+        )
+      },
+    }))
+  }, [activeFileViewerTab, activeFileViewerDisplayColumns, fileViewerSelectedCell, formatFileViewerCellText])
+  const fileViewerFieldOptions = useMemo(() => {
+    return activeFileViewerBaseColumns.map((column) => ({ value: column, label: column }))
+  }, [activeFileViewerBaseColumns])
+  const fileViewerHasSourceQuery = useMemo(() => (
+    Boolean(fileViewerSearchText.trim())
+    || fileViewerFilters.length > 0
+    || (fileViewerFilterField.trim() && (fileViewerFilterOperator === 'empty' || fileViewerFilterOperator === 'not_empty' || fileViewerFilterValue.trim()))
+  ), [fileViewerFilterField, fileViewerFilterOperator, fileViewerFilterValue, fileViewerFilters.length, fileViewerSearchText])
+  const activeFileViewerSummary = useMemo(() => {
+    const tab = activeFileViewerTab
+    const rows = tab?.rows || []
+    const columns = tab?.columns || []
+    let numericColumns = 0
+    let emptyCells = 0
+    columns.forEach((column) => {
+      let sawNumber = false
+      rows.forEach((row) => {
+        const value = row?.[column]
+        if (value === null || value === undefined || value === '') emptyCells += 1
+        if (typeof value === 'number' && Number.isFinite(value)) sawNumber = true
+      })
+      if (sawNumber) numericColumns += 1
+    })
+    return {
+      fileName: tab?.path ? tab.path.split('/').pop() || tab.path : '',
+      fullPath: tab?.path || '',
+      kind: tab?.kind || '',
+      rowCount: Number(tab?.meta?.row_count || rows.length || 0),
+      loadedRows: rows.length,
+      columns: columns.length,
+      numericColumns,
+      emptyCells,
+      selectedCell: fileViewerSelectedCell?.tabKey === tab?.key ? fileViewerSelectedCell : null,
+    }
+  }, [activeFileViewerTab, fileViewerSelectedCell])
+  const activeFileViewerProfileRows = useMemo(() => {
+    const rows = activeFileViewerTab?.rows || []
+    return activeFileViewerDisplayColumns.map((column) => {
+      const values = rows.map((row) => row?.[column])
+      const nonEmptyValues = values.filter((value) => value !== null && value !== undefined && value !== '')
+      const uniqueValues = new Set(nonEmptyValues.map((value) => formatFileViewerCellText(value))).size
+      let type = 'empty'
+      if (nonEmptyValues.some((value) => typeof value === 'number')) type = 'number'
+      else if (nonEmptyValues.some((value) => typeof value === 'boolean')) type = 'boolean'
+      else if (nonEmptyValues.some((value) => typeof value === 'object')) type = 'object'
+      else if (nonEmptyValues.length > 0) type = 'text'
+      return {
+        column,
+        type,
+        non_empty: nonEmptyValues.length,
+        empty: Math.max(0, rows.length - nonEmptyValues.length),
+        unique: uniqueValues,
+        sample: formatFileViewerCellText(nonEmptyValues[0]),
+      }
+    })
+  }, [activeFileViewerTab, activeFileViewerDisplayColumns, formatFileViewerCellText])
+  const activeFileViewerProfileColumns = useMemo(() => ([
+    { title: 'Column', dataIndex: 'column', key: 'column', width: 220, fixed: 'left' as const, sorter: (a: any, b: any) => String(a.column || '').localeCompare(String(b.column || '')) },
+    { title: 'Type', dataIndex: 'type', key: 'type', width: 100, filters: ['number', 'text', 'boolean', 'object', 'empty'].map((value) => ({ text: value, value })), onFilter: (value: boolean | string | number, record: any) => record.type === String(value) },
+    { title: 'Non-empty', dataIndex: 'non_empty', key: 'non_empty', width: 110, sorter: (a: any, b: any) => Number(a.non_empty || 0) - Number(b.non_empty || 0) },
+    { title: 'Empty', dataIndex: 'empty', key: 'empty', width: 100, sorter: (a: any, b: any) => Number(a.empty || 0) - Number(b.empty || 0) },
+    { title: 'Unique', dataIndex: 'unique', key: 'unique', width: 100, sorter: (a: any, b: any) => Number(a.unique || 0) - Number(b.unique || 0) },
+    {
+      title: 'Sample',
+      dataIndex: 'sample',
+      key: 'sample',
+      width: 360,
+      ellipsis: true,
+      render: (value: unknown) => (
+        <Tooltip title={String(value || '')}>
+          <Text style={{ color: 'var(--app-text)', fontSize: 11, fontFamily: 'monospace' }} ellipsis>{String(value || '-')}</Text>
+        </Tooltip>
+      ),
+    },
+  ]), [])
+  useEffect(() => {
+    if (fileViewerDatasetView === 'summary') {
+      setFileViewerVisibleTableRows(activeFileViewerProfileRows as Record<string, unknown>[])
+    } else {
+      setFileViewerVisibleTableRows(activeFileViewerTab?.rows || [])
+    }
+  }, [activeFileViewerTab?.key, activeFileViewerTab?.rows, activeFileViewerProfileRows, fileViewerDatasetView, fileViewerTableResetKey])
+  const downloadFileViewerRows = useCallback((scope: 'view' | 'all') => {
+    const tab = activeFileViewerTab
+    if (!tab) return
+    if (scope === 'all') {
+      const baseUrl = String(import.meta.env.VITE_API_BASE || 'http://localhost:8001')
+      const link = document.createElement('a')
+      link.href = `${baseUrl}/api/download?path=${encodeURIComponent(tab.path)}`
+      link.download = activeFileViewerSummary.fileName || tab.path.split('/').pop() || 'source_file'
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      return
+    }
+    const csvEscape = (value: unknown) => {
+      const text = formatFileViewerCellText(value)
+      return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
+    }
+    const safeName = String(activeFileViewerSummary.fileName || 'file')
+      .replace(/\.[^.]+$/, '')
+      .replace(/[^A-Za-z0-9._-]+/g, '_')
+      || 'file'
+    const isSummaryView = fileViewerDatasetView === 'summary'
+    const rows = fileViewerVisibleTableRows
+    const columns = isSummaryView
+      ? ['column', 'type', 'non_empty', 'empty', 'unique', 'sample']
+      : activeFileViewerDisplayColumns
+    const csv = [
+      columns.map(csvEscape).join(','),
+      ...rows.map((row) => columns.map((column) => csvEscape(((row || {}) as Record<string, unknown>)[column])).join(',')),
+    ].join('\n')
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${safeName}_${isSummaryView ? 'summary_view' : 'selected_view'}.csv`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
+  }, [
+    activeFileViewerBaseColumns,
+    activeFileViewerDisplayColumns,
+    activeFileViewerProfileRows,
+    activeFileViewerSummary.fileName,
+    activeFileViewerTab,
+    fileViewerDatasetView,
+    fileViewerVisibleTableRows,
+    formatFileViewerCellText,
+  ])
+  const loadFileViewerPreview = useCallback(async (override?: {
+    path?: string
+    kind?: string
+    sheet?: string
+    json_path?: string
+    max_rows?: number
+    label?: string
+    source_node_id?: string
+    search?: string
+    filters?: FileViewerFilter[]
+    sort_by?: string
+    sort_dir?: 'asc' | 'desc'
+  }) => {
+    if (!canOpenFileViewerStudio) return
+    const path = String(override?.path ?? nodeConfig.file_path ?? '').trim()
+    if (!path) {
+      setFileViewerRows([])
+      setFileViewerColumns([])
+      setFileViewerMeta(null)
+      setFileViewerError('Select a pipeline file node or enter a file path.')
+      return
+    }
+    const requestedMaxRows = override?.max_rows !== undefined
+      ? Math.trunc(Number(override.max_rows))
+      : effectiveFileViewerMaxRows
+    const maxRows = requestedMaxRows <= 0 ? 0 : Math.max(1, Math.min(requestedMaxRows, 200000))
+    const kind = normalizeViewerFileKind(override?.kind ?? (isDirectFileViewerNode ? getFileType(nodeType) : nodeConfig.file_kind), path)
+    const sourceNodeType = viewerSourceNodeType(kind, path)
+    const sourceConfig: Record<string, unknown> = {
+      file_path: path,
+      delimiter: ',',
+      encoding: 'utf-8',
+      has_header: true,
+      sheet: String(override?.sheet ?? nodeConfig.sheet ?? '0'),
+      json_path: String(override?.json_path ?? nodeConfig.json_path ?? ''),
+    }
+    const resolvedKind = (kind === 'auto' ? getFileType(sourceNodeType) : kind) as 'csv' | 'excel' | 'json'
+    const tabKey = `${path}::${resolvedKind}::${sourceConfig.sheet || ''}::${sourceConfig.json_path || ''}`
+    const label = String(override?.label || path.split('/').pop() || path || 'File').trim()
+    setFileViewerActiveTabKey(tabKey)
+    setFileViewerTabs((prev) => {
+      const nextTab: FileViewerTab = {
+        key: tabKey,
+        label,
+        path,
+        kind: resolvedKind,
+        rows: [],
+        columns: [],
+        meta: { file_kind: resolvedKind, node_type: sourceNodeType },
+        loading: true,
+      }
+      const idx = prev.findIndex((tab) => tab.key === tabKey)
+      if (idx >= 0) {
+        const next = [...prev]
+        next[idx] = { ...next[idx], loading: true, error: null }
+        return next
+      }
+      return [...prev, nextTab]
+    })
+    setFileViewerLoading(true)
+    setFileViewerError(null)
+    try {
+      const response = await api.detectSourceFieldOptions(sourceNodeType, sourceConfig, maxRows, {
+        previewRows: maxRows <= 0 ? 1000000 : maxRows,
+        includeSchemaScan: false,
+        previewCompact: true,
+        previewMaxCellChars: 1200,
+        previewMaxCollectionItems: 32,
+        search: override?.search ?? fileViewerSearchText,
+        filters: override?.filters ?? fileViewerFilters,
+        sortBy: override?.sort_by ?? fileViewerSortBy,
+        sortDir: override?.sort_dir ?? fileViewerSortDir,
+        timeoutMs: 30000,
+      })
+      const rows = Array.isArray(response?.preview)
+        ? response.preview.filter((row: unknown) => !!row && typeof row === 'object' && !Array.isArray(row)) as Record<string, unknown>[]
+        : []
+      const columns = Array.isArray(response?.columns)
+        ? response.columns.map((item: unknown) => String(item || '').trim()).filter(Boolean)
+        : Array.from(new Set(rows.flatMap((row) => Object.keys(row || {}))))
+      setFileViewerRows(rows)
+      setFileViewerColumns(columns)
+      const meta = {
+        row_count: response?.row_count,
+        has_more: response?.has_more,
+        node_type: sourceNodeType,
+        file_kind: resolvedKind,
+      }
+      setFileViewerMeta(meta)
+      setFileViewerTabs((prev) => prev.map((tab) => (
+        tab.key === tabKey
+          ? { ...tab, rows, columns, meta, loading: false, error: null }
+          : tab
+      )))
+      if (selectedNodeId) {
+        updateNodeConfig(selectedNodeId, {
+          source_node_id: override?.source_node_id ?? nodeConfig.source_node_id ?? '',
+          file_path: path,
+          file_kind: resolvedKind,
+          sheet: String(sourceConfig.sheet || '0'),
+          json_path: String(sourceConfig.json_path || ''),
+          max_rows: maxRows,
+          _detected_columns: columns.join(', '),
+          _row_count: Number(response?.row_count || rows.length),
+          _preview_rows: rows.slice(0, 50),
+        })
+      }
+    } catch (err: any) {
+      setFileViewerRows([])
+      setFileViewerColumns([])
+      setFileViewerMeta(null)
+      const message = String(err?.message || 'Failed to load file preview')
+      setFileViewerError(message)
+      setFileViewerTabs((prev) => prev.map((tab) => (
+        tab.key === tabKey ? { ...tab, loading: false, error: message } : tab
+      )))
+    } finally {
+      setFileViewerLoading(false)
+    }
+  }, [
+    nodeType,
+    canOpenFileViewerStudio,
+    isDirectFileViewerNode,
+    nodeConfig.file_path,
+    nodeConfig.file_kind,
+    effectiveFileViewerMaxRows,
+    nodeConfig.sheet,
+    nodeConfig.json_path,
+    fileViewerSearchText,
+    fileViewerFilters,
+    fileViewerSortBy,
+    fileViewerSortDir,
+    selectedNodeId,
+    updateNodeConfig,
+  ])
+  const resetFileViewerQuery = useCallback(() => {
+    setFileViewerSearchText('')
+    setFileViewerFilterField('')
+    setFileViewerFilterOperator('contains')
+    setFileViewerFilterValue('')
+    setFileViewerFilters([])
+    setFileViewerSortBy('')
+    setFileViewerSortDir('asc')
+    setFileViewerTableResetKey((value) => value + 1)
+    void loadFileViewerPreview({
+      search: '',
+      filters: [],
+      sort_by: '',
+      sort_dir: 'asc',
+    })
+  }, [loadFileViewerPreview])
+  const buildFileViewerQueryFilters = useCallback(() => {
+    const filters = [...fileViewerFilters]
+    const field = fileViewerFilterField.trim()
+    const hasPendingValue = fileViewerFilterOperator === 'empty'
+      || fileViewerFilterOperator === 'not_empty'
+      || fileViewerFilterValue.trim()
+    if (field && hasPendingValue) {
+      filters.push({ field, operator: fileViewerFilterOperator, value: fileViewerFilterValue })
+    }
+    return filters
+  }, [fileViewerFilterField, fileViewerFilterOperator, fileViewerFilterValue, fileViewerFilters])
+  const applyFileViewerSourceQuery = useCallback(() => {
+    const filters = buildFileViewerQueryFilters()
+    const search = fileViewerSearchText
+    setFileViewerFilters(filters)
+    setFileViewerFilterValue('')
+    void loadFileViewerPreview({
+      max_rows: (search.trim() || filters.length > 0) ? 0 : effectiveFileViewerMaxRows,
+      search,
+      filters,
+      sort_by: '',
+      sort_dir: 'asc',
+    })
+  }, [buildFileViewerQueryFilters, effectiveFileViewerMaxRows, fileViewerSearchText, loadFileViewerPreview])
+  const browseFileViewerFile = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file || !selectedNodeId) return
+    setFileViewerBrowseUploading(true)
+    setFileViewerError(null)
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      const baseUrl = String(import.meta.env.VITE_API_BASE || 'http://localhost:8001')
+      const response = await fetch(`${baseUrl}/api/upload`, { method: 'POST', body: form })
+      if (!response.ok) {
+        const detail = await response.text().catch(() => '')
+        throw new Error(detail || `Upload failed (${response.status})`)
+      }
+      const payload = await response.json()
+      const path = String(payload?.tmp_path || '').trim()
+      if (!path) throw new Error('Upload did not return a server file path.')
+      const kind = normalizeViewerFileKind('auto', file.name)
+      updateNodeConfig(selectedNodeId, {
+        source_node_id: '',
+        file_path: path,
+        file_kind: kind,
+        max_rows: effectiveFileViewerMaxRows,
+      })
+      void loadFileViewerPreview({
+        path,
+        kind,
+        max_rows: effectiveFileViewerMaxRows,
+        label: file.name,
+      })
+    } catch (err: any) {
+      setFileViewerError(String(err?.message || 'Failed to browse file'))
+    } finally {
+      setFileViewerBrowseUploading(false)
+      if (event.target) event.target.value = ''
+    }
+  }, [effectiveFileViewerMaxRows, loadFileViewerPreview, selectedNodeId, updateNodeConfig])
   const conditionStudioEditingActive = conditionStudioOpen && nodeType === 'condition_node' && !!selectedNodeId
   const refreshBusinessWorkflowOptions = useCallback(async () => {
     if (nodeType !== 'business_workflow') return
@@ -8672,6 +11133,22 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       if (!previewRows.length) return []
       return filterUserFacingFieldNames(extractSampleFieldPaths(previewRows))
     },
+    [nodeType, selectedNodeId, nodes, edges]
+  )
+  const businessWorkflowUpstreamInputFields = useMemo(
+    () => (
+      nodeType === 'business_workflow' && selectedNodeId
+        ? inferUpstreamInputFields(selectedNodeId, nodes, edges)
+        : []
+    ),
+    [nodeType, selectedNodeId, nodes, edges]
+  )
+  const businessWorkflowUpstreamPreviewRows = useMemo(
+    () => (
+      nodeType === 'business_workflow' && selectedNodeId
+        ? inferUpstreamPreviewRows(selectedNodeId, nodes, edges, 300)
+        : []
+    ),
     [nodeType, selectedNodeId, nodes, edges]
   )
   const conditionSelectedSourceNodeIds = useMemo(
@@ -10113,9 +12590,25 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => filterUserFacingFieldNames(buildCustomProfilePathSuggestions(customFieldDraft)),
     [customFieldDraft]
   )
+  const expressionStudioProfilePathOptions = useMemo(() => {
+    const out = new Set<string>()
+    expressionStudioRules.forEach((rule) => {
+      inferProfilePathSuggestionsFromExpression(expressionStudioRuleExpression(rule, customFnsVersionDraft))
+        .forEach((pathName) => out.add(pathName))
+    })
+    expressionStudioJsonDeclarations.forEach((row) => {
+      inferProfilePathSuggestionsFromExpression(expressionStudioJsonKeyExpression(row, customFnsVersionDraft))
+        .forEach((pathName) => {
+          out.add(pathName)
+          const objectName = String(row.objectName || '').trim()
+          if (objectName) out.add(`${objectName}.${pathName}`)
+        })
+    })
+    return filterUserFacingFieldNames(Array.from(out))
+  }, [expressionStudioRules, expressionStudioJsonDeclarations, customFnsVersionDraft])
   const expressionPathOptions = useMemo(
-    () => filterUserFacingFieldNames([...expressionFieldOptions, ...customProfilePathOptions]),
-    [expressionFieldOptions, customProfilePathOptions]
+    () => filterUserFacingFieldNames([...expressionFieldOptions, ...customProfilePathOptions, ...expressionStudioProfilePathOptions]),
+    [expressionFieldOptions, customProfilePathOptions, expressionStudioProfilePathOptions]
   )
   const expressionCompletionEntries = useMemo<ExpressionCompletionEntry[]>(() => {
     const out: ExpressionCompletionEntry[] = []
@@ -10184,7 +12677,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => (
       (uiExpressionPlaceholders || []).reduce((acc, placeholder) => {
         const inputValue = String(
-          uiExpressionValuesByIndex[placeholder.index] ?? placeholder.defaultValue ?? ''
+          uiExpressionValuesByIndex[placeholder.index] ?? defaultUiExpressionParameterValue(placeholder)
         )
         const mode = (uiExpressionParamModeByIndex[placeholder.index] || defaultUiExpressionParameterMode(placeholder)) as UiExpressionParameterMode
         acc[placeholder.index] = resolveUiExpressionParameterToken(mode, inputValue, uiExpressionVariables)
@@ -10218,9 +12711,23 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => (
       isUiGroupAggregateTemplate
         ? uiGroupAggregateExpression
-        : buildExpressionFromSnippet(selectedUiExpressionTemplateSnippet, uiExpressionResolvedValuesByIndex)
+        : buildExpressionFromSnippetWithUiParameters(
+          selectedUiExpressionTemplateSnippet,
+          uiExpressionPlaceholders,
+          uiExpressionValuesByIndex,
+          uiExpressionParamModeByIndex,
+          uiExpressionVariables,
+        )
     ),
-    [isUiGroupAggregateTemplate, uiGroupAggregateExpression, selectedUiExpressionTemplateSnippet, uiExpressionResolvedValuesByIndex]
+    [
+      isUiGroupAggregateTemplate,
+      uiGroupAggregateExpression,
+      selectedUiExpressionTemplateSnippet,
+      uiExpressionPlaceholders,
+      uiExpressionValuesByIndex,
+      uiExpressionParamModeByIndex,
+      uiExpressionVariables,
+    ]
   )
   const uiExpressionPreview = useMemo(
     () => normalizeExpressionValue(uiExpressionPreviewRaw),
@@ -10244,6 +12751,259 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => expressionPathOptions.slice(0, 600).map((value) => ({ value })),
     [expressionPathOptions]
   )
+  const expressionStudioDeclaredFieldNames = useMemo(
+    () => uniqueFieldNames([
+      ...expressionStudioFieldDeclarations
+        .filter((item) => item.enabled)
+        .map((item) => String(item.name || '').trim())
+        .filter(Boolean),
+      ...customFieldDraft.map((item) => String(item.name || '').trim()).filter(Boolean),
+      ...customProfilePathOptions,
+      ...expressionStudioProfilePathOptions,
+    ]),
+    [expressionStudioFieldDeclarations, customFieldDraft, customProfilePathOptions, expressionStudioProfilePathOptions]
+  )
+  const expressionStudioDeclaredFieldSelectOptions = useMemo(
+    () => expressionStudioDeclaredFieldNames.slice(0, 300).map((field) => ({
+      value: field,
+      label: field,
+    })),
+    [expressionStudioDeclaredFieldNames]
+  )
+  const expressionStudioFieldSelectOptions = useMemo(
+    () => {
+      const sourceOptions = expressionFieldOptions.slice(0, 600).map((field) => ({
+        value: field,
+        label: field,
+      }))
+      const sourceSet = new Set(sourceOptions.map((item) => String(item.value || '').toLowerCase()))
+      const declaredOptions = expressionStudioDeclaredFieldSelectOptions
+        .filter((item) => !sourceSet.has(String(item.value || '').toLowerCase()))
+      return [...sourceOptions, ...declaredOptions]
+    },
+    [expressionFieldOptions, expressionStudioDeclaredFieldSelectOptions]
+  )
+  const expressionStudioRawValueOptions = useMemo(
+    () => uniqueFieldNames([
+      ...expressionPathOptions,
+      ...expressionFieldOptions,
+      ...expressionStudioDeclaredFieldNames,
+    ]).slice(0, 800).map((value) => ({
+      value,
+      label: value,
+    })),
+    [expressionPathOptions, expressionFieldOptions, expressionStudioDeclaredFieldNames]
+  )
+  const expressionStudioMetricPathOptions = useMemo(
+    () => uniqueFieldNames([
+      ...expressionStudioProfilePathOptions,
+      ...customProfilePathOptions,
+      ...expressionPathOptions,
+      ...expressionStudioDeclaredFieldNames,
+    ])
+      .filter((value) => String(value || '').includes('.'))
+      .slice(0, 800)
+      .map((value) => ({
+        value,
+        label: value,
+      })),
+    [expressionStudioProfilePathOptions, customProfilePathOptions, expressionPathOptions, expressionStudioDeclaredFieldNames]
+  )
+  const expressionStudioRoleSuggestions = useMemo(
+    () => inferExpressionStudioRoles(expressionFieldOptions),
+    [expressionFieldOptions]
+  )
+  const expressionStudioEffectiveRoles = useMemo(
+    () => EXPRESSION_STUDIO_ROLE_CONFIG.reduce((acc, item) => {
+      acc[item.key] = expressionStudioPrimaryRoleField(
+        expressionStudioRoleSelections,
+        expressionStudioRoleSuggestions,
+        item.key,
+      )
+      return acc
+    }, {} as ExpressionStudioRoleSuggestions),
+    [expressionStudioRoleSelections, expressionStudioRoleSuggestions]
+  )
+  const expressionStudioGeneratedSpecs = useMemo(
+    () => expressionStudioBuildSpecs(
+      expressionStudioFieldDeclarations,
+      expressionStudioRules,
+      expressionStudioJsonDeclarations,
+      customFnsVersionDraft,
+    ),
+    [expressionStudioFieldDeclarations, expressionStudioRules, expressionStudioJsonDeclarations, customFnsVersionDraft]
+  )
+  const expressionStudioAllGeneratedOutputNames = useMemo(
+    () => uniqueFieldNames([
+      ...expressionStudioFieldDeclarations.map((item) => String(item.name || '').trim()).filter(Boolean),
+      ...expressionStudioRules.map((item) => String(item.outputName || '').trim()).filter(Boolean),
+      ...expressionStudioJsonDeclarations.map((item) => String(item.objectName || '').trim()).filter(Boolean),
+    ]),
+    [expressionStudioFieldDeclarations, expressionStudioRules, expressionStudioJsonDeclarations]
+  )
+  const expressionStudioPreviewText = useMemo(
+    () => JSON.stringify(
+      expressionStudioGeneratedSpecs.map((item) => ({
+        name: item.name || '',
+        mode: item.mode || 'value',
+        enabled: item.enabled ?? true,
+        output: expressionStudioPreviewOutputValue(item),
+      })),
+      null,
+      2,
+    ),
+    [expressionStudioGeneratedSpecs]
+  )
+  const expressionStudioBuildIssues = useMemo(
+    () => expressionStudioCollectBuildIssues(
+      expressionStudioFieldDeclarations,
+      expressionStudioRules,
+      expressionStudioJsonDeclarations,
+      customFnsVersionDraft,
+    ),
+    [expressionStudioFieldDeclarations, expressionStudioRules, expressionStudioJsonDeclarations, customFnsVersionDraft]
+  )
+  const expressionStudioRecordRows = useMemo<ExpressionStudioRecordRow[]>(
+    () => {
+      const jsonRows = [...expressionStudioJsonDeclarations].sort((left, right) => {
+        const leftObject = String(left.objectName || '').trim().toLowerCase()
+        const rightObject = String(right.objectName || '').trim().toLowerCase()
+        if (leftObject !== rightObject) return leftObject.localeCompare(rightObject)
+        return String(left.keyName || '').trim().toLowerCase().localeCompare(String(right.keyName || '').trim().toLowerCase())
+      })
+      const jsonObjectCounts = jsonRows.reduce<Map<string, number>>((acc, row) => {
+        const objectName = String(row.objectName || '').trim()
+        const key = objectName.toLowerCase()
+        acc.set(key, (acc.get(key) || 0) + 1)
+        return acc
+      }, new Map())
+      return [
+      ...expressionStudioFieldDeclarations.map((decl) => ({
+        key: `field:${decl.id}`,
+        section: 'fields' as ExpressionStudioTab,
+        sectionLabel: 'Field Declaration',
+        name: String(decl.name || ''),
+        type: String(decl.mode || 'field'),
+        output: 'Single Value',
+        enabled: Boolean(decl.enabled),
+        summary: decl.mode === 'expression'
+          ? String(decl.expression || '')
+          : decl.mode === 'literal'
+            ? String(decl.literalValue || '')
+            : String(decl.sourceField || ''),
+      })),
+      ...expressionStudioRules.map((rule) => ({
+        key: `rule:${rule.id}`,
+        section: 'rules' as ExpressionStudioTab,
+        sectionLabel: 'Rule Builder',
+        name: String(rule.outputName || ''),
+        type: String(rule.ruleType || 'direct_field'),
+        output: rule.outputMode === 'json' ? 'JSON Object' : 'Single Value',
+        summary: expressionStudioRuleExpression(rule, customFnsVersionDraft),
+        enabled: Boolean(rule.enabled),
+      })),
+      ...jsonRows.map((row) => {
+        const objectName = String(row.objectName || '').trim()
+        const objectKey = objectName.toLowerCase()
+        return {
+          key: `json:${row.id}`,
+          section: 'json' as ExpressionStudioTab,
+          sectionLabel: 'JSON Object',
+          name: objectName,
+          type: String(row.ruleType || 'direct_field'),
+          output: 'JSON Key',
+          enabled: Boolean(row.enabled),
+          objectEnabled: Boolean(row.objectEnabled),
+          objectName,
+          keyName: String(row.keyName || ''),
+          objectRowSpan: jsonObjectCounts.get(objectKey) || 1,
+          summary: expressionStudioJsonKeyExpression(row, customFnsVersionDraft),
+        }
+      }),
+    ]
+    },
+    [expressionStudioFieldDeclarations, expressionStudioRules, expressionStudioJsonDeclarations, customFnsVersionDraft]
+  )
+  const expressionStudioActiveRecordRows = useMemo(
+    () => expressionStudioRecordRows.filter((row) => row.section === expressionStudioTab),
+    [expressionStudioRecordRows, expressionStudioTab]
+  )
+  const expressionStudioJsonObjectGroups = useMemo(
+    () => {
+      const grouped = new Map<string, { objectName: string; objectEnabled: boolean; rows: ExpressionStudioRecordRow[] }>()
+      expressionStudioRecordRows
+        .filter((row) => row.section === 'json')
+        .forEach((row) => {
+          const objectName = String(row.objectName || row.name || 'Untitled Object').trim() || 'Untitled Object'
+          const key = objectName.toLowerCase()
+          const current = grouped.get(key) || { objectName, objectEnabled: Boolean(row.objectEnabled), rows: [] }
+          current.objectEnabled = current.objectEnabled || Boolean(row.objectEnabled)
+          current.rows.push(row)
+          grouped.set(key, current)
+        })
+      return Array.from(grouped.values()).sort((left, right) => (
+        left.objectName.localeCompare(right.objectName, undefined, { numeric: true, sensitivity: 'base' })
+      ))
+    },
+    [expressionStudioRecordRows]
+  )
+  const expressionStudioActiveRecordTitle = expressionStudioTab === 'fields'
+    ? 'Field Declaration Records'
+    : expressionStudioTab === 'rules'
+      ? 'Rule Builder Records'
+      : 'JSON Object Records'
+  const expressionStudioJsonObjectNameOptions = useMemo(
+    () => uniqueFieldNames(
+      expressionStudioJsonDeclarations
+        .map((item) => String(item.objectName || '').trim())
+        .filter(Boolean)
+    ).map((value) => ({ value, label: value })),
+    [expressionStudioJsonDeclarations]
+  )
+  const expressionStudioConfigRecord = useMemo(
+    () => expressionStudioRecordRows.find((row) => row.key === expressionStudioConfigRecordKey) || null,
+    [expressionStudioRecordRows, expressionStudioConfigRecordKey]
+  )
+  const expressionStudioConfigDraftTitle = useMemo(() => {
+    const draft = expressionStudioConfigDraft
+    if (!draft) return 'Configure Expression Record'
+    if (draft.kind === 'field') return `${draft.isNew ? 'Add' : 'Configure'} Field Declaration: ${draft.item.name || 'Untitled'}`
+    if (draft.kind === 'rule') return `${draft.isNew ? 'Add' : 'Configure'} Rule: ${draft.item.outputName || 'Untitled'}`
+    return `${draft.isNew ? 'Add' : 'Configure'} JSON Key: ${draft.item.objectName || 'object'}.${draft.item.keyName || 'key'}`
+  }, [expressionStudioConfigDraft])
+  const expressionStudioCurrentSignature = useMemo(
+    () => JSON.stringify({
+      roles: expressionStudioRoleSelections,
+      fields: expressionStudioFieldDeclarations,
+      rules: expressionStudioRules,
+      json: expressionStudioJsonDeclarations,
+      fns: customFnsVersionDraft,
+    }),
+    [expressionStudioRoleSelections, expressionStudioFieldDeclarations, expressionStudioRules, expressionStudioJsonDeclarations, customFnsVersionDraft]
+  )
+  const expressionStudioPersistedDraft = useMemo<ExpressionStudioPersistedConfig>(
+    () => ({
+      version: 1,
+      view: customFieldStudioView,
+      tab: expressionStudioTab,
+      roleSelections: expressionStudioRoleSelections,
+      fieldDeclarations: expressionStudioFieldDeclarations,
+      rules: expressionStudioRules,
+      jsonDeclarations: expressionStudioJsonDeclarations,
+      lastAppliedSignature: expressionStudioLastAppliedSignature,
+    }),
+    [
+      customFieldStudioView,
+      expressionStudioTab,
+      expressionStudioRoleSelections,
+      expressionStudioFieldDeclarations,
+      expressionStudioRules,
+      expressionStudioJsonDeclarations,
+      expressionStudioLastAppliedSignature,
+    ]
+  )
+  const expressionStudioHasAppliedRows = expressionStudioLastAppliedSignature.length > 0
+  const expressionStudioIsSynced = expressionStudioHasAppliedRows && expressionStudioLastAppliedSignature === expressionStudioCurrentSignature
   const uiExpressionVariableOptions = useMemo(
     () => (
       (uiExpressionVariables || [])
@@ -10584,7 +13344,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       const next = { ...prev }
       uiExpressionPlaceholders.forEach((placeholder) => {
         if (next[placeholder.index] === undefined) {
-          next[placeholder.index] = placeholder.defaultValue
+          next[placeholder.index] = defaultUiExpressionParameterValue(placeholder)
         }
       })
       return next
@@ -10800,6 +13560,48 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const handleFieldChange = (name: string, value: unknown) => {
     if (!selectedNodeId) return
     updateNodeConfig(selectedNodeId, { [name]: value })
+  }
+
+  const saveBlwStudioConfig = (blwConfig: BlwStudioConfig) => {
+    if (!selectedNodeId) return
+    updateNodeConfig(selectedNodeId, {
+      blw_studio_config: blwConfig,
+      blw_instance_variables: blwConfig.instanceVariables,
+      instanceVariables: blwConfig.instanceVariables,
+      workflow_mode: 'embedded',
+      embedded_workflow_enabled: true,
+      workflow_tracking_enabled: blwConfig.enabled,
+      workflow_tracking_table: blwConfig.trackerTable,
+      workflow_unique_id_field: blwConfig.uniqueIdField,
+      workflow_parallel_enabled: blwConfig.parallelEnabled,
+      workflow_max_parallel_branches: blwConfig.maxParallelBranches,
+      workflow_max_iterations: blwConfig.maxIterations,
+      workflow_max_retry_attempts: blwConfig.maxRetryAttempts,
+    })
+    form.setFieldsValue({
+      blw_studio_config: blwConfig,
+      blw_instance_variables: blwConfig.instanceVariables,
+      instanceVariables: blwConfig.instanceVariables,
+      workflow_mode: 'embedded',
+      embedded_workflow_enabled: true,
+      workflow_tracking_enabled: blwConfig.enabled,
+      workflow_tracking_table: blwConfig.trackerTable,
+      workflow_unique_id_field: blwConfig.uniqueIdField,
+      workflow_parallel_enabled: blwConfig.parallelEnabled,
+      workflow_max_parallel_branches: blwConfig.maxParallelBranches,
+      workflow_max_iterations: blwConfig.maxIterations,
+      workflow_max_retry_attempts: blwConfig.maxRetryAttempts,
+    })
+    void Promise.resolve().then(async () => {
+      await useWorkflowStore.getState().savePipeline()
+    }).catch((error) => {
+      console.warn('Failed to persist BLW Studio config', error)
+      notification.warning({
+        message: 'BLW Studio saved locally',
+        description: 'Pipeline save failed, so changes may not survive refresh until the pipeline is saved.',
+        placement: 'bottomRight',
+      })
+    })
   }
 
   const conditionOperatorOptions = useMemo(
@@ -11144,7 +13946,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     [nodeConfig.array_match_mode]
   )
   const dataQueryIncludeOriginalConfigured = useMemo(
-    () => parseBoolLike(nodeConfig.include_original_row, true),
+    () => parseBoolLike(nodeConfig.include_original_row, false),
     [nodeConfig.include_original_row]
   )
   const dataQueryOffsetConfigured = useMemo(
@@ -11254,6 +14056,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const mlopsStage2LabelFieldConfigured = useMemo(
     () => String(nodeConfig.mlops_stage2_label_field || '').trim(),
     [nodeConfig.mlops_stage2_label_field],
+  )
+  const mlopsStage2ArtifactConfigured = useMemo(
+    () => (
+      nodeConfig.mlops_stage2_artifact
+      && typeof nodeConfig.mlops_stage2_artifact === 'object'
+      && !Array.isArray(nodeConfig.mlops_stage2_artifact)
+        ? nodeConfig.mlops_stage2_artifact as Record<string, unknown>
+        : null
+    ),
+    [nodeConfig.mlops_stage2_artifact],
   )
   const mlopsStage3TaskTypeConfigured = useMemo<MLOpsStage3TaskType>(
     () => {
@@ -12565,6 +15377,27 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     })
     return out
   }, [mlopsStudioOpen, mlopsPreviewRows, mlopsFieldOptions])
+  const mlopsStage2DistinctValuesByField = useMemo(() => {
+    const out = new Map<string, string[]>()
+    if (!mlopsStudioOpen || mlopsPreviewRows.length <= 0 || mlopsFieldOptions.length <= 0) return out
+    mlopsFieldOptions.forEach((fieldPath) => {
+      const values: string[] = []
+      const seen = new Set<string>()
+      for (const row of mlopsPreviewRows.slice(0, 5000)) {
+        if (!row || typeof row !== 'object') continue
+        const hit = readPathValue(row as Record<string, unknown>, fieldPath)
+        const value = hit.found ? mlopsStage2ToScalar(hit.value) : undefined
+        if (mlopsStage2IsMissing(value)) continue
+        const text = String(value).trim()
+        if (!text || seen.has(text)) continue
+        seen.add(text)
+        values.push(text)
+        if (values.length >= 80) break
+      }
+      out.set(fieldPath, values)
+    })
+    return out
+  }, [mlopsStudioOpen, mlopsPreviewRows, mlopsFieldOptions])
   const mlopsStage2EffectiveConfigRows = useMemo(() => {
     const map = mlopsStage2FieldConfigsByFieldDraft || {}
     const merged: MLOpsStage2FieldConfig[] = []
@@ -12581,6 +15414,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         missing_values: base?.missing_values || [],
         encoding: base?.encoding || [],
         scaling: base?.scaling || [],
+        ordinal_mapping: base?.ordinal_mapping || {},
+        binary_mapping: base?.binary_mapping || {},
+        target_encoding_smoothing: base?.target_encoding_smoothing ?? 10,
       }))
     })
     Object.values(map).forEach((item) => {
@@ -12620,24 +15456,117 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     ),
     [mlopsStage2SerializedConfig],
   )
+  const mlopsStage2GeneratedFields = useMemo(() => {
+    const generated: string[] = []
+
+    const artifactDerived = mlopsStage2ArtifactDraft?.derived_columns
+      ?? mlopsStage2ArtifactConfigured?.derived_columns
+    if (Array.isArray(artifactDerived)) {
+      artifactDerived.forEach((item) => {
+        const field = String(item || '').trim()
+        if (field) generated.push(field)
+      })
+    }
+
+    mlopsStage2PreviewRows.slice(0, 300).forEach((row) => {
+      Object.keys(row || {}).forEach((key) => {
+        const field = String(key || '').trim()
+        if (field) generated.push(field)
+      })
+    })
+
+    const sanitizeColumnToken = (value: string): string => {
+      const text = String(value || '').trim()
+      if (!text) return 'value'
+      return text
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 48) || 'value'
+    }
+
+    const oneHotConfigs = mlopsStage2SerializedConfig.filter(
+      (item) => item.enabled && item.encoding.includes('one_hot_encoding') && String(item.field_path || '').trim(),
+    )
+    if (oneHotConfigs.length > 0 && mlopsPreviewRows.length > 0) {
+      oneHotConfigs.forEach((cfg) => {
+        const field = String(cfg.field_path || '').trim()
+        const categories = uniqueFieldNames(
+          mlopsPreviewRows
+            .slice(0, 1000)
+            .map((row) => {
+              if (!row || typeof row !== 'object') return ''
+              const values = readPathValues(row as Record<string, unknown>, field)
+              const value = Array.isArray(values) && values.length > 0
+                ? mlopsStage2ToScalar(values[0])
+                : readPathValue(row as Record<string, unknown>, field).value
+              return mlopsStage2IsMissing(value) ? '' : String(value)
+            })
+            .filter(Boolean),
+        ).slice(0, 30)
+        categories.forEach((category) => generated.push(`${field}__${sanitizeColumnToken(category)}`))
+      })
+    }
+
+    return filterUserFacingFieldNames(uniqueFieldNames(generated))
+  }, [
+    mlopsStage2ArtifactConfigured,
+    mlopsStage2ArtifactDraft,
+    mlopsStage2PreviewRows,
+    mlopsStage2SerializedConfig,
+    mlopsPreviewRows,
+  ])
   const mlopsStage3AvailableFields = useMemo(
-    () => (mlopsStage2EnabledFields.length > 0 ? mlopsStage2EnabledFields : mlopsFieldOptions),
-    [mlopsStage2EnabledFields, mlopsFieldOptions],
+    () => {
+      const previewFields = mlopsStage2PreviewRows.length > 0
+        ? filterUserFacingFieldNames([
+          ...extractPriorityJsonFieldPaths(mlopsStage2PreviewRows),
+          ...extractSampleFieldPaths(mlopsStage2PreviewRows),
+        ])
+        : []
+      const baseFields = previewFields.length > 0
+        ? previewFields
+        : (mlopsStage2EnabledFields.length > 0 ? mlopsStage2EnabledFields : mlopsFieldOptions)
+      return uniqueFieldNames([
+        ...baseFields,
+        ...mlopsStage2GeneratedFields,
+        String(mlopsStage2TargetFieldDraft || mlopsStage2TargetFieldConfigured || '').trim(),
+        String(mlopsStage2LabelFieldDraft || mlopsStage2LabelFieldConfigured || '').trim(),
+      ].filter(Boolean))
+    },
+    [
+      mlopsFieldOptions,
+      mlopsStage2EnabledFields,
+      mlopsStage2GeneratedFields,
+      mlopsStage2LabelFieldConfigured,
+      mlopsStage2LabelFieldDraft,
+      mlopsStage2PreviewRows,
+      mlopsStage2TargetFieldConfigured,
+      mlopsStage2TargetFieldDraft,
+    ],
   )
   const mlopsStage3FeatureFieldOptions = useMemo(
     () => mlopsStage3AvailableFields.map((path) => ({ value: path, label: path })),
     [mlopsStage3AvailableFields],
   )
-  const mlopsStage3EnsembleFeatureOptions = useMemo(
+  const mlopsStage3EnsembleOutputFields = useMemo(
     () => {
       const upstreamOutputs: string[] = []
       mlopsStage3EnsembleModelsDraft.forEach((model) => {
         if (model.prediction_field) upstreamOutputs.push(model.prediction_field)
         if (model.score_field) upstreamOutputs.push(model.score_field)
       })
-      return uniqueFieldNames([...mlopsStage3AvailableFields, ...upstreamOutputs]).map((path) => ({ value: path, label: path }))
+      return uniqueFieldNames(upstreamOutputs)
     },
-    [mlopsStage3AvailableFields, mlopsStage3EnsembleModelsDraft],
+    [mlopsStage3EnsembleModelsDraft],
+  )
+  const mlopsStage3EnsembleAvailableFields = useMemo(
+    () => uniqueFieldNames([...mlopsStage3AvailableFields, ...mlopsStage3EnsembleOutputFields]),
+    [mlopsStage3AvailableFields, mlopsStage3EnsembleOutputFields],
+  )
+  const mlopsStage3EnsembleFeatureOptions = useMemo(
+    () => mlopsStage3EnsembleAvailableFields.map((path) => ({ value: path, label: path })),
+    [mlopsStage3EnsembleAvailableFields],
   )
   const mlopsStage4MonitorFieldOptions = useMemo(
     () => mlopsStage3AvailableFields.map((path) => ({ value: path, label: path })),
@@ -13224,6 +16153,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => uniqueFieldNames(mlopsStage3FeatureFieldsDraft.filter((item) => mlopsStage3AvailableFields.includes(item))),
     [mlopsStage3FeatureFieldsDraft, mlopsStage3AvailableFields],
   )
+  const pruneMLOpsStage3FeatureFields = useCallback(
+    (fields: unknown) => {
+      const allowed = new Set(mlopsStage3EnsembleAvailableFields)
+      return uniqueFieldNames(
+        (Array.isArray(fields) ? fields : parseStringList(fields))
+          .map((item) => String(item || '').trim())
+          .filter((item) => item && allowed.has(item)),
+      )
+    },
+    [mlopsStage3EnsembleAvailableFields],
+  )
   const mlopsStage4SelectedMonitorFields = useMemo(
     () => uniqueFieldNames(mlopsStage4MonitorNumericFieldsDraft.filter((item) => mlopsStage3AvailableFields.includes(item))),
     [mlopsStage4MonitorNumericFieldsDraft, mlopsStage3AvailableFields],
@@ -13688,6 +16628,35 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   }, [mlopsStudioOpen, nodeType, mlopsStage3FeatureFieldsDraft, mlopsStage3AvailableFields])
   useEffect(() => {
     if (!mlopsStudioOpen || nodeType !== 'mlops_transform') return
+    const allowed = new Set(mlopsStage3EnsembleAvailableFields)
+    setMLOpsStage3EnsembleModelsDraft((prev) => {
+      let changed = false
+      const next = prev.map((model) => {
+        const cleanedFeatures = uniqueFieldNames((model.feature_fields || []).filter((field) => allowed.has(field)))
+        const target = String(model.target_field || '').trim()
+        const cleanedTarget = target && !allowed.has(target) ? '' : target
+        const dateField = String(model.forecast_date_field || '').trim()
+        const cleanedDateField = dateField && !allowed.has(dateField) ? '' : dateField
+        if (
+          cleanedFeatures.length !== (model.feature_fields || []).length
+          || cleanedTarget !== target
+          || cleanedDateField !== dateField
+        ) {
+          changed = true
+          return {
+            ...model,
+            feature_fields: cleanedFeatures,
+            target_field: cleanedTarget,
+            forecast_date_field: cleanedDateField,
+          }
+        }
+        return model
+      })
+      return changed ? next : prev
+    })
+  }, [mlopsStudioOpen, nodeType, mlopsStage3EnsembleAvailableFields])
+  useEffect(() => {
+    if (!mlopsStudioOpen || nodeType !== 'mlops_transform') return
     const allowed = new Set(mlopsStage3AvailableFields)
     const cleaned = uniqueFieldNames(mlopsStage4MonitorNumericFieldsDraft.filter((item) => allowed.has(item)))
     if (cleaned.length !== mlopsStage4MonitorNumericFieldsDraft.length) {
@@ -13739,6 +16708,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         type: String(item?.type || ''),
         missing_pct: Number(item?.missing_pct || 0),
         unique_count: Number(item?.unique_count || 0),
+        raw_suggested_operations: Array.isArray(item?.suggested_operations)
+          ? (item?.suggested_operations as unknown[]).map((v) => String(v || '')).filter(Boolean)
+          : [],
         suggested_operations: Array.isArray(item?.suggested_operations)
           ? (item?.suggested_operations as unknown[]).map((v) => String(v || '')).filter(Boolean).slice(0, 3).join(', ')
           : '',
@@ -14167,7 +17139,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     select_field_aliases: dataQuerySelectFieldAliasesDraft,
     array_output_mode: dataQueryArrayOutputModeDraft,
     array_match_mode: dataQueryArrayMatchModeDraft,
-    include_original_row: dataQueryIncludeOriginalRowDraft,
+    include_original_row: dataQuerySelectFieldsDraft.length > 0 ? false : dataQueryIncludeOriginalRowDraft,
     offset: dataQueryOffsetDraft,
     limit: dataQueryLimitDraft,
     preview_source_mode: dataQueryPreviewSourceModeDraft,
@@ -15853,7 +18825,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const aliasMap = dataQuerySelectFieldAliasesDraft || {}
     const arrayOutputMode = dataQueryArrayOutputModeDraft === 'explode_rows' ? 'explode_rows' : 'list'
     const arrayMatchMode = dataQueryArrayMatchModeDraft === 'matched_elements_only' ? 'matched_elements_only' : 'all_elements'
-    const includeOriginal = Boolean(dataQueryIncludeOriginalRowDraft)
+    const includeOriginal = selectedFields.length > 0 ? false : Boolean(dataQueryIncludeOriginalRowDraft)
     const safeOffset = Number.isFinite(dataQueryOffsetDraft)
       ? Math.max(0, Math.trunc(dataQueryOffsetDraft))
       : 0
@@ -16848,7 +19820,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       ),
       array_output_mode: dataQueryArrayOutputModeDraft,
       array_match_mode: dataQueryArrayMatchModeDraft,
-      include_original_row: Boolean(dataQueryIncludeOriginalRowDraft),
+      include_original_row: dataQuerySelectFieldsDraft.length > 0 ? false : Boolean(dataQueryIncludeOriginalRowDraft),
       offset: safeOffset,
       limit: safeLimit,
       preview_source_mode: dataQueryPreviewSourceModeDraft,
@@ -16925,7 +19897,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const selectedFieldAliases = dataQuerySelectFieldAliasesConfigured
     const arrayOutputMode = dataQueryArrayOutputModeConfigured
     const arrayMatchMode = dataQueryArrayMatchModeConfigured
-    const includeOriginal = dataQueryIncludeOriginalConfigured
+    const includeOriginal = selectedFields.length > 0 ? false : dataQueryIncludeOriginalConfigured
     const offset = dataQueryOffsetConfigured
     const limit = dataQueryLimitConfigured
     const previewSourceMode = dataQueryPreviewSourceModeConfigured
@@ -17235,6 +20207,192 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     })
   }, [])
 
+  const applyMLOpsSuggestedOpsToStage2 = useCallback((
+    fieldPath: string,
+    operations: unknown,
+  ) => {
+    const key = String(fieldPath || '').trim()
+    if (!key) return
+    const normalizeSuggestedOps = (value: unknown): string[] => {
+      const rawItems = Array.isArray(value) ? value : parseStringList(value)
+      const out: string[] = []
+      rawItems.forEach((item) => {
+        String(item || '')
+          .split(/[,\n]/)
+          .map((part) => part.trim())
+          .filter(Boolean)
+          .forEach((part) => out.push(part))
+      })
+      return uniqueFieldNames(out)
+    }
+    const ops = normalizeSuggestedOps(operations)
+    if (ops.length <= 0) return
+    const cleaningMap: Record<string, MLOpsStage2CleaningOperation> = {
+      to_numeric: 'schema_datatype_correction',
+      to_datetime: 'schema_datatype_correction',
+      text_lower: 'standardization',
+      text_length: 'standardization',
+      text_word_count: 'standardization',
+      datetime_parts: 'schema_datatype_correction',
+      cyclical_encode: 'schema_datatype_correction',
+    }
+    const missingMap: Record<string, MLOpsStage2MissingOperation> = {
+      impute_mean: 'mean_imputation',
+      impute_median: 'median_imputation',
+      impute_mode: 'mode_imputation',
+      impute_constant: 'mode_imputation',
+      drop_null_rows: 'row_removal',
+      drop_column: 'column_removal',
+    }
+    const encodingMap: Record<string, MLOpsStage2EncodingOperation> = {
+      one_hot_encode: 'one_hot_encoding',
+      label_encode: 'label_encoding',
+      ordinal_encode: 'ordinal_encoding',
+      binary_encode: 'binary_encoding',
+      frequency_encode: 'target_encoding',
+      target_encode: 'target_encoding',
+      target_encoding: 'target_encoding',
+      text_length: 'label_encoding',
+      text_word_count: 'label_encoding',
+    }
+    const scalingMap: Record<string, MLOpsStage2ScalingOperation> = {
+      scale_standard: 'standard_scaling',
+      scale_minmax: 'min_max_scaling',
+      scale_robust: 'robust_scaling',
+      log1p: 'log_transformation',
+      sqrt: 'log_transformation',
+      square: 'log_transformation',
+      cube: 'log_transformation',
+      abs: 'log_transformation',
+      winsorize: 'outlier_clipping',
+      clip: 'outlier_clipping',
+      bin_equal_width: 'outlier_clipping',
+      bin_quantile: 'outlier_clipping',
+    }
+    setMLOpsStage2FieldConfigsByFieldDraft((prev) => {
+      const current = createMLOpsStage2FieldConfig(prev[key] || { field_path: key, enabled: false })
+      const cleaning = [...current.cleaning]
+      const missingValues = [...current.missing_values]
+      const encoding = [...current.encoding]
+      const scaling = [...current.scaling]
+      ops.forEach((opRaw) => {
+        const op = String(opRaw || '').trim().toLowerCase()
+        const clean = cleaningMap[op]
+        if (clean && !cleaning.includes(clean)) cleaning.push(clean)
+        const missing = missingMap[op]
+        if (missing && !missingValues.includes(missing)) missingValues.push(missing)
+        const enc = encodingMap[op]
+        if (enc && !encoding.includes(enc)) encoding.push(enc)
+        const scale = scalingMap[op]
+        if (scale && !scaling.includes(scale)) scaling.push(scale)
+      })
+      return {
+        ...prev,
+        [key]: createMLOpsStage2FieldConfig({
+          ...current,
+          enabled: true,
+          cleaning,
+          missing_values: missingValues,
+          encoding,
+          scaling,
+        }),
+      }
+    })
+    setMLOpsStudioTab('pre_processing')
+  }, [])
+
+  const applyAllMLOpsProfileSuggestionsToStage2 = useCallback(() => {
+    const normalizeSuggestedOps = (value: unknown): string[] => {
+      const rawItems = Array.isArray(value) ? value : parseStringList(value)
+      const out: string[] = []
+      rawItems.forEach((item) => {
+        String(item || '')
+          .split(/[,\n]/)
+          .map((part) => part.trim())
+          .filter(Boolean)
+          .forEach((part) => out.push(part))
+      })
+      return uniqueFieldNames(out)
+    }
+    const cleaningMap: Record<string, MLOpsStage2CleaningOperation> = {
+      to_numeric: 'schema_datatype_correction',
+      to_datetime: 'schema_datatype_correction',
+      text_lower: 'standardization',
+      text_length: 'standardization',
+      text_word_count: 'standardization',
+      datetime_parts: 'schema_datatype_correction',
+      cyclical_encode: 'schema_datatype_correction',
+    }
+    const missingMap: Record<string, MLOpsStage2MissingOperation> = {
+      impute_mean: 'mean_imputation',
+      impute_median: 'median_imputation',
+      impute_mode: 'mode_imputation',
+      impute_constant: 'mode_imputation',
+      drop_null_rows: 'row_removal',
+      drop_column: 'column_removal',
+    }
+    const encodingMap: Record<string, MLOpsStage2EncodingOperation> = {
+      one_hot_encode: 'one_hot_encoding',
+      label_encode: 'label_encoding',
+      ordinal_encode: 'ordinal_encoding',
+      binary_encode: 'binary_encoding',
+      frequency_encode: 'target_encoding',
+      target_encode: 'target_encoding',
+      target_encoding: 'target_encoding',
+      text_length: 'label_encoding',
+      text_word_count: 'label_encoding',
+    }
+    const scalingMap: Record<string, MLOpsStage2ScalingOperation> = {
+      scale_standard: 'standard_scaling',
+      scale_minmax: 'min_max_scaling',
+      scale_robust: 'robust_scaling',
+      log1p: 'log_transformation',
+      sqrt: 'log_transformation',
+      square: 'log_transformation',
+      cube: 'log_transformation',
+      abs: 'log_transformation',
+      winsorize: 'outlier_clipping',
+      clip: 'outlier_clipping',
+      bin_equal_width: 'outlier_clipping',
+      bin_quantile: 'outlier_clipping',
+    }
+    setMLOpsStage2FieldConfigsByFieldDraft((prev) => {
+      const next = { ...prev }
+      mlopsProfileColumns.forEach((column: any) => {
+        const key = String(column?.name || '').trim()
+        if (!key) return
+        const ops = normalizeSuggestedOps(column?.raw_suggested_operations)
+        if (ops.length <= 0) return
+        const current = createMLOpsStage2FieldConfig(next[key] || { field_path: key, enabled: false })
+        const cleaning = [...current.cleaning]
+        const missingValues = [...current.missing_values]
+        const encoding = [...current.encoding]
+        const scaling = [...current.scaling]
+        ops.forEach((opRaw) => {
+          const op = String(opRaw || '').trim().toLowerCase()
+          const clean = cleaningMap[op]
+          if (clean && !cleaning.includes(clean)) cleaning.push(clean)
+          const missing = missingMap[op]
+          if (missing && !missingValues.includes(missing)) missingValues.push(missing)
+          const enc = encodingMap[op]
+          if (enc && !encoding.includes(enc)) encoding.push(enc)
+          const scale = scalingMap[op]
+          if (scale && !scaling.includes(scale)) scaling.push(scale)
+        })
+        next[key] = createMLOpsStage2FieldConfig({
+          ...current,
+          enabled: true,
+          cleaning,
+          missing_values: missingValues,
+          encoding,
+          scaling,
+        })
+      })
+      return next
+    })
+    setMLOpsStudioTab('pre_processing')
+  }, [mlopsProfileColumns])
+
   const runMLOpsStage2Preview = useCallback(() => {
     if (nodeType !== 'mlops_transform' || !selectedNodeId) return
     const inputRows = mlopsPreviewRows
@@ -17254,7 +20412,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       })
       return
     }
-    const configs = mlopsStage2SerializedConfig.filter((item) => item.enabled)
+    const configs = mlopsStage2SerializedConfig.filter((item) => item.enabled || hasMLOpsStage2FieldOps(item))
     if (configs.length <= 0) {
       setMLOpsStage2PreviewError('No enabled fields selected. Enable at least one field to run Stage 2 preview.')
       setMLOpsStage2PreviewRows([])
@@ -17359,6 +20517,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         const missingIndices = values
           .map((value, index) => (mlopsStage2IsMissing(value) ? index : -1))
           .filter((index) => index >= 0)
+        if (cfg.missing_values.includes('row_removal')) {
+          missingIndices.forEach((idx) => { rowKeepMask[idx] = false })
+        }
         const numericSeries = values
           .map((value) => mlopsStage2ToNumber(value))
           .filter((value): value is number => value != null)
@@ -17404,11 +20565,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             }
           }
         }
-        if (cfg.missing_values.includes('row_removal')) {
-          for (let i = 0; i < values.length; i += 1) {
-            if (mlopsStage2IsMissing(values[i])) rowKeepMask[i] = false
-          }
-        }
 
         // Encoding
         if (cfg.encoding.includes('rare_category_grouping')) {
@@ -17447,11 +20603,32 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               .map((value) => (mlopsStage2IsMissing(value) ? '' : String(value)))
               .filter(Boolean)
           ).sort((a, b) => a.localeCompare(b))
+          const configuredRank = cfg.ordinal_mapping || {}
           const rank = new Map<string, number>()
-          categories.forEach((item, idx) => rank.set(item, idx))
+          categories.forEach((item, idx) => {
+            const mapped = Number(configuredRank[item])
+            rank.set(item, Number.isFinite(mapped) ? mapped : idx)
+          })
           for (let i = 0; i < values.length; i += 1) {
             if (mlopsStage2IsMissing(values[i])) continue
             values[i] = rank.get(String(values[i])) ?? null
+          }
+        }
+        if (cfg.encoding.includes('binary_encoding')) {
+          const categories = uniqueFieldNames(
+            values
+              .map((value) => (mlopsStage2IsMissing(value) ? '' : String(value)))
+              .filter(Boolean)
+          )
+          const configuredBinary = cfg.binary_mapping || {}
+          const binaryMap = new Map<string, number>()
+          categories.forEach((item, idx) => {
+            const mapped = Number(configuredBinary[item])
+            binaryMap.set(item, Number.isFinite(mapped) ? (mapped ? 1 : 0) : (idx === 0 ? 0 : idx === 1 ? 1 : 0))
+          })
+          for (let i = 0; i < values.length; i += 1) {
+            if (mlopsStage2IsMissing(values[i])) continue
+            values[i] = binaryMap.get(String(values[i])) ?? null
           }
         }
         if (cfg.encoding.includes('label_encoding')) {
@@ -17488,12 +20665,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             const globalMean = globalTargets.length > 0
               ? globalTargets.reduce((sum, item) => sum + item, 0) / globalTargets.length
               : 0
+            const smoothing = Math.max(0, Number(cfg.target_encoding_smoothing ?? 10) || 0)
             for (let i = 0; i < values.length; i += 1) {
               if (mlopsStage2IsMissing(values[i])) continue
               const key = categoryKey(values[i])
               const count = counts.get(key) || 0
               const sum = sums.get(key) || 0
-              values[i] = count > 0 ? (sum / count) : globalMean
+              values[i] = count > 0
+                ? ((sum + (smoothing * globalMean)) / (count + smoothing))
+                : globalMean
             }
           } else {
             const counts = new Map<string, number>()
@@ -17621,6 +20801,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           missing_values: cfg.missing_values,
           encoding: cfg.encoding,
           scaling: cfg.scaling,
+          ordinal_mapping: cfg.ordinal_mapping,
+          binary_mapping: cfg.binary_mapping,
+          target_encoding_smoothing: cfg.target_encoding_smoothing,
         })),
       }
 
@@ -17660,12 +20843,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   ])
 
   const resolveMLOpsTrainingRows = useCallback(async (): Promise<Array<Record<string, unknown>>> => {
-    const fallbackRows = (
-      mlopsStage2PreviewRows.length > 0
-        ? mlopsStage2PreviewRows
-        : mlopsPreviewRows
-    ) as Array<Record<string, unknown>>
-    return resolveMLOpsFullSourceRows(fallbackRows)
+    if (mlopsStage2PreviewRows.length > 0) {
+      return mlopsStage2PreviewRows as Array<Record<string, unknown>>
+    }
+    return resolveMLOpsFullSourceRows(mlopsPreviewRows as Array<Record<string, unknown>>)
   }, [
     resolveMLOpsFullSourceRows,
     mlopsPreviewRows,
@@ -17703,7 +20884,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       setMLOpsStage3RunSummary(null)
       return
     }
-    const ensembleModels = serializeMLOpsEnsembleModels(mlopsStage3EnsembleModelsDraft)
+    const ensembleModels = serializeMLOpsEnsembleModels(mlopsStage3EnsembleModelsDraft.map((model) => ({
+      ...model,
+      feature_fields: pruneMLOpsStage3FeatureFields(model.feature_fields),
+    }))).filter((model) => Array.isArray(model.feature_fields) && model.feature_fields.length > 0)
     if (modelMode === 'ensemble_pipeline' && ensembleModels.length <= 0) {
       setMLOpsStage3RunError('Add at least one ensemble model step.')
       setMLOpsStage3RunSummary(null)
@@ -17894,11 +21078,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage3ExplainabilityMethodDraft,
     mlopsStage3TrackingEnabledDraft,
     mlopsStage3RunNameDraft,
+    pruneMLOpsStage3FeatureFields,
   ])
 
   const runMLOpsSingleEnsembleModelTest = useCallback(async (model: MLOpsEnsembleModelConfig) => {
     if (nodeType !== 'mlops_transform' || !selectedNodeId || !model) return
-    const featureFields = uniqueFieldNames((model.feature_fields || []).map((item) => String(item || '').trim()).filter(Boolean))
+    const featureFields = pruneMLOpsStage3FeatureFields(model.feature_fields)
     if (featureFields.length <= 0) {
       setMLOpsStage3ModelRunErrors((prev) => ({ ...prev, [model.id]: 'Select at least one feature field before running this model.' }))
       return
@@ -17907,6 +21092,22 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       setMLOpsStage3ModelRunErrors((prev) => ({ ...prev, [model.id]: 'Target / Label field is required for this model.' }))
       return
     }
+    const selectedModelIndex = mlopsStage3EnsembleModelsDraft.findIndex((item) => item.id === model.id)
+    const modelSequenceForTest = (
+      selectedModelIndex >= 0
+        ? mlopsStage3EnsembleModelsDraft.slice(0, selectedModelIndex + 1)
+        : [...mlopsStage3EnsembleModelsDraft, model]
+    )
+      .filter((item) => item.id === model.id || item.enabled !== false)
+      .map((item, index) => createMLOpsEnsembleModel({
+        ...item,
+        enabled: item.id === model.id ? true : item.enabled,
+      }, index))
+    const serializedModelSequence = serializeMLOpsEnsembleModels(modelSequenceForTest)
+      .map((item) => ({
+        ...item,
+        feature_fields: pruneMLOpsStage3FeatureFields(item.feature_fields),
+      }))
     setMLOpsStage3ModelRunLoadingId(model.id)
     setMLOpsStage3ModelRunErrors((prev) => ({ ...prev, [model.id]: '' }))
     try {
@@ -17919,7 +21120,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         rows: rowsForTraining,
         task_type: model.task_type,
         model: model.model,
-        model_mode: 'single',
+        model_mode: 'ensemble_pipeline',
+        ensemble_models: serializedModelSequence,
         feature_fields: featureFields,
         target_field: String(model.target_field || '').trim() || undefined,
         target_fields: model.task_type === 'forecasting' && String(model.target_field || '').trim()
@@ -17952,16 +21154,33 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         explainability_method: model.explainability_method,
       })
       const backendSummary = (response?.summary || response || {}) as Record<string, unknown>
-      setMLOpsStage3ModelRunSummaries((prev) => ({
-        ...prev,
-        [model.id]: {
-          ...backendSummary,
+      const stepSummaries = Array.isArray(backendSummary.model_summaries)
+        ? backendSummary.model_summaries.filter((item): item is Record<string, unknown> => item != null && typeof item === 'object')
+        : []
+      const selectedStepSummary = stepSummaries.find((item) => String(item.step_id || '') === model.id)
+        || stepSummaries.find((item) => String(item.step_name || '') === model.name)
+        || stepSummaries[stepSummaries.length - 1]
+        || backendSummary
+      setMLOpsStage3ModelRunSummaries((prev) => {
+        const next = { ...prev }
+        stepSummaries.forEach((item) => {
+          const stepId = String(item.step_id || '').trim()
+          if (!stepId) return
+          next[stepId] = {
+            ...item,
+            step_id: stepId,
+            step_name: String(item.step_name || stepId),
+          }
+        })
+        next[model.id] = {
+          ...selectedStepSummary,
           step_id: model.id,
           step_name: model.name,
           prediction_field: model.prediction_field,
           score_field: model.score_field,
-        },
-      }))
+        }
+        return next
+      })
       setMLOpsStage3ModelRunErrors((prev) => ({ ...prev, [model.id]: '' }))
     } catch (err: any) {
       const detail = err?.response?.data?.detail
@@ -17976,6 +21195,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     nodeType,
     selectedNodeId,
     resolveMLOpsTrainingRows,
+    mlopsStage3EnsembleModelsDraft,
     mlopsStage3TrainTestSplitDraft,
     mlopsStage3CvFoldsDraft,
     mlopsStage3ClusterCountDraft,
@@ -17986,7 +21206,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage3TuningMethodDraft,
     mlopsStage3TuningParamsDraft,
     mlopsStage3TrackingEnabledDraft,
+    mlopsStage3TrackVersionsDraft,
+    mlopsStage3TrackParamsDraft,
+    mlopsStage3TrackMetricsDraft,
+    mlopsStage3TrackLogsDraft,
     mlopsStage3RunNameDraft,
+    pruneMLOpsStage3FeatureFields,
   ])
 
   const runMLOpsStage4Deploy = useCallback(async () => {
@@ -18127,7 +21352,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_stage2_field_configs: mlopsStage2SerializedConfig,
       mlops_stage2_artifact: mlopsStage2ArtifactDraft || null,
       mlops_stage3_model_mode: 'ensemble_pipeline',
-      mlops_stage3_ensemble_models: serializeMLOpsEnsembleModels(mlopsStage3EnsembleModelsDraft),
+      mlops_stage3_ensemble_models: serializeMLOpsEnsembleModels(mlopsStage3EnsembleModelsDraft.map((model) => ({
+        ...model,
+        feature_fields: pruneMLOpsStage3FeatureFields(model.feature_fields),
+      }))),
       mlops_stage3_task_type: mlopsStage3TaskTypeDraft,
       mlops_stage3_model: String(mlopsStage3ModelDraft || '').trim(),
       mlops_stage3_feature_fields: mlopsStage3SelectedFeatureFields,
@@ -18285,12 +21513,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage4MonitorSampleSizeDraft,
     mlopsStage4SelectedMonitorFields,
     mlopsStage4Summary,
+    pruneMLOpsStage3FeatureFields,
     updateNodeConfig,
   ])
 
   const saveMLOpsEnsembleModelConfiguration = useCallback((modelsOverride?: MLOpsEnsembleModelConfig[]) => {
     if (nodeType !== 'mlops_transform' || !selectedNodeId) return
-    const modelsToSave = modelsOverride || mlopsStage3EnsembleModelsDraft
+    const modelsToSave = (modelsOverride || mlopsStage3EnsembleModelsDraft).map((model) => ({
+      ...model,
+      feature_fields: pruneMLOpsStage3FeatureFields(model.feature_fields),
+    }))
     setMLOpsStage3ModelModeDraft('ensemble_pipeline')
     setMLOpsStage3EnsembleModelsDraft(modelsToSave)
     updateNodeConfig(selectedNodeId, {
@@ -18311,6 +21543,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage3EnsembleModelsDraft,
     mlopsStage3ModelBundleDraft,
     mlopsStage3RunSummary,
+    pruneMLOpsStage3FeatureFields,
     updateNodeConfig,
   ])
 
@@ -18446,7 +21679,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setMLOpsStage2PreviewLoading(false)
     setMLOpsStage2PreviewError(null)
     setMLOpsStage2PreviewRows([])
-    setMLOpsStage2ArtifactDraft(null)
+    setMLOpsStage2ArtifactDraft(mlopsStage2ArtifactConfigured)
     setMLOpsStage2PreviewSummary({
       ran: false,
       inputRows: 0,
@@ -18476,6 +21709,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_stage2_target_field: mlopsStage2TargetFieldConfigured,
       mlops_stage2_label_field: mlopsStage2LabelFieldConfigured,
       mlops_stage2_field_configs: serializeMLOpsStage2FieldConfigMap(stage2ConfigMap),
+      mlops_stage2_artifact: mlopsStage2ArtifactConfigured || null,
       mlops_stage3_model_mode: 'ensemble_pipeline',
       mlops_stage3_ensemble_models: serializeMLOpsEnsembleModels(mlopsStage3EnsembleModelsConfigured),
       mlops_stage3_task_type: mlopsStage3TaskTypeConfigured,
@@ -18565,6 +21799,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage2PreviewLimitConfigured,
     mlopsStage2TargetFieldConfigured,
     mlopsStage2LabelFieldConfigured,
+    mlopsStage2ArtifactConfigured,
     mlopsStage3EnsembleModelsConfigured,
     mlopsStage3TaskTypeConfigured,
     mlopsStage3ModelConfigured,
@@ -19729,6 +22964,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const safeIndex = Number(index)
     if (!Number.isFinite(safeIndex)) return
     setUiExpressionBuilderTouched(true)
+    setUiExpressionValuesByIndex((prev) => ({
+      ...prev,
+      [safeIndex]: normalizeUiExpressionParameterValueForMode(mode, prev[safeIndex] || ''),
+    }))
     setUiExpressionParamModeByIndex((prev) => ({
       ...prev,
       [safeIndex]: mode,
@@ -20865,7 +24104,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     try {
       const result = await api.validateCustomFields({
         config: testConfig,
-        rows: validationSource === 'rows' ? sampleRows : [],
+        rows: sampleRows,
         max_rows: validationLimit,
         validation_source: validationSource,
         lmdb_config: {
@@ -20958,7 +24197,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const initialDraft = (
       configuredCustomFields.length > 0
         ? configuredCustomFields.map((item) => createCustomFieldSpec(item))
-        : [createCustomFieldSpec()]
+        : []
     )
     setCustomFieldDraft(initialDraft)
     const allowedStateKeys = new Set<string>()
@@ -21079,6 +24318,25 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     lastFocusedExpressionEditorRef.current = null
     setExampleRepoCategory('all')
     setExampleRepoSearch('')
+    const fallbackExpressionRoles = inferExpressionStudioRoles(expressionFieldOptions)
+    const persistedExpressionStudio = parseExpressionStudioPersistedConfig(
+      nodeConfig.custom_expression_studio,
+      fallbackExpressionRoles,
+    )
+    setCustomFieldStudioView('workbench')
+    setExpressionStudioTab(persistedExpressionStudio?.tab || 'fields')
+    setExpressionStudioRoleSelections(
+      persistedExpressionStudio?.roleSelections || expressionStudioRoleSelectionDefaults(fallbackExpressionRoles)
+    )
+    setExpressionStudioFieldDeclarations(persistedExpressionStudio?.fieldDeclarations || [])
+    setExpressionStudioRules(persistedExpressionStudio?.rules || [])
+    setExpressionStudioJsonDeclarations(
+      removeUnappliedLegacyExpressionStudioJsonDeclarations(
+        persistedExpressionStudio?.jsonDeclarations || [],
+        initialDraft,
+      )
+    )
+    setExpressionStudioLastAppliedSignature(persistedExpressionStudio?.lastAppliedSignature || '')
     setCustomFieldBeautifyUndoById({})
     setCustomFieldStudioOpen(true)
     setProfileMonitorData(null)
@@ -21199,6 +24457,1670 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
   const addCustomFieldDraft = (seed?: Partial<CustomFieldSpec>) => {
     setCustomFieldDraft((prev) => [...prev, createCustomFieldSpec(seed)])
+  }
+
+  const updateExpressionStudioRule = (id: string, patch: Partial<ExpressionStudioRule>) => {
+    setExpressionStudioRules((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)))
+  }
+
+  const updateExpressionStudioFieldDeclaration = (id: string, patch: Partial<ExpressionStudioFieldDeclaration>) => {
+    setExpressionStudioFieldDeclarations((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)))
+  }
+
+  const updateExpressionStudioJsonDeclaration = (id: string, patch: Partial<ExpressionStudioJsonDeclaration>) => {
+    setExpressionStudioJsonDeclarations((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)))
+  }
+
+  const configureExpressionStudioRecord = (row: ExpressionStudioRecordRow) => {
+    const [kind, rawId] = String(row.key || '').split(':')
+    const id = String(rawId || '').trim()
+    setCustomFieldStudioView('workbench')
+    setExpressionStudioTab(row.section)
+    setExpressionStudioConfigRecordKey(row.key)
+    if (kind === 'field') {
+      const item = expressionStudioFieldDeclarations.find((entry) => entry.id === id)
+      if (item) setExpressionStudioConfigDraft({ kind: 'field', isNew: false, item: { ...item } })
+    } else if (kind === 'rule') {
+      const item = expressionStudioRules.find((entry) => entry.id === id)
+      if (item) {
+        setExpressionStudioConfigDraft({
+          kind: 'rule',
+          isNew: false,
+          item: {
+            ...item,
+            paramValues: { ...item.paramValues },
+            paramModes: { ...item.paramModes },
+          },
+        })
+      }
+    } else if (kind === 'json') {
+      const item = expressionStudioJsonDeclarations.find((entry) => entry.id === id)
+      if (item) {
+        setExpressionStudioConfigDraft({
+          kind: 'json',
+          isNew: false,
+          item: {
+            ...item,
+            paramValues: { ...item.paramValues },
+            paramModes: { ...item.paramModes },
+          },
+        })
+      }
+    }
+  }
+
+  const removeExpressionStudioRecord = (row: ExpressionStudioRecordRow) => {
+    const [kind, rawId] = String(row.key || '').split(':')
+    const id = String(rawId || '').trim()
+    if (!id) return
+    if (kind === 'field') {
+      setExpressionStudioFieldDeclarations((prev) => prev.filter((item) => item.id !== id))
+    } else if (kind === 'rule') {
+      setExpressionStudioRules((prev) => prev.filter((item) => item.id !== id))
+    } else if (kind === 'json') {
+      setExpressionStudioJsonDeclarations((prev) => prev.filter((item) => item.id !== id))
+    }
+    setExpressionStudioConfigRecordKey((prev) => (prev === row.key ? null : prev))
+    setExpressionStudioConfigDraft((prev) => {
+      if (!prev) return prev
+      const draftKey = `${prev.kind}:${prev.item.id}`
+      return draftKey === row.key ? null : prev
+    })
+    setExpressionStudioLastAppliedSignature('')
+  }
+
+  const setExpressionStudioRecordEnabled = (row: ExpressionStudioRecordRow, enabled: boolean) => {
+    const [kind, rawId] = String(row.key || '').split(':')
+    const id = String(rawId || '').trim()
+    if (!id) return
+    if (kind === 'field') {
+      updateExpressionStudioFieldDeclaration(id, { enabled })
+    } else if (kind === 'rule') {
+      updateExpressionStudioRule(id, { enabled })
+    } else if (kind === 'json') {
+      updateExpressionStudioJsonDeclaration(id, { enabled })
+    } else {
+      return
+    }
+    setExpressionStudioLastAppliedSignature('')
+  }
+
+  const setExpressionStudioJsonObjectEnabled = (row: ExpressionStudioRecordRow, enabled: boolean) => {
+    const objectName = String(row.objectName || row.name?.split('.')?.[0] || '').trim()
+    if (!objectName) return
+    setExpressionStudioJsonDeclarations((prev) => prev.map((item) => (
+      String(item.objectName || '').trim() === objectName ? { ...item, objectEnabled: enabled } : item
+    )))
+    setExpressionStudioLastAppliedSignature('')
+  }
+
+  const addExpressionStudioFieldDeclarationAndConfigure = (seed?: Partial<ExpressionStudioFieldDeclaration>) => {
+    const item = expressionStudioDefaultFieldDeclaration({
+      name: `field_alias_${expressionStudioFieldDeclarations.length + 1}`,
+      sourceField: expressionStudioEffectiveRoles.aggregate,
+      ...seed,
+    })
+    setCustomFieldStudioView('workbench')
+    setExpressionStudioTab('fields')
+    setExpressionStudioConfigRecordKey(`field:${item.id}`)
+    setExpressionStudioConfigDraft({ kind: 'field', isNew: true, item })
+  }
+
+  const addExpressionStudioRuleAndConfigure = (seed?: Partial<ExpressionStudioRule>) => {
+    const item = expressionStudioDefaultRule({
+      outputName: `custom_metric_${expressionStudioRules.length + 1}`,
+      sourceField: expressionStudioEffectiveRoles.aggregate,
+      uniqueIdField: expressionStudioEffectiveRoles.uniqueId,
+      groupField: expressionStudioEffectiveRoles.grouping,
+      ...seed,
+    })
+    setCustomFieldStudioView('workbench')
+    setExpressionStudioTab('rules')
+    setExpressionStudioConfigRecordKey(`rule:${item.id}`)
+    setExpressionStudioConfigDraft({ kind: 'rule', isNew: true, item })
+  }
+
+  const addExpressionStudioJsonDeclarationAndConfigure = (seed?: Partial<ExpressionStudioJsonDeclaration>) => {
+    const objectNames = uniqueFieldNames(
+      expressionStudioJsonDeclarations.map((item) => String(item.objectName || '').trim()).filter(Boolean)
+    )
+    const defaultObjectName = String(seed?.objectName || objectNames[objectNames.length - 1] || 'json_profile')
+    const item = expressionStudioDefaultJsonDeclaration({
+      objectName: defaultObjectName,
+      keyName: `metric_${expressionStudioJsonDeclarations.length + 1}`,
+      sourceField: expressionStudioEffectiveRoles.aggregate,
+      uniqueIdField: expressionStudioEffectiveRoles.uniqueId,
+      ...seed,
+    })
+    setCustomFieldStudioView('workbench')
+    setExpressionStudioTab('json')
+    setExpressionStudioConfigRecordKey(`json:${item.id}`)
+    setExpressionStudioConfigDraft({ kind: 'json', isNew: true, item })
+  }
+
+  const addExpressionStudioJsonObjectAndConfigure = (seed?: Partial<ExpressionStudioJsonDeclaration>) => {
+    const objectNames = uniqueFieldNames(
+      expressionStudioJsonDeclarations.map((item) => String(item.objectName || '').trim()).filter(Boolean)
+    )
+    const existingNames = new Set(objectNames.map((name) => name.toLowerCase()))
+    let nextIndex = objectNames.length + 1
+    let nextObjectName = `json_profile_${nextIndex}`
+    while (existingNames.has(nextObjectName.toLowerCase())) {
+      nextIndex += 1
+      nextObjectName = `json_profile_${nextIndex}`
+    }
+    addExpressionStudioJsonDeclarationAndConfigure({
+      objectName: nextObjectName,
+      keyName: 'value',
+      objectEnabled: true,
+      enabled: true,
+      ...seed,
+    })
+  }
+
+  const addExpressionStudioRule = (seed?: Partial<ExpressionStudioRule>) => {
+    setExpressionStudioRules((prev) => [
+      ...prev,
+      expressionStudioDefaultRule({
+        outputName: `custom_metric_${prev.length + 1}`,
+        sourceField: expressionStudioEffectiveRoles.aggregate,
+        uniqueIdField: expressionStudioEffectiveRoles.uniqueId,
+        groupField: expressionStudioEffectiveRoles.grouping,
+        ...seed,
+      }),
+    ])
+  }
+
+  const addExpressionStudioFieldDeclaration = (seed?: Partial<ExpressionStudioFieldDeclaration>) => {
+    setExpressionStudioFieldDeclarations((prev) => [
+      ...prev,
+      expressionStudioDefaultFieldDeclaration({
+        name: `field_alias_${prev.length + 1}`,
+        sourceField: expressionStudioEffectiveRoles.aggregate,
+        ...seed,
+      }),
+    ])
+  }
+
+  const addExpressionStudioJsonDeclaration = (seed?: Partial<ExpressionStudioJsonDeclaration>) => {
+    setExpressionStudioJsonDeclarations((prev) => [
+      ...prev,
+      expressionStudioDefaultJsonDeclaration({
+        objectName: seed?.objectName || 'json_profile',
+        keyName: `metric_${prev.length + 1}`,
+        sourceField: expressionStudioEffectiveRoles.aggregate,
+        uniqueIdField: expressionStudioEffectiveRoles.uniqueId,
+        ...seed,
+      }),
+    ])
+  }
+
+  const loadExpressionStudioSuggestedStarter = () => {
+    const roles = expressionStudioEffectiveRoles
+    setExpressionStudioFieldDeclarations([
+      expressionStudioDefaultFieldDeclaration({
+        name: 'amount_number',
+        mode: 'number',
+        sourceField: roles.aggregate,
+      }),
+      expressionStudioDefaultFieldDeclaration({
+        name: 'success_flag',
+        mode: 'expression',
+        expression: roles.status
+          ? `=if_(${exprStudioField(roles.status)}=='00', 1, 0)`
+          : '=0',
+      }),
+    ])
+    setExpressionStudioRules(expressionStudioDefaultRules(roles))
+    setExpressionStudioJsonDeclarations([
+      expressionStudioDefaultJsonDeclaration({
+        objectName: 'amount_profile',
+        keyName: 'avg_amount',
+        ruleType: 'unique_profile',
+        aggregate: 'avg',
+        sourceField: roles.aggregate,
+        uniqueIdField: roles.uniqueId,
+      }),
+      expressionStudioDefaultJsonDeclaration({
+        objectName: 'amount_profile',
+        keyName: 'max_amount',
+        ruleType: 'unique_profile',
+        aggregate: 'max',
+        sourceField: roles.aggregate,
+        uniqueIdField: roles.uniqueId,
+      }),
+    ])
+    setExpressionStudioTab('fields')
+  }
+
+  const autoFillExpressionStudioRows = () => {
+    const roles = expressionStudioEffectiveRoles
+    setExpressionStudioFieldDeclarations((prev) => prev.map((item) => ({
+      ...item,
+      sourceField: String(item.sourceField || '').trim() ? item.sourceField : roles.aggregate,
+      expression: item.mode === 'expression' && !String(item.expression || '').trim() && roles.status
+        ? `=if_(${exprStudioField(roles.status)}=='00', 1, 0)`
+        : item.expression,
+    })))
+    setExpressionStudioRules((prev) => prev.map((item) => ({
+      ...item,
+      sourceField: String(item.sourceField || '').trim() ? item.sourceField : roles.aggregate,
+      uniqueIdField: String(item.uniqueIdField || '').trim() ? item.uniqueIdField : roles.uniqueId,
+      groupField: String(item.groupField || '').trim() ? item.groupField : roles.grouping,
+    })))
+    setExpressionStudioJsonDeclarations((prev) => prev.map((item) => ({
+      ...item,
+      sourceField: String(item.sourceField || '').trim() ? item.sourceField : roles.aggregate,
+      uniqueIdField: String(item.uniqueIdField || '').trim() ? item.uniqueIdField : roles.uniqueId,
+    })))
+  }
+
+  const syncManualFieldsToExpressionStudio = () => {
+    const nextRules: ExpressionStudioRule[] = []
+    const nextJsonDeclarations: ExpressionStudioJsonDeclaration[] = []
+    const skippedNames: string[] = []
+
+    customFieldDraft.forEach((field) => {
+      const name = String(field.name || '').trim()
+      if (!name) return
+      const enabled = Boolean(field.enabled)
+      if (field.mode === 'json') {
+        const parsed = parseJsonTemplateLikeValue(String(field.jsonTemplate || ''))
+        if (!parsed || typeof parsed !== 'object') {
+          skippedNames.push(name)
+          return
+        }
+        const rows = Array.isArray(parsed)
+          ? [['value', parsed] as [string, unknown]]
+          : Object.entries(parsed as Record<string, unknown>)
+        rows.forEach(([rawKey, rawValue], index) => {
+          const keyName = String(rawKey || '').trim() || `value_${index + 1}`
+          const expression = expressionStudioJsonTemplateValueToExpression(rawValue)
+          const advancedSeed = expressionStudioAdvancedSeedFromExpression(expression)
+          nextJsonDeclarations.push(
+            expressionStudioDefaultJsonDeclaration({
+              enabled,
+              objectEnabled: enabled,
+              objectName: name,
+              keyName,
+              ruleType: 'advanced_function',
+              templateLabel: advancedSeed?.templateLabel,
+              paramValues: advancedSeed?.paramValues,
+              paramModes: advancedSeed?.paramModes,
+              expression: advancedSeed ? advancedSeed.rawExpression : expression,
+            }),
+          )
+        })
+        return
+      }
+
+      const expression = normalizeExpressionValue(String(field.expression || ''))
+      if (!expression.trim()) {
+        skippedNames.push(name)
+        return
+      }
+      const advancedSeed = expressionStudioAdvancedSeedFromExpression(expression)
+      nextRules.push(
+        expressionStudioDefaultRule({
+          enabled,
+          ruleType: 'advanced_function',
+          outputName: name,
+          outputMode: 'value',
+          templateLabel: advancedSeed?.templateLabel,
+          paramValues: advancedSeed?.paramValues,
+          paramModes: advancedSeed?.paramModes,
+          rawExpression: advancedSeed ? advancedSeed.rawExpression : expression,
+        }),
+      )
+    })
+
+    if (nextRules.length === 0 && nextJsonDeclarations.length === 0) {
+      notification.warning({
+        message: 'Nothing to sync',
+        description: 'No manual fields with valid expressions or JSON templates were found.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+
+    const nextFieldDeclarations: ExpressionStudioFieldDeclaration[] = []
+    const nextSignature = JSON.stringify({
+      roles: expressionStudioRoleSelections,
+      fields: nextFieldDeclarations,
+      rules: nextRules,
+      json: nextJsonDeclarations,
+      fns: customFnsVersionDraft,
+    })
+
+    setExpressionStudioFieldDeclarations(nextFieldDeclarations)
+    setExpressionStudioRules(nextRules)
+    setExpressionStudioJsonDeclarations(nextJsonDeclarations)
+    setExpressionStudioConfigRecordKey(null)
+    setExpressionStudioConfigDraft(null)
+    setExpressionStudioLastAppliedSignature(nextSignature)
+    setExpressionStudioTab(nextJsonDeclarations.length > 0 ? 'json' : 'rules')
+    setCustomFieldStudioView('workbench')
+
+    notification.success({
+      message: 'Manual fields synced',
+      description: [
+        `${nextRules.length + nextJsonDeclarations.length} Expression Studio row${nextRules.length + nextJsonDeclarations.length === 1 ? '' : 's'} created from Manual Fields.`,
+        skippedNames.length > 0 ? `Skipped: ${skippedNames.slice(0, 4).join(', ')}${skippedNames.length > 4 ? '...' : ''}` : '',
+      ].filter(Boolean).join(' '),
+      placement: 'bottomRight',
+    })
+  }
+
+  const applyExpressionStudioToDraft = () => {
+    if (expressionStudioBuildIssues.length > 0) {
+      notification.error({
+        message: 'Expression Studio has missing configuration',
+        description: expressionStudioBuildIssues.slice(0, 6).map((issue, idx) => `${idx + 1}. ${issue}`).join('\n'),
+        placement: 'bottomRight',
+        duration: 6,
+      })
+      return
+    }
+    const specs = expressionStudioGeneratedSpecs
+      .map((item) => createCustomFieldSpec({ ...item, enabled: item.enabled ?? true }))
+      .filter((item) => String(item.name || '').trim())
+    if (specs.length === 0 && expressionStudioAllGeneratedOutputNames.length === 0) {
+      notification.warning({
+        message: 'No expression rows to apply',
+        description: 'Add at least one field, rule, or JSON object row first.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    setCustomFieldDraft((prev) => {
+      const next = [...prev]
+      const managedOutputNames = new Set(
+        expressionStudioAllGeneratedOutputNames.map((name) => String(name || '').trim().toLowerCase()).filter(Boolean)
+      )
+      const enabledOutputNames = new Set(
+        specs.map((spec) => String(spec.name || '').trim().toLowerCase()).filter(Boolean)
+      )
+      next.forEach((item, index) => {
+        const normalizedName = String(item.name || '').trim().toLowerCase()
+        if (managedOutputNames.has(normalizedName) && !enabledOutputNames.has(normalizedName)) {
+          next[index] = { ...item, enabled: false }
+        }
+      })
+      specs.forEach((spec) => {
+        const normalizedName = String(spec.name || '').trim().toLowerCase()
+        const existingIndex = next.findIndex((item) => String(item.name || '').trim().toLowerCase() === normalizedName)
+        if (existingIndex >= 0) {
+          next[existingIndex] = {
+            ...next[existingIndex],
+            ...spec,
+            id: next[existingIndex].id,
+          }
+          return
+        }
+        next.push(spec)
+      })
+      return next
+    })
+    if (customFnsVersionDraft === 'v2' || expressionStudioRules.some((rule) => rule.ruleType === 'unique_profile')) {
+      setCustomProfileEnabledDraft(true)
+    }
+    setExpressionStudioLastAppliedSignature(expressionStudioCurrentSignature)
+    notification.success({
+      message: 'Expression Studio applied',
+      description: `${specs.length} enabled generated field${specs.length === 1 ? '' : 's'} added or updated. Disabled generated outputs were switched off.`,
+      placement: 'bottomRight',
+    })
+  }
+
+  const renderExpressionStudioAdvancedParameters = (
+    templateLabel: string,
+    paramValues: Record<number, string>,
+    paramModes: Record<number, UiExpressionParameterMode>,
+    onPatch: (patch: {
+      templateLabel?: string
+      paramValues?: Record<number, string>
+      paramModes?: Record<number, UiExpressionParameterMode>
+    }) => void,
+  ) => {
+    const selectedTemplate = EXPRESSION_FUNCTION_SNIPPETS.find((item) => item.label === templateLabel)
+      || EXPRESSION_FUNCTION_SNIPPETS[0]
+    const selectedTemplateLabel = String(selectedTemplate?.label || '')
+    const selectedTemplateSnippet = String(selectedTemplate?.snippet || '')
+    const selectedIsGroupAggregate = isExpressionStudioGroupAggregateTemplate(selectedTemplateLabel, selectedTemplateSnippet)
+    const selectedIsAppendUniqueObject = isExpressionStudioAppendUniqueObjectTemplate(selectedTemplateLabel, selectedTemplateSnippet)
+    const placeholders = parseSnippetPlaceholders(selectedTemplateSnippet)
+    const groupAggregateDefaultParts = selectedIsGroupAggregate
+      ? parseGroupAggregateExpressionParts(
+        buildExpressionFromSnippetWithUiParameters(selectedTemplateSnippet, placeholders, paramValues, paramModes)
+      )
+      : null
+    const appendObjectDefaultParts = selectedIsAppendUniqueObject
+      ? parseAppendUniqueObjectExpressionParts(
+        buildExpressionFromSnippetWithUiParameters(selectedTemplateSnippet, placeholders, paramValues, paramModes)
+      )
+      : null
+    const groupAggregateKeyField = String(
+      paramValues?.[EXPRESSION_STUDIO_GROUP_AGG_KEY_PARAM_INDEX]
+      || groupAggregateDefaultParts?.keyField
+      || paramValues?.[1]
+      || ''
+    )
+    const groupAggregateKeyName = String(
+      paramValues?.[EXPRESSION_STUDIO_GROUP_AGG_NAME_PARAM_INDEX]
+      || groupAggregateDefaultParts?.keyName
+      || paramValues?.[5]
+      || paramValues?.[7]
+      || 'group'
+    )
+    const groupAggregateMetrics = expressionStudioGroupAggregateMetricsFromPlaceholderValues(
+      paramValues || {},
+      groupAggregateDefaultParts?.metrics || [],
+    )
+    const patchGroupAggregateMetrics = (nextMetrics: UiGroupAggregateMetric[]) => {
+      onPatch({
+        paramValues: {
+          ...paramValues,
+          [EXPRESSION_STUDIO_GROUP_AGG_METRICS_PARAM_INDEX]: serializeGroupAggregateMetrics(nextMetrics),
+        },
+      })
+    }
+    const appendObjectProfilePath = String(
+      paramValues?.[EXPRESSION_STUDIO_APPEND_OBJECT_PATH_PARAM_INDEX]
+      || appendObjectDefaultParts?.profilePath
+      || paramValues?.[1]
+      || 'workflow'
+    )
+    const appendObjectFields = expressionStudioAppendUniqueObjectFieldsFromPlaceholderValues(
+      paramValues || {},
+      appendObjectDefaultParts?.fields || [],
+    )
+    const patchAppendObjectFields = (nextFields: UiAppendUniqueObjectField[]) => {
+      onPatch({
+        paramValues: {
+          ...paramValues,
+          [EXPRESSION_STUDIO_APPEND_OBJECT_FIELDS_PARAM_INDEX]: serializeAppendUniqueObjectFields(nextFields),
+        },
+      })
+    }
+    return (
+      <Space direction="vertical" size={6} style={{ width: '100%' }}>
+        <Select
+          showSearch
+          size="small"
+          value={selectedTemplate?.label}
+          onChange={(value) => {
+            const nextTemplate = EXPRESSION_FUNCTION_SNIPPETS.find((item) => item.label === value) || EXPRESSION_FUNCTION_SNIPPETS[0]
+            const nextPlaceholders = parseSnippetPlaceholders(String(nextTemplate?.snippet || ''))
+            onPatch({
+              templateLabel: String(value || ''),
+              paramValues: nextPlaceholders.reduce<Record<number, string>>((acc, placeholder) => {
+                acc[placeholder.index] = defaultUiExpressionParameterValue(placeholder)
+                return acc
+              }, {}),
+              paramModes: nextPlaceholders.reduce<Record<number, UiExpressionParameterMode>>((acc, placeholder) => {
+                acc[placeholder.index] = defaultUiExpressionParameterMode(placeholder)
+                return acc
+              }, {}),
+            })
+          }}
+          options={uiExpressionTemplateOptions}
+          style={{ width: '100%' }}
+        />
+        {selectedIsGroupAggregate ? (
+          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(220px, 1fr) minmax(180px, 0.8fr) auto', gap: 8 }}>
+              <div>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Group key field</Text>
+                <Select
+                  showSearch
+                  allowClear
+                  size="small"
+                  value={groupAggregateKeyField || undefined}
+                  onChange={(nextValue) => {
+                    onPatch({
+                      paramValues: {
+                        ...paramValues,
+                        [EXPRESSION_STUDIO_GROUP_AGG_KEY_PARAM_INDEX]: String(nextValue || ''),
+                      },
+                    })
+                  }}
+                  options={expressionStudioFieldSelectOptions}
+                  placeholder="Select group field"
+                  style={{ width: '100%', marginTop: 4 }}
+                  optionFilterProp="label"
+                />
+              </div>
+              <div>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Group output name</Text>
+                <Input
+                  size="small"
+                  value={groupAggregateKeyName}
+                  onChange={(event) => {
+                    onPatch({
+                      paramValues: {
+                        ...paramValues,
+                        [EXPRESSION_STUDIO_GROUP_AGG_NAME_PARAM_INDEX]: event.target.value,
+                      },
+                    })
+                  }}
+                  placeholder="customer"
+                  style={{ ...commonInputStyle, marginTop: 4 }}
+                />
+              </div>
+              <Button
+                size="small"
+                style={{ alignSelf: 'end' }}
+                onClick={() => {
+                  const defaultPath = expressionPathOptions[0] || ''
+                  patchGroupAggregateMetrics([
+                    ...groupAggregateMetrics,
+                    createUiGroupAggregateMetric({
+                      outputName: `metric_${groupAggregateMetrics.length + 1}`,
+                      path: defaultPath,
+                      agg: 'sum',
+                    }),
+                  ])
+                }}
+              >
+                Add Metric
+              </Button>
+            </div>
+            <Space direction="vertical" size={6} style={{ width: '100%' }}>
+              {groupAggregateMetrics.map((metric, metricIndex) => (
+                <div
+                  key={metric.id || metricIndex}
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'minmax(160px, 1fr) minmax(180px, 1.2fr) minmax(120px, 0.7fr) auto',
+                    gap: 6,
+                    border: '1px solid var(--app-border)',
+                    borderRadius: 8,
+                    padding: 8,
+                    background: 'var(--app-bg-elevated)',
+                  }}
+                >
+                  <Input
+                    size="small"
+                    value={metric.outputName}
+                    onChange={(event) => {
+                      const nextMetrics = groupAggregateMetrics.map((item, idx) => (
+                        idx === metricIndex
+                          ? { ...item, outputName: normalizeUiGroupAggregateOutputName(event.target.value) }
+                          : item
+                      ))
+                      patchGroupAggregateMetrics(nextMetrics)
+                    }}
+                    placeholder="metric_name"
+                    style={commonInputStyle}
+                  />
+                  <Select
+                    showSearch
+                    allowClear
+                    size="small"
+                    value={metric.path || undefined}
+                    onChange={(nextValue) => {
+                      const nextMetrics = groupAggregateMetrics.map((item, idx) => (
+                        idx === metricIndex ? { ...item, path: String(nextValue || '') } : item
+                      ))
+                      patchGroupAggregateMetrics(nextMetrics)
+                    }}
+                    options={expressionStudioFieldSelectOptions}
+                    placeholder="metric source field"
+                    style={{ width: '100%' }}
+                    optionFilterProp="label"
+                  />
+                  <Select
+                    size="small"
+                    value={EXPR_ALLOWED_AGG_VALUES.has(String(metric.agg || '').toLowerCase()) ? String(metric.agg || '').toLowerCase() : 'sum'}
+                    options={EXPR_ALLOWED_AGG_VALUES_OPTIONS.map((agg) => ({ value: agg, label: agg }))}
+                    onChange={(nextValue) => {
+                      const nextMetrics = groupAggregateMetrics.map((item, idx) => (
+                        idx === metricIndex ? { ...item, agg: String(nextValue || 'sum') } : item
+                      ))
+                      patchGroupAggregateMetrics(nextMetrics)
+                    }}
+                    style={{ width: '100%' }}
+                  />
+                  <Button
+                    size="small"
+                    danger
+                    onClick={() => {
+                      const nextMetrics = groupAggregateMetrics.filter((_, idx) => idx !== metricIndex)
+                      patchGroupAggregateMetrics(
+                        nextMetrics.length > 0
+                          ? nextMetrics
+                          : [createUiGroupAggregateMetric({ outputName: 'metric', path: expressionPathOptions[0] || '', agg: 'sum' })]
+                      )
+                    }}
+                  >
+                    Delete
+                  </Button>
+                </div>
+              ))}
+            </Space>
+          </Space>
+        ) : selectedIsAppendUniqueObject ? (
+          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(220px, 1fr) auto', gap: 8 }}>
+              <div>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Profile list path</Text>
+                <Input
+                  size="small"
+                  value={appendObjectProfilePath}
+                  onChange={(event) => {
+                    onPatch({
+                      paramValues: {
+                        ...paramValues,
+                        [EXPRESSION_STUDIO_APPEND_OBJECT_PATH_PARAM_INDEX]: event.target.value,
+                      },
+                    })
+                  }}
+                  placeholder="workflow"
+                  style={{ ...commonInputStyle, marginTop: 4 }}
+                />
+              </div>
+              <Button
+                size="small"
+                style={{ alignSelf: 'end' }}
+                onClick={() => patchAppendObjectFields([
+                  ...appendObjectFields,
+                  createUiAppendUniqueObjectField({ key: `field_${appendObjectFields.length + 1}`, mode: 'literal', value: '' }),
+                ])}
+              >
+                Add Object Field
+              </Button>
+            </div>
+            <Space direction="vertical" size={6} style={{ width: '100%' }}>
+              {appendObjectFields.map((field, fieldIndex) => {
+                const mode = normalizeUiExpressionParameterMode(field.mode)
+                const value = normalizeUiExpressionParameterValueForMode(mode, field.value)
+                const updateField = (patch: Partial<UiAppendUniqueObjectField>) => {
+                  patchAppendObjectFields(appendObjectFields.map((item, idx) => (
+                    idx === fieldIndex
+                      ? createUiAppendUniqueObjectField({ ...item, ...patch, id: item.id })
+                      : item
+                  )))
+                }
+                const valueInput = mode === 'field' || mode === 'number_field' || mode === 'values' ? (
+                  <Select
+                    showSearch
+                    allowClear
+                    size="small"
+                    value={value || undefined}
+                    onChange={(nextValue) => updateField({ value: String(nextValue || '') })}
+                    options={expressionStudioFieldSelectOptions}
+                    placeholder="Select source field"
+                    style={{ width: '100%' }}
+                    optionFilterProp="label"
+                  />
+                ) : mode === 'declared' ? (
+                  <Select
+                    showSearch
+                    allowClear
+                    size="small"
+                    value={value || undefined}
+                    onChange={(nextValue) => updateField({ value: String(nextValue || '') })}
+                    options={expressionStudioDeclaredFieldSelectOptions.length > 0
+                      ? expressionStudioDeclaredFieldSelectOptions
+                      : expressionStudioFieldSelectOptions}
+                    placeholder="Select declared field"
+                    style={{ width: '100%' }}
+                    optionFilterProp="label"
+                  />
+                ) : mode === 'metric_path' ? (
+                  <Select
+                    showSearch
+                    allowClear
+                    size="small"
+                    value={value || undefined}
+                    onChange={(nextValue) => updateField({ value: String(nextValue || '') })}
+                    options={expressionStudioMetricPathOptions}
+                    placeholder="Select metric path"
+                    style={{ width: '100%' }}
+                    optionFilterProp="label"
+                  />
+                ) : mode === 'variable' ? (
+                  <Select
+                    showSearch
+                    allowClear
+                    size="small"
+                    value={value || undefined}
+                    onChange={(nextValue) => updateField({ value: String(nextValue || '') })}
+                    options={uiExpressionVariableOptions}
+                    placeholder="Select variable"
+                    style={{ width: '100%' }}
+                    optionFilterProp="label"
+                  />
+                ) : (
+                  <AutoComplete
+                    size="small"
+                    value={value}
+                    onChange={(nextValue) => updateField({ value: String(nextValue || '') })}
+                    options={[
+                      { value: 'str(randint(100000000000000,999999999999999))', label: 'random workflow id' },
+                      { value: 'now()', label: 'current timestamp' },
+                      { value: 'null', label: 'null' },
+                      { value: 'active', label: 'active' },
+                      ...expressionStudioRawValueOptions,
+                    ]}
+                    filterOption={(inputValue, option) => (
+                      String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())
+                    )}
+                    placeholder={mode === 'raw' ? 'raw expression' : 'value'}
+                    style={{ ...commonInputStyle, width: '100%', minWidth: 0, flex: 1 }}
+                  />
+                )
+                return (
+                  <div
+                    key={field.id || fieldIndex}
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'minmax(130px, 0.8fr) 140px minmax(220px, 1.4fr) auto',
+                      gap: 6,
+                      border: '1px solid var(--app-border)',
+                      borderRadius: 8,
+                      padding: 8,
+                      background: 'var(--app-bg-elevated)',
+                    }}
+                  >
+                    <Input
+                      size="small"
+                      value={field.key}
+                      onChange={(event) => updateField({ key: event.target.value })}
+                      placeholder="object_key"
+                      style={commonInputStyle}
+                    />
+                    <Select
+                      size="small"
+                      value={mode}
+                      onChange={(nextMode) => {
+                        const normalizedMode = nextMode as UiExpressionParameterMode
+                        updateField({
+                          mode: normalizedMode,
+                          value: normalizeUiExpressionParameterValueForMode(normalizedMode, field.value),
+                        })
+                      }}
+                      options={EXPRESSION_STUDIO_PARAM_MODE_OPTIONS}
+                      style={{ width: '100%' }}
+                    />
+                    {valueInput}
+                    <Button
+                      size="small"
+                      danger
+                      onClick={() => {
+                        const nextFields = appendObjectFields.filter((_, idx) => idx !== fieldIndex)
+                        patchAppendObjectFields(
+                          nextFields.length > 0
+                            ? nextFields
+                            : [createUiAppendUniqueObjectField({ key: 'value', mode: 'literal', value: '' })]
+                        )
+                      }}
+                    >
+                      Delete
+                    </Button>
+                  </div>
+                )
+              })}
+            </Space>
+          </Space>
+        ) : placeholders.length > 0 ? (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 320px))', gap: 8 }}>
+            {placeholders.map((placeholder) => {
+              const mode = (paramModes?.[placeholder.index] || defaultUiExpressionParameterMode(placeholder)) as UiExpressionParameterMode
+              const value = normalizeUiExpressionParameterValueForMode(
+                mode,
+                String(paramValues?.[placeholder.index] ?? defaultUiExpressionParameterValue(placeholder))
+              )
+              const meta = expressionStudioParameterMeta(String(selectedTemplate?.label || ''), placeholder)
+              const conditionModel = mode === 'condition' ? parseBreModelFromExpression(value) : null
+              const conditionClause = conditionModel?.clauses?.[0] || createBreClause()
+              const conditionThenValue = conditionModel ? unwrapOuterExpressionQuotes(String(conditionModel.thenExpr || '1')) : '1'
+              const conditionElseValue = conditionModel ? unwrapOuterExpressionQuotes(String(conditionModel.elseExpr || '0')) : '0'
+              const patchConditionValue = (
+                clausePatch: Partial<BreClause> = {},
+                resultPatch: Partial<Pick<BreModel, 'thenExpr' | 'elseExpr'>> = {},
+              ) => {
+                const nextModel: BreModel = {
+                  clauses: [{ ...conditionClause, ...clausePatch }],
+                  thenExpr: resultPatch.thenExpr ?? renderBreLiteral(conditionThenValue),
+                  elseExpr: resultPatch.elseExpr ?? renderBreLiteral(conditionElseValue),
+                  parseError: null,
+                }
+                onPatch({
+                  paramValues: {
+                    ...paramValues,
+                    [placeholder.index]: stripExpressionPrefix(buildExpressionFromBreModel(nextModel)),
+                  },
+                })
+              }
+              const valueInput = mode === 'field' || mode === 'number_field' || mode === 'values' ? (
+                <Select
+                  showSearch
+                  allowClear
+                  size="small"
+                  value={value || undefined}
+                  onChange={(nextValue) => {
+                    onPatch({ paramValues: { ...paramValues, [placeholder.index]: String(nextValue || '') } })
+                  }}
+                  options={expressionStudioFieldSelectOptions}
+                  placeholder="Select source field"
+                  style={{ width: '100%' }}
+                  optionFilterProp="label"
+                />
+              ) : mode === 'declared' ? (
+                <Select
+                  showSearch
+                  allowClear
+                  size="small"
+                  value={value || undefined}
+                  onChange={(nextValue) => {
+                    onPatch({ paramValues: { ...paramValues, [placeholder.index]: String(nextValue || '') } })
+                  }}
+                  options={expressionStudioDeclaredFieldSelectOptions.length > 0
+                    ? expressionStudioDeclaredFieldSelectOptions
+                    : expressionStudioFieldSelectOptions}
+                  placeholder="Select declared field"
+                  style={{ width: '100%' }}
+                  optionFilterProp="label"
+                />
+              ) : mode === 'metric_path' ? (
+                <Select
+                  showSearch
+                  allowClear
+                  size="small"
+                  value={value || undefined}
+                  onChange={(nextValue) => {
+                    onPatch({ paramValues: { ...paramValues, [placeholder.index]: String(nextValue || '') } })
+                  }}
+                  options={expressionStudioMetricPathOptions}
+                  placeholder="Select metric path"
+                  style={{ width: '100%' }}
+                  optionFilterProp="label"
+                />
+              ) : mode === 'variable' ? (
+                <Select
+                  showSearch
+                  allowClear
+                  size="small"
+                  value={value || undefined}
+                  onChange={(nextValue) => {
+                    onPatch({ paramValues: { ...paramValues, [placeholder.index]: String(nextValue || '') } })
+                  }}
+                  options={uiExpressionVariableOptions}
+                  placeholder="Select variable"
+                  style={{ width: '100%' }}
+                  optionFilterProp="label"
+                />
+              ) : mode === 'condition' ? (
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'minmax(130px, 1fr) 96px minmax(100px, 0.8fr) 76px 76px',
+                    gap: 6,
+                    width: '100%',
+                  }}
+                >
+                  <Select
+                    showSearch
+                    allowClear
+                    size="small"
+                    value={conditionClause.leftKind === 'field' ? conditionClause.leftValue || undefined : undefined}
+                    options={expressionStudioFieldSelectOptions}
+                    onChange={(nextValue) => patchConditionValue({
+                      leftKind: 'field',
+                      leftValue: String(nextValue || ''),
+                    })}
+                    placeholder="field"
+                    optionFilterProp="label"
+                  />
+                  <Select
+                    size="small"
+                    value={conditionClause.operator === 'raw' ? '==' : conditionClause.operator}
+                    options={EXPRESSION_STUDIO_OPERATOR_OPTIONS}
+                    onChange={(nextValue) => patchConditionValue({ operator: nextValue as BreClauseOperator })}
+                  />
+                  <Input
+                    size="small"
+                    value={conditionClause.rightValue}
+                    onChange={(event) => patchConditionValue({
+                      rightKind: 'literal',
+                      rightValue: event.target.value,
+                    })}
+                    placeholder="match"
+                    style={commonInputStyle}
+                  />
+                  <Input
+                    size="small"
+                    value={conditionThenValue}
+                    onChange={(event) => patchConditionValue({}, { thenExpr: renderBreLiteral(event.target.value) })}
+                    placeholder="yes"
+                    style={commonInputStyle}
+                  />
+                  <Input
+                    size="small"
+                    value={conditionElseValue}
+                    onChange={(event) => patchConditionValue({}, { elseExpr: renderBreLiteral(event.target.value) })}
+                    placeholder="no"
+                    style={commonInputStyle}
+                  />
+                </div>
+              ) : (
+                <AutoComplete
+                  size="small"
+                  value={value}
+                  onChange={(nextValue) => {
+                    onPatch({ paramValues: { ...paramValues, [placeholder.index]: String(nextValue || '') } })
+                  }}
+                  options={expressionStudioRawValueOptions}
+                  filterOption={(inputValue, option) => (
+                    String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())
+                  )}
+                  placeholder={mode === 'raw' ? 'raw expression' : 'value'}
+                  style={{ ...commonInputStyle, width: '100%', minWidth: 0, flex: 1 }}
+                />
+              )
+              return (
+                <div
+                  key={`${selectedTemplate?.label}_${placeholder.index}`}
+                  style={{
+                    border: '1px solid var(--app-border)',
+                    borderRadius: 8,
+                    padding: 8,
+                    background: 'var(--app-bg-elevated)',
+                  }}
+                >
+                  <Space direction="vertical" size={0} style={{ width: '100%' }}>
+                    <Text style={{ color: 'var(--app-text)', fontSize: 12, fontWeight: 600 }}>
+                      {meta.label}
+                    </Text>
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                      {meta.description}
+                    </Text>
+                  </Space>
+                  <Space.Compact style={{ width: '100%', marginTop: 4 }}>
+                    <Select
+                      size="small"
+                      value={mode}
+                      onChange={(nextMode) => {
+                        const normalizedMode = nextMode as UiExpressionParameterMode
+                        onPatch({
+                          paramModes: {
+                            ...paramModes,
+                            [placeholder.index]: normalizedMode,
+                          },
+                          paramValues: {
+                            ...paramValues,
+                            [placeholder.index]: normalizeUiExpressionParameterValueForMode(normalizedMode, value),
+                          },
+                        })
+                      }}
+                      options={EXPRESSION_STUDIO_PARAM_MODE_OPTIONS}
+                      style={{ width: 130 }}
+                    />
+                    {valueInput}
+                  </Space.Compact>
+                </div>
+              )
+            })}
+          </div>
+        ) : (
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+            This function has no configurable parameters.
+          </Text>
+        )}
+      </Space>
+    )
+  }
+
+  const renderExpressionStudioRuleConfig = (rule: ExpressionStudioRule, onPatch: (patch: Partial<ExpressionStudioRule>) => void) => (
+    <Space direction="vertical" size={10} style={{ width: '100%' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '80px minmax(180px, 1fr) minmax(180px, 1fr) 150px', gap: 10 }}>
+        <Space>
+          <Switch
+            size="small"
+            checked={rule.enabled}
+            onChange={(enabled) => onPatch({ enabled })}
+          />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Enabled</Text>
+        </Space>
+        <Select
+          size="small"
+          value={rule.ruleType}
+          onChange={(value) => onPatch({ ruleType: value as ExpressionStudioRuleType })}
+          options={EXPRESSION_STUDIO_RULE_TYPE_OPTIONS.filter((item) => item.value !== 'json_object')}
+          style={{ width: '100%' }}
+        />
+        <Input
+          size="small"
+          value={rule.outputName}
+          onChange={(event) => onPatch({ outputName: event.target.value })}
+          placeholder="output_field"
+          style={commonInputStyle}
+        />
+        <Select
+          size="small"
+          value={rule.outputMode}
+          onChange={(value) => onPatch({ outputMode: value as ExpressionStudioOutputMode })}
+          options={EXPRESSION_STUDIO_OUTPUT_MODE_OPTIONS}
+          style={{ width: '100%' }}
+        />
+      </div>
+      {rule.ruleType === 'advanced_function' ? (
+        renderExpressionStudioAdvancedParameters(
+          rule.templateLabel,
+          rule.paramValues,
+          rule.paramModes,
+          (patch) => onPatch(patch),
+        )
+      ) : rule.ruleType === 'if_else' ? (
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 1fr) 130px 150px 150px 150px', gap: 8 }}>
+          <Select
+            showSearch
+            allowClear
+            size="small"
+            value={rule.sourceField || undefined}
+            onChange={(value) => onPatch({ sourceField: String(value || '') })}
+            options={expressionStudioFieldSelectOptions}
+            placeholder="condition field"
+            style={{ width: '100%' }}
+          />
+          <Select
+            size="small"
+            value={rule.operator}
+            onChange={(value) => onPatch({ operator: String(value || '==') })}
+            options={EXPRESSION_STUDIO_OPERATOR_OPTIONS}
+            style={{ width: '100%' }}
+          />
+          <Input size="small" value={rule.compareValue} onChange={(event) => onPatch({ compareValue: event.target.value })} placeholder="compare value" style={commonInputStyle} />
+          <Input size="small" value={rule.thenValue} onChange={(event) => onPatch({ thenValue: event.target.value })} placeholder="then" style={commonInputStyle} />
+          <Input size="small" value={rule.elseValue} onChange={(event) => onPatch({ elseValue: event.target.value })} placeholder="else" style={commonInputStyle} />
+        </div>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: rule.ruleType === 'unique_profile' ? 'minmax(180px, 1fr) 130px minmax(180px, 1fr) minmax(180px, 1fr)' : 'minmax(180px, 1fr) 130px', gap: 8 }}>
+          <Select
+            showSearch
+            allowClear
+            size="small"
+            value={rule.sourceField || undefined}
+            onChange={(value) => onPatch({ sourceField: String(value || '') })}
+            options={expressionStudioFieldSelectOptions}
+            placeholder="source field"
+            style={{ width: '100%' }}
+          />
+          {rule.ruleType === 'direct_field' ? null : (
+            <Select
+              size="small"
+              value={rule.aggregate}
+              onChange={(value) => onPatch({ aggregate: String(value || 'sum') })}
+              options={EXPRESSION_STUDIO_AGG_OPTIONS.map((value) => ({ value, label: value }))}
+              style={{ width: '100%' }}
+            />
+          )}
+          {rule.ruleType === 'unique_profile' ? (
+            <>
+              <Select
+                showSearch
+                allowClear
+                size="small"
+                value={rule.uniqueIdField || undefined}
+                onChange={(value) => onPatch({ uniqueIdField: String(value || '') })}
+                options={expressionStudioFieldSelectOptions}
+                placeholder="unique id"
+                style={{ width: '100%' }}
+              />
+              <Select
+                showSearch
+                allowClear
+                size="small"
+                value={rule.groupField || undefined}
+                onChange={(value) => onPatch({ groupField: String(value || '') })}
+                options={expressionStudioFieldSelectOptions}
+                placeholder="group/entity optional"
+                style={{ width: '100%' }}
+              />
+            </>
+          ) : null}
+        </div>
+      )}
+      {rule.ruleType === 'advanced_function' ? (
+        <Input.TextArea
+          value={rule.rawExpression}
+          onChange={(event) => onPatch({ rawExpression: event.target.value })}
+          placeholder="Optional expression override"
+          autoSize={{ minRows: 1, maxRows: 4 }}
+          style={commonInputStyle}
+        />
+      ) : null}
+      <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, padding: 8, background: 'var(--app-card-bg)', overflowX: 'auto' }}>
+        <Text code style={{ whiteSpace: 'nowrap' }}>{expressionStudioRuleExpression(rule, customFnsVersionDraft)}</Text>
+      </div>
+    </Space>
+  )
+
+  const renderExpressionStudioJsonConfig = (row: ExpressionStudioJsonDeclaration, onPatch: (patch: Partial<ExpressionStudioJsonDeclaration>) => void) => {
+    const effectiveRow = expressionStudioStructuredJsonDeclaration(row)
+    const patchEffectiveRow = (patch: Partial<ExpressionStudioJsonDeclaration>) => {
+      const basePatch = effectiveRow !== row
+        ? {
+          templateLabel: effectiveRow.templateLabel,
+          paramValues: effectiveRow.paramValues,
+          paramModes: effectiveRow.paramModes,
+          expression: '',
+        }
+        : {}
+      onPatch({ ...basePatch, ...patch })
+    }
+    return (
+    <Space direction="vertical" size={10} style={{ width: '100%' }}>
+      <Space size={16} wrap>
+        <Space size={8} align="center">
+          <Switch size="small" checked={effectiveRow.objectEnabled} onChange={(enabled) => patchEffectiveRow({ objectEnabled: enabled })} />
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Enable JSON object</Text>
+        </Space>
+        <Space size={8} align="center">
+          <Switch size="small" checked={effectiveRow.enabled} onChange={(enabled) => patchEffectiveRow({ enabled })} />
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Enable JSON key</Text>
+        </Space>
+      </Space>
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 1fr) minmax(180px, 1fr) minmax(180px, 1fr)', gap: 10 }}>
+        <AutoComplete
+          size="small"
+          value={effectiveRow.objectName}
+          options={expressionStudioJsonObjectNameOptions}
+          onChange={(value) => patchEffectiveRow({ objectName: String(value || '') })}
+          filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+        >
+          <Input placeholder="custom field / object name" style={commonInputStyle} />
+        </AutoComplete>
+        <Input size="small" value={effectiveRow.keyName} onChange={(event) => patchEffectiveRow({ keyName: event.target.value })} placeholder="json key" style={commonInputStyle} />
+        <Select
+          size="small"
+          value={effectiveRow.ruleType}
+          onChange={(value) => patchEffectiveRow({ ruleType: value as ExpressionStudioRuleType })}
+          options={EXPRESSION_STUDIO_RULE_TYPE_OPTIONS.filter((item) => item.value !== 'json_object')}
+          style={{ width: '100%' }}
+        />
+      </div>
+      {effectiveRow.ruleType === 'advanced_function' ? (
+        renderExpressionStudioAdvancedParameters(
+          effectiveRow.templateLabel,
+          effectiveRow.paramValues,
+          effectiveRow.paramModes,
+          (patch) => patchEffectiveRow(patch),
+        )
+      ) : effectiveRow.ruleType === 'if_else' ? (
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 1fr) 130px 150px 150px 150px', gap: 8 }}>
+          <Select showSearch allowClear size="small" value={effectiveRow.sourceField || undefined} onChange={(value) => patchEffectiveRow({ sourceField: String(value || '') })} options={expressionStudioFieldSelectOptions} placeholder="condition field" style={{ width: '100%' }} />
+          <Select size="small" value={effectiveRow.operator} onChange={(value) => patchEffectiveRow({ operator: String(value || '==') })} options={EXPRESSION_STUDIO_OPERATOR_OPTIONS} style={{ width: '100%' }} />
+          <Input size="small" value={effectiveRow.compareValue} onChange={(event) => patchEffectiveRow({ compareValue: event.target.value })} placeholder="compare value" style={commonInputStyle} />
+          <Input size="small" value={effectiveRow.thenValue} onChange={(event) => patchEffectiveRow({ thenValue: event.target.value })} placeholder="then" style={commonInputStyle} />
+          <Input size="small" value={effectiveRow.elseValue} onChange={(event) => patchEffectiveRow({ elseValue: event.target.value })} placeholder="else" style={commonInputStyle} />
+        </div>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: effectiveRow.ruleType === 'unique_profile' ? 'minmax(180px, 1fr) 130px minmax(180px, 1fr)' : 'minmax(180px, 1fr) 130px', gap: 8 }}>
+          <Select showSearch allowClear size="small" value={effectiveRow.sourceField || undefined} onChange={(value) => patchEffectiveRow({ sourceField: String(value || '') })} options={expressionStudioFieldSelectOptions} placeholder="source field" style={{ width: '100%' }} />
+          {effectiveRow.ruleType === 'direct_field' ? null : (
+            <Select size="small" value={effectiveRow.aggregate} onChange={(value) => patchEffectiveRow({ aggregate: String(value || 'sum') })} options={EXPRESSION_STUDIO_AGG_OPTIONS.map((value) => ({ value, label: value }))} style={{ width: '100%' }} />
+          )}
+          {effectiveRow.ruleType === 'unique_profile' ? (
+            <Select showSearch allowClear size="small" value={effectiveRow.uniqueIdField || undefined} onChange={(value) => patchEffectiveRow({ uniqueIdField: String(value || '') })} options={expressionStudioFieldSelectOptions} placeholder="unique id" style={{ width: '100%' }} />
+          ) : null}
+        </div>
+      )}
+      <Input.TextArea
+        value={effectiveRow.expression}
+        onChange={(event) => patchEffectiveRow({ expression: event.target.value })}
+        placeholder="Optional expression override for this JSON key"
+        autoSize={{ minRows: 1, maxRows: 4 }}
+        style={commonInputStyle}
+      />
+      <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, padding: 8, background: 'var(--app-card-bg)', overflowX: 'auto' }}>
+        <Text code style={{ whiteSpace: 'nowrap' }}>{expressionStudioJsonKeyExpression(effectiveRow, customFnsVersionDraft)}</Text>
+      </div>
+    </Space>
+    )
+  }
+
+  const patchExpressionStudioConfigDraft = (patch: Partial<ExpressionStudioFieldDeclaration | ExpressionStudioRule | ExpressionStudioJsonDeclaration>) => {
+    setExpressionStudioConfigDraft((prev) => {
+      if (!prev) return prev
+      return {
+        ...prev,
+        item: {
+          ...prev.item,
+          ...patch,
+        } as any,
+      } as ExpressionStudioConfigDraft
+    })
+  }
+
+  const closeExpressionStudioConfigOverlay = () => {
+    setExpressionStudioConfigDraft(null)
+    setExpressionStudioConfigRecordKey(null)
+  }
+
+  const removeExpressionStudioConfigOverlayRecord = () => {
+    const draft = expressionStudioConfigDraft
+    if (!draft) return
+    if (!draft.isNew) {
+      const key = `${draft.kind}:${draft.item.id}`
+      removeExpressionStudioRecord({
+        key,
+        section: draft.kind === 'field' ? 'fields' : draft.kind === 'rule' ? 'rules' : 'json',
+        sectionLabel: draft.kind === 'field' ? 'Field Declaration' : draft.kind === 'rule' ? 'Rule Builder' : 'JSON Object',
+        name: '',
+        type: '',
+        output: '',
+        summary: '',
+      })
+    }
+    closeExpressionStudioConfigOverlay()
+  }
+
+  const saveExpressionStudioConfigOverlay = () => {
+    const draft = expressionStudioConfigDraft
+    if (!draft) return
+    if (draft.kind === 'field') {
+      setExpressionStudioFieldDeclarations((prev) => {
+        const exists = prev.some((item) => item.id === draft.item.id)
+        return exists
+          ? prev.map((item) => (item.id === draft.item.id ? { ...draft.item } : item))
+          : [...prev, { ...draft.item }]
+      })
+      setExpressionStudioTab('fields')
+      setExpressionStudioConfigRecordKey(`field:${draft.item.id}`)
+    } else if (draft.kind === 'rule') {
+      setExpressionStudioRules((prev) => {
+        const exists = prev.some((item) => item.id === draft.item.id)
+        return exists
+          ? prev.map((item) => (item.id === draft.item.id ? { ...draft.item } : item))
+          : [...prev, { ...draft.item }]
+      })
+      setExpressionStudioTab('rules')
+      setExpressionStudioConfigRecordKey(`rule:${draft.item.id}`)
+    } else {
+      const jsonItem = expressionStudioStructuredJsonDeclaration(draft.item as ExpressionStudioJsonDeclaration)
+      setExpressionStudioJsonDeclarations((prev) => {
+        const nextObjectName = String(jsonItem.objectName || '').trim()
+        const exists = prev.some((item) => item.id === jsonItem.id)
+        const nextRows = exists
+          ? prev.map((item) => (item.id === jsonItem.id ? { ...jsonItem } : item))
+          : [...prev, { ...jsonItem }]
+        if (!nextObjectName) return nextRows
+        return nextRows.map((item) => (
+          String(item.objectName || '').trim() === nextObjectName
+            ? { ...item, objectEnabled: Boolean(jsonItem.objectEnabled) }
+            : item
+        ))
+      })
+      setExpressionStudioTab('json')
+      setExpressionStudioConfigRecordKey(`json:${jsonItem.id}`)
+    }
+    setExpressionStudioLastAppliedSignature('')
+    setExpressionStudioConfigDraft(null)
+    notification.success({
+      message: draft.isNew ? 'Expression record added' : 'Expression record saved',
+      description: 'Configuration changes are now reflected in the table.',
+      placement: 'bottomRight',
+      duration: 2,
+    })
+  }
+
+  const renderExpressionStudioConfigOverlayContent = () => {
+    const draft = expressionStudioConfigDraft
+    if (!draft) return null
+    if (draft.kind === 'field') {
+      const decl = draft.item
+      return (
+        <Space direction="vertical" size={10} style={{ width: '100%' }}>
+          <Space size={8} align="center">
+            <Switch size="small" checked={decl.enabled} onChange={(enabled) => patchExpressionStudioConfigDraft({ enabled })} />
+            <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Enable field declaration</Text>
+          </Space>
+          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 1fr) 160px minmax(220px, 1fr)', gap: 10 }}>
+            <Input size="small" value={decl.name} onChange={(event) => patchExpressionStudioConfigDraft({ name: event.target.value })} placeholder="field_alias" style={commonInputStyle} />
+            <Select size="small" value={decl.mode} onChange={(value) => patchExpressionStudioConfigDraft({ mode: value as ExpressionStudioFieldDeclMode })} options={EXPRESSION_STUDIO_FIELD_DECL_MODE_OPTIONS} style={{ width: '100%' }} />
+            {decl.mode === 'field' || decl.mode === 'number' ? (
+              <Select showSearch allowClear size="small" value={decl.sourceField || undefined} onChange={(value) => patchExpressionStudioConfigDraft({ sourceField: String(value || '') })} options={expressionStudioFieldSelectOptions} placeholder="source field" style={{ width: '100%' }} />
+            ) : decl.mode === 'literal' ? (
+              <Input size="small" value={decl.literalValue} onChange={(event) => patchExpressionStudioConfigDraft({ literalValue: event.target.value })} placeholder="literal value" style={commonInputStyle} />
+            ) : (
+              <Input size="small" value={decl.expression} onChange={(event) => patchExpressionStudioConfigDraft({ expression: event.target.value })} placeholder="=expression" style={commonInputStyle} />
+            )}
+          </div>
+          <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, padding: 8, background: 'var(--app-card-bg)', overflowX: 'auto' }}>
+            <Text code style={{ whiteSpace: 'nowrap' }}>{expressionStudioFieldDeclarationExpression(decl)}</Text>
+          </div>
+        </Space>
+      )
+    }
+    if (draft.kind === 'rule') {
+      return renderExpressionStudioRuleConfig(draft.item, (patch) => patchExpressionStudioConfigDraft(patch))
+    }
+    if (draft.kind === 'json') {
+      return renderExpressionStudioJsonConfig(draft.item, (patch) => patchExpressionStudioConfigDraft(patch))
+    }
+    return null
+  }
+
+  const renderExpressionStudioActiveRecordTable = () => {
+    const makeFiltersForRows = (rows: ExpressionStudioRecordRow[], getter: (row: ExpressionStudioRecordRow) => unknown) => (
+      uniqueFieldNames(
+        rows
+          .map((row) => String(getter(row) ?? '').trim())
+          .filter(Boolean)
+      )
+        .slice(0, 80)
+        .map((value) => ({ text: value, value }))
+    )
+    const makeFilters = (getter: (row: ExpressionStudioRecordRow) => unknown) => (
+      makeFiltersForRows(expressionStudioActiveRecordRows, getter)
+    )
+    const matchesFilter = (getter: (row: ExpressionStudioRecordRow) => unknown, value: unknown, row: ExpressionStudioRecordRow) => (
+      String(getter(row) ?? '').toLowerCase().includes(String(value ?? '').toLowerCase())
+    )
+    const compareText = (getter: (row: ExpressionStudioRecordRow) => unknown, left: ExpressionStudioRecordRow, right: ExpressionStudioRecordRow) => (
+      String(getter(left) ?? '').localeCompare(String(getter(right) ?? ''), undefined, { numeric: true, sensitivity: 'base' })
+    )
+    if (expressionStudioTab === 'json') {
+      return (
+        <div
+          style={{
+            marginTop: 10,
+            border: '1px solid var(--app-border-strong)',
+            borderRadius: 8,
+            background: 'var(--app-bg-elevated)',
+            overflow: 'hidden',
+          }}
+        >
+          <Space style={{ justifyContent: 'space-between', width: '100%', padding: '8px 10px' }} wrap>
+            <div>
+              <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>JSON Object Records</Text>
+              <br />
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                Expand each custom field/object to manage its JSON keys in a dedicated table.
+              </Text>
+            </div>
+            <Space size={6} wrap>
+              <Tag style={{ marginInlineEnd: 0 }}>{expressionStudioJsonObjectGroups.length} object{expressionStudioJsonObjectGroups.length === 1 ? '' : 's'}</Tag>
+              <Button size="small" onClick={() => addExpressionStudioJsonObjectAndConfigure()}>
+                Add JSON Object
+              </Button>
+              <Button size="small" onClick={() => addExpressionStudioJsonDeclarationAndConfigure()}>
+                Add JSON Key
+              </Button>
+            </Space>
+          </Space>
+          <div style={{ borderTop: '1px solid var(--app-border-strong)', padding: 10, background: 'var(--app-card-bg)' }}>
+            {expressionStudioJsonObjectGroups.length === 0 ? (
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>No JSON objects configured.</Text>
+            ) : (
+              <Collapse
+                size="small"
+                defaultActiveKey={expressionStudioJsonObjectGroups.map((group) => group.objectName)}
+                style={{ background: 'transparent' }}
+                items={expressionStudioJsonObjectGroups.map((group) => ({
+                  key: group.objectName,
+                  label: (
+                    <Space direction="vertical" size={0} style={{ minWidth: 0 }}>
+                      <Text style={{ color: 'var(--app-text)', fontWeight: 700 }} ellipsis={{ tooltip: group.objectName }}>
+                        {group.objectName}
+                      </Text>
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                        {group.rows.length} key{group.rows.length === 1 ? '' : 's'}
+                      </Text>
+                    </Space>
+                  ),
+                  extra: (
+                    <Space
+                      size={8}
+                      onClick={(event) => event.stopPropagation()}
+                      onMouseDown={(event) => event.stopPropagation()}
+                    >
+                      <Switch
+                        size="small"
+                        checked={Boolean(group.objectEnabled)}
+                        onChange={(enabled) => setExpressionStudioJsonObjectEnabled(group.rows[0], enabled)}
+                      />
+                      <Button size="small" onClick={() => addExpressionStudioJsonDeclarationAndConfigure({ objectName: group.objectName })}>
+                        Add Key
+                      </Button>
+                    </Space>
+                  ),
+                  children: (
+                    <Table<ExpressionStudioRecordRow>
+                      size="small"
+                      rowKey="key"
+                      dataSource={group.rows}
+                      pagination={false}
+                      scroll={{ x: 820, y: 260 }}
+                      locale={{ emptyText: 'No JSON keys configured.' }}
+                      columns={[
+                        {
+                          title: 'Key',
+                          dataIndex: 'keyName',
+                          width: 180,
+                          filters: makeFiltersForRows(group.rows, (row) => row.keyName),
+                          onFilter: (value: unknown, row: ExpressionStudioRecordRow) => matchesFilter((item) => item.keyName, value, row),
+                          sorter: (left: ExpressionStudioRecordRow, right: ExpressionStudioRecordRow) => compareText((row) => row.keyName, left, right),
+                          render: (value: unknown) => (
+                            <Text style={{ color: 'var(--app-text)', fontWeight: 600 }} ellipsis={{ tooltip: String(value || '') }}>
+                              {String(value || '-')}
+                            </Text>
+                          ),
+                        },
+                        {
+                          title: 'Type',
+                          dataIndex: 'type',
+                          width: 150,
+                          filters: makeFiltersForRows(group.rows, (row) => row.type),
+                          onFilter: (value: unknown, row: ExpressionStudioRecordRow) => matchesFilter((item) => item.type, value, row),
+                          sorter: (left: ExpressionStudioRecordRow, right: ExpressionStudioRecordRow) => compareText((row) => row.type, left, right),
+                          render: (value: unknown) => <Text style={{ color: 'var(--app-text-subtle)' }}>{String(value || '-')}</Text>,
+                        },
+                        {
+                          title: 'Enabled',
+                          dataIndex: 'enabled',
+                          width: 100,
+                          filters: [
+                            { text: 'Enabled', value: 'enabled' },
+                            { text: 'Disabled', value: 'disabled' },
+                          ],
+                          onFilter: (value: unknown, row: ExpressionStudioRecordRow) => (
+                            String(value) === 'enabled' ? Boolean(row.enabled) : !Boolean(row.enabled)
+                          ),
+                          sorter: (left: ExpressionStudioRecordRow, right: ExpressionStudioRecordRow) => Number(Boolean(left.enabled)) - Number(Boolean(right.enabled)),
+                          render: (_value: unknown, row: ExpressionStudioRecordRow) => (
+                            <Switch
+                              size="small"
+                              checked={Boolean(row.enabled)}
+                              onChange={(enabled) => setExpressionStudioRecordEnabled(row, enabled)}
+                            />
+                          ),
+                        },
+                        {
+                          title: 'Preview',
+                          dataIndex: 'summary',
+                          width: 320,
+                          sorter: (left: ExpressionStudioRecordRow, right: ExpressionStudioRecordRow) => compareText((row) => row.summary, left, right),
+                          render: (value: unknown) => (
+                            <Text
+                              code
+                              style={{ maxWidth: 300, display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                              title={String(value || '')}
+                            >
+                              {String(value || '-')}
+                            </Text>
+                          ),
+                        },
+                        {
+                          title: 'Actions',
+                          key: 'actions',
+                          fixed: 'right',
+                          width: 170,
+                          render: (_value: unknown, row: ExpressionStudioRecordRow) => (
+                            <Space size={6}>
+                              <Button size="small" onClick={() => configureExpressionStudioRecord(row)}>
+                                Configure
+                              </Button>
+                              <Popconfirm
+                                title="Remove JSON key?"
+                                okText="Remove"
+                                okButtonProps={{ danger: true }}
+                                onConfirm={() => removeExpressionStudioRecord(row)}
+                              >
+                                <Button size="small" danger>
+                                  Remove
+                                </Button>
+                              </Popconfirm>
+                            </Space>
+                          ),
+                        },
+                      ]}
+                    />
+                  ),
+                }))}
+              />
+            )}
+          </div>
+        </div>
+      )
+    }
+    return (
+    <div
+      style={{
+        marginTop: 10,
+        border: '1px solid var(--app-border-strong)',
+        borderRadius: 8,
+        background: 'var(--app-bg-elevated)',
+        overflow: 'hidden',
+      }}
+    >
+      <Space style={{ justifyContent: 'space-between', width: '100%', padding: '8px 10px' }} wrap>
+        <div>
+          <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>{expressionStudioActiveRecordTitle}</Text>
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+            Manage records for this tab. Use Configure to edit details in the overlay.
+          </Text>
+        </div>
+        <Space size={6} wrap>
+          {expressionStudioTab === 'fields' ? (
+            <Button size="small" onClick={() => addExpressionStudioFieldDeclarationAndConfigure()}>
+              Add Field
+            </Button>
+          ) : (
+            <Button size="small" onClick={() => addExpressionStudioRuleAndConfigure()}>
+              Add Rule
+            </Button>
+          )}
+        </Space>
+      </Space>
+      <Table<ExpressionStudioRecordRow>
+        size="small"
+        rowKey="key"
+        dataSource={expressionStudioActiveRecordRows}
+        pagination={false}
+        scroll={{ x: 980, y: 420 }}
+        locale={{ emptyText: 'No expression records configured.' }}
+        columns={[
+          {
+            title: 'Name',
+            dataIndex: 'name',
+            width: 210,
+            filters: makeFilters((row) => row.objectName || row.name),
+            onFilter: (value, row) => matchesFilter((item) => item.objectName || item.name, value, row),
+            sorter: (left, right) => compareText((row) => row.objectName || row.name, left, right),
+            render: (value) => (
+              <Text style={{ color: 'var(--app-text)', fontWeight: 600 }} ellipsis={{ tooltip: String(value || '') }}>
+                {String(value || '-')}
+              </Text>
+            ),
+          },
+          {
+            title: 'Type',
+            dataIndex: 'type',
+            width: 150,
+            filters: makeFilters((row) => row.type),
+            onFilter: (value, row) => matchesFilter((item) => item.type, value, row),
+            sorter: (left, right) => compareText((row) => row.type, left, right),
+            render: (value) => <Text style={{ color: 'var(--app-text-subtle)' }}>{String(value || '-')}</Text>,
+          },
+          {
+            title: 'Output',
+            dataIndex: 'output',
+            width: 130,
+            filters: makeFilters((row) => row.output),
+            onFilter: (value, row) => matchesFilter((item) => item.output, value, row),
+            sorter: (left, right) => compareText((row) => row.output, left, right),
+            render: (value) => <Text style={{ color: 'var(--app-text-subtle)' }}>{String(value || '-')}</Text>,
+          },
+          {
+            title: 'Enabled',
+            dataIndex: 'enabled',
+            width: 95,
+            filters: [
+              { text: 'Enabled', value: 'enabled' },
+              { text: 'Disabled', value: 'disabled' },
+            ],
+            onFilter: (value: unknown, row: ExpressionStudioRecordRow) => (
+              String(value) === 'enabled' ? Boolean(row.enabled) : !Boolean(row.enabled)
+            ),
+            sorter: (left: ExpressionStudioRecordRow, right: ExpressionStudioRecordRow) => Number(Boolean(left.enabled)) - Number(Boolean(right.enabled)),
+            render: (_value: unknown, row: ExpressionStudioRecordRow) => (
+              row.enabled === undefined ? (
+                <Text style={{ color: 'var(--app-text-subtle)' }}>-</Text>
+              ) : (
+                <Switch
+                  size="small"
+                  checked={Boolean(row.enabled)}
+                  onChange={(enabled) => setExpressionStudioRecordEnabled(row, enabled)}
+                />
+              )
+            ),
+          },
+          {
+            title: 'Preview',
+            dataIndex: 'summary',
+            width: 380,
+            sorter: (left, right) => compareText((row) => row.summary, left, right),
+            render: (value) => (
+              <Text
+                code
+                style={{ maxWidth: 360, display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                title={String(value || '')}
+              >
+                {String(value || '-')}
+              </Text>
+            ),
+          },
+          {
+            title: 'Actions',
+            key: 'actions',
+            fixed: 'right',
+            width: 170,
+            render: (_value, row) => (
+              <Space size={6}>
+                <Button size="small" onClick={() => configureExpressionStudioRecord(row)}>
+                  Configure
+                </Button>
+                <Popconfirm
+                  title="Remove expression record?"
+                  okText="Remove"
+                  okButtonProps={{ danger: true }}
+                  onConfirm={() => removeExpressionStudioRecord(row)}
+                >
+                  <Button size="small" danger>
+                    Remove
+                  </Button>
+                </Popconfirm>
+              </Space>
+            ),
+          },
+        ]}
+      />
+    </div>
+    )
   }
 
   const removeCustomFieldDraft = (id: string) => {
@@ -21520,6 +26442,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       custom_validation_lmdb_limit: validationLimit,
       custom_validation_rocksdb_env_path: String(validationLmdbEnvPathDraft || '').trim(),
       custom_collapsed_field_ids: collapsedIds,
+      custom_expression_studio: serializeExpressionStudioPersistedConfig(expressionStudioPersistedDraft),
     })
     if (normalized.length > 0) {
       const outputFields = uniqueFieldNames(
@@ -22373,42 +27296,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           const selectedFields = parseFieldList(val)
           return (
             <Space direction="vertical" size={6} style={{ width: '100%' }}>
-              <Space style={{ justifyContent: 'space-between', width: '100%' }}>
-                <Button
-                  onMouseDown={(event) => {
-                    event.preventDefault()
-                    event.stopPropagation()
-                  }}
-                  onPointerDown={(event) => {
-                    event.preventDefault()
-                    event.stopPropagation()
-                  }}
-                  onClick={(event) => {
-                    event.preventDefault()
-                    event.stopPropagation()
-                    openCustomFieldStudio()
-                  }}
-                  style={{
-                    background: '#6366f11a',
-                    border: '1px solid #6366f140',
-                    color: '#6366f1',
-                  }}
-                >
-                  Open Custom Fields Studio
-                </Button>
-                {customFieldConfiguredCount > 0 ? (
-                  <Tag
-                    style={{
-                      marginInlineEnd: 0,
-                      background: '#22c55e1a',
-                      border: '1px solid #22c55e40',
-                      color: '#22c55e',
-                    }}
-                  >
-                    {customFieldEnabledConfiguredCount}/{customFieldConfiguredCount} enabled
-                  </Tag>
-                ) : null}
-              </Space>
               <Select
                 mode="tags"
                 value={selectedFields}
@@ -22515,96 +27402,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         )
       case 'select':
         if (nodeType === 'business_workflow' && field.name === 'workflow_id') {
-          const workflowId = String(val || '').trim()
-          const workflowMode = String(nodeConfig.workflow_mode || 'embedded').trim().toLowerCase() === 'external'
-            ? 'external'
-            : 'embedded'
-          const canOpenChildCanvas = Boolean(activePipelineId && selectedNodeId)
-          const embeddedNodes = parseJsonArraySafe(nodeConfig.embedded_workflow_nodes)
-          const embeddedEdges = parseJsonArraySafe(nodeConfig.embedded_workflow_edges)
-          return (
-            <Space direction="vertical" size={8} style={{ width: '100%' }}>
-              <Select
-                value={workflowMode}
-                onChange={(value) => {
-                  const mode = String(value || '').trim().toLowerCase() === 'external' ? 'external' : 'embedded'
-                  if (!selectedNodeId) return
-                  updateNodeConfig(selectedNodeId, {
-                    workflow_mode: mode,
-                    embedded_workflow_enabled: mode === 'embedded',
-                  })
-                }}
-                options={[
-                  { value: 'embedded', label: 'Embedded (Child Canvas)' },
-                  { value: 'external', label: 'External Business Workflow' },
-                ]}
-                style={{ width: '100%' }}
-              />
-              {workflowMode === 'external' ? (
-                <Select
-                  showSearch
-                  value={workflowId || undefined}
-                  onChange={(value) => handleFieldChange(field.name, value)}
-                  options={businessWorkflowOptions}
-                  placeholder="Select external workflow"
-                  loading={businessWorkflowOptionsLoading}
-                  style={{ width: '100%' }}
-                />
-              ) : (
-                <div
-                  style={{
-                    border: '1px solid var(--app-border-strong)',
-                    borderRadius: 8,
-                    padding: '8px 10px',
-                    background: 'var(--app-card-bg)',
-                    display: 'grid',
-                    gap: 3,
-                  }}
-                >
-                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
-                    Embedded child canvas: {embeddedNodes.length} node(s), {embeddedEdges.length} edge(s)
-                  </Text>
-                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
-                    Save from child canvas writes back to this node configuration.
-                  </Text>
-                </div>
-              )}
-              <Space size={8} wrap>
-                <Button
-                  size="small"
-                  disabled={!canOpenChildCanvas}
-                  onClick={() => {
-                    if (!canOpenChildCanvas) return
-                    if (typeof window !== 'undefined') {
-                      window.dispatchEvent(new CustomEvent('pipeline:open-business-canvas-tab', {
-                        detail: {
-                          pipelineId: String(activePipelineId || ''),
-                          nodeId: String(selectedNodeId || ''),
-                        },
-                      }))
-                    }
-                  }}
-                >
-                  Open In Canvas Tab
-                </Button>
-                {workflowMode === 'external' ? (
-                  <Button
-                    size="small"
-                    icon={<ReloadOutlined />}
-                    loading={businessWorkflowOptionsLoading}
-                    onClick={() => { void refreshBusinessWorkflowOptions() }}
-                  >
-                    Refresh
-                  </Button>
-                ) : null}
-              </Space>
-              {businessWorkflowOptionsError ? (
-                <Text style={{ color: '#ef4444', fontSize: 11 }}>
-                  {businessWorkflowOptionsError}
-                </Text>
-              ) : null}
-            </Space>
-          )
+          return null
         }
         if (nodeType === 'join_transform' && (field.name === 'left_source_node' || field.name === 'right_source_node')) {
           const options = field.name === 'right_source_node'
@@ -22773,6 +27571,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       return false
     }
     if (nodeType === 'oracle_destination' && (f.name === 'table' || f.name === 'if_exists')) {
+      return false
+    }
+    if (nodeType === 'business_workflow' && f.name === 'workflow_id') {
+      return false
+    }
+    if (nodeType === 'file_viewer') {
       return false
     }
     return true
@@ -23004,6 +27808,99 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               </div>
             ) : null}
 
+            {nodeType === 'file_viewer' ? (
+              <div style={{
+                background: '#0ea5e90f',
+                border: '1px solid #0ea5e930',
+                borderRadius: 10,
+                padding: '10px 12px',
+                marginBottom: 12,
+              }}>
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  <Text style={{ color: '#0ea5e9', fontSize: 12, fontWeight: 700 }}>File View Studio</Text>
+                  <Space size={6} wrap>
+                    <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>rows: {Number(fileViewerMeta?.row_count || fileViewerRows.length || 0).toLocaleString()}</Tag>
+                    <Tag style={{ background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1' }}>columns: {fileViewerColumns.length.toLocaleString()}</Tag>
+                    <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b' }}>tabs: {fileViewerTabs.length.toLocaleString()}</Tag>
+                  </Space>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Open file selection, tabs, search, filters, and compact grid viewing.
+                  </Text>
+                  {fileViewerError ? (
+                    <Text style={{ color: '#ef4444', fontSize: 11 }}>{fileViewerError}</Text>
+                  ) : null}
+                  {selectedFileViewerPath ? (
+                    <Tooltip title={selectedFileViewerPath}>
+                      <Tag style={{ marginInlineEnd: 0 }}>{selectedFileViewerPath.split('/').pop()}</Tag>
+                    </Tooltip>
+                  ) : null}
+                  <Button
+                    size="small"
+                    loading={fileViewerLoading}
+                    onClick={() => {
+                      setFileViewerStudioOpen(true)
+                      void loadFileViewerPreview()
+                    }}
+                    style={{
+                      width: '100%',
+                      background: '#0ea5e91a',
+                      border: '1px solid #0ea5e940',
+                      color: '#0ea5e9',
+                    }}
+                  >
+                    Open File View Studio
+                  </Button>
+                </Space>
+              </div>
+            ) : null}
+
+            {isDirectFileViewerNode ? (
+              <div style={{
+                background: '#0ea5e90f',
+                border: '1px solid #0ea5e930',
+                borderRadius: 10,
+                padding: '10px 12px',
+                marginBottom: 12,
+              }}>
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  <div style={{ minWidth: 0 }}>
+                    <Text style={{ color: '#0ea5e9', fontSize: 12, fontWeight: 700 }}>File View Studio</Text>
+                    <br />
+                    <Tooltip title={selectedFileViewerPath || 'No file path configured'}>
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }} ellipsis>
+                        {selectedFileViewerPath ? selectedFileViewerPath.split('/').pop() : 'Configure a file path to preview this node.'}
+                      </Text>
+                    </Tooltip>
+                  </div>
+                  <Button
+                    size="small"
+                    block
+                    loading={fileViewerLoading}
+                    disabled={!selectedFileViewerPath}
+                    onClick={() => {
+                      setFileViewerStudioOpen(true)
+                      void loadFileViewerPreview({
+                        path: selectedFileViewerPath,
+                        kind: getFileType(nodeType),
+                        sheet: String(nodeConfig.sheet || '0'),
+                        json_path: String(nodeConfig.json_path || ''),
+                        max_rows: effectiveFileViewerMaxRows,
+                        label: String(data.label || definition.label || selectedFileViewerPath.split('/').pop() || 'File'),
+                      })
+                    }}
+                    style={{
+                      width: '100%',
+                      background: '#0ea5e91a',
+                      border: '1px solid #0ea5e940',
+                      color: '#0ea5e9',
+                    }}
+                  >
+                    Open File View Studio
+                  </Button>
+                </Space>
+              </div>
+            ) : null}
+
             {nodeType === 'oracle_destination' ? (
               <div style={{
                 background: '#f973160f',
@@ -23065,6 +27962,77 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       </Tag>
                     ) : null}
                   </Space>
+                </Space>
+              </div>
+            ) : null}
+
+            {nodeType === 'business_workflow' ? (
+              <div style={{
+                background: '#3b82f60f',
+                border: '1px solid #3b82f630',
+                borderRadius: 10,
+                padding: '10px 12px',
+                marginBottom: 12,
+              }}>
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  <Text style={{ color: '#60a5fa', fontSize: 12, fontWeight: 700 }}>
+                    BLW Studio
+                  </Text>
+                  <Space size={6} wrap>
+                    <Tag style={{ background: '#3b82f614', border: '1px solid #3b82f630', color: '#60a5fa' }}>
+                      embedded
+                    </Tag>
+                    <Tag style={{ background: '#8b5cf614', border: '1px solid #8b5cf630', color: '#8b5cf6' }}>
+                      routing
+                    </Tag>
+                    <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b' }}>
+                      tracker
+                    </Tag>
+                  </Space>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Configure visual routing, child canvas execution, and tracker settings.
+                  </Text>
+                  <Space.Compact block style={{ width: '100%' }}>
+                    <Button
+                      size="small"
+                      onMouseDown={(event) => event.stopPropagation()}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        setBlwStudioOpen(true)
+                      }}
+                      style={{
+                        width: '50%',
+                        background: '#3b82f61a',
+                        border: '1px solid #3b82f640',
+                        color: '#60a5fa',
+                      }}
+                    >
+                      Open BLW Studio
+                    </Button>
+                    <Button
+                      size="small"
+                      disabled={!activePipelineId || !selectedNodeId}
+                      onMouseDown={(event) => event.stopPropagation()}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        if (!activePipelineId || !selectedNodeId || typeof window === 'undefined') return
+                        window.dispatchEvent(new CustomEvent('pipeline:open-business-canvas-tab', {
+                          detail: {
+                            pipelineId: String(activePipelineId || ''),
+                            nodeId: String(selectedNodeId || ''),
+                          },
+                        }))
+                      }}
+                      style={{
+                        width: '50%',
+                        background: '#14b8a61a',
+                        border: '1px solid #14b8a640',
+                        color: '#14b8a6',
+                      }}
+                    >
+                      Open Canvas Tab
+                    </Button>
+                  </Space.Compact>
                 </Space>
               </div>
             ) : null}
@@ -23154,6 +28122,56 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               </div>
             ) : null}
 
+            {nodeType === 'map_transform' ? (
+              <div style={{
+                background: '#6366f10f',
+                border: '1px solid #6366f130',
+                borderRadius: 10,
+                padding: '10px 12px',
+                marginBottom: 12,
+              }}>
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  <Text style={{ color: '#6366f1', fontSize: 12, fontWeight: 700 }}>
+                    Custom Fields Studio
+                  </Text>
+                  <Space size={6} wrap>
+                    <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e' }}>
+                      enabled: {customFieldEnabledConfiguredCount}
+                    </Tag>
+                    <Tag style={{ background: '#6366f114', border: '1px solid #6366f130', color: '#6366f1' }}>
+                      fields: {customFieldConfiguredCount}
+                    </Tag>
+                    <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b' }}>
+                      source: {mapInputFieldOptions.length || 'none'}
+                    </Tag>
+                  </Space>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Build formula fields, nested JSON outputs, validation, and source-field selection.
+                  </Text>
+                  <Button
+                    size="small"
+                    onMouseDown={(event) => {
+                      event.preventDefault()
+                      event.stopPropagation()
+                    }}
+                    onClick={(event) => {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      openCustomFieldStudio()
+                    }}
+                    style={{
+                      width: '100%',
+                      background: '#6366f11a',
+                      border: '1px solid #6366f140',
+                      color: '#6366f1',
+                    }}
+                  >
+                    Open Custom Fields Studio
+                  </Button>
+                </Space>
+              </div>
+            ) : null}
+
             {nodeType === 'profile_query_transform' ? (
               <div style={{
                 background: '#a855f70f',
@@ -23163,22 +28181,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 marginBottom: 12,
               }}>
                 <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                  <Space style={{ justifyContent: 'space-between', width: '100%' }}>
-                    <Text style={{ color: '#a855f7', fontSize: 12, fontWeight: 700 }}>
-                      Data Query Studio
-                    </Text>
-                    <Button
-                      size="small"
-                      onClick={openDataQueryStudio}
-                      style={{
-                        background: '#a855f71a',
-                        border: '1px solid #a855f740',
-                        color: '#a855f7',
-                      }}
-                    >
-                      Open Full Screen
-                    </Button>
-                  </Space>
+                  <Text style={{ color: '#a855f7', fontSize: 12, fontWeight: 700 }}>
+                    Data Query Studio
+                  </Text>
                   <Space size={6} wrap>
                     <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>
                       rules: {dataQueryCriteriaConfigured.length}
@@ -23202,6 +28207,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
                     Configure query rules, JSON path field picker, and projection in studio. Changes apply only after explicit Save.
                   </Text>
+                  <Button
+                    size="small"
+                    onClick={openDataQueryStudio}
+                    style={{
+                      width: '100%',
+                      background: '#a855f71a',
+                      border: '1px solid #a855f740',
+                      color: '#a855f7',
+                    }}
+                  >
+                    Open Data Query Studio
+                  </Button>
                 </Space>
               </div>
             ) : null}
@@ -23215,22 +28232,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 marginBottom: 12,
               }}>
                 <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                  <Space style={{ justifyContent: 'space-between', width: '100%' }}>
-                    <Text style={{ color: '#0ea5e9', fontSize: 12, fontWeight: 700 }}>
-                      MLOps Studio
-                    </Text>
-                    <Button
-                      size="small"
-                      onClick={openMLOpsStudio}
-                      style={{
-                        background: '#0ea5e91a',
-                        border: '1px solid #0ea5e940',
-                        color: '#0ea5e9',
-                      }}
-                    >
-                      Open Full Screen
-                    </Button>
-                  </Space>
+                  <Text style={{ color: '#0ea5e9', fontSize: 12, fontWeight: 700 }}>
+                    MLOps Studio
+                  </Text>
                   <Space size={6} wrap>
                     <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>
                       stage: 1
@@ -23248,6 +28252,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
                     Incoming data profiling + compact analytics visualization (Polars + Plotly + optional YData).
                   </Text>
+                  <Button
+                    size="small"
+                    onClick={openMLOpsStudio}
+                    style={{
+                      width: '100%',
+                      background: '#0ea5e91a',
+                      border: '1px solid #0ea5e940',
+                      color: '#0ea5e9',
+                    }}
+                  >
+                    Open MLOps Studio
+                  </Button>
                 </Space>
               </div>
             ) : null}
@@ -23261,22 +28277,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 marginBottom: 12,
               }}>
                 <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                  <Space style={{ justifyContent: 'space-between', width: '100%' }}>
-                    <Text style={{ color: '#0ea5e9', fontSize: 12, fontWeight: 700 }}>
-                      Control Flow Studio
-                    </Text>
-                    <Button
-                      size="small"
-                      onClick={openConditionStudio}
-                      style={{
-                        background: '#0ea5e91a',
-                        border: '1px solid #0ea5e940',
-                        color: '#0ea5e9',
-                      }}
-                    >
-                      Open Full Screen
-                    </Button>
-                  </Space>
+                  <Text style={{ color: '#0ea5e9', fontSize: 12, fontWeight: 700 }}>
+                    Control Flow Studio
+                  </Text>
 
                   <Space size={6} wrap>
                     <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>
@@ -23300,6 +28303,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       : `TRUE route: ${conditionBranchTargets.trueTargets.length > 0 ? conditionBranchTargets.trueTargets.join(', ') : '(not connected)'} | FALSE route: ${conditionBranchTargets.falseTargets.length > 0 ? conditionBranchTargets.falseTargets.join(', ') : '(not connected)'}`
                     }
                   </Text>
+                  <Button
+                    size="small"
+                    onClick={openConditionStudio}
+                    style={{
+                      width: '100%',
+                      background: '#0ea5e91a',
+                      border: '1px solid #0ea5e940',
+                      color: '#0ea5e9',
+                    }}
+                  >
+                    Open Control Flow Studio
+                  </Button>
                 </Space>
               </div>
             ) : null}
@@ -23324,7 +28339,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               </Form.Item>
             ))}
 
-            {visibleFields.length === 0 && (
+            {visibleFields.length === 0 && nodeType !== 'file_viewer' && (
               <div style={{ textAlign: 'center', padding: '20px 0' }}>
                 <Text style={{ color: 'var(--app-text-dim)', fontSize: 12 }}>No configuration required.</Text>
               </div>
@@ -24867,59 +29882,61 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             </Text>
           </div>
           <Space wrap>
-            <Popover
-              trigger="click"
-              placement="bottomRight"
-              content={(
-                <div style={{ width: 320, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                  <Select
-                    size="small"
-                    value={customEditorColorProfile}
-                    onChange={(value) => setCustomEditorColorProfile(value as CustomEditorColorProfile)}
-                    options={CUSTOM_EDITOR_COLOR_PROFILE_OPTIONS}
-                    style={{ width: '100%' }}
-                  />
-                  <Select
-                    size="small"
-                    value={customEditorFontPreset}
-                    onChange={(value) => setCustomEditorFontPreset(value as CustomEditorFontPreset)}
-                    options={CUSTOM_EDITOR_FONT_FAMILY_OPTIONS}
-                    style={{ width: '100%' }}
-                  />
-                  <Select
-                    size="small"
-                    value={customEditorBeautifyStyle}
-                    onChange={(value) => setCustomEditorBeautifyStyle(value as CustomBeautifyStyle)}
-                    options={CUSTOM_EDITOR_BEAUTIFY_STYLE_OPTIONS}
-                    style={{ width: '100%' }}
-                  />
-                  <Select
-                    size="small"
-                    value={customEditorFontSize}
-                    onChange={(value) => setCustomEditorFontSize(Number(value || 13))}
-                    options={[11, 12, 13, 14, 15, 16, 18, 20].map((size) => ({ value: size, label: `Size ${size}` }))}
-                    style={{ width: '100%' }}
-                  />
-                  <Select
-                    size="small"
-                    value={customEditorLineHeight}
-                    onChange={(value) => setCustomEditorLineHeight(Number(value || 22))}
-                    options={[18, 20, 22, 24, 26, 28].map((line) => ({ value: line, label: `Line ${line}` }))}
-                    style={{ width: '100%' }}
-                  />
-                  <Space size={4}>
-                    <Switch size="small" checked={customEditorWordWrap} onChange={setCustomEditorWordWrap} />
-                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Wrap</Text>
-                  </Space>
-                  <Space size={4}>
-                    <Switch size="small" checked={customEditorLigatures} onChange={setCustomEditorLigatures} />
-                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Ligatures</Text>
-                  </Space>
-                </div>
-              )}
-            >
-              <Button size="small">Editor Style</Button>
-            </Popover>
+            {customFieldStudioView === 'manual' ? (
+              <Popover
+                trigger="click"
+                placement="bottomRight"
+                content={(
+                  <div style={{ width: 320, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                    <Select
+                      size="small"
+                      value={customEditorColorProfile}
+                      onChange={(value) => setCustomEditorColorProfile(value as CustomEditorColorProfile)}
+                      options={CUSTOM_EDITOR_COLOR_PROFILE_OPTIONS}
+                      style={{ width: '100%' }}
+                    />
+                    <Select
+                      size="small"
+                      value={customEditorFontPreset}
+                      onChange={(value) => setCustomEditorFontPreset(value as CustomEditorFontPreset)}
+                      options={CUSTOM_EDITOR_FONT_FAMILY_OPTIONS}
+                      style={{ width: '100%' }}
+                    />
+                    <Select
+                      size="small"
+                      value={customEditorBeautifyStyle}
+                      onChange={(value) => setCustomEditorBeautifyStyle(value as CustomBeautifyStyle)}
+                      options={CUSTOM_EDITOR_BEAUTIFY_STYLE_OPTIONS}
+                      style={{ width: '100%' }}
+                    />
+                    <Select
+                      size="small"
+                      value={customEditorFontSize}
+                      onChange={(value) => setCustomEditorFontSize(Number(value || 13))}
+                      options={[11, 12, 13, 14, 15, 16, 18, 20].map((size) => ({ value: size, label: `Size ${size}` }))}
+                      style={{ width: '100%' }}
+                    />
+                    <Select
+                      size="small"
+                      value={customEditorLineHeight}
+                      onChange={(value) => setCustomEditorLineHeight(Number(value || 22))}
+                      options={[18, 20, 22, 24, 26, 28].map((line) => ({ value: line, label: `Line ${line}` }))}
+                      style={{ width: '100%' }}
+                    />
+                    <Space size={4}>
+                      <Switch size="small" checked={customEditorWordWrap} onChange={setCustomEditorWordWrap} />
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Wrap</Text>
+                    </Space>
+                    <Space size={4}>
+                      <Switch size="small" checked={customEditorLigatures} onChange={setCustomEditorLigatures} />
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Ligatures</Text>
+                    </Space>
+                  </div>
+                )}
+              >
+                <Button size="small">Editor Style</Button>
+              </Popover>
+            ) : null}
             <Switch
               checked={customIncludeSourceDraft}
               onChange={setCustomIncludeSourceDraft}
@@ -24934,12 +29951,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             >
               Test Output Validation
             </Button>
-            <Button
-              onClick={() => addCustomFieldDraft()}
-              style={{ background: '#6366f11a', border: '1px solid #6366f140', color: '#6366f1' }}
-            >
-              Add Field
-            </Button>
+            {customFieldStudioView === 'manual' ? (
+              <Button
+                onClick={() => addCustomFieldDraft()}
+                style={{ background: '#6366f11a', border: '1px solid #6366f140', color: '#6366f1' }}
+              >
+                Add Field
+              </Button>
+            ) : null}
             <Button onClick={() => setCustomFieldStudioOpen(false)}>Close</Button>
             <Button
               type="primary"
@@ -25920,6 +30939,768 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             <Space
               align="center"
               wrap
+              style={{
+                justifyContent: 'space-between',
+                width: '100%',
+                marginBottom: 12,
+                border: '1px solid var(--app-border-strong)',
+                borderRadius: 10,
+                background: 'var(--app-card-bg)',
+                padding: 10,
+              }}
+            >
+              <Space.Compact>
+                <Button
+                  size="small"
+                  type={customFieldStudioView === 'workbench' ? 'primary' : 'default'}
+                  onClick={() => setCustomFieldStudioView('workbench')}
+                >
+                  Expression Studio
+                </Button>
+                <Button
+                  size="small"
+                  type={customFieldStudioView === 'manual' ? 'primary' : 'default'}
+                  onClick={() => setCustomFieldStudioView('manual')}
+                >
+                  Manual Fields
+                </Button>
+              </Space.Compact>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                Expression Studio generates rows first; fields are saved only after Apply to Fields and Save Custom Fields.
+              </Text>
+            </Space>
+            <div
+              style={{
+                display: customFieldStudioView === 'workbench' ? 'block' : 'none',
+                background: 'var(--app-card-bg)',
+                border: '1px solid var(--app-border-strong)',
+                borderRadius: 10,
+                padding: 12,
+                marginBottom: 12,
+              }}
+            >
+              <Space align="start" style={{ justifyContent: 'space-between', width: '100%', gap: 12 }} wrap>
+                <div>
+                  <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Expression Studio Workbench</Text>
+                  <br />
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                    Compact row-wise builder for field declarations, v1/v2 functions, profile aggregations, if/else logic, and JSON objects.
+                  </Text>
+                </div>
+                <Space size={6} wrap>
+                  <Button size="small" onClick={loadExpressionStudioSuggestedStarter}>
+                    Load Suggested Starter
+                  </Button>
+                  <Button
+                    size="small"
+                    onClick={() => setExpressionStudioRoleSelections(expressionStudioRoleSelectionDefaults(expressionStudioRoleSuggestions))}
+                  >
+                    Auto Select Fields
+                  </Button>
+                  <Button size="small" onClick={autoFillExpressionStudioRows}>
+                    Auto Fill Rows
+                  </Button>
+                  <Button
+                    size="small"
+                    type="primary"
+                    onClick={applyExpressionStudioToDraft}
+                    style={{ background: 'linear-gradient(135deg, #6366f1, #8b5cf6)', border: 'none' }}
+                  >
+                    Apply to Fields
+                  </Button>
+                </Space>
+              </Space>
+
+              <div
+                style={{
+                  marginTop: 10,
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(3, minmax(180px, 1fr))',
+                  gap: 8,
+                }}
+              >
+                {EXPRESSION_STUDIO_ROLE_CONFIG.map((role) => (
+                  <div
+                    key={role.key}
+                    style={{
+                      border: '1px solid var(--app-border-strong)',
+                      borderRadius: 8,
+                      padding: 8,
+                      background: 'var(--app-bg-elevated)',
+                      minWidth: 0,
+                    }}
+                  >
+                    <Space style={{ justifyContent: 'space-between', width: '100%', marginBottom: 4 }}>
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{role.label}</Text>
+                      {expressionStudioRoleSuggestions[role.key] ? (
+                        <Tag style={{ marginInlineEnd: 0, fontSize: 10 }}>auto</Tag>
+                      ) : null}
+                    </Space>
+                    <Select
+                      mode="multiple"
+                      size="small"
+                      allowClear
+                      showSearch
+                      maxTagCount="responsive"
+                      value={expressionStudioRoleSelections[role.key] || []}
+                      onChange={(values) => {
+                        setExpressionStudioRoleSelections((prev) => ({
+                          ...prev,
+                          [role.key]: uniqueFieldNames((values || []).map((value) => String(value || '').trim()).filter(Boolean)),
+                        }))
+                      }}
+                      options={expressionStudioFieldSelectOptions}
+                      placeholder={expressionStudioRoleSuggestions[role.key] || `Select ${role.label.toLowerCase()} fields`}
+                      style={{ width: '100%' }}
+                    />
+                  </div>
+                ))}
+              </div>
+
+              {false ? (
+              <div
+                style={{
+                  marginTop: 10,
+                  border: '1px solid var(--app-border-strong)',
+                  borderRadius: 8,
+                  background: 'var(--app-bg-elevated)',
+                  overflow: 'hidden',
+                }}
+              >
+                <Space style={{ justifyContent: 'space-between', width: '100%', padding: '8px 10px' }} wrap>
+                  <div>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>{expressionStudioActiveRecordTitle}</Text>
+                    <br />
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                      Row-wise records for the active configuration tab.
+                    </Text>
+                  </div>
+                  <Space size={6} wrap>
+                    {expressionStudioTab === 'fields' ? (
+                      <Button size="small" onClick={() => addExpressionStudioFieldDeclarationAndConfigure()}>
+                      Add Field
+                      </Button>
+                    ) : expressionStudioTab === 'rules' ? (
+                      <Button size="small" onClick={() => addExpressionStudioRuleAndConfigure()}>
+                        Add Rule
+                      </Button>
+                    ) : (
+                      <Button size="small" onClick={() => addExpressionStudioJsonDeclarationAndConfigure()}>
+                        Add JSON Key
+                      </Button>
+                    )}
+                  </Space>
+                </Space>
+                <Table<ExpressionStudioRecordRow>
+                  size="small"
+                  rowKey="key"
+                  dataSource={expressionStudioActiveRecordRows}
+                  pagination={false}
+                  scroll={{ x: 920, y: 220 }}
+                  locale={{ emptyText: 'No expression records configured.' }}
+                  columns={[
+                    {
+                      title: 'Section',
+                      dataIndex: 'sectionLabel',
+                      width: 145,
+                      render: (value) => <Tag style={{ marginInlineEnd: 0 }}>{String(value || '')}</Tag>,
+                    },
+                    {
+                      title: 'Name',
+                      dataIndex: 'name',
+                      width: 190,
+                      render: (value) => (
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 600 }} ellipsis={{ tooltip: String(value || '') }}>
+                          {String(value || '-')}
+                        </Text>
+                      ),
+                    },
+                    {
+                      title: 'Type',
+                      dataIndex: 'type',
+                      width: 135,
+                      render: (value) => <Text style={{ color: 'var(--app-text-subtle)' }}>{String(value || '-')}</Text>,
+                    },
+                    {
+                      title: 'Output',
+                      dataIndex: 'output',
+                      width: 120,
+                      render: (value) => <Text style={{ color: 'var(--app-text-subtle)' }}>{String(value || '-')}</Text>,
+                    },
+                    {
+                      title: 'Enabled',
+                      dataIndex: 'enabled',
+                      width: 95,
+                      render: (_value, row) => (
+                        row.enabled === undefined ? (
+                          <Text style={{ color: 'var(--app-text-subtle)' }}>-</Text>
+                        ) : (
+                          <Switch
+                            size="small"
+                            checked={Boolean(row.enabled)}
+                            onChange={(enabled) => setExpressionStudioRecordEnabled(row, enabled)}
+                          />
+                        )
+                      ),
+                    },
+                    {
+                      title: 'Summary',
+                      dataIndex: 'summary',
+                      width: 320,
+                      render: (value) => (
+                        <Text
+                          code
+                          style={{ maxWidth: 300, display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                          title={String(value || '')}
+                        >
+                          {String(value || '-')}
+                        </Text>
+                      ),
+                    },
+                    {
+                      title: 'Actions',
+                      key: 'actions',
+                      fixed: 'right',
+                      width: 160,
+                      render: (_value, row) => (
+                        <Space size={6}>
+                          <Button size="small" onClick={() => configureExpressionStudioRecord(row)}>
+                            Configure
+                          </Button>
+                          <Popconfirm
+                            title="Remove expression record?"
+                            okText="Remove"
+                            okButtonProps={{ danger: true }}
+                            onConfirm={() => removeExpressionStudioRecord(row)}
+                          >
+                            <Button size="small" danger>
+                              Remove
+                            </Button>
+                          </Popconfirm>
+                        </Space>
+                      ),
+                    },
+                  ]}
+                />
+              </div>
+              ) : null}
+
+              <Space style={{ width: '100%', justifyContent: 'space-between', marginTop: 12 }} wrap>
+                <Space.Compact>
+                  <Button
+                    size="small"
+                    type={expressionStudioTab === 'fields' ? 'primary' : 'default'}
+                    onClick={() => setExpressionStudioTab('fields')}
+                  >
+                    Field Declarations
+                  </Button>
+                  <Button
+                    size="small"
+                    type={expressionStudioTab === 'rules' ? 'primary' : 'default'}
+                    onClick={() => setExpressionStudioTab('rules')}
+                  >
+                    Rule Builder
+                  </Button>
+                  <Button
+                    size="small"
+                    type={expressionStudioTab === 'json' ? 'primary' : 'default'}
+                    onClick={() => setExpressionStudioTab('json')}
+                  >
+                    JSON Objects
+                  </Button>
+                </Space.Compact>
+                <Space size={6} wrap>
+                  {expressionStudioBuildIssues.length > 0 ? (
+                    <Tag color="error" style={{ marginInlineEnd: 0 }}>{expressionStudioBuildIssues.length} issue{expressionStudioBuildIssues.length === 1 ? '' : 's'}</Tag>
+                  ) : expressionStudioIsSynced ? (
+                    <Tag color="success" style={{ marginInlineEnd: 0 }}>synced</Tag>
+                  ) : expressionStudioHasAppliedRows ? (
+                    <Tag color="warning" style={{ marginInlineEnd: 0 }}>pending sync</Tag>
+                  ) : null}
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                    {expressionStudioGeneratedSpecs.length} generated output field{expressionStudioGeneratedSpecs.length === 1 ? '' : 's'}
+                  </Text>
+                  <Button size="small" onClick={() => setExpressionStudioPreviewOpen(true)}>
+                    JSON View
+                  </Button>
+                </Space>
+              </Space>
+
+              {expressionStudioBuildIssues.length > 0 ? (
+                <div
+                  style={{
+                    marginTop: 10,
+                    border: '1px solid #ef444440',
+                    background: '#ef444410',
+                    borderRadius: 8,
+                    padding: 8,
+                  }}
+                >
+                  <Text style={{ color: '#ef4444', fontSize: 12, fontWeight: 600 }}>
+                    Fix required before applying:
+                  </Text>
+                  <div style={{ marginTop: 4, display: 'grid', gap: 2 }}>
+                    {expressionStudioBuildIssues.slice(0, 5).map((issue, idx) => (
+                      <Text key={`${issue}_${idx}`} style={{ color: '#ef4444', fontSize: 11 }}>
+                        {idx + 1}. {issue}
+                      </Text>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {renderExpressionStudioActiveRecordTable()}
+
+              {false && expressionStudioTab === 'rules' ? (
+                <Space direction="vertical" size={8} style={{ width: '100%', marginTop: 10 }}>
+                  <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Rule Builder</Text>
+                    <Button size="small" onClick={() => addExpressionStudioRule()}>
+                      Add Rule
+                    </Button>
+                  </Space>
+                  {expressionStudioRules.length === 0 ? (
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>No rule rows configured.</Text>
+                  ) : (
+                    expressionStudioRules.map((rule, idx) => {
+                      const preview = expressionStudioRuleExpression(rule, customFnsVersionDraft)
+                      return (
+                        <div
+                          key={rule.id}
+                          style={{
+                            border: '1px solid var(--app-border-strong)',
+                            borderRadius: 8,
+                            padding: 10,
+                            background: 'var(--app-bg-elevated)',
+                            maxWidth: 980,
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: 'grid',
+                              gridTemplateColumns: '42px 190px 220px 150px 90px',
+                              gap: 8,
+                              alignItems: 'center',
+                              overflowX: 'auto',
+                            }}
+                          >
+                            <Switch
+                              size="small"
+                              checked={rule.enabled}
+                              onChange={(enabled) => updateExpressionStudioRule(rule.id, { enabled })}
+                            />
+                            <Select
+                              size="small"
+                              value={rule.ruleType}
+                              onChange={(value) => updateExpressionStudioRule(rule.id, { ruleType: value as ExpressionStudioRuleType })}
+                              options={EXPRESSION_STUDIO_RULE_TYPE_OPTIONS.filter((item) => item.value !== 'json_object')}
+                              style={{ width: '100%' }}
+                            />
+                            <Input
+                              size="small"
+                              value={rule.outputName}
+                              onChange={(event) => updateExpressionStudioRule(rule.id, { outputName: event.target.value })}
+                              placeholder={`output_field_${idx + 1}`}
+                              style={commonInputStyle}
+                            />
+                            <Select
+                              size="small"
+                              value={rule.outputMode}
+                              onChange={(value) => updateExpressionStudioRule(rule.id, { outputMode: value as ExpressionStudioOutputMode })}
+                              options={EXPRESSION_STUDIO_OUTPUT_MODE_OPTIONS}
+                              style={{ width: '100%' }}
+                            />
+                            <Button
+                              size="small"
+                              danger
+                              onClick={() => setExpressionStudioRules((prev) => prev.filter((item) => item.id !== rule.id))}
+                            >
+                              Remove
+                            </Button>
+                          </div>
+                          <div style={{ marginTop: 8 }}>
+                            {rule.ruleType === 'advanced_function' ? (
+                              renderExpressionStudioAdvancedParameters(
+                                rule.templateLabel,
+                                rule.paramValues,
+                                rule.paramModes,
+                                (patch) => updateExpressionStudioRule(rule.id, patch),
+                              )
+                            ) : rule.ruleType === 'if_else' ? (
+                              <div style={{ display: 'grid', gridTemplateColumns: '220px 130px 150px 150px 150px', gap: 8, overflowX: 'auto' }}>
+                                <Select
+                                  showSearch
+                                  allowClear
+                                  size="small"
+                                  value={rule.sourceField || undefined}
+                                  onChange={(value) => updateExpressionStudioRule(rule.id, { sourceField: String(value || '') })}
+                                  options={expressionStudioFieldSelectOptions}
+                                  placeholder="condition field"
+                                  style={{ width: '100%' }}
+                                />
+                                <Select
+                                  size="small"
+                                  value={rule.operator}
+                                  onChange={(value) => updateExpressionStudioRule(rule.id, { operator: String(value || '==') })}
+                                  options={EXPRESSION_STUDIO_OPERATOR_OPTIONS}
+                                  style={{ width: '100%' }}
+                                />
+                                <Input
+                                  size="small"
+                                  value={rule.compareValue}
+                                  onChange={(event) => updateExpressionStudioRule(rule.id, { compareValue: event.target.value })}
+                                  placeholder="compare value"
+                                  style={commonInputStyle}
+                                />
+                                <Input
+                                  size="small"
+                                  value={rule.thenValue}
+                                  onChange={(event) => updateExpressionStudioRule(rule.id, { thenValue: event.target.value })}
+                                  placeholder="then"
+                                  style={commonInputStyle}
+                                />
+                                <Input
+                                  size="small"
+                                  value={rule.elseValue}
+                                  onChange={(event) => updateExpressionStudioRule(rule.id, { elseValue: event.target.value })}
+                                  placeholder="else"
+                                  style={commonInputStyle}
+                                />
+                              </div>
+                            ) : rule.ruleType === 'json_object' ? (
+                              <Input.TextArea
+                                value={rule.rawExpression}
+                                onChange={(event) => updateExpressionStudioRule(rule.id, { rawExpression: event.target.value })}
+                                placeholder={'{\n  "key": "=field(\\\'AMOUNT\\\')"\n}'}
+                                autoSize={{ minRows: 2, maxRows: 5 }}
+                                style={commonInputStyle}
+                              />
+                            ) : (
+                              <div style={{ display: 'grid', gridTemplateColumns: rule.ruleType === 'unique_profile' ? '240px 130px 210px 210px' : '240px 130px', gap: 8, overflowX: 'auto' }}>
+                                <Select
+                                  showSearch
+                                  allowClear
+                                  size="small"
+                                  value={rule.sourceField || undefined}
+                                  onChange={(value) => updateExpressionStudioRule(rule.id, { sourceField: String(value || '') })}
+                                  options={expressionStudioFieldSelectOptions}
+                                  placeholder="source field"
+                                  style={{ width: '100%' }}
+                                />
+                                {rule.ruleType === 'direct_field' ? null : (
+                                  <Select
+                                    size="small"
+                                    value={rule.aggregate}
+                                    onChange={(value) => updateExpressionStudioRule(rule.id, { aggregate: String(value || 'sum') })}
+                                    options={EXPRESSION_STUDIO_AGG_OPTIONS.map((value) => ({ value, label: value }))}
+                                    style={{ width: '100%' }}
+                                  />
+                                )}
+                                {rule.ruleType === 'unique_profile' ? (
+                                  <>
+                                    <Select
+                                      showSearch
+                                      allowClear
+                                      size="small"
+                                      value={rule.uniqueIdField || undefined}
+                                      onChange={(value) => updateExpressionStudioRule(rule.id, { uniqueIdField: String(value || '') })}
+                                      options={expressionStudioFieldSelectOptions}
+                                      placeholder="unique id"
+                                      style={{ width: '100%' }}
+                                    />
+                                    <Select
+                                      showSearch
+                                      allowClear
+                                      size="small"
+                                      value={rule.groupField || undefined}
+                                      onChange={(value) => updateExpressionStudioRule(rule.id, { groupField: String(value || '') })}
+                                      options={expressionStudioFieldSelectOptions}
+                                      placeholder="group/entity optional"
+                                      style={{ width: '100%' }}
+                                    />
+                                  </>
+                                ) : null}
+                              </div>
+                            )}
+                          </div>
+                          {rule.ruleType === 'advanced_function' ? (
+                            <Input.TextArea
+                              value={rule.rawExpression}
+                              onChange={(event) => updateExpressionStudioRule(rule.id, { rawExpression: event.target.value })}
+                              placeholder="Optional expression override"
+                              autoSize={{ minRows: 1, maxRows: 4 }}
+                              style={{ ...commonInputStyle, marginTop: 8 }}
+                            />
+                          ) : null}
+                          <div
+                            style={{
+                              marginTop: 8,
+                              border: '1px solid var(--app-border)',
+                              borderRadius: 8,
+                              padding: 8,
+                              background: 'var(--app-card-bg)',
+                              overflowX: 'auto',
+                              maxWidth: 940,
+                            }}
+                          >
+                            <Text code style={{ whiteSpace: 'nowrap' }}>{preview}</Text>
+                          </div>
+                        </div>
+                      )
+                    })
+                  )}
+                </Space>
+              ) : null}
+
+              {false && expressionStudioTab === 'fields' ? (
+                <Space direction="vertical" size={8} style={{ width: '100%', marginTop: 10 }}>
+                  <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Field Declarations</Text>
+                    <Button size="small" onClick={() => addExpressionStudioFieldDeclaration()}>
+                      Add Field Declaration
+                    </Button>
+                  </Space>
+                  {expressionStudioFieldDeclarations.length === 0 ? (
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>No field declarations configured.</Text>
+                  ) : (
+                    expressionStudioFieldDeclarations.map((decl) => (
+                      <div
+                        key={decl.id}
+                        style={{
+                          border: '1px solid var(--app-border-strong)',
+                          borderRadius: 8,
+                          padding: 10,
+                          background: 'var(--app-bg-elevated)',
+                        }}
+                      >
+                        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(150px, 1fr) minmax(140px, 170px) minmax(220px, 2fr) 92px', gap: 8, alignItems: 'center' }}>
+                          <Input
+                            size="small"
+                            value={decl.name}
+                            onChange={(event) => updateExpressionStudioFieldDeclaration(decl.id, { name: event.target.value })}
+                            placeholder="field name"
+                            style={commonInputStyle}
+                          />
+                          <Select
+                            size="small"
+                            value={decl.mode}
+                            onChange={(value) => updateExpressionStudioFieldDeclaration(decl.id, { mode: value as ExpressionStudioFieldDeclMode })}
+                            options={EXPRESSION_STUDIO_FIELD_DECL_MODE_OPTIONS}
+                            style={{ width: '100%' }}
+                          />
+                          {decl.mode === 'field' || decl.mode === 'number' ? (
+                            <Select
+                              showSearch
+                              allowClear
+                              size="small"
+                              value={decl.sourceField || undefined}
+                              onChange={(value) => updateExpressionStudioFieldDeclaration(decl.id, { sourceField: String(value || '') })}
+                              options={expressionStudioFieldSelectOptions}
+                              placeholder="source field"
+                              style={{ width: '100%' }}
+                            />
+                          ) : decl.mode === 'literal' ? (
+                            <Input
+                              size="small"
+                              value={decl.literalValue}
+                              onChange={(event) => updateExpressionStudioFieldDeclaration(decl.id, { literalValue: event.target.value })}
+                              placeholder="literal value"
+                              style={commonInputStyle}
+                            />
+                          ) : (
+                            <Input
+                              size="small"
+                              value={decl.expression}
+                              onChange={(event) => updateExpressionStudioFieldDeclaration(decl.id, { expression: event.target.value })}
+                              placeholder="=expression"
+                              style={commonInputStyle}
+                            />
+                          )}
+                          <Button
+                            size="small"
+                            danger
+                            onClick={() => setExpressionStudioFieldDeclarations((prev) => prev.filter((item) => item.id !== decl.id))}
+                          >
+                            Remove
+                          </Button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </Space>
+              ) : null}
+
+              {false && expressionStudioTab === 'json' ? (
+                <Space direction="vertical" size={8} style={{ width: '100%', marginTop: 10 }}>
+                  <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>JSON Objects</Text>
+                    <Button size="small" onClick={() => addExpressionStudioJsonDeclaration()}>
+                      Add JSON Key
+                    </Button>
+                  </Space>
+                  {expressionStudioJsonDeclarations.length === 0 ? (
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>No JSON object rows configured.</Text>
+                  ) : (
+                    expressionStudioJsonDeclarations.map((row) => (
+                      <div
+                        key={row.id}
+                        style={{
+                          border: '1px solid var(--app-border-strong)',
+                          borderRadius: 8,
+                          padding: 10,
+                          background: 'var(--app-bg-elevated)',
+                          maxWidth: 980,
+                        }}
+                      >
+                        <div style={{ display: 'grid', gridTemplateColumns: '180px 160px 190px 90px', gap: 8, alignItems: 'center', overflowX: 'auto' }}>
+                          <Input
+                            size="small"
+                            value={row.objectName}
+                            onChange={(event) => updateExpressionStudioJsonDeclaration(row.id, { objectName: event.target.value })}
+                            placeholder="object name"
+                            style={commonInputStyle}
+                          />
+                          <Input
+                            size="small"
+                            value={row.keyName}
+                            onChange={(event) => updateExpressionStudioJsonDeclaration(row.id, { keyName: event.target.value })}
+                            placeholder="json key"
+                            style={commonInputStyle}
+                          />
+                          <Select
+                            size="small"
+                            value={row.ruleType}
+                            onChange={(value) => updateExpressionStudioJsonDeclaration(row.id, { ruleType: value as ExpressionStudioRuleType })}
+                            options={EXPRESSION_STUDIO_RULE_TYPE_OPTIONS.filter((item) => item.value !== 'json_object')}
+                            style={{ width: '100%' }}
+                          />
+                          <Button
+                            size="small"
+                            danger
+                            onClick={() => setExpressionStudioJsonDeclarations((prev) => prev.filter((item) => item.id !== row.id))}
+                          >
+                            Remove
+                          </Button>
+                        </div>
+                        <div style={{ marginTop: 8 }}>
+                          {row.ruleType === 'advanced_function' ? (
+                            renderExpressionStudioAdvancedParameters(
+                              row.templateLabel,
+                              row.paramValues,
+                              row.paramModes,
+                              (patch) => updateExpressionStudioJsonDeclaration(row.id, patch),
+                            )
+                          ) : row.ruleType === 'if_else' ? (
+                            <div style={{ display: 'grid', gridTemplateColumns: '220px 130px 150px 150px 150px', gap: 8, overflowX: 'auto' }}>
+                              <Select
+                                showSearch
+                                allowClear
+                                size="small"
+                                value={row.sourceField || undefined}
+                                onChange={(value) => updateExpressionStudioJsonDeclaration(row.id, { sourceField: String(value || '') })}
+                                options={expressionStudioFieldSelectOptions}
+                                placeholder="condition field"
+                                style={{ width: '100%' }}
+                              />
+                              <Select
+                                size="small"
+                                value={row.operator}
+                                onChange={(value) => updateExpressionStudioJsonDeclaration(row.id, { operator: String(value || '==') })}
+                                options={EXPRESSION_STUDIO_OPERATOR_OPTIONS}
+                                style={{ width: '100%' }}
+                              />
+                              <Input
+                                size="small"
+                                value={row.compareValue}
+                                onChange={(event) => updateExpressionStudioJsonDeclaration(row.id, { compareValue: event.target.value })}
+                                placeholder="compare value"
+                                style={commonInputStyle}
+                              />
+                              <Input
+                                size="small"
+                                value={row.thenValue}
+                                onChange={(event) => updateExpressionStudioJsonDeclaration(row.id, { thenValue: event.target.value })}
+                                placeholder="then"
+                                style={commonInputStyle}
+                              />
+                              <Input
+                                size="small"
+                                value={row.elseValue}
+                                onChange={(event) => updateExpressionStudioJsonDeclaration(row.id, { elseValue: event.target.value })}
+                                placeholder="else"
+                                style={commonInputStyle}
+                              />
+                            </div>
+                          ) : (
+                            <div style={{ display: 'grid', gridTemplateColumns: row.ruleType === 'unique_profile' ? '240px 130px 210px' : '240px 130px', gap: 8, overflowX: 'auto' }}>
+                              <Select
+                                showSearch
+                                allowClear
+                                size="small"
+                                value={row.sourceField || undefined}
+                                onChange={(value) => updateExpressionStudioJsonDeclaration(row.id, { sourceField: String(value || '') })}
+                                options={expressionStudioFieldSelectOptions}
+                                placeholder="source field"
+                                style={{ width: '100%' }}
+                              />
+                              {row.ruleType === 'direct_field' ? null : (
+                                <Select
+                                  size="small"
+                                  value={row.aggregate}
+                                  onChange={(value) => updateExpressionStudioJsonDeclaration(row.id, { aggregate: String(value || 'sum') })}
+                                  options={EXPRESSION_STUDIO_AGG_OPTIONS.map((value) => ({ value, label: value }))}
+                                  style={{ width: '100%' }}
+                                />
+                              )}
+                              {row.ruleType === 'unique_profile' ? (
+                                <Select
+                                  showSearch
+                                  allowClear
+                                  size="small"
+                                  value={row.uniqueIdField || undefined}
+                                  onChange={(value) => updateExpressionStudioJsonDeclaration(row.id, { uniqueIdField: String(value || '') })}
+                                  options={expressionStudioFieldSelectOptions}
+                                  placeholder="unique id"
+                                  style={{ width: '100%' }}
+                                />
+                              ) : null}
+                            </div>
+                          )}
+                        </div>
+                        <Input.TextArea
+                          value={row.expression}
+                          onChange={(event) => updateExpressionStudioJsonDeclaration(row.id, { expression: event.target.value })}
+                          placeholder="Optional expression override for this JSON key"
+                          autoSize={{ minRows: 1, maxRows: 4 }}
+                          style={{ ...commonInputStyle, marginTop: 8 }}
+                        />
+                        <div
+                          style={{
+                            marginTop: 8,
+                            border: '1px solid var(--app-border)',
+                            borderRadius: 8,
+                            padding: 8,
+                            background: 'var(--app-card-bg)',
+                            overflowX: 'auto',
+                            maxWidth: 940,
+                          }}
+                        >
+                          <Text code style={{ whiteSpace: 'nowrap' }}>
+                            {expressionStudioJsonKeyExpression(row, customFnsVersionDraft)}
+                          </Text>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </Space>
+              ) : null}
+
+            </div>
+
+            <div style={{ display: customFieldStudioView === 'manual' ? 'block' : 'none' }}>
+            <Space
+              align="center"
+              wrap
               style={{ justifyContent: 'space-between', width: '100%', marginBottom: 10 }}
             >
               <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
@@ -25927,6 +31708,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 {customFieldDraftCount > 0 ? ` • ${customFieldDraftCollapsedCount} collapsed` : ''}
               </Text>
               <Space size={6} wrap>
+                <Button
+                  size="small"
+                  disabled={customFieldDraftCount === 0}
+                  onClick={syncManualFieldsToExpressionStudio}
+                >
+                  Sync to Expression Studio
+                </Button>
                 <Button
                   size="small"
                   disabled={customFieldDraftCount === 0}
@@ -26199,9 +31987,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               })
             )}
           </div>
+          </div>
 
           <div
             style={{
+              display: customFieldStudioView === 'manual' ? 'block' : 'none',
               width: '24%',
               minWidth: 300,
               borderLeft: '1px solid var(--app-border-strong)',
@@ -26331,6 +32121,176 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         </div>
       </Modal>
     )}
+    <Modal
+      open={Boolean(expressionStudioConfigDraft)}
+      onCancel={closeExpressionStudioConfigOverlay}
+      zIndex={2500}
+      centered
+      width="96vw"
+      title={null}
+      closable={false}
+      styles={{
+        content: {
+          padding: 0,
+          borderRadius: 12,
+          overflow: 'hidden',
+          border: '1px solid var(--app-border-strong)',
+          background: 'var(--app-panel-bg)',
+          height: '96vh',
+          display: 'flex',
+          flexDirection: 'column',
+        },
+        body: {
+          padding: 0,
+          flex: 1,
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          overflow: 'hidden',
+        },
+      }}
+      footer={null}
+    >
+      <div
+        style={{
+          borderBottom: '1px solid var(--app-border-strong)',
+          background: 'var(--app-card-bg)',
+          padding: '12px 16px',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: 12,
+        }}
+      >
+        <div>
+          <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 16 }}>
+            {expressionStudioConfigDraftTitle}
+          </Text>
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+            Changes are staged here and applied to the table only after Save.
+          </Text>
+        </div>
+        <Space>
+          <Popconfirm
+            title={expressionStudioConfigDraft?.isNew ? 'Discard this draft?' : 'Remove this expression record?'}
+            okText={expressionStudioConfigDraft?.isNew ? 'Discard' : 'Remove'}
+            okButtonProps={{ danger: true }}
+            onConfirm={removeExpressionStudioConfigOverlayRecord}
+          >
+            <Button danger>{expressionStudioConfigDraft?.isNew ? 'Discard' : 'Remove'}</Button>
+          </Popconfirm>
+          <Button onClick={closeExpressionStudioConfigOverlay}>Cancel</Button>
+          <Button
+            type="primary"
+            onClick={saveExpressionStudioConfigOverlay}
+            style={{ background: 'linear-gradient(135deg, #6366f1, #8b5cf6)', border: 'none' }}
+          >
+            Save
+          </Button>
+        </Space>
+      </div>
+      <div
+        style={{
+          flex: 1,
+          minHeight: 0,
+          padding: '24px clamp(16px, 3vw, 36px)',
+          overflowY: 'auto',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'flex-start',
+        }}
+      >
+        <div
+          style={{
+            width: 'min(1120px, 100%)',
+            boxSizing: 'border-box',
+            padding: 18,
+            border: '1px solid var(--app-border-strong)',
+            borderRadius: 12,
+            background: 'var(--app-card-bg)',
+          }}
+        >
+          {renderExpressionStudioConfigOverlayContent()}
+        </div>
+      </div>
+    </Modal>
+    <Modal
+      open={expressionStudioPreviewOpen}
+      onCancel={() => setExpressionStudioPreviewOpen(false)}
+      zIndex={2550}
+      centered
+      width="96vw"
+      title={null}
+      closable={false}
+      footer={null}
+      styles={{
+        content: {
+          padding: 0,
+          borderRadius: 12,
+          overflow: 'hidden',
+          border: '1px solid var(--app-border-strong)',
+          background: 'var(--app-panel-bg)',
+          height: '94vh',
+          display: 'flex',
+          flexDirection: 'column',
+        },
+        body: {
+          padding: 0,
+          flex: 1,
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          overflow: 'hidden',
+        },
+      }}
+    >
+      <div
+        style={{
+          borderBottom: '1px solid var(--app-border-strong)',
+          background: 'var(--app-card-bg)',
+          padding: '12px 16px',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: 12,
+        }}
+      >
+        <div>
+          <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 16 }}>
+            Generated Custom Field Preview
+          </Text>
+          <br />
+          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+            JSON view of fields generated from Expression Studio.
+          </Text>
+        </div>
+        <Space>
+          <Button onClick={() => navigator.clipboard?.writeText(expressionStudioPreviewText)}>Copy JSON</Button>
+          <Button onClick={() => setExpressionStudioPreviewOpen(false)}>Close</Button>
+        </Space>
+      </div>
+      <div style={{ flex: 1, minHeight: 0, padding: 16, background: 'var(--app-panel-bg)' }}>
+        <div style={{ height: '100%', border: '1px solid var(--app-border-strong)', borderRadius: 10, overflow: 'hidden', background: '#0f172a' }}>
+          <Editor
+            height="100%"
+            language="json"
+            value={expressionStudioPreviewText}
+            theme="vs-dark"
+            options={{
+              readOnly: true,
+              minimap: { enabled: false },
+              fontSize: 12,
+              lineNumbers: 'on',
+              wordWrap: 'on',
+              scrollBeyondLastLine: false,
+              automaticLayout: true,
+              tabSize: 2,
+            }}
+          />
+        </div>
+      </div>
+    </Modal>
     <Modal
       open={profileDataModalOpen}
       onCancel={() => setProfileDataModalOpen(false)}
@@ -26670,7 +32630,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       options={uiExpressionTemplateOptions}
                       onChange={(value) => {
                         setUiExpressionBuilderTouched(true)
+                        const nextTemplate = uiExpressionTemplateOptions.find((item) => item.value === value) || uiExpressionTemplateOptions[0]
+                        const nextPlaceholders = parseSnippetPlaceholders(String(nextTemplate?.snippet || ''))
                         setUiExpressionTemplateLabel(String(value || ''))
+                        setUiExpressionValuesByIndex(nextPlaceholders.reduce<Record<number, string>>((acc, placeholder) => {
+                          acc[placeholder.index] = defaultUiExpressionParameterValue(placeholder)
+                          return acc
+                        }, {}))
+                        setUiExpressionParamModeByIndex(nextPlaceholders.reduce<Record<number, UiExpressionParameterMode>>((acc, placeholder) => {
+                          acc[placeholder.index] = defaultUiExpressionParameterMode(placeholder)
+                          return acc
+                        }, {}))
                       }}
                       style={{ width: '100%' }}
                     />
@@ -26822,7 +32792,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           <Space direction="vertical" size={8} style={{ width: '100%' }}>
                             {uiExpressionPlaceholders.map((placeholder) => {
                               const currentValue = String(
-                                uiExpressionValuesByIndex[placeholder.index] ?? placeholder.defaultValue ?? ''
+                                uiExpressionValuesByIndex[placeholder.index] ?? defaultUiExpressionParameterValue(placeholder)
                               )
                               const currentMode = (
                                 uiExpressionParamModeByIndex[placeholder.index]
@@ -26860,11 +32830,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                               )
                               const parameterModeOptions: Array<{ value: UiExpressionParameterMode; label: string }> = [
                                 { value: 'field', label: 'Field' },
-                                { value: 'values', label: 'Values' },
-                                { value: 'variable', label: 'Variable' },
+                                { value: 'number_field', label: 'Number Field' },
+                                { value: 'values', label: 'Values/List' },
+                                { value: 'declared', label: 'Declared Field' },
+                                { value: 'metric_path', label: 'Metric Path' },
                                 { value: 'literal', label: 'Literal' },
-                                { value: 'raw', label: 'Raw' },
+                                { value: 'variable', label: 'Variable' },
+                                { value: 'raw', label: 'Raw Expression' },
                               ]
+                              const parameterMeta = expressionStudioParameterMeta(String(selectedUiExpressionTemplate?.label || ''), placeholder)
                               return (
                                 <div
                                   key={`ui_expr_placeholder_${placeholder.index}`}
@@ -26877,20 +32851,33 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                 >
                                   <Space direction="vertical" size={6} style={{ width: '100%' }}>
                                     <div style={{ display: 'grid', gridTemplateColumns: 'minmax(165px, 1fr) minmax(105px, 0.8fr) minmax(170px, 1.4fr) auto', gap: 6 }}>
-                                      <div
-                                        style={{
-                                          alignSelf: 'center',
-                                          color: 'var(--app-text-subtle)',
-                                          fontSize: 11,
-                                          fontFamily: 'monospace',
-                                          overflow: 'hidden',
-                                          textOverflow: 'ellipsis',
-                                          whiteSpace: 'nowrap',
-                                        }}
-                                        title={`Parameter #${placeholder.index} (${placeholder.defaultValue || 'value'})`}
-                                      >
-                                        #{placeholder.index} {placeholder.defaultValue || 'value'}
-                                      </div>
+                                      <Space direction="vertical" size={0} style={{ minWidth: 0 }}>
+                                        <Text
+                                          style={{
+                                            color: 'var(--app-text)',
+                                            fontSize: 12,
+                                            fontWeight: 600,
+                                            overflow: 'hidden',
+                                            textOverflow: 'ellipsis',
+                                            whiteSpace: 'nowrap',
+                                          }}
+                                          title={parameterMeta.label}
+                                        >
+                                          #{placeholder.index} {parameterMeta.label}
+                                        </Text>
+                                        <Text
+                                          style={{
+                                            color: 'var(--app-text-subtle)',
+                                            fontSize: 11,
+                                            overflow: 'hidden',
+                                            textOverflow: 'ellipsis',
+                                            whiteSpace: 'nowrap',
+                                          }}
+                                          title={parameterMeta.description}
+                                        >
+                                          {parameterMeta.description}
+                                        </Text>
+                                      </Space>
                                       <Select
                                         size="small"
                                         value={currentMode}
@@ -26898,15 +32885,44 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                         onChange={(value) => updateUiExpressionPlaceholderMode(placeholder.index, value as UiExpressionParameterMode)}
                                         style={{ width: '100%' }}
                                       />
-                                      {currentMode === 'field' || currentMode === 'values' ? (
-                                        <AutoComplete
-                                          value={currentValue}
-                                          options={uiFieldAutoCompleteOptions}
+                                      {currentMode === 'field' || currentMode === 'number_field' || currentMode === 'values' ? (
+                                        <Select
+                                          size="small"
+                                          showSearch
+                                          allowClear
+                                          value={currentValue || undefined}
+                                          options={expressionStudioFieldSelectOptions}
                                           onChange={(value) => updateUiExpressionPlaceholderValue(placeholder.index, String(value || ''))}
-                                          filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
-                                        >
-                                          <Input size="small" placeholder="field/path" />
-                                        </AutoComplete>
+                                          placeholder="Select source field"
+                                          style={{ width: '100%' }}
+                                          optionFilterProp="label"
+                                        />
+                                      ) : currentMode === 'declared' ? (
+                                        <Select
+                                          size="small"
+                                          showSearch
+                                          allowClear
+                                          value={currentValue || undefined}
+                                          options={expressionStudioDeclaredFieldSelectOptions.length > 0
+                                            ? expressionStudioDeclaredFieldSelectOptions
+                                            : expressionStudioFieldSelectOptions}
+                                          onChange={(value) => updateUiExpressionPlaceholderValue(placeholder.index, String(value || ''))}
+                                          placeholder="Select declared field"
+                                          style={{ width: '100%' }}
+                                          optionFilterProp="label"
+                                        />
+                                      ) : currentMode === 'metric_path' ? (
+                                        <Select
+                                          size="small"
+                                          showSearch
+                                          allowClear
+                                          value={currentValue || undefined}
+                                          options={expressionStudioMetricPathOptions}
+                                          onChange={(value) => updateUiExpressionPlaceholderValue(placeholder.index, String(value || ''))}
+                                          placeholder="Select metric path"
+                                          style={{ width: '100%' }}
+                                          optionFilterProp="label"
+                                        />
                                       ) : currentMode === 'variable' ? (
                                         <Select
                                           size="small"
@@ -27139,7 +33155,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           <div key={`ui_expr_preview_param_${placeholder.index}`} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                             <Tag style={{ marginInlineEnd: 0 }}>#{placeholder.index}</Tag>
                             <Text style={{ color: 'var(--app-text-subtle)', minWidth: 140 }}>
-                              {placeholder.defaultValue || 'value'}
+                              {expressionStudioParameterMeta(String(selectedUiExpressionTemplate?.label || ''), placeholder).label}
                             </Text>
                             <Text
                               style={{
@@ -27961,11 +33977,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             <Space size={8} wrap>
               <Switch
                 size="small"
-                checked={Boolean(dataQueryIncludeOriginalRowDraft)}
+                checked={dataQuerySelectFieldsDraft.length > 0 ? false : Boolean(dataQueryIncludeOriginalRowDraft)}
+                disabled={dataQuerySelectFieldsDraft.length > 0}
                 onChange={(checked) => setDataQueryIncludeOriginalRowDraft(Boolean(checked))}
               />
               <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
-                Include original row
+                {dataQuerySelectFieldsDraft.length > 0
+                  ? 'Strict projection: output only selected fields'
+                  : 'Include original row'}
               </Text>
             </Space>
             <div style={{ display: 'grid', gridTemplateColumns: 'minmax(110px,1fr) minmax(110px,1fr)', gap: 8 }}>
@@ -28343,7 +34362,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   select_field_aliases: dataQuerySelectFieldAliasesDraft,
                   array_output_mode: dataQueryArrayOutputModeDraft,
                   array_match_mode: dataQueryArrayMatchModeDraft,
-                  include_original_row: dataQueryIncludeOriginalRowDraft,
+                  include_original_row: dataQuerySelectFieldsDraft.length > 0 ? false : dataQueryIncludeOriginalRowDraft,
                   offset: dataQueryOffsetDraft,
                   limit: dataQueryLimitDraft,
                   profile_patch_enabled: dataQueryProfilePatchEnabledDraft,
@@ -28781,7 +34800,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               marginBottom: 12,
             }}
           >
-            <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Column Profile</Text>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+              <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Column Profile</Text>
+              <Button
+                size="small"
+                disabled={mlopsProfileColumns.length <= 0}
+                onClick={applyAllMLOpsProfileSuggestionsToStage2}
+              >
+                Apply All Suggestions
+              </Button>
+            </div>
             <Table
               size="small"
               style={{ marginTop: 8 }}
@@ -28794,6 +34822,20 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 { title: 'Missing %', dataIndex: 'missing_pct', key: 'missing_pct', width: 100, render: (v: number) => Number(v || 0).toFixed(2) },
                 { title: 'Unique', dataIndex: 'unique_count', key: 'unique_count', width: 90 },
                 { title: 'Suggested Ops', dataIndex: 'suggested_operations', key: 'suggested_operations', ellipsis: true },
+                {
+                  title: 'Pre-Processing',
+                  key: 'apply_suggested_ops',
+                  width: 150,
+                  render: (_: unknown, row: any) => (
+                    <Button
+                      size="small"
+                      disabled={!Array.isArray(row?.raw_suggested_operations) || row.raw_suggested_operations.length <= 0}
+                      onClick={() => applyMLOpsSuggestedOpsToStage2(row?.name, row?.raw_suggested_operations)}
+                    >
+                      Apply
+                    </Button>
+                  ),
+                },
               ]}
             />
           </div>
@@ -29268,7 +35310,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       rowKey={(row) => String((row as MLOpsStage2FieldConfig).field_path)}
                       dataSource={mlopsStage2EffectiveConfigRows}
                       pagination={{ pageSize: mlopsCompactView ? 12 : 18, showSizeChanger: false }}
-                      scroll={{ x: 1800 }}
+                      scroll={{ x: 2240 }}
                       columns={[
                         {
                           title: 'Field',
@@ -29318,7 +35360,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                               mode="multiple"
                               size="small"
                               value={row.cleaning || []}
-                              onChange={(values) => updateMLOpsStage2FieldConfig(String(row.field_path || ''), { cleaning: values as MLOpsStage2CleaningOperation[] })}
+                              onChange={(values) => updateMLOpsStage2FieldConfig(String(row.field_path || ''), {
+                                enabled: true,
+                                cleaning: values as MLOpsStage2CleaningOperation[],
+                              })}
                               options={MLOPS_STAGE2_CLEANING_OPTIONS}
                               style={{ width: '100%' }}
                               maxTagCount={1}
@@ -29336,7 +35381,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                               mode="multiple"
                               size="small"
                               value={row.missing_values || []}
-                              onChange={(values) => updateMLOpsStage2FieldConfig(String(row.field_path || ''), { missing_values: values as MLOpsStage2MissingOperation[] })}
+                              onChange={(values) => updateMLOpsStage2FieldConfig(String(row.field_path || ''), {
+                                enabled: true,
+                                missing_values: values as MLOpsStage2MissingOperation[],
+                              })}
                               options={MLOPS_STAGE2_MISSING_OPTIONS}
                               style={{ width: '100%' }}
                               maxTagCount={1}
@@ -29354,13 +35402,83 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                               mode="multiple"
                               size="small"
                               value={row.encoding || []}
-                              onChange={(values) => updateMLOpsStage2FieldConfig(String(row.field_path || ''), { encoding: values as MLOpsStage2EncodingOperation[] })}
+                              onChange={(values) => updateMLOpsStage2FieldConfig(String(row.field_path || ''), {
+                                enabled: true,
+                                encoding: values as MLOpsStage2EncodingOperation[],
+                              })}
                               options={MLOPS_STAGE2_ENCODING_OPTIONS}
                               style={{ width: '100%' }}
                               maxTagCount={1}
                               placeholder="Select"
                             />
                           ),
+                        },
+                        {
+                          title: 'Encoding Map',
+                          key: 'encoding_map',
+                          width: 440,
+                          render: (_: unknown, row: any) => {
+                            const cfg = createMLOpsStage2FieldConfig(row)
+                            const fieldPath = String(cfg.field_path || '').trim()
+                            const distinctValues = mlopsStage2DistinctValuesByField.get(fieldPath) || []
+                            const hasOrdinal = cfg.encoding.includes('ordinal_encoding')
+                            const hasBinary = cfg.encoding.includes('binary_encoding')
+                            const hasTarget = cfg.encoding.includes('target_encoding')
+                            if (!hasOrdinal && !hasBinary && !hasTarget) {
+                              return <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Select ordinal, binary, or target encoding.</Text>
+                            }
+                            return (
+                              <div style={{ display: 'grid', gap: 8 }}>
+                                {hasTarget ? (
+                                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 100px', gap: 6, alignItems: 'center' }}>
+                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                                      Target field: {mlopsStage2TargetFieldDraft || mlopsStage2LabelFieldDraft || 'select above'}
+                                    </Text>
+                                    <InputNumber
+                                      size="small"
+                                      min={0}
+                                      max={100000}
+                                      value={cfg.target_encoding_smoothing}
+                                      onChange={(value) => updateMLOpsStage2FieldConfig(fieldPath, {
+                                        target_encoding_smoothing: Number.isFinite(Number(value)) ? Number(value) : 10,
+                                      })}
+                                      placeholder="smooth"
+                                    />
+                                  </div>
+                                ) : null}
+                                {hasOrdinal || hasBinary ? (
+                                  <div style={{ maxHeight: 160, overflowY: 'auto', display: 'grid', gap: 4 }}>
+                                    {distinctValues.length > 0 ? distinctValues.map((value, idx) => {
+                                      const mapKey = hasOrdinal ? 'ordinal_mapping' : 'binary_mapping'
+                                      const mapping = (cfg as any)[mapKey] || {}
+                                      const fallback = hasOrdinal ? idx : (idx === 0 ? 0 : 1)
+                                      const currentValue = Number.isFinite(Number(mapping[value])) ? Number(mapping[value]) : fallback
+                                      return (
+                                        <div key={`${fieldPath}_${mapKey}_${value}`} style={{ display: 'grid', gridTemplateColumns: '1fr 88px', gap: 6, alignItems: 'center' }}>
+                                          <Tooltip title={value}>
+                                            <Text style={{ color: 'var(--app-text)', fontSize: 11, fontFamily: 'monospace' }} ellipsis>{value}</Text>
+                                          </Tooltip>
+                                          <InputNumber
+                                            size="small"
+                                            min={hasBinary ? 0 : undefined}
+                                            max={hasBinary ? 1 : undefined}
+                                            value={currentValue}
+                                            onChange={(nextValue) => {
+                                              const num = Number(nextValue)
+                                              const nextMap = { ...mapping, [value]: Number.isFinite(num) ? (hasBinary ? (num ? 1 : 0) : num) : fallback }
+                                              updateMLOpsStage2FieldConfig(fieldPath, { [mapKey]: nextMap } as Partial<MLOpsStage2FieldConfig>)
+                                            }}
+                                          />
+                                        </div>
+                                      )
+                                    }) : (
+                                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>No distinct values found in preview rows.</Text>
+                                    )}
+                                  </div>
+                                ) : null}
+                              </div>
+                            )
+                          },
                         },
                         {
                           title: 'Scaling & Transform',
@@ -29372,7 +35490,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                               mode="multiple"
                               size="small"
                               value={row.scaling || []}
-                              onChange={(values) => updateMLOpsStage2FieldConfig(String(row.field_path || ''), { scaling: values as MLOpsStage2ScalingOperation[] })}
+                              onChange={(values) => updateMLOpsStage2FieldConfig(String(row.field_path || ''), {
+                                enabled: true,
+                                scaling: values as MLOpsStage2ScalingOperation[],
+                              })}
                               options={MLOPS_STAGE2_SCALING_OPTIONS}
                               style={{ width: '100%' }}
                               maxTagCount={1}
@@ -29700,9 +35821,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                 <Select
                                   mode="multiple"
                                   size="small"
-                                  value={model.feature_fields}
+                                  value={pruneMLOpsStage3FeatureFields(model.feature_fields)}
                                   options={mlopsStage3EnsembleFeatureOptions}
-                                  onChange={(values) => updateMLOpsEnsembleModel(model.id, { feature_fields: uniqueFieldNames((values || []).map((item) => String(item || '').trim()).filter(Boolean)) })}
+                                  onChange={(values) => updateMLOpsEnsembleModel(model.id, { feature_fields: pruneMLOpsStage3FeatureFields(values) })}
                                   maxTagCount={4}
                                   style={{ width: '100%', marginTop: 4 }}
                                 />
@@ -30085,9 +36206,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                             <Select
                               mode="multiple"
                               size="small"
-                              value={selectedMLOpsEnsembleModel.feature_fields}
+                              value={pruneMLOpsStage3FeatureFields(selectedMLOpsEnsembleModel.feature_fields)}
                               options={mlopsStage3EnsembleFeatureOptions}
-                              onChange={(values) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { feature_fields: uniqueFieldNames((values || []).map((item) => String(item || '').trim()).filter(Boolean)) })}
+                              onChange={(values) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { feature_fields: pruneMLOpsStage3FeatureFields(values) })}
                               maxTagCount={6}
                               style={{ width: '100%', marginTop: 4 }}
                             />
@@ -32700,6 +38821,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     <Modal
       open={validationModalOpen}
       onCancel={() => setValidationModalOpen(false)}
+      zIndex={2800}
       footer={null}
       centered
       width="92vw"
@@ -32812,8 +38934,498 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           />
         </div>
       </Space>
-    </Modal>
-    {isLmdbSource && (
+	    </Modal>
+	    {canOpenFileViewerStudio && (
+	      <Modal
+	        open={fileViewerStudioOpen}
+	        onCancel={() => setFileViewerStudioOpen(false)}
+	        footer={null}
+	        closable={false}
+	        centered
+	        width="94vw"
+	        styles={{
+	          content: {
+	            padding: 0,
+	            borderRadius: 12,
+	            overflow: 'hidden',
+	            border: '1px solid var(--app-border-strong)',
+	            background: 'var(--app-panel-bg)',
+	            height: '94vh',
+	            display: 'flex',
+	            flexDirection: 'column',
+	          },
+	          body: { padding: 0, flex: 1, minHeight: 0 },
+	        }}
+	      >
+	        <div style={{ height: '100%', display: 'grid', gridTemplateRows: 'auto 1fr', minHeight: 0 }}>
+	          <div style={{ borderBottom: '1px solid var(--app-border-strong)', padding: '10px 12px', display: 'grid', gap: 8 }}>
+	            <Space style={{ width: '100%', justifyContent: 'space-between' }} align="center">
+	              <div>
+	                <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 15 }}>File View Studio</Text>
+	                <br />
+	                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+	                  Select pipeline files to open each view in a tab. File type is auto-detected and loaded immediately.
+	                </Text>
+	              </div>
+	              <Space>
+	                <Button size="small" loading={fileViewerLoading} onClick={() => {
+	                  void (activeFileViewerTab
+	                    ? loadFileViewerPreview({
+	                        path: activeFileViewerTab.path,
+	                        kind: activeFileViewerTab.kind,
+	                        label: activeFileViewerTab.label,
+	                        max_rows: effectiveFileViewerMaxRows,
+	                      })
+	                    : loadFileViewerPreview())
+	                }}>
+	                  Reload Active
+	                </Button>
+	                <Button size="small" onClick={resetFileViewerQuery}>
+	                  Reset Table
+	                </Button>
+	                <Button size="small" disabled={!activeFileViewerTab} onClick={() => downloadFileViewerRows('view')}>
+	                  Download View
+	                </Button>
+	                <Button size="small" disabled={!activeFileViewerTab} onClick={() => downloadFileViewerRows('all')}>
+	                  Download All
+	                </Button>
+	                <Button size="small" onClick={() => setFileViewerStudioOpen(false)}>
+	                  Close
+	                </Button>
+	              </Space>
+	            </Space>
+	          </div>
+	          <div style={{
+	            minHeight: 0,
+	            padding: 10,
+	            overflow: 'hidden',
+	            display: 'grid',
+	            gridTemplateColumns: fileViewerToolsCollapsed ? '44px minmax(0, 1fr)' : '292px minmax(0, 1fr)',
+	            gap: 10,
+	          }}>
+	            <div style={{
+	              minHeight: 0,
+	              overflowY: fileViewerToolsCollapsed ? 'hidden' : 'auto',
+	              overflowX: 'hidden',
+	              border: '1px solid var(--app-border)',
+	              borderRadius: 8,
+	              background: 'var(--app-card-bg)',
+	              padding: fileViewerToolsCollapsed ? 6 : 10,
+	              display: 'flex',
+	              flexDirection: 'column',
+	              gap: 8,
+	            }}>
+	              {fileViewerToolsCollapsed ? (
+	                <Button size="small" onClick={() => setFileViewerToolsCollapsed(false)} style={{ width: 30, paddingInline: 0 }}>
+	                  &gt;
+	                </Button>
+	              ) : (
+	                <>
+	                  <Space style={{ width: '100%', justifyContent: 'space-between' }} align="center">
+	                    <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 12 }}>Options</Text>
+	                    <Button size="small" onClick={() => setFileViewerToolsCollapsed(true)}>Hide</Button>
+	                  </Space>
+	              {nodeType === 'file_viewer' ? (
+	                <Select
+	                size="small"
+	                allowClear
+	                showSearch
+	                optionFilterProp="label"
+	                value={selectedFileViewerSourceNodeId}
+	                options={fileViewerNodeOptions.map((item) => ({ value: item.value, label: item.label }))}
+	                placeholder="Select CSV / Excel / JSON node"
+	                onChange={(value) => {
+	                  if (!selectedNodeId) return
+	                  const picked = fileViewerNodeOptions.find((item) => item.value === value)
+	                  updateNodeConfig(selectedNodeId, {
+	                    source_node_id: value || '',
+	                    file_path: picked?.path || '',
+	                    file_kind: picked?.kind || 'auto',
+	                    sheet: String(picked?.config?.sheet || nodeConfig.sheet || '0'),
+	                    json_path: String(picked?.config?.json_path || nodeConfig.json_path || ''),
+	                  })
+	                  if (picked?.path) {
+	                    void loadFileViewerPreview({
+	                      path: picked.path,
+	                      kind: picked.kind,
+	                      sheet: String(picked.config?.sheet || nodeConfig.sheet || '0'),
+	                      json_path: String(picked.config?.json_path || nodeConfig.json_path || ''),
+	                      max_rows: effectiveFileViewerMaxRows,
+	                      label: String(picked.label || picked.path.split('/').pop() || 'File'),
+	                      source_node_id: String(value || ''),
+	                    })
+	                  }
+	                }}
+	                />
+	              ) : (
+	                <Tooltip title={selectedFileViewerPath || ''}>
+	                  <Tag style={{ marginInlineEnd: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+	                    {String(getFileType(nodeType)).toUpperCase()} · {selectedFileViewerPath.split('/').pop() || 'file'}
+	                  </Tag>
+	                </Tooltip>
+	              )}
+	              {nodeType === 'file_viewer' ? (
+	                <Input
+	                  size="small"
+	                  value={selectedFileViewerPath}
+	                  placeholder="/path/file.csv, output.xlsx, data.json"
+	                  onChange={(e) => selectedNodeId && updateNodeConfig(selectedNodeId, { file_path: e.target.value })}
+	                  onPressEnter={() => void loadFileViewerPreview()}
+	                  style={commonInputStyle}
+	                />
+	              ) : null}
+	              <div style={{ display: 'grid', gridTemplateColumns: '1fr 96px', gap: 6 }}>
+	                <Select
+	                  size="small"
+	                  value={String(nodeConfig.file_kind || 'auto')}
+	                  disabled={isDirectFileViewerNode}
+	                  options={[
+	                    { value: 'auto', label: 'Auto' },
+	                    { value: 'csv', label: 'CSV' },
+	                    { value: 'excel', label: 'Excel' },
+	                    { value: 'json', label: 'JSON' },
+	                  ]}
+	                  onChange={(value) => selectedNodeId && updateNodeConfig(selectedNodeId, { file_kind: value })}
+	                />
+	                <InputNumber
+	                  size="small"
+	                  min={1}
+	                  max={200000}
+	                  value={effectiveFileViewerMaxRows}
+	                  onChange={(value) => selectedNodeId && updateNodeConfig(selectedNodeId, { max_rows: Number(value || 1000) })}
+	                  style={{ width: '100%' }}
+	                />
+	              </div>
+	              {nodeType === 'file_viewer' ? (
+	                <>
+	                  <input
+	                    ref={fileViewerBrowseInputRef}
+	                    type="file"
+	                    accept=".csv,.tsv,.xlsx,.xls,.json"
+	                    style={{ display: 'none' }}
+	                    onChange={browseFileViewerFile}
+	                  />
+	                  <Button
+	                    size="small"
+	                    block
+	                    loading={fileViewerBrowseUploading}
+	                    onClick={() => fileViewerBrowseInputRef.current?.click()}
+	                  >
+	                    Browse Any File
+	                  </Button>
+	                </>
+	              ) : null}
+	              <Input
+	                size="small"
+	                value={String(nodeConfig.sheet || '0')}
+	                placeholder="Excel sheet"
+	                disabled={selectedFileViewerKind !== 'excel'}
+	                onChange={(e) => selectedNodeId && updateNodeConfig(selectedNodeId, { sheet: e.target.value })}
+	                style={commonInputStyle}
+	              />
+	              <Input
+	                size="small"
+	                value={String(nodeConfig.json_path || '')}
+	                placeholder="JSON path, e.g. data.records"
+	                disabled={selectedFileViewerKind !== 'json'}
+	                onChange={(e) => selectedNodeId && updateNodeConfig(selectedNodeId, { json_path: e.target.value })}
+	                style={commonInputStyle}
+	              />
+	              <Divider style={{ margin: '2px 0', borderColor: 'var(--app-border)' }} />
+	              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, fontWeight: 700 }}>Filter Complete Source</Text>
+	              <Input.Search
+	                size="small"
+	                allowClear
+	                value={fileViewerSearchText}
+	                placeholder="Search complete loaded data"
+	                onChange={(e) => setFileViewerSearchText(e.target.value)}
+	                onSearch={applyFileViewerSourceQuery}
+	              />
+	              <div style={{ display: 'grid', gridTemplateColumns: '1fr 92px', gap: 6 }}>
+	              <Select
+	                size="small"
+	                allowClear
+	                showSearch
+	                optionFilterProp="label"
+	                value={fileViewerFilterField || undefined}
+	                options={fileViewerFieldOptions}
+	                placeholder="Filter field"
+	                onChange={(value) => setFileViewerFilterField(String(value || ''))}
+	              />
+	              <Select
+	                size="small"
+	                value={fileViewerFilterOperator}
+	                options={[
+	                  { value: 'contains', label: 'contains' },
+	                  { value: 'equals', label: '=' },
+	                  { value: 'starts_with', label: 'starts' },
+	                  { value: 'ends_with', label: 'ends' },
+	                  { value: 'not_empty', label: 'not empty' },
+	                  { value: 'empty', label: 'empty' },
+	                ]}
+	                onChange={setFileViewerFilterOperator}
+	              />
+	              </div>
+	              <Input
+	                size="small"
+	                value={fileViewerFilterValue}
+	                placeholder="Filter value"
+	                disabled={fileViewerFilterOperator === 'empty' || fileViewerFilterOperator === 'not_empty'}
+	                onChange={(e) => setFileViewerFilterValue(e.target.value)}
+	                onPressEnter={() => {
+	                  if (!fileViewerFilterField) return
+	                  setFileViewerFilters((prev) => [...prev, { field: fileViewerFilterField, operator: fileViewerFilterOperator, value: fileViewerFilterValue }])
+	                  setFileViewerFilterValue('')
+	                }}
+	                style={commonInputStyle}
+	              />
+	              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6 }}>
+	              <Button
+	                size="small"
+	                disabled={!fileViewerFilterField}
+	                onClick={() => {
+	                  setFileViewerFilters((prev) => [...prev, { field: fileViewerFilterField, operator: fileViewerFilterOperator, value: fileViewerFilterValue }])
+	                  setFileViewerFilterValue('')
+	                }}
+	              >
+	                Add Filter
+	              </Button>
+	              <Button size="small" loading={fileViewerLoading} onClick={applyFileViewerSourceQuery}>
+	                Apply
+	              </Button>
+	              <Button size="small" onClick={resetFileViewerQuery}>
+	                Reset
+	              </Button>
+	              </div>
+	              <Divider style={{ margin: '2px 0', borderColor: 'var(--app-border)' }} />
+	              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, fontWeight: 700 }}>Columns</Text>
+	              <Select
+	                size="small"
+	                mode="multiple"
+	                allowClear
+	                maxTagCount={2}
+	                optionFilterProp="label"
+	                value={fileViewerVisibleFields}
+	                options={fileViewerFieldOptions}
+	                placeholder="Visible fields (blank = all)"
+	                onChange={(values) => setFileViewerVisibleFields(values.map((value) => String(value)))}
+	              />
+	              <div style={{ maxHeight: 190, overflowY: 'auto', border: '1px solid var(--app-border)', borderRadius: 6, padding: 4, display: 'grid', gap: 4 }}>
+	                {activeFileViewerDisplayColumns.slice(0, 80).map((column, index) => (
+	                  <div key={`viewer_col_order_${column}`} style={{ display: 'grid', gridTemplateColumns: '1fr 28px 28px 44px', gap: 4, alignItems: 'center' }}>
+	                    <Tooltip title={column}>
+	                      <Text style={{ color: 'var(--app-text)', fontSize: 11 }} ellipsis>{index + 1}. {column}</Text>
+	                    </Tooltip>
+	                    <Button size="small" disabled={index <= 0} onClick={() => {
+	                      setFileViewerColumnOrder((prev) => {
+	                        const order = prev.length > 0 ? [...prev] : [...activeFileViewerBaseColumns]
+	                        const idx = order.indexOf(column)
+	                        if (idx <= 0) return prev
+	                        ;[order[idx - 1], order[idx]] = [order[idx], order[idx - 1]]
+	                        return order
+	                      })
+	                    }}>↑</Button>
+	                    <Button size="small" disabled={index >= activeFileViewerDisplayColumns.length - 1} onClick={() => {
+	                      setFileViewerColumnOrder((prev) => {
+	                        const order = prev.length > 0 ? [...prev] : [...activeFileViewerBaseColumns]
+	                        const idx = order.indexOf(column)
+	                        if (idx < 0 || idx >= order.length - 1) return prev
+	                        ;[order[idx + 1], order[idx]] = [order[idx], order[idx + 1]]
+	                        return order
+	                      })
+	                    }}>↓</Button>
+	                    <Button size="small" onClick={() => {
+	                      setFileViewerVisibleFields((prev) => {
+	                        const current = prev.length > 0 ? prev : activeFileViewerBaseColumns
+	                        return current.filter((item) => item !== column)
+	                      })
+	                    }}>
+	                      Hide
+	                    </Button>
+	                  </div>
+	                ))}
+	                {activeFileViewerDisplayColumns.length > 80 ? (
+	                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Showing first 80 columns.</Text>
+	                ) : null}
+	              </div>
+	              <Space size={6} wrap>
+	                <Button size="small" onClick={() => setFileViewerVisibleFields([])}>All Fields</Button>
+	                <Button size="small" onClick={() => setFileViewerColumnOrder(activeFileViewerBaseColumns)}>Reset Order</Button>
+	              </Space>
+	              <Divider style={{ margin: '2px 0', borderColor: 'var(--app-border)' }} />
+	              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, fontWeight: 700 }}>View</Text>
+	              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+	                <Button size="small" type={fileViewerDatasetView === 'data' ? 'primary' : 'default'} onClick={() => setFileViewerDatasetView('data')}>
+	                  Data
+	                </Button>
+	                <Button size="small" type={fileViewerDatasetView === 'summary' ? 'primary' : 'default'} onClick={() => setFileViewerDatasetView('summary')}>
+	                  Summary
+	                </Button>
+	              </div>
+	            {(fileViewerFilters.length > 0 || fileViewerSearchText || fileViewerSortBy) ? (
+	              <Space size={6} wrap>
+	                {fileViewerSearchText ? <Tag style={{ marginInlineEnd: 0 }}>search: {fileViewerSearchText}</Tag> : null}
+	                {fileViewerFilters.map((filter, idx) => (
+	                  <Tag
+	                    key={`${filter.field}_${idx}`}
+	                    closable
+	                    onClose={() => setFileViewerFilters((prev) => prev.filter((_item, itemIdx) => itemIdx !== idx))}
+	                    style={{ marginInlineEnd: 0 }}
+	                  >
+	                    {filter.field} {filter.operator} {filter.value}
+	                  </Tag>
+	                ))}
+	                {fileViewerSortBy ? <Tag style={{ marginInlineEnd: 0 }}>sort: {fileViewerSortBy} {fileViewerSortDir}</Tag> : null}
+	                <Button size="small" onClick={resetFileViewerQuery}>
+	                  Clear
+	                </Button>
+	              </Space>
+	            ) : null}
+	                </>
+	              )}
+	            </div>
+	            <div style={{ minHeight: 0, overflow: 'hidden', display: 'grid', gridTemplateRows: 'auto 1fr', gap: 8 }}>
+	            <div style={{
+	              border: '1px solid var(--app-border)',
+	              borderRadius: 6,
+	              background: 'var(--app-card-bg)',
+	              padding: '7px 8px',
+	              display: 'flex',
+	              alignItems: 'center',
+	              gap: 6,
+	              flexWrap: 'wrap',
+	              minWidth: 0,
+	            }}>
+	              <Tooltip title={activeFileViewerSummary.fullPath || activeFileViewerSummary.fileName || '-'}>
+	                <Tag style={{ marginInlineEnd: 0 }}>file: {activeFileViewerSummary.fileName || '-'}</Tag>
+	              </Tooltip>
+	              <Tag style={{ marginInlineEnd: 0 }}>type: {String(activeFileViewerSummary.kind || '-').toUpperCase()}</Tag>
+	              <Tag style={{ marginInlineEnd: 0 }}>rows: {activeFileViewerSummary.rowCount.toLocaleString()}</Tag>
+	              <Tag style={{ marginInlineEnd: 0 }}>loaded: {activeFileViewerSummary.loadedRows.toLocaleString()}</Tag>
+	              <Tag style={{ marginInlineEnd: 0 }}>columns: {activeFileViewerSummary.columns.toLocaleString()}</Tag>
+	              <Tag style={{ marginInlineEnd: 0 }}>numeric: {activeFileViewerSummary.numericColumns.toLocaleString()}</Tag>
+	              <Tag style={{ marginInlineEnd: 0 }}>empty cells: {activeFileViewerSummary.emptyCells.toLocaleString()}</Tag>
+	              {activeFileViewerSummary.selectedCell ? (
+	                <Tooltip title={String(activeFileViewerSummary.selectedCell.value ?? '')}>
+	                  <Tag color="blue" style={{ marginInlineEnd: 0, maxWidth: 420, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+	                    cell: R{activeFileViewerSummary.selectedCell.rowIndex + 1} / {activeFileViewerSummary.selectedCell.column} = {String(activeFileViewerSummary.selectedCell.value ?? '')}
+	                  </Tag>
+	                </Tooltip>
+	              ) : null}
+	            </div>
+	            {fileViewerTabs.length <= 0 ? (
+	              <div style={{ height: '100%', border: '1px dashed var(--app-border-strong)', borderRadius: 8, display: 'grid', placeItems: 'center' }}>
+	                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Select an active file node to open a file tab.</Text>
+	              </div>
+	            ) : (
+	              <Tabs
+	                type="editable-card"
+	                hideAdd
+	                activeKey={activeFileViewerTab?.key}
+	                onChange={setFileViewerActiveTabKey}
+	                onEdit={(targetKey, action) => {
+	                  if (action !== 'remove') return
+	                  const key = String(targetKey || '')
+	                  setFileViewerTabs((prev) => {
+	                    const next = prev.filter((tab) => tab.key !== key)
+	                    if (fileViewerActiveTabKey === key) setFileViewerActiveTabKey(next[0]?.key || '')
+	                    return next
+	                  })
+	                }}
+	                style={{ height: '100%', minWidth: 0, overflow: 'hidden' }}
+	                tabBarStyle={{ marginBottom: 8 }}
+	                items={fileViewerTabs.map((tab) => ({
+	                  key: tab.key,
+	                  label: `${tab.label} · ${tab.kind.toUpperCase()}`,
+	                  children: (
+	                    <div style={{ height: 'calc(94vh - 310px)', minHeight: 0, minWidth: 0, overflow: 'hidden', display: 'grid', gridTemplateRows: 'auto 1fr', gap: 8 }}>
+	                      <Space size={6} wrap>
+	                        <Tag style={{ marginInlineEnd: 0 }}>rows: {Number(tab.meta?.row_count || tab.rows.length || 0).toLocaleString()}</Tag>
+	                        <Tag style={{ marginInlineEnd: 0 }}>columns: {tab.columns.length.toLocaleString()}</Tag>
+	                        {tab.meta?.has_more ? <Tag color="gold" style={{ marginInlineEnd: 0 }}>sample limited</Tag> : null}
+	                        {tab.loading ? <Tag color="processing" style={{ marginInlineEnd: 0 }}>loading</Tag> : null}
+	                        <Tooltip title={tab.path}>
+	                          <Tag style={{ marginInlineEnd: 0, maxWidth: 360, overflow: 'hidden', textOverflow: 'ellipsis' }}>{tab.path.split('/').pop() || tab.path}</Tag>
+	                        </Tooltip>
+	                      </Space>
+	                      {tab.error ? (
+	                        <div style={{ border: '1px solid #ef444440', background: '#ef444414', borderRadius: 8, padding: 10 }}>
+	                          <Text style={{ color: '#ef4444', fontSize: 12 }}>{tab.error}</Text>
+	                        </div>
+	                      ) : fileViewerDatasetView === 'summary' ? (
+	                        <Table
+	                          key={`summary_${fileViewerTableResetKey}`}
+	                          size="small"
+	                          bordered
+	                          tableLayout="fixed"
+	                          style={{ width: '100%', minWidth: 0 }}
+	                          pagination={{ pageSize: 50, size: 'small', showSizeChanger: false }}
+	                          rowKey={(row) => String((row as any).column || '')}
+	                          dataSource={activeFileViewerProfileRows}
+	                          columns={activeFileViewerProfileColumns as any[]}
+	                          scroll={{ x: 1000, y: 'calc(94vh - 420px)' }}
+	                          loading={tab.loading}
+	                          onChange={(_pagination, _filters, _sorter, extra) => {
+	                            setFileViewerVisibleTableRows((extra.currentDataSource || []) as Record<string, unknown>[])
+	                          }}
+	                          locale={{ emptyText: tab.loading ? 'Loading file...' : 'No summary available' }}
+	                        />
+	                      ) : tab.kind === 'json' ? (
+	                        <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, overflow: 'hidden', minHeight: 0, minWidth: 0 }}>
+	                          <Editor
+	                            height="100%"
+	                            language="json"
+	                            value={jsonViewerText(tab.rows, [])}
+	                            theme="vs-dark"
+	                            options={{
+	                              readOnly: true,
+	                              minimap: { enabled: false },
+	                              fontSize: 11,
+	                              lineNumbers: 'off',
+	                              scrollBeyondLastLine: false,
+	                              wordWrap: 'on',
+	                              folding: true,
+	                              padding: { top: 8, bottom: 8 },
+	                            }}
+	                          />
+	                        </div>
+	                      ) : (
+	                        <Table
+	                          key={`data_${tab.key}_${fileViewerTableResetKey}`}
+	                          size="small"
+	                          bordered
+	                          tableLayout="fixed"
+	                          style={{ width: '100%', minWidth: 0 }}
+	                          pagination={{ pageSize: 40, size: 'small', showSizeChanger: false }}
+	                          rowKey={(_row, idx) => `${tab.key}_row_${idx}`}
+	                          dataSource={tab.rows}
+	                          columns={(tab.key === activeFileViewerTab?.key ? activeFileViewerGridColumns : activeFileViewerDisplayColumns.slice(0, 180).map((key) => ({
+	                            title: key,
+	                            dataIndex: key,
+	                            key,
+	                            width: 160,
+	                            ellipsis: true,
+	                            sorter: (a: Record<string, unknown>, b: Record<string, unknown>) => String(a?.[key] ?? '').localeCompare(String(b?.[key] ?? ''), undefined, { numeric: true }),
+	                          }))) as any[]}
+	                          scroll={{ x: Math.max(1100, (activeFileViewerDisplayColumns.length || 1) * 160), y: 'calc(94vh - 420px)' }}
+	                          loading={tab.loading}
+	                          onChange={(_pagination, _filters, _sorter, extra) => {
+	                            setFileViewerVisibleTableRows((extra.currentDataSource || []) as Record<string, unknown>[])
+	                          }}
+	                          locale={{ emptyText: tab.loading ? 'Loading file...' : 'No rows in this file sample' }}
+	                        />
+	                      )}
+	                    </div>
+	                  ),
+	                }))}
+	              />
+	            )}
+	          </div>
+	        </div>
+	        </div>
+	      </Modal>
+	    )}
+	    {isLmdbSource && (
       <Modal
         open={lmdbStudioOpen}
         onCancel={() => setLmdbStudioOpen(false)}
@@ -33777,6 +40389,27 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         </Space>
       </Modal>
     )}
+    {nodeType === 'business_workflow' && (
+      <BLWStudio
+        open={blwStudioOpen}
+        nodeLabel={String(data?.label || definition?.label || 'Business Logic Workflow')}
+        config={nodeConfig}
+        upstreamInputFields={businessWorkflowUpstreamInputFields}
+        upstreamPreviewRows={businessWorkflowUpstreamPreviewRows as Record<string, unknown>[]}
+        onClose={() => setBlwStudioOpen(false)}
+        onOpenChildCanvas={() => {
+          if (!activePipelineId || !selectedNodeId || typeof window === 'undefined') return
+          window.dispatchEvent(new CustomEvent('pipeline:open-business-canvas-tab', {
+            detail: {
+              pipelineId: String(activePipelineId || ''),
+              nodeId: String(selectedNodeId || ''),
+            },
+          }))
+        }}
+        onSave={saveBlwStudioConfig}
+      />
+    )}
+
     {nodeType === 'oracle_destination' && (
       <Modal
         open={oracleStudioOpen}

@@ -147,7 +147,27 @@
       }
     },
     "dd819f1c-1875-4fae-925f-110d69b3acf8": {
-      "incremental_checkpoints": {}
+      "incremental_checkpoints": {},
+      "cursor_processor_state": {
+        "89bcf357-362c-46cd-b62d-99504a31770e": {
+          "last_cursor": "UBI4000395",
+          "dedupe_map": {},
+          "stats": {
+            "accepted": 4,
+            "dropped_old": 13,
+            "dropped_late": 0,
+            "dropped_duplicate": 0,
+            "missing_cursor": 0,
+            "late_kept": 0,
+            "input_rows": 17,
+            "output_rows": 4,
+            "cursor_field": "AGENTCODE",
+            "dedupe_field": "",
+            "allowed_lateness_seconds": 0.0,
+            "processing_mode": "row_by_row"
+          }
+        }
+      }
     },
     "3490a877-4e7f-488b-8240-4267dc1301e1": {
       "incremental_checkpoints": {}

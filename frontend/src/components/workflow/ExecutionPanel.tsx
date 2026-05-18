@@ -1,4 +1,5 @@
-import { useRef, useEffect, useState, useMemo } from 'react'
+import { useRef, useEffect, useState, useMemo, useCallback } from 'react'
+import type { MouseEvent as ReactMouseEvent } from 'react'
 import { Typography, Space, Tag, Button, Alert } from 'antd'
 import {
   CloseOutlined, LoadingOutlined, CheckCircleFilled, CloseCircleFilled,
@@ -11,7 +12,25 @@ import { destDirHandles, destFilenames } from './FilePicker'
 
 const { Text } = Typography
 
-export default function ExecutionPanel() {
+const runColor = 'var(--app-accent)'
+const runBg = 'var(--app-accent-soft)'
+const runBorder = 'var(--app-accent-border)'
+const successColor = '#89d185'
+const successBg = 'rgba(137, 209, 133, 0.14)'
+const successBorder = 'rgba(137, 209, 133, 0.34)'
+const errorColor = '#f48771'
+const errorBg = 'rgba(244, 135, 113, 0.14)'
+const errorBorder = 'rgba(244, 135, 113, 0.4)'
+const warningColor = '#d7ba7d'
+const warningBg = 'rgba(215, 186, 125, 0.12)'
+const warningBorder = 'rgba(215, 186, 125, 0.34)'
+
+interface ExecutionPanelProps {
+  height?: number
+  onHeightChange?: (height: number) => void
+}
+
+export default function ExecutionPanel({ height, onHeightChange }: ExecutionPanelProps) {
   const {
     executionLogs,
     isExecuting,
@@ -22,6 +41,7 @@ export default function ExecutionPanel() {
     nodes,
   } = useWorkflowStore()
   const bottomRef = useRef<HTMLDivElement>(null)
+  const resizeStartRef = useRef<{ startY: number; startHeight: number } | null>(null)
   const [localWriteStatus, setLocalWriteStatus] = useState<Record<string, 'writing' | 'done' | 'error'>>({})
 
   useEffect(() => {
@@ -89,9 +109,32 @@ export default function ExecutionPanel() {
     })
   }, [isSuccess, outputFiles, nodes, nodeOutputPathById])
 
-  if (!showLogs) return null
+  const naturalPanelHeight = isOfflineError ? 148 : outputFiles.length > 0 ? 268 : 240
+  const panelHeight = height ?? naturalPanelHeight
 
-  const panelHeight = isOfflineError ? 148 : outputFiles.length > 0 ? 268 : 240
+  const startResize = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    if (!onHeightChange) return
+    event.preventDefault()
+    resizeStartRef.current = { startY: event.clientY, startHeight: panelHeight }
+
+    const handleMove = (moveEvent: MouseEvent) => {
+      const start = resizeStartRef.current
+      if (!start) return
+      const nextHeight = Math.max(120, Math.min(520, start.startHeight + (start.startY - moveEvent.clientY)))
+      onHeightChange(nextHeight)
+    }
+
+    const handleUp = () => {
+      resizeStartRef.current = null
+      window.removeEventListener('mousemove', handleMove)
+      window.removeEventListener('mouseup', handleUp)
+    }
+
+    window.addEventListener('mousemove', handleMove)
+    window.addEventListener('mouseup', handleUp)
+  }, [onHeightChange, panelHeight])
+
+  if (!showLogs) return null
 
   return (
     <div style={{
@@ -102,7 +145,34 @@ export default function ExecutionPanel() {
       flexDirection: 'column',
       transition: 'height 0.2s',
       flexShrink: 0,
+      position: 'relative',
     }}>
+      {onHeightChange ? (
+        <div
+          role="separator"
+          aria-label="Resize execution output"
+          title="Drag to resize Execution Output"
+          onMouseDown={startResize}
+          style={{
+            position: 'absolute',
+            top: -4,
+            left: 0,
+            right: 0,
+            height: 8,
+            cursor: 'ns-resize',
+            zIndex: 2,
+          }}
+        >
+          <div style={{
+            width: 48,
+            height: 3,
+            borderRadius: 999,
+            background: 'var(--app-border-strong)',
+            margin: '2px auto 0',
+            opacity: 0.85,
+          }} />
+        </div>
+      ) : null}
 
       {/* ── Header row ───────────────────────────────────────────────────────── */}
       <div style={{
@@ -117,11 +187,11 @@ export default function ExecutionPanel() {
       }}>
         <Space size={6} style={{ flexWrap: 'nowrap', overflow: 'hidden' }}>
           {isExecuting
-            ? <LoadingOutlined spin style={{ color: '#6366f1', fontSize: 12, flexShrink: 0 }} />
+            ? <LoadingOutlined spin style={{ color: runColor, fontSize: 12, flexShrink: 0 }} />
             : isSuccess
-              ? <CheckCircleFilled style={{ color: '#22c55e', fontSize: 12, flexShrink: 0 }} />
+              ? <CheckCircleFilled style={{ color: successColor, fontSize: 12, flexShrink: 0 }} />
               : hasError
-                ? <CloseCircleFilled style={{ color: '#ef4444', fontSize: 12, flexShrink: 0 }} />
+                ? <CloseCircleFilled style={{ color: errorColor, fontSize: 12, flexShrink: 0 }} />
                 : null}
 
           <Text style={{ color: 'var(--app-text-muted)', fontSize: 12, fontWeight: 600, whiteSpace: 'nowrap', flexShrink: 0 }}>
@@ -129,12 +199,12 @@ export default function ExecutionPanel() {
           </Text>
 
           {isSuccess && (
-            <Tag style={{ background: '#22c55e15', border: '1px solid #22c55e30', color: '#22c55e', borderRadius: 4, fontSize: 11, flexShrink: 0, margin: 0 }}>
+            <Tag style={{ background: successBg, border: `1px solid ${successBorder}`, color: successColor, borderRadius: 4, fontSize: 11, flexShrink: 0, margin: 0 }}>
               SUCCESS · {totalRows.toLocaleString()} rows
             </Tag>
           )}
           {hasError && !isOfflineError && (
-            <Tag style={{ background: '#ef444415', border: '1px solid #ef444430', color: '#ef4444', borderRadius: 4, fontSize: 11, flexShrink: 0, margin: 0 }}>
+            <Tag style={{ background: errorBg, border: `1px solid ${errorBorder}`, color: errorColor, borderRadius: 4, fontSize: 11, flexShrink: 0, margin: 0 }}>
               FAILED
             </Tag>
           )}
@@ -185,9 +255,27 @@ export default function ExecutionPanel() {
 
             if (folderName) {
               // Local folder write mode
-              const color  = writeStatus === 'done' ? '#22c55e' : writeStatus === 'error' ? '#ef4444' : writeStatus === 'writing' ? '#6366f1' : '#f59e0b'
-              const bgCol  = color + '15'
-              const border = `1px solid ${color}40`
+              const color = writeStatus === 'done'
+                ? successColor
+                : writeStatus === 'error'
+                  ? errorColor
+                  : writeStatus === 'writing'
+                    ? runColor
+                    : warningColor
+              const bgCol = writeStatus === 'done'
+                ? successBg
+                : writeStatus === 'error'
+                  ? errorBg
+                  : writeStatus === 'writing'
+                    ? runBg
+                    : warningBg
+              const border = writeStatus === 'done'
+                ? `1px solid ${successBorder}`
+                : writeStatus === 'error'
+                  ? `1px solid ${errorBorder}`
+                  : writeStatus === 'writing'
+                    ? `1px solid ${runBorder}`
+                    : `1px solid ${warningBorder}`
               return (
                 <Tag key={i} style={{ background: bgCol, border, color, borderRadius: 4, fontSize: 11, margin: 0 }}>
                   {writeStatus === 'writing' && <LoadingOutlined spin style={{ marginRight: 5 }} />}
@@ -210,7 +298,7 @@ export default function ExecutionPanel() {
                 key={i}
                 size="small"
                 icon={<DownloadOutlined />}
-                style={{ background: '#6366f115', border: '1px solid #6366f130', color: '#6366f1', fontSize: 11, height: 22 }}
+                style={{ background: runBg, border: `1px solid ${runBorder}`, color: runColor, fontSize: 11, height: 22 }}
                 onClick={() => api.downloadOutputFile(path)}
               >
                 {filename.length > 30 ? filename.slice(0, 28) + '…' : filename}
@@ -233,8 +321,8 @@ export default function ExecutionPanel() {
                   Real ETL operations require the Python backend. Start it with:
                 </Text>
                 <div style={{
-                  background: '#0a0a10', border: '1px solid var(--app-border-strong)', borderRadius: 6,
-                  padding: '6px 12px', fontFamily: 'monospace', fontSize: 12, color: '#22c55e',
+                  background: 'var(--app-shell-bg-2)', border: '1px solid var(--app-border-strong)', borderRadius: 6,
+                  padding: '6px 12px', fontFamily: 'monospace', fontSize: 12, color: successColor,
                   display: 'inline-block',
                 }}>
                   <CodeOutlined style={{ marginRight: 8 }} />
@@ -242,7 +330,7 @@ export default function ExecutionPanel() {
                 </div>
               </Space>
             }
-            style={{ background: '#f59e0b08', border: '1px solid #f59e0b30', borderRadius: 8 }}
+            style={{ background: warningBg, border: `1px solid ${warningBorder}`, borderRadius: 8 }}
           />
         </div>
 
@@ -251,7 +339,7 @@ export default function ExecutionPanel() {
         <div style={{ flex: 1, overflowY: 'auto', padding: '4px 0', fontFamily: 'monospace', fontSize: 12 }}>
           {executionLogs.length === 0 && isExecuting && (
             <div style={{ padding: '10px 16px' }}>
-              <LoadingOutlined spin style={{ marginRight: 8, color: '#6366f1' }} />
+              <LoadingOutlined spin style={{ marginRight: 8, color: runColor }} />
               <span style={{ color: 'var(--app-text-dim)' }}>Connecting to ETL engine…</span>
             </div>
           )}
@@ -265,8 +353,8 @@ export default function ExecutionPanel() {
                 alignItems: 'baseline',
                 gap: 8,
                 borderLeft: `2px solid ${
-                  log.status === 'error'   ? '#ef444450' :
-                  log.status === 'success' ? '#22c55e40' : '#6366f140'
+                  log.status === 'error'   ? errorBorder :
+                  log.status === 'success' ? successBorder : runBorder
                 }`,
                 marginLeft: 8,
                 marginBottom: 1,
@@ -277,15 +365,15 @@ export default function ExecutionPanel() {
               </span>
               <span style={{
                 flexShrink: 0, width: 14,
-                color: log.status === 'error' ? '#ef4444' : log.status === 'success' ? '#22c55e' : '#6366f1',
+                color: log.status === 'error' ? errorColor : log.status === 'success' ? successColor : runColor,
               }}>
                 {log.status === 'success' ? '✓' : log.status === 'error' ? '✗' : '⟳'}
               </span>
-              <span style={{ color: log.status === 'error' ? '#fca5a5' : 'var(--app-text-muted)', flex: 1, wordBreak: 'break-all' }}>
+              <span style={{ color: log.status === 'error' ? '#ffb4a8' : 'var(--app-text-muted)', flex: 1, wordBreak: 'break-all' }}>
                 {log.message}
               </span>
               {log.rows > 0 && (
-                <span style={{ color: '#6366f1', fontSize: 11, flexShrink: 0 }}>
+                <span style={{ color: runColor, fontSize: 11, flexShrink: 0 }}>
                   {log.rows.toLocaleString()} rows
                 </span>
               )}
@@ -301,16 +389,16 @@ export default function ExecutionPanel() {
               color: 'var(--app-text-faint)',
               fontSize: 11,
             }}>
-              Total rows processed: <span style={{ color: '#22c55e' }}>{totalRows.toLocaleString()}</span>
-              &nbsp;·&nbsp; Nodes completed: <span style={{ color: '#6366f1' }}>
+              Total rows processed: <span style={{ color: successColor }}>{totalRows.toLocaleString()}</span>
+              &nbsp;·&nbsp; Nodes completed: <span style={{ color: runColor }}>
                 {executionLogs.filter(l => l.status === 'success').length}
               </span>
               {outputFiles.length > 0 && (
                 <span>
                   &nbsp;·&nbsp;
                   {Object.values(localWriteStatus).some(s => s === 'done')
-                    ? <span style={{ color: '#22c55e' }}>✓ saved to local folder</span>
-                    : <span style={{ color: '#f59e0b' }}>{outputFiles.length} file{outputFiles.length > 1 ? 's' : ''} on server (↑ click to download)</span>
+                    ? <span style={{ color: successColor }}>✓ saved to local folder</span>
+                    : <span style={{ color: warningColor }}>{outputFiles.length} file{outputFiles.length > 1 ? 's' : ''} on server (↑ click to download)</span>
                   }
                 </span>
               )}

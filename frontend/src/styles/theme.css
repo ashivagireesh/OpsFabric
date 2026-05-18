@@ -23,6 +23,14 @@
   --app-ruler-tick: #475569;
   --app-ruler-major: #94a3b8;
   --app-ruler-text: #cbd5e1;
+  --app-accent: #6366f1;
+  --app-accent-strong: #8b5cf6;
+  --app-accent-soft: #6366f115;
+  --app-accent-soft-strong: #6366f11a;
+  --app-accent-border: #6366f130;
+  --app-accent-border-strong: #6366f155;
+  --app-accent-text-soft: #a5b4fc;
+  --app-accent-gradient: linear-gradient(135deg, #6366f1, #a855f7);
 }
 
 :root[data-app-theme='light'] {
@@ -48,11 +56,240 @@
   --app-ruler-tick: #94a3b8;
   --app-ruler-major: #475569;
   --app-ruler-text: #334155;
+  --app-accent: #4f46e5;
+  --app-accent-strong: #7c3aed;
+  --app-accent-soft: rgba(79, 70, 229, 0.1);
+  --app-accent-soft-strong: rgba(79, 70, 229, 0.14);
+  --app-accent-border: rgba(79, 70, 229, 0.24);
+  --app-accent-border-strong: rgba(79, 70, 229, 0.34);
+  --app-accent-text-soft: #4338ca;
+  --app-accent-gradient: linear-gradient(135deg, #4f46e5, #7c3aed);
+}
+
+:root[data-app-theme='enterprise-dark'] {
+  --app-shell-bg: #0e0e0e;
+  --app-shell-bg-2: #080808;
+  --app-panel-bg: #181818;
+  --app-panel-2: #111111;
+  --app-card-bg: #1f1f1f;
+  --app-input-bg: #151515;
+  --app-border: #2b2b2b;
+  --app-border-strong: #3c3c3c;
+  --app-text: #d4d4d4;
+  --app-text-muted: #b5b5b5;
+  --app-text-subtle: #8c8c8c;
+  --app-text-dim: #6a6a6a;
+  --app-text-faint: #4f4f4f;
+  --app-shell-overlay: rgba(14, 14, 14, 0.72);
+  --app-border-soft-a: rgba(60, 60, 60, 0.12);
+  --app-border-soft-b: rgba(60, 60, 60, 0.2);
+  --app-canvas-dot: rgba(133, 133, 133, 0.34);
+  --app-ruler-bg: #111111;
+  --app-ruler-border: #3c3c3c;
+  --app-ruler-tick: #6a6a6a;
+  --app-ruler-major: #b5b5b5;
+  --app-ruler-text: #d4d4d4;
+  --app-accent: #007acc;
+  --app-accent-strong: #3794ff;
+  --app-accent-soft: rgba(0, 122, 204, 0.16);
+  --app-accent-soft-strong: rgba(0, 122, 204, 0.22);
+  --app-accent-border: rgba(0, 122, 204, 0.34);
+  --app-accent-border-strong: rgba(55, 148, 255, 0.44);
+  --app-accent-text-soft: #9cdcfe;
+  --app-accent-gradient: linear-gradient(135deg, #007acc, #3794ff);
 }
 
 body {
   background: var(--app-shell-bg);
   color: var(--app-text);
+}
+
+html {
+  width: 100%;
+  height: 100%;
+  background: var(--app-shell-bg);
+}
+
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+
+#root {
+  width: 100%;
+  height: 100%;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-btn-primary {
+  background: var(--app-accent) !important;
+  border-color: var(--app-accent) !important;
+  color: #ffffff !important;
+  box-shadow: none !important;
+  font-weight: 600;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-btn-primary:not(:disabled):not(.ant-btn-disabled):hover,
+:root[data-app-theme='enterprise-dark'] .ant-btn-primary:not(:disabled):not(.ant-btn-disabled):focus-visible {
+  background: #0e8dde !important;
+  border-color: var(--app-accent-strong) !important;
+  color: #ffffff !important;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-btn-default,
+:root[data-app-theme='enterprise-dark'] .ant-btn-dashed {
+  background: #252526;
+  border-color: var(--app-border-strong);
+  color: var(--app-text);
+  box-shadow: none;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-btn-default:not(:disabled):not(.ant-btn-disabled):hover,
+:root[data-app-theme='enterprise-dark'] .ant-btn-dashed:not(:disabled):not(.ant-btn-disabled):hover,
+:root[data-app-theme='enterprise-dark'] .ant-btn-text:not(:disabled):not(.ant-btn-disabled):hover {
+  border-color: #5a5a5a;
+  color: #ffffff;
+  background: #2a2d2e;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-btn-link {
+  color: var(--app-accent-text-soft);
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-btn-link:hover {
+  color: var(--app-accent-strong);
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-btn-dangerous:not(.ant-btn-primary) {
+  background: #252526;
+  border-color: rgba(244, 135, 113, 0.45);
+  color: #f48771;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-btn-dangerous:not(.ant-btn-primary):hover {
+  background: rgba(244, 135, 113, 0.1);
+  border-color: #f48771;
+  color: #ff9f8b;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-tag {
+  background: #252526;
+  border-color: var(--app-border-strong);
+  color: var(--app-text-muted);
+  border-radius: 4px;
+  font-weight: 600;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-tag-blue,
+:root[data-app-theme='enterprise-dark'] .ant-tag-processing {
+  background: rgba(0, 122, 204, 0.16);
+  border-color: rgba(55, 148, 255, 0.38);
+  color: #9cdcfe;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-tag-purple {
+  background: rgba(197, 134, 192, 0.14);
+  border-color: rgba(197, 134, 192, 0.34);
+  color: #d8a4d4;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-tag-green,
+:root[data-app-theme='enterprise-dark'] .ant-tag-success {
+  background: rgba(137, 209, 133, 0.14);
+  border-color: rgba(137, 209, 133, 0.34);
+  color: #89d185;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-tag-gold,
+:root[data-app-theme='enterprise-dark'] .ant-tag-warning,
+:root[data-app-theme='enterprise-dark'] .ant-tag-orange {
+  background: rgba(204, 167, 0, 0.14);
+  border-color: rgba(204, 167, 0, 0.34);
+  color: #d7ba7d;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-tag-red,
+:root[data-app-theme='enterprise-dark'] .ant-tag-error {
+  background: rgba(244, 135, 113, 0.14);
+  border-color: rgba(244, 135, 113, 0.4);
+  color: #f48771;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-badge-status-text {
+  color: var(--app-text-muted);
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-switch {
+  background: #3c3c3c;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-switch.ant-switch-checked {
+  background: var(--app-accent);
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-table {
+  background: var(--app-card-bg);
+  color: var(--app-text);
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-table-thead > tr > th {
+  background: #252526 !important;
+  border-color: var(--app-border-strong) !important;
+  color: var(--app-text) !important;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-table-column-sorter,
+:root[data-app-theme='enterprise-dark'] .ant-table-column-sorter-up,
+:root[data-app-theme='enterprise-dark'] .ant-table-column-sorter-down,
+:root[data-app-theme='enterprise-dark'] .ant-table-filter-trigger {
+  color: var(--app-text-muted) !important;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-table-column-sorter-up.active,
+:root[data-app-theme='enterprise-dark'] .ant-table-column-sorter-down.active,
+:root[data-app-theme='enterprise-dark'] .ant-table-filter-trigger.active,
+:root[data-app-theme='enterprise-dark'] .ant-table-filter-trigger:hover,
+:root[data-app-theme='enterprise-dark'] th:hover .ant-table-column-sorter,
+:root[data-app-theme='enterprise-dark'] th:hover .ant-table-filter-trigger {
+  color: var(--app-accent-strong) !important;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-table-column-sorters:hover {
+  background: #2a2d2e !important;
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-table-filter-dropdown {
+  background: var(--app-card-bg);
+  border: 1px solid var(--app-border-strong);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-table-filter-dropdown .ant-dropdown-menu {
+  background: var(--app-card-bg);
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-pagination .ant-pagination-item-active {
+  border-color: var(--app-accent);
+}
+
+:root[data-app-theme='enterprise-dark'] .ant-pagination .ant-pagination-item-active a {
+  color: var(--app-accent-text-soft);
+}
+
+:root[data-app-theme='dark'] .ant-table-column-sorter,
+:root[data-app-theme='dark'] .ant-table-column-sorter-up,
+:root[data-app-theme='dark'] .ant-table-column-sorter-down,
+:root[data-app-theme='dark'] .ant-table-filter-trigger {
+  color: var(--app-text-muted) !important;
+}
+
+:root[data-app-theme='dark'] .ant-table-column-sorter-up.active,
+:root[data-app-theme='dark'] .ant-table-column-sorter-down.active,
+:root[data-app-theme='dark'] .ant-table-filter-trigger.active,
+:root[data-app-theme='dark'] .ant-table-filter-trigger:hover,
+:root[data-app-theme='dark'] th:hover .ant-table-column-sorter,
+:root[data-app-theme='dark'] th:hover .ant-table-filter-trigger {
+  color: var(--app-accent-text-soft) !important;
 }
 
 /* Keep notifications above drawer + studio overlay modals. */

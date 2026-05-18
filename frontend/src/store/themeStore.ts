@@ -1,13 +1,13 @@
 import { create } from 'zustand'
 
-export type AppThemeMode = 'dark' | 'light'
+export type AppThemeMode = 'dark' | 'light' | 'enterprise-dark'
 
 const STORAGE_KEY = 'etlflow_app_theme_mode'
 
 function resolveInitialMode(): AppThemeMode {
   if (typeof window === 'undefined') return 'dark'
   const saved = window.localStorage.getItem(STORAGE_KEY)
-  if (saved === 'dark' || saved === 'light') return saved
+  if (saved === 'dark' || saved === 'light' || saved === 'enterprise-dark') return saved
   try {
     if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {
       return 'light'
@@ -37,9 +37,13 @@ export const useThemeStore = create<ThemeState>((set) => ({
   },
   toggleMode: () =>
     set((state) => {
-      const nextMode: AppThemeMode = state.mode === 'dark' ? 'light' : 'dark'
+      const nextMode: AppThemeMode =
+        state.mode === 'dark'
+          ? 'enterprise-dark'
+          : state.mode === 'enterprise-dark'
+            ? 'light'
+            : 'dark'
       persistMode(nextMode)
       return { mode: nextMode }
     }),
 }))
-

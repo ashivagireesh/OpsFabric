@@ -20,6 +20,7 @@ import pickle
 import smtplib
 import ssl
 import sqlite3 as _sqlite3
+import fcntl as _fcntl
 from datetime import datetime, timedelta, date, time
 from decimal import Decimal
 from pathlib import Path
@@ -73,6 +74,7 @@ async def lifespan(app: FastAPI):
     _reload_all_pipeline_schedule_jobs()
     _sync_all_gateway_routes()
     _sync_sqlite_cleanup_schedule_job()
+    _sync_blw_async_worker_job()
     logger.info("✅ ETL Flow Platform started")
     yield
     if scheduler.running:
@@ -362,6 +364,11 @@ _SYSTEM_SETTING_SQLITE_CLEANUP_SCHEDULE_KEY = "sqlite_cleanup_schedule_v1"
 _SYSTEM_SETTING_APP_FEATURE_FLAGS_KEY = "app_feature_flags_v1"
 _SYSTEM_SETTING_DEV_CHAT_KEY = "dev_chat_provider_profiles_v1"
 _SQLITE_CLEANUP_SCHEDULE_JOB_ID = "system:sqlite_cleanup_schedule"
+_BLW_ASYNC_WORKER_JOB_ID = "system:blw_async_tracker_worker"
+_BLW_ASYNC_WORKER_LOCK_FH: Any = None
+_BLW_ASYNC_WORKER_LOCK_HELD = False
+_BLW_ASYNC_WORKER_FAILURES = 0
+_BLW_ASYNC_WORKER_PAUSE_UNTIL = 0.0
 _DEFAULT_SQLITE_CLEANUP_SCHEDULE_CONFIG: Dict[str, Any] = {
     "enabled": False,
     "interval_minutes": 60,
@@ -2361,6 +2368,134 @@ def _sync_sqlite_cleanup_schedule_job() -> Dict[str, Any]:
         f"Scheduled SQLite periodic cleanup every {interval_minutes} minute(s)."
     )
     return _sqlite_cleanup_schedule_status(config)
+
+
+def _try_acquire_blw_async_worker_lock() -> bool:
+    global _BLW_ASYNC_WORKER_LOCK_FH, _BLW_ASYNC_WORKER_LOCK_HELD
+    if _BLW_ASYNC_WORKER_LOCK_HELD:
+        return True
+    if not _env_bool("BLW_ASYNC_WORKER_SINGLE_PROCESS_LOCK", True):
+        return True
+    lock_dir = _BACKEND_DIR / "state"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / "blw_async_worker.lock"
+    try:
+        lock_fh = open(lock_path, "a+", encoding="utf-8")
+        _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        lock_fh.seek(0)
+        lock_fh.truncate()
+        lock_fh.write(f"pid={_os.getpid()} acquired_at={datetime.utcnow().isoformat()}Z\n")
+        lock_fh.flush()
+        _BLW_ASYNC_WORKER_LOCK_FH = lock_fh
+        _BLW_ASYNC_WORKER_LOCK_HELD = True
+        return True
+    except BlockingIOError:
+        try:
+            lock_fh.close()  # type: ignore[name-defined]
+        except Exception:
+            pass
+        return False
+    except Exception as exc:
+        logger.warning(f"BLW async worker lock unavailable; worker disabled in this process: {exc}")
+        return False
+
+
+async def _run_blw_async_tracker_worker_job():
+    global _BLW_ASYNC_WORKER_FAILURES, _BLW_ASYNC_WORKER_PAUSE_UNTIL
+    try:
+        if not _env_bool("BLW_ASYNC_WORKER_ENABLED", True):
+            return
+        now = _time.time()
+        if _BLW_ASYNC_WORKER_PAUSE_UNTIL > now:
+            return
+        batch_size = _env_int("BLW_ASYNC_WORKER_BATCH_SIZE", 50, 1, 500)
+        max_batches = _env_int("BLW_ASYNC_WORKER_MAX_DRAIN_BATCHES", 4, 1, 100)
+        stale_seconds = _env_int("BLW_ASYNC_WORKER_STALE_RUNNING_SECONDS", 60, 10, 86400)
+        total = {"claimed": 0, "processed": 0, "waiting": 0, "failed": 0, "batches": 0}
+        for _ in range(max_batches):
+            result = await etl_engine.process_blw_async_tracker_queue(
+                {},
+                limit=batch_size,
+                stale_running_seconds=stale_seconds,
+            )
+            claimed = int(result.get("claimed") or 0) if isinstance(result, dict) else 0
+            total["claimed"] += claimed
+            total["processed"] += int(result.get("processed") or 0) if isinstance(result, dict) else 0
+            total["waiting"] += int(result.get("waiting") or 0) if isinstance(result, dict) else 0
+            total["failed"] += int(result.get("failed") or 0) if isinstance(result, dict) else 0
+            if claimed:
+                total["batches"] += 1
+            if claimed < batch_size:
+                break
+        _BLW_ASYNC_WORKER_FAILURES = 0
+        _BLW_ASYNC_WORKER_PAUSE_UNTIL = 0.0
+        if total["claimed"]:
+            logger.info(f"BLW async tracker worker processed queue: {total}")
+    except Exception as exc:
+        _BLW_ASYNC_WORKER_FAILURES += 1
+        base_backoff = _env_int("BLW_ASYNC_WORKER_ERROR_BACKOFF_SECONDS", 15, 1, 3600)
+        max_backoff = _env_int("BLW_ASYNC_WORKER_MAX_ERROR_BACKOFF_SECONDS", 300, 5, 7200)
+        delay = min(max_backoff, base_backoff * (2 ** min(_BLW_ASYNC_WORKER_FAILURES - 1, 6)))
+        _BLW_ASYNC_WORKER_PAUSE_UNTIL = _time.time() + delay
+        logger.warning(
+            f"BLW async tracker worker failed; pausing {delay}s "
+            f"(failure #{_BLW_ASYNC_WORKER_FAILURES}): {exc}"
+        )
+
+
+def _blw_async_worker_status() -> Dict[str, Any]:
+    job = scheduler.get_job(_BLW_ASYNC_WORKER_JOB_ID) if scheduler.running else None
+    next_run_at = None
+    if job is not None:
+        try:
+            next_obj = getattr(job, "next_run_time", None)
+            if next_obj is not None:
+                next_run_at = next_obj.isoformat()
+        except Exception:
+            next_run_at = None
+    return {
+        "enabled": _env_bool("BLW_ASYNC_WORKER_ENABLED", True),
+        "interval_seconds": _env_int("BLW_ASYNC_WORKER_INTERVAL_SECONDS", 2, 1, 3600),
+        "batch_size": _env_int("BLW_ASYNC_WORKER_BATCH_SIZE", 50, 1, 500),
+        "max_drain_batches": _env_int("BLW_ASYNC_WORKER_MAX_DRAIN_BATCHES", 4, 1, 100),
+        "stale_running_seconds": _env_int("BLW_ASYNC_WORKER_STALE_RUNNING_SECONDS", 60, 10, 86400),
+        "single_process_lock": _env_bool("BLW_ASYNC_WORKER_SINGLE_PROCESS_LOCK", True),
+        "lock_held": _BLW_ASYNC_WORKER_LOCK_HELD,
+        "failure_count": _BLW_ASYNC_WORKER_FAILURES,
+        "paused_until": datetime.fromtimestamp(_BLW_ASYNC_WORKER_PAUSE_UNTIL).isoformat() if _BLW_ASYNC_WORKER_PAUSE_UNTIL else None,
+        "job_active": bool(job is not None),
+        "next_run_at": next_run_at,
+    }
+
+
+def _sync_blw_async_worker_job() -> Dict[str, Any]:
+    existing = scheduler.get_job(_BLW_ASYNC_WORKER_JOB_ID)
+    if existing is not None:
+        scheduler.remove_job(_BLW_ASYNC_WORKER_JOB_ID)
+
+    if not _env_bool("BLW_ASYNC_WORKER_ENABLED", True):
+        return _blw_async_worker_status()
+    if not _try_acquire_blw_async_worker_lock():
+        logger.info("BLW async tracker worker not scheduled in this process; another worker owns the lock.")
+        return _blw_async_worker_status()
+
+    interval_seconds = _env_int("BLW_ASYNC_WORKER_INTERVAL_SECONDS", 2, 1, 3600)
+    max_instances = _env_int("BLW_ASYNC_WORKER_SCHEDULER_MAX_INSTANCES", 1, 1, 16)
+    scheduler.add_job(
+        _run_blw_async_tracker_worker_job,
+        trigger="interval",
+        seconds=interval_seconds,
+        id=_BLW_ASYNC_WORKER_JOB_ID,
+        replace_existing=True,
+        coalesce=True,
+        max_instances=max_instances,
+        misfire_grace_time=max(10, min(interval_seconds * 3, 300)),
+    )
+    logger.info(
+        f"Scheduled BLW async tracker worker every {interval_seconds} second(s) "
+        f"with max_instances={max_instances}."
+    )
+    return _blw_async_worker_status()
 
 
 # ─── PYDANTIC SCHEMAS ─────────────────────────────────────────────────────────
@@ -12910,6 +13045,11 @@ async def _simulate_business_workflow_run(workflow_id: str, run_id: str):
                         should_send = send_mode not in {"draft", "preview", "disabled", "off"}
                     else:
                         should_send = _business_to_bool(config.get("send_email"), default=True)
+                    delivery_mode = str(
+                        config.get("email_delivery_mode") or config.get("delivery_mode") or "sync"
+                    ).strip().lower() or "sync"
+                    async_delivery = delivery_mode in {"async", "async_background", "background", "queued", "queue"}
+                    mail_job_id = f"mail_{uuid.uuid4().hex}"
                     generated_at = datetime.utcnow().isoformat()
                     dashboard_id = str(config.get("dashboard_id") or "").strip()
                     include_snapshot = _business_to_bool(
@@ -12930,18 +13070,58 @@ async def _simulate_business_workflow_run(workflow_id: str, run_id: str):
                         dashboard_snapshot_data_url = str(dashboard_row.thumbnail).strip()
 
                     if should_send:
-                        transport = _business_send_mail_via_smtp(
-                            config=config,
-                            recipients=recipients,
-                            subject=subject,
-                            body=body_text,
-                            dashboard_snapshot_data_url=dashboard_snapshot_data_url,
-                        )
+                        if async_delivery:
+                            safe_config = dict(config or {})
+
+                            def _send_async_mail() -> None:
+                                try:
+                                    _business_send_mail_via_smtp(
+                                        config=safe_config,
+                                        recipients=recipients,
+                                        subject=subject,
+                                        body=body_text,
+                                        dashboard_snapshot_data_url=dashboard_snapshot_data_url,
+                                    )
+                                    logger.info(f"Async Mail Writer job {mail_job_id} sent to {', '.join(recipients)}")
+                                except Exception as exc:
+                                    logger.warning(f"Async Mail Writer job {mail_job_id} failed: {exc}")
+
+                            threading.Thread(target=_send_async_mail, daemon=True).start()
+                            transport = {
+                                "transport": "smtp",
+                                "smtp_host": _business_mail_config_value(
+                                    config, "smtp_host", ["BUSINESS_SMTP_HOST", "SMTP_HOST"], ""
+                                ),
+                                "smtp_port": _business_mail_config_value(
+                                    config, "smtp_port", ["BUSINESS_SMTP_PORT", "SMTP_PORT"], ""
+                                ),
+                                "smtp_security": _business_mail_config_value(
+                                    config, "smtp_security", ["BUSINESS_SMTP_SECURITY", "SMTP_SECURITY"], "tls"
+                                ),
+                                "from_email": _business_mail_config_value(
+                                    config,
+                                    "from_email",
+                                    ["BUSINESS_SMTP_FROM_EMAIL", "SMTP_FROM_EMAIL", "BUSINESS_MAIL_FROM_EMAIL"],
+                                    "",
+                                ),
+                            }
+                            email_status = "queued"
+                        else:
+                            transport = _business_send_mail_via_smtp(
+                                config=config,
+                                recipients=recipients,
+                                subject=subject,
+                                body=body_text,
+                                dashboard_snapshot_data_url=dashboard_snapshot_data_url,
+                            )
+                            email_status = "sent"
                         output_rows = [{
                             "to": ", ".join(recipients),
                             "subject": subject,
                             "body": body_text,
-                            "status": "sent",
+                            "status": email_status,
+                            "delivery_mode": delivery_mode,
+                            "mail_job_id": mail_job_id if email_status == "queued" else None,
                             "generated_at": generated_at,
                             "transport": transport.get("transport"),
                             "smtp_host": transport.get("smtp_host"),
@@ -12952,13 +13132,18 @@ async def _simulate_business_workflow_run(workflow_id: str, run_id: str):
                             "dashboard_snapshot_embedded": transport.get("dashboard_snapshot_embedded", False),
                             "dashboard_id": dashboard_id or None,
                         }]
-                        step_message = f"✓ {node_label} sent email to {', '.join(recipients)}."
+                        step_message = (
+                            f"✓ {node_label} queued email to {', '.join(recipients)}."
+                            if email_status == "queued"
+                            else f"✓ {node_label} sent email to {', '.join(recipients)}."
+                        )
                     else:
                         output_rows = [{
                             "to": ", ".join(recipients),
                             "subject": subject,
                             "body": body_text,
                             "status": "draft",
+                            "delivery_mode": delivery_mode,
                             "generated_at": generated_at,
                             "dashboard_snapshot_embedded": False,
                             "dashboard_id": dashboard_id or None,
@@ -13572,8 +13757,8 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
         worker = execution_workers.get(str(execution.id or ""))
         worker_alive = bool(worker and worker.is_alive())
         no_worker_grace_s = max(
-            2,
-            int(str(_os.getenv("EXECUTION_NO_WORKER_AUTOFINALIZE_GRACE_SECONDS", "5")).strip() or "5"),
+            30,
+            int(str(_os.getenv("EXECUTION_NO_WORKER_AUTOFINALIZE_GRACE_SECONDS", "300")).strip() or "300"),
         )
         fast_finalize_worker_missing = (not worker_alive) and (age_s is None or age_s >= no_worker_grace_s)
 
@@ -21400,6 +21585,297 @@ async def _scan_kv_source_rows_for_query(
         "pages": max(1, len(scan_units)) if scan_units else 0,
         "has_more": bool(scanned_rows < safe_scan_limit),
     }
+
+
+def _prepare_blw_tracker_request_config(body: dict) -> Dict[str, Any]:
+    config = body.get("config") if isinstance(body.get("config"), dict) else {}
+    if not isinstance(config, dict):
+        config = {}
+    studio_cfg = config.get("blw_studio_config") if isinstance(config.get("blw_studio_config"), dict) else {}
+    merged_config = {**config}
+    if isinstance(studio_cfg, dict):
+        merged_config.update({
+            "workflow_tracking_table": studio_cfg.get("trackerTable") or config.get("workflow_tracking_table"),
+            "workflow_unique_id_field": studio_cfg.get("uniqueIdField") or config.get("workflow_unique_id_field"),
+        })
+    return merged_config
+
+
+def _read_oracle_clob(value: Any) -> Any:
+    if value is None:
+        return None
+    if hasattr(value, "read"):
+        try:
+            return value.read()
+        except Exception:
+            return str(value)
+    return value
+
+
+def _open_blw_tracker_from_body(body: dict):
+    merged_config = _prepare_blw_tracker_request_config(body)
+    conn, tracker_cfg = etl_engine._blw_tracker_connect(merged_config)  # pylint: disable=protected-access
+    table_name = str(tracker_cfg.get("table") or "BLW_WORKFLOW_TRACKER").strip() or "BLW_WORKFLOW_TRACKER"
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)?", table_name):
+        raise ValueError("Invalid BLW tracker table name.")
+    etl_engine._ensure_blw_tracker_table(conn, table_name)  # pylint: disable=protected-access
+    return conn, table_name, merged_config
+
+
+@app.post("/api/blw/tracker/summary")
+async def blw_tracker_summary(body: dict):
+    """Return compact BLW tracker dashboard data from the configured Oracle tracker table."""
+    merged_config = _prepare_blw_tracker_request_config(body)
+    try:
+        limit = int(body.get("limit") or 50)
+    except Exception:
+        limit = 50
+    limit = max(1, min(limit, 500))
+
+    try:
+        conn, table_name, _ = _open_blw_tracker_from_body(body)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "message": str(exc),
+            "table": str(merged_config.get("workflow_tracking_table") or "BLW_WORKFLOW_TRACKER"),
+            "summary": {"total": 0, "status_counts": {}, "stage_counts": {}},
+            "rows": [],
+        }
+
+    cur = conn.cursor()
+    try:
+        cur.execute(f"""
+            SELECT CURRENT_STATUS, COUNT(*)
+            FROM {table_name}
+            GROUP BY CURRENT_STATUS
+        """)
+        status_counts = {str(row[0] or "UNKNOWN"): int(row[1] or 0) for row in cur.fetchall()}
+        cur.execute(f"""
+            SELECT CURRENT_STAGE, COUNT(*)
+            FROM {table_name}
+            GROUP BY CURRENT_STAGE
+        """)
+        stage_counts = {str(row[0] or "UNKNOWN"): int(row[1] or 0) for row in cur.fetchall()}
+        cur.execute(f"""
+            SELECT RUN_ID, WORKFLOW_NAME, INPUT_UNIQUE_ID, CURRENT_STAGE, CURRENT_STEP_ID,
+                   CURRENT_STATUS, ITERATION_NO, RETRY_COUNT, ESCALATION_LEVEL,
+                   INPUT_SOURCE, PIPELINE_ID, BUSINESS_NODE_ID, ERROR_CODE,
+                   SUBSTR(ERROR_MESSAGE, 1, 500),
+                   TO_CHAR(STARTED_AT, 'YYYY-MM-DD HH24:MI:SS'),
+                   TO_CHAR(LAST_UPDATED_AT, 'YYYY-MM-DD HH24:MI:SS'),
+                   TO_CHAR(WAIT_UNTIL, 'YYYY-MM-DD HH24:MI:SS'),
+                   CASE
+                       WHEN WAIT_UNTIL IS NULL THEN NULL
+                       ELSE GREATEST(0, ROUND((CAST(WAIT_UNTIL AS DATE) - CAST(CAST(SYSTIMESTAMP AS TIMESTAMP) AS DATE)) * 86400))
+                   END,
+                   TO_CHAR(ENDED_AT, 'YYYY-MM-DD HH24:MI:SS'),
+                   ROUND((CAST(COALESCE(ENDED_AT, LAST_UPDATED_AT) AS DATE) - CAST(STARTED_AT AS DATE)) * 86400),
+                   CONTEXT_JSON
+            FROM {table_name}
+            ORDER BY LAST_UPDATED_AT DESC
+            FETCH FIRST {limit} ROWS ONLY
+        """)
+        rows = []
+        for row in cur.fetchall():
+            context_payload = _read_oracle_clob(row[20])
+            context_json: Dict[str, Any] = {}
+            if isinstance(context_payload, str) and context_payload.strip():
+                try:
+                    parsed_context = json.loads(context_payload)
+                    context_json = parsed_context if isinstance(parsed_context, dict) else {}
+                except Exception:
+                    context_json = {}
+            rows.append({
+                "run_id": str(row[0] or ""),
+                "workflow_name": str(row[1] or ""),
+                "input_unique_id": str(row[2] or ""),
+                "current_stage": str(row[3] or ""),
+                "current_step_id": str(row[4] or ""),
+                "current_status": str(row[5] or ""),
+                "iteration_no": int(row[6] or 0),
+                "retry_count": int(row[7] or 0),
+                "escalation_level": int(row[8] or 0),
+                "input_source": str(row[9] or ""),
+                "pipeline_id": str(row[10] or ""),
+                "business_node_id": str(row[11] or ""),
+                "error_code": str(row[12] or ""),
+                "error_message": str(row[13] or ""),
+                "started_at": str(row[14] or ""),
+                "last_updated_at": str(row[15] or ""),
+                "wait_until": str(row[16] or ""),
+                "wait_remaining_seconds": int(row[17]) if row[17] is not None else None,
+                "ended_at": str(row[18] or ""),
+                "duration_seconds": int(row[19] or 0),
+                "last_wait_node_id": str(context_json.get("last_wait_node_id") or ""),
+                "last_wait_seconds": (
+                    float(context_json.get("last_wait_seconds"))
+                    if context_json.get("last_wait_seconds") is not None
+                    else None
+                ),
+                "last_wait_until": str(context_json.get("last_wait_until") or ""),
+            })
+        return {
+            "ok": True,
+            "table": table_name,
+            "summary": {
+                "total": sum(status_counts.values()),
+                "status_counts": status_counts,
+                "stage_counts": stage_counts,
+            },
+            "rows": rows,
+        }
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/api/blw/tracker/detail")
+async def blw_tracker_detail(body: dict):
+    """Return full JSON tracker payloads for a single BLW run."""
+    run_id = str(body.get("run_id") or "").strip()
+    if not run_id:
+        raise HTTPException(status_code=400, detail="run_id is required")
+    try:
+        conn, table_name, _ = _open_blw_tracker_from_body(body)
+    except Exception as exc:
+        return {"ok": False, "message": str(exc), "row": None}
+    cur = conn.cursor()
+    try:
+        cur.execute(f"""
+            SELECT RUN_ID, WORKFLOW_ID, WORKFLOW_NAME, PIPELINE_ID, BUSINESS_NODE_ID,
+                   INPUT_UNIQUE_ID, INPUT_SOURCE, INPUT_PAYLOAD_JSON, CURRENT_STAGE,
+                   CURRENT_STEP_ID, CURRENT_STATUS, ITERATION_NO, MAX_ITERATIONS,
+                   RETRY_COUNT, MAX_RETRY_ATTEMPTS, ESCALATION_LEVEL, ESCALATION_STATUS,
+                   ESCALATED_TO, ERROR_CODE, ERROR_MESSAGE, WORKFLOW_CONFIG_JSON,
+                   STEP_TRACK_JSON, ROUTING_HISTORY_JSON, RETRY_HISTORY_JSON,
+                   ESCALATION_JSON, PARALLEL_BRANCH_JSON, CONTEXT_JSON,
+                   TO_CHAR(STARTED_AT, 'YYYY-MM-DD HH24:MI:SS'),
+                   TO_CHAR(LAST_UPDATED_AT, 'YYYY-MM-DD HH24:MI:SS'),
+                   TO_CHAR(WAIT_UNTIL, 'YYYY-MM-DD HH24:MI:SS'),
+                   CASE
+                       WHEN WAIT_UNTIL IS NULL THEN NULL
+                       ELSE GREATEST(0, ROUND((CAST(WAIT_UNTIL AS DATE) - CAST(CAST(SYSTIMESTAMP AS TIMESTAMP) AS DATE)) * 86400))
+                   END,
+                   TO_CHAR(ENDED_AT, 'YYYY-MM-DD HH24:MI:SS')
+            FROM {table_name}
+            WHERE RUN_ID = :run_id
+        """, {"run_id": run_id})
+        row = cur.fetchone()
+        if not row:
+            return {"ok": False, "message": "Run not found", "row": None}
+        keys = [
+            "run_id", "workflow_id", "workflow_name", "pipeline_id", "business_node_id",
+            "input_unique_id", "input_source", "input_payload_json", "current_stage",
+            "current_step_id", "current_status", "iteration_no", "max_iterations",
+            "retry_count", "max_retry_attempts", "escalation_level", "escalation_status",
+            "escalated_to", "error_code", "error_message", "workflow_config_json",
+            "step_track_json", "routing_history_json", "retry_history_json",
+            "escalation_json", "parallel_branch_json", "context_json",
+            "started_at", "last_updated_at", "wait_until", "wait_remaining_seconds", "ended_at",
+        ]
+        output = {key: _read_oracle_clob(value) for key, value in zip(keys, row)}
+        for json_key in [
+            "input_payload_json", "workflow_config_json", "step_track_json",
+            "routing_history_json", "retry_history_json", "escalation_json",
+            "parallel_branch_json", "context_json",
+        ]:
+            raw = output.get(json_key)
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    output[json_key] = json.loads(raw)
+                except Exception:
+                    pass
+        return {"ok": True, "table": table_name, "row": output}
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/api/blw/tracker/action")
+async def blw_tracker_action(body: dict):
+    """Apply manual BLW tracker actions for resume, retry, pause, or terminate."""
+    run_id = str(body.get("run_id") or "").strip()
+    action = str(body.get("action") or "").strip().lower()
+    if not run_id:
+        raise HTTPException(status_code=400, detail="run_id is required")
+    if action not in {"resume", "retry", "pause", "terminate"}:
+        raise HTTPException(status_code=400, detail="Unsupported BLW tracker action")
+    try:
+        conn, table_name, _ = _open_blw_tracker_from_body(body)
+    except Exception as exc:
+        return {"ok": False, "message": str(exc)}
+
+    next_status = {
+        "resume": "resume_requested",
+        "retry": "retry_requested",
+        "pause": "paused",
+        "terminate": "terminated",
+    }[action]
+    cur = conn.cursor()
+    try:
+        cur.execute(f"""
+            UPDATE {table_name}
+            SET CURRENT_STATUS = :status,
+                ERROR_CODE = CASE WHEN :action IN ('resume','retry') THEN NULL ELSE ERROR_CODE END,
+                ERROR_MESSAGE = CASE WHEN :action IN ('resume','retry') THEN NULL ELSE ERROR_MESSAGE END,
+                RETRY_COUNT = CASE WHEN :action = 'retry' THEN 0 ELSE RETRY_COUNT END,
+                RESUMED_AT = CASE WHEN :action = 'resume' THEN SYSTIMESTAMP ELSE RESUMED_AT END,
+                PAUSED_AT = CASE WHEN :action = 'pause' THEN SYSTIMESTAMP ELSE PAUSED_AT END,
+                TERMINATED_AT = CASE WHEN :action = 'terminate' THEN SYSTIMESTAMP ELSE TERMINATED_AT END,
+                ENDED_AT = CASE WHEN :action IN ('resume','retry') THEN NULL ELSE ENDED_AT END,
+                LAST_UPDATED_AT = SYSTIMESTAMP
+            WHERE RUN_ID = :run_id
+        """, {"status": next_status, "action": action, "run_id": run_id})
+        affected = int(getattr(cur, "rowcount", 0) or 0)
+        conn.commit()
+        return {"ok": affected > 0, "run_id": run_id, "action": action, "status": next_status, "updated": affected}
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.post("/api/blw/worker/run-once")
+async def blw_worker_run_once(body: dict):
+    """Run the BLW async tracker worker once for queued/pending tracker rows."""
+    try:
+        limit = int(body.get("limit") or _env_int("BLW_ASYNC_WORKER_BATCH_SIZE", 50, 1, 500))
+    except Exception:
+        limit = 5
+    limit = max(1, min(limit, 500))
+    try:
+        stale_seconds = int(body.get("stale_running_seconds") or _env_int("BLW_ASYNC_WORKER_STALE_RUNNING_SECONDS", 60, 10, 86400))
+    except Exception:
+        stale_seconds = 60
+    stale_seconds = max(10, min(stale_seconds, 86400))
+    config = body.get("config") if isinstance(body.get("config"), dict) else {}
+    try:
+        result = await etl_engine.process_blw_async_tracker_queue(
+            config,
+            limit=limit,
+            stale_running_seconds=stale_seconds,
+        )
+        return {"ok": True, "worker": _blw_async_worker_status(), "result": result}
+    except Exception as exc:
+        return {"ok": False, "message": str(exc), "worker": _blw_async_worker_status()}
 
 
 @app.post("/api/query")

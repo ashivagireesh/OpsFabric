@@ -11,25 +11,35 @@ const { darkAlgorithm, defaultAlgorithm } = theme
 
 function AppThemeProvider() {
   const mode = useThemeStore((state) => state.mode)
-  const isDark = mode === 'dark'
+  const isDark = mode === 'dark' || mode === 'enterprise-dark'
+  const isEnterpriseDark = mode === 'enterprise-dark'
 
   React.useEffect(() => {
     document.documentElement.setAttribute('data-app-theme', mode)
     document.body.style.background = 'var(--app-shell-bg)'
     document.body.style.color = 'var(--app-text)'
-  }, [isDark, mode])
+  }, [mode])
 
   const config = React.useMemo(() => {
     if (isDark) {
+      const accent = isEnterpriseDark ? '#007acc' : '#6366f1'
+      const accentHover = isEnterpriseDark ? '#3794ff' : '#818cf8'
+      const selectedBg = isEnterpriseDark ? 'rgba(0, 122, 204, 0.22)' : 'rgba(99, 102, 241, 0.15)'
+      const elevatedBg = isEnterpriseDark ? '#252526' : '#22222f'
+
       return {
         algorithm: darkAlgorithm,
         token: {
-          colorPrimary: '#6366f1',
+          colorPrimary: accent,
+          colorInfo: accent,
           colorBgBase: 'var(--app-shell-bg)',
           colorBgContainer: 'var(--app-card-bg)',
-          colorBgElevated: '#22222f',
+          colorBgElevated: elevatedBg,
           colorBorder: 'var(--app-border-strong)',
           colorBorderSecondary: 'var(--app-border)',
+          colorText: 'var(--app-text)',
+          colorTextSecondary: 'var(--app-text-muted)',
+          colorTextTertiary: 'var(--app-text-subtle)',
           borderRadius: 8,
           fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
         },
@@ -42,15 +52,42 @@ function AppThemeProvider() {
           Menu: {
             darkItemBg: 'var(--app-panel-bg)',
             darkSubMenuItemBg: 'var(--app-panel-bg)',
-            darkItemSelectedBg: 'rgba(99, 102, 241, 0.15)',
-            darkItemSelectedColor: '#6366f1',
+            darkItemSelectedBg: selectedBg,
+            darkItemSelectedColor: isEnterpriseDark ? '#ffffff' : accent,
+            darkItemHoverBg: isEnterpriseDark ? '#2a2d2e' : 'rgba(99, 102, 241, 0.1)',
+            darkItemHoverColor: isEnterpriseDark ? '#ffffff' : accent,
           },
           Card: {
             colorBgContainer: 'var(--app-card-bg)',
           },
           Table: {
             colorBgContainer: 'var(--app-card-bg)',
-            headerBg: 'var(--app-input-bg)',
+            headerBg: isEnterpriseDark ? '#252526' : 'var(--app-input-bg)',
+            rowHoverBg: isEnterpriseDark ? '#2a2d2e' : undefined,
+          },
+          Select: {
+            optionSelectedBg: selectedBg,
+            optionActiveBg: isEnterpriseDark ? '#2a2d2e' : undefined,
+          },
+          Tabs: {
+            itemSelectedColor: accent,
+            itemHoverColor: accent,
+            inkBarColor: accent,
+          },
+          Button: {
+            colorPrimary: accent,
+            colorPrimaryHover: accentHover,
+            colorPrimaryActive: isEnterpriseDark ? '#005a9e' : '#4f46e5',
+            primaryColor: '#ffffff',
+            primaryShadow: 'none',
+          },
+          Input: {
+            activeBorderColor: accent,
+            hoverBorderColor: accentHover,
+          },
+          InputNumber: {
+            activeBorderColor: accent,
+            hoverBorderColor: accentHover,
           },
         },
       }
@@ -91,7 +128,7 @@ function AppThemeProvider() {
         },
       },
     }
-  }, [darkAlgorithm, defaultAlgorithm, isDark])
+  }, [darkAlgorithm, defaultAlgorithm, isDark, isEnterpriseDark])
 
   return (
     <ConfigProvider theme={config}>
