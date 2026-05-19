@@ -53,6 +53,7 @@ export default function MLConfigDrawer({ open, onClose }: MLConfigDrawerProps) {
   const [featureOpType, setFeatureOpType] = useState('')
   const [featureOpParamsText, setFeatureOpParamsText] = useState('{}')
   const [featureOpError, setFeatureOpError] = useState('')
+  const [showEncodedFeatureColumns, setShowEncodedFeatureColumns] = useState(false)
   const touchDrawerActivity = useCallback(() => {
     markDrawerInteraction('mlops')
   }, [])
@@ -77,6 +78,7 @@ export default function MLConfigDrawer({ open, onClose }: MLConfigDrawerProps) {
 
   const isPipelineOutputNode = data?.nodeType === 'ml_pipeline_output_source'
   const isFeatureNode = data?.nodeType === 'ml_feature_engineering'
+  const isTrainingNode = data?.nodeType === 'ml_model_training'
   const isFeatureOverlay = isFeatureNode
   const selectedPipelineId = String(data?.config?.pipeline_id || '')
 
@@ -144,7 +146,7 @@ export default function MLConfigDrawer({ open, onClose }: MLConfigDrawerProps) {
   }, [isPipelineOutputNode, open, selectedPipelineId])
 
   const loadFeatureProfile = async () => {
-    if (!open || !isFeatureNode || !workflow?.id || !selectedNodeId) return
+    if (!open || (!isFeatureNode && !isTrainingNode) || !workflow?.id || !selectedNodeId) return
     setFeatureProfileLoading(true)
     try {
       const resp = await api.getMLOpsFeatureProfile(workflow.id, {
@@ -166,19 +168,19 @@ export default function MLConfigDrawer({ open, onClose }: MLConfigDrawerProps) {
   }
 
   useEffect(() => {
-    if (!open || !isFeatureNode) return
+    if (!open || (!isFeatureNode && !isTrainingNode)) return
     void loadFeatureProfile()
-  }, [open, isFeatureNode, workflow?.id, selectedNodeId])
+  }, [open, isFeatureNode, isTrainingNode, workflow?.id, selectedNodeId])
 
   useEffect(() => {
-    if (!isFeatureNode) {
+    if (!isFeatureNode && !isTrainingNode) {
       setFeatureProfile(null)
       setFeatureOpColumn('')
       setFeatureOpType('')
       setFeatureOpParamsText('{}')
       setFeatureOpError('')
     }
-  }, [isFeatureNode])
+  }, [isFeatureNode, isTrainingNode])
 
   if (!data || !data.definition) return null
 
@@ -222,6 +224,66 @@ export default function MLConfigDrawer({ open, onClose }: MLConfigDrawerProps) {
       label: colName ? `${colName} (${colType})` : colType,
     }
   })
+  const trainingColumnNames: string[] = profileColumns
+    .map((col: any) => String(col?.name || '').trim())
+    .filter(Boolean)
+  const trainingTargetColumn = String(data.config?.target_column || '').trim()
+  const encodedColumnsByMain = trainingColumnNames.reduce((acc: Record<string, string[]>, col: string) => {
+    const idx = col.indexOf('__')
+    if (idx <= 0) return acc
+    const main = col.slice(0, idx)
+    if (!main || col === trainingTargetColumn || main === trainingTargetColumn) return acc
+    if (!acc[main]) acc[main] = []
+    acc[main].push(col)
+    return acc
+  }, {})
+  const mainTrainingColumns = Array.from(new Set([
+    ...trainingColumnNames.filter((col: string) => !col.includes('__')),
+    ...Object.keys(encodedColumnsByMain),
+  ])).filter((col: string) => col && col !== trainingTargetColumn)
+  const resolveTrainingFeatureColumns = (mainColumns: string[], includeExplicitEncoded = false): string[] => {
+    const out: string[] = []
+    const available = new Set(trainingColumnNames)
+    mainColumns.forEach((raw) => {
+      const col = String(raw || '').trim()
+      if (!col || col === trainingTargetColumn) return
+      if (includeExplicitEncoded && col.includes('__') && available.has(col)) {
+        out.push(col)
+        return
+      }
+      const encoded = encodedColumnsByMain[col] || []
+      if (encoded.length > 0) {
+        out.push(...encoded)
+      } else if (available.has(col)) {
+        out.push(col)
+      }
+    })
+    return Array.from(new Set(out))
+  }
+  const configuredFeatureColumns = Array.isArray(data.config?.feature_columns)
+    ? (data.config.feature_columns as unknown[]).map((value) => String(value || '').trim()).filter(Boolean)
+    : []
+  const configuredMainFeatureColumns = Array.isArray(data.config?.feature_main_columns)
+    ? (data.config.feature_main_columns as unknown[]).map((value) => String(value || '').trim()).filter(Boolean)
+    : []
+  const selectedTrainingFeatureMainColumns = configuredMainFeatureColumns.length > 0
+    ? configuredMainFeatureColumns
+    : Array.from(new Set(configuredFeatureColumns.map((col) => {
+        const idx = col.indexOf('__')
+        return idx > 0 ? col.slice(0, idx) : col
+      }))).filter((col) => col && col !== trainingTargetColumn)
+  const trainingFeatureMainOptions = mainTrainingColumns.map((col) => {
+    const encoded = encodedColumnsByMain[col] || []
+    return {
+      value: col,
+      label: encoded.length > 0 ? `${col} -> ${encoded.length} encoded field${encoded.length === 1 ? '' : 's'}` : col,
+    }
+  })
+  const trainingEncodedFeatureOptions = showEncodedFeatureColumns
+    ? trainingColumnNames
+        .filter((col: string) => col && col !== trainingTargetColumn)
+        .map((col: string) => ({ value: col, label: col.includes('__') ? `${col} [encoded]` : col }))
+    : []
 
   const availableFeatureOps = Array.isArray(featureProfile?.available_operations)
     ? featureProfile.available_operations
@@ -301,6 +363,16 @@ export default function MLConfigDrawer({ open, onClose }: MLConfigDrawerProps) {
       params: parsedParams,
     })
     setFeatureOpError('')
+  }
+
+  const handleTrainingFeatureMainColumnsChange = (values: string[]) => {
+    if (!selectedNodeId) return
+    const selected = Array.isArray(values) ? values.map((value) => String(value || '').trim()).filter(Boolean) : []
+    const resolved = resolveTrainingFeatureColumns(selected, showEncodedFeatureColumns)
+    updateNodeConfig(selectedNodeId, {
+      feature_main_columns: selected,
+      feature_columns: resolved,
+    })
   }
 
   const commonInputStyle = {
@@ -582,6 +654,44 @@ export default function MLConfigDrawer({ open, onClose }: MLConfigDrawerProps) {
                 {renderField(field)}
               </Form.Item>
             ))}
+
+            {isTrainingNode && (
+              <>
+                <Divider style={{ borderColor: 'var(--app-border)', margin: '8px 0 14px' }}>
+                  <Text style={{ color: 'var(--app-text-dim)', fontSize: 11 }}>Model Training Feature Columns</Text>
+                </Divider>
+                <Space direction="vertical" size={8} style={{ width: '100%', marginBottom: 14 }}>
+                  <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+                    <Text style={{ color: 'var(--app-text-muted)', fontSize: 12 }}>Feature Main Columns</Text>
+                    <Space size={8}>
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Show encoded fields</Text>
+                      <Switch size="small" checked={showEncodedFeatureColumns} onChange={setShowEncodedFeatureColumns} />
+                      <Button size="small" loading={featureProfileLoading} onClick={() => void loadFeatureProfile()}>
+                        Refresh Columns
+                      </Button>
+                    </Space>
+                  </Space>
+                  <Select
+                    mode="multiple"
+                    value={selectedTrainingFeatureMainColumns}
+                    onChange={handleTrainingFeatureMainColumnsChange}
+                    options={showEncodedFeatureColumns ? trainingEncodedFeatureOptions : trainingFeatureMainOptions}
+                    placeholder="Auto-select all usable features"
+                    showSearch
+                    optionFilterProp="label"
+                    allowClear
+                    maxTagCount="responsive"
+                    loading={featureProfileLoading}
+                    style={{ width: '100%' }}
+                  />
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    {configuredFeatureColumns.length > 0
+                      ? `Training will use ${configuredFeatureColumns.length} resolved field${configuredFeatureColumns.length === 1 ? '' : 's'}.`
+                      : 'Leave empty to let training use all usable columns except the target.'}
+                  </Text>
+                </Space>
+              </>
+            )}
 
             {isFeatureNode && (
               <>

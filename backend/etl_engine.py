@@ -63,10 +63,11 @@ class ExecutionAbortedError(Exception):
 class BLWDelaySuspended(Exception):
     """Raised by BLW async runs when a delay should be persisted instead of slept."""
 
-    def __init__(self, node_id: str, delay_seconds: float, rows_count: int = 0):
+    def __init__(self, node_id: str, delay_seconds: float, rows_count: int = 0, rows: Optional[List[Any]] = None):
         self.node_id = str(node_id or "")
         self.delay_seconds = max(0.0, float(delay_seconds or 0.0))
         self.rows_count = int(rows_count or 0)
+        self.rows = rows if isinstance(rows, list) else []
         super().__init__(f"BLW delay suspended at {self.node_id} for {self.delay_seconds:.3f}s")
 
 
@@ -5429,6 +5430,32 @@ END;"""
             f"ORDER BY src_q.{field} ASC"
         )
 
+    def _oracle_query_has_row_limiter(self, query: str) -> bool:
+        text = str(query or "").strip().lower()
+        if not text:
+            return False
+        return bool(
+            re.search(r"\bfetch\s+first\s+\d+\s+rows?\s+only\b", text)
+            or re.search(r"\brownum\b", text)
+            or re.search(r"\boffset\s+\d+\s+rows?\s+fetch\s+next\s+\d+\s+rows?\s+only\b", text)
+        )
+
+    def _oracle_source_row_limit(self, config: Dict[str, Any], default: int = 1000) -> int:
+        try:
+            limit = int((config or {}).get("limit", default) or default)
+        except Exception:
+            limit = default
+        return max(1, min(limit, 50000))
+
+    def _apply_oracle_source_limit(self, query: str, limit: int) -> str:
+        q = str(query or "").strip().rstrip(";")
+        if not q:
+            return q
+        if self._oracle_query_has_row_limiter(q):
+            return q
+        safe_limit = max(1, min(int(limit or 1000), 50000))
+        return f"SELECT * FROM ({q}) src_q WHERE ROWNUM <= {safe_limit}"
+
     def _normalize_profile_query_mode(self, value: Any) -> str:
         mode = str(value or "hybrid").strip().lower()
         if mode not in {"upstream", "pushdown", "hybrid"}:
@@ -8032,19 +8059,16 @@ END;"""
                 if oracle_password_raw is not None
                 else ""
             )
+            source_limit = self._oracle_source_row_limit(config)
             base_query_input = str(config.get("query", "") or "").strip()
             if not base_query_input:
                 table = str(config.get("table", "") or "").strip()
-                limit_raw = config.get("limit", 1000)
-                try:
-                    limit = max(1, min(int(limit_raw), 50000))
-                except Exception:
-                    limit = 1000
                 if table:
-                    base_query_input = f"SELECT * FROM {table} FETCH FIRST {limit} ROWS ONLY"
+                    base_query_input = f"SELECT * FROM {table} FETCH FIRST {source_limit} ROWS ONLY"
                 else:
                     raise RuntimeError("Oracle source requires SQL query (or table name).")
             base_query_input = base_query_input.rstrip(";").strip()
+            base_query_input = self._apply_oracle_source_limit(base_query_input, source_limit)
             inc_ctx = self._get_incremental_source_context(execution_context)
 
             def _is_oracle_reconnectable_error(exc: Exception) -> bool:
@@ -8098,8 +8122,12 @@ END;"""
                             raise
                         _warn("Incremental pushdown failed for Oracle query; fell back to full-source fetch + filter.")
                         cursor.execute(base_query_input)
+                    try:
+                        cursor.arraysize = min(max(source_limit, 100), 2000)
+                    except Exception:
+                        pass
                     cols = [desc[0] for desc in (cursor.description or [])]
-                    raw_rows = cursor.fetchall()
+                    raw_rows = cursor.fetchmany(source_limit)
 
                     def _materialize_oracle_value(col_name: str, value: Any) -> Any:
                         if value is None:
@@ -10461,20 +10489,41 @@ END;"""
         node_key = str(node_id or "").strip()
         if not node_key:
             return None
-        pipeline_nodes = execution_context.get("pipeline_nodes")
-        if isinstance(pipeline_nodes, dict):
-            node_payload = pipeline_nodes.get(node_key)
-            if isinstance(node_payload, dict):
-                return node_payload
-            return None
-        if isinstance(pipeline_nodes, list):
-            for raw_node in pipeline_nodes:
+        seen_ids: set = set()
+
+        def _search_nodes(raw_nodes: Any) -> Optional[Dict[str, Any]]:
+            if isinstance(raw_nodes, dict):
+                raw_nodes = list(raw_nodes.values())
+            if not isinstance(raw_nodes, list):
+                return None
+            for raw_node in raw_nodes:
                 if not isinstance(raw_node, dict):
                     continue
+                object_id = id(raw_node)
+                if object_id in seen_ids:
+                    continue
+                seen_ids.add(object_id)
                 raw_id = str(raw_node.get("id") or "").strip()
                 if raw_id and raw_id == node_key:
                     return raw_node
-        return None
+                data = raw_node.get("data") if isinstance(raw_node.get("data"), dict) else {}
+                cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
+                nested = _search_nodes(cfg.get("embedded_workflow_nodes"))
+                if nested is not None:
+                    return nested
+                nested = _search_nodes(cfg.get("workflow_nodes"))
+                if nested is not None:
+                    return nested
+                nested = _search_nodes(cfg.get("child_workflow_nodes"))
+                if nested is not None:
+                    return nested
+                nested = _search_nodes(cfg.get("nodes"))
+                if nested is not None:
+                    return nested
+            return None
+
+        pipeline_nodes = execution_context.get("pipeline_nodes")
+        return _search_nodes(pipeline_nodes)
 
     def _profile_query_default_patch_payload(self, row_obj: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(row_obj, dict):
@@ -11433,6 +11482,75 @@ END;"""
                 return value, True
         return None, False
 
+    def _profile_query_entity_token_candidates_from_value(self, value: Any) -> List[str]:
+        if value is None:
+            return []
+        text = str(value).strip()
+        if not text:
+            return []
+        candidates = [
+            self._stable_json_token(value),
+        ]
+        if not isinstance(value, str):
+            candidates.append(self._stable_json_token(text))
+        candidates.append(text)
+        out: List[str] = []
+        seen = set()
+        for candidate in candidates:
+            token = str(candidate or "").strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            out.append(token)
+        return out
+
+    def _profile_query_patch_entity_token_candidates(
+        self,
+        row_obj: Dict[str, Any],
+        primary_key_field: str,
+        patch_ops: List[Dict[str, Any]],
+    ) -> Tuple[List[str], Any, bool]:
+        if not isinstance(row_obj, dict):
+            return [], None, False
+
+        key_paths = [
+            primary_key_field,
+            "ENTITY_TOKEN",
+            "entity_token",
+            "entityToken",
+        ]
+        key_value, key_found = self._profile_query_extract_first_row_value(row_obj, key_paths)
+        if key_found and key_value is not None and str(key_value).strip() != "":
+            primary_is_token = str(primary_key_field or "").strip().lower() in {
+                "entity_token",
+                "entitytoken",
+            }
+            if primary_is_token or str(key_value).strip().split(":", 1)[0] in {"s", "i", "f", "b", "d", "dt", "t"}:
+                return [str(key_value).strip()], key_value, True
+            return self._profile_query_entity_token_candidates_from_value(key_value), key_value, True
+
+        # Oracle profile rows are keyed by the Custom Fields primary key token.
+        # For Set-Where patches, the match/source field is usually that same
+        # business key (for example customer_account). If ENTITY_TOKEN has been
+        # projected out before patching, derive likely profile tokens from that
+        # match field instead of skipping the row.
+        fallback_paths: List[str] = []
+        for op_cfg in patch_ops or []:
+            if not isinstance(op_cfg, dict):
+                continue
+            for raw_path in (
+                op_cfg.get("where_source_path"),
+                op_cfg.get("where_field"),
+                op_cfg.get("source_path"),
+            ):
+                path = str(raw_path or "").strip()
+                if path and path not in fallback_paths:
+                    fallback_paths.append(path)
+        fallback_value, fallback_found = self._profile_query_extract_first_row_value(row_obj, fallback_paths)
+        if fallback_found and fallback_value is not None and str(fallback_value).strip() != "":
+            return self._profile_query_entity_token_candidates_from_value(fallback_value), fallback_value, True
+        return [], None, False
+
     def _profile_query_json_dict_from_row_value(self, value: Any) -> Tuple[Dict[str, Any], bool]:
         if isinstance(value, dict):
             return self._json_safe_value(value), True
@@ -11635,6 +11753,7 @@ END;"""
         patch_ops: List[Dict[str, Any]],
         has_hash_columns: bool,
         require_pipeline_id: bool = True,
+        require_node_id: bool = True,
     ) -> Tuple[str, List[Dict[str, Any]], str]:
         if not patch_ops:
             return "", [], "patch operations are empty"
@@ -11710,12 +11829,9 @@ END;"""
         key_clauses = []
         if require_pipeline_id:
             key_clauses.append("PIPELINE_ID = :pipeline_id")
-        key_clauses.extend(
-            [
-                "NODE_ID = :node_id",
-                "ENTITY_TOKEN = :entity_token",
-            ]
-        )
+        if require_node_id:
+            key_clauses.append("NODE_ID = :node_id")
+        key_clauses.append("ENTITY_TOKEN = :entity_token")
         sql = f"UPDATE {table_sql} SET " + ", ".join(set_fragments) + " WHERE " + " AND ".join(key_clauses)
         if where_clauses:
             sql += " AND " + " AND ".join(where_clauses)
@@ -11731,6 +11847,7 @@ END;"""
         default_node_id: str,
         use_row_pipeline_id: bool = False,
         use_row_node_id: bool = False,
+        require_node_id: bool = True,
     ) -> Tuple[List[Dict[str, Any]], int, int, str]:
         binds: List[Dict[str, Any]] = []
         skipped_missing_key = 0
@@ -11738,16 +11855,12 @@ END;"""
 
         for raw_row in rows or []:
             row_obj = raw_row if isinstance(raw_row, dict) else {"value": raw_row}
-            token_value, token_found = self._profile_query_extract_first_row_value(
+            token_candidates, _token_value, _token_found = self._profile_query_patch_entity_token_candidates(
                 row_obj,
-                [
-                    primary_key_field,
-                    "ENTITY_TOKEN",
-                    "entity_token",
-                    "entityToken",
-                ],
+                primary_key_field,
+                patch_ops,
             )
-            token = str(token_value).strip() if token_found and token_value is not None else ""
+            token = token_candidates[0] if token_candidates else ""
             row_pipeline_value, row_pipeline_found = self._profile_query_extract_first_row_value(
                 row_obj,
                 [
@@ -11774,15 +11887,16 @@ END;"""
                 if use_row_node_id and row_node_found and row_node_value is not None
                 else str(default_node_id or "").strip()
             )
-            if not token or not row_pipeline_id or not row_node_id:
+            if not token or not row_pipeline_id or (require_node_id and not row_node_id):
                 skipped_missing_key += 1
                 continue
 
             bind_row: Dict[str, Any] = {
                 "pipeline_id": row_pipeline_id,
-                "node_id": row_node_id,
                 "entity_token": token,
             }
+            if require_node_id:
+                bind_row["node_id"] = row_node_id
             row_supported = True
             row_invalid = False
             for spec in op_specs:
@@ -11854,6 +11968,7 @@ END;"""
         use_row_pipeline_id: bool = False,
         use_row_node_id: bool = False,
         allow_any_pipeline_id: bool = False,
+        allow_any_node_id: bool = False,
         warn_cb: Optional[Any] = None,
     ) -> Tuple[int, int, int, str, str]:
         if not self._profile_query_oracle_partial_update_enabled(config):
@@ -11871,6 +11986,7 @@ END;"""
                 table_sql,
                 patch_ops,
                 has_hash_columns,
+                require_node_id=not bool(allow_any_node_id),
             )
             if unsupported_reason:
                 return 0, 0, 0, "unsupported", unsupported_reason
@@ -11885,6 +12001,7 @@ END;"""
                     default_node_id,
                     use_row_pipeline_id=use_row_pipeline_id,
                     use_row_node_id=use_row_node_id,
+                    require_node_id=not bool(allow_any_node_id),
                 )
             )
             if bind_reason:
@@ -11901,6 +12018,7 @@ END;"""
                     patch_ops,
                     has_hash_columns,
                     require_pipeline_id=False,
+                    require_node_id=not bool(allow_any_node_id),
                 )
                 if update_sql_any_pipeline and not any_pipeline_reason:
                     any_pipeline_binds = [
@@ -11916,7 +12034,8 @@ END;"""
                     f"target_pipeline_id={default_pipeline_id or 'missing'}, "
                     f"use_row_pipeline_id={str(bool(use_row_pipeline_id)).lower()}, "
                     f"use_row_node_id={str(bool(use_row_node_id)).lower()}, "
-                    f"allow_any_pipeline_id={str(bool(allow_any_pipeline_id)).lower()}."
+                    f"allow_any_pipeline_id={str(bool(allow_any_pipeline_id)).lower()}, "
+                    f"allow_any_node_id={str(bool(allow_any_node_id)).lower()}."
                 )
             self._close_oracle_profile_session(session, commit=True)
             session = None
@@ -12124,6 +12243,10 @@ END;"""
             config.get("profile_patch_oracle_allow_any_pipeline_id"),
             bool(query_node_id) and not bool(query_pipeline_id) and not bool(use_row_pipeline_id),
         )
+        allow_any_node_id = self._parse_bool_like(
+            config.get("profile_patch_oracle_allow_any_node_id"),
+            not bool(query_node_id) and not bool(use_row_node_id),
+        )
 
         partial_updated_count, partial_missing_key, partial_invalid_patch, partial_status, partial_reason = (
             self._apply_profile_query_patch_updates_oracle_source_partial(
@@ -12137,6 +12260,7 @@ END;"""
                 use_row_pipeline_id=use_row_pipeline_id,
                 use_row_node_id=use_row_node_id,
                 allow_any_pipeline_id=allow_any_pipeline_id,
+                allow_any_node_id=allow_any_node_id,
                 warn_cb=warn_cb,
             )
         )
@@ -12166,16 +12290,12 @@ END;"""
             if not self._profile_query_patch_ops_can_apply_to_row(row_obj, patch_ops):
                 continue
 
-            token_value, token_found = self._profile_query_extract_first_row_value(
+            token_candidates, _token_value, _token_found = self._profile_query_patch_entity_token_candidates(
                 row_obj,
-                [
-                    primary_key_field,
-                    "ENTITY_TOKEN",
-                    "entity_token",
-                    "entityToken",
-                ],
+                primary_key_field,
+                patch_ops,
             )
-            token = str(token_value).strip() if token_found and token_value is not None else ""
+            token = token_candidates[0] if token_candidates else ""
             row_pipeline_value, row_pipeline_found = self._profile_query_extract_first_row_value(
                 row_obj,
                 [
@@ -12404,6 +12524,8 @@ END;"""
             return
 
         primary_key_field = str(safe_cfg.get("profile_patch_primary_key_field") or "").strip()
+        if not primary_key_field and storage == "oracle":
+            primary_key_field = "ENTITY_TOKEN"
         if not primary_key_field:
             if callable(warn_cb):
                 warn_cb("Profile Query patch skipped: primary key field is empty.")
@@ -12421,21 +12543,7 @@ END;"""
         profile_cfg: Optional[Dict[str, Any]] = None
         if storage == "oracle":
             node_config = target_node_config if isinstance(target_node_config, dict) else {}
-            profile_cfg = {
-                "custom_profile_oracle_host": node_config.get("custom_profile_oracle_host"),
-                "custom_profile_oracle_port": node_config.get("custom_profile_oracle_port"),
-                "custom_profile_oracle_service_name": node_config.get("custom_profile_oracle_service_name"),
-                "custom_profile_oracle_sid": node_config.get("custom_profile_oracle_sid"),
-                "custom_profile_oracle_user": node_config.get("custom_profile_oracle_user"),
-                "custom_profile_oracle_password": node_config.get("custom_profile_oracle_password"),
-                "custom_profile_oracle_dsn": node_config.get("custom_profile_oracle_dsn"),
-                "custom_profile_oracle_table": node_config.get("custom_profile_oracle_table"),
-                "custom_profile_oracle_write_strategy": node_config.get("custom_profile_oracle_write_strategy"),
-                "custom_profile_oracle_parallel_workers": node_config.get("custom_profile_oracle_parallel_workers"),
-                "custom_profile_oracle_parallel_min_tokens": node_config.get("custom_profile_oracle_parallel_min_tokens"),
-                "custom_profile_oracle_merge_batch_size": node_config.get("custom_profile_oracle_merge_batch_size"),
-                "custom_profile_oracle_parallel_force": node_config.get("custom_profile_oracle_parallel_force"),
-            }
+            profile_cfg = self._profile_query_oracle_profile_cfg_from_source_config(node_config)
 
         def _collect_patch_changes(
             rows_to_patch: List[Any],
@@ -12451,25 +12559,38 @@ END;"""
                     # no-op cancel check guard by caller context; keep loop lightweight.
                     pass
                 row_obj = row if isinstance(row, dict) else {"value": row}
-                pk_value, pk_found = self._extract_row_value_by_path(row_obj, primary_key_field)
-                if not pk_found:
-                    pk_value = row_obj.get(primary_key_field)
-                token = str(pk_value).strip() if pk_value is not None else ""
-                if not token:
+                token_candidates, pk_value, pk_found = self._profile_query_patch_entity_token_candidates(
+                    row_obj,
+                    primary_key_field,
+                    patch_ops,
+                )
+                if not token_candidates:
                     skipped_missing_key_local += 1
                     continue
 
+                token = token_candidates[0]
                 if token in docs_store_local:
                     base_doc = docs_store_local.get(token) if isinstance(docs_store_local.get(token), dict) else {}
                     base_meta = meta_store_local.get(token) if isinstance(meta_store_local.get(token), dict) else {}
                 else:
-                    base_doc_loaded, base_meta_loaded = self._load_profile_state_single_entity(
-                        pipeline_id,
-                        target_node_id,
-                        token,
-                        storage=storage,
-                        profile_cfg=profile_cfg,
-                    )
+                    base_doc_loaded: Dict[str, Any] = {}
+                    base_meta_loaded: Dict[str, Any] = {}
+                    for candidate_token in token_candidates:
+                        loaded_doc, loaded_meta = self._load_profile_state_single_entity(
+                            pipeline_id,
+                            target_node_id,
+                            candidate_token,
+                            storage=storage,
+                            profile_cfg=profile_cfg,
+                        )
+                        if isinstance(loaded_doc, dict) and loaded_doc:
+                            token = candidate_token
+                            base_doc_loaded = loaded_doc
+                            base_meta_loaded = loaded_meta if isinstance(loaded_meta, dict) else {}
+                            break
+                        if candidate_token == token:
+                            base_doc_loaded = loaded_doc if isinstance(loaded_doc, dict) else {}
+                            base_meta_loaded = loaded_meta if isinstance(loaded_meta, dict) else {}
                     base_doc = base_doc_loaded if isinstance(base_doc_loaded, dict) else {}
                     base_meta = base_meta_loaded if isinstance(base_meta_loaded, dict) else {}
 
@@ -12485,7 +12606,11 @@ END;"""
                     skipped_invalid_patch_local += invalid_ops
 
                 current_pk, current_pk_found = self._extract_row_value_by_path(next_doc, primary_key_field)
-                if (not current_pk_found) or current_pk is None or str(current_pk).strip() == "":
+                if (
+                    pk_found
+                    and primary_key_field.upper() != "ENTITY_TOKEN"
+                    and ((not current_pk_found) or current_pk is None or str(current_pk).strip() == "")
+                ):
                     self._set_profile_path_value(next_doc, primary_key_field, self._json_safe_value(pk_value))
 
                 docs_store_local[token] = next_doc if isinstance(next_doc, dict) else {}
@@ -13600,6 +13725,44 @@ END;"""
         # flattened to row-level records, keep the current row instead of empty output.
         if normalized and re.search(r"\[(?:\d+|\*|)\]$", normalized):
             return row, True
+
+        # Profile-table rows often contain business fields nested under
+        # DOCUMENT_JSON.<profile>.field while downstream Data Query configs use
+        # the compact leaf name, e.g. customer_account. Resolve that leaf from
+        # nested dictionaries/lists before declaring the path missing.
+        if normalized and "." not in normalized and "[" not in normalized and "]" not in normalized:
+            leaf_norm = normalized.strip().lower()
+
+            def _find_leaf(value: Any, depth: int = 0) -> Tuple[Any, bool]:
+                if depth > 8:
+                    return None, False
+                if isinstance(value, str):
+                    text = value.strip()
+                    if text.startswith("{") and text.endswith("}"):
+                        try:
+                            value = json.loads(text)
+                        except Exception:
+                            return None, False
+                    else:
+                        return None, False
+                if isinstance(value, dict):
+                    for raw_key, raw_value in value.items():
+                        if str(raw_key or "").strip().lower() == leaf_norm:
+                            return raw_value, True
+                    for raw_value in value.values():
+                        found_value, found = _find_leaf(raw_value, depth + 1)
+                        if found:
+                            return found_value, True
+                elif isinstance(value, list):
+                    for item in value:
+                        found_value, found = _find_leaf(item, depth + 1)
+                        if found:
+                            return found_value, True
+                return None, False
+
+            nested_value, nested_found = _find_leaf(row)
+            if nested_found:
+                return nested_value, True
 
         return None, False
 
@@ -20823,7 +20986,7 @@ END;"""
                 )
                 return data
             if delay_node_id and delay_node_id not in completed_delay_ids:
-                raise BLWDelaySuspended(delay_node_id, delay_seconds, len(data))
+                raise BLWDelaySuspended(delay_node_id, delay_seconds, len(data), rows=list(data))
 
         if delay_scope == "message":
             output: List[Any] = []
@@ -21762,6 +21925,9 @@ END;"""
         ensure_key = table_sql.upper()
         if ensure_key in self._blw_tracker_ensured_tables:
             return
+        if self._parse_bool_like(os.getenv("BLW_TRACKER_SKIP_ENSURE", "0"), False):
+            self._blw_tracker_ensured_tables.add(ensure_key)
+            return
         if "." in table_sql:
             table_owner, table_base = table_sql.split(".", 1)
         else:
@@ -21855,6 +22021,10 @@ CREATE TABLE {table_sql} (
             (
                 f"IDX_{safe_suffix}_PIPE_NODE",
                 f"CREATE INDEX IDX_{safe_suffix}_PIPE_NODE ON {table_sql} (PIPELINE_ID, BUSINESS_NODE_ID)",
+            ),
+            (
+                f"IDX_{safe_suffix}_UPDATED",
+                f"CREATE INDEX IDX_{safe_suffix}_UPDATED ON {table_sql} (LAST_UPDATED_AT DESC)",
             ),
         ]
         cur = conn.cursor()
@@ -21960,17 +22130,25 @@ CREATE TABLE {table_sql} (
             safe["escalation_level"] = 0
         return safe
 
-    def _blw_tracker_apply_clob_inputsizes(self, cur: Any) -> None:
+    def _blw_tracker_apply_clob_inputsizes(
+        self,
+        cur: Any,
+        payloads: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
         try:
             import oracledb  # type: ignore
-            # Keep very small JSON fields as normal strings. Binding every JSON
-            # field as CLOB makes async enqueue much slower for thousands of rows.
-            cur.setinputsizes(
-                input_payload_json=oracledb.DB_TYPE_CLOB,
-                workflow_config_json=oracledb.DB_TYPE_CLOB,
-                context_json=oracledb.DB_TYPE_CLOB,
-                error_message=oracledb.DB_TYPE_CLOB,
-            )
+            bind_sizes: Dict[str, Any] = {}
+            rows = payloads if isinstance(payloads, list) else []
+            for key in self._blw_tracker_clob_keys():
+                if not rows:
+                    continue
+                for row in rows[:200]:
+                    value = row.get(key) if isinstance(row, dict) else None
+                    if isinstance(value, str) and len(value) > 3900:
+                        bind_sizes[key] = oracledb.DB_TYPE_CLOB
+                        break
+            if bind_sizes:
+                cur.setinputsizes(**bind_sizes)
         except Exception:
             pass
 
@@ -22032,9 +22210,92 @@ WHEN NOT MATCHED THEN INSERT (
 )"""
         cur = conn.cursor()
         try:
-            self._blw_tracker_apply_clob_inputsizes(cur)
+            self._blw_tracker_apply_clob_inputsizes(cur, [safe])
             cur.execute(sql, safe)
             conn.commit()
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+    def _blw_tracker_merge_many(self, conn: Any, table_name: str, payloads: List[Dict[str, Any]]) -> None:
+        if not payloads:
+            return
+        safe_payloads = [self._blw_tracker_safe_payload(payload) for payload in payloads]
+        try:
+            batch_size = int(os.getenv("BLW_TRACKER_MERGE_BATCH_SIZE", "500") or 500)
+        except Exception:
+            batch_size = 500
+        batch_size = max(25, min(batch_size, 2000))
+        sql = f"""
+MERGE INTO {table_name} t
+USING (SELECT :run_id AS run_id FROM dual) s
+ON (t.RUN_ID = s.run_id)
+WHEN MATCHED THEN UPDATE SET
+  WORKFLOW_ID=:workflow_id,
+  WORKFLOW_NAME=:workflow_name,
+  PIPELINE_ID=:pipeline_id,
+  BUSINESS_NODE_ID=:business_node_id,
+  INPUT_UNIQUE_ID=:input_unique_id,
+  INPUT_SOURCE=:input_source,
+  INPUT_PAYLOAD_JSON=:input_payload_json,
+  CURRENT_STAGE=:current_stage,
+  CURRENT_STEP_ID=:current_step_id,
+  CURRENT_STATUS=:current_status,
+  ITERATION_NO=:iteration_no,
+  MAX_ITERATIONS=:max_iterations,
+  RETRY_COUNT=:retry_count,
+  MAX_RETRY_ATTEMPTS=:max_retry_attempts,
+  ESCALATION_LEVEL=:escalation_level,
+  ESCALATION_STATUS=:escalation_status,
+  ESCALATED_TO=:escalated_to,
+  ERROR_CODE=:error_code,
+  ERROR_MESSAGE=:error_message,
+  WORKFLOW_CONFIG_JSON=:workflow_config_json,
+  STEP_TRACK_JSON=:step_track_json,
+  ROUTING_HISTORY_JSON=:routing_history_json,
+  RETRY_HISTORY_JSON=:retry_history_json,
+  ESCALATION_JSON=:escalation_json,
+  PARALLEL_BRANCH_JSON=:parallel_branch_json,
+  CONTEXT_JSON=:context_json,
+  LAST_UPDATED_AT=CAST(SYSTIMESTAMP AS TIMESTAMP),
+  ENDED_AT=CASE WHEN :current_status IN ('success','failed','terminated') THEN SYSTIMESTAMP ELSE ENDED_AT END,
+  PAUSED_AT=CASE WHEN :current_status = 'paused' THEN SYSTIMESTAMP ELSE PAUSED_AT END,
+  TERMINATED_AT=CASE WHEN :current_status = 'terminated' THEN SYSTIMESTAMP ELSE TERMINATED_AT END,
+  ESCALATED_AT=CASE WHEN :current_status = 'escalated' THEN SYSTIMESTAMP ELSE ESCALATED_AT END,
+  LAST_RETRY_AT=CASE WHEN :current_status = 'retrying' THEN SYSTIMESTAMP ELSE LAST_RETRY_AT END
+WHEN NOT MATCHED THEN INSERT (
+  RUN_ID, WORKFLOW_ID, WORKFLOW_NAME, PIPELINE_ID, BUSINESS_NODE_ID,
+  INPUT_UNIQUE_ID, INPUT_SOURCE, INPUT_PAYLOAD_JSON, CURRENT_STAGE,
+  CURRENT_STEP_ID, CURRENT_STATUS, ITERATION_NO, MAX_ITERATIONS,
+  RETRY_COUNT, MAX_RETRY_ATTEMPTS, ESCALATION_LEVEL, ESCALATION_STATUS,
+  ESCALATED_TO, ERROR_CODE, ERROR_MESSAGE, WORKFLOW_CONFIG_JSON,
+  STEP_TRACK_JSON, ROUTING_HISTORY_JSON, RETRY_HISTORY_JSON, ESCALATION_JSON,
+  PARALLEL_BRANCH_JSON, CONTEXT_JSON
+) VALUES (
+  :run_id, :workflow_id, :workflow_name, :pipeline_id, :business_node_id,
+  :input_unique_id, :input_source, :input_payload_json, :current_stage,
+  :current_step_id, :current_status, :iteration_no, :max_iterations,
+  :retry_count, :max_retry_attempts, :escalation_level, :escalation_status,
+  :escalated_to, :error_code, :error_message, :workflow_config_json,
+  :step_track_json, :routing_history_json, :retry_history_json, :escalation_json,
+  :parallel_branch_json, :context_json
+)"""
+        cur = conn.cursor()
+        try:
+            for start in range(0, len(safe_payloads), batch_size):
+                batch = safe_payloads[start:start + batch_size]
+                try:
+                    cur.bindarraysize = max(1, len(batch))
+                except Exception:
+                    pass
+                self._blw_tracker_apply_clob_inputsizes(cur, batch)
+                cur.executemany(sql, batch)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             try:
                 cur.close()
@@ -22045,6 +22306,11 @@ WHEN NOT MATCHED THEN INSERT (
         if not payloads:
             return
         safe_payloads = [self._blw_tracker_safe_payload(payload) for payload in payloads]
+        try:
+            batch_size = int(os.getenv("BLW_TRACKER_INSERT_BATCH_SIZE", "1000") or 1000)
+        except Exception:
+            batch_size = 1000
+        batch_size = max(50, min(batch_size, 5000))
         sql = f"""
 INSERT INTO {table_name} (
   RUN_ID, WORKFLOW_ID, WORKFLOW_NAME, PIPELINE_ID, BUSINESS_NODE_ID,
@@ -22065,25 +22331,102 @@ INSERT INTO {table_name} (
 )"""
         cur = conn.cursor()
         try:
-            self._blw_tracker_apply_clob_inputsizes(cur)
-            cur.executemany(sql, safe_payloads, batcherrors=True)
-            batch_errors = cur.getbatcherrors() if hasattr(cur, "getbatcherrors") else []
-            if batch_errors:
-                duplicate_errors = [
-                    err for err in batch_errors
-                    if "ORA-00001" in str(getattr(err, "message", err))
-                    or "unique constraint" in str(getattr(err, "message", err)).lower()
-                ]
-                if len(duplicate_errors) != len(batch_errors):
-                    raise RuntimeError("; ".join(str(getattr(err, "message", err)) for err in batch_errors[:5]))
+            for start in range(0, len(safe_payloads), batch_size):
+                batch = safe_payloads[start:start + batch_size]
+                try:
+                    cur.bindarraysize = max(1, len(batch))
+                except Exception:
+                    pass
+                self._blw_tracker_apply_clob_inputsizes(cur, batch)
+                cur.executemany(sql, batch, batcherrors=True)
+                batch_errors = cur.getbatcherrors() if hasattr(cur, "getbatcherrors") else []
+                if batch_errors:
+                    duplicate_errors = [
+                        err for err in batch_errors
+                        if "ORA-00001" in str(getattr(err, "message", err))
+                        or "unique constraint" in str(getattr(err, "message", err)).lower()
+                    ]
+                    if len(duplicate_errors) != len(batch_errors):
+                        raise RuntimeError("; ".join(str(getattr(err, "message", err)) for err in batch_errors[:5]))
             conn.commit()
         except Exception as exc:
             conn.rollback()
             text = str(exc or "")
             if "ORA-00001" not in text and "unique constraint" not in text.lower():
                 raise
-            for payload in payloads:
-                self._blw_tracker_merge(conn, table_name, payload)
+            self._blw_tracker_merge_many(conn, table_name, payloads)
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+    def _blw_tracker_insert_many_minimal(self, conn: Any, table_name: str, payloads: List[Dict[str, Any]]) -> None:
+        if not payloads:
+            return
+        safe_payloads = []
+        for payload in payloads:
+            safe = self._blw_tracker_safe_payload(payload)
+            safe["input_payload_json"] = None
+            safe["workflow_config_json"] = None
+            safe["step_track_json"] = None
+            safe["routing_history_json"] = None
+            safe["retry_history_json"] = None
+            safe["escalation_json"] = None
+            safe["parallel_branch_json"] = None
+            safe["context_json"] = json.dumps(
+                {
+                    "node_id_prefix": safe.get("business_node_id") or "business_workflow",
+                    "async": True,
+                    "minimal_tracker": True,
+                },
+                separators=(",", ":"),
+            )
+            safe_payloads.append(safe)
+        try:
+            batch_size = int(os.getenv("BLW_TRACKER_INSERT_BATCH_SIZE", "2000") or 2000)
+        except Exception:
+            batch_size = 2000
+        batch_size = max(50, min(batch_size, 10000))
+        sql = f"""
+INSERT INTO {table_name} (
+  RUN_ID, WORKFLOW_ID, WORKFLOW_NAME, PIPELINE_ID, BUSINESS_NODE_ID,
+  INPUT_UNIQUE_ID, INPUT_SOURCE, CURRENT_STAGE, CURRENT_STEP_ID,
+  CURRENT_STATUS, ITERATION_NO, MAX_ITERATIONS, RETRY_COUNT,
+  MAX_RETRY_ATTEMPTS, ESCALATION_LEVEL, ESCALATION_STATUS,
+  ESCALATED_TO, ERROR_CODE, ERROR_MESSAGE, CONTEXT_JSON
+) VALUES (
+  :run_id, :workflow_id, :workflow_name, :pipeline_id, :business_node_id,
+  :input_unique_id, :input_source, :current_stage, :current_step_id,
+  :current_status, :iteration_no, :max_iterations, :retry_count,
+  :max_retry_attempts, :escalation_level, :escalation_status,
+  :escalated_to, :error_code, :error_message, :context_json
+)"""
+        cur = conn.cursor()
+        try:
+            for start in range(0, len(safe_payloads), batch_size):
+                batch = safe_payloads[start:start + batch_size]
+                try:
+                    cur.bindarraysize = max(1, len(batch))
+                except Exception:
+                    pass
+                cur.executemany(sql, batch, batcherrors=True)
+                batch_errors = cur.getbatcherrors() if hasattr(cur, "getbatcherrors") else []
+                if batch_errors:
+                    duplicate_errors = [
+                        err for err in batch_errors
+                        if "ORA-00001" in str(getattr(err, "message", err))
+                        or "unique constraint" in str(getattr(err, "message", err)).lower()
+                    ]
+                    if len(duplicate_errors) != len(batch_errors):
+                        raise RuntimeError("; ".join(str(getattr(err, "message", err)) for err in batch_errors[:5]))
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            text = str(exc or "")
+            if "ORA-00001" not in text and "unique constraint" not in text.lower():
+                raise
+            self._blw_tracker_merge_many(conn, table_name, payloads)
         finally:
             try:
                 cur.close()
@@ -22120,24 +22463,73 @@ INSERT INTO {table_name} (
         seed = f"async:{exec_id}:{pipeline_id}:{node_id_prefix}:{instance_index}:{unique_value}:{datetime.utcnow().isoformat()}"
         return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:40]
 
+    def _blw_tracking_mode(self, wf_cfg: Dict[str, Any]) -> str:
+        """Normalize BLW tracker persistence mode from node or studio config."""
+        if not isinstance(wf_cfg, dict):
+            return "all_rows"
+
+        candidates = [
+            wf_cfg.get("workflow_tracking_mode"),
+            wf_cfg.get("workflowTrackingMode"),
+            wf_cfg.get("trackingMode"),
+        ]
+        studio_cfg = self._blw_parse_json_object(wf_cfg.get("blw_studio_config"))
+        if isinstance(studio_cfg, dict):
+            candidates.extend([
+                studio_cfg.get("workflow_tracking_mode"),
+                studio_cfg.get("workflowTrackingMode"),
+                studio_cfg.get("trackingMode"),
+            ])
+
+        aliases = {
+            "all": "all_rows",
+            "all_rows": "all_rows",
+            "track_all": "all_rows",
+            "minimal": "minimal",
+            "minimal_payload": "minimal",
+            "all_rows_minimal": "minimal",
+            "track_all_minimal": "minimal",
+            "exception": "exception_only",
+            "exceptions": "exception_only",
+            "exception_only": "exception_only",
+            "waiting_exception": "exception_only",
+            "wait_retry_error": "exception_only",
+            "none": "none",
+            "off": "none",
+            "disabled": "none",
+            "no_tracker": "none",
+        }
+        for value in candidates:
+            key = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+            if key in aliases:
+                return aliases[key]
+        return "all_rows"
+
     def _compact_blw_async_workflow_config(self, wf_cfg: Dict[str, Any]) -> Dict[str, Any]:
         """Keep only the fields the async BLW worker needs for runtime execution."""
         if not isinstance(wf_cfg, dict):
             return {"workflow_execution_mode": "inline"}
+        include_graph_cfg = wf_cfg.get(
+            "workflow_async_store_graph_in_tracker",
+            os.getenv("BLW_ASYNC_STORE_GRAPH_IN_TRACKER", "0"),
+        )
+        include_graph = bool(self._parse_bool_like(include_graph_cfg, False))
         keep_keys = [
             "workflow_id", "id", "workflowName", "workflow_name",
             "workflow_execution_mode", "execution_mode",
             "invoke_mode", "include_input_payload", "wait_for_completion",
             "completion_timeout_seconds", "workflow_tracking_enabled",
+            "workflow_tracking_mode", "workflowTrackingMode",
             "workflow_tracking_table", "workflow_unique_id_field",
             "workflow_parallel_enabled", "workflow_max_parallel_branches",
             "workflow_max_iterations", "workflow_max_retry_attempts",
             "custom_variables_json", "profile_store", "profile_namespace",
-            "blw_studio_config",
-            "embedded_workflow_nodes", "embedded_workflow_edges",
         ]
+        if include_graph:
+            keep_keys.extend(["blw_studio_config", "embedded_workflow_nodes", "embedded_workflow_edges"])
         compact = {key: wf_cfg.get(key) for key in keep_keys if key in wf_cfg}
         compact["workflow_execution_mode"] = "inline"
+        compact["_reload_graph_from_pipeline"] = not include_graph
         # Oracle connection credentials are resolved from env by the worker; do not
         # repeat them in every queued row.
         for key in list(compact.keys()):
@@ -22145,6 +22537,54 @@ INSERT INTO {table_name} (
             if "password" in lowered or "secret" in lowered or "token" in lowered:
                 compact.pop(key, None)
         return compact
+
+    def _blw_workflow_requests_batch_child_execution(self, wf_cfg: Dict[str, Any]) -> bool:
+        """Return true when any Execute Child Node explicitly asks for batch routed rows."""
+        if not isinstance(wf_cfg, dict):
+            return False
+        studio_cfg = self._blw_parse_json_object(wf_cfg.get("blw_studio_config"))
+        graph_nodes = studio_cfg.get("graphNodes")
+        if not isinstance(graph_nodes, list):
+            return False
+        for node in graph_nodes:
+            if not isinstance(node, dict):
+                continue
+            data = node.get("data") if isinstance(node.get("data"), dict) else {}
+            if str(data.get("blwType") or "").strip().lower() != "execute_child_node":
+                continue
+            action = self._blw_parse_json_object(data.get("actionJson"))
+            run_mode = str(
+                action.get("childRunMode")
+                or action.get("childBatchMode")
+                or action.get("runMode")
+                or ""
+            ).strip().lower()
+            if run_mode in {"batch", "batch_routed_rows", "routed_batch", "batch_rows"}:
+                return True
+        return False
+
+    def _blw_workflow_child_execution_batch_size(self, wf_cfg: Dict[str, Any], default: int = 2000) -> int:
+        if not isinstance(wf_cfg, dict):
+            return default
+        studio_cfg = self._blw_parse_json_object(wf_cfg.get("blw_studio_config"))
+        graph_nodes = studio_cfg.get("graphNodes")
+        if not isinstance(graph_nodes, list):
+            return default
+        for node in graph_nodes:
+            if not isinstance(node, dict):
+                continue
+            data = node.get("data") if isinstance(node.get("data"), dict) else {}
+            if str(data.get("blwType") or "").strip().lower() != "execute_child_node":
+                continue
+            action = self._blw_parse_json_object(data.get("actionJson"))
+            run_mode = str(action.get("childRunMode") or action.get("childBatchMode") or "").strip().lower()
+            if run_mode not in {"batch", "batch_routed_rows", "routed_batch", "batch_rows"}:
+                continue
+            try:
+                return max(1, min(int(action.get("childBatchSize") or default), 5000))
+            except Exception:
+                return default
+        return default
 
     def _enqueue_blw_async_instances(
         self,
@@ -22167,6 +22607,12 @@ INSERT INTO {table_name} (
             instances = [[row] for row in rows[:max_instances]]
         else:
             instances = [rows if include_input_payload else [{}]]
+        tracking_mode = self._blw_tracking_mode(wf_cfg)
+        # Minimal tracker rows deliberately omit CLOB payload/config columns.
+        # That is only safe for tracker-only enqueue. If the BLW graph contains
+        # Execute Child nodes, the async worker needs the input row payload to
+        # run child Data Query / Custom Fields / MLOps nodes correctly.
+        minimal_payload = tracking_mode == "minimal" and not self._blw_workflow_requests_batch_child_execution(wf_cfg)
         pipeline_id = ""
         business_node_id = node_id_prefix
         if isinstance(execution_context, dict):
@@ -22176,7 +22622,7 @@ INSERT INTO {table_name} (
         queue_payloads: List[Dict[str, Any]] = []
         try:
             compact_wf_cfg_json = json.dumps(
-                self._json_safe_value(self._compact_blw_async_workflow_config(wf_cfg)),
+                self._json_safe_value({} if minimal_payload else self._compact_blw_async_workflow_config(wf_cfg)),
                 ensure_ascii=False,
                 default=str,
                 separators=(",", ":"),
@@ -22204,7 +22650,16 @@ INSERT INTO {table_name} (
                     "business_node_id": business_node_id,
                     "input_unique_id": unique_value or f"instance_{idx}",
                     "input_source": "async_tracker",
-                    "input_payload_json": self._json_safe_value(instance_payload),
+                    "input_payload_json": self._json_safe_value(
+                        [
+                            {
+                                unique_field or "TRANSACTIONID": unique_value or f"instance_{idx}",
+                                "_blw_payload_ref": "pipeline_source",
+                            }
+                        ]
+                        if minimal_payload
+                        else instance_payload
+                    ),
                     "current_stage": "Queued",
                     "current_step_id": "__queued__",
                     "current_status": "pending",
@@ -22218,21 +22673,88 @@ INSERT INTO {table_name} (
                     "error_code": "",
                     "error_message": "",
                     "workflow_config_json": compact_wf_cfg_json,
-                    "step_track_json": [{"node_id": "__queued__", "label": "Queued", "status": "pending", "rows": len(instance_payload), "at": datetime.utcnow().isoformat()}],
+                    "step_track_json": [] if minimal_payload else [{"node_id": "__queued__", "label": "Queued", "status": "pending", "rows": len(instance_payload), "at": datetime.utcnow().isoformat()}],
                     "routing_history_json": [],
                     "retry_history_json": [],
                     "escalation_json": [],
                     "parallel_branch_json": [],
-                    "context_json": {"node_id_prefix": node_id_prefix, "async": True, "instance_index": idx},
+                    "context_json": {
+                        "node_id_prefix": node_id_prefix,
+                        "async": True,
+                        "instance_index": idx,
+                        "minimal_tracker": True,
+                    } if minimal_payload else {"node_id_prefix": node_id_prefix, "async": True, "instance_index": idx},
                 })
                 enqueued.append({"run_id": run_id, "rows": len(instance_payload), "input_unique_id": unique_value or f"instance_{idx}"})
-            self._blw_tracker_insert_many(conn, table_name, queue_payloads)
+            if minimal_payload:
+                self._blw_tracker_insert_many_minimal(conn, table_name, queue_payloads)
+            else:
+                self._blw_tracker_insert_many(conn, table_name, queue_payloads)
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
         return enqueued
+
+    def _mark_blw_runs_waiting(
+        self,
+        workflow_config: Dict[str, Any],
+        run_ids: List[str],
+        wait_node_id: str,
+        wait_seconds: float,
+    ) -> None:
+        ids = [str(run_id or "").strip() for run_id in run_ids if str(run_id or "").strip()]
+        if not ids:
+            return
+        conn, tracker_cfg = self._blw_tracker_connect(workflow_config)
+        table_name = str(tracker_cfg.get("table") or workflow_config.get("workflow_tracking_table") or "BLW_WORKFLOW_TRACKER")
+        self._ensure_blw_tracker_table(conn, table_name)
+        wait_seconds = max(0.0, float(wait_seconds or 0.0))
+        wait_until = datetime.utcnow() + timedelta(seconds=wait_seconds)
+        payloads = [
+            {
+                "run_id": run_id,
+                "wait_node_id": str(wait_node_id or "")[:255],
+                "wait_seconds": wait_seconds,
+                "context_json": json.dumps(
+                    self._json_safe_value({
+                        "completed_delay_node_ids": [str(wait_node_id or "")],
+                        "last_wait_node_id": str(wait_node_id or ""),
+                        "last_wait_seconds": wait_seconds,
+                        "last_wait_until": wait_until.isoformat(),
+                        "exception_only_tracking": True,
+                    }),
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            }
+            for run_id in ids
+        ]
+        cur = conn.cursor()
+        try:
+            cur.executemany(f"""
+                UPDATE {table_name}
+                SET CURRENT_STATUS='waiting',
+                    CURRENT_STAGE='Waiting',
+                    CURRENT_STEP_ID=:wait_node_id,
+                    WAIT_UNTIL=CAST(SYSTIMESTAMP AS TIMESTAMP) + NUMTODSINTERVAL(:wait_seconds, 'SECOND'),
+                    CONTEXT_JSON=:context_json,
+                    ERROR_CODE=NULL,
+                    ERROR_MESSAGE=NULL,
+                    LAST_UPDATED_AT=CAST(SYSTIMESTAMP AS TIMESTAMP)
+                WHERE RUN_ID=:run_id
+            """, payloads)
+            conn.commit()
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _blw_read_lob_text(self, value: Any) -> str:
         if value is None:
@@ -22250,9 +22772,28 @@ INSERT INTO {table_name} (
         node_id = str(business_node_id or "").strip()
         if not pid or not node_id:
             return {}
+        nodes_raw = self._load_current_pipeline_nodes(pid)
+        if not nodes_raw:
+            return {}
+        try:
+            for node in nodes_raw:
+                if not isinstance(node, dict) or str(node.get("id") or "").strip() != node_id:
+                    continue
+                data = node.get("data") if isinstance(node.get("data"), dict) else {}
+                cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
+                return dict(cfg)
+        except Exception as exc:
+            logger.warning(f"Unable to reload BLW node config from SQLite for {pid}/{node_id}: {exc}")
+        return {}
+
+    def _load_current_pipeline_nodes(self, pipeline_id: str) -> List[Dict[str, Any]]:
+        """Reload latest pipeline nodes from SQLite for embedded/async child execution context."""
+        pid = str(pipeline_id or "").strip()
+        if not pid:
+            return []
         db_url = str(os.getenv("DATABASE_URL", "sqlite:///./etl_platform.db") or "").strip()
         if not db_url.lower().startswith("sqlite"):
-            return {}
+            return []
         if db_url.startswith("sqlite:///"):
             raw_path = db_url[len("sqlite:///"):]
         elif db_url.startswith("sqlite://"):
@@ -22263,7 +22804,7 @@ INSERT INTO {table_name} (
         if not db_path.is_absolute():
             db_path = Path(__file__).resolve().parent / db_path
         if not db_path.exists():
-            return {}
+            return []
         try:
             conn = sqlite3.connect(str(db_path))
             try:
@@ -22271,19 +22812,14 @@ INSERT INTO {table_name} (
             finally:
                 conn.close()
             if not row:
-                return {}
+                return []
             nodes_raw = json.loads(str(row[0] or "[]"))
             if not isinstance(nodes_raw, list):
-                return {}
-            for node in nodes_raw:
-                if not isinstance(node, dict) or str(node.get("id") or "").strip() != node_id:
-                    continue
-                data = node.get("data") if isinstance(node.get("data"), dict) else {}
-                cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
-                return dict(cfg)
+                return []
+            return [node for node in nodes_raw if isinstance(node, dict)]
         except Exception as exc:
-            logger.warning(f"Unable to reload BLW node config from SQLite for {pid}/{node_id}: {exc}")
-        return {}
+            logger.warning(f"Unable to reload pipeline nodes from SQLite for {pid}: {exc}")
+        return []
 
     async def process_blw_async_tracker_queue(
         self,
@@ -22295,7 +22831,7 @@ INSERT INTO {table_name} (
         conn, tracker_cfg = self._blw_tracker_connect(cfg)
         table_name = str(tracker_cfg.get("table") or cfg.get("workflow_tracking_table") or "BLW_WORKFLOW_TRACKER")
         self._ensure_blw_tracker_table(conn, table_name)
-        safe_limit = max(1, min(int(limit or 50), 500))
+        safe_limit = max(1, min(int(limit or 500), 5000))
         try:
             stale_seconds = max(10, min(int(stale_running_seconds or 60), 86400))
         except Exception:
@@ -22321,10 +22857,26 @@ INSERT INTO {table_name} (
                 FETCH FIRST {safe_limit} ROWS ONLY
             """, {"stale_seconds": stale_seconds})
             rows = cur.fetchall()
+            rows_by_run_id: Dict[str, Any] = {}
+            ordered_run_ids: List[str] = []
             for row in rows:
                 run_id = str(row[0] or "").strip()
                 if not run_id:
                     continue
+                if run_id in rows_by_run_id:
+                    continue
+                rows_by_run_id[run_id] = row
+                ordered_run_ids.append(run_id)
+
+            claimed_ids: set = set()
+            for start in range(0, len(ordered_run_ids), 900):
+                chunk = ordered_run_ids[start:start + 900]
+                if not chunk:
+                    continue
+                bind_names = [f"run_id_{idx}" for idx in range(len(chunk))]
+                params = {name: value for name, value in zip(bind_names, chunk)}
+                params["stale_seconds"] = stale_seconds
+                placeholders = ", ".join(f":{name}" for name in bind_names)
                 cur.execute(f"""
                     UPDATE {table_name}
                     SET CURRENT_STATUS='running',
@@ -22332,7 +22884,7 @@ INSERT INTO {table_name} (
                         CURRENT_STEP_ID='__worker__',
                         WAIT_UNTIL=NULL,
                         LAST_UPDATED_AT=CAST(SYSTIMESTAMP AS TIMESTAMP)
-                    WHERE RUN_ID=:run_id
+                    WHERE RUN_ID IN ({placeholders})
                       AND (
                             CURRENT_STATUS IN ('pending', 'retry_requested', 'resume_requested')
                             OR (
@@ -22344,8 +22896,14 @@ INSERT INTO {table_name} (
                                 AND LAST_UPDATED_AT < CAST(SYSTIMESTAMP AS TIMESTAMP) - NUMTODSINTERVAL(:stale_seconds, 'SECOND')
                             )
                       )
-                """, {"run_id": run_id, "stale_seconds": stale_seconds})
-                if int(getattr(cur, "rowcount", 0) or 0) <= 0:
+                """, params)
+                if int(getattr(cur, "rowcount", 0) or 0) > 0:
+                    claimed_ids.update(chunk)
+            for run_id in ordered_run_ids:
+                if run_id not in claimed_ids:
+                    continue
+                row = rows_by_run_id.get(run_id)
+                if row is None:
                     continue
                 claimed.append({
                     "run_id": run_id,
@@ -22397,6 +22955,8 @@ INSERT INTO {table_name} (
                 run_context = context_raw if isinstance(context_raw, dict) else {}
             except Exception:
                 run_context = {}
+            pipeline_id_for_context = str(item.get("pipeline_id") or wf_cfg.get("pipeline_id") or "").strip()
+            pipeline_nodes_for_context = self._load_current_pipeline_nodes(pipeline_id_for_context)
             completed_delay_node_ids = [
                 str(value)
                 for value in run_context.get("completed_delay_node_ids", [])
@@ -22431,6 +22991,8 @@ INSERT INTO {table_name} (
                     child_edges=child_edges,
                     workflow_config=wf_cfg,
                     execution_context={
+                        "pipeline_id": pipeline_id_for_context,
+                        "pipeline_nodes": pipeline_nodes_for_context,
                         "node_id": str(item.get("business_node_id") or "business_workflow"),
                         "node_label": "BLW Async Worker",
                         "blw_async_persist_wait": True,
@@ -22466,19 +23028,240 @@ INSERT INTO {table_name} (
                     "error_message": str(exc),
                 }
 
+        def _claimed_item_wf_cfg(item: Dict[str, Any]) -> Dict[str, Any]:
+            try:
+                wf_cfg_raw = json.loads(str(item.get("workflow_config_json") or "{}"))
+                wf_cfg = wf_cfg_raw if isinstance(wf_cfg_raw, dict) else {}
+            except Exception:
+                wf_cfg = {}
+            if not isinstance(wf_cfg.get("embedded_workflow_nodes"), list):
+                current_cfg = self._load_current_blw_node_config(
+                    str(item.get("pipeline_id") or wf_cfg.get("pipeline_id") or ""),
+                    str(item.get("business_node_id") or ""),
+                )
+                if current_cfg:
+                    if isinstance(current_cfg.get("embedded_workflow_nodes"), list):
+                        wf_cfg["embedded_workflow_nodes"] = current_cfg.get("embedded_workflow_nodes")
+                    if isinstance(current_cfg.get("embedded_workflow_edges"), list):
+                        wf_cfg["embedded_workflow_edges"] = current_cfg.get("embedded_workflow_edges")
+                    if not isinstance(wf_cfg.get("blw_studio_config"), dict) and isinstance(current_cfg.get("blw_studio_config"), dict):
+                        wf_cfg["blw_studio_config"] = current_cfg.get("blw_studio_config")
+            return wf_cfg
+
+        async def _process_claimed_batch(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            if not items:
+                return []
+            first = items[0]
+            run_ids = [str(item.get("run_id") or "") for item in items if str(item.get("run_id") or "").strip()]
+            wf_cfg = _claimed_item_wf_cfg(first)
+            all_input_rows: List[Any] = []
+            item_contexts: Dict[str, Dict[str, Any]] = {}
+            completed_delay_node_ids: List[str] = []
+            for item in items:
+                run_id = str(item.get("run_id") or "")
+                try:
+                    input_rows_raw = json.loads(str(item.get("input_payload_json") or "[]"))
+                    input_rows = input_rows_raw if isinstance(input_rows_raw, list) else [input_rows_raw]
+                except Exception:
+                    input_rows = []
+                run_tagged_rows: List[Any] = []
+                for raw_row in input_rows:
+                    if isinstance(raw_row, dict):
+                        row_obj = dict(raw_row)
+                    else:
+                        row_obj = {"value": raw_row}
+                    row_obj["_blw_async_run_id"] = run_id
+                    run_tagged_rows.append(row_obj)
+                all_input_rows.extend(run_tagged_rows)
+                try:
+                    context_raw = json.loads(str(item.get("context_json") or "{}"))
+                    run_context = context_raw if isinstance(context_raw, dict) else {}
+                except Exception:
+                    run_context = {}
+                item_contexts[run_id] = run_context
+                raw_completed = run_context.get("completed_delay_node_ids")
+                if isinstance(raw_completed, list):
+                    for value in raw_completed:
+                        text = str(value or "").strip()
+                        if text and text not in completed_delay_node_ids:
+                            completed_delay_node_ids.append(text)
+            pipeline_id_for_context = str(first.get("pipeline_id") or wf_cfg.get("pipeline_id") or "").strip()
+            pipeline_nodes_for_context = self._load_current_pipeline_nodes(pipeline_id_for_context)
+            wf_cfg = {
+                **wf_cfg,
+                "workflow_execution_mode": "inline",
+                "workflow_run_id": str(first.get("run_id") or ""),
+                "workflow_tracking_enabled": False,
+            }
+            blw_runtime_cfg = self._blw_parse_json_object(wf_cfg.get("blw_studio_config"))
+            if isinstance(wf_cfg.get("embedded_workflow_nodes"), list):
+                blw_runtime_cfg["embedded_workflow_nodes"] = wf_cfg.get("embedded_workflow_nodes")
+            if isinstance(wf_cfg.get("embedded_workflow_edges"), list):
+                blw_runtime_cfg["embedded_workflow_edges"] = wf_cfg.get("embedded_workflow_edges")
+            child_nodes, child_edges = self._blw_studio_to_embedded_runtime(blw_runtime_cfg)
+            if not child_nodes:
+                return [
+                    {
+                        "status": "failed",
+                        "run_id": run_id,
+                        "error_code": "BLWConfigError",
+                        "error_message": "Async BLW batch has no BLW Studio graph to execute.",
+                    }
+                    for run_id in run_ids
+                ]
+            try:
+                wait_rows_by_node: Dict[str, List[Any]] = {}
+                await self._run_business_workflow_embedded(
+                    input_rows=all_input_rows,
+                    child_nodes=child_nodes,
+                    child_edges=child_edges,
+                    workflow_config=wf_cfg,
+                    execution_context={
+                        "pipeline_id": pipeline_id_for_context,
+                        "pipeline_nodes": pipeline_nodes_for_context,
+                        "node_id": str(first.get("business_node_id") or "business_workflow"),
+                        "node_label": "BLW Async Batch Worker",
+                        "blw_async_persist_wait": True,
+                        "blw_completed_delay_node_ids": completed_delay_node_ids,
+                        "blw_batch_nonblocking_wait": True,
+                        "blw_wait_rows_by_node": wait_rows_by_node,
+                    },
+                    node_id_prefix=str(first.get("business_node_id") or "business_workflow"),
+                )
+                waiting_run_ids: Dict[str, Dict[str, Any]] = {}
+                wait_until = datetime.utcnow()
+                for wait_node_id, wait_rows in wait_rows_by_node.items():
+                    if not isinstance(wait_rows, list) or not wait_rows:
+                        continue
+                    delay_seconds = 0.0
+                    for node_payload in child_nodes:
+                        node_cfg = node_payload.get("config") if isinstance(node_payload.get("config"), dict) else {}
+                        if str(node_cfg.get("blw_node_id") or node_payload.get("id") or "") == str(wait_node_id):
+                            delay_seconds = self._resolve_delay_seconds(node_cfg)
+                            break
+                    wait_until = datetime.utcnow() + timedelta(seconds=delay_seconds)
+                    for wait_row in wait_rows:
+                        if not isinstance(wait_row, dict):
+                            continue
+                        wait_run_id = str(wait_row.get("_blw_async_run_id") or "").strip()
+                        if not wait_run_id:
+                            continue
+                        run_context = item_contexts.get(wait_run_id) or {}
+                        raw_completed = run_context.get("completed_delay_node_ids")
+                        base_completed = [
+                            str(value)
+                            for value in raw_completed
+                            if str(value or "").strip()
+                        ] if isinstance(raw_completed, list) else []
+                        waiting_run_ids[wait_run_id] = {
+                            "status": "waiting",
+                            "run_id": wait_run_id,
+                            "wait_node_id": str(wait_node_id),
+                            "wait_seconds": delay_seconds,
+                            "rows": 1,
+                            "context_json": self._json_safe_value({
+                                **run_context,
+                                "completed_delay_node_ids": list(dict.fromkeys([*base_completed, str(wait_node_id)])),
+                                "last_wait_node_id": str(wait_node_id),
+                                "last_wait_seconds": delay_seconds,
+                                "last_wait_until": wait_until.isoformat(),
+                                "batch_wait": True,
+                            }),
+                        }
+                return [
+                    waiting_run_ids[run_id] if run_id in waiting_run_ids else {"status": "processed", "run_id": run_id}
+                    for run_id in run_ids
+                ]
+            except BLWDelaySuspended as wait_exc:
+                wait_until = datetime.utcnow() + timedelta(seconds=wait_exc.delay_seconds)
+                results: List[Dict[str, Any]] = []
+                for run_id in run_ids:
+                    run_context = item_contexts.get(run_id) or {}
+                    raw_completed = run_context.get("completed_delay_node_ids")
+                    base_completed = [
+                        str(value)
+                        for value in raw_completed
+                        if str(value or "").strip()
+                    ] if isinstance(raw_completed, list) else []
+                    next_context = {
+                        **run_context,
+                        "completed_delay_node_ids": list(dict.fromkeys([*base_completed, wait_exc.node_id])),
+                        "last_wait_node_id": wait_exc.node_id,
+                        "last_wait_seconds": wait_exc.delay_seconds,
+                        "last_wait_until": wait_until.isoformat(),
+                        "batch_wait": True,
+                    }
+                    results.append({
+                        "status": "waiting",
+                        "run_id": run_id,
+                        "wait_node_id": wait_exc.node_id,
+                        "wait_seconds": wait_exc.delay_seconds,
+                        "rows": wait_exc.rows_count,
+                        "context_json": self._json_safe_value(next_context),
+                    })
+                return results
+            except Exception as exc:
+                logger.warning(f"BLW async batch worker failed for {len(run_ids)} run(s): {exc}")
+                return [
+                    {
+                        "status": "failed",
+                        "run_id": run_id,
+                        "error_code": type(exc).__name__,
+                        "error_message": str(exc),
+                    }
+                    for run_id in run_ids
+                ]
+
         if claimed:
             try:
-                max_concurrency = int(os.getenv("BLW_ASYNC_WORKER_CONCURRENCY", "500") or "500")
+                max_concurrency = int(os.getenv("BLW_ASYNC_WORKER_CONCURRENCY", "150") or "150")
             except Exception:
-                max_concurrency = 500
-            max_concurrency = max(1, min(safe_limit, max_concurrency))
+                max_concurrency = 150
+            max_concurrency = max(1, min(300, max_concurrency))
             semaphore = asyncio.Semaphore(max_concurrency)
+            batch_groups: Dict[str, List[Dict[str, Any]]] = {}
+            batch_group_counts: Dict[str, int] = {}
+            single_items: List[Dict[str, Any]] = []
+            for item in claimed:
+                wf_cfg = _claimed_item_wf_cfg(item)
+                if self._blw_workflow_requests_batch_child_execution(wf_cfg):
+                    try:
+                        requested_size = int(
+                            self._blw_workflow_child_execution_batch_size(
+                                wf_cfg,
+                                int(os.getenv("BLW_CHILD_EXECUTION_BATCH_SIZE", "2000") or 2000),
+                            )
+                            or 2000
+                        )
+                    except Exception:
+                        requested_size = 2000
+                    requested_size = max(1, min(requested_size, 5000))
+                    group_base = "|".join([
+                        str(item.get("pipeline_id") or ""),
+                        str(item.get("business_node_id") or ""),
+                        hashlib.sha1(json.dumps(self._json_safe_value(wf_cfg), sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16],
+                    ])
+                    group_count = int(batch_group_counts.get(group_base, 0))
+                    group_index = group_count // requested_size
+                    batch_group_counts[group_base] = group_count + 1
+                    batch_groups.setdefault(f"{group_base}|{group_index}", []).append(item)
+                else:
+                    single_items.append(item)
 
             async def _guarded_process(item: Dict[str, Any]) -> Dict[str, Any]:
                 async with semaphore:
                     return await _process_claimed_item(item)
 
-            results = await asyncio.gather(*[_guarded_process(item) for item in claimed])
+            async def _guarded_batch(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                async with semaphore:
+                    return await _process_claimed_batch(items)
+
+            single_results = await asyncio.gather(*[_guarded_process(item) for item in single_items]) if single_items else []
+            grouped_results = await asyncio.gather(*[_guarded_batch(items) for items in batch_groups.values()]) if batch_groups else []
+            results = list(single_results)
+            for result_group in grouped_results:
+                if isinstance(result_group, list):
+                    results.extend(result_group)
         else:
             results = []
         processed_items = [result for result in results if isinstance(result, dict) and result.get("status") == "processed"]
@@ -22636,6 +23419,90 @@ INSERT INTO {table_name} (
             ).strip() or parent_node_label
 
         if workflow_execution_mode in {"async", "async_tracker", "background", "queue"}:
+            def _prepare_async_inline_rows(base_rows: List[Any]) -> List[Any]:
+                prepared: List[Any] = []
+                for raw in base_rows if isinstance(base_rows, list) else []:
+                    prepared.append(dict(raw) if isinstance(raw, dict) else {"value": raw})
+                return prepared
+
+            tracking_mode = str(
+                node_cfg.get("workflow_tracking_mode")
+                or node_cfg.get("workflowTrackingMode")
+                or (self._blw_parse_json_object(node_cfg.get("blw_studio_config")).get("trackingMode") if node_cfg.get("blw_studio_config") else "")
+                or "all_rows"
+            ).strip().lower()
+            if tracking_mode in {"none", "off", "disabled", "batch_only", "no_tracker"}:
+                inline_cfg = {
+                    **node_cfg,
+                    "workflow_execution_mode": "inline",
+                    "workflow_tracking_enabled": False,
+                }
+                base_rows = rows if include_input_payload else ([{}] if rows else [])
+                return await self._run_business_workflow_embedded(
+                    input_rows=_prepare_async_inline_rows(base_rows),
+                    child_nodes=child_nodes,
+                    child_edges=child_edges,
+                    workflow_config=inline_cfg,
+                    execution_context=execution_context,
+                    node_id_prefix=parent_node_id or "business_workflow",
+                )
+            if tracking_mode in {"exception_only", "exceptions", "waiting_exception", "waiting_exceptions", "track_exceptions"}:
+                wait_rows_by_node: Dict[str, List[Any]] = {}
+                inline_ctx = dict(execution_context or {})
+                inline_ctx.update({
+                    "blw_async_persist_wait": True,
+                    "blw_batch_nonblocking_wait": True,
+                    "blw_wait_rows_by_node": wait_rows_by_node,
+                })
+                inline_cfg = {
+                    **node_cfg,
+                    "workflow_execution_mode": "inline",
+                    "workflow_tracking_enabled": False,
+                }
+                base_rows = rows if include_input_payload else ([{}] if rows else [])
+                output_rows = await self._run_business_workflow_embedded(
+                    input_rows=_prepare_async_inline_rows(base_rows),
+                    child_nodes=child_nodes,
+                    child_edges=child_edges,
+                    workflow_config=inline_cfg,
+                    execution_context=inline_ctx,
+                    node_id_prefix=parent_node_id or "business_workflow",
+                )
+                for wait_node_id, wait_rows in wait_rows_by_node.items():
+                    if not isinstance(wait_rows, list) or not wait_rows:
+                        continue
+                    delay_seconds = 0.0
+                    for node_payload in child_nodes:
+                        node_cfg_for_wait = node_payload.get("config") if isinstance(node_payload.get("config"), dict) else {}
+                        if str(node_cfg_for_wait.get("blw_node_id") or node_payload.get("id") or "") == str(wait_node_id):
+                            delay_seconds = self._resolve_delay_seconds(node_cfg_for_wait)
+                            break
+                    enqueued_waits = self._enqueue_blw_async_instances(
+                        input_rows=wait_rows,
+                        workflow_config=node_cfg,
+                        execution_context=execution_context,
+                        node_id_prefix=parent_node_id or "business_workflow",
+                        per_row_mode=True,
+                        max_instances=max_instances,
+                        include_input_payload=include_input_payload,
+                    )
+                    self._mark_blw_runs_waiting(
+                        node_cfg,
+                        [str(item.get("run_id") or "") for item in enqueued_waits],
+                        str(wait_node_id),
+                        delay_seconds,
+                    )
+                if isinstance(output_rows, list):
+                    summary = {
+                        "_blw_async_enqueued": bool(wait_rows_by_node),
+                        "_blw_tracking_mode": "exception_only",
+                        "_blw_exception_tracker_rows": sum(len(v) for v in wait_rows_by_node.values() if isinstance(v, list)),
+                    }
+                    return [
+                        {**row, **summary} if isinstance(row, dict) else {"value": row, **summary}
+                        for row in output_rows
+                    ]
+                return output_rows
             base_rows_for_queue = rows if include_input_payload else ([{} for _ in rows] if rows else [{}])
             enqueued = self._enqueue_blw_async_instances(
                 input_rows=base_rows_for_queue,
@@ -23378,7 +24245,19 @@ INSERT INTO {table_name} (
                             )
                         last_exc = None
                         break
-                    except BLWDelaySuspended:
+                    except BLWDelaySuspended as wait_exc:
+                        if isinstance(execution_context, dict) and self._parse_bool_like(
+                            execution_context.get("blw_batch_nonblocking_wait", False),
+                            False,
+                        ):
+                            wait_rows_by_node = execution_context.setdefault("blw_wait_rows_by_node", {})
+                            if isinstance(wait_rows_by_node, dict):
+                                bucket = wait_rows_by_node.setdefault(wait_exc.node_id, [])
+                                if isinstance(bucket, list):
+                                    bucket.extend(wait_exc.rows if isinstance(wait_exc.rows, list) else [])
+                            output = []
+                            last_exc = None
+                            break
                         raise
                     except Exception as attempt_exc:
                         last_exc = attempt_exc
@@ -24484,7 +25363,7 @@ INSERT INTO {table_name} (
         engine = None
         engine_cache_key: Optional[str] = None
         try:
-            from sqlalchemy import types as sql_types
+            from sqlalchemy import inspect, types as sql_types
             from sqlalchemy.dialects import oracle as oracle_types
             import pandas as pd
 
@@ -24695,6 +25574,96 @@ INSERT INTO {table_name} (
                 lower = text.lower()
                 return "unique constraint" in lower and "violated" in lower
 
+            def _bounded_int_config(
+                primary_key: str,
+                legacy_key: str,
+                env_key: str,
+                default: int,
+                min_value: int,
+                max_value: int,
+            ) -> int:
+                raw = config.get(primary_key)
+                if raw in (None, ""):
+                    raw = config.get(legacy_key)
+                if raw in (None, ""):
+                    raw = os.getenv(env_key, str(default))
+                try:
+                    value = int(float(str(raw).strip()))
+                except Exception:
+                    value = default
+                return max(min_value, min(value, max_value))
+
+            def _direct_oracle_insert_many(conn: Any, frame: Any, batch_size: int) -> int:
+                columns = [str(col) for col in frame.columns]
+                if not columns or frame.empty:
+                    return 0
+
+                table_expr = _quote_ident(table)
+                if schema:
+                    table_expr = f"{_quote_ident(schema)}.{table_expr}"
+
+                bind_names = [f"c{idx}" for idx, _ in enumerate(columns)]
+                insert_sql = (
+                    f"INSERT INTO {table_expr} "
+                    f"({', '.join(_quote_ident(col) for col in columns)}) "
+                    f"VALUES ({', '.join(':' + name for name in bind_names)})"
+                )
+
+                raw_connection = None
+                try:
+                    raw_connection = getattr(conn.connection, "driver_connection", None)
+                    if raw_connection is None:
+                        raw_connection = getattr(conn.connection, "connection", None)
+                except Exception:
+                    raw_connection = None
+                if raw_connection is None:
+                    raise RuntimeError("Oracle raw connection is unavailable for direct batch insert.")
+
+                cursor = raw_connection.cursor()
+                try:
+                    large_text_binds: Dict[str, Any] = {}
+                    try:
+                        import oracledb  # type: ignore
+                        for idx, col in enumerate(columns):
+                            series = frame[col]
+                            if not (
+                                pd.api.types.is_object_dtype(series)
+                                or pd.api.types.is_string_dtype(series)
+                            ):
+                                continue
+                            sample = series.dropna().head(200)
+                            if any(isinstance(value, str) and len(value) > 3900 for value in sample):
+                                large_text_binds[bind_names[idx]] = oracledb.DB_TYPE_CLOB
+                        if large_text_binds:
+                            cursor.setinputsizes(**large_text_binds)
+                    except Exception:
+                        pass
+
+                    safe_frame = frame.where(pd.notnull(frame), None)
+                    total = int(len(safe_frame))
+                    written = 0
+                    step = max(1, int(batch_size or 5000))
+                    for start in range(0, total, step):
+                        _raise_if_aborted()
+                        batch_frame = safe_frame.iloc[start:start + step]
+                        batch_params = [
+                            {
+                                bind_names[idx]: _normalize_value(row.get(col))
+                                for idx, col in enumerate(columns)
+                            }
+                            for row in batch_frame.to_dict(orient="records")
+                        ]
+                        if not batch_params:
+                            continue
+                        cursor.executemany(insert_sql, batch_params, batcherrors=False)
+                        written += len(batch_params)
+                    return written
+                finally:
+                    try:
+                        cursor.close()
+                    except Exception:
+                        pass
+
             url = self._build_sqlalchemy_oracle_url(config)
             reuse_connection_cfg = config.get(
                 "oracle_reuse_connection",
@@ -24714,6 +25683,21 @@ INSERT INTO {table_name} (
             operation = str(config.get("oracle_operation", "insert") or "insert").strip().lower()
             if operation not in {"insert", "update", "upsert"}:
                 operation = "insert"
+            direct_insert_enabled = _parse_bool_like(
+                config.get(
+                    "oracle_direct_insert_enabled",
+                    config.get("oracle_fast_insert_enabled", os.getenv("ORACLE_DESTINATION_DIRECT_INSERT_ENABLED", "1")),
+                ),
+                True,
+            )
+            direct_insert_batch_size = _bounded_int_config(
+                "oracle_direct_insert_batch_size",
+                "oracle_insert_batch_size",
+                "ORACLE_DESTINATION_DIRECT_INSERT_BATCH_SIZE",
+                5000,
+                100,
+                50000,
+            )
             skip_null_key_rows_cfg = config.get(
                 "oracle_skip_null_key_rows",
                 os.getenv("ORACLE_DESTINATION_SKIP_NULL_KEY_ROWS", "1"),
@@ -24851,15 +25835,30 @@ INSERT INTO {table_name} (
                     conn.exec_driver_sql(stmt)
 
                 if operation == "insert":
-                    df_to_write_prepared.to_sql(
-                        table,
-                        conn,
-                        if_exists=if_exists,
-                        index=False,
-                        schema=schema,
-                        dtype=dtype_map,
-                    )
-                    rows_written = len(df_to_write_prepared)
+                    use_direct_insert = False
+                    if direct_insert_enabled and if_exists == "append":
+                        try:
+                            use_direct_insert = bool(inspect(conn).has_table(table, schema=schema))
+                        except Exception:
+                            use_direct_insert = False
+
+                    if use_direct_insert:
+                        rows_written = _direct_oracle_insert_many(
+                            conn,
+                            df_to_write_prepared,
+                            direct_insert_batch_size,
+                        )
+                    else:
+                        df_to_write_prepared.to_sql(
+                            table,
+                            conn,
+                            if_exists=if_exists,
+                            index=False,
+                            schema=schema,
+                            dtype=dtype_map,
+                            chunksize=direct_insert_batch_size,
+                        )
+                        rows_written = len(df_to_write_prepared)
                     inserted_rows = rows_written
                 else:
                     if not key_columns:

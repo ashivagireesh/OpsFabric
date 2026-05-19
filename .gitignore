@@ -63,3 +63,4 @@ build/
 
 # oracle
 oracle-apex-26.1/
+frontend/electron/

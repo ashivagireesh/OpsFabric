@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import {
   Drawer, Form, Input, Select, Switch, InputNumber,
   Button, Typography, Space, Tabs, Divider, Tag, Tooltip, Table, notification, Modal, Popover, AutoComplete, Tree, Popconfirm, Collapse
@@ -117,6 +117,72 @@ function jsonViewerText(rows: Record<string, unknown>[], fallback: unknown): str
   } catch {
     return '[]'
   }
+}
+
+const DATA_QUERY_PREVIEW_DISPLAY_ROWS = 5
+const DATA_QUERY_PREVIEW_MAX_INLINE_TEXT = 500
+const DATA_QUERY_PREVIEW_MAX_ARRAY_ITEMS = 12
+const DATA_QUERY_PREVIEW_MAX_OBJECT_KEYS = 24
+const DATA_QUERY_META_FIELD_PATTERN = /(^|_|\.)(meta|metadata)($|_|\.)/i
+const DATA_QUERY_FIELD_TREE_FIELD_LIMIT = 1200
+const DATA_QUERY_FIELD_SEARCH_RESULT_LIMIT = 300
+const DATA_QUERY_AUTOCOMPLETE_OPTION_LIMIT = 500
+
+function safeJsonText(value: unknown, fallback = '[]'): string {
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return fallback
+  }
+}
+
+function summarizeLargePreviewValue(value: unknown): string {
+  if (Array.isArray(value)) return `[collapsed array: ${value.length} items]`
+  if (value && typeof value === 'object') return `[collapsed object: ${Object.keys(value as Record<string, unknown>).length} keys]`
+  const text = String(value ?? '')
+  return text.length > DATA_QUERY_PREVIEW_MAX_INLINE_TEXT
+    ? `${text.slice(0, DATA_QUERY_PREVIEW_MAX_INLINE_TEXT)}... [truncated ${text.length.toLocaleString()} chars]`
+    : text
+}
+
+function compactDataQueryPreviewValue(value: unknown, keyPath: string, includeMetaJson: boolean, depth = 0): unknown {
+  if (value === null || value === undefined) return value
+  const keyLooksLikeMeta = DATA_QUERY_META_FIELD_PATTERN.test(keyPath)
+  if (!includeMetaJson && keyLooksLikeMeta) {
+    return summarizeLargePreviewValue(value)
+  }
+  if (typeof value === 'string') {
+    return value.length > DATA_QUERY_PREVIEW_MAX_INLINE_TEXT
+      ? `${value.slice(0, DATA_QUERY_PREVIEW_MAX_INLINE_TEXT)}... [truncated ${value.length.toLocaleString()} chars]`
+      : value
+  }
+  if (typeof value !== 'object') return value
+  if (depth >= 3) return summarizeLargePreviewValue(value)
+  if (Array.isArray(value)) {
+    const items = value.slice(0, DATA_QUERY_PREVIEW_MAX_ARRAY_ITEMS)
+      .map((item, idx) => compactDataQueryPreviewValue(item, `${keyPath}[${idx}]`, includeMetaJson, depth + 1))
+    if (value.length > DATA_QUERY_PREVIEW_MAX_ARRAY_ITEMS) {
+      items.push(`[+${(value.length - DATA_QUERY_PREVIEW_MAX_ARRAY_ITEMS).toLocaleString()} more items]`)
+    }
+    return items
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+  const out: Record<string, unknown> = {}
+  entries.slice(0, DATA_QUERY_PREVIEW_MAX_OBJECT_KEYS).forEach(([key, itemValue]) => {
+    const childPath = keyPath ? `${keyPath}.${key}` : key
+    out[key] = compactDataQueryPreviewValue(itemValue, childPath, includeMetaJson, depth + 1)
+  })
+  if (entries.length > DATA_QUERY_PREVIEW_MAX_OBJECT_KEYS) {
+    out.__preview_truncated__ = `+${(entries.length - DATA_QUERY_PREVIEW_MAX_OBJECT_KEYS).toLocaleString()} more keys`
+  }
+  return out
+}
+
+function compactDataQueryPreviewRows(rows: unknown, includeMetaJson: boolean): unknown {
+  if (!Array.isArray(rows)) return []
+  return rows
+    .slice(0, DATA_QUERY_PREVIEW_DISPLAY_ROWS)
+    .map((row) => compactDataQueryPreviewValue(row, '', includeMetaJson))
 }
 
 type FileViewerTab = {
@@ -7370,6 +7436,8 @@ function isInternalSystemField(fieldName: string): boolean {
   const root = String(rootMatch?.[0] || text).trim()
   if (!root) return false
   if (INTERNAL_FIELD_ROOT_EXACT.has(root)) return true
+  const segments = text.split(/[.[\]]+/).map((part) => part.trim()).filter(Boolean)
+  if (segments.includes('_fns_v2')) return true
   return INTERNAL_FIELD_ROOT_PREFIXES.some((prefix) => root.startsWith(prefix))
 }
 
@@ -9183,6 +9251,29 @@ function readPathValues(row: Record<string, unknown>, path: string): unknown[] {
   if (segments.length === 0) return []
   const out: unknown[] = []
 
+  if (segments.length === 1 && segments[0] !== '*') {
+    const leaf = String(segments[0] || '').trim().toLowerCase()
+    const findLeaf = (value: unknown, depth = 0): unknown[] => {
+      if (!leaf || depth > 8 || value == null) return []
+      const parsedJson = parseObjectLikeJsonString(value)
+      if (parsedJson && (Array.isArray(parsedJson) || typeof parsedJson === 'object')) {
+        value = parsedJson
+      }
+      if (Array.isArray(value)) {
+        return value.flatMap((item) => findLeaf(item, depth + 1))
+      }
+      if (typeof value === 'object') {
+        const obj = value as Record<string, unknown>
+        const directKey = Object.keys(obj).find((key) => String(key || '').trim().toLowerCase() === leaf)
+        if (directKey) return [obj[directKey]]
+        return Object.values(obj).flatMap((item) => findLeaf(item, depth + 1))
+      }
+      return []
+    }
+    const leafValues = findLeaf(row)
+    if (leafValues.length > 0) return leafValues
+  }
+
   const walk = (current: unknown, segIndex: number, depth: number) => {
     if (depth > 32) return
     const parsedJson = parseObjectLikeJsonString(current)
@@ -9548,6 +9639,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [mlopsStage3EnsembleModelModalId, setMLOpsStage3EnsembleModelModalId] = useState<string | null>(null)
   const [mlopsStage3NewEnsembleModelDraft, setMLOpsStage3NewEnsembleModelDraft] = useState<MLOpsEnsembleModelConfig | null>(null)
   const [mlopsStage3FeatureFieldsDraft, setMLOpsStage3FeatureFieldsDraft] = useState<string[]>([])
+  const [mlopsStage3ShowEncodedFeatureFields, setMLOpsStage3ShowEncodedFeatureFields] = useState(false)
   const [mlopsStage3TargetFieldDraft, setMLOpsStage3TargetFieldDraft] = useState('')
   const [mlopsStage3TargetFieldsDraft, setMLOpsStage3TargetFieldsDraft] = useState<string[]>([])
   const [mlopsStage3ForecastDateFieldDraft, setMLOpsStage3ForecastDateFieldDraft] = useState('')
@@ -9655,6 +9747,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [dataQueryTreeExpandedKeys, setDataQueryTreeExpandedKeys] = useState<string[]>([])
   const [dataQueryCompactView, setDataQueryCompactView] = useState(true)
   const [dataQueryShowQuickPicker, setDataQueryShowQuickPicker] = useState(false)
+  const [dataQueryShowMetaJsonPreview, setDataQueryShowMetaJsonPreview] = useState(false)
   const [dataQueryPreviewSummary, setDataQueryPreviewSummary] = useState<DataQueryPreviewSummary>({
     ran: false,
     inputRows: 0,
@@ -13571,6 +13664,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       workflow_mode: 'embedded',
       embedded_workflow_enabled: true,
       workflow_tracking_enabled: blwConfig.enabled,
+      workflow_tracking_mode: blwConfig.trackingMode,
       workflow_tracking_table: blwConfig.trackerTable,
       workflow_unique_id_field: blwConfig.uniqueIdField,
       workflow_parallel_enabled: blwConfig.parallelEnabled,
@@ -13585,6 +13679,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       workflow_mode: 'embedded',
       embedded_workflow_enabled: true,
       workflow_tracking_enabled: blwConfig.enabled,
+      workflow_tracking_mode: blwConfig.trackingMode,
       workflow_tracking_table: blwConfig.trackerTable,
       workflow_unique_id_field: blwConfig.uniqueIdField,
       workflow_parallel_enabled: blwConfig.parallelEnabled,
@@ -14767,6 +14862,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => String(dataQueryProfilePatchSelectedUpstreamNode?.nodeType || '').trim().toLowerCase() === 'lmdb_source',
     [dataQueryProfilePatchSelectedUpstreamNode]
   )
+  const dataQueryProfilePatchPrimaryKeyDefault = useMemo(
+    () => {
+      if (dataQueryProfilePatchIsDirectLmdbSource) return 'lmdb_key'
+      if (dataQueryProfilePatchStorageDraft === 'oracle') return 'ENTITY_TOKEN'
+      return ''
+    },
+    [dataQueryProfilePatchIsDirectLmdbSource, dataQueryProfilePatchStorageDraft],
+  )
   const dataQueryFieldOptions = useMemo(
     () => filterUserFacingFieldNames([
       ...mapInputFieldOptions,
@@ -14775,6 +14878,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       ...dataQueryRemoteFieldHints,
     ].map((field) => normalizeDataQueryPickerPath(field))),
     [mapInputFieldOptions, upstreamReferenceFields, upstreamPreviewReferenceFields, dataQueryRemoteFieldHints]
+  )
+  const dataQueryFieldOptionsLimited = useMemo(
+    () => dataQueryFieldOptions.slice(0, DATA_QUERY_FIELD_TREE_FIELD_LIMIT),
+    [dataQueryFieldOptions]
   )
   const dataQueryFieldOptionsBySource = useMemo(
     () => {
@@ -14839,12 +14946,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           nodes,
           edges,
         )
-        const fields = uniqueFieldNames([
+        const fields = filterUserFacingFieldNames(uniqueFieldNames([
           ...inferred,
           ...sourceInputHints,
           ...discovered,
           ...(dataQueryRemoteFieldHintsBySource[sourceId] || []),
-        ].map((field) => normalizeDataQueryPickerPath(field)))
+        ].map((field) => normalizeDataQueryPickerPath(field)))).slice(0, DATA_QUERY_FIELD_TREE_FIELD_LIMIT)
         return {
           sourceId,
           sourceLabel,
@@ -14949,7 +15056,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         })
       })
     } else {
-      dataQueryFieldOptions.forEach((rawPath) => {
+      dataQueryFieldOptionsLimited.forEach((rawPath) => {
         const fullPath = String(rawPath || '').trim()
         if (!fullPath) return
         addPathUnderParent(null, fullPath)
@@ -14964,32 +15071,40 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       children: node.children.map(toTreeData),
     })
     return rootNodes.map(toTreeData)
-  }, [dataQueryFieldOptions, dataQueryFieldOptionsBySource])
+  }, [dataQueryFieldOptionsLimited, dataQueryFieldOptionsBySource])
+  const dataQueryFieldSearchDeferred = useDeferredValue(dataQueryFieldSearchQuery)
   const dataQueryFieldSearchNormalized = useMemo(
     () => String(dataQueryFieldSearchQuery || '').trim().toLowerCase(),
     [dataQueryFieldSearchQuery]
   )
+  const dataQueryFieldSearchDeferredNormalized = useMemo(
+    () => String(dataQueryFieldSearchDeferred || '').trim().toLowerCase(),
+    [dataQueryFieldSearchDeferred]
+  )
   const dataQueryFilteredFieldTreeData = useMemo(() => {
-    if (!dataQueryFieldSearchNormalized) return dataQueryFieldTreeData as any[]
+    if (!dataQueryFieldSearchDeferredNormalized) return dataQueryFieldTreeData as any[]
+    let resultCount = 0
     const filterNodes = (nodes: any[]): any[] => {
       const out: any[] = []
       nodes.forEach((node) => {
+        if (resultCount >= DATA_QUERY_FIELD_SEARCH_RESULT_LIMIT) return
         const title = String(node?.title || '')
         const key = String(node?.key || '')
         const path = String(node?.path || '')
         const haystack = `${title} ${key} ${path}`.toLowerCase()
         const childMatches = Array.isArray(node?.children) ? filterNodes(node.children) : []
-        if (haystack.includes(dataQueryFieldSearchNormalized) || childMatches.length > 0) {
+        if (haystack.includes(dataQueryFieldSearchDeferredNormalized) || childMatches.length > 0) {
+          resultCount += 1
           out.push({
             ...node,
-            children: childMatches.length > 0 ? childMatches : node.children,
+            children: childMatches,
           })
         }
       })
       return out
     }
     return filterNodes(dataQueryFieldTreeData as any[])
-  }, [dataQueryFieldTreeData, dataQueryFieldSearchNormalized])
+  }, [dataQueryFieldTreeData, dataQueryFieldSearchDeferredNormalized])
   const dataQueryFilteredFieldTreeKeys = useMemo(() => {
     const keys: string[] = []
     const walk = (nodes: any[]) => {
@@ -15000,7 +15115,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       })
     }
     walk(dataQueryFilteredFieldTreeData as any[])
-    return uniqueFieldNames(keys)
+    return uniqueFieldNames(keys).slice(0, DATA_QUERY_FIELD_SEARCH_RESULT_LIMIT)
   }, [dataQueryFilteredFieldTreeData])
   const dataQueryFieldOptionsForPicker = useMemo(
     () => filterUserFacingFieldNames([
@@ -15014,9 +15129,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const dataQueryFilteredFieldOptions = useMemo(
     () => (
       !dataQueryFieldSearchNormalized
-        ? dataQueryFieldOptionsForPicker
+        ? dataQueryFieldOptionsForPicker.slice(0, DATA_QUERY_AUTOCOMPLETE_OPTION_LIMIT)
         : dataQueryFieldOptionsForPicker.filter((fieldName) =>
-          String(fieldName || '').toLowerCase().includes(dataQueryFieldSearchNormalized))
+          String(fieldName || '').toLowerCase().includes(dataQueryFieldSearchNormalized)).slice(0, DATA_QUERY_AUTOCOMPLETE_OPTION_LIMIT)
     ),
     [dataQueryFieldOptionsForPicker, dataQueryFieldSearchNormalized]
   )
@@ -15063,6 +15178,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     dataQueryRemotePreviewRows,
     dataQueryUpstreamCandidateNodes,
   ])
+  const dataQueryInputPreviewText = useMemo(
+    () => safeJsonText(compactDataQueryPreviewRows(dataQueryPreviewRows, dataQueryShowMetaJsonPreview)),
+    [dataQueryPreviewRows, dataQueryShowMetaJsonPreview]
+  )
+  const dataQueryMatchedPreviewText = useMemo(
+    () => safeJsonText(compactDataQueryPreviewRows(dataQueryPreviewSummary.matchedSamples || [], dataQueryShowMetaJsonPreview)),
+    [dataQueryPreviewSummary.matchedSamples, dataQueryShowMetaJsonPreview]
+  )
+  const dataQueryOutputPreviewText = useMemo(
+    () => safeJsonText(compactDataQueryPreviewRows(dataQueryPreviewSummary.outputSamples || [], dataQueryShowMetaJsonPreview)),
+    [dataQueryPreviewSummary.outputSamples, dataQueryShowMetaJsonPreview]
+  )
   const dataQueryFieldSamples = useMemo(() => {
     const out = new Map<string, string>()
     // Sample extraction is only used by Quick Picker labels; skip expensive scans otherwise.
@@ -15548,6 +15675,73 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const mlopsStage3FeatureFieldOptions = useMemo(
     () => mlopsStage3AvailableFields.map((path) => ({ value: path, label: path })),
     [mlopsStage3AvailableFields],
+  )
+  const mlopsStage3EncodedFieldsByMain = useMemo(() => {
+    const out: Record<string, string[]> = {}
+    mlopsStage3AvailableFields.forEach((field) => {
+      const path = String(field || '').trim()
+      const idx = path.indexOf('__')
+      if (idx <= 0) return
+      const main = path.slice(0, idx)
+      if (!main) return
+      if (!out[main]) out[main] = []
+      out[main].push(path)
+    })
+    return out
+  }, [mlopsStage3AvailableFields])
+  const mlopsStage3MainFeatureFields = useMemo(
+    () => uniqueFieldNames([
+      ...mlopsStage3AvailableFields.filter((field) => !String(field || '').includes('__')),
+      ...Object.keys(mlopsStage3EncodedFieldsByMain),
+    ].filter(Boolean)),
+    [mlopsStage3AvailableFields, mlopsStage3EncodedFieldsByMain],
+  )
+  const resolveMLOpsStage3FeatureFields = useCallback(
+    (fields: unknown, includeExplicitEncoded = false) => {
+      const allowed = new Set(mlopsStage3AvailableFields)
+      const targetFields = new Set([
+        String(mlopsStage3TargetFieldDraft || '').trim(),
+        ...mlopsStage3TargetFieldsDraft.map((item) => String(item || '').trim()),
+      ].filter(Boolean))
+      const selected = (Array.isArray(fields) ? fields : parseFieldList(fields))
+        .map((item) => String(item || '').trim())
+        .filter(Boolean)
+      const resolved: string[] = []
+      selected.forEach((field) => {
+        if (!field || targetFields.has(field)) return
+        if (includeExplicitEncoded && field.includes('__') && allowed.has(field)) {
+          resolved.push(field)
+          return
+        }
+        const encoded = mlopsStage3EncodedFieldsByMain[field] || []
+        if (encoded.length > 0) {
+          resolved.push(...encoded.filter((item) => allowed.has(item) && !targetFields.has(item)))
+        } else if (allowed.has(field)) {
+          resolved.push(field)
+        }
+      })
+      return uniqueFieldNames(resolved)
+    },
+    [mlopsStage3AvailableFields, mlopsStage3EncodedFieldsByMain, mlopsStage3TargetFieldDraft, mlopsStage3TargetFieldsDraft],
+  )
+  const mlopsStage3MainFeatureFieldOptions = useMemo(
+    () => mlopsStage3MainFeatureFields.map((field) => {
+      const encoded = mlopsStage3EncodedFieldsByMain[field] || []
+      return {
+        value: field,
+        label: encoded.length > 0 ? `${field} -> ${encoded.length} encoded field${encoded.length === 1 ? '' : 's'}` : field,
+      }
+    }),
+    [mlopsStage3EncodedFieldsByMain, mlopsStage3MainFeatureFields],
+  )
+  const mlopsStage3VisibleFeatureFieldOptions = useMemo(
+    () => mlopsStage3ShowEncodedFeatureFields
+      ? mlopsStage3AvailableFields.map((path) => ({
+          value: path,
+          label: String(path || '').includes('__') ? `${path} [encoded]` : path,
+        }))
+      : mlopsStage3MainFeatureFieldOptions,
+    [mlopsStage3AvailableFields, mlopsStage3MainFeatureFieldOptions, mlopsStage3ShowEncodedFeatureFields],
   )
   const mlopsStage3EnsembleOutputFields = useMemo(
     () => {
@@ -16153,6 +16347,22 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => uniqueFieldNames(mlopsStage3FeatureFieldsDraft.filter((item) => mlopsStage3AvailableFields.includes(item))),
     [mlopsStage3FeatureFieldsDraft, mlopsStage3AvailableFields],
   )
+  const mlopsStage3SelectedFeatureMainFields = useMemo(
+    () => uniqueFieldNames(mlopsStage3SelectedFeatureFields.map((field) => {
+      const path = String(field || '').trim()
+      const idx = path.indexOf('__')
+      return idx > 0 ? path.slice(0, idx) : path
+    }).filter(Boolean)),
+    [mlopsStage3SelectedFeatureFields],
+  )
+  const getMLOpsStage3FeatureMainFields = useCallback(
+    (fields: unknown) => uniqueFieldNames((Array.isArray(fields) ? fields : parseFieldList(fields)).map((field) => {
+      const path = String(field || '').trim()
+      const idx = path.indexOf('__')
+      return idx > 0 ? path.slice(0, idx) : path
+    }).filter(Boolean)),
+    [],
+  )
   const pruneMLOpsStage3FeatureFields = useCallback(
     (fields: unknown) => {
       const allowed = new Set(mlopsStage3EnsembleAvailableFields)
@@ -16622,10 +16832,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       setMLOpsStage3FeatureFieldsDraft(cleaned)
       return
     }
-    if (cleaned.length <= 0 && mlopsStage3AvailableFields.length > 0) {
-      setMLOpsStage3FeatureFieldsDraft(mlopsStage3AvailableFields.slice(0, Math.min(8, mlopsStage3AvailableFields.length)))
+    if (cleaned.length <= 0 && mlopsStage3MainFeatureFields.length > 0) {
+      setMLOpsStage3FeatureFieldsDraft(resolveMLOpsStage3FeatureFields(mlopsStage3MainFeatureFields.slice(0, Math.min(8, mlopsStage3MainFeatureFields.length))))
     }
-  }, [mlopsStudioOpen, nodeType, mlopsStage3FeatureFieldsDraft, mlopsStage3AvailableFields])
+  }, [mlopsStudioOpen, nodeType, mlopsStage3FeatureFieldsDraft, mlopsStage3AvailableFields, mlopsStage3MainFeatureFields, resolveMLOpsStage3FeatureFields])
   useEffect(() => {
     if (!mlopsStudioOpen || nodeType !== 'mlops_transform') return
     const allowed = new Set(mlopsStage3EnsembleAvailableFields)
@@ -17149,7 +17359,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     profile_patch_stage: dataQueryProfilePatchStageDraft,
     profile_patch_storage: dataQueryProfilePatchStorageDraft,
     profile_patch_node_id: dataQueryProfilePatchNodeIdDraft,
-    profile_patch_primary_key_field: dataQueryProfilePatchPrimaryKeyFieldDraft,
+    profile_patch_primary_key_field: String(dataQueryProfilePatchPrimaryKeyFieldDraft || dataQueryProfilePatchPrimaryKeyDefault || '').trim(),
     profile_patch_ops: serializeDataQueryProfilePatchOperations(dataQueryProfilePatchOpsDraft),
     profile_patch_document_path: dataQueryProfilePatchDocumentPathDraft,
     profile_patch_value_mode: dataQueryProfilePatchValueModeDraft,
@@ -17176,6 +17386,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     dataQueryProfilePatchStorageDraft,
     dataQueryProfilePatchNodeIdDraft,
     dataQueryProfilePatchPrimaryKeyFieldDraft,
+    dataQueryProfilePatchPrimaryKeyDefault,
     dataQueryProfilePatchOpsDraft,
     dataQueryProfilePatchDocumentPathDraft,
     dataQueryProfilePatchValueModeDraft,
@@ -17183,6 +17394,58 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     dataQueryProfilePatchTargetPathDraft,
     dataQueryProfilePatchMergeModeDraft,
   ])
+  const dataQueryCriteriaPayloadText = useMemo(
+    () => safeJsonText({
+      query_mode: dataQueryModeDraft,
+      criteria_mode: dataQueryMatchModeDraft,
+      criteria: dataQueryCriteriaDraft,
+      select_fields: dataQuerySelectFieldsDraft,
+      select_field_sorts: dataQuerySelectFieldSortsDraft,
+      select_field_aliases: dataQuerySelectFieldAliasesDraft,
+      array_output_mode: dataQueryArrayOutputModeDraft,
+      array_match_mode: dataQueryArrayMatchModeDraft,
+      include_original_row: dataQuerySelectFieldsDraft.length > 0 ? false : dataQueryIncludeOriginalRowDraft,
+      offset: dataQueryOffsetDraft,
+      limit: dataQueryLimitDraft,
+      profile_patch_enabled: dataQueryProfilePatchEnabledDraft,
+      profile_patch_reflect_output: dataQueryProfilePatchReflectOutputDraft,
+      profile_patch_stage: dataQueryProfilePatchStageDraft,
+      profile_patch_storage: dataQueryProfilePatchStorageDraft,
+      profile_patch_node_id: dataQueryProfilePatchNodeIdDraft,
+      profile_patch_primary_key_field: dataQueryProfilePatchPrimaryKeyFieldDraft,
+      profile_patch_ops: serializeDataQueryProfilePatchOperations(dataQueryProfilePatchOpsDraft),
+      profile_patch_document_path: dataQueryProfilePatchDocumentPathDraft,
+      profile_patch_value_mode: dataQueryProfilePatchValueModeDraft,
+      profile_patch_value: dataQueryProfilePatchValueDraft,
+      profile_patch_target_path: dataQueryProfilePatchTargetPathDraft,
+      profile_patch_merge_mode: dataQueryProfilePatchMergeModeDraft,
+    }, '{}'),
+    [
+      dataQueryModeDraft,
+      dataQueryMatchModeDraft,
+      dataQueryCriteriaDraft,
+      dataQuerySelectFieldsDraft,
+      dataQuerySelectFieldSortsDraft,
+      dataQuerySelectFieldAliasesDraft,
+      dataQueryArrayOutputModeDraft,
+      dataQueryArrayMatchModeDraft,
+      dataQueryIncludeOriginalRowDraft,
+      dataQueryOffsetDraft,
+      dataQueryLimitDraft,
+      dataQueryProfilePatchEnabledDraft,
+      dataQueryProfilePatchReflectOutputDraft,
+      dataQueryProfilePatchStageDraft,
+      dataQueryProfilePatchStorageDraft,
+      dataQueryProfilePatchNodeIdDraft,
+      dataQueryProfilePatchPrimaryKeyFieldDraft,
+      dataQueryProfilePatchOpsDraft,
+      dataQueryProfilePatchDocumentPathDraft,
+      dataQueryProfilePatchValueModeDraft,
+      dataQueryProfilePatchValueDraft,
+      dataQueryProfilePatchTargetPathDraft,
+      dataQueryProfilePatchMergeModeDraft,
+    ]
+  )
   const dataQueryStudioHasUnsavedChanges = useMemo(() => {
     if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform') return false
     const initial = dataQueryStudioInitialConfigRef.current
@@ -19832,7 +20095,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       profile_patch_stage: dataQueryProfilePatchStageDraft,
       profile_patch_storage: dataQueryProfilePatchStorageDraft,
       profile_patch_node_id: String(dataQueryProfilePatchNodeIdDraft || '').trim(),
-      profile_patch_primary_key_field: String(dataQueryProfilePatchPrimaryKeyFieldDraft || '').trim(),
+      profile_patch_primary_key_field: String(dataQueryProfilePatchPrimaryKeyFieldDraft || dataQueryProfilePatchPrimaryKeyDefault || '').trim(),
       profile_patch_ops: serializedPatchOps,
       profile_patch_document_path: String(firstPatchOp?.source_path || '').trim(),
       profile_patch_value_mode: String(firstPatchOp?.value_mode || 'row').trim().toLowerCase() === 'fixed' ? 'fixed' : 'row',
@@ -19870,6 +20133,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     dataQueryProfilePatchStorageDraft,
     dataQueryProfilePatchNodeIdDraft,
     dataQueryProfilePatchPrimaryKeyFieldDraft,
+    dataQueryProfilePatchPrimaryKeyDefault,
     dataQueryProfilePatchOpsDraft,
     dataQueryProfilePatchDocumentPathDraft,
     dataQueryProfilePatchValueModeDraft,
@@ -34126,14 +34390,20 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               >
                 <Input
                   size="small"
-                  placeholder={dataQueryProfilePatchIsDirectLmdbSource ? 'optional (auto: lmdb_key)' : 'example: AGENTCODE'}
+                  placeholder={
+                    dataQueryProfilePatchPrimaryKeyDefault
+                      ? `optional (auto: ${dataQueryProfilePatchPrimaryKeyDefault})`
+                      : 'example: AGENTCODE'
+                  }
                   style={{ marginTop: 4 }}
                   disabled={!dataQueryProfilePatchEnabledDraft}
                 />
               </AutoComplete>
-              {dataQueryProfilePatchIsDirectLmdbSource ? (
+              {dataQueryProfilePatchPrimaryKeyDefault ? (
                 <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10 }}>
-                  Direct LMDB patch uses `lmdb_key` automatically.
+                  {dataQueryProfilePatchStorageDraft === 'oracle'
+                    ? 'Oracle profile patch uses `ENTITY_TOKEN` automatically when this is blank.'
+                    : 'Direct LMDB patch uses `lmdb_key` automatically.'}
                 </Text>
               ) : null}
             </div>
@@ -34335,6 +34605,20 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               : 'Preview runs against upstream sample rows only.'}
           </Text>
 
+          <Space size={6} style={{ justifyContent: 'space-between', width: '100%', alignItems: 'center' }}>
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+              Large meta/metadata JSON is collapsed in previews while editing.
+            </Text>
+            <Space size={6}>
+              <Switch
+                size="small"
+                checked={dataQueryShowMetaJsonPreview}
+                onChange={(checked) => setDataQueryShowMetaJsonPreview(Boolean(checked))}
+              />
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Show meta JSON</Text>
+            </Space>
+          </Space>
+
           <Space size={8} style={{ width: '100%', justifyContent: 'space-between' }}>
             <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9', marginInlineEnd: 0 }}>
               input: {dataQueryPreviewSummary.ran ? dataQueryPreviewSummary.inputRows : dataQueryPreviewRows.length}
@@ -34353,31 +34637,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               <Input.TextArea
                 readOnly
                 rows={dataQueryCompactView ? 7 : 11}
-                value={JSON.stringify({
-                  query_mode: dataQueryModeDraft,
-                  criteria_mode: dataQueryMatchModeDraft,
-                  criteria: dataQueryCriteriaDraft,
-                  select_fields: dataQuerySelectFieldsDraft,
-                  select_field_sorts: dataQuerySelectFieldSortsDraft,
-                  select_field_aliases: dataQuerySelectFieldAliasesDraft,
-                  array_output_mode: dataQueryArrayOutputModeDraft,
-                  array_match_mode: dataQueryArrayMatchModeDraft,
-                  include_original_row: dataQuerySelectFieldsDraft.length > 0 ? false : dataQueryIncludeOriginalRowDraft,
-                  offset: dataQueryOffsetDraft,
-                  limit: dataQueryLimitDraft,
-                  profile_patch_enabled: dataQueryProfilePatchEnabledDraft,
-                  profile_patch_reflect_output: dataQueryProfilePatchReflectOutputDraft,
-                  profile_patch_stage: dataQueryProfilePatchStageDraft,
-                  profile_patch_storage: dataQueryProfilePatchStorageDraft,
-                  profile_patch_node_id: dataQueryProfilePatchNodeIdDraft,
-                  profile_patch_primary_key_field: dataQueryProfilePatchPrimaryKeyFieldDraft,
-                  profile_patch_ops: serializeDataQueryProfilePatchOperations(dataQueryProfilePatchOpsDraft),
-                  profile_patch_document_path: dataQueryProfilePatchDocumentPathDraft,
-                  profile_patch_value_mode: dataQueryProfilePatchValueModeDraft,
-                  profile_patch_value: dataQueryProfilePatchValueDraft,
-                  profile_patch_target_path: dataQueryProfilePatchTargetPathDraft,
-                  profile_patch_merge_mode: dataQueryProfilePatchMergeModeDraft,
-                }, null, 2)}
+                value={dataQueryCriteriaPayloadText}
                 style={{
                   marginTop: 6,
                   background: 'var(--app-input-bg)',
@@ -34395,7 +34655,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               <Input.TextArea
                 readOnly
                 rows={dataQueryCompactView ? 8 : 11}
-                value={JSON.stringify(dataQueryPreviewRows.slice(0, 5), null, 2)}
+                value={dataQueryInputPreviewText}
                 style={{
                   marginTop: 6,
                   background: 'var(--app-input-bg)',
@@ -34413,7 +34673,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               <Input.TextArea
                 readOnly
                 rows={dataQueryCompactView ? 6 : 9}
-                value={JSON.stringify(dataQueryPreviewSummary.matchedSamples || [], null, 2)}
+                value={dataQueryMatchedPreviewText}
                 style={{
                   marginTop: 6,
                   background: 'var(--app-input-bg)',
@@ -34431,7 +34691,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               <Input.TextArea
                 readOnly
                 rows={dataQueryCompactView ? 6 : 9}
-                value={JSON.stringify(dataQueryPreviewSummary.outputSamples || [], null, 2)}
+                value={dataQueryOutputPreviewText}
                 style={{
                   marginTop: 6,
                   background: 'var(--app-input-bg)',
@@ -35660,19 +35920,30 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 
                   {mlopsStage3ModelModeDraft === 'single' ? (
                   <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 8 }}>
-                    <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Input Features (from Pre-Processing)</Text>
+                    <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+                      <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Feature Main Columns (from Pre-Processing)</Text>
+                      <Space size={6}>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Show encoded fields</Text>
+                        <Switch size="small" checked={mlopsStage3ShowEncodedFeatureFields} onChange={setMLOpsStage3ShowEncodedFeatureFields} />
+                      </Space>
+                    </Space>
                     <Select
                       mode="multiple"
                       size="small"
                       style={{ width: '100%', marginTop: 8 }}
-                      options={mlopsStage3FeatureFieldOptions}
-                      value={mlopsStage3SelectedFeatureFields}
-                      onChange={(values) => setMLOpsStage3FeatureFieldsDraft(uniqueFieldNames((values || []).map((item) => String(item || '').trim())))}
-                      placeholder="Select feature fields"
+                      options={mlopsStage3VisibleFeatureFieldOptions}
+                      value={mlopsStage3ShowEncodedFeatureFields ? mlopsStage3SelectedFeatureFields : mlopsStage3SelectedFeatureMainFields}
+                      onChange={(values) => setMLOpsStage3FeatureFieldsDraft(resolveMLOpsStage3FeatureFields(values, mlopsStage3ShowEncodedFeatureFields))}
+                      placeholder="Select feature main columns"
                       maxTagCount={6}
                     />
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', marginTop: 6 }}>
+                      {mlopsStage3SelectedFeatureFields.length > 0
+                        ? `Training will use ${mlopsStage3SelectedFeatureFields.length} resolved field${mlopsStage3SelectedFeatureFields.length === 1 ? '' : 's'}.`
+                        : 'Select main columns; encoded counterparts are used automatically.'}
+                    </Text>
                     <div style={{ marginTop: 8, maxHeight: 200, overflowY: 'auto', border: '1px solid var(--app-border)', borderRadius: 6, padding: 8 }}>
-                      {(mlopsStage3AvailableFields.length > 0 ? mlopsStage3AvailableFields : ['(no pre-processing fields enabled)']).map((field) => (
+                      {((mlopsStage3ShowEncodedFeatureFields ? mlopsStage3AvailableFields : mlopsStage3MainFeatureFields).length > 0 ? (mlopsStage3ShowEncodedFeatureFields ? mlopsStage3AvailableFields : mlopsStage3MainFeatureFields) : ['(no pre-processing fields enabled)']).map((field) => (
                         <div key={`mlops_stage3_field_${field}`} style={{ marginBottom: 4 }}>
                           <Text style={{ color: 'var(--app-text)', fontSize: 12, fontFamily: 'monospace' }}>{field}</Text>
                         </div>
@@ -35817,13 +36088,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                             </div>
                             <div style={{ display: 'grid', gridTemplateColumns: '1fr 220px 180px 180px', gap: 8 }}>
                               <div>
-                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Feature fields</Text>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Feature main columns</Text>
                                 <Select
                                   mode="multiple"
                                   size="small"
-                                  value={pruneMLOpsStage3FeatureFields(model.feature_fields)}
-                                  options={mlopsStage3EnsembleFeatureOptions}
-                                  onChange={(values) => updateMLOpsEnsembleModel(model.id, { feature_fields: pruneMLOpsStage3FeatureFields(values) })}
+                                  value={mlopsStage3ShowEncodedFeatureFields ? pruneMLOpsStage3FeatureFields(model.feature_fields) : getMLOpsStage3FeatureMainFields(model.feature_fields)}
+                                  options={mlopsStage3VisibleFeatureFieldOptions}
+                                  onChange={(values) => updateMLOpsEnsembleModel(model.id, { feature_fields: resolveMLOpsStage3FeatureFields(values, mlopsStage3ShowEncodedFeatureFields) })}
                                   maxTagCount={4}
                                   style={{ width: '100%', marginTop: 4 }}
                                 />
@@ -36202,16 +36473,27 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Fields & Outputs</Text>
                         <div style={{ display: 'grid', gridTemplateColumns: 'minmax(320px, 1fr) repeat(3, minmax(180px, 240px))', gap: 10, marginTop: 8 }}>
                           <div>
-                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Feature Fields</Text>
+                            <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Feature Main Columns</Text>
+                              <Space size={6}>
+                                <Text style={{ color: 'var(--app-text-muted)', fontSize: 10 }}>Show encoded fields</Text>
+                                <Switch size="small" checked={mlopsStage3ShowEncodedFeatureFields} onChange={setMLOpsStage3ShowEncodedFeatureFields} />
+                              </Space>
+                            </Space>
                             <Select
                               mode="multiple"
                               size="small"
-                              value={pruneMLOpsStage3FeatureFields(selectedMLOpsEnsembleModel.feature_fields)}
-                              options={mlopsStage3EnsembleFeatureOptions}
-                              onChange={(values) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { feature_fields: pruneMLOpsStage3FeatureFields(values) })}
+                              value={mlopsStage3ShowEncodedFeatureFields ? pruneMLOpsStage3FeatureFields(selectedMLOpsEnsembleModel.feature_fields) : getMLOpsStage3FeatureMainFields(selectedMLOpsEnsembleModel.feature_fields)}
+                              options={mlopsStage3VisibleFeatureFieldOptions}
+                              onChange={(values) => updateMLOpsEnsembleModel(selectedMLOpsEnsembleModel.id, { feature_fields: resolveMLOpsStage3FeatureFields(values, mlopsStage3ShowEncodedFeatureFields) })}
                               maxTagCount={6}
                               style={{ width: '100%', marginTop: 4 }}
                             />
+                            <Text style={{ color: 'var(--app-text-muted)', fontSize: 10, display: 'block', marginTop: 4 }}>
+                              {selectedMLOpsEnsembleModel.feature_fields.length > 0
+                                ? `Training will use ${selectedMLOpsEnsembleModel.feature_fields.length} resolved field${selectedMLOpsEnsembleModel.feature_fields.length === 1 ? '' : 's'}.`
+                                : 'Select main columns; encoded counterparts are used automatically.'}
+                            </Text>
                           </div>
                           <div>
                             <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Label Field</Text>

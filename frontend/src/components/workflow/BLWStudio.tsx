@@ -62,10 +62,40 @@ import {
   ArrowDownOutlined,
   ArrowUpOutlined,
   WarningOutlined,
+  DownloadOutlined,
 } from '@ant-design/icons'
 import api from '../../api/client'
 
 const { Text } = Typography
+
+const csvEscape = (value: unknown): string => {
+  if (value === null || value === undefined) return ''
+  const text = typeof value === 'object' ? JSON.stringify(value) : String(value)
+  if (/[",\n\r]/.test(text)) return `"${text.replace(/"/g, '""')}"`
+  return text
+}
+
+const downloadBlwRowsAsCsv = (rows: any[], baseName: string): void => {
+  if (!Array.isArray(rows) || rows.length <= 0) return
+  const columns = Array.from(rows.reduce((set: Set<string>, row: any) => {
+    Object.keys(row || {}).forEach((key) => set.add(key))
+    return set
+  }, new Set<string>()))
+  const csv = [
+    columns.map(csvEscape).join(','),
+    ...rows.map((row) => columns.map((column) => csvEscape(row?.[column])).join(',')),
+  ].join('\n')
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+  link.href = url
+  link.download = `${baseName}-${timestamp}.csv`
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
+}
 
 const formatTrackerJson = (value: any): string => {
   if (value === undefined || value === null || value === '') return ''
@@ -205,6 +235,7 @@ type BlwGraphSnapshot = {
 
 export type BlwStudioConfig = {
   enabled: boolean
+  trackingMode: 'all_rows' | 'minimal' | 'exception_only' | 'none'
   workflowName: string
   trackerTable: string
   uniqueIdField: string
@@ -984,6 +1015,11 @@ function normalizeConfig(raw: unknown, nodeLabel: string): BlwStudioConfig {
   const inputFields = uniqueStrings([cfg.inputFields, cfg.sourceFields, cfg._detected_columns])
   return {
     enabled: cfg.enabled !== false,
+    trackingMode: (
+      ['all_rows', 'minimal', 'exception_only', 'none'].includes(String(cfg.trackingMode || cfg.workflowTrackingMode || cfg.workflow_tracking_mode || '').trim())
+        ? String(cfg.trackingMode || cfg.workflowTrackingMode || cfg.workflow_tracking_mode).trim()
+        : 'all_rows'
+    ) as BlwStudioConfig['trackingMode'],
     workflowName: String(cfg.workflowName || nodeLabel || 'Business Logic Workflow'),
     trackerTable: String(cfg.trackerTable || 'BLW_WORKFLOW_TRACKER'),
     uniqueIdField: String(cfg.uniqueIdField || 'TRANSACTIONID'),
@@ -1012,6 +1048,9 @@ function resolveStoredBlwConfig(config: Record<string, unknown> | undefined): Re
   const nested = asRecord(topLevel.blw_studio_config)
   return {
     ...nested,
+    trackingMode: nested.trackingMode ?? nested.workflowTrackingMode ?? nested.workflow_tracking_mode ?? topLevel.workflow_tracking_mode ?? topLevel.workflowTrackingMode,
+    workflowTrackingMode: nested.workflowTrackingMode ?? nested.trackingMode ?? nested.workflow_tracking_mode ?? topLevel.workflow_tracking_mode ?? topLevel.workflowTrackingMode,
+    workflow_tracking_mode: nested.workflow_tracking_mode ?? nested.trackingMode ?? nested.workflowTrackingMode ?? topLevel.workflow_tracking_mode ?? topLevel.workflowTrackingMode,
     inputFields: nested.inputFields ?? topLevel.inputFields,
     inputFieldMappings: nested.inputFieldMappings ?? topLevel.inputFieldMappings,
     instanceVariables: nested.instanceVariables ?? topLevel.instanceVariables ?? topLevel.blw_instance_variables,
@@ -1085,9 +1124,13 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
   const [trackerDetailLoading, setTrackerDetailLoading] = useState(false)
   const [trackerDetail, setTrackerDetail] = useState<any>(null)
   const [trackerSearch, setTrackerSearch] = useState('')
+  const [trackerDrillRows, setTrackerDrillRows] = useState<any[] | null>(null)
+  const [trackerDrillLoading, setTrackerDrillLoading] = useState(false)
+  const [trackerExportLoading, setTrackerExportLoading] = useState(false)
   const [dashboardTab, setDashboardTab] = useState('overview')
-  const [dashboardRefreshSeconds, setDashboardRefreshSeconds] = useState(0)
+  const [dashboardRefreshSeconds, setDashboardRefreshSeconds] = useState(5)
   const [trackerPageSize, setTrackerPageSize] = useState(25)
+  const trackerRefreshInFlightRef = useRef(false)
   const [childNodeConfigOpen, setChildNodeConfigOpen] = useState(false)
   const [conditionConfigOpen, setConditionConfigOpen] = useState(false)
   const [graphHistoryVersion, setGraphHistoryVersion] = useState(0)
@@ -1266,11 +1309,12 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
   }, [edges.length, nodes])
 
   const trackerRows = useMemo(() => {
+    if (trackerSearch.trim() && Array.isArray(trackerDrillRows)) return trackerDrillRows
     const rows = Array.isArray(trackerSummary?.rows) ? trackerSummary.rows : []
     const q = trackerSearch.trim().toLowerCase()
     if (!q) return rows
     return rows.filter((row: any) => Object.values(row || {}).some((value) => String(value || '').toLowerCase().includes(q)))
-  }, [trackerSearch, trackerSummary])
+  }, [trackerDrillRows, trackerSearch, trackerSummary])
 
   const dashboardRows = useMemo<any[]>(() => Array.isArray(trackerSummary?.rows) ? trackerSummary.rows : [], [trackerSummary])
   const dashboardInsights = useMemo(() => {
@@ -1285,8 +1329,12 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
     const statusCounts: Record<string, number> = Object.keys(trackerSummary?.summary?.status_counts || {}).length
       ? trackerSummary.summary.status_counts
       : countBy('current_status')
-    const stageCounts = countBy('current_stage')
-    const nodeCounts = countBy('business_node_id')
+    const stageCounts: Record<string, number> = Object.keys(trackerSummary?.summary?.stage_counts || {}).length
+      ? trackerSummary.summary.stage_counts
+      : countBy('current_stage')
+    const nodeCounts: Record<string, number> = Object.keys(trackerSummary?.summary?.node_counts || {}).length
+      ? trackerSummary.summary.node_counts
+      : countBy('business_node_id')
     const errorCounts = dashboardRows.reduce((acc: Record<string, number>, row: any) => {
       const code = String(row?.error_code || row?.error_message || '').trim()
       if (!code) return acc
@@ -1370,10 +1418,12 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
     }
   }, [dashboardRows, trackerSummary])
 
-  const refreshTrackerSummary = useCallback(async () => {
+  const refreshTrackerSummary = useCallback(async (options?: { refreshCounts?: boolean }) => {
+    if (trackerRefreshInFlightRef.current) return
+    trackerRefreshInFlightRef.current = true
     setTrackerLoading(true)
-    setTrackerSummary(null)
     try {
+      const refreshCounts = Boolean(options?.refreshCounts)
       const payloadConfig = {
         ...(config || {}),
         workflow_tracking_table: draft.trackerTable,
@@ -1383,17 +1433,24 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
         workflow_max_iterations: draft.maxIterations,
         workflow_max_retry_attempts: draft.maxRetryAttempts,
         blw_studio_config: {
-          ...draft,
-          graphNodes: nodes.map((node) => ({ ...node, selected: false, dragging: false })),
-          graphEdges: edges.map((edge) => ({ ...edge, selected: false })),
+          trackerTable: draft.trackerTable,
+          uniqueIdField: draft.uniqueIdField,
+          trackingMode: draft.trackingMode,
         },
       }
-      const summary = await api.getBlwTrackerSummary({ config: payloadConfig, limit: 500 })
+      const summary = await api.getBlwTrackerSummary({
+        config: payloadConfig,
+        limit: 100,
+        fast: true,
+        counts_ttl_seconds: refreshCounts ? 5 : 30,
+        refresh_counts: refreshCounts,
+      })
       setTrackerSummary(summary)
     } finally {
+      trackerRefreshInFlightRef.current = false
       setTrackerLoading(false)
     }
-  }, [config, draft, edges, nodes])
+  }, [config, draft.maxIterations, draft.maxParallelBranches, draft.maxRetryAttempts, draft.parallelEnabled, draft.trackerTable, draft.trackingMode, draft.uniqueIdField])
 
   const buildTrackerPayloadConfig = useCallback(() => ({
     ...(config || {}),
@@ -1431,7 +1488,7 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
       } else {
         notification.error({ message: `BLW ${action} failed`, description: String(result?.message || 'No tracker row updated'), placement: 'bottomRight' })
       }
-      await refreshTrackerSummary()
+      await refreshTrackerSummary({ refreshCounts: true })
       if (trackerDetail?.row?.run_id === runId) {
         await openTrackerDetail(runId)
       }
@@ -1442,10 +1499,11 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
 
   useEffect(() => {
     if (!open || activeView !== 'dashboard') return
-    refreshTrackerSummary()
+    refreshTrackerSummary({ refreshCounts: true })
     if (!dashboardRefreshSeconds) return
     const timer = window.setInterval(() => {
-      refreshTrackerSummary()
+      if (document.hidden) return
+      refreshTrackerSummary({ refreshCounts: false })
     }, dashboardRefreshSeconds * 1000)
     return () => window.clearInterval(timer)
   }, [activeView, dashboardRefreshSeconds, open, refreshTrackerSummary])
@@ -1455,7 +1513,69 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
     if (!next) return
     setTrackerSearch(next)
     setDashboardTab('tracker')
-  }, [])
+    setTrackerDrillLoading(true)
+    api.exportBlwTrackerRows({
+      config: buildTrackerPayloadConfig(),
+      search: next,
+      limit: 5000,
+    })
+      .then((result) => {
+        const rows = Array.isArray(result?.rows) ? result.rows : []
+        setTrackerDrillRows(rows)
+        if (rows.length <= 0) {
+          notification.warning({
+            message: 'No BLW drill records found',
+            description: `No tracker rows matched "${next}".`,
+            placement: 'bottomRight',
+          })
+        }
+      })
+      .catch((exc: any) => {
+        setTrackerDrillRows([])
+        notification.error({
+          message: 'BLW drill failed',
+          description: String(exc?.message || exc || 'Failed to load drill rows'),
+          placement: 'bottomRight',
+        })
+      })
+      .finally(() => setTrackerDrillLoading(false))
+  }, [buildTrackerPayloadConfig])
+
+  const downloadTrackerRows = useCallback(async () => {
+    setTrackerExportLoading(true)
+    try {
+      const search = String(trackerSearch || '').trim()
+      const result = await api.exportBlwTrackerRows({
+        config: buildTrackerPayloadConfig(),
+        search,
+        limit: 5000,
+      })
+      const rows = Array.isArray(result?.rows) ? result.rows : []
+      if (rows.length <= 0) {
+        notification.warning({
+          message: 'No BLW tracker records to download',
+          description: search ? `No rows matched "${search}".` : 'Tracker export returned no rows.',
+          placement: 'bottomRight',
+        })
+        return
+      }
+      const suffix = search ? `drill-${search.replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 40)}` : 'latest'
+      downloadBlwRowsAsCsv(rows, `blw-tracker-${suffix}`)
+      notification.success({
+        message: 'BLW tracker CSV downloaded',
+        description: `${rows.length.toLocaleString()} record(s) exported.`,
+        placement: 'bottomRight',
+      })
+    } catch (exc: any) {
+      notification.error({
+        message: 'BLW tracker download failed',
+        description: String(exc?.message || exc || 'Export failed'),
+        placement: 'bottomRight',
+      })
+    } finally {
+      setTrackerExportLoading(false)
+    }
+  }, [buildTrackerPayloadConfig, trackerSearch])
 
   const updateDraft = useCallback((patch: Partial<BlwStudioConfig>) => {
     setDraft((prev) => ({ ...prev, ...patch }))
@@ -2133,6 +2253,7 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
     if (selectedNode.data.blwType === 'execute_child_node') {
       const selectedChildOption = embeddedChildNodeOptions.find((item) => item.value === selectedNode.data.childNodeId)
       const childExecutionMode = String(action.childExecutionMode || 'downstream')
+      const childRunMode = String(action.childRunMode || 'per_record')
       const sequenceLabels = toStringArray(action.childNodeIds)
         .map((id) => embeddedChildNodeOptions.find((item) => item.value === id)?.label || id)
       return (
@@ -2149,7 +2270,7 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                 : (selectedChildOption?.label || selectedNode.data.childNodeId || 'No child workflow canvas node selected')}
             </div>
             <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
-              Mode: {childExecutionMode === 'sequence' ? 'Explicit sequence' : 'Downstream cluster'} · Input: {String(action.inputMode || 'pass_all')} · Output: {String(action.outputPath || '$.child_output')}
+              Mode: {childExecutionMode === 'sequence' ? 'Explicit sequence' : 'Downstream cluster'} · Run: {childRunMode === 'batch' ? 'Batch routed rows' : 'Per record'} · Input: {String(action.inputMode || 'pass_all')} · Output: {String(action.outputPath || '$.child_output')}
             </Text>
           </div>
           <Button block size="small" style={{ marginTop: 8 }} onClick={() => setChildNodeConfigOpen(true)}>
@@ -2459,12 +2580,14 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                               style={{ width: 118 }}
                               options={[
                                 { value: 0, label: 'Manual' },
+                                { value: 3, label: '3 sec' },
+                                { value: 5, label: '5 sec' },
                                 { value: 10, label: '10 sec' },
                                 { value: 30, label: '30 sec' },
                                 { value: 60, label: '1 min' },
                               ]}
                             />
-                            <Button size="small" icon={<SyncOutlined />} loading={trackerLoading} onClick={refreshTrackerSummary}>Refresh</Button>
+                            <Button size="small" icon={<SyncOutlined />} loading={trackerLoading} onClick={() => refreshTrackerSummary({ refreshCounts: true })}>Refresh</Button>
                           </Space>
                         </Space>
                         <Row gutter={[10, 10]}>
@@ -2648,7 +2771,7 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                         <div style={{ border: '1px solid var(--app-border)', background: 'var(--app-panel-bg)', borderRadius: 8, padding: 12 }}>
                           <Space style={{ justifyContent: 'space-between', width: '100%', marginBottom: 8 }}>
                             <Text style={{ color: 'var(--app-text)', fontWeight: 800 }}>Oracle Tracker Summary</Text>
-                            <Button size="small" loading={trackerLoading} onClick={refreshTrackerSummary}>Refresh</Button>
+                            <Button size="small" loading={trackerLoading} onClick={() => refreshTrackerSummary({ refreshCounts: true })}>Refresh</Button>
                           </Space>
                           {trackerSummary?.ok === false ? (
                             <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>{String(trackerSummary?.message || 'Tracker is not connected.')}</Text>
@@ -2671,6 +2794,14 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                             <Space style={{ width: '100%', justifyContent: 'space-between' }}>
                               <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Tracker Runs</Text>
                               <Space size={8}>
+                                <Button
+                                  size="small"
+                                  icon={<DownloadOutlined />}
+                                  loading={trackerExportLoading}
+                                  onClick={downloadTrackerRows}
+                                >
+                                  {trackerSearch.trim() ? 'Download Drill' : 'Download Rows'}
+                                </Button>
                                 <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Rows</Text>
                                 <Select
                                   size="small"
@@ -2684,12 +2815,22 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                                     { value: 200, label: '200' },
                                   ]}
                                 />
-                                <Input.Search size="small" allowClear placeholder="Search tracker rows" value={trackerSearch} onChange={(event) => setTrackerSearch(event.target.value)} style={{ width: 260 }} />
+                                <Input.Search
+                                  size="small"
+                                  allowClear
+                                  placeholder="Search tracker rows"
+                                  value={trackerSearch}
+                                  onChange={(event) => {
+                                    setTrackerSearch(event.target.value)
+                                    setTrackerDrillRows(null)
+                                  }}
+                                  style={{ width: 260 }}
+                                />
                               </Space>
                             </Space>
                           )}
                           dataSource={trackerRows}
-                          loading={trackerLoading}
+                          loading={trackerLoading || trackerDrillLoading}
                           pagination={{
                             pageSize: trackerPageSize,
                             size: 'small',
@@ -2836,6 +2977,23 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                   <Col span={8}><Form.Item label="Escalate after failures"><InputNumber min={1} max={100} style={{ width: '100%' }} value={draft.escalationAfterFailures} onChange={(value) => updateDraft({ escalationAfterFailures: Number(value || 1) })} /></Form.Item></Col>
                   <Col span={8}><Form.Item label="Wait timeout minutes"><InputNumber min={1} max={10080} style={{ width: '100%' }} value={draft.waitTimeoutMinutes} onChange={(value) => updateDraft({ waitTimeoutMinutes: Number(value || 1) })} /></Form.Item></Col>
                   <Col span={8}><Form.Item label="Workflow enabled"><Switch checked={draft.enabled} onChange={(enabled) => updateDraft({ enabled })} /></Form.Item></Col>
+                  <Col span={24}>
+                    <Form.Item
+                      label="Workflow tracking mode"
+                      help="Use exception-only for high volume runs: normal rows complete in batch, tracker rows are created only for wait/retry/escalation/failure paths."
+                    >
+                      <Select
+                        value={draft.trackingMode || 'all_rows'}
+                        options={[
+                          { value: 'all_rows', label: 'Track all rows' },
+                          { value: 'minimal', label: 'Track all rows - minimal payload' },
+                          { value: 'exception_only', label: 'Track only waiting / exception rows' },
+                          { value: 'none', label: 'No tracker, batch only' },
+                        ]}
+                        onChange={(trackingMode) => updateDraft({ trackingMode: trackingMode as BlwStudioConfig['trackingMode'] })}
+                      />
+                    </Form.Item>
+                  </Col>
                 </Row>
               </Form>
             ) : null}
@@ -3251,6 +3409,7 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
           const action = safeJson(selectedNode.data.actionJson)
           const inputMode = String(action.inputMode || 'pass_all')
           const childExecutionMode = String(action.childExecutionMode || 'downstream')
+          const childRunMode = String(action.childRunMode || 'per_record')
           return (
             <Form layout="vertical">
               <Row gutter={10}>
@@ -3308,6 +3467,35 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                       />
                     </Form.Item>
                   )}
+                </Col>
+              </Row>
+              <Row gutter={10}>
+                <Col span={12}>
+                  <Form.Item
+                    label="Run mode"
+                    help="Per record keeps one workflow instance per input row. Batch routed rows runs the child node sequence once for all rows routed to this Execute Child Node."
+                  >
+                    <Select
+                      value={childRunMode}
+                      options={[
+                        { value: 'per_record', label: 'Per record workflow' },
+                        { value: 'batch', label: 'Batch routed rows' },
+                      ]}
+                      onChange={(nextRunMode) => updateSelectedNodeData({ actionJson: jsonPatch(selectedNode.data.actionJson, { childRunMode: nextRunMode }) })}
+                    />
+                  </Form.Item>
+                </Col>
+                <Col span={12}>
+                  <Form.Item label="Batch size">
+                    <InputNumber
+                      min={1}
+                      max={5000}
+                      style={{ width: '100%' }}
+                      value={Number(action.childBatchSize || 500)}
+                      disabled={childRunMode !== 'batch'}
+                      onChange={(childBatchSize) => updateSelectedNodeData({ actionJson: jsonPatch(selectedNode.data.actionJson, { childBatchSize: Number(childBatchSize || 500) }) })}
+                    />
+                  </Form.Item>
                 </Col>
               </Row>
               <Row gutter={10}>

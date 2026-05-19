@@ -249,6 +249,7 @@ execution_abort_requested_at: Dict[str, float] = {}
 execution_workers: Dict[str, threading.Thread] = {}
 execution_runtime_node_enabled_overrides: Dict[str, Dict[str, bool]] = {}
 execution_pipeline_overrides: Dict[str, Dict[str, Any]] = {}
+_BLW_TRACKER_SUMMARY_CACHE: Dict[str, Dict[str, Any]] = {}
 _execution_start_lock = threading.Lock()
 _execution_runtime_node_enabled_lock = threading.Lock()
 _execution_pipeline_overrides_lock = threading.Lock()
@@ -2421,11 +2422,15 @@ async def _run_blw_async_tracker_worker_job():
         now = _time.time()
         if _BLW_ASYNC_WORKER_PAUSE_UNTIL > now:
             return
-        batch_size = _env_int("BLW_ASYNC_WORKER_BATCH_SIZE", 50, 1, 500)
-        max_batches = _env_int("BLW_ASYNC_WORKER_MAX_DRAIN_BATCHES", 4, 1, 100)
+        batch_size = _env_int("BLW_ASYNC_WORKER_BATCH_SIZE", 3000, 1, 5000)
+        max_batches = _env_int("BLW_ASYNC_WORKER_MAX_DRAIN_BATCHES", 2, 1, 100)
         stale_seconds = _env_int("BLW_ASYNC_WORKER_STALE_RUNNING_SECONDS", 60, 10, 86400)
+        job_budget_seconds = _env_int("BLW_ASYNC_WORKER_JOB_BUDGET_SECONDS", 120, 1, 3600)
+        deadline = _time.monotonic() + float(job_budget_seconds)
         total = {"claimed": 0, "processed": 0, "waiting": 0, "failed": 0, "batches": 0}
         for _ in range(max_batches):
+            if _time.monotonic() >= deadline:
+                break
             result = await etl_engine.process_blw_async_tracker_queue(
                 {},
                 limit=batch_size,
@@ -2468,9 +2473,10 @@ def _blw_async_worker_status() -> Dict[str, Any]:
             next_run_at = None
     return {
         "enabled": _env_bool("BLW_ASYNC_WORKER_ENABLED", True),
-        "interval_seconds": _env_int("BLW_ASYNC_WORKER_INTERVAL_SECONDS", 2, 1, 3600),
-        "batch_size": _env_int("BLW_ASYNC_WORKER_BATCH_SIZE", 50, 1, 500),
-        "max_drain_batches": _env_int("BLW_ASYNC_WORKER_MAX_DRAIN_BATCHES", 4, 1, 100),
+        "interval_seconds": _env_int("BLW_ASYNC_WORKER_INTERVAL_SECONDS", 10, 1, 3600),
+        "batch_size": _env_int("BLW_ASYNC_WORKER_BATCH_SIZE", 3000, 1, 5000),
+        "max_drain_batches": _env_int("BLW_ASYNC_WORKER_MAX_DRAIN_BATCHES", 2, 1, 100),
+        "job_budget_seconds": _env_int("BLW_ASYNC_WORKER_JOB_BUDGET_SECONDS", 120, 1, 3600),
         "stale_running_seconds": _env_int("BLW_ASYNC_WORKER_STALE_RUNNING_SECONDS", 60, 10, 86400),
         "single_process_lock": _env_bool("BLW_ASYNC_WORKER_SINGLE_PROCESS_LOCK", True),
         "lock_held": _BLW_ASYNC_WORKER_LOCK_HELD,
@@ -2492,7 +2498,7 @@ def _sync_blw_async_worker_job() -> Dict[str, Any]:
         logger.info("BLW async tracker worker not scheduled in this process; another worker owns the lock.")
         return _blw_async_worker_status()
 
-    interval_seconds = _env_int("BLW_ASYNC_WORKER_INTERVAL_SECONDS", 2, 1, 3600)
+    interval_seconds = _env_int("BLW_ASYNC_WORKER_INTERVAL_SECONDS", 10, 1, 3600)
     max_instances = _env_int("BLW_ASYNC_WORKER_SCHEDULER_MAX_INSTANCES", 1, 1, 16)
     scheduler.add_job(
         _run_blw_async_tracker_worker_job,
@@ -7267,6 +7273,21 @@ def _mlops_stage3_train_rows(
         if str(item or "").strip()
     ]
     resolved_fields = list(dict.fromkeys(resolved_fields))
+    if resolved_fields:
+        available_top_level_fields = list(dict.fromkeys(
+            str(key)
+            for row in normalized_rows
+            if isinstance(row, dict)
+            for key in row.keys()
+            if str(key)
+        ))
+        resolved_from_encoded = _mlops_resolve_encoded_feature_columns(
+            available_top_level_fields,
+            target_path,
+            resolved_fields,
+        )
+        if resolved_from_encoded:
+            resolved_fields = resolved_from_encoded
     if not resolved_fields:
         first_row = normalized_rows[0] if normalized_rows else {}
         resolved_fields = [str(k) for k in list(first_row.keys())[:80] if str(k) and str(k) != target_path]
@@ -21625,13 +21646,14 @@ def _read_oracle_clob(value: Any) -> Any:
     return value
 
 
-def _open_blw_tracker_from_body(body: dict):
+def _open_blw_tracker_from_body(body: dict, ensure: bool = True):
     merged_config = _prepare_blw_tracker_request_config(body)
     conn, tracker_cfg = etl_engine._blw_tracker_connect(merged_config)  # pylint: disable=protected-access
     table_name = str(tracker_cfg.get("table") or "BLW_WORKFLOW_TRACKER").strip() or "BLW_WORKFLOW_TRACKER"
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)?", table_name):
         raise ValueError("Invalid BLW tracker table name.")
-    etl_engine._ensure_blw_tracker_table(conn, table_name)  # pylint: disable=protected-access
+    if ensure:
+        etl_engine._ensure_blw_tracker_table(conn, table_name)  # pylint: disable=protected-access
     return conn, table_name, merged_config
 
 
@@ -21643,10 +21665,10 @@ async def blw_tracker_summary(body: dict):
         limit = int(body.get("limit") or 50)
     except Exception:
         limit = 50
-    limit = max(1, min(limit, 500))
+    limit = max(1, min(limit, 5000))
 
     try:
-        conn, table_name, _ = _open_blw_tracker_from_body(body)
+        conn, table_name, _ = _open_blw_tracker_from_body(body, ensure=False)
     except Exception as exc:
         return {
             "ok": False,
@@ -21658,6 +21680,139 @@ async def blw_tracker_summary(body: dict):
 
     cur = conn.cursor()
     try:
+        fast_mode_raw = body.get("fast", True)
+        fast_mode = fast_mode_raw is not False and str(fast_mode_raw).strip().lower() not in {"0", "false", "no", "off"}
+        if fast_mode:
+            try:
+                cur.arraysize = max(50, min(int(limit), 1000))
+            except Exception:
+                pass
+            try:
+                counts_ttl_seconds = float(body.get("counts_ttl_seconds") or _os.getenv("BLW_DASHBOARD_COUNTS_CACHE_SECONDS", "30") or 30)
+            except Exception:
+                counts_ttl_seconds = 30.0
+            counts_ttl_seconds = max(1.0, min(counts_ttl_seconds, 3600.0))
+            cache_key = f"{table_name.upper()}|status_counts"
+            now_mono = _time.monotonic()
+            cached_counts = _BLW_TRACKER_SUMMARY_CACHE.get(cache_key)
+            all_status_counts: Dict[str, int] = {}
+            all_stage_counts: Dict[str, int] = {}
+            all_node_counts: Dict[str, int] = {}
+            all_total = 0
+            counts_cached = False
+            if isinstance(cached_counts, dict) and now_mono - float(cached_counts.get("at") or 0.0) <= counts_ttl_seconds:
+                raw_counts = cached_counts.get("status_counts")
+                if isinstance(raw_counts, dict):
+                    all_status_counts = {str(key): int(value or 0) for key, value in raw_counts.items()}
+                    all_total = int(cached_counts.get("total") or sum(all_status_counts.values()))
+                    counts_cached = True
+                raw_stage_counts = cached_counts.get("stage_counts")
+                if isinstance(raw_stage_counts, dict):
+                    all_stage_counts = {str(key): int(value or 0) for key, value in raw_stage_counts.items()}
+                raw_node_counts = cached_counts.get("node_counts")
+                if isinstance(raw_node_counts, dict):
+                    all_node_counts = {str(key): int(value or 0) for key, value in raw_node_counts.items()}
+            refresh_counts_raw = body.get("refresh_counts", False)
+            refresh_counts = refresh_counts_raw is True or str(refresh_counts_raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+            if not counts_cached and refresh_counts:
+                cur.execute(f"""
+                    SELECT CURRENT_STATUS, COUNT(*)
+                    FROM {table_name}
+                    GROUP BY CURRENT_STATUS
+                """)
+                all_status_counts = {str(row[0] or "UNKNOWN"): int(row[1] or 0) for row in cur.fetchall() or []}
+                all_total = sum(all_status_counts.values())
+                cur.execute(f"""
+                    SELECT CURRENT_STAGE, COUNT(*)
+                    FROM {table_name}
+                    GROUP BY CURRENT_STAGE
+                """)
+                all_stage_counts = {str(row[0] or "UNKNOWN"): int(row[1] or 0) for row in cur.fetchall() or []}
+                cur.execute(f"""
+                    SELECT BUSINESS_NODE_ID, COUNT(*)
+                    FROM {table_name}
+                    GROUP BY BUSINESS_NODE_ID
+                """)
+                all_node_counts = {str(row[0] or "UNKNOWN"): int(row[1] or 0) for row in cur.fetchall() or []}
+                _BLW_TRACKER_SUMMARY_CACHE[cache_key] = {
+                    "at": now_mono,
+                    "status_counts": all_status_counts,
+                    "stage_counts": all_stage_counts,
+                    "node_counts": all_node_counts,
+                    "total": all_total,
+                }
+            cur.execute(f"""
+                SELECT RUN_ID, WORKFLOW_NAME, INPUT_UNIQUE_ID, CURRENT_STAGE, CURRENT_STEP_ID,
+                       CURRENT_STATUS, ITERATION_NO, RETRY_COUNT, ESCALATION_LEVEL,
+                       INPUT_SOURCE, PIPELINE_ID, BUSINESS_NODE_ID, ERROR_CODE,
+                       CAST(NULL AS VARCHAR2(500)),
+                       TO_CHAR(STARTED_AT, 'YYYY-MM-DD HH24:MI:SS'),
+                       TO_CHAR(LAST_UPDATED_AT, 'YYYY-MM-DD HH24:MI:SS'),
+                       TO_CHAR(WAIT_UNTIL, 'YYYY-MM-DD HH24:MI:SS'),
+                       CASE
+                           WHEN WAIT_UNTIL IS NULL THEN NULL
+                           ELSE GREATEST(0, ROUND((CAST(WAIT_UNTIL AS DATE) - CAST(CAST(SYSTIMESTAMP AS TIMESTAMP) AS DATE)) * 86400))
+                       END,
+                       TO_CHAR(ENDED_AT, 'YYYY-MM-DD HH24:MI:SS'),
+                       ROUND((CAST(COALESCE(ENDED_AT, LAST_UPDATED_AT) AS DATE) - CAST(STARTED_AT AS DATE)) * 86400)
+                FROM {table_name}
+                ORDER BY LAST_UPDATED_AT DESC
+                FETCH FIRST {limit} ROWS ONLY
+            """)
+            rows = []
+            stage_counts: Dict[str, int] = {}
+            for row in cur.fetchall() or []:
+                stage = str(row[3] or "UNKNOWN")
+                stage_counts[stage] = stage_counts.get(stage, 0) + 1
+                rows.append({
+                    "run_id": str(row[0] or ""),
+                    "workflow_name": str(row[1] or ""),
+                    "input_unique_id": str(row[2] or ""),
+                    "current_stage": str(row[3] or ""),
+                    "current_step_id": str(row[4] or ""),
+                    "current_status": str(row[5] or ""),
+                    "iteration_no": int(row[6] or 0),
+                    "retry_count": int(row[7] or 0),
+                    "escalation_level": int(row[8] or 0),
+                    "input_source": str(row[9] or ""),
+                    "pipeline_id": str(row[10] or ""),
+                    "business_node_id": str(row[11] or ""),
+                    "error_code": str(row[12] or ""),
+                    "error_message": str(row[13] or ""),
+                    "started_at": str(row[14] or ""),
+                    "last_updated_at": str(row[15] or ""),
+                    "wait_until": str(row[16] or ""),
+                    "wait_remaining_seconds": int(row[17]) if row[17] is not None else None,
+                    "ended_at": str(row[18] or ""),
+                    "duration_seconds": int(row[19] or 0),
+                    "last_wait_node_id": "",
+                    "last_wait_seconds": None,
+                    "last_wait_until": "",
+                })
+            return {
+                "ok": True,
+                "table": table_name,
+                "summary": {
+                    "total": all_total or len(rows),
+                    "status_counts": all_status_counts or {
+                        str(row.get("current_status") or "UNKNOWN"): sum(
+                            1 for item in rows if str(item.get("current_status") or "UNKNOWN") == str(row.get("current_status") or "UNKNOWN")
+                        )
+                        for row in rows
+                    },
+                    "stage_counts": all_stage_counts or stage_counts,
+                    "node_counts": all_node_counts,
+                    "fast_mode": True,
+                    "sample_limit": int(limit),
+                    "stage_counts_sampled": not bool(all_stage_counts),
+                    "node_counts_sampled": not bool(all_node_counts),
+                    "counts_cached": counts_cached,
+                    "counts_deferred": not counts_cached and not refresh_counts,
+                    "counts_cache_seconds": counts_ttl_seconds,
+                },
+                "rows": rows,
+            }
+
         cur.execute(f"""
             SELECT CURRENT_STATUS, COUNT(*)
             FROM {table_name}
@@ -21674,7 +21829,7 @@ async def blw_tracker_summary(body: dict):
             SELECT RUN_ID, WORKFLOW_NAME, INPUT_UNIQUE_ID, CURRENT_STAGE, CURRENT_STEP_ID,
                    CURRENT_STATUS, ITERATION_NO, RETRY_COUNT, ESCALATION_LEVEL,
                    INPUT_SOURCE, PIPELINE_ID, BUSINESS_NODE_ID, ERROR_CODE,
-                   SUBSTR(ERROR_MESSAGE, 1, 500),
+                   CAST(NULL AS VARCHAR2(500)),
                    TO_CHAR(STARTED_AT, 'YYYY-MM-DD HH24:MI:SS'),
                    TO_CHAR(LAST_UPDATED_AT, 'YYYY-MM-DD HH24:MI:SS'),
                    TO_CHAR(WAIT_UNTIL, 'YYYY-MM-DD HH24:MI:SS'),
@@ -21713,7 +21868,7 @@ async def blw_tracker_summary(body: dict):
                 "pipeline_id": str(row[10] or ""),
                 "business_node_id": str(row[11] or ""),
                 "error_code": str(row[12] or ""),
-                "error_message": str(row[13] or ""),
+                "error_message": str(_read_oracle_clob(row[13]) or ""),
                 "started_at": str(row[14] or ""),
                 "last_updated_at": str(row[15] or ""),
                 "wait_until": str(row[16] or ""),
@@ -21817,6 +21972,102 @@ async def blw_tracker_detail(body: dict):
             pass
 
 
+@app.post("/api/blw/tracker/export")
+async def blw_tracker_export(body: dict):
+    """Return BLW tracker rows for CSV export, optionally filtered by dashboard drill/search text."""
+    try:
+        limit = int(body.get("limit") or 5000)
+    except Exception:
+        limit = 5000
+    limit = max(1, min(limit, 50000))
+    search_text = str(body.get("search") or "").strip()
+
+    try:
+        conn, table_name, _ = _open_blw_tracker_from_body(body)
+    except Exception as exc:
+        return {"ok": False, "message": str(exc), "rows": []}
+
+    cur = conn.cursor()
+    try:
+        bind_params: Dict[str, Any] = {"limit": int(limit)}
+        where_sql = ""
+        if search_text:
+            bind_params["search"] = f"%{search_text.upper()}%"
+            where_sql = """
+            WHERE UPPER(
+                COALESCE(RUN_ID, '') || ' ' ||
+                COALESCE(WORKFLOW_NAME, '') || ' ' ||
+                COALESCE(INPUT_UNIQUE_ID, '') || ' ' ||
+                COALESCE(CURRENT_STAGE, '') || ' ' ||
+                COALESCE(CURRENT_STEP_ID, '') || ' ' ||
+                COALESCE(CURRENT_STATUS, '') || ' ' ||
+                COALESCE(INPUT_SOURCE, '') || ' ' ||
+                COALESCE(PIPELINE_ID, '') || ' ' ||
+                COALESCE(BUSINESS_NODE_ID, '') || ' ' ||
+                COALESCE(ERROR_CODE, '')
+            ) LIKE :search
+            """
+        cur.execute(f"""
+            SELECT RUN_ID, WORKFLOW_NAME, INPUT_UNIQUE_ID, CURRENT_STAGE, CURRENT_STEP_ID,
+                   CURRENT_STATUS, ITERATION_NO, RETRY_COUNT, ESCALATION_LEVEL,
+                   INPUT_SOURCE, PIPELINE_ID, BUSINESS_NODE_ID, ERROR_CODE,
+                   ERROR_MESSAGE,
+                   TO_CHAR(STARTED_AT, 'YYYY-MM-DD HH24:MI:SS'),
+                   TO_CHAR(LAST_UPDATED_AT, 'YYYY-MM-DD HH24:MI:SS'),
+                   TO_CHAR(WAIT_UNTIL, 'YYYY-MM-DD HH24:MI:SS'),
+                   CASE
+                       WHEN WAIT_UNTIL IS NULL THEN NULL
+                       ELSE GREATEST(0, ROUND((CAST(WAIT_UNTIL AS DATE) - CAST(CAST(SYSTIMESTAMP AS TIMESTAMP) AS DATE)) * 86400))
+                   END,
+                   TO_CHAR(ENDED_AT, 'YYYY-MM-DD HH24:MI:SS'),
+                   ROUND((CAST(COALESCE(ENDED_AT, LAST_UPDATED_AT) AS DATE) - CAST(STARTED_AT AS DATE)) * 86400)
+            FROM {table_name}
+            {where_sql}
+            ORDER BY LAST_UPDATED_AT DESC
+            FETCH FIRST :limit ROWS ONLY
+        """, bind_params)
+        rows = []
+        for row in cur.fetchall() or []:
+            rows.append({
+                "run_id": str(row[0] or ""),
+                "workflow_name": str(row[1] or ""),
+                "input_unique_id": str(row[2] or ""),
+                "current_stage": str(row[3] or ""),
+                "current_step_id": str(row[4] or ""),
+                "current_status": str(row[5] or ""),
+                "iteration_no": int(row[6] or 0),
+                "retry_count": int(row[7] or 0),
+                "escalation_level": int(row[8] or 0),
+                "input_source": str(row[9] or ""),
+                "pipeline_id": str(row[10] or ""),
+                "business_node_id": str(row[11] or ""),
+                "error_code": str(row[12] or ""),
+                "error_message": str(row[13] or ""),
+                "started_at": str(row[14] or ""),
+                "last_updated_at": str(row[15] or ""),
+                "wait_until": str(row[16] or ""),
+                "wait_remaining_seconds": int(row[17]) if row[17] is not None else None,
+                "ended_at": str(row[18] or ""),
+                "duration_seconds": int(row[19] or 0),
+            })
+        return {
+            "ok": True,
+            "table": table_name,
+            "search": search_text,
+            "limit": int(limit),
+            "rows": rows,
+        }
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 @app.post("/api/blw/tracker/action")
 async def blw_tracker_action(body: dict):
     """Apply manual BLW tracker actions for resume, retry, pause, or terminate."""
@@ -21866,14 +22117,143 @@ async def blw_tracker_action(body: dict):
             pass
 
 
+@app.get("/api/blw/worker/status")
+async def blw_worker_status():
+    """Return BLW async worker scheduler/runtime settings."""
+    return {"ok": True, "worker": _blw_async_worker_status()}
+
+
+@app.post("/api/blw/worker/pause")
+async def blw_worker_pause(body: dict):
+    """Pause the BLW async worker briefly so maintenance can run without row-lock contention."""
+    global _BLW_ASYNC_WORKER_PAUSE_UNTIL
+    try:
+        pause_seconds = int(body.get("pause_seconds") or 120)
+    except Exception:
+        pause_seconds = 120
+    pause_seconds = max(1, min(pause_seconds, 3600))
+    _BLW_ASYNC_WORKER_PAUSE_UNTIL = max(_BLW_ASYNC_WORKER_PAUSE_UNTIL, _time.time() + pause_seconds)
+    return {"ok": True, "worker": _blw_async_worker_status()}
+
+
+@app.post("/api/blw/tracker/purge")
+async def blw_tracker_purge(body: dict):
+    """Safely clear the BLW tracker table without fighting the async worker."""
+    global _BLW_ASYNC_WORKER_PAUSE_UNTIL
+    try:
+        pause_seconds = int(body.get("pause_seconds") or 180)
+    except Exception:
+        pause_seconds = 180
+    pause_seconds = max(10, min(pause_seconds, 3600))
+    _BLW_ASYNC_WORKER_PAUSE_UNTIL = max(_BLW_ASYNC_WORKER_PAUSE_UNTIL, _time.time() + pause_seconds)
+
+    use_truncate_raw = body.get("truncate", True)
+    use_truncate = use_truncate_raw is not False and str(use_truncate_raw).strip().lower() not in {"0", "false", "no", "off"}
+    try:
+        batch_size = int(body.get("batch_size") or 1000)
+    except Exception:
+        batch_size = 1000
+    batch_size = max(100, min(batch_size, 10000))
+    try:
+        max_retries = int(body.get("max_retries") or 5)
+    except Exception:
+        max_retries = 5
+    max_retries = max(0, min(max_retries, 20))
+
+    try:
+        conn, table_name, _ = _open_blw_tracker_from_body(body, ensure=False)
+    except Exception as exc:
+        return {"ok": False, "message": str(exc), "worker": _blw_async_worker_status()}
+
+    cur = conn.cursor()
+    deleted = 0
+    method = "truncate" if use_truncate else "delete"
+    try:
+        if use_truncate:
+            try:
+                try:
+                    cur.execute("ALTER SESSION SET ddl_lock_timeout = 120")
+                except Exception:
+                    pass
+                cur.execute(f"TRUNCATE TABLE {table_name}")
+                _BLW_TRACKER_SUMMARY_CACHE.clear()
+                return {
+                    "ok": True,
+                    "table": table_name,
+                    "method": "truncate",
+                    "deleted": None,
+                    "worker": _blw_async_worker_status(),
+                }
+            except Exception as exc:
+                message = str(exc)
+                if not any(code in message for code in ("ORA-00054", "ORA-00060", "ORA-02266", "ORA-14705")):
+                    raise
+                method = "delete"
+
+        retries = 0
+        while True:
+            try:
+                cur.execute(f"""
+                    DELETE FROM {table_name}
+                    WHERE ROWID IN (
+                        SELECT rid
+                        FROM (
+                            SELECT ROWID AS rid
+                            FROM {table_name}
+                            FETCH FIRST :batch_size ROWS ONLY
+                        )
+                    )
+                """, {"batch_size": batch_size})
+                affected = int(getattr(cur, "rowcount", 0) or 0)
+                conn.commit()
+                deleted += max(0, affected)
+                retries = 0
+                if affected <= 0:
+                    break
+            except Exception as exc:
+                message = str(exc)
+                conn.rollback()
+                if ("ORA-00060" in message or "ORA-00054" in message) and retries < max_retries:
+                    retries += 1
+                    await asyncio.sleep(min(10.0, 0.5 * (2 ** retries)))
+                    continue
+                raise
+        _BLW_TRACKER_SUMMARY_CACHE.clear()
+        return {
+            "ok": True,
+            "table": table_name,
+            "method": method,
+            "deleted": deleted,
+            "worker": _blw_async_worker_status(),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "table": table_name,
+            "method": method,
+            "deleted": deleted,
+            "message": str(exc),
+            "worker": _blw_async_worker_status(),
+        }
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 @app.post("/api/blw/worker/run-once")
 async def blw_worker_run_once(body: dict):
     """Run the BLW async tracker worker once for queued/pending tracker rows."""
     try:
-        limit = int(body.get("limit") or _env_int("BLW_ASYNC_WORKER_BATCH_SIZE", 50, 1, 500))
+        limit = int(body.get("limit") or _env_int("BLW_ASYNC_WORKER_BATCH_SIZE", 3000, 1, 5000))
     except Exception:
         limit = 5
-    limit = max(1, min(limit, 500))
+    limit = max(1, min(limit, 5000))
     try:
         stale_seconds = int(body.get("stale_running_seconds") or _env_int("BLW_ASYNC_WORKER_STALE_RUNNING_SECONDS", 60, 10, 86400))
     except Exception:

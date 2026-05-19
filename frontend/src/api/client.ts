@@ -1229,7 +1229,7 @@ const api = {
     }
   },
 
-  getBlwTrackerSummary: (payload: { config: Record<string, unknown>; limit?: number }) => safeGet(async () => {
+  getBlwTrackerSummary: (payload: { config: Record<string, unknown>; limit?: number; fast?: boolean; counts_ttl_seconds?: number; refresh_counts?: boolean }) => safeGet(async () => {
     const r = await http.post('/api/blw/tracker/summary', payload)
     return r.data
   }, {
@@ -1241,6 +1241,11 @@ const api = {
 
   getBlwTrackerDetail: async (payload: { config: Record<string, unknown>; run_id: string }) => {
     const r = await http.post('/api/blw/tracker/detail', payload)
+    return r.data
+  },
+
+  exportBlwTrackerRows: async (payload: { config: Record<string, unknown>; search?: string; limit?: number }) => {
+    const r = await http.post('/api/blw/tracker/export', payload, { timeout: 120000 })
     return r.data
   },
 

@@ -180,6 +180,7 @@ const sourceNodes: NodeTypeDefinition[] = [
       { name: 'password', label: 'Password', type: 'password' },
       { name: 'query', label: 'SQL Query', type: 'code', language: 'sql',
         placeholder: 'SELECT * FROM YOUR_TABLE FETCH FIRST 1000 ROWS ONLY', required: true },
+      { name: 'limit', label: 'Max Rows', type: 'number', defaultValue: 1000 },
     ],
   },
   {
@@ -1032,6 +1033,8 @@ const destinationNodes: NodeTypeDefinition[] = [
       { name: 'if_exists', label: 'If Table Exists', type: 'select',
         options: [{ value: 'append', label: 'Append' }, { value: 'replace', label: 'Replace' }, { value: 'fail', label: 'Fail' }],
         defaultValue: 'append' },
+      { name: 'oracle_direct_insert_enabled', label: 'Direct Batch Insert', type: 'toggle', defaultValue: true },
+      { name: 'oracle_direct_insert_batch_size', label: 'Direct Insert Batch Size', type: 'number', defaultValue: 5000 },
     ],
   },
   {
