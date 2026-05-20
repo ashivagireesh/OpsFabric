@@ -585,6 +585,14 @@ function serializeEmbeddedNodes(nodes: any[]): Array<Record<string, unknown>> {
         nodeType: String(node?.data?.nodeType || ''),
         label: String(node?.data?.label || ''),
         config: cfg,
+        status: node?.data?.status,
+        executionRows: node?.data?.executionRows,
+        executionSampleInput: Array.isArray(node?.data?.executionSampleInput)
+          ? cloneStructured(node.data.executionSampleInput)
+          : undefined,
+        executionSampleOutput: Array.isArray(node?.data?.executionSampleOutput)
+          ? cloneStructured(node.data.executionSampleOutput)
+          : undefined,
       },
     }
   }).filter((node) => String(node.id || '').trim().length > 0)

@@ -6787,6 +6787,10 @@ END;"""
                         "input_sample": event_payload.get("input_sample", []),
                         "output_sample": event_payload.get("output_sample", []),
                     }
+                    if isinstance(event_payload.get("route_counts"), dict):
+                        log_payload["route_counts"] = dict(event_payload.get("route_counts") or {})
+                    if isinstance(event_payload.get("route_handles"), dict):
+                        log_payload["route_handles"] = dict(event_payload.get("route_handles") or {})
 
                     if event_type in {"node_progress", "node_success", "node_error"}:
                         replaced = False
@@ -10352,7 +10356,14 @@ END;"""
                     row_copy,
                     profile_patch_ops_for_output,
                 )
-                reflected_rows.append(next_row if applied_ops > 0 else row_copy)
+                reflected = next_row if applied_ops > 0 and isinstance(next_row, dict) else row_copy
+                reflected_rows.append(
+                    self._profile_query_reflect_patch_aliases(
+                        reflected,
+                        profile_patch_ops_for_output,
+                        select_field_aliases,
+                    )
+                )
             projection_input_rows = reflected_rows
 
         if not selected_fields:
@@ -10382,7 +10393,14 @@ END;"""
                         row_copy,
                         profile_patch_ops_for_output,
                     )
-                    reflected_rows.append(next_row if applied_ops > 0 else row_copy)
+                    reflected = next_row if applied_ops > 0 and isinstance(next_row, dict) else row_copy
+                    reflected_rows.append(
+                        self._profile_query_reflect_patch_aliases(
+                            reflected,
+                            profile_patch_ops_for_output,
+                            select_field_aliases,
+                        )
+                    )
                 result_rows = reflected_rows
             return result_rows
 
@@ -10462,7 +10480,14 @@ END;"""
                     row_copy,
                     profile_patch_ops_for_output,
                 )
-                reflected_rows.append(next_row if applied_ops > 0 else row_copy)
+                reflected = next_row if applied_ops > 0 and isinstance(next_row, dict) else row_copy
+                reflected_rows.append(
+                    self._profile_query_reflect_patch_aliases(
+                        reflected,
+                        profile_patch_ops_for_output,
+                        select_field_aliases,
+                    )
+                )
             result_rows = reflected_rows
 
         return result_rows
@@ -11159,6 +11184,112 @@ END;"""
             current_doc = next_doc if isinstance(next_doc, dict) else current_doc
             applied += 1
         return current_doc, applied, invalid
+
+    def _profile_query_reflect_patch_aliases(
+        self,
+        row_obj: Dict[str, Any],
+        patch_ops: List[Dict[str, Any]],
+        select_field_aliases: Dict[str, str],
+    ) -> Dict[str, Any]:
+        if not isinstance(row_obj, dict):
+            return row_obj
+        out = dict(row_obj)
+        alias_by_path: Dict[str, str] = {}
+        for raw_path, raw_alias in (select_field_aliases or {}).items():
+            path = str(raw_path or "").strip()
+            alias = str(raw_alias or "").strip()
+            if path and alias:
+                alias_by_path[path] = alias
+                if path.lower().startswith("document_json."):
+                    alias_by_path[path[len("DOCUMENT_JSON."):]] = alias
+
+        def _path_alias(path: str) -> str:
+            path_text = str(path or "").strip()
+            if not path_text:
+                return ""
+            alias = alias_by_path.get(path_text)
+            if alias:
+                return alias
+            if path_text.lower().startswith("document_json."):
+                alias = alias_by_path.get(path_text[len("DOCUMENT_JSON."):])
+                if alias:
+                    return alias
+            tokens = self._split_profile_path(path_text)
+            for token in reversed(tokens):
+                if isinstance(token, str) and token:
+                    return token
+            return ""
+
+        def _row_value(path: str) -> Tuple[Any, bool]:
+            path_text = str(path or "").strip()
+            if not path_text:
+                return None, False
+            value, found = self._extract_row_value_by_path(out, path_text)
+            if found:
+                return value, True
+            if path_text in out:
+                return out.get(path_text), True
+            alias = _path_alias(path_text)
+            if alias and alias in out:
+                return out.get(alias), True
+            return None, False
+
+        for raw_op in patch_ops or []:
+            if not isinstance(raw_op, dict):
+                continue
+            op_type = str(raw_op.get("op") or "set").strip().lower()
+            if op_type not in {"set", "set_where", "inc"}:
+                continue
+            target_path = str(raw_op.get("target_path") or "").strip()
+            if not target_path:
+                continue
+
+            if op_type == "set_where":
+                where_value_mode = str(raw_op.get("where_value_mode") or "row").strip().lower()
+                where_source_path = str(raw_op.get("where_source_path") or "").strip()
+                where_field = str(raw_op.get("where_field") or "").strip()
+                if where_value_mode == "fixed":
+                    expected = self._profile_query_coerce_patch_value_literal(raw_op.get("where_value"))
+                    actual, actual_found = _row_value(where_field)
+                    if actual_found and not self._flow_condition_eval_operator(actual, "equals", expected, False):
+                        continue
+                    if not actual_found:
+                        continue
+                else:
+                    expected_path = where_source_path or where_field
+                    expected, expected_found = _row_value(expected_path)
+                    if not expected_found:
+                        continue
+                    actual, actual_found = _row_value(where_field)
+                    if actual_found and not self._flow_condition_eval_operator(actual, "equals", expected, False):
+                        continue
+
+            patch_value, patch_found = self._profile_query_pick_patch_value(
+                row_obj=out,
+                patch_source_path=str(raw_op.get("source_path") or "").strip(),
+                patch_target_path=target_path,
+                patch_value_mode=str(raw_op.get("value_mode") or "row").strip().lower(),
+                patch_value_literal=raw_op.get("value"),
+            )
+            if not patch_found:
+                continue
+
+            if op_type == "inc":
+                current_alias = _path_alias(target_path)
+                current_value = out.get(current_alias) if current_alias else None
+                base_num = self._profile_query_coerce_numeric_value(current_value)
+                delta = self._profile_query_coerce_numeric_value(patch_value)
+                if delta is None:
+                    continue
+                next_num = (base_num or 0.0) + delta
+                patch_value = int(next_num) if float(next_num).is_integer() else float(next_num)
+
+            safe_value = self._json_safe_value(patch_value)
+            self._set_profile_path_value(out, target_path, safe_value)
+            alias = _path_alias(target_path)
+            if alias:
+                out[alias] = safe_value
+        return out
 
     def _profile_query_apply_patch_operations_to_lmdb_payload(
         self,
@@ -20977,7 +21108,58 @@ END;"""
                 for item in completed_delay_ids_raw
                 if str(item or "").strip()
             } if isinstance(completed_delay_ids_raw, list) else set()
+            if delay_node_id and self._parse_bool_like(
+                execution_context.get("blw_batch_nonblocking_wait", False),
+                False,
+            ):
+                resumed_rows: List[Any] = []
+                waiting_rows: List[Any] = []
+                for row in data:
+                    row_completed_raw = row.get("_blw_completed_delay_node_ids") if isinstance(row, dict) else None
+                    row_completed_ids = {
+                        str(item).strip()
+                        for item in row_completed_raw
+                        if str(item or "").strip()
+                    } if isinstance(row_completed_raw, list) else completed_delay_ids
+                    if delay_node_id in row_completed_ids:
+                        if isinstance(row, dict):
+                            row["_blw_completed_delay_node_ids"] = [
+                                str(item).strip()
+                                for item in row_completed_raw
+                                if str(item or "").strip() and str(item).strip() != delay_node_id
+                            ] if isinstance(row_completed_raw, list) else []
+                        resumed_rows.append(row)
+                    else:
+                        waiting_rows.append(row)
+                if waiting_rows and resumed_rows:
+                    wait_rows_by_node = execution_context.setdefault("blw_wait_rows_by_node", {})
+                    if isinstance(wait_rows_by_node, dict):
+                        bucket = wait_rows_by_node.setdefault(delay_node_id, [])
+                        if isinstance(bucket, list):
+                            bucket.extend(waiting_rows)
+                    _emit(
+                        f"✓ Delay Transform — resumed {len(resumed_rows):,} row(s), waiting {len(waiting_rows):,} row(s) for {delay_seconds:.6f}s",
+                        len(data),
+                        len(resumed_rows),
+                        len(resumed_rows),
+                    )
+                    return resumed_rows
+                if waiting_rows:
+                    raise BLWDelaySuspended(delay_node_id, delay_seconds, len(waiting_rows), rows=list(waiting_rows))
+                _emit(
+                    f"✓ Delay Transform — resumed after persisted wait for {delay_seconds:.6f}s",
+                    len(data),
+                    len(data),
+                    len(data),
+                )
+                return data
             if delay_node_id and delay_node_id in completed_delay_ids:
+                next_completed_delay_ids = [
+                    str(item)
+                    for item in completed_delay_ids_raw
+                    if str(item or "").strip() and str(item or "").strip() != delay_node_id
+                ] if isinstance(completed_delay_ids_raw, list) else []
+                execution_context["blw_completed_delay_node_ids"] = next_completed_delay_ids
                 _emit(
                     f"✓ Delay Transform — resumed after persisted wait for {delay_seconds:.6f}s",
                     len(data),
@@ -21569,6 +21751,32 @@ END;"""
             return value
         return row.get(key)
 
+    def _blw_variable_value(self, row: Any, field: str) -> Any:
+        if not isinstance(row, dict):
+            return None
+        blw_vars = row.get("_blw_vars")
+        if not isinstance(blw_vars, dict):
+            return None
+        key = str(field or "").strip()
+        if not key:
+            return None
+        if key in blw_vars:
+            return blw_vars.get(key)
+        if "." not in key:
+            return blw_vars.get(key)
+        root, nested_path = key.split(".", 1)
+        root_value = blw_vars.get(root)
+        if root_value is None:
+            return None
+        if not nested_path:
+            return root_value
+        if isinstance(root_value, dict):
+            extracted_value, extracted_found = self._extract_row_value_by_path(root_value, nested_path)
+            if extracted_found:
+                return extracted_value
+        nested_value = self._extract_json_path_value(root_value, nested_path)
+        return nested_value
+
     def _blw_compare(self, left: Any, operator: str, right: Any) -> bool:
         op = str(operator or "equals").strip().lower()
         if op in {"=", "=="}:
@@ -21588,6 +21796,9 @@ END;"""
             return left is None or str(left).strip() == ""
         if op in {"is_not_null", "not_null"}:
             return not (left is None or str(left).strip() == "")
+
+        if isinstance(left, list) and op not in {"contains", "not_contains"}:
+            return False
 
         left_num = self._business_to_number(left)
         right_num = self._business_to_number(right)
@@ -21630,8 +21841,7 @@ END;"""
         if function_match:
             source, key, operator, compare_value = function_match.groups()
             if source == "var" and isinstance(row, dict):
-                blw_vars = row.get("_blw_vars")
-                left_value = blw_vars.get(key) if isinstance(blw_vars, dict) else None
+                left_value = self._blw_variable_value(row, key)
             else:
                 left_value = self._blw_field_value(row, key)
             return self._blw_compare(left_value, operator, compare_value)
@@ -21709,8 +21919,7 @@ END;"""
             if not field:
                 return False
             if source == "variable" and isinstance(row, dict):
-                blw_vars = row.get("_blw_vars")
-                left_value = blw_vars.get(field) if isinstance(blw_vars, dict) else None
+                left_value = self._blw_variable_value(row, field)
             else:
                 left_value = self._blw_field_value(row, field)
             if operator == "exists":
@@ -21807,16 +22016,22 @@ END;"""
         action = cfg.get("blw_action") if isinstance(cfg.get("blw_action"), dict) else {}
         global_variables = cfg.get("blw_instance_variables") if isinstance(cfg.get("blw_instance_variables"), list) else []
         node_variables = action.get("variableAssignments") if isinstance(action.get("variableAssignments"), list) else []
-        variable_assignments = [item for item in [*global_variables, *node_variables] if isinstance(item, dict)]
+        variable_assignments = [
+            (item, True) for item in global_variables if isinstance(item, dict)
+        ] + [
+            (item, False) for item in node_variables if isinstance(item, dict)
+        ]
         out: List[Any] = []
         for row in active_rows:
             row_obj = dict(row) if isinstance(row, dict) else {"value": row}
             blw_vars = row_obj.get("_blw_vars")
             if not isinstance(blw_vars, dict):
                 blw_vars = {}
-            for assignment in variable_assignments:
+            for assignment, is_global_assignment in variable_assignments:
                 name = str(assignment.get("name") or "").strip()
                 if not name:
+                    continue
+                if is_global_assignment and name in blw_vars:
                     continue
                 source = str(assignment.get("source") or "input_field").strip().lower()
                 if source == "static":
@@ -21829,6 +22044,8 @@ END;"""
                     value = self._blw_field_value(row_obj, field) if field else assignment.get("defaultValue")
                     if value in (None, "") and assignment.get("defaultValue") not in (None, ""):
                         value = assignment.get("defaultValue")
+                if name in blw_vars and value in (None, "") and assignment.get("defaultValue") in (None, ""):
+                    continue
                 blw_vars[name] = value
             row_obj["_blw_vars"] = blw_vars
             trace = row_obj.get("_blw_trace")
@@ -22985,6 +23202,8 @@ INSERT INTO {table_name} (
                     "error_message": "Async BLW run has no BLW Studio graph to execute.",
                 }
             try:
+                route_audit_by_run_id: Dict[str, List[Dict[str, Any]]] = {}
+                variable_audit_by_run_id: Dict[str, Dict[str, Any]] = {}
                 await self._run_business_workflow_embedded(
                     input_rows=input_rows,
                     child_nodes=child_nodes,
@@ -22997,10 +23216,20 @@ INSERT INTO {table_name} (
                         "node_label": "BLW Async Worker",
                         "blw_async_persist_wait": True,
                         "blw_completed_delay_node_ids": completed_delay_node_ids,
+                        "blw_route_audit_by_run_id": route_audit_by_run_id,
+                        "blw_variable_audit_by_run_id": variable_audit_by_run_id,
                     },
                     node_id_prefix=str(item.get("business_node_id") or "business_workflow"),
                 )
-                return {"status": "processed", "run_id": run_id}
+                return {
+                    "status": "processed",
+                    "run_id": run_id,
+                    "routing_history_json": self._json_safe_value(route_audit_by_run_id.get(run_id) or []),
+                    "context_json": self._json_safe_value({
+                        **run_context,
+                        "latest_variables": variable_audit_by_run_id.get(run_id) or {},
+                    }),
+                }
             except BLWDelaySuspended as wait_exc:
                 next_completed = list(dict.fromkeys([*completed_delay_node_ids, wait_exc.node_id]))
                 wait_until = datetime.utcnow() + timedelta(seconds=wait_exc.delay_seconds)
@@ -23080,11 +23309,19 @@ INSERT INTO {table_name} (
                     run_context = {}
                 item_contexts[run_id] = run_context
                 raw_completed = run_context.get("completed_delay_node_ids")
+                row_completed_delay_node_ids = [
+                    str(value).strip()
+                    for value in raw_completed
+                    if str(value or "").strip()
+                ] if isinstance(raw_completed, list) else []
                 if isinstance(raw_completed, list):
                     for value in raw_completed:
                         text = str(value or "").strip()
                         if text and text not in completed_delay_node_ids:
                             completed_delay_node_ids.append(text)
+                for tagged_row in run_tagged_rows:
+                    if isinstance(tagged_row, dict):
+                        tagged_row["_blw_completed_delay_node_ids"] = list(row_completed_delay_node_ids)
             pipeline_id_for_context = str(first.get("pipeline_id") or wf_cfg.get("pipeline_id") or "").strip()
             pipeline_nodes_for_context = self._load_current_pipeline_nodes(pipeline_id_for_context)
             wf_cfg = {
@@ -23111,6 +23348,9 @@ INSERT INTO {table_name} (
                 ]
             try:
                 wait_rows_by_node: Dict[str, List[Any]] = {}
+                route_audit_by_run_id: Dict[str, List[Dict[str, Any]]] = {}
+                variable_audit_by_run_id: Dict[str, Dict[str, Any]] = {}
+                failed_rows_by_run_id: Dict[str, Dict[str, Any]] = {}
                 await self._run_business_workflow_embedded(
                     input_rows=all_input_rows,
                     child_nodes=child_nodes,
@@ -23125,6 +23365,9 @@ INSERT INTO {table_name} (
                         "blw_completed_delay_node_ids": completed_delay_node_ids,
                         "blw_batch_nonblocking_wait": True,
                         "blw_wait_rows_by_node": wait_rows_by_node,
+                        "blw_route_audit_by_run_id": route_audit_by_run_id,
+                        "blw_variable_audit_by_run_id": variable_audit_by_run_id,
+                        "blw_failed_rows_by_run_id": failed_rows_by_run_id,
                     },
                     node_id_prefix=str(first.get("business_node_id") or "business_workflow"),
                 )
@@ -23159,6 +23402,7 @@ INSERT INTO {table_name} (
                             "wait_node_id": str(wait_node_id),
                             "wait_seconds": delay_seconds,
                             "rows": 1,
+                            "routing_history_json": self._json_safe_value(route_audit_by_run_id.get(wait_run_id) or []),
                             "context_json": self._json_safe_value({
                                 **run_context,
                                 "completed_delay_node_ids": list(dict.fromkeys([*base_completed, str(wait_node_id)])),
@@ -23166,10 +23410,24 @@ INSERT INTO {table_name} (
                                 "last_wait_seconds": delay_seconds,
                                 "last_wait_until": wait_until.isoformat(),
                                 "batch_wait": True,
+                                "latest_variables": variable_audit_by_run_id.get(wait_run_id) or run_context.get("latest_variables") or {},
                             }),
                         }
                 return [
-                    waiting_run_ids[run_id] if run_id in waiting_run_ids else {"status": "processed", "run_id": run_id}
+                    {
+                        "status": "failed",
+                        "run_id": run_id,
+                        "error_code": str((failed_rows_by_run_id.get(run_id) or {}).get("error_code") or "BLWRowError"),
+                        "error_message": str((failed_rows_by_run_id.get(run_id) or {}).get("error_message") or "BLW row failed."),
+                    } if run_id in failed_rows_by_run_id else waiting_run_ids[run_id] if run_id in waiting_run_ids else {
+                        "status": "processed",
+                        "run_id": run_id,
+                        "routing_history_json": self._json_safe_value(route_audit_by_run_id.get(run_id) or []),
+                        "context_json": self._json_safe_value({
+                            **(item_contexts.get(run_id) or {}),
+                            "latest_variables": variable_audit_by_run_id.get(run_id) or {},
+                        }),
+                    }
                     for run_id in run_ids
                 ]
             except BLWDelaySuspended as wait_exc:
@@ -23278,13 +23536,30 @@ INSERT INTO {table_name} (
                         SET CURRENT_STATUS='success',
                             CURRENT_STAGE='Workflow Complete',
                             CURRENT_STEP_ID='__workflow__',
+                            CONTEXT_JSON=:context_json,
+                            ROUTING_HISTORY_JSON=:routing_history_json,
                             ERROR_CODE=NULL,
                             ERROR_MESSAGE=NULL,
                             WAIT_UNTIL=NULL,
                             ENDED_AT=CAST(SYSTIMESTAMP AS TIMESTAMP),
                             LAST_UPDATED_AT=CAST(SYSTIMESTAMP AS TIMESTAMP)
                         WHERE RUN_ID=:run_id
-                    """, [{"run_id": str(item.get("run_id") or "")} for item in processed_items])
+                    """, [
+                        {
+                            "run_id": str(item.get("run_id") or ""),
+                            "routing_history_json": json.dumps(
+                                self._json_safe_value(item.get("routing_history_json") or []),
+                                ensure_ascii=False,
+                                default=str,
+                            ),
+                            "context_json": json.dumps(
+                                self._json_safe_value(item.get("context_json") or {}),
+                                ensure_ascii=False,
+                                default=str,
+                            ),
+                        }
+                        for item in processed_items
+                    ])
                 if waiting_items:
                     cur3.executemany(f"""
                         UPDATE {table3}
@@ -23293,6 +23568,7 @@ INSERT INTO {table_name} (
                             CURRENT_STEP_ID=:wait_node_id,
                             WAIT_UNTIL=CAST(SYSTIMESTAMP AS TIMESTAMP) + NUMTODSINTERVAL(:wait_seconds, 'SECOND'),
                             CONTEXT_JSON=:context_json,
+                            ROUTING_HISTORY_JSON=:routing_history_json,
                             ERROR_CODE=NULL,
                             ERROR_MESSAGE=NULL,
                             LAST_UPDATED_AT=CAST(SYSTIMESTAMP AS TIMESTAMP)
@@ -23302,6 +23578,11 @@ INSERT INTO {table_name} (
                             "run_id": str(item.get("run_id") or ""),
                             "wait_node_id": str(item.get("wait_node_id") or "")[:255],
                             "wait_seconds": max(0.0, float(item.get("wait_seconds") or 0.0)),
+                            "routing_history_json": json.dumps(
+                                self._json_safe_value(item.get("routing_history_json") or []),
+                                ensure_ascii=False,
+                                default=str,
+                            ),
                             "context_json": json.dumps(self._json_safe_value(item.get("context_json") or {}), ensure_ascii=False, default=str),
                         }
                         for item in waiting_items
@@ -23730,17 +24011,61 @@ INSERT INTO {table_name} (
             incoming_edges[target].append(filtered_edge)
             in_degree[target] = int(in_degree.get(target, 0)) + 1
 
-        queue: List[str] = [node_id for node_id, deg in in_degree.items() if deg == 0]
+        # Use a DAG view for scheduling. BLW route graphs may intentionally
+        # contain retry/wait loops; those feedback edges must still route rows,
+        # but they should not force the scheduler to fall back to arbitrary
+        # canvas order and run downstream nodes before their first input exists.
+        sort_in_degree: Dict[str, int] = {node_id: 0 for node_id in child_nodes_by_id.keys()}
+        sort_outgoing_edges: Dict[str, List[Dict[str, str]]] = {
+            node_id: [] for node_id in child_nodes_by_id.keys()
+        }
+
+        def _is_feedback_edge(candidate_edge: Dict[str, str]) -> bool:
+            source = str(candidate_edge.get("source") or "").strip()
+            target = str(candidate_edge.get("target") or "").strip()
+            if not source or not target or source == target:
+                return True
+            source_payload = child_nodes_by_id.get(source) or {}
+            source_node_type = str(source_payload.get("node_type") or "").strip()
+            if source_node_type not in {"condition_node", "blw_condition_node"}:
+                return False
+            queue_paths = [target]
+            seen_paths = {target}
+            while queue_paths:
+                current = queue_paths.pop(0)
+                if current == source:
+                    return True
+                for next_edge in filtered_edges:
+                    if next_edge is candidate_edge:
+                        continue
+                    if str(next_edge.get("source") or "").strip() != current:
+                        continue
+                    next_target = str(next_edge.get("target") or "").strip()
+                    if not next_target or next_target in seen_paths:
+                        continue
+                    seen_paths.add(next_target)
+                    queue_paths.append(next_target)
+            return False
+
+        for edge in filtered_edges:
+            if _is_feedback_edge(edge):
+                continue
+            source = str(edge.get("source") or "").strip()
+            target = str(edge.get("target") or "").strip()
+            sort_outgoing_edges[source].append(edge)
+            sort_in_degree[target] = int(sort_in_degree.get(target, 0)) + 1
+
+        queue: List[str] = [node_id for node_id, deg in sort_in_degree.items() if deg == 0]
         topo_order: List[str] = []
         while queue:
             node_id = queue.pop(0)
             topo_order.append(node_id)
-            for edge in outgoing_edges.get(node_id, []):
+            for edge in sort_outgoing_edges.get(node_id, []):
                 target = str(edge.get("target") or "").strip()
-                if target not in in_degree:
+                if target not in sort_in_degree:
                     continue
-                in_degree[target] = int(in_degree.get(target, 0)) - 1
-                if in_degree[target] == 0:
+                sort_in_degree[target] = int(sort_in_degree.get(target, 0)) - 1
+                if sort_in_degree[target] == 0:
                     queue.append(target)
         if len(topo_order) != len(child_nodes_by_id):
             seen = set(topo_order)
@@ -23961,9 +24286,94 @@ INSERT INTO {table_name} (
                     sample.append({"value": safe})
             return sample
 
-        for node_id in topo_order:
+        def _record_async_route_audit(
+            node_id: str,
+            node_label: str,
+            input_rows_for_node: List[Any],
+            route_bundle: Dict[str, List[Any]],
+        ) -> None:
+            if not isinstance(execution_context, dict):
+                return
+            audit_by_run = execution_context.setdefault("blw_route_audit_by_run_id", {})
+            if not isinstance(audit_by_run, dict):
+                return
+
+            def _row_run_id(row_value: Any) -> str:
+                if not isinstance(row_value, dict):
+                    return ""
+                return str(row_value.get("_blw_async_run_id") or "").strip()
+
+            run_ids = [_row_run_id(row) for row in input_rows_for_node if _row_run_id(row)]
+            if not run_ids:
+                return
+            for run_id in list(dict.fromkeys(run_ids)):
+                input_count = sum(1 for row in input_rows_for_node if _row_run_id(row) == run_id)
+                handle_counts: Dict[str, int] = {}
+                for handle, rows_for_handle in route_bundle.items():
+                    if isinstance(rows_for_handle, list):
+                        handle_counts[str(handle)] = sum(1 for row in rows_for_handle if _row_run_id(row) == run_id)
+                bucket = audit_by_run.setdefault(run_id, [])
+                if isinstance(bucket, list):
+                    bucket.append({
+                        "node_id": node_id,
+                        "label": node_label,
+                        "mode": "blw_expression",
+                        "input_rows": input_count,
+                        "true_rows": int(handle_counts.get("output", 0)),
+                        "false_rows": int(handle_counts.get("output_false", 0)),
+                        "handles": handle_counts,
+                        "at": datetime.utcnow().isoformat(),
+                    })
+
+        def _record_async_variable_audit(
+            node_id: str,
+            node_label: str,
+            rows_for_node: List[Any],
+        ) -> None:
+            if not isinstance(execution_context, dict) or not isinstance(rows_for_node, list):
+                return
+            audit_by_run = execution_context.setdefault("blw_variable_audit_by_run_id", {})
+            if not isinstance(audit_by_run, dict):
+                return
+            for row_value in rows_for_node:
+                if not isinstance(row_value, dict):
+                    continue
+                run_id = str(row_value.get("_blw_async_run_id") or "").strip()
+                blw_vars = row_value.get("_blw_vars")
+                if not run_id or not isinstance(blw_vars, dict) or not blw_vars:
+                    continue
+                audit_by_run[run_id] = {
+                    "node_id": node_id,
+                    "label": node_label,
+                    "variables": self._json_safe_value(blw_vars),
+                    "child_output": self._json_safe_value(row_value.get("_blw_child_output")),
+                    "child_output_variable": str(row_value.get("_blw_child_output_variable") or ""),
+                    "child_node_id": str(row_value.get("_blw_child_node_id") or ""),
+                    "at": datetime.utcnow().isoformat(),
+                }
+
+        try:
+            workflow_max_iterations = int(wf_cfg.get("workflow_max_iterations") or wf_cfg.get("maxIterations") or 5)
+        except Exception:
+            workflow_max_iterations = 5
+        workflow_max_iterations = max(1, min(workflow_max_iterations, 1000))
+        topo_index = {node_id: idx for idx, node_id in enumerate(topo_order)}
+        work_queue: List[str] = list(topo_order)
+        forced_inputs_by_node: Dict[str, List[Any]] = {}
+        forced_sources_by_node: Dict[str, str] = {}
+        processed_normal_nodes: set[str] = set()
+
+        while work_queue:
+            node_id = work_queue.pop(0)
             if node_id in execute_child_targets:
                 continue
+            forced_upstream = forced_inputs_by_node.pop(node_id, None)
+            forced_source = forced_sources_by_node.pop(node_id, "")
+            forced_mode = isinstance(forced_upstream, list)
+            if not forced_mode:
+                if node_id in processed_normal_nodes:
+                    continue
+                processed_normal_nodes.add(node_id)
             if callable(raise_if_aborted):
                 raise_if_aborted()
             node_payload = child_nodes_by_id.get(node_id) or {}
@@ -23971,53 +24381,59 @@ INSERT INTO {table_name} (
             node_label = str(node_payload.get("label") or node_id).strip() or node_id
             node_cfg = node_payload.get("config") if isinstance(node_payload.get("config"), dict) else {}
 
-            upstream_data: List[Any] = []
-            incoming_by_source: Dict[str, list] = {}
-            incoming_order: List[str] = []
-            seen_bindings: set[tuple[str, str]] = set()
-            target_incoming = incoming_edges.get(node_id, [])
-            for edge in target_incoming:
-                source_id = str(edge.get("source") or "").strip()
-                source_handle = str(edge.get("source_handle") or "output").strip() or "output"
-                if source_id not in child_results:
-                    continue
-                source_node_payload = child_nodes_by_id.get(source_id) or {}
-                source_node_type = str(source_node_payload.get("node_type") or "").strip()
-                source_node_cfg = (
-                    source_node_payload.get("config")
-                    if isinstance(source_node_payload.get("config"), dict)
-                    else {}
-                )
-                source_routing_mode = str(
-                    source_node_cfg.get("condition_routing_mode") or ""
-                ).strip().lower()
-                if (
-                    source_handle == "output"
-                    and source_node_type == "condition_node"
-                    and source_routing_mode == "case"
-                ):
-                    # CASE routes should use explicit case_* handles only.
-                    continue
-                binding = (source_id, source_handle)
-                if binding in seen_bindings:
-                    continue
-                seen_bindings.add(binding)
-                source_bundle = child_results_by_handle.get(source_id) or {}
-                source_rows = source_bundle.get(source_handle)
-                if source_rows is None and source_handle == "output":
-                    source_rows = child_results.get(source_id)
-                if source_rows is None:
-                    source_rows = []
-                if not isinstance(source_rows, list):
-                    source_rows = [source_rows] if source_rows is not None else []
-                existing_rows = incoming_by_source.get(source_id, [])
-                existing_rows.extend(source_rows)
-                incoming_by_source[source_id] = existing_rows
-                if source_id not in incoming_order:
-                    incoming_order.append(source_id)
-                upstream_data.extend(source_rows)
+            if forced_mode:
+                upstream_data = list(forced_upstream or [])
+                source_key = forced_source or "__loop__"
+                incoming_by_source = {source_key: list(upstream_data)}
+                incoming_order = [source_key]
+            else:
+                upstream_data: List[Any] = []
+                incoming_by_source: Dict[str, list] = {}
+                incoming_order: List[str] = []
+                seen_bindings: set[tuple[str, str]] = set()
+                target_incoming = incoming_edges.get(node_id, [])
+                for edge in target_incoming:
+                    source_id = str(edge.get("source") or "").strip()
+                    source_handle = str(edge.get("source_handle") or "output").strip() or "output"
+                    if source_id not in child_results:
+                        continue
+                    source_node_payload = child_nodes_by_id.get(source_id) or {}
+                    source_node_type = str(source_node_payload.get("node_type") or "").strip()
+                    source_node_cfg = (
+                        source_node_payload.get("config")
+                        if isinstance(source_node_payload.get("config"), dict)
+                        else {}
+                    )
+                    source_routing_mode = str(
+                        source_node_cfg.get("condition_routing_mode") or ""
+                    ).strip().lower()
+                    if (
+                        source_handle == "output"
+                        and source_node_type == "condition_node"
+                        and source_routing_mode == "case"
+                    ):
+                        # CASE routes should use explicit case_* handles only.
+                        continue
+                    binding = (source_id, source_handle)
+                    if binding in seen_bindings:
+                        continue
+                    seen_bindings.add(binding)
+                    source_bundle = child_results_by_handle.get(source_id) or {}
+                    source_rows = source_bundle.get(source_handle)
+                    if source_rows is None and source_handle == "output":
+                        source_rows = child_results.get(source_id)
+                    if source_rows is None:
+                        source_rows = []
+                    if not isinstance(source_rows, list):
+                        source_rows = [source_rows] if source_rows is not None else []
+                    existing_rows = incoming_by_source.get(source_id, [])
+                    existing_rows.extend(source_rows)
+                    incoming_by_source[source_id] = existing_rows
+                    if source_id not in incoming_order:
+                        incoming_order.append(source_id)
+                    upstream_data.extend(source_rows)
 
-            if not target_incoming:
+            if not forced_mode and not incoming_edges.get(node_id, []):
                 parent_rows = input_rows if isinstance(input_rows, list) else []
                 upstream_data = list(parent_rows)
                 incoming_by_source = {"__parent__": list(parent_rows)}
@@ -24179,6 +24595,8 @@ INSERT INTO {table_name} (
                                     ]
                             target_exec_ctx = dict(child_exec_ctx)
                             target_exec_ctx["node_id"] = f"{node_id_prefix}::{node_id}::{target_child_id}"
+                            target_node_outputs_by_id: Dict[str, List[Any]] = {}
+                            target_exec_ctx["blw_node_outputs_by_id"] = target_node_outputs_by_id
                             if embedded_sub_nodes:
                                 embedded_start = embedded_child_nodes_by_id.get(target_child_id) or {}
                                 embedded_label = str(embedded_start.get("label") or target_child_id).strip() or target_child_id
@@ -24217,20 +24635,142 @@ INSERT INTO {table_name} (
                                     output = true_rows
                                     child_results_by_handle[node_id] = condition_bundle
                             output_path = str(action_cfg.get("outputPath") or "").strip()
-                            if output_path and isinstance(output, list):
+                            output_variable = str(
+                                action_cfg.get("outputVariable")
+                                or action_cfg.get("outputVariableName")
+                                or action_cfg.get("outputVar")
+                                or ""
+                            ).strip()
+                            if (output_path or output_variable) and isinstance(output, list):
+                                if target_node_outputs_by_id:
+                                    def _is_destination_output(node_output_id: str) -> bool:
+                                        output_payload = (
+                                            embedded_child_nodes_by_id.get(str(node_output_id or "").strip())
+                                            or child_nodes_by_id.get(str(node_output_id or "").strip())
+                                            or {}
+                                        )
+                                        output_type = str(output_payload.get("node_type") or "").strip().lower()
+                                        return output_type.endswith("_destination") or output_type in {
+                                            "csv_destination",
+                                            "json_destination",
+                                            "excel_destination",
+                                            "oracle_destination",
+                                            "postgres_destination",
+                                            "mysql_destination",
+                                            "s3_destination",
+                                        }
+
+                                    for output_node_id, output_rows in reversed(list(target_node_outputs_by_id.items())):
+                                        if _is_destination_output(str(output_node_id)):
+                                            continue
+                                        if isinstance(output_rows, list) and output_rows:
+                                            output = output_rows
+                                            break
                                 normalized_output_path = self._normalize_json_path_expr(output_path)
                                 mapped_rows: List[Any] = []
-                                if len(output) == 1 and len(upstream_data) != 1:
+                                safe_output_all = self._json_safe_value(output)
+                                no_child_match = object()
+
+                                def _dedupe_keys(raw_keys: List[Any]) -> List[str]:
+                                    seen_keys: set[str] = set()
+                                    resolved: List[str] = []
+                                    for raw_key in raw_keys:
+                                        key_text = str(raw_key or "").strip()
+                                        if not key_text:
+                                            continue
+                                        lowered_key = key_text.lower()
+                                        if lowered_key in seen_keys:
+                                            continue
+                                        seen_keys.add(lowered_key)
+                                        resolved.append(key_text)
+                                    return resolved
+
+                                match_keys = _dedupe_keys([
+                                    action_cfg.get("outputMatchField"),
+                                    action_cfg.get("matchField"),
+                                    action_cfg.get("inputMatchField"),
+                                    node_cfg.get("blw_unique_id_field"),
+                                    wf_cfg.get("workflow_unique_id_field"),
+                                    wf_cfg.get("uniqueIdField"),
+                                    wf_cfg.get("unique_id_field"),
+                                    wf_cfg.get("input_unique_id_field"),
+                                    *selected_fields,
+                                    "customer_account",
+                                    "customer_id",
+                                    "account",
+                                    "account_no",
+                                    "account_number",
+                                    "agentcode",
+                                    "agent_code",
+                                    "entity",
+                                    "entity_token",
+                                    "TRANSACTIONID",
+                                ])
+
+                                def _match_value(row_value: Any, key_name: str) -> Optional[str]:
+                                    if not isinstance(row_value, dict):
+                                        return None
+                                    found_value = self._blw_field_value(row_value, key_name)
+                                    if found_value is None or str(found_value).strip() == "":
+                                        return None
+                                    return str(found_value).strip().lower()
+
+                                output_lookup: Dict[tuple[str, str], List[Any]] = {}
+                                for produced_row in output:
+                                    if not isinstance(produced_row, dict):
+                                        continue
+                                    for match_key in match_keys:
+                                        match_value = _match_value(produced_row, match_key)
+                                        if not match_value:
+                                            continue
+                                        output_lookup.setdefault((match_key.lower(), match_value), []).append(produced_row)
+
+                                def _matched_output_for_parent(parent_row: Any) -> Any:
+                                    if not isinstance(parent_row, dict):
+                                        return no_child_match
+                                    for match_key in match_keys:
+                                        parent_value = _match_value(parent_row, match_key)
+                                        if not parent_value:
+                                            continue
+                                        bucket = output_lookup.get((match_key.lower(), parent_value))
+                                        if bucket:
+                                            return bucket.pop(0)
+                                    return no_child_match
+
+                                if len(output) == 0:
+                                    paired_output = [{
+                                        "status": "completed",
+                                        "rows": 0,
+                                        "output": [],
+                                    } for _ in upstream_data]
+                                elif len(output) == len(upstream_data):
+                                    paired_output = output
+                                elif len(output) == 1:
                                     paired_output = [output[0] for _ in upstream_data]
                                 else:
-                                    paired_output = output
+                                    paired_output = [_matched_output_for_parent(original) for original in upstream_data]
                                 for original, produced in zip(upstream_data, paired_output):
                                     row_obj = dict(original) if isinstance(original, dict) else {"value": original}
+                                    if produced is no_child_match:
+                                        row_obj["_blw_child_output_path"] = output_path
+                                        row_obj["_blw_child_output_variable"] = output_variable
+                                        row_obj["_blw_child_node_id"] = target_child_id
+                                        row_obj["_blw_child_output_unmatched"] = True
+                                        mapped_rows.append(row_obj)
+                                        continue
                                     safe_produced = self._json_safe_value(produced)
                                     if normalized_output_path:
                                         self._set_profile_path_value(row_obj, normalized_output_path, safe_produced)
+                                    if output_variable:
+                                        blw_vars = row_obj.get("_blw_vars")
+                                        if not isinstance(blw_vars, dict):
+                                            blw_vars = {}
+                                        blw_vars[output_variable] = safe_produced
+                                        blw_vars[f"{output_variable}__all"] = safe_output_all
+                                        row_obj["_blw_vars"] = blw_vars
                                     row_obj["_blw_child_output_path"] = output_path
                                     row_obj["_blw_child_output"] = safe_produced
+                                    row_obj["_blw_child_output_variable"] = output_variable
                                     row_obj["_blw_child_node_id"] = target_child_id
                                     mapped_rows.append(row_obj)
                                 output = mapped_rows
@@ -24324,6 +24864,8 @@ INSERT INTO {table_name} (
                         pass
                 raise
 
+            condition_route_counts: Optional[Dict[str, int]] = None
+            condition_route_handles: Optional[Dict[str, int]] = None
             if node_type in {"condition_node", "blw_condition_node"}:
                 routing_mode = str(node_cfg.get("condition_routing_mode") or "").strip().lower()
                 condition_input_rows = upstream_data if isinstance(upstream_data, list) else []
@@ -24331,6 +24873,16 @@ INSERT INTO {table_name} (
                     condition_bundle = self._blw_condition_group_split(condition_input_rows, node_cfg)
                     true_rows = condition_bundle.get("output", [])
                     false_rows = condition_bundle.get("output_false", [])
+                    condition_route_handles = {
+                        str(k): len(v)
+                        for k, v in condition_bundle.items()
+                        if isinstance(v, list)
+                    }
+                    condition_route_counts = {
+                        "input": len(condition_input_rows),
+                        "true": len(true_rows),
+                        "false": len(false_rows),
+                    }
                     tracker_routing_events.append({
                         "node_id": node_id,
                         "label": node_label,
@@ -24338,25 +24890,47 @@ INSERT INTO {table_name} (
                         "true_rows": len(true_rows),
                         "false_rows": len(false_rows),
                         "expression": str(node_cfg.get("blw_condition_expression") or ""),
-                        "handles": {str(k): len(v) for k, v in condition_bundle.items() if isinstance(v, list)},
+                        "handles": condition_route_handles,
                         "at": datetime.utcnow().isoformat(),
                     })
+                    _record_async_route_audit(node_id, node_label, condition_input_rows, condition_bundle)
                     output = true_rows
                     child_results_by_handle[node_id] = condition_bundle
                 elif routing_mode == "case":
                     case_split = self._flow_condition_case_routes_split(condition_input_rows, node_cfg)
                     output_rows = case_split.get("output")
                     output = output_rows if isinstance(output_rows, list) else []
+                    false_rows = case_split.get("output_false", [])
+                    condition_route_handles = {
+                        str(k): len(v)
+                        for k, v in case_split.items()
+                        if isinstance(v, list)
+                    }
+                    condition_route_counts = {
+                        "input": len(condition_input_rows),
+                        "true": len(output),
+                        "false": len(false_rows) if isinstance(false_rows, list) else 0,
+                    }
                     tracker_routing_events.append({
                         "node_id": node_id,
                         "label": node_label,
                         "mode": "case",
-                        "handles": {str(k): len(v) for k, v in case_split.items() if isinstance(v, list)},
+                        "handles": condition_route_handles,
                         "at": datetime.utcnow().isoformat(),
                     })
+                    _record_async_route_audit(node_id, node_label, condition_input_rows, case_split)
                     child_results_by_handle[node_id] = case_split
                 else:
                     true_rows, false_rows = self._flow_condition_split(condition_input_rows, node_cfg)
+                    condition_route_counts = {
+                        "input": len(condition_input_rows),
+                        "true": len(true_rows),
+                        "false": len(false_rows),
+                    }
+                    condition_route_handles = {
+                        "output": len(true_rows),
+                        "output_false": len(false_rows),
+                    }
                     tracker_routing_events.append({
                         "node_id": node_id,
                         "label": node_label,
@@ -24365,6 +24939,12 @@ INSERT INTO {table_name} (
                         "false_rows": len(false_rows),
                         "at": datetime.utcnow().isoformat(),
                     })
+                    _record_async_route_audit(
+                        node_id,
+                        node_label,
+                        condition_input_rows,
+                        {"output": true_rows, "output_false": false_rows},
+                    )
                     output = true_rows
                     child_results_by_handle[node_id] = {
                         "output": true_rows,
@@ -24376,6 +24956,14 @@ INSERT INTO {table_name} (
                     "output_false": [],
                 }
             child_results[node_id] = output if isinstance(output, list) else []
+            node_outputs_by_id = (
+                execution_context.get("blw_node_outputs_by_id")
+                if isinstance(execution_context, dict) and isinstance(execution_context.get("blw_node_outputs_by_id"), dict)
+                else None
+            )
+            if isinstance(node_outputs_by_id, dict):
+                node_outputs_by_id[node_id] = child_results[node_id]
+            _record_async_variable_audit(node_id, node_label, child_results[node_id])
             if node_type == "blw_runtime_step":
                 blw_type = str(node_cfg.get("blw_type") or "").strip().lower()
                 if blw_type in {"parallel_start", "parallel_join"}:
@@ -24407,22 +24995,126 @@ INSERT INTO {table_name} (
 
             if callable(emit_embedded_node_event):
                 output_rows = output if isinstance(output, list) else []
+                success_message = (
+                    f"✓ {node_label} evaluated — true: {condition_route_counts.get('true', 0):,}, "
+                    f"false: {condition_route_counts.get('false', 0):,}, "
+                    f"input: {condition_route_counts.get('input', 0):,}"
+                    if isinstance(condition_route_counts, dict)
+                    else (
+                        f"✓ {node_label} — {len(output_rows):,} rows"
+                        if output_rows
+                        else f"✓ {node_label} completed"
+                    )
+                )
                 maybe_coro = emit_embedded_node_event({
                     "type": "node_success",
                     "node_id": child_runtime_node_id,
                     "node_label": node_label,
                     "status": "success",
                     "rows": len(output_rows),
-                    "message": (
-                        f"✓ {node_label} — {len(output_rows):,} rows"
-                        if output_rows
-                        else f"✓ {node_label} completed"
-                    ),
+                    "message": success_message,
                     "input_sample": _sample_rows(upstream_data),
                     "output_sample": _sample_rows(output_rows),
+                    "route_counts": condition_route_counts,
+                    "route_handles": condition_route_handles,
                 })
                 if asyncio.iscoroutine(maybe_coro):
                     await maybe_coro
+
+            produced_bundle = child_results_by_handle.get(node_id) or {}
+            for edge in outgoing_edges.get(node_id, []):
+                target_id = str(edge.get("target") or "").strip()
+                if not target_id or target_id not in child_nodes_by_id or target_id in execute_child_targets:
+                    continue
+                source_handle = str(edge.get("source_handle") or "output").strip() or "output"
+                routed_rows = produced_bundle.get(source_handle)
+                if routed_rows is None and source_handle == "output":
+                    routed_rows = child_results.get(node_id)
+                if routed_rows is None:
+                    routed_rows = []
+                if not isinstance(routed_rows, list):
+                    routed_rows = [routed_rows] if routed_rows is not None else []
+                if not routed_rows:
+                    continue
+
+                is_feedback = topo_index.get(target_id, 0) <= topo_index.get(node_id, 0)
+                if not forced_mode and not is_feedback:
+                    continue
+
+                edge_key = (node_id, target_id, source_handle)
+                if is_feedback:
+                    target_payload_for_loop = child_nodes_by_id.get(target_id) or {}
+                    target_loop_type = str(target_payload_for_loop.get("node_type") or "").strip().lower()
+                    loop_has_persisted_wait = target_loop_type == "delay_transform"
+                    edge_key_text = "|".join(edge_key)
+                    allowed_rows: List[Any] = []
+                    exceeded_rows: List[Any] = []
+                    next_count = 0
+                    for routed_row in routed_rows:
+                        if isinstance(routed_row, dict):
+                            row_obj = routed_row
+                            loop_counts = row_obj.get("_blw_loop_counts")
+                            if not isinstance(loop_counts, dict):
+                                loop_counts = {}
+                            row_count = int(loop_counts.get(edge_key_text) or 0) + 1
+                            loop_counts[edge_key_text] = row_count
+                            row_obj["_blw_loop_counts"] = loop_counts
+                            next_count = max(next_count, row_count)
+                            if not loop_has_persisted_wait and row_count > workflow_max_iterations:
+                                exceeded_rows.append(row_obj)
+                            else:
+                                allowed_rows.append(row_obj)
+                        else:
+                            next_count = max(next_count, 1)
+                            allowed_rows.append(routed_row)
+                    if exceeded_rows:
+                        error_message = (
+                            f"BLW loop exceeded maxIterations={workflow_max_iterations} at "
+                            f"{node_label} -> {child_nodes_by_id.get(target_id, {}).get('label') or target_id}; "
+                            f"{len(exceeded_rows)} row(s) still matched the loop condition."
+                        )
+                        tracker_routing_events.append({
+                            "node_id": node_id,
+                            "label": node_label,
+                            "mode": "max_iterations_exceeded",
+                            "target_node_id": target_id,
+                            "handle": source_handle,
+                            "rows": len(exceeded_rows),
+                            "iteration": next_count,
+                            "max_iterations": workflow_max_iterations,
+                            "at": datetime.utcnow().isoformat(),
+                        })
+                        if isinstance(execution_context, dict) and self._parse_bool_like(
+                            execution_context.get("blw_batch_nonblocking_wait", False),
+                            False,
+                        ):
+                            failed_rows_by_run_id = execution_context.setdefault("blw_failed_rows_by_run_id", {})
+                            if isinstance(failed_rows_by_run_id, dict):
+                                for failed_row in exceeded_rows:
+                                    if not isinstance(failed_row, dict):
+                                        continue
+                                    failed_run_id = str(failed_row.get("_blw_async_run_id") or "").strip()
+                                    if not failed_run_id:
+                                        continue
+                                    failed_rows_by_run_id[failed_run_id] = {
+                                        "error_code": "MaxIterationsExceeded",
+                                        "error_message": error_message,
+                                        "node_id": node_id,
+                                        "target_node_id": target_id,
+                                        "iteration": next_count,
+                                        "max_iterations": workflow_max_iterations,
+                                    }
+                        else:
+                            raise RuntimeError(error_message)
+                    routed_rows = allowed_rows
+                    if not routed_rows:
+                        continue
+
+                bucket = forced_inputs_by_node.setdefault(target_id, [])
+                bucket.extend(routed_rows)
+                forced_sources_by_node[target_id] = node_id
+                if target_id not in work_queue:
+                    work_queue.append(target_id)
 
         sink_ids = [
             node_id

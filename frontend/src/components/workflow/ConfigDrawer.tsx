@@ -9378,6 +9378,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     selectedNodeId,
     pipeline,
     isExecuting,
+    executionLogs,
     setEdges,
     updateNodeConfig,
     updateNodeConfigSilent,
@@ -13655,9 +13656,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     updateNodeConfig(selectedNodeId, { [name]: value })
   }
 
-  const saveBlwStudioConfig = (blwConfig: BlwStudioConfig) => {
+  const saveBlwStudioConfig = (blwConfig: BlwStudioConfig, options?: { persist?: boolean; silent?: boolean }) => {
     if (!selectedNodeId) return
-    updateNodeConfig(selectedNodeId, {
+    const patch = {
       blw_studio_config: blwConfig,
       blw_instance_variables: blwConfig.instanceVariables,
       instanceVariables: blwConfig.instanceVariables,
@@ -13671,7 +13672,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       workflow_max_parallel_branches: blwConfig.maxParallelBranches,
       workflow_max_iterations: blwConfig.maxIterations,
       workflow_max_retry_attempts: blwConfig.maxRetryAttempts,
-    })
+    }
+    if (options?.persist === false) {
+      updateNodeConfigSilent(selectedNodeId, patch)
+    } else {
+      updateNodeConfig(selectedNodeId, patch)
+    }
     form.setFieldsValue({
       blw_studio_config: blwConfig,
       blw_instance_variables: blwConfig.instanceVariables,
@@ -13687,6 +13693,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       workflow_max_iterations: blwConfig.maxIterations,
       workflow_max_retry_attempts: blwConfig.maxRetryAttempts,
     })
+    if (options?.persist === false) return
     void Promise.resolve().then(async () => {
       await useWorkflowStore.getState().savePipeline()
     }).catch((error) => {
@@ -40678,6 +40685,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         config={nodeConfig}
         upstreamInputFields={businessWorkflowUpstreamInputFields}
         upstreamPreviewRows={businessWorkflowUpstreamPreviewRows as Record<string, unknown>[]}
+        latestOutputRows={(Array.isArray(data?.executionSampleOutput) ? data.executionSampleOutput : []) as Record<string, unknown>[]}
+        executionLogs={executionLogs as unknown as Record<string, unknown>[]}
+        parentNodeId={String(selectedNodeId || '')}
         onClose={() => setBlwStudioOpen(false)}
         onOpenChildCanvas={() => {
           if (!activePipelineId || !selectedNodeId || typeof window === 'undefined') return

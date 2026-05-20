@@ -12,8 +12,10 @@ import {
   Position,
   useEdgesState,
   useNodesState,
+  useUpdateNodeInternals,
   type Connection,
   type Edge,
+  type EdgeChange,
   type Node,
   type NodeProps,
   type NodeTypes,
@@ -35,6 +37,7 @@ import {
   Table,
   Tabs,
   Tag,
+  Tooltip,
   Typography,
   notification,
 } from 'antd'
@@ -262,8 +265,11 @@ type BLWStudioProps = {
   config?: Record<string, unknown>
   upstreamInputFields?: string[]
   upstreamPreviewRows?: Record<string, unknown>[]
+  latestOutputRows?: Record<string, unknown>[]
+  executionLogs?: Record<string, unknown>[]
+  parentNodeId?: string
   onClose: () => void
-  onSave: (config: BlwStudioConfig) => void
+  onSave: (config: BlwStudioConfig, options?: { persist?: boolean; silent?: boolean }) => void
   onOpenChildCanvas?: () => void
 }
 
@@ -438,7 +444,8 @@ function connectionHandlesForType(type: BlwNodeKind): Array<{
   ]
 }
 
-function BlwCanvasNode({ data, selected }: NodeProps<BlwNodeData>) {
+function BlwCanvasNode({ id, data, selected }: NodeProps<BlwNodeData>) {
+  const updateNodeInternals = useUpdateNodeInternals()
   const type = data.blwType || 'activity'
   const color = nodeKindColor[type] || '#3b82f6'
   const isEnabled = data.enabled !== false
@@ -461,6 +468,11 @@ function BlwCanvasNode({ data, selected }: NodeProps<BlwNodeData>) {
       )
     })
   }
+  useEffect(() => {
+    if (type !== 'condition') return
+    const frame = window.requestAnimationFrame(() => updateNodeInternals(id))
+    return () => window.cancelAnimationFrame(frame)
+  }, [data.actionJson, id, type, updateNodeInternals])
   const baseHandleStyle: CSSProperties = {
     width: 5,
     height: 5,
@@ -596,6 +608,19 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
 
+function recordFromUnknown(value: unknown): Record<string, unknown> {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>
+  if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+    } catch {
+      return {}
+    }
+  }
+  return {}
+}
+
 function safeJson(value: unknown, fallback: Record<string, unknown> = {}): Record<string, unknown> {
   if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>
   if (typeof value !== 'string' || !value.trim()) return fallback
@@ -670,6 +695,246 @@ function fieldsFromRows(value: unknown): string[] {
     }
   })
   return Array.from(fields)
+}
+
+function rowsFromSample(value: unknown): Record<string, unknown>[] {
+  if (Array.isArray(value)) return value.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && !Array.isArray(item)))
+  if (value && typeof value === 'object') return [value as Record<string, unknown>]
+  return []
+}
+
+function valueAtJsonPath(value: unknown, path: string): unknown {
+  const normalized = String(path || '').trim().replace(/^\$\.?/, '')
+  if (!normalized) return value
+  let current = value
+  const tokens = normalized.split('.').filter(Boolean)
+  for (const token of tokens) {
+    if (current === null || current === undefined) return undefined
+    if (Array.isArray(current)) {
+      const index = Number(token)
+      if (Number.isInteger(index) && index >= 0 && index < current.length) {
+        current = current[index]
+        continue
+      }
+      const projected = current
+        .map((item) => (item && typeof item === 'object' && !Array.isArray(item) ? (item as Record<string, unknown>)[token] : undefined))
+        .filter((item) => item !== undefined)
+      current = projected.length ? projected : undefined
+      continue
+    }
+    if (typeof current === 'object') {
+      current = (current as Record<string, unknown>)[token]
+      continue
+    }
+    return undefined
+  }
+  return current
+}
+
+function latestVariableOutputFromRows(rows: Record<string, unknown>[], variableName: string): unknown {
+  const name = String(variableName || '').trim()
+  if (!name) return undefined
+  return [...rows].reverse()
+    .map((row) => recordFromUnknown(row?._blw_vars)[name])
+    .find((value) => value !== undefined)
+}
+
+function latestChildOutputFromRows(rows: Record<string, unknown>[], variableName: string): unknown {
+  const name = String(variableName || '').trim()
+  if (!name) return undefined
+  return [...rows].reverse()
+    .map((row) => {
+      const childOutputVariable = String(row?._blw_child_output_variable || '').trim()
+      if (childOutputVariable && childOutputVariable !== name) return undefined
+      return row?._blw_child_output
+    })
+    .find((value) => value !== undefined)
+}
+
+function latestScopedChildOutputFromRows(rows: Record<string, unknown>[], variableName: string, childNodeIds: string[]): unknown {
+  const nodeIds = new Set(childNodeIds.map((item) => String(item || '').trim()).filter(Boolean))
+  if (nodeIds.size === 0) return latestChildOutputFromRows(rows, variableName)
+  return [...rows].reverse()
+    .map((row) => {
+      const childOutputNodeId = String(row?._blw_child_node_id || '').trim()
+      if (childOutputNodeId && !nodeIds.has(childOutputNodeId)) return undefined
+      const childOutputVariable = String(row?._blw_child_output_variable || '').trim()
+      if (childOutputVariable && childOutputVariable !== variableName) return undefined
+      return row?._blw_child_output
+    })
+    .find((value) => value !== undefined)
+}
+
+function latestEmbeddedVariableOutput(
+  logs: Record<string, unknown>[],
+  parentNodeId: string,
+  blwNodeId: string,
+  variableName: string,
+): unknown {
+  const parentId = String(parentNodeId || '').trim()
+  const nodeId = String(blwNodeId || '').trim()
+  const expectedRuntimeId = parentId && nodeId ? `${parentId}::${nodeId}` : ''
+  for (const log of [...logs].reverse()) {
+    const logNodeId = String(log?.nodeId || '').trim()
+    const isSelectedNodeLog = expectedRuntimeId
+      ? logNodeId === expectedRuntimeId
+      : Boolean(nodeId && logNodeId.endsWith(`::${nodeId}`))
+    if (!isSelectedNodeLog) continue
+    const rows = rowsFromSample(
+      log.output_sample
+      ?? log.outputSample
+      ?? log.sample_output
+      ?? log.sampleOutput,
+    )
+    const hit = latestVariableOutputFromRows(rows, variableName)
+    if (hit !== undefined) return hit
+  }
+  return undefined
+}
+
+function latestVariableOutputFromLogs(logs: Record<string, unknown>[], variableName: string): unknown {
+  for (const log of [...logs].reverse()) {
+    const rows = rowsFromSample(log.output_sample ?? log.outputSample ?? log.sample_output ?? log.sampleOutput)
+    const hit = latestVariableOutputFromRows(rows, variableName)
+    if (hit !== undefined) return hit
+  }
+  return undefined
+}
+
+function latestChildOutputFromLogs(logs: Record<string, unknown>[], variableName: string): unknown {
+  for (const log of [...logs].reverse()) {
+    const rows = rowsFromSample(log.output_sample ?? log.outputSample ?? log.sample_output ?? log.sampleOutput)
+    const hit = latestChildOutputFromRows(rows, variableName)
+    if (hit !== undefined) return hit
+  }
+  return undefined
+}
+
+function latestEmbeddedChildOutput(
+  logs: Record<string, unknown>[],
+  parentNodeId: string,
+  blwNodeId: string,
+  variableName: string,
+  childNodeIds: string[],
+): unknown {
+  const parentId = String(parentNodeId || '').trim()
+  const nodeId = String(blwNodeId || '').trim()
+  const expectedRuntimeId = parentId && nodeId ? `${parentId}::${nodeId}` : ''
+  for (const log of [...logs].reverse()) {
+    const logNodeId = String(log?.nodeId || '').trim()
+    const isSelectedNodeLog = expectedRuntimeId
+      ? logNodeId === expectedRuntimeId
+      : Boolean(nodeId && logNodeId.endsWith(`::${nodeId}`))
+    if (!isSelectedNodeLog) continue
+    const rows = rowsFromSample(log.output_sample ?? log.outputSample ?? log.sample_output ?? log.sampleOutput)
+    const hit = latestScopedChildOutputFromRows(rows, variableName, childNodeIds)
+    if (hit !== undefined) return hit
+  }
+  return undefined
+}
+
+function logNodeIdMatchesExecuteChild(logNodeIdValue: unknown, parentNodeId: string, executeNodeId: string): boolean {
+  const logNodeId = String(logNodeIdValue || '').trim()
+  const parentId = String(parentNodeId || '').trim()
+  const nodeId = String(executeNodeId || '').trim()
+  if (!logNodeId || !nodeId) return false
+  if (parentId) return logNodeId === `${parentId}::${nodeId}` || logNodeId.startsWith(`${parentId}::${nodeId}::`)
+  return logNodeId === nodeId || logNodeId.includes(`::${nodeId}::`) || logNodeId.endsWith(`::${nodeId}`)
+}
+
+function logNodeIdMatchesChildNode(logNodeIdValue: unknown, childNodeId: string): boolean {
+  const logNodeId = String(logNodeIdValue || '').trim()
+  const nodeId = String(childNodeId || '').trim()
+  if (!logNodeId || !nodeId) return false
+  const parts = logNodeId.split('::').filter(Boolean)
+  return parts[parts.length - 1] === nodeId || logNodeId === nodeId
+}
+
+function latestSelectedChildLogRows(
+  logs: Record<string, unknown>[],
+  parentNodeId: string,
+  executeNodeId: string,
+  childNodeIds: string[],
+): Record<string, unknown>[] {
+  const childIds = childNodeIds.map((item) => String(item || '').trim()).filter(Boolean)
+  for (const childNodeId of [...childIds].reverse()) {
+    for (const log of [...logs].reverse()) {
+      if (!logNodeIdMatchesExecuteChild(log?.nodeId, parentNodeId, executeNodeId)) continue
+      if (!logNodeIdMatchesChildNode(log?.nodeId, childNodeId)) continue
+      const rows = rowsFromSample(log.output_sample ?? log.outputSample ?? log.sample_output ?? log.sampleOutput)
+      if (rows.length > 0) return rows
+    }
+  }
+  return []
+}
+
+function previewVariableValue(value: unknown, maxItems = 10): unknown {
+  if (!Array.isArray(value)) return value
+  const rows = value.filter((item) => item !== undefined)
+  if (rows.length <= maxItems) return rows
+  return rows.slice(-maxItems)
+}
+
+function embeddedChildNodesFromConfig(config?: Record<string, unknown>): Record<string, unknown>[] {
+  const rawNodes = config?.embedded_workflow_nodes
+  if (Array.isArray(rawNodes)) return rawNodes.filter((node): node is Record<string, unknown> => Boolean(node && typeof node === 'object' && !Array.isArray(node)))
+  if (typeof rawNodes === 'string' && rawNodes.trim()) {
+    try {
+      const parsed = JSON.parse(rawNodes)
+      if (Array.isArray(parsed)) return parsed.filter((node): node is Record<string, unknown> => Boolean(node && typeof node === 'object' && !Array.isArray(node)))
+    } catch {
+      return []
+    }
+  }
+  return []
+}
+
+function childNodeOutputRows(childNodes: Record<string, unknown>[], childNodeId: string): Record<string, unknown>[] {
+  const node = childNodes.find((item) => String(item?.id || '').trim() === String(childNodeId || '').trim())
+  const data = asRecord(node?.data)
+  const nodeConfig = asRecord(data.config)
+  return rowsFromSample(
+    data.executionSampleOutput
+    ?? data.output_sample
+    ?? data.sample_output
+    ?? nodeConfig._preview_rows,
+  )
+}
+
+function latestSelectedChildCanvasOutput(childNodes: Record<string, unknown>[], childNodeIds: string[]): unknown {
+  for (const childNodeId of [...childNodeIds].reverse()) {
+    const rows = childNodeOutputRows(childNodes, childNodeId)
+    if (rows.length > 0) return rows
+  }
+  return undefined
+}
+
+function jsonValuePathHints(value: unknown, prefix = '', depth = 0): string[] {
+  if (depth > 4 || value === null || value === undefined) return []
+  if (Array.isArray(value)) {
+    const hints: string[] = []
+    if (value.length > 0) {
+      hints.push(`${prefix}.0`)
+      hints.push(...jsonValuePathHints(value[0], prefix, depth + 1))
+      hints.push(...jsonValuePathHints(value[0], `${prefix}.0`, depth + 1))
+    }
+    return hints
+  }
+  if (typeof value !== 'object') return []
+  return Object.entries(value as Record<string, unknown>).flatMap(([key, nested]) => {
+    if (!key) return []
+    const path = prefix ? `${prefix}.${key}` : key
+    return [path, ...jsonValuePathHints(nested, path, depth + 1)]
+  })
+}
+
+function jsonValueIndexedPathHints(value: unknown, prefix = '', depth = 0): string[] {
+  if (depth > 4 || value === null || value === undefined) return []
+  if (Array.isArray(value)) {
+    if (value.length === 0) return []
+    return [`${prefix}.0`, ...jsonValuePathHints(value[0], `${prefix}.0`, depth + 1)]
+  }
+  return jsonValuePathHints(value, prefix, depth)
 }
 
 function buildConditionExpression(field: string, operator: string, value: string, source: 'field' | 'variable' = 'field'): string {
@@ -786,7 +1051,7 @@ function createGraphNode(type: BlwNodeKind, label: string, x: number, y: number)
       : type === 'oracle_update' ? { table: 'BLW_WORKFLOW_TRACKER', keyField: 'TRANSACTIONID', statusField: 'CURRENT_STATUS' }
         : type === 'email' ? { recipient: '$.email', template: 'Workflow notification for ${TRANSACTIONID}', sendMode: 'draft' }
           : type === 'sms' ? { recipient: '$.phone', template: 'Workflow update for ${TRANSACTIONID}' }
-            : type === 'execute_child_node' ? { inputMode: 'pass_all', outputPath: '$.child_output' }
+            : type === 'execute_child_node' ? { inputMode: 'pass_all', outputPath: '$.child_output', outputVariable: '' }
               : {}
   return {
     id,
@@ -903,11 +1168,15 @@ function normalizeEdges(raw: unknown): Edge[] {
 }
 
 function normalizeEdgeStyle(edge: Edge): Edge {
+  const normalizedTargetHandle = String(edge.targetHandle || '').trim() === 'input'
+    ? 'in-left'
+    : edge.targetHandle
   return {
     ...edge,
+    targetHandle: normalizedTargetHandle,
     type: String(edge.type || 'smoothstep'),
     markerEnd: edge.markerEnd || { type: MarkerType.ArrowClosed, color: blwEdgeColor, width: 8, height: 8 },
-    style: { ...(edge.style || {}), ...blwEdgeStyle },
+    style: { ...blwEdgeStyle, ...(edge.style || {}) },
     labelStyle: { fill: 'var(--app-text-muted)', fontSize: 8, fontWeight: 500, ...(edge.labelStyle || {}) },
     labelBgStyle: { fill: 'var(--app-panel-bg)', fillOpacity: 0.92, ...(edge.labelBgStyle || {}) },
     labelBgPadding: edge.labelBgPadding || [4, 1],
@@ -1046,6 +1315,9 @@ function normalizeConfig(raw: unknown, nodeLabel: string): BlwStudioConfig {
 function resolveStoredBlwConfig(config: Record<string, unknown> | undefined): Record<string, unknown> {
   const topLevel = asRecord(config)
   const nested = asRecord(topLevel.blw_studio_config)
+  const nestedInstanceVariables = Array.isArray(nested.instanceVariables) && nested.instanceVariables.length > 0
+    ? nested.instanceVariables
+    : undefined
   return {
     ...nested,
     trackingMode: nested.trackingMode ?? nested.workflowTrackingMode ?? nested.workflow_tracking_mode ?? topLevel.workflow_tracking_mode ?? topLevel.workflowTrackingMode,
@@ -1053,7 +1325,7 @@ function resolveStoredBlwConfig(config: Record<string, unknown> | undefined): Re
     workflow_tracking_mode: nested.workflow_tracking_mode ?? nested.trackingMode ?? nested.workflowTrackingMode ?? topLevel.workflow_tracking_mode ?? topLevel.workflowTrackingMode,
     inputFields: nested.inputFields ?? topLevel.inputFields,
     inputFieldMappings: nested.inputFieldMappings ?? topLevel.inputFieldMappings,
-    instanceVariables: nested.instanceVariables ?? topLevel.instanceVariables ?? topLevel.blw_instance_variables,
+    instanceVariables: nestedInstanceVariables ?? topLevel.instanceVariables ?? topLevel.blw_instance_variables,
   }
 }
 
@@ -1111,7 +1383,12 @@ function hasRuntimeControl(type: BlwNodeKind): boolean {
   return ['activity', 'execute_child_node', 'email', 'sms', 'oracle_update', 'wait', 'delay', 'pause', 'escalation'].includes(type)
 }
 
-export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields = [], upstreamPreviewRows = [], onClose, onSave, onOpenChildCanvas }: BLWStudioProps) {
+function isConditionRouteHandle(value: unknown): boolean {
+  const handle = String(value || '').trim()
+  return handle === 'true' || handle === 'false' || handle === 'output_false' || /^group_[A-Za-z0-9_-]+_(true|false)$/.test(handle)
+}
+
+export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields = [], upstreamPreviewRows = [], latestOutputRows = [], executionLogs = [], parentNodeId = '', onClose, onSave, onOpenChildCanvas }: BLWStudioProps) {
   const [activeView, setActiveView] = useState<string>('designer')
   const initial = useMemo(() => normalizeConfig(resolveStoredBlwConfig(config), nodeLabel), [config, nodeLabel])
   const [draft, setDraft] = useState<BlwStudioConfig>(initial)
@@ -1134,6 +1411,7 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
   const [childNodeConfigOpen, setChildNodeConfigOpen] = useState(false)
   const [conditionConfigOpen, setConditionConfigOpen] = useState(false)
   const [graphHistoryVersion, setGraphHistoryVersion] = useState(0)
+  const lastSilentSyncRef = useRef<string>('')
   const wasOpenRef = useRef(false)
   const graphHistoryRef = useRef<{
     past: BlwGraphSnapshot[]
@@ -1172,6 +1450,12 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
 
   const selectedNode = useMemo(() => nodes.find((node) => node.id === selectedNodeId) || null, [nodes, selectedNodeId])
   const selectedEdge = useMemo(() => edges.find((edge) => edge.id === selectedEdgeId) || null, [edges, selectedEdgeId])
+  const isConditionNodeId = useCallback((nodeId: string) => (
+    nodes.find((node) => node.id === nodeId)?.data?.blwType === 'condition'
+  ), [nodes])
+  const isConditionRouteEdge = useCallback((edge: Pick<Edge, 'source' | 'sourceHandle'> | null | undefined) => (
+    Boolean(edge && isConditionNodeId(String(edge.source || '')) && isConditionRouteHandle(edge.sourceHandle))
+  ), [isConditionNodeId])
   const upstreamNodeIds = useMemo(() => {
     const upstream = new Set<string>()
     if (!selectedNodeId) return upstream
@@ -1186,23 +1470,13 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
     }
     return upstream
   }, [edges, selectedNodeId])
+  const embeddedChildNodes = useMemo(() => embeddedChildNodesFromConfig(config), [config?.embedded_workflow_nodes])
   const embeddedChildNodeOptions = useMemo(() => {
-    const rawNodes = config?.embedded_workflow_nodes
-    let childNodes: any[] = []
-    if (Array.isArray(rawNodes)) {
-      childNodes = rawNodes
-    } else if (typeof rawNodes === 'string' && rawNodes.trim()) {
-      try {
-        const parsed = JSON.parse(rawNodes)
-        childNodes = Array.isArray(parsed) ? parsed : []
-      } catch {
-        childNodes = []
-      }
-    }
+    const childNodes = embeddedChildNodes
     return childNodes
       .filter((node) => node && typeof node === 'object' && String(node.id || '').trim())
       .map((node) => {
-        const data = node.data && typeof node.data === 'object' ? node.data : {}
+        const data = asRecord(node.data)
         const nodeType = String(data.nodeType || node.nodeType || node.type || 'node')
         const label = String(data.label || node.label || node.id)
         return {
@@ -1210,7 +1484,7 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
           label: `${label} (${displayNodeType(nodeType)})`,
         }
       })
-  }, [config?.embedded_workflow_nodes])
+  }, [embeddedChildNodes])
   const conditionRouteTargetOptions = useMemo(() => nodes
     .filter((node) => node.id !== selectedNodeId && !['start'].includes(String(node.data?.blwType || '')))
     .map((node) => ({
@@ -1277,7 +1551,98 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
       ? [{ label: 'Child output paths', options: childOutputPathFields.map((field) => ({ value: field, label: field })) }]
       : []),
   ], [availableFields.length, childOutputPathFields, fieldPickerOptions])
-  const variableOptions = useMemo(() => draft.instanceVariables.map((item) => item.name).filter(Boolean), [draft.instanceVariables])
+  const variableOptions = useMemo(() => uniqueStrings([
+    draft.instanceVariables.map((item) => item.name),
+    nodes.flatMap((node) => {
+      if (node.data?.blwType !== 'execute_child_node') return []
+      const action = safeJson(node.data?.actionJson)
+      return [
+        action.outputVariable,
+        action.outputVariableName,
+        action.outputVar,
+      ].map((item) => String(item || '').trim()).filter(Boolean)
+    }),
+  ]), [draft.instanceVariables, nodes])
+  const variablePickerOptions = useMemo(() => variableOptions.map((name) => ({ value: name, label: name })), [variableOptions])
+  const variableFieldOptions = useMemo(() => uniqueStrings([
+    variableOptions,
+    nodes.flatMap((node) => {
+      const action = safeJson(node.data?.actionJson)
+      const outputVariable = String(action.outputVariable || action.outputVariableName || '').trim()
+      if (node.data?.blwType !== 'execute_child_node' || !outputVariable) return []
+      const childExecutionMode = String(action.childExecutionMode || 'downstream')
+      const childNodeIds = childExecutionMode === 'sequence'
+        ? toStringArray(action.childNodeIds)
+        : [String(node.data?.childNodeId || action.childNodeId || '')].filter(Boolean)
+      const childLogRows = latestSelectedChildLogRows(executionLogs, parentNodeId, node.id, childNodeIds)
+      const childCanvasOutput = latestSelectedChildCanvasOutput(embeddedChildNodes, childNodeIds)
+      const childOutputShape = childLogRows.length > 0 ? childLogRows : childCanvasOutput
+      return [
+        outputVariable,
+        ...jsonValuePathHints(childOutputShape, outputVariable),
+        `${outputVariable}.status`,
+        `${outputVariable}.rows`,
+        `${outputVariable}.path`,
+        `${outputVariable}.output_file`,
+        `${outputVariable}.message`,
+        `${outputVariable}.error`,
+        `${outputVariable}.0.status`,
+        `${outputVariable}.0.rows`,
+        `${outputVariable}.0.path`,
+        `${outputVariable}.0.output_file`,
+        `${outputVariable}.0.message`,
+        `${outputVariable}.0.error`,
+        `${outputVariable}__all`,
+        ...jsonValueIndexedPathHints(childOutputShape, `${outputVariable}__all`),
+      ]
+    }),
+    upstreamPreviewRows.flatMap((row) => {
+      const blwVars = recordFromUnknown(row?._blw_vars)
+      return Object.entries(blwVars).flatMap(([name, value]) => [name, ...jsonValuePathHints(value, name)])
+    }),
+    latestOutputRows.flatMap((row) => {
+      const blwVars = recordFromUnknown(row?._blw_vars)
+      return Object.entries(blwVars).flatMap(([name, value]) => [name, ...jsonValuePathHints(value, name)])
+    }),
+    executionLogs
+      .flatMap((log) => rowsFromSample(log.output_sample ?? log.outputSample ?? log.sample_output ?? log.sampleOutput))
+      .flatMap((row) => {
+        const blwVars = recordFromUnknown(row?._blw_vars)
+        return Object.entries(blwVars).flatMap(([name, value]) => [name, ...jsonValuePathHints(value, name)])
+      }),
+  ]), [embeddedChildNodes, executionLogs, latestOutputRows, nodes, parentNodeId, upstreamPreviewRows, variableOptions])
+  const variableFieldPickerOptions = useMemo(() => variableFieldOptions.map((field) => ({ value: field, label: field })), [variableFieldOptions])
+  const latestVariablePreviewValue = useCallback((field: string): unknown => {
+    const key = String(field || '').trim()
+    if (!key) return undefined
+    const [root, ...nestedParts] = key.split('.')
+    const nestedPath = nestedParts.join('.')
+    if (!root) return undefined
+
+    for (const node of nodes) {
+      if (!upstreamNodeIds.has(node.id) || node.data?.blwType !== 'execute_child_node') continue
+      const action = safeJson(node.data?.actionJson)
+      const outputVariable = String(action.outputVariable || action.outputVariableName || '').trim()
+      if (outputVariable !== root) continue
+      const childExecutionMode = String(action.childExecutionMode || 'downstream')
+      const childNodeIds = childExecutionMode === 'sequence'
+        ? toStringArray(action.childNodeIds)
+        : [String(node.data?.childNodeId || action.childNodeId || '')].filter(Boolean)
+      const childRows = latestSelectedChildLogRows(executionLogs, parentNodeId, node.id, childNodeIds)
+      const lastRow = childRows.length > 0 ? childRows[childRows.length - 1] : undefined
+      if (lastRow !== undefined) return nestedPath ? valueAtJsonPath(lastRow, nestedPath) : lastRow
+    }
+
+    const runtimeRows = executionLogs.flatMap((log) => rowsFromSample(log.output_sample ?? log.outputSample ?? log.sample_output ?? log.sampleOutput))
+    const allRows = [...runtimeRows, ...latestOutputRows, ...upstreamPreviewRows]
+    for (const row of [...allRows].reverse()) {
+      const blwVars = recordFromUnknown(row?._blw_vars)
+      if (!(root in blwVars)) continue
+      const rootValue = blwVars[root]
+      return nestedPath ? valueAtJsonPath(rootValue, nestedPath) : rootValue
+    }
+    return undefined
+  }, [executionLogs, latestOutputRows, nodes, parentNodeId, upstreamNodeIds, upstreamPreviewRows])
   const validationIssues = useMemo(() => validateBlwGraph(nodes, edges, draft), [draft, edges, nodes])
   const validationErrors = validationIssues.filter((issue) => issue.severity === 'error')
   const canUndoGraph = useMemo(() => graphHistoryRef.current.past.length > 0, [graphHistoryVersion])
@@ -1592,10 +1957,19 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
 
   const updateSelectedEdge = useCallback((patch: Partial<Edge>) => {
     if (!selectedEdgeId) return
+    const currentEdge = edges.find((edge) => edge.id === selectedEdgeId)
+    if (isConditionRouteEdge(currentEdge)) {
+      notification.warning({
+        message: 'Use Configure Condition Routing',
+        description: 'Condition route labels and targets are generated from the condition configuration.',
+        placement: 'bottomRight',
+      })
+      return
+    }
     setEdges((current) => current.map((edge) => (
       edge.id === selectedEdgeId ? { ...edge, ...patch } : edge
     )))
-  }, [selectedEdgeId, setEdges])
+  }, [edges, isConditionRouteEdge, selectedEdgeId, setEdges])
 
   const updateConditionRouteTargets = useCallback((
     sourceNodeId: string,
@@ -1615,7 +1989,7 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
       source,
       target,
       sourceHandle: handleFor(route),
-      targetHandle: 'input',
+      targetHandle: 'in-left',
       type: 'smoothstep',
       label: `${labelPrefix}${route === 'true' ? trueLabel : falseLabel}${index > 0 ? ` ${index + 1}` : ''}`,
       markerEnd: { type: MarkerType.ArrowClosed, color: blwEdgeColor, width: 8, height: 8 },
@@ -1644,6 +2018,14 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
   }, [setEdges])
 
   const onConnect = useCallback((connection: Connection) => {
+    if (isConditionNodeId(String(connection.source || ''))) {
+      notification.warning({
+        message: 'Use Configure Condition Routing',
+        description: 'Condition routes are controlled by the condition configuration panel.',
+        placement: 'bottomRight',
+      })
+      return
+    }
     const sourceHandle = String(connection.sourceHandle || '').trim()
     const routeLabel = sourceHandle === 'true'
       ? 'true'
@@ -1662,7 +2044,25 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
       markerEnd: { type: MarkerType.ArrowClosed, color: blwEdgeColor, width: 8, height: 8 },
       style: blwEdgeStyle,
     } as Edge), current))
-  }, [setEdges])
+  }, [isConditionNodeId, setEdges])
+
+  const onCanvasEdgesChange = useCallback((changes: EdgeChange[]) => {
+    const guardedChanges = changes.filter((change) => {
+      const edgeId = 'id' in change ? String(change.id || '') : ''
+      const currentEdge = edgeId ? edges.find((edge) => edge.id === edgeId) : null
+      if (isConditionRouteEdge(currentEdge)) {
+        if (change.type === 'select') return true
+        notification.warning({
+          message: 'Use Configure Condition Routing',
+          description: 'Condition route connectors can only be changed from the condition configuration panel.',
+          placement: 'bottomRight',
+        })
+        return false
+      }
+      return true
+    })
+    if (guardedChanges.length > 0) onEdgesChange(guardedChanges)
+  }, [edges, isConditionRouteEdge, onEdgesChange])
 
   const addCanvasNode = (type: BlwNodeKind, label: string) => {
     const next = createGraphNode(type, label, 520 + ((nodes.length % 3) - 1) * 240, 120 + nodes.length * 80)
@@ -1680,6 +2080,14 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
 
   const removeSelectedEdge = () => {
     if (!selectedEdge) return
+    if (isConditionRouteEdge(selectedEdge)) {
+      notification.warning({
+        message: 'Use Configure Condition Routing',
+        description: 'Remove condition route targets from the condition configuration panel.',
+        placement: 'bottomRight',
+      })
+      return
+    }
     setEdges((current) => current.filter((edge) => edge.id !== selectedEdge.id))
     setSelectedEdgeId('')
   }
@@ -1946,6 +2354,40 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
       })
   }
 
+  const buildCurrentConfig = useCallback((): BlwStudioConfig => {
+    const cleanedNodes = nodes.map((node) => ({ ...node, selected: false, dragging: false }))
+    const cleanedEdges = edges.map((edge) => ({ ...edge, selected: false }))
+    return {
+      ...draft,
+      graphNodes: cleanedNodes,
+      graphEdges: cleanedEdges,
+      steps: stepsFromGraph(cleanedNodes, cleanedEdges, draft.maxRetryAttempts, draft.maxIterations),
+    }
+  }, [draft, edges, nodes])
+
+  useEffect(() => {
+    if (!open) return
+    const nextConfig = buildCurrentConfig()
+    let signature = ''
+    try {
+      signature = JSON.stringify({
+        graphNodes: nextConfig.graphNodes,
+        graphEdges: nextConfig.graphEdges,
+        instanceVariables: nextConfig.instanceVariables,
+        uniqueIdField: nextConfig.uniqueIdField,
+        trackingMode: nextConfig.trackingMode,
+      })
+    } catch {
+      signature = `${Date.now()}`
+    }
+    if (signature && signature === lastSilentSyncRef.current) return
+    const timer = window.setTimeout(() => {
+      lastSilentSyncRef.current = signature
+      onSave(nextConfig, { persist: false, silent: true })
+    }, 200)
+    return () => window.clearTimeout(timer)
+  }, [buildCurrentConfig, onSave, open])
+
   const save = () => {
     if (validationErrors.length > 0) {
       notification.error({
@@ -1956,14 +2398,7 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
       setActiveView('dashboard')
       return false
     }
-    const cleanedNodes = nodes.map((node) => ({ ...node, selected: false, dragging: false }))
-    const cleanedEdges = edges.map((edge) => ({ ...edge, selected: false }))
-    const nextConfig: BlwStudioConfig = {
-      ...draft,
-      graphNodes: cleanedNodes,
-      graphEdges: cleanedEdges,
-      steps: stepsFromGraph(cleanedNodes, cleanedEdges, draft.maxRetryAttempts, draft.maxIterations),
-    }
+    const nextConfig = buildCurrentConfig()
     setDraft(nextConfig)
     onSave(nextConfig)
     notification.success({ message: 'BLW visual workflow saved', placement: 'bottomRight' })
@@ -2160,8 +2595,14 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
       const rules = conditionRuleRows(action.conditionRules)
       const matchMode = String(action.conditionMatchMode || 'all') === 'any' ? 'any' : 'all'
       const outgoingRoutes = edges.filter((edge) => edge.source === selectedNode.id)
-      const trueTargets = outgoingRoutes.filter((edge) => String(edge.sourceHandle || 'output') === 'true')
-      const falseTargets = outgoingRoutes.filter((edge) => String(edge.sourceHandle || 'output') === 'false')
+      const trueTargets = outgoingRoutes.filter((edge) => {
+        const handle = String(edge.sourceHandle || 'output')
+        return handle === 'true' || /^group_[A-Za-z0-9_-]+_true$/.test(handle)
+      })
+      const falseTargets = outgoingRoutes.filter((edge) => {
+        const handle = String(edge.sourceHandle || 'output')
+        return handle === 'false' || handle === 'output_false' || /^group_[A-Za-z0-9_-]+_false$/.test(handle)
+      })
       const targetLabel = (targetId: string) => nodes.find((node) => node.id === targetId)?.data?.label || targetId
       return (
         <>
@@ -2172,8 +2613,8 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
               <Space size={6} wrap>
                 <Tag>{rules.length ? `${rules.length} rule${rules.length === 1 ? '' : 's'}` : 'custom expression'}</Tag>
                 <Tag>{rules.length ? `match ${matchMode.toUpperCase()}` : 'manual'}</Tag>
-                <Tag color="green">true: {trueTargets.length || 0}</Tag>
-                <Tag color="red">false: {falseTargets.length || 0}</Tag>
+                <Tag color="green">true routes: {trueTargets.length || 0}</Tag>
+                <Tag color="red">else routes: {falseTargets.length || 0}</Tag>
               </Space>
               <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
                 True route: {trueTargets.map((edge) => targetLabel(edge.target)).join(', ') || 'not connected'}
@@ -2381,7 +2822,7 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
       open={open}
       onCancel={(event) => {
         event?.stopPropagation?.()
-        onClose()
+        if (save()) onClose()
       }}
       width="100vw"
       footer={null}
@@ -2454,7 +2895,15 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
               </>
             ) : null}
             <Button icon={<SaveOutlined />} type="primary" onClick={save}>Save BLW Config</Button>
-            <Button onMouseDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); onClose() }}>Done</Button>
+            <Button
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation()
+                if (save()) onClose()
+              }}
+            >
+              Done
+            </Button>
           </Space>
         </div>
 
@@ -2515,7 +2964,7 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                   edges={flowEdges}
                   nodeTypes={blwNodeTypes}
                   onNodesChange={onNodesChange}
-                  onEdgesChange={onEdgesChange}
+                  onEdgesChange={onCanvasEdgesChange}
                   onConnect={onConnect}
                   fitView
                   minZoom={0.2}
@@ -3275,7 +3724,7 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                                 { value: 'variable', label: 'Variable' },
                               ]}
                               onChange={(source) => {
-                                const field = source === 'variable' ? variableOptions[0] || '' : availableFields[0] || ''
+                                const field = source === 'variable' ? variableFieldOptions[0] || '' : availableFields[0] || ''
                                 updateGroupRule(groupId, rule.id, { source, field })
                               }}
                             />
@@ -3284,7 +3733,7 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                         {
                           title: 'Field / Variable',
                           render: (_, rule) => {
-                            const fieldOptions = rule.source === 'variable' ? variableOptions : pathFieldOptions
+                            const fieldOptions = rule.source === 'variable' ? variableFieldOptions : pathFieldOptions
                             return (
                               <Select
                                 showSearch
@@ -3294,7 +3743,7 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                                 optionFilterProp="label"
                                 disabled={!groupEnabled}
                                 style={{ width: '100%' }}
-                                options={fieldOptions.map((field) => ({ value: field, label: field }))}
+                                options={(rule.source === 'variable' ? variableFieldPickerOptions : fieldOptions.map((field) => ({ value: field, label: field })))}
                                 onChange={(field) => updateGroupRule(groupId, rule.id, { field })}
                               />
                             )
@@ -3326,6 +3775,7 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                         },
                         {
                           title: 'Value',
+                          width: 250,
                           render: (_, rule) => (
                             <Input
                               size="small"
@@ -3335,6 +3785,27 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                               onChange={(event) => updateGroupRule(groupId, rule.id, { value: event.target.value })}
                             />
                           ),
+                        },
+                        {
+                          title: 'Current value',
+                          width: 260,
+                          render: (_, rule) => {
+                            if (rule.source !== 'variable' || !rule.field) {
+                              return <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>-</Text>
+                            }
+                            const currentValue = latestVariablePreviewValue(rule.field)
+                            const text = currentValue === undefined ? 'not found in latest run' : formatTrackerJson(currentValue)
+                            return (
+                              <Tooltip title={text || 'empty'}>
+                                <Input.TextArea
+                                  readOnly
+                                  autoSize={{ minRows: 1, maxRows: 3 }}
+                                  value={text || 'empty'}
+                                  style={{ fontFamily: 'monospace', fontSize: 11 }}
+                                />
+                              </Tooltip>
+                            )
+                          },
                         },
                         {
                           title: '',
@@ -3399,7 +3870,10 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
         open={childNodeConfigOpen}
         title="Configure Child Execution"
         onCancel={() => setChildNodeConfigOpen(false)}
-        onOk={() => setChildNodeConfigOpen(false)}
+        onOk={() => {
+          onSave(buildCurrentConfig(), { persist: false, silent: true })
+          setChildNodeConfigOpen(false)
+        }}
         okText="Apply"
         width="min(760px, 94vw)"
         styles={{ body: { paddingTop: 12 } }}
@@ -3410,6 +3884,22 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
           const inputMode = String(action.inputMode || 'pass_all')
           const childExecutionMode = String(action.childExecutionMode || 'downstream')
           const childRunMode = String(action.childRunMode || 'per_record')
+          const outputVariable = String(action.outputVariable || action.outputVariableName || '').trim()
+          const selectedChildNodeIds = childExecutionMode === 'sequence'
+            ? toStringArray(action.childNodeIds)
+            : [String(selectedNode.data.childNodeId || action.childNodeId || '')].filter(Boolean)
+          const latestChildCanvasOutput = latestSelectedChildCanvasOutput(embeddedChildNodes, selectedChildNodeIds)
+          const runtimeSampleRows = executionLogs.flatMap((log) => rowsFromSample(log.output_sample ?? log.outputSample ?? log.sample_output ?? log.sampleOutput))
+          const rawLastStoredVariableOutput = outputVariable
+            ? latestEmbeddedVariableOutput(executionLogs, parentNodeId, selectedNode.id, outputVariable)
+              ?? latestVariableOutputFromRows(latestOutputRows, outputVariable)
+              ?? latestVariableOutputFromRows(upstreamPreviewRows, outputVariable)
+              ?? latestEmbeddedChildOutput(executionLogs, parentNodeId, selectedNode.id, outputVariable, selectedChildNodeIds)
+              ?? latestScopedChildOutputFromRows(latestOutputRows, outputVariable, selectedChildNodeIds)
+              ?? latestScopedChildOutputFromRows(upstreamPreviewRows, outputVariable, selectedChildNodeIds)
+              ?? latestChildCanvasOutput
+            : undefined
+          const lastStoredVariableOutput = previewVariableValue(rawLastStoredVariableOutput, 10)
           return (
             <Form layout="vertical">
               <Row gutter={10}>
@@ -3522,6 +4012,31 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                   </Form.Item>
                 </Col>
               </Row>
+              <Form.Item
+                label="Store output in instance variable"
+                help="Downstream condition and validation nodes can reference this result with var('variable_name')."
+              >
+                <Select
+                  showSearch
+                  allowClear
+                  value={outputVariable || undefined}
+                  placeholder="Select an instance variable"
+                  optionFilterProp="label"
+                  options={variablePickerOptions}
+                  onChange={(outputVariable) => updateSelectedNodeData({
+                    actionJson: jsonPatch(selectedNode.data.actionJson, { outputVariable: outputVariable || '' }),
+                  })}
+                />
+              </Form.Item>
+              {outputVariable ? (
+                <Form.Item label={`Last stored ${outputVariable} output`}>
+                  <Input.TextArea
+                    readOnly
+                    rows={6}
+                    value={lastStoredVariableOutput === undefined ? `No stored output found yet. Checked ${runtimeSampleRows.length} runtime sample row(s) and ${latestOutputRows.length} parent output row(s). Run the workflow after applying this config, then open the node again.` : formatTrackerJson(lastStoredVariableOutput)}
+                  />
+                </Form.Item>
+              ) : null}
               {inputMode === 'selected_fields' ? (
                 <Form.Item label="Selected input fields">
                   <Select
@@ -3686,6 +4201,19 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                   key: 'config',
                   label: 'Config',
                   children: <Input.TextArea readOnly rows={18} value={formatTrackerJson(trackerDetail?.row?.workflow_config_json)} style={{ fontFamily: 'monospace', fontSize: 12 }} />,
+                },
+                {
+                  key: 'variables',
+                  label: 'Variables',
+                  children: (
+                    <Input.TextArea
+                      readOnly
+                      rows={18}
+                      value={formatTrackerJson(trackerDetail?.row?.context_json?.latest_variables)}
+                      placeholder="No instance variables stored for this run yet."
+                      style={{ fontFamily: 'monospace', fontSize: 12 }}
+                    />
+                  ),
                 },
                 {
                   key: 'history',
