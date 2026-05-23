@@ -177,6 +177,7 @@ type BlwNodeKind =
   | 'sms'
   | 'oracle_update'
   | 'execute_child_node'
+  | 'counter'
   | 'terminate'
   | 'end'
 
@@ -239,9 +240,21 @@ type BlwGraphSnapshot = {
 export type BlwStudioConfig = {
   enabled: boolean
   trackingMode: 'all_rows' | 'minimal' | 'exception_only' | 'none'
+  executionMode: 'inline' | 'async_tracker'
+  invokeMode: 'once_per_batch' | 'per_row'
+  maxInstances: number
+  waitForCompletion: boolean
+  completionTimeoutSeconds: number
+  includeInputPayload: boolean
   workflowName: string
   trackerTable: string
   uniqueIdField: string
+  instanceScope: 'forever' | 'daily' | 'monthly' | 'yearly' | 'date_range'
+  instanceDateField: string
+  instanceRangeStart: string
+  instanceRangeEnd: string
+  existingInstancePolicy: 'reuse_active' | 'skip_active' | 'allow_duplicate'
+  terminalInstancePolicy: 'skip_terminal' | 'new_on_terminal' | 'allow_duplicate'
   parallelEnabled: boolean
   maxParallelBranches: number
   maxIterations: number
@@ -251,6 +264,17 @@ export type BlwStudioConfig = {
   waitTimeoutMinutes: number
   oracleUpdateEnabled: boolean
   notificationEnabled: boolean
+  oracleHost: string
+  oraclePort: number
+  oracleServiceName: string
+  oracleSid: string
+  oracleDsn: string
+  oracleUser: string
+  oraclePassword: string
+  oracleSchema: string
+  profileStore: string
+  profileNamespace: string
+  customVariablesJson: string
   inputFields: string[]
   inputFieldMappings: BlwInputFieldMapping[]
   instanceVariables: BlwInstanceVariable[]
@@ -279,6 +303,7 @@ const nodeTypeOptions: Array<{ type: BlwNodeKind; label: string; color: string }
   { type: 'parallel_start', label: 'Parallel Start', color: '#7c6bb3' },
   { type: 'parallel_join', label: 'Parallel Join', color: '#7c6bb3' },
   { type: 'execute_child_node', label: 'Execute Child Node', color: '#3f98ad' },
+  { type: 'counter', label: 'Counter', color: '#64748b' },
   { type: 'wait', label: 'Wait Timer', color: '#a66f35' },
   { type: 'delay', label: 'Delay', color: '#64748b' },
   { type: 'pause', label: 'Pause', color: '#7d6a9f' },
@@ -297,6 +322,7 @@ const nodeKindColor: Record<string, string> = {
   parallel_start: '#5e35b1',
   parallel_join: '#5e35b1',
   execute_child_node: '#00838f',
+  counter: '#64748b',
   wait: '#8d6e63',
   delay: '#64748b',
   pause: '#6d4c41',
@@ -381,6 +407,7 @@ function nodeIcon(type: BlwNodeKind, color: string) {
   if (type === 'parallel_start') return <ForkOutlined style={style} />
   if (type === 'parallel_join') return <ApartmentOutlined style={style} />
   if (type === 'execute_child_node') return <ThunderboltOutlined style={style} />
+  if (type === 'counter') return <PlusOutlined style={style} />
   if (type === 'wait') return <ClockCircleOutlined style={style} />
   if (type === 'delay') return <ClockCircleOutlined style={style} />
   if (type === 'pause') return <PauseCircleOutlined style={style} />
@@ -1052,7 +1079,8 @@ function createGraphNode(type: BlwNodeKind, label: string, x: number, y: number)
         : type === 'email' ? { recipient: '$.email', template: 'Workflow notification for ${TRANSACTIONID}', sendMode: 'draft' }
           : type === 'sms' ? { recipient: '$.phone', template: 'Workflow update for ${TRANSACTIONID}' }
             : type === 'execute_child_node' ? { inputMode: 'pass_all', outputPath: '$.child_output', outputVariable: '' }
-              : {}
+              : type === 'counter' ? { counterVariable: 'NODE_COUNTER', counterMode: 'increment', startValue: 0, stepValue: 1, resetValue: 0 }
+                : {}
   return {
     id,
     type: 'blwNode',
@@ -1282,6 +1310,16 @@ function normalizeConfig(raw: unknown, nodeLabel: string): BlwStudioConfig {
   const maxIterations = Number(cfg.maxIterations || 5)
   const maxRetryAttempts = Number(cfg.maxRetryAttempts || 3)
   const inputFields = uniqueStrings([cfg.inputFields, cfg.sourceFields, cfg._detected_columns])
+  const rawInstanceScope = String(cfg.instanceScope || cfg.workflow_instance_scope || cfg.workflowScope || 'daily').trim().toLowerCase()
+  const instanceScope = (['forever', 'daily', 'monthly', 'yearly', 'date_range'].includes(rawInstanceScope) ? rawInstanceScope : 'daily') as BlwStudioConfig['instanceScope']
+  const rawExistingPolicy = String(cfg.existingInstancePolicy || cfg.workflow_existing_instance_policy || 'reuse_active').trim().toLowerCase()
+  const existingInstancePolicy = (['reuse_active', 'skip_active', 'allow_duplicate'].includes(rawExistingPolicy) ? rawExistingPolicy : 'reuse_active') as BlwStudioConfig['existingInstancePolicy']
+  const rawTerminalPolicy = String(cfg.terminalInstancePolicy || cfg.workflow_terminal_instance_policy || 'skip_terminal').trim().toLowerCase()
+  const terminalInstancePolicy = (['skip_terminal', 'new_on_terminal', 'allow_duplicate'].includes(rawTerminalPolicy) ? rawTerminalPolicy : 'skip_terminal') as BlwStudioConfig['terminalInstancePolicy']
+  const rawExecutionMode = String(cfg.executionMode || cfg.workflow_execution_mode || cfg.execution_mode || 'inline').trim().toLowerCase()
+  const executionMode = (['inline', 'async_tracker'].includes(rawExecutionMode) ? rawExecutionMode : rawExecutionMode === 'async' ? 'async_tracker' : 'inline') as BlwStudioConfig['executionMode']
+  const rawInvokeMode = String(cfg.invokeMode || cfg.invoke_mode || 'once_per_batch').trim().toLowerCase()
+  const invokeMode = (['once_per_batch', 'per_row'].includes(rawInvokeMode) ? rawInvokeMode : rawInvokeMode === 'row_by_row' ? 'per_row' : 'once_per_batch') as BlwStudioConfig['invokeMode']
   return {
     enabled: cfg.enabled !== false,
     trackingMode: (
@@ -1289,9 +1327,21 @@ function normalizeConfig(raw: unknown, nodeLabel: string): BlwStudioConfig {
         ? String(cfg.trackingMode || cfg.workflowTrackingMode || cfg.workflow_tracking_mode).trim()
         : 'all_rows'
     ) as BlwStudioConfig['trackingMode'],
+    executionMode,
+    invokeMode,
+    maxInstances: Number(cfg.maxInstances || cfg.max_instances || 10000),
+    waitForCompletion: Boolean(cfg.waitForCompletion ?? cfg.wait_for_completion ?? false),
+    completionTimeoutSeconds: Number(cfg.completionTimeoutSeconds || cfg.completion_timeout_seconds || 90),
+    includeInputPayload: Boolean(cfg.includeInputPayload ?? cfg.include_input_payload ?? true),
     workflowName: String(cfg.workflowName || nodeLabel || 'Business Logic Workflow'),
     trackerTable: String(cfg.trackerTable || 'BLW_WORKFLOW_TRACKER'),
     uniqueIdField: String(cfg.uniqueIdField || 'TRANSACTIONID'),
+    instanceScope,
+    instanceDateField: String(cfg.instanceDateField || cfg.workflow_instance_date_field || cfg.workflowScopeDateField || ''),
+    instanceRangeStart: String(cfg.instanceRangeStart || cfg.workflow_instance_range_start || cfg.workflowScopeRangeStart || ''),
+    instanceRangeEnd: String(cfg.instanceRangeEnd || cfg.workflow_instance_range_end || cfg.workflowScopeRangeEnd || ''),
+    existingInstancePolicy,
+    terminalInstancePolicy,
     parallelEnabled: cfg.parallelEnabled !== false,
     maxParallelBranches: Number(cfg.maxParallelBranches || 4),
     maxIterations,
@@ -1301,6 +1351,21 @@ function normalizeConfig(raw: unknown, nodeLabel: string): BlwStudioConfig {
     waitTimeoutMinutes: Number(cfg.waitTimeoutMinutes || 30),
     oracleUpdateEnabled: cfg.oracleUpdateEnabled !== false,
     notificationEnabled: cfg.notificationEnabled !== false,
+    oracleHost: String(cfg.oracleHost || cfg.workflow_oracle_host || ''),
+    oraclePort: Number(cfg.oraclePort || cfg.workflow_oracle_port || 1521),
+    oracleServiceName: String(cfg.oracleServiceName || cfg.workflow_oracle_service_name || ''),
+    oracleSid: String(cfg.oracleSid || cfg.workflow_oracle_sid || ''),
+    oracleDsn: String(cfg.oracleDsn || cfg.workflow_oracle_dsn || ''),
+    oracleUser: String(cfg.oracleUser || cfg.workflow_oracle_user || ''),
+    oraclePassword: String(cfg.oraclePassword || cfg.workflow_oracle_password || ''),
+    oracleSchema: String(cfg.oracleSchema || cfg.workflow_oracle_schema || ''),
+    profileStore: String(cfg.profileStore || cfg.profile_store || 'sqlite'),
+    profileNamespace: String(cfg.profileNamespace || cfg.profile_namespace || ''),
+    customVariablesJson: typeof cfg.customVariablesJson === 'string'
+      ? cfg.customVariablesJson
+      : typeof cfg.custom_variables_json === 'string'
+        ? cfg.custom_variables_json
+        : '{}',
     inputFields,
     inputFieldMappings: normalizeInputFieldMappings(cfg.inputFieldMappings, inputFields),
     instanceVariables: normalizeInstanceVariables(cfg.instanceVariables),
@@ -1323,6 +1388,52 @@ function resolveStoredBlwConfig(config: Record<string, unknown> | undefined): Re
     trackingMode: nested.trackingMode ?? nested.workflowTrackingMode ?? nested.workflow_tracking_mode ?? topLevel.workflow_tracking_mode ?? topLevel.workflowTrackingMode,
     workflowTrackingMode: nested.workflowTrackingMode ?? nested.trackingMode ?? nested.workflow_tracking_mode ?? topLevel.workflow_tracking_mode ?? topLevel.workflowTrackingMode,
     workflow_tracking_mode: nested.workflow_tracking_mode ?? nested.trackingMode ?? nested.workflowTrackingMode ?? topLevel.workflow_tracking_mode ?? topLevel.workflowTrackingMode,
+    executionMode: nested.executionMode ?? topLevel.workflow_execution_mode,
+    workflow_execution_mode: nested.workflow_execution_mode ?? nested.executionMode ?? topLevel.workflow_execution_mode,
+    invokeMode: nested.invokeMode ?? topLevel.invoke_mode,
+    invoke_mode: nested.invoke_mode ?? nested.invokeMode ?? topLevel.invoke_mode,
+    maxInstances: nested.maxInstances ?? topLevel.max_instances,
+    max_instances: nested.max_instances ?? nested.maxInstances ?? topLevel.max_instances,
+    waitForCompletion: nested.waitForCompletion ?? topLevel.wait_for_completion,
+    wait_for_completion: nested.wait_for_completion ?? nested.waitForCompletion ?? topLevel.wait_for_completion,
+    completionTimeoutSeconds: nested.completionTimeoutSeconds ?? topLevel.completion_timeout_seconds,
+    completion_timeout_seconds: nested.completion_timeout_seconds ?? nested.completionTimeoutSeconds ?? topLevel.completion_timeout_seconds,
+    includeInputPayload: nested.includeInputPayload ?? topLevel.include_input_payload,
+    include_input_payload: nested.include_input_payload ?? nested.includeInputPayload ?? topLevel.include_input_payload,
+    instanceScope: nested.instanceScope ?? topLevel.workflow_instance_scope,
+    workflow_instance_scope: nested.workflow_instance_scope ?? nested.instanceScope ?? topLevel.workflow_instance_scope,
+    instanceDateField: nested.instanceDateField ?? topLevel.workflow_instance_date_field,
+    workflow_instance_date_field: nested.workflow_instance_date_field ?? nested.instanceDateField ?? topLevel.workflow_instance_date_field,
+    instanceRangeStart: nested.instanceRangeStart ?? topLevel.workflow_instance_range_start,
+    workflow_instance_range_start: nested.workflow_instance_range_start ?? nested.instanceRangeStart ?? topLevel.workflow_instance_range_start,
+    instanceRangeEnd: nested.instanceRangeEnd ?? topLevel.workflow_instance_range_end,
+    workflow_instance_range_end: nested.workflow_instance_range_end ?? nested.instanceRangeEnd ?? topLevel.workflow_instance_range_end,
+    existingInstancePolicy: nested.existingInstancePolicy ?? topLevel.workflow_existing_instance_policy,
+    workflow_existing_instance_policy: nested.workflow_existing_instance_policy ?? nested.existingInstancePolicy ?? topLevel.workflow_existing_instance_policy,
+    terminalInstancePolicy: nested.terminalInstancePolicy ?? topLevel.workflow_terminal_instance_policy,
+    workflow_terminal_instance_policy: nested.workflow_terminal_instance_policy ?? nested.terminalInstancePolicy ?? topLevel.workflow_terminal_instance_policy,
+    oracleHost: nested.oracleHost ?? topLevel.workflow_oracle_host,
+    workflow_oracle_host: nested.workflow_oracle_host ?? nested.oracleHost ?? topLevel.workflow_oracle_host,
+    oraclePort: nested.oraclePort ?? topLevel.workflow_oracle_port,
+    workflow_oracle_port: nested.workflow_oracle_port ?? nested.oraclePort ?? topLevel.workflow_oracle_port,
+    oracleServiceName: nested.oracleServiceName ?? topLevel.workflow_oracle_service_name,
+    workflow_oracle_service_name: nested.workflow_oracle_service_name ?? nested.oracleServiceName ?? topLevel.workflow_oracle_service_name,
+    oracleSid: nested.oracleSid ?? topLevel.workflow_oracle_sid,
+    workflow_oracle_sid: nested.workflow_oracle_sid ?? nested.oracleSid ?? topLevel.workflow_oracle_sid,
+    oracleDsn: nested.oracleDsn ?? topLevel.workflow_oracle_dsn,
+    workflow_oracle_dsn: nested.workflow_oracle_dsn ?? nested.oracleDsn ?? topLevel.workflow_oracle_dsn,
+    oracleUser: nested.oracleUser ?? topLevel.workflow_oracle_user,
+    workflow_oracle_user: nested.workflow_oracle_user ?? nested.oracleUser ?? topLevel.workflow_oracle_user,
+    oraclePassword: nested.oraclePassword ?? topLevel.workflow_oracle_password,
+    workflow_oracle_password: nested.workflow_oracle_password ?? nested.oraclePassword ?? topLevel.workflow_oracle_password,
+    oracleSchema: nested.oracleSchema ?? topLevel.workflow_oracle_schema,
+    workflow_oracle_schema: nested.workflow_oracle_schema ?? nested.oracleSchema ?? topLevel.workflow_oracle_schema,
+    profileStore: nested.profileStore ?? topLevel.profile_store,
+    profile_store: nested.profile_store ?? nested.profileStore ?? topLevel.profile_store,
+    profileNamespace: nested.profileNamespace ?? topLevel.profile_namespace,
+    profile_namespace: nested.profile_namespace ?? nested.profileNamespace ?? topLevel.profile_namespace,
+    customVariablesJson: nested.customVariablesJson ?? topLevel.custom_variables_json,
+    custom_variables_json: nested.custom_variables_json ?? nested.customVariablesJson ?? topLevel.custom_variables_json,
     inputFields: nested.inputFields ?? topLevel.inputFields,
     inputFieldMappings: nested.inputFieldMappings ?? topLevel.inputFieldMappings,
     instanceVariables: nestedInstanceVariables ?? topLevel.instanceVariables ?? topLevel.blw_instance_variables,
@@ -1338,6 +1449,9 @@ function buildOracleDdl(config: BlwStudioConfig): string {
   PIPELINE_ID            VARCHAR2(64),
   BUSINESS_NODE_ID       VARCHAR2(64),
   INPUT_UNIQUE_ID        VARCHAR2(255),
+  WORKFLOW_SCOPE_TYPE    VARCHAR2(50),
+  WORKFLOW_SCOPE_KEY     VARCHAR2(255),
+  INSTANCE_KEY           VARCHAR2(128),
   INPUT_SOURCE           VARCHAR2(255),
   INPUT_PAYLOAD_JSON     CLOB,
   CURRENT_STAGE          VARCHAR2(255),
@@ -1380,7 +1494,7 @@ function displayNodeType(type: string): string {
 }
 
 function hasRuntimeControl(type: BlwNodeKind): boolean {
-  return ['activity', 'execute_child_node', 'email', 'sms', 'oracle_update', 'wait', 'delay', 'pause', 'escalation'].includes(type)
+  return ['activity', 'execute_child_node', 'counter', 'email', 'sms', 'oracle_update', 'wait', 'delay', 'pause', 'escalation'].includes(type)
 }
 
 function isConditionRouteHandle(value: unknown): boolean {
@@ -1535,6 +1649,15 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
     draft.uniqueIdField,
     ['TRANSACTIONID', 'AGENTCODE', 'AMOUNT', 'STATUS', 'TXNDATE', 'SERVERTIME', 'CUSTACCOUNTNUMBER'],
   ]), [config, draft.inputFieldMappings, draft.inputFields, draft.uniqueIdField, upstreamInputFields, upstreamPreviewRows])
+  const counterVariableNames = useMemo(() => uniqueStrings(nodes.flatMap((node) => {
+    if (node.data?.blwType !== 'counter') return []
+    const action = safeJson(node.data?.actionJson)
+    return [
+      action.counterVariable,
+      action.variableName,
+      action.outputVariable,
+    ].map((item) => String(item || '').trim()).filter(Boolean)
+  })), [nodes])
   const childOutputPathFields = useMemo(() => uniqueStrings(
     nodes.flatMap((node) => {
       const data = node.data || {}
@@ -1543,16 +1666,20 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
       return outputReceivePathHints(safeJson(data.actionJson).outputPath || '$.child_output')
     })
   ), [nodes, upstreamNodeIds])
-  const fieldPickerOptions = useMemo(() => availableFields.map((field) => ({ value: field, label: field })), [availableFields])
-  const pathFieldOptions = useMemo(() => uniqueStrings([availableFields, childOutputPathFields]), [availableFields, childOutputPathFields])
+  const fieldPickerOptions = useMemo(() => uniqueStrings([availableFields, counterVariableNames]).map((field) => ({ value: field, label: field })), [availableFields, counterVariableNames])
+  const pathFieldOptions = useMemo(() => uniqueStrings([availableFields, counterVariableNames, counterVariableNames.map((name) => `_blw_vars.${name}`), childOutputPathFields]), [availableFields, childOutputPathFields, counterVariableNames])
   const pathPickerOptions = useMemo(() => [
     ...(availableFields.length > 0 ? [{ label: 'Upstream fields', options: fieldPickerOptions }] : []),
+    ...(counterVariableNames.length > 0
+      ? [{ label: 'Instance counters', options: counterVariableNames.map((field) => ({ value: field, label: field })) }]
+      : []),
     ...(childOutputPathFields.length > 0
       ? [{ label: 'Child output paths', options: childOutputPathFields.map((field) => ({ value: field, label: field })) }]
       : []),
-  ], [availableFields.length, childOutputPathFields, fieldPickerOptions])
+  ], [availableFields.length, childOutputPathFields, counterVariableNames, fieldPickerOptions])
   const variableOptions = useMemo(() => uniqueStrings([
     draft.instanceVariables.map((item) => item.name),
+    counterVariableNames,
     nodes.flatMap((node) => {
       if (node.data?.blwType !== 'execute_child_node') return []
       const action = safeJson(node.data?.actionJson)
@@ -1562,7 +1689,7 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
         action.outputVar,
       ].map((item) => String(item || '').trim()).filter(Boolean)
     }),
-  ]), [draft.instanceVariables, nodes])
+  ]), [counterVariableNames, draft.instanceVariables, nodes])
   const variablePickerOptions = useMemo(() => variableOptions.map((name) => ({ value: name, label: name })), [variableOptions])
   const variableFieldOptions = useMemo(() => uniqueStrings([
     variableOptions,
@@ -1700,17 +1827,25 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
     const nodeCounts: Record<string, number> = Object.keys(trackerSummary?.summary?.node_counts || {}).length
       ? trackerSummary.summary.node_counts
       : countBy('business_node_id')
-    const errorCounts = dashboardRows.reduce((acc: Record<string, number>, row: any) => {
+    const sampledErrorCounts = dashboardRows.reduce((acc: Record<string, number>, row: any) => {
       const code = String(row?.error_code || row?.error_message || '').trim()
       if (!code) return acc
       acc[code] = (acc[code] || 0) + 1
       return acc
     }, {} as Record<string, number>)
+    const errorCounts: Record<string, number> = Object.keys(trackerSummary?.summary?.error_counts || {}).length
+      ? trackerSummary.summary.error_counts
+      : sampledErrorCounts
     const durations = dashboardRows.map((row: any) => Number(row?.duration_seconds || 0)).filter((value: number) => Number.isFinite(value) && value >= 0)
     const waitLeft = dashboardRows.map((row: any) => Number(row?.wait_remaining_seconds || 0)).filter((value: number) => Number.isFinite(value) && value > 0)
     const sortedDurations = [...durations].sort((a, b) => a - b)
-    const avg = durations.length ? durations.reduce((sum: number, value: number) => sum + value, 0) / durations.length : 0
-    const p95 = sortedDurations.length ? sortedDurations[Math.min(sortedDurations.length - 1, Math.floor(sortedDurations.length * 0.95))] : 0
+    const durationStats = trackerSummary?.summary?.duration_stats || {}
+    const avg = Number.isFinite(Number(durationStats?.avg_seconds))
+      ? Number(durationStats.avg_seconds || 0)
+      : durations.length ? durations.reduce((sum: number, value: number) => sum + value, 0) / durations.length : 0
+    const p95 = Number.isFinite(Number(durationStats?.p95_seconds))
+      ? Number(durationStats.p95_seconds || 0)
+      : sortedDurations.length ? sortedDurations[Math.min(sortedDurations.length - 1, Math.floor(sortedDurations.length * 0.95))] : 0
     const slowest = [...dashboardRows]
       .sort((a: any, b: any) => Number(b?.duration_seconds || 0) - Number(a?.duration_seconds || 0))
       .slice(0, 8)
@@ -1751,12 +1886,15 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
       yAxis: { type: 'category', data: Object.entries(nodeCounts).sort((a, b) => Number(b[1]) - Number(a[1])).slice(0, 10).map(([node]) => node), axisLabel: { color: chartSubtleColor, fontSize: 10 } },
       series: [{ type: 'bar', data: Object.entries(nodeCounts).sort((a, b) => Number(b[1]) - Number(a[1])).slice(0, 10).map(([, count]) => count), itemStyle: { color: '#a78bfa' }, barWidth: 12 }],
     }
-    const latencyBuckets = [
-      { name: '0-5s', value: durations.filter((value: number) => value <= 5).length },
-      { name: '5-30s', value: durations.filter((value: number) => value > 5 && value <= 30).length },
-      { name: '30-120s', value: durations.filter((value: number) => value > 30 && value <= 120).length },
-      { name: '>120s', value: durations.filter((value: number) => value > 120).length },
-    ]
+    const fullLatencyBuckets: Record<string, number> = trackerSummary?.summary?.latency_buckets || {}
+    const latencyBuckets = Object.keys(fullLatencyBuckets).length
+      ? ['0-5s', '5-30s', '30-120s', '>120s'].map((name) => ({ name, value: Number(fullLatencyBuckets[name] || 0) }))
+      : [
+        { name: '0-5s', value: durations.filter((value: number) => value <= 5).length },
+        { name: '5-30s', value: durations.filter((value: number) => value > 5 && value <= 30).length },
+        { name: '30-120s', value: durations.filter((value: number) => value > 30 && value <= 120).length },
+        { name: '>120s', value: durations.filter((value: number) => value > 120).length },
+      ]
     const latencyChart = {
       backgroundColor: 'transparent',
       tooltip: { trigger: 'axis' },
@@ -1775,7 +1913,9 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
       running: statusRows.filter((row) => ['running', 'pending', 'waiting'].includes(String(row.status).toLowerCase())).reduce((sum, row) => sum + Number(row.count || 0), 0),
       avg,
       p95,
-      waitQueue: waitLeft.length,
+      waitQueue: Number.isFinite(Number(trackerSummary?.summary?.wait_queue_total))
+        ? Number(trackerSummary?.summary?.wait_queue_total || 0)
+        : waitLeft.length,
       statusChart,
       stageChart,
       nodeChart,
@@ -1793,6 +1933,29 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
         ...(config || {}),
         workflow_tracking_table: draft.trackerTable,
         workflow_unique_id_field: draft.uniqueIdField,
+        workflow_execution_mode: draft.executionMode,
+        invoke_mode: draft.invokeMode,
+        max_instances: draft.maxInstances,
+        wait_for_completion: draft.waitForCompletion,
+        completion_timeout_seconds: draft.completionTimeoutSeconds,
+        include_input_payload: draft.includeInputPayload,
+        workflow_instance_scope: draft.instanceScope,
+        workflow_instance_date_field: draft.instanceDateField,
+        workflow_instance_range_start: draft.instanceRangeStart,
+        workflow_instance_range_end: draft.instanceRangeEnd,
+        workflow_existing_instance_policy: draft.existingInstancePolicy,
+        workflow_terminal_instance_policy: draft.terminalInstancePolicy,
+        workflow_oracle_host: draft.oracleHost,
+        workflow_oracle_port: draft.oraclePort,
+        workflow_oracle_service_name: draft.oracleServiceName,
+        workflow_oracle_sid: draft.oracleSid,
+        workflow_oracle_dsn: draft.oracleDsn,
+        workflow_oracle_user: draft.oracleUser,
+        workflow_oracle_password: draft.oraclePassword,
+        workflow_oracle_schema: draft.oracleSchema,
+        profile_store: draft.profileStore,
+        profile_namespace: draft.profileNamespace,
+        custom_variables_json: draft.customVariablesJson,
         workflow_parallel_enabled: draft.parallelEnabled,
         workflow_max_parallel_branches: draft.maxParallelBranches,
         workflow_max_iterations: draft.maxIterations,
@@ -1801,6 +1964,29 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
           trackerTable: draft.trackerTable,
           uniqueIdField: draft.uniqueIdField,
           trackingMode: draft.trackingMode,
+          executionMode: draft.executionMode,
+          invokeMode: draft.invokeMode,
+          maxInstances: draft.maxInstances,
+          waitForCompletion: draft.waitForCompletion,
+          completionTimeoutSeconds: draft.completionTimeoutSeconds,
+          includeInputPayload: draft.includeInputPayload,
+          instanceScope: draft.instanceScope,
+          instanceDateField: draft.instanceDateField,
+          instanceRangeStart: draft.instanceRangeStart,
+          instanceRangeEnd: draft.instanceRangeEnd,
+          existingInstancePolicy: draft.existingInstancePolicy,
+          terminalInstancePolicy: draft.terminalInstancePolicy,
+          oracleHost: draft.oracleHost,
+          oraclePort: draft.oraclePort,
+          oracleServiceName: draft.oracleServiceName,
+          oracleSid: draft.oracleSid,
+          oracleDsn: draft.oracleDsn,
+          oracleUser: draft.oracleUser,
+          oraclePassword: draft.oraclePassword,
+          oracleSchema: draft.oracleSchema,
+          profileStore: draft.profileStore,
+          profileNamespace: draft.profileNamespace,
+          customVariablesJson: draft.customVariablesJson,
         },
       }
       const summary = await api.getBlwTrackerSummary({
@@ -1808,19 +1994,42 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
         limit: 100,
         fast: true,
         counts_ttl_seconds: refreshCounts ? 5 : 30,
-        refresh_counts: refreshCounts,
+        refresh_counts: true,
       })
       setTrackerSummary(summary)
     } finally {
       trackerRefreshInFlightRef.current = false
       setTrackerLoading(false)
     }
-  }, [config, draft.maxIterations, draft.maxParallelBranches, draft.maxRetryAttempts, draft.parallelEnabled, draft.trackerTable, draft.trackingMode, draft.uniqueIdField])
+  }, [config, draft.completionTimeoutSeconds, draft.customVariablesJson, draft.executionMode, draft.existingInstancePolicy, draft.includeInputPayload, draft.instanceDateField, draft.instanceRangeEnd, draft.instanceRangeStart, draft.instanceScope, draft.invokeMode, draft.maxInstances, draft.maxIterations, draft.maxParallelBranches, draft.maxRetryAttempts, draft.oracleDsn, draft.oracleHost, draft.oraclePassword, draft.oraclePort, draft.oracleSchema, draft.oracleServiceName, draft.oracleSid, draft.oracleUser, draft.parallelEnabled, draft.profileNamespace, draft.profileStore, draft.terminalInstancePolicy, draft.trackerTable, draft.trackingMode, draft.uniqueIdField, draft.waitForCompletion])
 
   const buildTrackerPayloadConfig = useCallback(() => ({
     ...(config || {}),
     workflow_tracking_table: draft.trackerTable,
     workflow_unique_id_field: draft.uniqueIdField,
+    workflow_execution_mode: draft.executionMode,
+    invoke_mode: draft.invokeMode,
+    max_instances: draft.maxInstances,
+    wait_for_completion: draft.waitForCompletion,
+    completion_timeout_seconds: draft.completionTimeoutSeconds,
+    include_input_payload: draft.includeInputPayload,
+    workflow_instance_scope: draft.instanceScope,
+    workflow_instance_date_field: draft.instanceDateField,
+    workflow_instance_range_start: draft.instanceRangeStart,
+    workflow_instance_range_end: draft.instanceRangeEnd,
+    workflow_existing_instance_policy: draft.existingInstancePolicy,
+    workflow_terminal_instance_policy: draft.terminalInstancePolicy,
+    workflow_oracle_host: draft.oracleHost,
+    workflow_oracle_port: draft.oraclePort,
+    workflow_oracle_service_name: draft.oracleServiceName,
+    workflow_oracle_sid: draft.oracleSid,
+    workflow_oracle_dsn: draft.oracleDsn,
+    workflow_oracle_user: draft.oracleUser,
+    workflow_oracle_password: draft.oraclePassword,
+    workflow_oracle_schema: draft.oracleSchema,
+    profile_store: draft.profileStore,
+    profile_namespace: draft.profileNamespace,
+    custom_variables_json: draft.customVariablesJson,
     workflow_parallel_enabled: draft.parallelEnabled,
     workflow_max_parallel_branches: draft.maxParallelBranches,
     workflow_max_iterations: draft.maxIterations,
@@ -2375,6 +2584,29 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
         graphEdges: nextConfig.graphEdges,
         instanceVariables: nextConfig.instanceVariables,
         uniqueIdField: nextConfig.uniqueIdField,
+        executionMode: nextConfig.executionMode,
+        invokeMode: nextConfig.invokeMode,
+        maxInstances: nextConfig.maxInstances,
+        waitForCompletion: nextConfig.waitForCompletion,
+        completionTimeoutSeconds: nextConfig.completionTimeoutSeconds,
+        includeInputPayload: nextConfig.includeInputPayload,
+        instanceScope: nextConfig.instanceScope,
+        instanceDateField: nextConfig.instanceDateField,
+        instanceRangeStart: nextConfig.instanceRangeStart,
+        instanceRangeEnd: nextConfig.instanceRangeEnd,
+        existingInstancePolicy: nextConfig.existingInstancePolicy,
+        terminalInstancePolicy: nextConfig.terminalInstancePolicy,
+        oracleHost: nextConfig.oracleHost,
+        oraclePort: nextConfig.oraclePort,
+        oracleServiceName: nextConfig.oracleServiceName,
+        oracleSid: nextConfig.oracleSid,
+        oracleDsn: nextConfig.oracleDsn,
+        oracleUser: nextConfig.oracleUser,
+        oraclePassword: nextConfig.oraclePassword,
+        oracleSchema: nextConfig.oracleSchema,
+        profileStore: nextConfig.profileStore,
+        profileNamespace: nextConfig.profileNamespace,
+        customVariablesJson: nextConfig.customVariablesJson,
         trackingMode: nextConfig.trackingMode,
       })
     } catch {
@@ -2756,6 +2988,74 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
         </>
       )
     }
+    if (selectedNode.data.blwType === 'counter') {
+      return (
+        <>
+          <Divider style={{ margin: '8px 0', borderColor: 'var(--app-border)' }} />
+          <Text style={{ color: 'var(--app-text)', fontSize: 12, fontWeight: 800 }}>Counter</Text>
+          <Form.Item
+            label="Instance variable"
+            help="Stored per workflow instance. Conditions can use this as var('name') or select it as a Variable field."
+          >
+            <Input
+              value={String(action.counterVariable || action.variableName || action.outputVariable || '')}
+              placeholder="Example: NODE_COUNTER"
+              onChange={(event) => updateSelectedNodeData({ actionJson: jsonPatch(selectedNode.data.actionJson, { counterVariable: event.target.value }) })}
+            />
+          </Form.Item>
+          <Row gutter={8}>
+            <Col span={12}>
+              <Form.Item label="Mode">
+                <Select
+                  value={String(action.counterMode || 'increment')}
+                  options={[
+                    { value: 'increment', label: 'Increment' },
+                    { value: 'decrement', label: 'Decrement' },
+                    { value: 'reset', label: 'Reset' },
+                  ]}
+                  onChange={(counterMode) => updateSelectedNodeData({ actionJson: jsonPatch(selectedNode.data.actionJson, { counterMode }) })}
+                />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item label="Step">
+                <InputNumber
+                  min={0}
+                  step={1}
+                  style={{ width: '100%' }}
+                  value={Number(action.stepValue ?? 1)}
+                  disabled={String(action.counterMode || 'increment') === 'reset'}
+                  onChange={(stepValue) => updateSelectedNodeData({ actionJson: jsonPatch(selectedNode.data.actionJson, { stepValue: Number(stepValue || 0) }) })}
+                />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Row gutter={8}>
+            <Col span={12}>
+              <Form.Item label="Initial value">
+                <InputNumber
+                  step={1}
+                  style={{ width: '100%' }}
+                  value={Number(action.startValue ?? 0)}
+                  onChange={(startValue) => updateSelectedNodeData({ actionJson: jsonPatch(selectedNode.data.actionJson, { startValue: Number(startValue || 0) }) })}
+                />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item label="Reset value">
+                <InputNumber
+                  step={1}
+                  style={{ width: '100%' }}
+                  value={Number(action.resetValue ?? 0)}
+                  disabled={String(action.counterMode || 'increment') !== 'reset'}
+                  onChange={(resetValue) => updateSelectedNodeData({ actionJson: jsonPatch(selectedNode.data.actionJson, { resetValue: Number(resetValue || 0) }) })}
+                />
+              </Form.Item>
+            </Col>
+          </Row>
+        </>
+      )
+    }
     if (selectedNode.data.blwType === 'activity') {
       return (
         <>
@@ -2920,20 +3220,6 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                   {label}
                 </Button>
               ))}
-
-              <Divider style={{ margin: '8px 0', borderColor: 'var(--app-border)' }} />
-              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Workflow</Text>
-              <Input value={draft.workflowName} onChange={(event) => updateDraft({ workflowName: event.target.value })} />
-              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Unique input field</Text>
-              <Select
-                showSearch
-                size="small"
-                value={draft.uniqueIdField || undefined}
-                placeholder="Select unique input field"
-                optionFilterProp="label"
-                options={fieldPickerOptions}
-                onChange={(uniqueIdField) => updateDraft({ uniqueIdField })}
-              />
 
               {activeView === 'designer' ? (
                 <>
@@ -3420,6 +3706,94 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                       />
                     </Form.Item>
                   </Col>
+                  <Col span={8}>
+                    <Form.Item label="Execution mode">
+                      <Select
+                        value={draft.executionMode || 'inline'}
+                        options={[
+                          { value: 'inline', label: 'Inline' },
+                          { value: 'async_tracker', label: 'Async tracker worker' },
+                        ]}
+                        onChange={(executionMode) => updateDraft({ executionMode: executionMode as BlwStudioConfig['executionMode'] })}
+                      />
+                    </Form.Item>
+                  </Col>
+                  <Col span={8}>
+                    <Form.Item label="Invoke mode">
+                      <Select
+                        value={draft.invokeMode || 'once_per_batch'}
+                        options={[
+                          { value: 'once_per_batch', label: 'Once per batch' },
+                          { value: 'per_row', label: 'Per row' },
+                        ]}
+                        onChange={(invokeMode) => updateDraft({ invokeMode: invokeMode as BlwStudioConfig['invokeMode'] })}
+                      />
+                    </Form.Item>
+                  </Col>
+                  <Col span={8}><Form.Item label="Max instances"><InputNumber min={1} max={100000} style={{ width: '100%' }} value={draft.maxInstances} onChange={(value) => updateDraft({ maxInstances: Number(value || 1) })} /></Form.Item></Col>
+                  <Col span={8}><Form.Item label="Wait for completion"><Switch checked={draft.waitForCompletion} onChange={(waitForCompletion) => updateDraft({ waitForCompletion })} /></Form.Item></Col>
+                  <Col span={8}><Form.Item label="Completion timeout seconds"><InputNumber min={1} max={86400} style={{ width: '100%' }} value={draft.completionTimeoutSeconds} onChange={(value) => updateDraft({ completionTimeoutSeconds: Number(value || 1) })} /></Form.Item></Col>
+                  <Col span={8}><Form.Item label="Pass input payload"><Switch checked={draft.includeInputPayload} onChange={(includeInputPayload) => updateDraft({ includeInputPayload })} /></Form.Item></Col>
+                  <Col span={8}>
+                    <Form.Item label="Instance window">
+                      <Select
+                        value={draft.instanceScope || 'daily'}
+                        options={[
+                          { value: 'forever', label: 'Forever' },
+                          { value: 'daily', label: 'Daily' },
+                          { value: 'monthly', label: 'Monthly' },
+                          { value: 'yearly', label: 'Yearly' },
+                          { value: 'date_range', label: 'Date range' },
+                        ]}
+                        onChange={(instanceScope) => updateDraft({ instanceScope: instanceScope as BlwStudioConfig['instanceScope'] })}
+                      />
+                    </Form.Item>
+                  </Col>
+                  <Col span={8}>
+                    <Form.Item label="Instance date field" help="Optional source date field. System date is used when blank or missing.">
+                      <Select
+                        showSearch
+                        allowClear
+                        value={draft.instanceDateField || undefined}
+                        placeholder="System date"
+                        optionFilterProp="label"
+                        options={fieldPickerOptions}
+                        onChange={(instanceDateField) => updateDraft({ instanceDateField: String(instanceDateField || '') })}
+                      />
+                    </Form.Item>
+                  </Col>
+                  <Col span={8}>
+                    <Form.Item label="Active duplicate policy">
+                      <Select
+                        value={draft.existingInstancePolicy || 'reuse_active'}
+                        options={[
+                          { value: 'reuse_active', label: 'Reuse active' },
+                          { value: 'skip_active', label: 'Skip active' },
+                          { value: 'allow_duplicate', label: 'Allow duplicate' },
+                        ]}
+                        onChange={(existingInstancePolicy) => updateDraft({ existingInstancePolicy: existingInstancePolicy as BlwStudioConfig['existingInstancePolicy'] })}
+                      />
+                    </Form.Item>
+                  </Col>
+                  {draft.instanceScope === 'date_range' ? (
+                    <>
+                      <Col span={8}><Form.Item label="Range start"><Input value={draft.instanceRangeStart} placeholder="YYYY-MM-DD" onChange={(event) => updateDraft({ instanceRangeStart: event.target.value })} /></Form.Item></Col>
+                      <Col span={8}><Form.Item label="Range end"><Input value={draft.instanceRangeEnd} placeholder="YYYY-MM-DD" onChange={(event) => updateDraft({ instanceRangeEnd: event.target.value })} /></Form.Item></Col>
+                    </>
+                  ) : null}
+                  <Col span={8}>
+                    <Form.Item label="Terminal same-window policy">
+                      <Select
+                        value={draft.terminalInstancePolicy || 'skip_terminal'}
+                        options={[
+                          { value: 'skip_terminal', label: 'Skip same window' },
+                          { value: 'new_on_terminal', label: 'Create new after terminal' },
+                          { value: 'allow_duplicate', label: 'Allow duplicate' },
+                        ]}
+                        onChange={(terminalInstancePolicy) => updateDraft({ terminalInstancePolicy: terminalInstancePolicy as BlwStudioConfig['terminalInstancePolicy'] })}
+                      />
+                    </Form.Item>
+                  </Col>
                   <Col span={8}><Form.Item label="Max parallel branches"><InputNumber min={1} max={64} style={{ width: '100%' }} value={draft.maxParallelBranches} onChange={(value) => updateDraft({ maxParallelBranches: Number(value || 1) })} /></Form.Item></Col>
                   <Col span={8}><Form.Item label="Max iterations"><InputNumber min={1} max={1000} style={{ width: '100%' }} value={draft.maxIterations} onChange={(value) => updateDraft({ maxIterations: Number(value || 1) })} /></Form.Item></Col>
                   <Col span={8}><Form.Item label="Max retry attempts"><InputNumber min={0} max={100} style={{ width: '100%' }} value={draft.maxRetryAttempts} onChange={(value) => updateDraft({ maxRetryAttempts: Number(value || 0) })} /></Form.Item></Col>
@@ -3443,6 +3817,36 @@ export default function BLWStudio({ open, nodeLabel, config, upstreamInputFields
                       />
                     </Form.Item>
                   </Col>
+                  <Col span={24}>
+                    <Divider style={{ borderColor: 'var(--app-border)', margin: '4px 0 10px' }}>
+                      <Text style={{ color: 'var(--app-text-dim)', fontSize: 11 }}>Oracle connection</Text>
+                    </Divider>
+                  </Col>
+                  <Col span={8}><Form.Item label="Oracle host"><Input value={draft.oracleHost} placeholder="Fallback env: BLW_ORACLE_HOST" onChange={(event) => updateDraft({ oracleHost: event.target.value })} /></Form.Item></Col>
+                  <Col span={8}><Form.Item label="Oracle port"><InputNumber min={1} max={65535} style={{ width: '100%' }} value={draft.oraclePort} onChange={(value) => updateDraft({ oraclePort: Number(value || 1521) })} /></Form.Item></Col>
+                  <Col span={8}><Form.Item label="Service name"><Input value={draft.oracleServiceName} placeholder="Fallback env: BLW_ORACLE_SERVICE_NAME" onChange={(event) => updateDraft({ oracleServiceName: event.target.value })} /></Form.Item></Col>
+                  <Col span={8}><Form.Item label="SID"><Input value={draft.oracleSid} placeholder="Optional" onChange={(event) => updateDraft({ oracleSid: event.target.value })} /></Form.Item></Col>
+                  <Col span={8}><Form.Item label="DSN override"><Input value={draft.oracleDsn} placeholder="host:1521/service" onChange={(event) => updateDraft({ oracleDsn: event.target.value })} /></Form.Item></Col>
+                  <Col span={8}><Form.Item label="Schema"><Input value={draft.oracleSchema} placeholder="Optional schema" onChange={(event) => updateDraft({ oracleSchema: event.target.value })} /></Form.Item></Col>
+                  <Col span={8}><Form.Item label="Oracle user"><Input value={draft.oracleUser} placeholder="Fallback env: BLW_ORACLE_USER" onChange={(event) => updateDraft({ oracleUser: event.target.value })} /></Form.Item></Col>
+                  <Col span={8}><Form.Item label="Oracle password"><Input.Password value={draft.oraclePassword} placeholder="Fallback env: BLW_ORACLE_PASSWORD" onChange={(event) => updateDraft({ oraclePassword: event.target.value })} /></Form.Item></Col>
+                  <Col span={8}>
+                    <Form.Item label="Profile store">
+                      <Select
+                        value={draft.profileStore || 'sqlite'}
+                        options={[
+                          { value: 'sqlite', label: 'SQLite' },
+                          { value: 'lmdb', label: 'LMDB' },
+                          { value: 'rocksdb', label: 'RocksDB' },
+                          { value: 'redis', label: 'Redis' },
+                          { value: 'oracle', label: 'Oracle' },
+                        ]}
+                        onChange={(profileStore) => updateDraft({ profileStore: String(profileStore || 'sqlite') })}
+                      />
+                    </Form.Item>
+                  </Col>
+                  <Col span={12}><Form.Item label="Profile namespace"><Input value={draft.profileNamespace} placeholder="agent_profile_v1" onChange={(event) => updateDraft({ profileNamespace: event.target.value })} /></Form.Item></Col>
+                  <Col span={12}><Form.Item label="Custom variables JSON"><Input.TextArea rows={2} value={draft.customVariablesJson} onChange={(event) => updateDraft({ customVariablesJson: event.target.value })} /></Form.Item></Col>
                 </Row>
               </Form>
             ) : null}

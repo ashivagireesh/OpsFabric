@@ -10402,6 +10402,12 @@ END;"""
                         )
                     )
                 result_rows = reflected_rows
+            self._apply_profile_query_workflow_instance_mapper(
+                result_rows if isinstance(result_rows, list) else [],
+                safe_config,
+                execution_context if isinstance(execution_context, dict) else {},
+                warn_cb=_warn,
+            )
             return result_rows
 
         selected_field_array_roots: Dict[str, str] = {}
@@ -10490,6 +10496,12 @@ END;"""
                 )
             result_rows = reflected_rows
 
+        self._apply_profile_query_workflow_instance_mapper(
+            result_rows if isinstance(result_rows, list) else [],
+            safe_config,
+            execution_context if isinstance(execution_context, dict) else {},
+            warn_cb=_warn,
+        )
         return result_rows
 
     def _profile_query_deep_merge_docs(self, base_doc: Dict[str, Any], patch_doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -10565,6 +10577,327 @@ END;"""
                 continue
             out[key] = self._json_safe_value(raw_value)
         return out
+
+    def _blw_context_latest_variables_to_vars(self, context_obj: Any) -> Dict[str, Any]:
+        if not isinstance(context_obj, dict):
+            return {}
+        latest = context_obj.get("latest_variables")
+        if not isinstance(latest, dict):
+            return {}
+        if isinstance(latest.get("variables"), dict):
+            return dict(latest.get("variables") or {})
+        out: Dict[str, Any] = {}
+        for key, value in latest.items():
+            key_text = str(key or "").strip()
+            if not key_text or key_text in {
+                "node_id",
+                "label",
+                "child_output",
+                "child_output_variable",
+                "child_node_id",
+                "at",
+                "mapped_by_data_query",
+            }:
+                continue
+            out[key_text] = value
+        return out
+
+    def _profile_query_resolve_workflow_mapper_node_config(
+        self,
+        config: Dict[str, Any],
+        execution_context: Optional[Dict[str, Any]],
+    ) -> Tuple[str, Dict[str, Any]]:
+        workflow_node_id = str(config.get("workflow_instance_mapper_workflow_node_id") or "").strip()
+        if not workflow_node_id:
+            return "", {}
+        node_payload = self._profile_query_get_pipeline_node_payload(execution_context, workflow_node_id)
+        if not isinstance(node_payload, dict) and isinstance(execution_context, dict):
+            pipeline_id = str(execution_context.get("pipeline_id") or "").strip()
+            for node in self._load_current_pipeline_nodes(pipeline_id):
+                if str(node.get("id") or "").strip() == workflow_node_id:
+                    node_payload = node
+                    break
+        if not isinstance(node_payload, dict):
+            return workflow_node_id, {}
+        data = node_payload.get("data") if isinstance(node_payload.get("data"), dict) else {}
+        node_type = str(data.get("nodeType") or "").strip().lower()
+        if node_type != "business_workflow":
+            return workflow_node_id, {}
+        node_cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
+        return workflow_node_id, dict(node_cfg)
+
+    def _apply_profile_query_workflow_instance_mapper(
+        self,
+        rows: List[Any],
+        config: Dict[str, Any],
+        execution_context: Optional[Dict[str, Any]],
+        warn_cb: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, int]:
+        if not self._parse_bool_like(config.get("workflow_instance_mapper_enabled"), False):
+            return {"matched": 0, "updated": 0, "resumed": 0, "skipped": 0, "missing": 0}
+        row_list = rows if isinstance(rows, list) else []
+        if not row_list:
+            return {"matched": 0, "updated": 0, "resumed": 0, "skipped": 0, "missing": 0}
+
+        workflow_node_id, workflow_cfg = self._profile_query_resolve_workflow_mapper_node_config(
+            config,
+            execution_context,
+        )
+        variable_name = str(config.get("workflow_instance_mapper_variable") or "").strip()
+        if not workflow_node_id or not workflow_cfg or not variable_name:
+            if callable(warn_cb):
+                warn_cb("Workflow instance mapper skipped: workflow and instance variable are required.")
+            return {"matched": 0, "updated": 0, "resumed": 0, "skipped": len(row_list), "missing": 0}
+
+        query_unique_field = str(config.get("workflow_instance_mapper_query_unique_id_field") or "").strip()
+        workflow_unique_field = str(
+            config.get("workflow_instance_mapper_workflow_unique_id_field")
+            or workflow_cfg.get("workflow_unique_id_field")
+            or workflow_cfg.get("uniqueIdField")
+            or "TRANSACTIONID"
+        ).strip()
+        if not query_unique_field:
+            query_unique_field = workflow_unique_field
+        if not query_unique_field:
+            if callable(warn_cb):
+                warn_cb("Workflow instance mapper skipped: query unique id field is required.")
+            return {"matched": 0, "updated": 0, "resumed": 0, "skipped": len(row_list), "missing": 0}
+
+        select_field_aliases = self._parse_select_field_aliases(config.get("select_field_aliases"))
+        query_unique_alias = str(select_field_aliases.get(query_unique_field) or "").strip()
+        query_unique_leaf = query_unique_field.split(".")[-1] if "." in query_unique_field else ""
+
+        def _mapper_unique_value(row_obj: Dict[str, Any]) -> Any:
+            candidates = [
+                query_unique_field,
+                query_unique_alias,
+                workflow_unique_field,
+                query_unique_leaf,
+            ]
+            seen: set = set()
+            for candidate in candidates:
+                key = str(candidate or "").strip()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                value = self._blw_field_value(row_obj, key)
+                if value in (None, ""):
+                    extracted, found = self._extract_row_value_by_path(row_obj, key)
+                    value = extracted if found else row_obj.get(key)
+                if value not in (None, ""):
+                    return value
+            return None
+
+        pipeline_id = ""
+        if isinstance(execution_context, dict):
+            pipeline_id = str(execution_context.get("pipeline_id") or "").strip()
+        resume_policy = str(config.get("workflow_instance_mapper_resume_policy") or "waiting_only").strip().lower()
+        terminal_policy = str(config.get("workflow_instance_mapper_terminal_policy") or "skip").strip().lower()
+        if resume_policy not in {"waiting_only", "safe_non_terminal"}:
+            resume_policy = "waiting_only"
+        if terminal_policy not in {"skip", "update_only", "retry"}:
+            terminal_policy = "skip"
+
+        terminal_statuses = {"success", "failed", "terminated"}
+        waiting_statuses = {"waiting"}
+        safe_non_terminal_statuses = {
+            "waiting",
+            "paused",
+            "pending",
+            "retry_requested",
+            "resume_requested",
+            "escalated",
+        }
+        counts = {"matched": 0, "updated": 0, "resumed": 0, "skipped": 0, "missing": 0}
+        conn = None
+        cur = None
+        try:
+            conn, tracker_cfg = self._blw_tracker_connect(workflow_cfg)
+            table_name = str(tracker_cfg.get("table") or workflow_cfg.get("workflow_tracking_table") or "BLW_WORKFLOW_TRACKER")
+            self._ensure_blw_tracker_table(conn, table_name)
+            cur = conn.cursor()
+            status_order_sql = """
+                        CASE
+                          WHEN LOWER(CURRENT_STATUS) = 'waiting' THEN 0
+                          WHEN LOWER(CURRENT_STATUS) IN (
+                            'resume_requested',
+                            'paused',
+                            'pending',
+                            'retry_requested',
+                            'escalated',
+                            'running'
+                          ) THEN 1
+                          WHEN LOWER(CURRENT_STATUS) IN ('success', 'failed', 'terminated') THEN 3
+                          ELSE 2
+                        END,
+                        LAST_UPDATED_AT DESC
+                    """
+            for row in row_list:
+                if not isinstance(row, dict):
+                    counts["skipped"] += 1
+                    continue
+                unique_value = _mapper_unique_value(row)
+                unique_text = str(unique_value or "").strip()
+                if not unique_text:
+                    counts["skipped"] += 1
+                    continue
+                identity_row = dict(row)
+                if workflow_unique_field:
+                    identity_row[workflow_unique_field] = unique_text
+                identity = self._blw_instance_identity(
+                    workflow_cfg,
+                    identity_row,
+                    pipeline_id=pipeline_id,
+                    business_node_id=workflow_node_id,
+                    fallback_unique=unique_text,
+                )
+                instance_key = str(identity.get("instance_key") or "").strip()
+                params = {
+                    "input_unique_id": unique_text,
+                    "business_node_id": workflow_node_id,
+                    "pipeline_id": pipeline_id,
+                    "instance_key": instance_key,
+                }
+                tracker_row = None
+                if instance_key:
+                    cur.execute(f"""
+                        SELECT RUN_ID, CURRENT_STATUS, CONTEXT_JSON
+                        FROM {table_name}
+                        WHERE INSTANCE_KEY=:instance_key
+                        ORDER BY {status_order_sql}
+                        FETCH FIRST 1 ROWS ONLY
+                    """, {"instance_key": instance_key})
+                    tracker_row = cur.fetchone()
+                if not tracker_row and pipeline_id:
+                    cur.execute(f"""
+                        SELECT RUN_ID, CURRENT_STATUS, CONTEXT_JSON
+                        FROM {table_name}
+                        WHERE INPUT_UNIQUE_ID=:input_unique_id
+                          AND BUSINESS_NODE_ID=:business_node_id
+                          AND PIPELINE_ID=:pipeline_id
+                        ORDER BY {status_order_sql}
+                        FETCH FIRST 1 ROWS ONLY
+                    """, {
+                        "input_unique_id": unique_text,
+                        "business_node_id": workflow_node_id,
+                        "pipeline_id": pipeline_id,
+                    })
+                    tracker_row = cur.fetchone()
+                elif not tracker_row:
+                    cur.execute(f"""
+                        SELECT RUN_ID, CURRENT_STATUS, CONTEXT_JSON
+                        FROM {table_name}
+                        WHERE INPUT_UNIQUE_ID=:input_unique_id
+                          AND BUSINESS_NODE_ID=:business_node_id
+                        ORDER BY {status_order_sql}
+                        FETCH FIRST 1 ROWS ONLY
+                    """, {
+                        "input_unique_id": unique_text,
+                        "business_node_id": workflow_node_id,
+                    })
+                    tracker_row = cur.fetchone()
+                if not tracker_row:
+                    counts["missing"] += 1
+                    continue
+                counts["matched"] += 1
+                run_id = str(tracker_row[0] or "").strip()
+                current_status = str(tracker_row[1] or "").strip().lower()
+                if current_status in terminal_statuses and terminal_policy == "skip":
+                    counts["skipped"] += 1
+                    continue
+                try:
+                    context_raw = self._blw_read_lob_text(tracker_row[2])
+                    parsed_context = json.loads(context_raw) if context_raw else {}
+                    context_obj = parsed_context if isinstance(parsed_context, dict) else {}
+                except Exception:
+                    context_obj = {}
+                latest = context_obj.get("latest_variables")
+                if not isinstance(latest, dict):
+                    latest = {}
+                variables = latest.get("variables")
+                if not isinstance(variables, dict):
+                    variables = self._blw_context_latest_variables_to_vars(context_obj)
+                safe_row = self._json_safe_value(row)
+                variables[variable_name] = safe_row
+                latest = {
+                    **latest,
+                    "variables": self._json_safe_value(variables),
+                    variable_name: safe_row,
+                    "mapped_by_data_query": {
+                        "query_node_id": str((execution_context or {}).get("node_id") or ""),
+                        "query_unique_id_field": query_unique_field,
+                        "workflow_unique_id_field": workflow_unique_field,
+                        "input_unique_id": unique_text,
+                        "workflow_scope_type": str(identity.get("workflow_scope_type") or ""),
+                        "workflow_scope_key": str(identity.get("workflow_scope_key") or ""),
+                        "instance_key": instance_key,
+                        "mapped_at": datetime.utcnow().isoformat(),
+                    },
+                }
+                context_obj["latest_variables"] = self._json_safe_value(latest)
+                context_obj["workflow_instance_mapper"] = {
+                    "query_node_id": str((execution_context or {}).get("node_id") or ""),
+                    "workflow_node_id": workflow_node_id,
+                    "variable": variable_name,
+                    "input_unique_id": unique_text,
+                    "workflow_scope_type": str(identity.get("workflow_scope_type") or ""),
+                    "workflow_scope_key": str(identity.get("workflow_scope_key") or ""),
+                    "instance_key": instance_key,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+                should_resume = False
+                should_retry_terminal = current_status in terminal_statuses and terminal_policy == "retry"
+                if should_retry_terminal:
+                    should_resume = True
+                elif current_status not in terminal_statuses:
+                    if resume_policy == "waiting_only":
+                        should_resume = current_status in waiting_statuses
+                    else:
+                        should_resume = current_status in safe_non_terminal_statuses
+                next_status = "retry_requested" if should_retry_terminal else "resume_requested" if should_resume else current_status
+                context_json_text = json.dumps(self._json_safe_value(context_obj), ensure_ascii=False, default=str)
+                self._blw_tracker_apply_clob_inputsizes(cur, [{"context_json": context_json_text}])
+                cur.execute(f"""
+                    UPDATE {table_name}
+                    SET CONTEXT_JSON=:context_json,
+                        CURRENT_STATUS=:current_status,
+                        WAIT_UNTIL=CASE WHEN :current_status IN ('resume_requested','retry_requested') THEN NULL ELSE WAIT_UNTIL END,
+                        ERROR_CODE=CASE WHEN :current_status IN ('resume_requested','retry_requested') THEN NULL ELSE ERROR_CODE END,
+                        ERROR_MESSAGE=CASE WHEN :current_status IN ('resume_requested','retry_requested') THEN NULL ELSE ERROR_MESSAGE END,
+                        ENDED_AT=CASE WHEN :current_status = 'retry_requested' THEN NULL ELSE ENDED_AT END,
+                        LAST_UPDATED_AT=CAST(SYSTIMESTAMP AS TIMESTAMP)
+                    WHERE RUN_ID=:run_id
+                """, {
+                    "run_id": run_id,
+                    "current_status": next_status,
+                    "context_json": context_json_text,
+                })
+                counts["updated"] += 1
+                if should_resume:
+                    counts["resumed"] += 1
+            conn.commit()
+            if callable(warn_cb):
+                warn_cb(
+                    "Workflow instance mapper: "
+                    f"matched={counts['matched']}, updated={counts['updated']}, "
+                    f"resumed={counts['resumed']}, missing={counts['missing']}, skipped={counts['skipped']}."
+                )
+            return counts
+        except Exception as exc:
+            if callable(warn_cb):
+                warn_cb(f"Workflow instance mapper failed: {exc}")
+            return counts
+        finally:
+            try:
+                if cur is not None:
+                    cur.close()
+            except Exception:
+                pass
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
 
     def _profile_query_coerce_patch_value_literal(self, raw_value: Any) -> Any:
         if raw_value is None:
@@ -21749,7 +22082,22 @@ END;"""
         value, found = self._extract_row_value_by_path(row, key)
         if found:
             return value
-        return row.get(key)
+        if key in row:
+            return row.get(key)
+        blw_vars = row.get("_blw_vars")
+        if isinstance(blw_vars, dict):
+            if key in blw_vars:
+                return blw_vars.get(key)
+            if "." in key:
+                root, nested_path = key.split(".", 1)
+                root_value = blw_vars.get(root)
+                if root_value is not None:
+                    if isinstance(root_value, dict):
+                        extracted_value, extracted_found = self._extract_row_value_by_path(root_value, nested_path)
+                        if extracted_found:
+                            return extracted_value
+                    return self._extract_json_path_value(root_value, nested_path)
+        return None
 
     def _blw_variable_value(self, row: Any, field: str) -> Any:
         if not isinstance(row, dict):
@@ -21866,7 +22214,7 @@ END;"""
                     safe_locals.setdefault(key, value)
             safe_locals.update({
                 "field": lambda name, default=None: self._blw_field_value(row, str(name)) if self._blw_field_value(row, str(name)) is not None else default,
-                "var": lambda name, default=None: blw_vars.get(str(name), default),
+                "var": lambda name, default=None: self._blw_variable_value(row, str(name)) if self._blw_variable_value(row, str(name)) is not None else default,
                 "contains": lambda value, needle: str(needle or "") in str(value or ""),
                 "len": len,
                 "int": int,
@@ -22047,6 +22395,43 @@ END;"""
                 if name in blw_vars and value in (None, "") and assignment.get("defaultValue") in (None, ""):
                     continue
                 blw_vars[name] = value
+            if blw_type == "counter":
+                counter_name = str(
+                    action.get("counterVariable")
+                    or action.get("variableName")
+                    or action.get("outputVariable")
+                    or ""
+                ).strip()
+                if counter_name:
+                    mode = str(action.get("counterMode") or "increment").strip().lower()
+                    if mode not in {"increment", "decrement", "reset"}:
+                        mode = "increment"
+                    current_num = self._business_to_number(blw_vars.get(counter_name))
+                    try:
+                        start_value = float(action.get("startValue", 0) or 0)
+                    except Exception:
+                        start_value = 0.0
+                    try:
+                        step_value = float(action.get("stepValue", 1) or 0)
+                    except Exception:
+                        step_value = 1.0
+                    try:
+                        reset_value = float(action.get("resetValue", 0) or 0)
+                    except Exception:
+                        reset_value = 0.0
+                    if mode == "reset":
+                        next_value = reset_value
+                    else:
+                        base_value = float(current_num) if current_num is not None else start_value
+                        next_value = base_value + step_value if mode == "increment" else base_value - step_value
+                    if float(next_value).is_integer():
+                        next_value = int(next_value)
+                    blw_vars[counter_name] = next_value
+                    row_obj["_blw_counter"] = {
+                        "name": counter_name,
+                        "value": next_value,
+                        "mode": mode,
+                    }
             row_obj["_blw_vars"] = blw_vars
             trace = row_obj.get("_blw_trace")
             if not isinstance(trace, list):
@@ -22160,6 +22545,9 @@ CREATE TABLE {table_sql} (
   PIPELINE_ID            VARCHAR2(64),
   BUSINESS_NODE_ID       VARCHAR2(64),
   INPUT_UNIQUE_ID        VARCHAR2(255),
+  WORKFLOW_SCOPE_TYPE    VARCHAR2(50),
+  WORKFLOW_SCOPE_KEY     VARCHAR2(255),
+  INSTANCE_KEY           VARCHAR2(128),
   INPUT_SOURCE           VARCHAR2(255),
   INPUT_PAYLOAD_JSON     CLOB,
   CURRENT_STAGE          VARCHAR2(255),
@@ -22211,6 +22599,41 @@ CREATE TABLE {table_sql} (
             if not table_exists:
                 cur.execute(create_sql)
                 conn.commit()
+            else:
+                existing_columns: set[str] = set()
+                try:
+                    if table_owner:
+                        cur.execute(
+                            """
+                            SELECT COLUMN_NAME
+                            FROM ALL_TAB_COLUMNS
+                            WHERE OWNER=:owner AND TABLE_NAME=:table_name
+                            """,
+                            {"owner": table_owner, "table_name": table_base},
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT COLUMN_NAME FROM USER_TAB_COLUMNS WHERE TABLE_NAME=:table_name",
+                            {"table_name": table_base},
+                        )
+                    existing_columns = {str(row[0] or "").upper() for row in cur.fetchall()}
+                except Exception:
+                    existing_columns = set()
+                alter_columns = [
+                    ("WORKFLOW_SCOPE_TYPE", "VARCHAR2(50)"),
+                    ("WORKFLOW_SCOPE_KEY", "VARCHAR2(255)"),
+                    ("INSTANCE_KEY", "VARCHAR2(128)"),
+                ]
+                for column_name, column_type in alter_columns:
+                    if column_name in existing_columns:
+                        continue
+                    try:
+                        cur.execute(f"ALTER TABLE {table_sql} ADD ({column_name} {column_type})")
+                    except Exception as alter_exc:
+                        text = str(alter_exc or "")
+                        if "ORA-01430" not in text and "ORA-00904" not in text and "ORA-00054" not in text:
+                            raise
+                conn.commit()
         except Exception as exc:
             text = str(exc or "")
             if "ORA-00955" not in text and "ORA-00054" not in text:
@@ -22234,6 +22657,14 @@ CREATE TABLE {table_sql} (
             (
                 f"IDX_{safe_suffix}_INPUT",
                 f"CREATE INDEX IDX_{safe_suffix}_INPUT ON {table_sql} (INPUT_UNIQUE_ID)",
+            ),
+            (
+                f"IDX_{safe_suffix}_INST",
+                f"CREATE INDEX IDX_{safe_suffix}_INST ON {table_sql} (INSTANCE_KEY, CURRENT_STATUS)",
+            ),
+            (
+                f"IDX_{safe_suffix}_SCOPE",
+                f"CREATE INDEX IDX_{safe_suffix}_SCOPE ON {table_sql} (WORKFLOW_ID, WORKFLOW_SCOPE_KEY, INPUT_UNIQUE_ID)",
             ),
             (
                 f"IDX_{safe_suffix}_PIPE_NODE",
@@ -22307,7 +22738,8 @@ CREATE TABLE {table_sql} (
                 safe[key] = str(value)
         for key in [
             "run_id", "workflow_id", "workflow_name", "pipeline_id", "business_node_id",
-            "input_unique_id", "input_source", "current_stage", "current_step_id",
+            "input_unique_id", "workflow_scope_type", "workflow_scope_key", "instance_key",
+            "input_source", "current_stage", "current_step_id",
             "current_status", "escalation_status", "escalated_to", "error_code",
         ]:
             safe[key] = str(safe.get(key) or "")[:255]
@@ -22315,6 +22747,8 @@ CREATE TABLE {table_sql} (
         safe["workflow_id"] = safe["workflow_id"][:64]
         safe["pipeline_id"] = safe["pipeline_id"][:64]
         safe["business_node_id"] = safe["business_node_id"][:64]
+        safe["workflow_scope_type"] = safe["workflow_scope_type"][:50]
+        safe["instance_key"] = safe["instance_key"][:128]
         for key in [
             "step_track_json",
             "routing_history_json",
@@ -22346,6 +22780,203 @@ CREATE TABLE {table_sql} (
         except Exception:
             safe["escalation_level"] = 0
         return safe
+
+    def _blw_tracker_workflow_id(self, workflow_config: Dict[str, Any], fallback_id: str = "") -> str:
+        cfg = workflow_config if isinstance(workflow_config, dict) else {}
+        workflow_id = str(
+            cfg.get("workflow_id")
+            or cfg.get("workflowId")
+            or cfg.get("id")
+            or fallback_id
+            or ""
+        ).strip()
+        return workflow_id[:64]
+
+    def _blw_instance_scope_mode(self, workflow_config: Dict[str, Any]) -> str:
+        cfg = workflow_config if isinstance(workflow_config, dict) else {}
+        raw = str(
+            cfg.get("workflow_instance_scope")
+            or cfg.get("workflow_instance_scope_type")
+            or cfg.get("workflowScope")
+            or "daily"
+        ).strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "once": "forever",
+            "one_time": "forever",
+            "all_time": "forever",
+            "all": "forever",
+            "none": "forever",
+            "day": "daily",
+            "date": "daily",
+            "month": "monthly",
+            "year": "yearly",
+            "annual": "yearly",
+            "range": "date_range",
+            "custom_range": "date_range",
+        }
+        mode = aliases.get(raw, raw)
+        if mode not in {"forever", "daily", "monthly", "yearly", "date_range"}:
+            mode = "daily"
+        return mode
+
+    def _blw_parse_scope_datetime(self, value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime.combine(value, time.min)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                # Treat very large numeric values as milliseconds.
+                number = float(value)
+                if number > 100000000000:
+                    number = number / 1000.0
+                return datetime.utcfromtimestamp(number)
+            except Exception:
+                return None
+        text = str(value or "").strip()
+        if not text:
+            return None
+        normalized = text.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+            return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+        except Exception:
+            pass
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d",
+            "%d-%m-%Y",
+            "%m/%d/%Y",
+            "%d/%m/%Y",
+            "%Y/%m/%d",
+            "%Y%m%d",
+        ):
+            try:
+                return datetime.strptime(text, fmt)
+            except Exception:
+                continue
+        return None
+
+    def _blw_instance_scope_key(
+        self,
+        workflow_config: Dict[str, Any],
+        row: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, str, str]:
+        cfg = workflow_config if isinstance(workflow_config, dict) else {}
+        mode = self._blw_instance_scope_mode(cfg)
+        if mode == "forever":
+            return mode, "forever", ""
+        if mode == "date_range":
+            start = str(cfg.get("workflow_instance_range_start") or cfg.get("workflowScopeRangeStart") or "").strip()
+            end = str(cfg.get("workflow_instance_range_end") or cfg.get("workflowScopeRangeEnd") or "").strip()
+            if start or end:
+                return mode, f"{start or '*'}..{end or '*'}", ""
+            mode = "daily"
+        date_field = str(
+            cfg.get("workflow_instance_date_field")
+            or cfg.get("workflow_scope_date_field")
+            or cfg.get("workflowScopeDateField")
+            or ""
+        ).strip()
+        source_value = None
+        if date_field and isinstance(row, dict):
+            source_value = self._blw_field_value(row, date_field)
+        parsed = self._blw_parse_scope_datetime(source_value)
+        fallback_used = False
+        if parsed is None:
+            parsed = datetime.utcnow()
+            fallback_used = bool(date_field)
+        if mode == "yearly":
+            key = parsed.strftime("%Y")
+        elif mode == "monthly":
+            key = parsed.strftime("%Y-%m")
+        else:
+            mode = "daily"
+            key = parsed.strftime("%Y-%m-%d")
+        return mode, key, date_field if not fallback_used else f"{date_field}:fallback_system_date"
+
+    def _blw_instance_identity(
+        self,
+        workflow_config: Dict[str, Any],
+        row: Optional[Dict[str, Any]],
+        pipeline_id: str,
+        business_node_id: str,
+        fallback_unique: str = "",
+    ) -> Dict[str, str]:
+        cfg = workflow_config if isinstance(workflow_config, dict) else {}
+        unique_field = str(
+            cfg.get("workflow_unique_id_field")
+            or cfg.get("uniqueIdField")
+            or "TRANSACTIONID"
+        ).strip()
+        unique_value = ""
+        if unique_field and isinstance(row, dict):
+            raw_unique = self._blw_field_value(row, unique_field)
+            if raw_unique not in (None, ""):
+                unique_value = str(raw_unique).strip()
+        if not unique_value:
+            unique_value = str(fallback_unique or "").strip()
+        workflow_id = self._blw_tracker_workflow_id(cfg, business_node_id)
+        scope_type, scope_key, scope_source = self._blw_instance_scope_key(cfg, row)
+        canonical = "|".join([
+            workflow_id,
+            str(pipeline_id or "").strip(),
+            str(business_node_id or "").strip(),
+            scope_type,
+            scope_key,
+            unique_value,
+        ])
+        instance_key = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return {
+            "workflow_id": workflow_id,
+            "unique_field": unique_field,
+            "input_unique_id": unique_value,
+            "workflow_scope_type": scope_type,
+            "workflow_scope_key": scope_key,
+            "workflow_scope_source": scope_source,
+            "instance_key": instance_key,
+        }
+
+    def _blw_find_existing_instance(
+        self,
+        cur: Any,
+        table_name: str,
+        instance_key: str,
+    ) -> Optional[Dict[str, str]]:
+        key = str(instance_key or "").strip()
+        if not key:
+            return None
+        cur.execute(f"""
+            SELECT RUN_ID, CURRENT_STATUS, INPUT_UNIQUE_ID, WORKFLOW_SCOPE_TYPE, WORKFLOW_SCOPE_KEY
+            FROM {table_name}
+            WHERE INSTANCE_KEY=:instance_key
+            ORDER BY
+              CASE
+                WHEN LOWER(CURRENT_STATUS) IN (
+                  'waiting',
+                  'pending',
+                  'running',
+                  'resume_requested',
+                  'retry_requested',
+                  'paused',
+                  'escalated'
+                ) THEN 0
+                WHEN LOWER(CURRENT_STATUS) IN ('success', 'failed', 'terminated') THEN 2
+                ELSE 1
+              END,
+              LAST_UPDATED_AT DESC
+            FETCH FIRST 1 ROWS ONLY
+        """, {"instance_key": key})
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "run_id": str(row[0] or "").strip(),
+            "current_status": str(row[1] or "").strip().lower(),
+            "input_unique_id": str(row[2] or "").strip(),
+            "workflow_scope_type": str(row[3] or "").strip(),
+            "workflow_scope_key": str(row[4] or "").strip(),
+        }
 
     def _blw_tracker_apply_clob_inputsizes(
         self,
@@ -22381,6 +23012,9 @@ WHEN MATCHED THEN UPDATE SET
   PIPELINE_ID=:pipeline_id,
   BUSINESS_NODE_ID=:business_node_id,
   INPUT_UNIQUE_ID=:input_unique_id,
+  WORKFLOW_SCOPE_TYPE=:workflow_scope_type,
+  WORKFLOW_SCOPE_KEY=:workflow_scope_key,
+  INSTANCE_KEY=:instance_key,
   INPUT_SOURCE=:input_source,
   INPUT_PAYLOAD_JSON=:input_payload_json,
   CURRENT_STAGE=:current_stage,
@@ -22410,7 +23044,8 @@ WHEN MATCHED THEN UPDATE SET
   LAST_RETRY_AT=CASE WHEN :current_status = 'retrying' THEN SYSTIMESTAMP ELSE LAST_RETRY_AT END
 WHEN NOT MATCHED THEN INSERT (
   RUN_ID, WORKFLOW_ID, WORKFLOW_NAME, PIPELINE_ID, BUSINESS_NODE_ID,
-  INPUT_UNIQUE_ID, INPUT_SOURCE, INPUT_PAYLOAD_JSON, CURRENT_STAGE,
+  INPUT_UNIQUE_ID, WORKFLOW_SCOPE_TYPE, WORKFLOW_SCOPE_KEY, INSTANCE_KEY,
+  INPUT_SOURCE, INPUT_PAYLOAD_JSON, CURRENT_STAGE,
   CURRENT_STEP_ID, CURRENT_STATUS, ITERATION_NO, MAX_ITERATIONS,
   RETRY_COUNT, MAX_RETRY_ATTEMPTS, ESCALATION_LEVEL, ESCALATION_STATUS,
   ESCALATED_TO, ERROR_CODE, ERROR_MESSAGE, WORKFLOW_CONFIG_JSON,
@@ -22418,7 +23053,8 @@ WHEN NOT MATCHED THEN INSERT (
   PARALLEL_BRANCH_JSON, CONTEXT_JSON
 ) VALUES (
   :run_id, :workflow_id, :workflow_name, :pipeline_id, :business_node_id,
-  :input_unique_id, :input_source, :input_payload_json, :current_stage,
+  :input_unique_id, :workflow_scope_type, :workflow_scope_key, :instance_key,
+  :input_source, :input_payload_json, :current_stage,
   :current_step_id, :current_status, :iteration_no, :max_iterations,
   :retry_count, :max_retry_attempts, :escalation_level, :escalation_status,
   :escalated_to, :error_code, :error_message, :workflow_config_json,
@@ -22455,6 +23091,9 @@ WHEN MATCHED THEN UPDATE SET
   PIPELINE_ID=:pipeline_id,
   BUSINESS_NODE_ID=:business_node_id,
   INPUT_UNIQUE_ID=:input_unique_id,
+  WORKFLOW_SCOPE_TYPE=:workflow_scope_type,
+  WORKFLOW_SCOPE_KEY=:workflow_scope_key,
+  INSTANCE_KEY=:instance_key,
   INPUT_SOURCE=:input_source,
   INPUT_PAYLOAD_JSON=:input_payload_json,
   CURRENT_STAGE=:current_stage,
@@ -22484,7 +23123,8 @@ WHEN MATCHED THEN UPDATE SET
   LAST_RETRY_AT=CASE WHEN :current_status = 'retrying' THEN SYSTIMESTAMP ELSE LAST_RETRY_AT END
 WHEN NOT MATCHED THEN INSERT (
   RUN_ID, WORKFLOW_ID, WORKFLOW_NAME, PIPELINE_ID, BUSINESS_NODE_ID,
-  INPUT_UNIQUE_ID, INPUT_SOURCE, INPUT_PAYLOAD_JSON, CURRENT_STAGE,
+  INPUT_UNIQUE_ID, WORKFLOW_SCOPE_TYPE, WORKFLOW_SCOPE_KEY, INSTANCE_KEY,
+  INPUT_SOURCE, INPUT_PAYLOAD_JSON, CURRENT_STAGE,
   CURRENT_STEP_ID, CURRENT_STATUS, ITERATION_NO, MAX_ITERATIONS,
   RETRY_COUNT, MAX_RETRY_ATTEMPTS, ESCALATION_LEVEL, ESCALATION_STATUS,
   ESCALATED_TO, ERROR_CODE, ERROR_MESSAGE, WORKFLOW_CONFIG_JSON,
@@ -22492,7 +23132,8 @@ WHEN NOT MATCHED THEN INSERT (
   PARALLEL_BRANCH_JSON, CONTEXT_JSON
 ) VALUES (
   :run_id, :workflow_id, :workflow_name, :pipeline_id, :business_node_id,
-  :input_unique_id, :input_source, :input_payload_json, :current_stage,
+  :input_unique_id, :workflow_scope_type, :workflow_scope_key, :instance_key,
+  :input_source, :input_payload_json, :current_stage,
   :current_step_id, :current_status, :iteration_no, :max_iterations,
   :retry_count, :max_retry_attempts, :escalation_level, :escalation_status,
   :escalated_to, :error_code, :error_message, :workflow_config_json,
@@ -22531,7 +23172,8 @@ WHEN NOT MATCHED THEN INSERT (
         sql = f"""
 INSERT INTO {table_name} (
   RUN_ID, WORKFLOW_ID, WORKFLOW_NAME, PIPELINE_ID, BUSINESS_NODE_ID,
-  INPUT_UNIQUE_ID, INPUT_SOURCE, INPUT_PAYLOAD_JSON, CURRENT_STAGE,
+  INPUT_UNIQUE_ID, WORKFLOW_SCOPE_TYPE, WORKFLOW_SCOPE_KEY, INSTANCE_KEY,
+  INPUT_SOURCE, INPUT_PAYLOAD_JSON, CURRENT_STAGE,
   CURRENT_STEP_ID, CURRENT_STATUS, ITERATION_NO, MAX_ITERATIONS,
   RETRY_COUNT, MAX_RETRY_ATTEMPTS, ESCALATION_LEVEL, ESCALATION_STATUS,
   ESCALATED_TO, ERROR_CODE, ERROR_MESSAGE, WORKFLOW_CONFIG_JSON,
@@ -22539,7 +23181,8 @@ INSERT INTO {table_name} (
   PARALLEL_BRANCH_JSON, CONTEXT_JSON
 ) VALUES (
   :run_id, :workflow_id, :workflow_name, :pipeline_id, :business_node_id,
-  :input_unique_id, :input_source, :input_payload_json, :current_stage,
+  :input_unique_id, :workflow_scope_type, :workflow_scope_key, :instance_key,
+  :input_source, :input_payload_json, :current_stage,
   :current_step_id, :current_status, :iteration_no, :max_iterations,
   :retry_count, :max_retry_attempts, :escalation_level, :escalation_status,
   :escalated_to, :error_code, :error_message, :workflow_config_json,
@@ -22596,6 +23239,9 @@ INSERT INTO {table_name} (
                     "node_id_prefix": safe.get("business_node_id") or "business_workflow",
                     "async": True,
                     "minimal_tracker": True,
+                    "workflow_scope_type": safe.get("workflow_scope_type") or "",
+                    "workflow_scope_key": safe.get("workflow_scope_key") or "",
+                    "instance_key": safe.get("instance_key") or "",
                 },
                 separators=(",", ":"),
             )
@@ -22608,13 +23254,15 @@ INSERT INTO {table_name} (
         sql = f"""
 INSERT INTO {table_name} (
   RUN_ID, WORKFLOW_ID, WORKFLOW_NAME, PIPELINE_ID, BUSINESS_NODE_ID,
-  INPUT_UNIQUE_ID, INPUT_SOURCE, CURRENT_STAGE, CURRENT_STEP_ID,
+  INPUT_UNIQUE_ID, WORKFLOW_SCOPE_TYPE, WORKFLOW_SCOPE_KEY, INSTANCE_KEY,
+  INPUT_SOURCE, CURRENT_STAGE, CURRENT_STEP_ID,
   CURRENT_STATUS, ITERATION_NO, MAX_ITERATIONS, RETRY_COUNT,
   MAX_RETRY_ATTEMPTS, ESCALATION_LEVEL, ESCALATION_STATUS,
   ESCALATED_TO, ERROR_CODE, ERROR_MESSAGE, CONTEXT_JSON
 ) VALUES (
   :run_id, :workflow_id, :workflow_name, :pipeline_id, :business_node_id,
-  :input_unique_id, :input_source, :current_stage, :current_step_id,
+  :input_unique_id, :workflow_scope_type, :workflow_scope_key, :instance_key,
+  :input_source, :current_stage, :current_step_id,
   :current_status, :iteration_no, :max_iterations, :retry_count,
   :max_retry_attempts, :escalation_level, :escalation_status,
   :escalated_to, :error_code, :error_message, :context_json
@@ -22837,7 +23485,33 @@ INSERT INTO {table_name} (
             business_node_id = str(execution_context.get("node_id") or node_id_prefix or "").strip()
         enqueued: List[Dict[str, Any]] = []
         queue_payloads: List[Dict[str, Any]] = []
+        lookup_cur = None
         try:
+            active_policy = str(
+                wf_cfg.get("workflow_existing_instance_policy")
+                or wf_cfg.get("workflow_active_instance_policy")
+                or "reuse_active"
+            ).strip().lower()
+            terminal_policy = str(
+                wf_cfg.get("workflow_terminal_instance_policy")
+                or "skip_terminal"
+            ).strip().lower()
+            if active_policy not in {"reuse_active", "skip_active", "allow_duplicate"}:
+                active_policy = "reuse_active"
+            if terminal_policy not in {"skip_terminal", "new_on_terminal", "allow_duplicate"}:
+                terminal_policy = "skip_terminal"
+            active_statuses = {
+                "waiting",
+                "pending",
+                "running",
+                "resume_requested",
+                "retry_requested",
+                "paused",
+                "escalated",
+            }
+            terminal_statuses = {"success", "failed", "terminated"}
+            planned_by_instance_key: Dict[str, Dict[str, Any]] = {}
+            lookup_cur = conn.cursor()
             compact_wf_cfg_json = json.dumps(
                 self._json_safe_value({} if minimal_payload else self._compact_blw_async_workflow_config(wf_cfg)),
                 ensure_ascii=False,
@@ -22846,6 +23520,57 @@ INSERT INTO {table_name} (
             )
             for idx, instance_rows in enumerate(instances, start=1):
                 instance_payload = [dict(row) if isinstance(row, dict) else {"value": row} for row in instance_rows]
+                unique_field = str(wf_cfg.get("workflow_unique_id_field") or wf_cfg.get("uniqueIdField") or "TRANSACTIONID").strip()
+                first_payload_row = instance_payload[0] if instance_payload and isinstance(instance_payload[0], dict) else {}
+                identity = self._blw_instance_identity(
+                    wf_cfg,
+                    first_payload_row,
+                    pipeline_id=pipeline_id,
+                    business_node_id=business_node_id or node_id_prefix,
+                    fallback_unique=f"instance_{idx}",
+                )
+                instance_key = str(identity.get("instance_key") or "").strip()
+                if instance_key and instance_key in planned_by_instance_key:
+                    planned = planned_by_instance_key[instance_key]
+                    enqueued.append({
+                        "run_id": str(planned.get("run_id") or ""),
+                        "rows": len(instance_payload),
+                        "input_unique_id": str(identity.get("input_unique_id") or f"instance_{idx}"),
+                        "workflow_scope_type": str(identity.get("workflow_scope_type") or ""),
+                        "workflow_scope_key": str(identity.get("workflow_scope_key") or ""),
+                        "instance_key": instance_key,
+                        "reused": True,
+                        "duplicate_in_batch": True,
+                    })
+                    continue
+                existing = self._blw_find_existing_instance(lookup_cur, table_name, instance_key)
+                if existing:
+                    existing_status = str(existing.get("current_status") or "").strip().lower()
+                    if existing_status in active_statuses and active_policy != "allow_duplicate":
+                        enqueued.append({
+                            "run_id": str(existing.get("run_id") or ""),
+                            "rows": len(instance_payload),
+                            "input_unique_id": str(identity.get("input_unique_id") or f"instance_{idx}"),
+                            "workflow_scope_type": str(identity.get("workflow_scope_type") or ""),
+                            "workflow_scope_key": str(identity.get("workflow_scope_key") or ""),
+                            "instance_key": instance_key,
+                            "reused": active_policy == "reuse_active",
+                            "skipped": active_policy == "skip_active",
+                            "existing_status": existing_status,
+                        })
+                        continue
+                    if existing_status in terminal_statuses and terminal_policy not in {"new_on_terminal", "allow_duplicate"}:
+                        enqueued.append({
+                            "run_id": str(existing.get("run_id") or ""),
+                            "rows": len(instance_payload),
+                            "input_unique_id": str(identity.get("input_unique_id") or f"instance_{idx}"),
+                            "workflow_scope_type": str(identity.get("workflow_scope_type") or ""),
+                            "workflow_scope_key": str(identity.get("workflow_scope_key") or ""),
+                            "instance_key": instance_key,
+                            "skipped": True,
+                            "existing_status": existing_status,
+                        })
+                        continue
                 run_id = self._build_blw_async_run_id(
                     wf_cfg,
                     instance_payload,
@@ -22853,19 +23578,18 @@ INSERT INTO {table_name} (
                     node_id_prefix=node_id_prefix,
                     instance_index=idx,
                 )
-                unique_field = str(wf_cfg.get("workflow_unique_id_field") or wf_cfg.get("uniqueIdField") or "TRANSACTIONID").strip()
-                unique_value = ""
-                if instance_payload and isinstance(instance_payload[0], dict) and unique_field:
-                    value = self._blw_field_value(instance_payload[0], unique_field)
-                    if value not in (None, ""):
-                        unique_value = str(value)
+                unique_value = str(identity.get("input_unique_id") or f"instance_{idx}")
+                workflow_id = str(identity.get("workflow_id") or self._blw_tracker_workflow_id(wf_cfg, business_node_id or node_id_prefix))
                 queue_payloads.append({
                     "run_id": run_id,
-                    "workflow_id": str(wf_cfg.get("workflow_id") or wf_cfg.get("id") or ""),
+                    "workflow_id": workflow_id,
                     "workflow_name": str(wf_cfg.get("workflowName") or wf_cfg.get("workflow_name") or "Business Logic Workflow"),
                     "pipeline_id": pipeline_id,
                     "business_node_id": business_node_id,
                     "input_unique_id": unique_value or f"instance_{idx}",
+                    "workflow_scope_type": str(identity.get("workflow_scope_type") or ""),
+                    "workflow_scope_key": str(identity.get("workflow_scope_key") or ""),
+                    "instance_key": instance_key,
                     "input_source": "async_tracker",
                     "input_payload_json": self._json_safe_value(
                         [
@@ -22899,15 +23623,43 @@ INSERT INTO {table_name} (
                         "node_id_prefix": node_id_prefix,
                         "async": True,
                         "instance_index": idx,
+                        "workflow_scope_type": str(identity.get("workflow_scope_type") or ""),
+                        "workflow_scope_key": str(identity.get("workflow_scope_key") or ""),
+                        "workflow_scope_source": str(identity.get("workflow_scope_source") or ""),
+                        "instance_key": instance_key,
                         "minimal_tracker": True,
-                    } if minimal_payload else {"node_id_prefix": node_id_prefix, "async": True, "instance_index": idx},
+                    } if minimal_payload else {
+                        "node_id_prefix": node_id_prefix,
+                        "async": True,
+                        "instance_index": idx,
+                        "workflow_scope_type": str(identity.get("workflow_scope_type") or ""),
+                        "workflow_scope_key": str(identity.get("workflow_scope_key") or ""),
+                        "workflow_scope_source": str(identity.get("workflow_scope_source") or ""),
+                        "instance_key": instance_key,
+                    },
                 })
-                enqueued.append({"run_id": run_id, "rows": len(instance_payload), "input_unique_id": unique_value or f"instance_{idx}"})
+                planned = {
+                    "run_id": run_id,
+                    "rows": len(instance_payload),
+                    "input_unique_id": unique_value or f"instance_{idx}",
+                    "workflow_scope_type": str(identity.get("workflow_scope_type") or ""),
+                    "workflow_scope_key": str(identity.get("workflow_scope_key") or ""),
+                    "instance_key": instance_key,
+                    "created": True,
+                }
+                if instance_key:
+                    planned_by_instance_key[instance_key] = planned
+                enqueued.append(planned)
             if minimal_payload:
                 self._blw_tracker_insert_many_minimal(conn, table_name, queue_payloads)
             else:
                 self._blw_tracker_insert_many(conn, table_name, queue_payloads)
         finally:
+            try:
+                if lookup_cur is not None:
+                    lookup_cur.close()
+            except Exception:
+                pass
             try:
                 conn.close()
             except Exception:
@@ -23172,6 +23924,26 @@ INSERT INTO {table_name} (
                 run_context = context_raw if isinstance(context_raw, dict) else {}
             except Exception:
                 run_context = {}
+            context_vars = self._blw_context_latest_variables_to_vars(run_context)
+            if context_vars:
+                hydrated_rows: List[Any] = []
+                for raw_row in input_rows:
+                    if isinstance(raw_row, dict):
+                        row_obj = dict(raw_row)
+                    else:
+                        row_obj = {"value": raw_row}
+                    existing_vars = row_obj.get("_blw_vars")
+                    if not isinstance(existing_vars, dict):
+                        existing_vars = {}
+                    row_obj["_blw_vars"] = {**context_vars, **existing_vars}
+                    hydrated_rows.append(row_obj)
+                input_rows = hydrated_rows
+            if str(item.get("current_status") or "").strip().lower() == "resume_requested":
+                resume_wait_node_id = str(run_context.get("last_wait_node_id") or "").strip()
+                if resume_wait_node_id:
+                    for row_obj in input_rows:
+                        if isinstance(row_obj, dict):
+                            row_obj["_blw_resume_from_wait_node_id"] = resume_wait_node_id
             pipeline_id_for_context = str(item.get("pipeline_id") or wf_cfg.get("pipeline_id") or "").strip()
             pipeline_nodes_for_context = self._load_current_pipeline_nodes(pipeline_id_for_context)
             completed_delay_node_ids = [
@@ -23215,6 +23987,11 @@ INSERT INTO {table_name} (
                         "node_id": str(item.get("business_node_id") or "business_workflow"),
                         "node_label": "BLW Async Worker",
                         "blw_async_persist_wait": True,
+                        "blw_resume_from_wait_node_id": (
+                            str(run_context.get("last_wait_node_id") or "").strip()
+                            if str(item.get("current_status") or "").strip().lower() == "resume_requested"
+                            else ""
+                        ),
                         "blw_completed_delay_node_ids": completed_delay_node_ids,
                         "blw_route_audit_by_run_id": route_audit_by_run_id,
                         "blw_variable_audit_by_run_id": variable_audit_by_run_id,
@@ -23308,6 +24085,15 @@ INSERT INTO {table_name} (
                 except Exception:
                     run_context = {}
                 item_contexts[run_id] = run_context
+                context_vars = self._blw_context_latest_variables_to_vars(run_context)
+                if context_vars:
+                    for tagged_row in run_tagged_rows:
+                        if not isinstance(tagged_row, dict):
+                            continue
+                        existing_vars = tagged_row.get("_blw_vars")
+                        if not isinstance(existing_vars, dict):
+                            existing_vars = {}
+                        tagged_row["_blw_vars"] = {**context_vars, **existing_vars}
                 raw_completed = run_context.get("completed_delay_node_ids")
                 row_completed_delay_node_ids = [
                     str(value).strip()
@@ -23319,9 +24105,15 @@ INSERT INTO {table_name} (
                         text = str(value or "").strip()
                         if text and text not in completed_delay_node_ids:
                             completed_delay_node_ids.append(text)
+                if str(item.get("current_status") or "").strip().lower() == "resume_requested":
+                    resume_wait_node_id = str(run_context.get("last_wait_node_id") or "").strip()
+                else:
+                    resume_wait_node_id = ""
                 for tagged_row in run_tagged_rows:
                     if isinstance(tagged_row, dict):
                         tagged_row["_blw_completed_delay_node_ids"] = list(row_completed_delay_node_ids)
+                        if resume_wait_node_id:
+                            tagged_row["_blw_resume_from_wait_node_id"] = resume_wait_node_id
             pipeline_id_for_context = str(first.get("pipeline_id") or wf_cfg.get("pipeline_id") or "").strip()
             pipeline_nodes_for_context = self._load_current_pipeline_nodes(pipeline_id_for_context)
             wf_cfg = {
@@ -23804,9 +24596,15 @@ INSERT INTO {table_name} (
                 run_id_return_limit = 25
             run_id_return_limit = max(0, min(run_id_return_limit, 1000))
             run_ids = [item.get("run_id") for item in enqueued]
+            created_count = sum(1 for item in enqueued if isinstance(item, dict) and item.get("created"))
+            reused_count = sum(1 for item in enqueued if isinstance(item, dict) and item.get("reused"))
+            skipped_count = sum(1 for item in enqueued if isinstance(item, dict) and item.get("skipped"))
             async_summary = {
-                "_blw_async_enqueued": True,
+                "_blw_async_enqueued": created_count > 0,
                 "_blw_async_instances": len(enqueued),
+                "_blw_async_created": created_count,
+                "_blw_async_reused": reused_count,
+                "_blw_async_skipped": skipped_count,
                 "_blw_async_run_ids": run_ids[:run_id_return_limit],
                 "_blw_async_run_ids_total": len(run_ids),
                 "_blw_async_run_ids_truncated": len(run_ids) > run_id_return_limit,
@@ -24206,13 +25004,23 @@ INSERT INTO {table_name} (
             if isinstance(execution_context, dict):
                 pipeline_id = str(execution_context.get("pipeline_id") or "").strip()
                 business_node_id = str(execution_context.get("node_id") or node_id_prefix or "").strip()
+            identity = self._blw_instance_identity(
+                wf_cfg,
+                _first_input_row(),
+                pipeline_id=pipeline_id,
+                business_node_id=business_node_id or node_id_prefix,
+                fallback_unique=_tracker_unique_id(),
+            )
             return {
                 "run_id": _tracker_run_id(),
-                "workflow_id": str(wf_cfg.get("workflow_id") or wf_cfg.get("id") or ""),
+                "workflow_id": str(identity.get("workflow_id") or self._blw_tracker_workflow_id(wf_cfg, business_node_id or node_id_prefix)),
                 "workflow_name": str(wf_cfg.get("workflowName") or wf_cfg.get("workflow_name") or "Business Logic Workflow"),
                 "pipeline_id": pipeline_id,
                 "business_node_id": business_node_id,
                 "input_unique_id": _tracker_unique_id(),
+                "workflow_scope_type": str(identity.get("workflow_scope_type") or ""),
+                "workflow_scope_key": str(identity.get("workflow_scope_key") or ""),
+                "instance_key": str(identity.get("instance_key") or ""),
                 "input_source": str(wf_cfg.get("input_source") or "pipeline"),
                 "input_payload_json": self._json_safe_value(input_rows[:5] if isinstance(input_rows, list) else []),
                 "current_stage": current_stage,
@@ -24362,6 +25170,45 @@ INSERT INTO {table_name} (
         forced_inputs_by_node: Dict[str, List[Any]] = {}
         forced_sources_by_node: Dict[str, str] = {}
         processed_normal_nodes: set[str] = set()
+        resume_rows_by_wait_node: Dict[str, List[Any]] = {}
+        resume_from_wait_node_id = ""
+        if isinstance(execution_context, dict):
+            resume_from_wait_node_id = str(execution_context.get("blw_resume_from_wait_node_id") or "").strip()
+        for row_value in input_rows if isinstance(input_rows, list) else []:
+            row_resume_wait_id = ""
+            if isinstance(row_value, dict):
+                row_resume_wait_id = str(row_value.get("_blw_resume_from_wait_node_id") or "").strip()
+            if not row_resume_wait_id:
+                row_resume_wait_id = resume_from_wait_node_id
+            if row_resume_wait_id and row_resume_wait_id in child_nodes_by_id:
+                resume_rows_by_wait_node.setdefault(row_resume_wait_id, []).append(row_value)
+        if resume_rows_by_wait_node:
+            work_queue = []
+            processed_normal_nodes.update(resume_rows_by_wait_node.keys())
+            for wait_node_id, wait_rows in resume_rows_by_wait_node.items():
+                child_results[wait_node_id] = list(wait_rows)
+                child_results_by_handle[wait_node_id] = {
+                    "output": list(wait_rows),
+                    "output_false": [],
+                    "route": list(wait_rows),
+                    "out-right": list(wait_rows),
+                    "out-bottom": list(wait_rows),
+                }
+                for edge in outgoing_edges.get(wait_node_id, []):
+                    target_id = str(edge.get("target") or "").strip()
+                    if not target_id or target_id not in child_nodes_by_id or target_id in execute_child_targets:
+                        continue
+                    source_handle = str(edge.get("source_handle") or "output").strip() or "output"
+                    routed_rows = child_results_by_handle[wait_node_id].get(source_handle)
+                    if routed_rows is None:
+                        routed_rows = child_results_by_handle[wait_node_id].get("output", [])
+                    if not isinstance(routed_rows, list) or not routed_rows:
+                        continue
+                    bucket = forced_inputs_by_node.setdefault(target_id, [])
+                    bucket.extend(routed_rows)
+                    forced_sources_by_node[target_id] = wait_node_id
+                    if target_id not in work_queue:
+                        work_queue.append(target_id)
 
         while work_queue:
             node_id = work_queue.pop(0)

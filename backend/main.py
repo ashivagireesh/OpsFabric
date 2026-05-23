@@ -2487,6 +2487,16 @@ def _blw_async_worker_status() -> Dict[str, Any]:
     }
 
 
+def _ensure_blw_async_worker_scheduled() -> None:
+    if not _env_bool("BLW_ASYNC_WORKER_ENABLED", True):
+        return
+    if not scheduler.running:
+        return
+    if scheduler.get_job(_BLW_ASYNC_WORKER_JOB_ID) is not None:
+        return
+    _sync_blw_async_worker_job()
+
+
 def _sync_blw_async_worker_job() -> Dict[str, Any]:
     existing = scheduler.get_job(_BLW_ASYNC_WORKER_JOB_ID)
     if existing is not None:
@@ -21734,13 +21744,99 @@ async def blw_tracker_summary(body: dict):
                     GROUP BY BUSINESS_NODE_ID
                 """)
                 all_node_counts = {str(row[0] or "UNKNOWN"): int(row[1] or 0) for row in cur.fetchall() or []}
+                duration_stats: Dict[str, Any] = {}
+                latency_buckets: Dict[str, int] = {}
+                error_counts: Dict[str, int] = {}
+                wait_queue_total = 0
+                try:
+                    cur.execute(f"""
+                        SELECT
+                            COUNT(*),
+                            ROUND(AVG(GREATEST(0, (CAST(COALESCE(ENDED_AT, LAST_UPDATED_AT) AS DATE) - CAST(STARTED_AT AS DATE)) * 86400)), 2),
+                            ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (
+                                ORDER BY GREATEST(0, (CAST(COALESCE(ENDED_AT, LAST_UPDATED_AT) AS DATE) - CAST(STARTED_AT AS DATE)) * 86400)
+                            ), 2)
+                        FROM {table_name}
+                        WHERE STARTED_AT IS NOT NULL
+                    """)
+                    stat_row = cur.fetchone()
+                    if stat_row:
+                        duration_stats = {
+                            "count": int(stat_row[0] or 0),
+                            "avg_seconds": float(stat_row[1] or 0),
+                            "p95_seconds": float(stat_row[2] or 0),
+                        }
+                except Exception:
+                    duration_stats = {}
+                try:
+                    cur.execute(f"""
+                        SELECT bucket, COUNT(*)
+                        FROM (
+                            SELECT CASE
+                                WHEN GREATEST(0, (CAST(COALESCE(ENDED_AT, LAST_UPDATED_AT) AS DATE) - CAST(STARTED_AT AS DATE)) * 86400) <= 5 THEN '0-5s'
+                                WHEN GREATEST(0, (CAST(COALESCE(ENDED_AT, LAST_UPDATED_AT) AS DATE) - CAST(STARTED_AT AS DATE)) * 86400) <= 30 THEN '5-30s'
+                                WHEN GREATEST(0, (CAST(COALESCE(ENDED_AT, LAST_UPDATED_AT) AS DATE) - CAST(STARTED_AT AS DATE)) * 86400) <= 120 THEN '30-120s'
+                                ELSE '>120s'
+                            END AS bucket
+                            FROM {table_name}
+                            WHERE STARTED_AT IS NOT NULL
+                        )
+                        GROUP BY bucket
+                    """)
+                    latency_buckets = {str(row[0] or "UNKNOWN"): int(row[1] or 0) for row in cur.fetchall() or []}
+                except Exception:
+                    latency_buckets = {}
+                try:
+                    cur.execute(f"""
+                        SELECT COUNT(*)
+                        FROM {table_name}
+                        WHERE WAIT_UNTIL IS NOT NULL
+                          AND WAIT_UNTIL > CAST(SYSTIMESTAMP AS TIMESTAMP)
+                    """)
+                    wait_row = cur.fetchone()
+                    wait_queue_total = int(wait_row[0] or 0) if wait_row else 0
+                except Exception:
+                    wait_queue_total = 0
+                try:
+                    cur.execute(f"""
+                        SELECT ERROR_CODE, COUNT(*)
+                        FROM {table_name}
+                        WHERE ERROR_CODE IS NOT NULL
+                          AND TRIM(ERROR_CODE) IS NOT NULL
+                        GROUP BY ERROR_CODE
+                        ORDER BY COUNT(*) DESC
+                        FETCH FIRST 25 ROWS ONLY
+                    """)
+                    error_counts = {str(row[0] or "UNKNOWN"): int(row[1] or 0) for row in cur.fetchall() or []}
+                except Exception:
+                    error_counts = {}
                 _BLW_TRACKER_SUMMARY_CACHE[cache_key] = {
                     "at": now_mono,
                     "status_counts": all_status_counts,
                     "stage_counts": all_stage_counts,
                     "node_counts": all_node_counts,
+                    "duration_stats": duration_stats,
+                    "latency_buckets": latency_buckets,
+                    "wait_queue_total": wait_queue_total,
+                    "error_counts": error_counts,
                     "total": all_total,
                 }
+                cached_counts = _BLW_TRACKER_SUMMARY_CACHE.get(cache_key)
+            duration_stats = {}
+            latency_buckets = {}
+            wait_queue_total = 0
+            error_counts = {}
+            if isinstance(cached_counts, dict):
+                raw_duration_stats = cached_counts.get("duration_stats")
+                if isinstance(raw_duration_stats, dict):
+                    duration_stats = raw_duration_stats
+                raw_latency_buckets = cached_counts.get("latency_buckets")
+                if isinstance(raw_latency_buckets, dict):
+                    latency_buckets = {str(key): int(value or 0) for key, value in raw_latency_buckets.items()}
+                wait_queue_total = int(cached_counts.get("wait_queue_total") or 0)
+                raw_error_counts = cached_counts.get("error_counts")
+                if isinstance(raw_error_counts, dict):
+                    error_counts = {str(key): int(value or 0) for key, value in raw_error_counts.items()}
             cur.execute(f"""
                 SELECT RUN_ID, WORKFLOW_NAME, INPUT_UNIQUE_ID, CURRENT_STAGE, CURRENT_STEP_ID,
                        CURRENT_STATUS, ITERATION_NO, RETRY_COUNT, ESCALATION_LEVEL,
@@ -21802,6 +21898,10 @@ async def blw_tracker_summary(body: dict):
                     },
                     "stage_counts": all_stage_counts or stage_counts,
                     "node_counts": all_node_counts,
+                    "duration_stats": duration_stats,
+                    "latency_buckets": latency_buckets,
+                    "wait_queue_total": wait_queue_total,
+                    "error_counts": error_counts,
                     "fast_mode": True,
                     "sample_limit": int(limit),
                     "stage_counts_sampled": not bool(all_stage_counts),
@@ -22120,6 +22220,7 @@ async def blw_tracker_action(body: dict):
 @app.get("/api/blw/worker/status")
 async def blw_worker_status():
     """Return BLW async worker scheduler/runtime settings."""
+    _ensure_blw_async_worker_scheduled()
     return {"ok": True, "worker": _blw_async_worker_status()}
 
 
@@ -22249,6 +22350,7 @@ async def blw_tracker_purge(body: dict):
 @app.post("/api/blw/worker/run-once")
 async def blw_worker_run_once(body: dict):
     """Run the BLW async tracker worker once for queued/pending tracker rows."""
+    _ensure_blw_async_worker_scheduled()
     try:
         limit = int(body.get("limit") or _env_int("BLW_ASYNC_WORKER_BATCH_SIZE", 3000, 1, 5000))
     except Exception:

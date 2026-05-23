@@ -1127,6 +1127,13 @@ const DATA_QUERY_STUDIO_SNAPSHOT_KEYS = [
   'profile_patch_value',
   'profile_patch_target_path',
   'profile_patch_merge_mode',
+  'workflow_instance_mapper_enabled',
+  'workflow_instance_mapper_workflow_node_id',
+  'workflow_instance_mapper_query_unique_id_field',
+  'workflow_instance_mapper_workflow_unique_id_field',
+  'workflow_instance_mapper_variable',
+  'workflow_instance_mapper_resume_policy',
+  'workflow_instance_mapper_terminal_policy',
 ] as const
 
 function pickDataQueryStudioSnapshot(config: Record<string, unknown>): Record<string, unknown> {
@@ -9742,6 +9749,19 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [dataQueryProfilePatchTargetPathDraft, setDataQueryProfilePatchTargetPathDraft] = useState('')
   const [dataQueryProfilePatchMergeModeDraft, setDataQueryProfilePatchMergeModeDraft] = useState<'merge' | 'replace'>('merge')
   const [dataQueryProfilePatchOpsDraft, setDataQueryProfilePatchOpsDraft] = useState<DataQueryProfilePatchOperation[]>([])
+  const [dataQueryWorkflowMapperEnabledDraft, setDataQueryWorkflowMapperEnabledDraft] = useState(false)
+  const [dataQueryWorkflowMapperWorkflowNodeIdDraft, setDataQueryWorkflowMapperWorkflowNodeIdDraft] = useState('')
+  const [dataQueryWorkflowMapperQueryUniqueIdFieldDraft, setDataQueryWorkflowMapperQueryUniqueIdFieldDraft] = useState('')
+  const [dataQueryWorkflowMapperWorkflowUniqueIdFieldDraft, setDataQueryWorkflowMapperWorkflowUniqueIdFieldDraft] = useState('')
+  const [dataQueryWorkflowMapperVariableDraft, setDataQueryWorkflowMapperVariableDraft] = useState('')
+  const [dataQueryWorkflowMapperResumePolicyDraft, setDataQueryWorkflowMapperResumePolicyDraft] = useState<'waiting_only' | 'safe_non_terminal'>('waiting_only')
+  const [dataQueryWorkflowMapperTerminalPolicyDraft, setDataQueryWorkflowMapperTerminalPolicyDraft] = useState<'skip' | 'update_only' | 'retry'>('skip')
+  const [dataQueryWorkflowMapperParentCandidates, setDataQueryWorkflowMapperParentCandidates] = useState<Array<{
+    id: string
+    label: string
+    uniqueIdField: string
+    variables: string[]
+  }>>([])
   const [dataQueryActiveRuleId, setDataQueryActiveRuleId] = useState<string | null>(null)
   const [dataQueryManualFieldPath, setDataQueryManualFieldPath] = useState('')
   const [dataQueryFieldSearchQuery, setDataQueryFieldSearchQuery] = useState('')
@@ -10063,6 +10083,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setDataQueryTreeExpandedKeys([])
     setDataQueryCompactView(true)
     setDataQueryShowQuickPicker(false)
+    setDataQueryWorkflowMapperEnabledDraft(false)
+    setDataQueryWorkflowMapperWorkflowNodeIdDraft('')
+    setDataQueryWorkflowMapperQueryUniqueIdFieldDraft('')
+    setDataQueryWorkflowMapperWorkflowUniqueIdFieldDraft('')
+    setDataQueryWorkflowMapperVariableDraft('')
+    setDataQueryWorkflowMapperResumePolicyDraft('waiting_only')
+    setDataQueryWorkflowMapperTerminalPolicyDraft('skip')
+    setDataQueryWorkflowMapperParentCandidates([])
     setDataQueryPreviewSummary({
       ran: false,
       inputRows: 0,
@@ -11508,6 +11536,75 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     [conditionStudioEditingActive, selectedNodeId, nodes, edges, conditionResolvedSourceNodeIds, conditionAllUpstreamSources, isAnyNodeDragging]
   )
   const activePipelineId = String(pipeline?.id || '').trim()
+  const extractWorkflowMapperCandidatesFromNodes = useCallback((sourceNodes: any[]) => {
+    return (Array.isArray(sourceNodes) ? sourceNodes : [])
+      .map((node) => {
+        const id = String(node?.id || '').trim()
+        const data = node?.data || {}
+        const kind = String(data?.nodeType || data?.type || '').trim().toLowerCase()
+        const cfg = (
+          data?.config && typeof data.config === 'object'
+            ? data.config
+            : {}
+        ) as Record<string, unknown>
+        if (!id || kind !== 'business_workflow') return null
+        const studio = cfg.blw_studio_config && typeof cfg.blw_studio_config === 'object'
+          ? cfg.blw_studio_config as Record<string, unknown>
+          : {}
+        const rawVariables = Array.isArray(studio.instanceVariables)
+          ? studio.instanceVariables
+          : Array.isArray(cfg.blw_instance_variables)
+            ? cfg.blw_instance_variables
+            : []
+        const variables = uniqueFieldNames(rawVariables
+          .map((item: any) => String(item?.name || item || '').trim())
+          .filter(Boolean))
+        const uniqueIdField = String(
+          cfg.workflow_unique_id_field
+          || studio.uniqueIdField
+          || cfg.uniqueIdField
+          || '',
+        ).trim()
+        return {
+          id,
+          label: String(data?.label || data?.definition?.label || id),
+          uniqueIdField,
+          variables,
+        }
+      })
+      .filter(Boolean) as Array<{ id: string; label: string; uniqueIdField: string; variables: string[] }>
+  }, [])
+
+  useEffect(() => {
+    if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform' || !activePipelineId) {
+      setDataQueryWorkflowMapperParentCandidates([])
+      return
+    }
+    let cancelled = false
+    const currentCanvasCandidates = extractWorkflowMapperCandidatesFromNodes(nodes)
+    if (currentCanvasCandidates.length > 0) {
+      setDataQueryWorkflowMapperParentCandidates([])
+      return
+    }
+    api.getPipeline(activePipelineId)
+      .then((pipelineData: any) => {
+        if (cancelled) return
+        const parentNodes = Array.isArray(pipelineData?.nodes) ? pipelineData.nodes : []
+        setDataQueryWorkflowMapperParentCandidates(extractWorkflowMapperCandidatesFromNodes(parentNodes))
+      })
+      .catch(() => {
+        if (!cancelled) setDataQueryWorkflowMapperParentCandidates([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [
+    dataQueryStudioOpen,
+    nodeType,
+    activePipelineId,
+    nodes,
+    extractWorkflowMapperCandidatesFromNodes,
+  ])
   const gatewayAllUpstreamSources = useMemo(
     () => {
       if (nodeType !== 'api_gateway' || !selectedNodeId) return []
@@ -13666,8 +13763,31 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       embedded_workflow_enabled: true,
       workflow_tracking_enabled: blwConfig.enabled,
       workflow_tracking_mode: blwConfig.trackingMode,
+      workflow_execution_mode: blwConfig.executionMode,
+      invoke_mode: blwConfig.invokeMode,
+      max_instances: blwConfig.maxInstances,
+      wait_for_completion: blwConfig.waitForCompletion,
+      completion_timeout_seconds: blwConfig.completionTimeoutSeconds,
+      include_input_payload: blwConfig.includeInputPayload,
       workflow_tracking_table: blwConfig.trackerTable,
       workflow_unique_id_field: blwConfig.uniqueIdField,
+      workflow_instance_scope: blwConfig.instanceScope,
+      workflow_instance_date_field: blwConfig.instanceDateField,
+      workflow_instance_range_start: blwConfig.instanceRangeStart,
+      workflow_instance_range_end: blwConfig.instanceRangeEnd,
+      workflow_existing_instance_policy: blwConfig.existingInstancePolicy,
+      workflow_terminal_instance_policy: blwConfig.terminalInstancePolicy,
+      workflow_oracle_host: blwConfig.oracleHost,
+      workflow_oracle_port: blwConfig.oraclePort,
+      workflow_oracle_service_name: blwConfig.oracleServiceName,
+      workflow_oracle_sid: blwConfig.oracleSid,
+      workflow_oracle_dsn: blwConfig.oracleDsn,
+      workflow_oracle_user: blwConfig.oracleUser,
+      workflow_oracle_password: blwConfig.oraclePassword,
+      workflow_oracle_schema: blwConfig.oracleSchema,
+      profile_store: blwConfig.profileStore,
+      profile_namespace: blwConfig.profileNamespace,
+      custom_variables_json: blwConfig.customVariablesJson,
       workflow_parallel_enabled: blwConfig.parallelEnabled,
       workflow_max_parallel_branches: blwConfig.maxParallelBranches,
       workflow_max_iterations: blwConfig.maxIterations,
@@ -13686,8 +13806,31 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       embedded_workflow_enabled: true,
       workflow_tracking_enabled: blwConfig.enabled,
       workflow_tracking_mode: blwConfig.trackingMode,
+      workflow_execution_mode: blwConfig.executionMode,
+      invoke_mode: blwConfig.invokeMode,
+      max_instances: blwConfig.maxInstances,
+      wait_for_completion: blwConfig.waitForCompletion,
+      completion_timeout_seconds: blwConfig.completionTimeoutSeconds,
+      include_input_payload: blwConfig.includeInputPayload,
       workflow_tracking_table: blwConfig.trackerTable,
       workflow_unique_id_field: blwConfig.uniqueIdField,
+      workflow_instance_scope: blwConfig.instanceScope,
+      workflow_instance_date_field: blwConfig.instanceDateField,
+      workflow_instance_range_start: blwConfig.instanceRangeStart,
+      workflow_instance_range_end: blwConfig.instanceRangeEnd,
+      workflow_existing_instance_policy: blwConfig.existingInstancePolicy,
+      workflow_terminal_instance_policy: blwConfig.terminalInstancePolicy,
+      workflow_oracle_host: blwConfig.oracleHost,
+      workflow_oracle_port: blwConfig.oraclePort,
+      workflow_oracle_service_name: blwConfig.oracleServiceName,
+      workflow_oracle_sid: blwConfig.oracleSid,
+      workflow_oracle_dsn: blwConfig.oracleDsn,
+      workflow_oracle_user: blwConfig.oracleUser,
+      workflow_oracle_password: blwConfig.oraclePassword,
+      workflow_oracle_schema: blwConfig.oracleSchema,
+      profile_store: blwConfig.profileStore,
+      profile_namespace: blwConfig.profileNamespace,
+      custom_variables_json: blwConfig.customVariablesJson,
       workflow_parallel_enabled: blwConfig.parallelEnabled,
       workflow_max_parallel_branches: blwConfig.maxParallelBranches,
       workflow_max_iterations: blwConfig.maxIterations,
@@ -14685,6 +14828,37 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     dataQueryProfilePatchValueConfigured,
     dataQueryProfilePatchMergeModeConfigured,
   ])
+  const dataQueryWorkflowMapperEnabledConfigured = useMemo(
+    () => parseBoolLike(nodeConfig.workflow_instance_mapper_enabled, false),
+    [nodeConfig.workflow_instance_mapper_enabled],
+  )
+  const dataQueryWorkflowMapperWorkflowNodeIdConfigured = useMemo(
+    () => String(nodeConfig.workflow_instance_mapper_workflow_node_id || '').trim(),
+    [nodeConfig.workflow_instance_mapper_workflow_node_id],
+  )
+  const dataQueryWorkflowMapperQueryUniqueIdFieldConfigured = useMemo(
+    () => String(nodeConfig.workflow_instance_mapper_query_unique_id_field || '').trim(),
+    [nodeConfig.workflow_instance_mapper_query_unique_id_field],
+  )
+  const dataQueryWorkflowMapperWorkflowUniqueIdFieldConfigured = useMemo(
+    () => String(nodeConfig.workflow_instance_mapper_workflow_unique_id_field || '').trim(),
+    [nodeConfig.workflow_instance_mapper_workflow_unique_id_field],
+  )
+  const dataQueryWorkflowMapperVariableConfigured = useMemo(
+    () => String(nodeConfig.workflow_instance_mapper_variable || '').trim(),
+    [nodeConfig.workflow_instance_mapper_variable],
+  )
+  const dataQueryWorkflowMapperResumePolicyConfigured = useMemo<'waiting_only' | 'safe_non_terminal'>(
+    () => String(nodeConfig.workflow_instance_mapper_resume_policy || '').trim().toLowerCase() === 'safe_non_terminal' ? 'safe_non_terminal' : 'waiting_only',
+    [nodeConfig.workflow_instance_mapper_resume_policy],
+  )
+  const dataQueryWorkflowMapperTerminalPolicyConfigured = useMemo<'skip' | 'update_only' | 'retry'>(
+    () => {
+      const raw = String(nodeConfig.workflow_instance_mapper_terminal_policy || '').trim().toLowerCase()
+      return raw === 'update_only' ? 'update_only' : raw === 'retry' ? 'retry' : 'skip'
+    },
+    [nodeConfig.workflow_instance_mapper_terminal_policy],
+  )
   const dataQueryUpstreamCandidateNodes = useMemo(
     () => {
       if (nodeType !== 'profile_query_transform' || !selectedNodeId) return [] as Array<{
@@ -14877,6 +15051,40 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     },
     [dataQueryProfilePatchIsDirectLmdbSource, dataQueryProfilePatchStorageDraft],
   )
+  const dataQueryWorkflowMapperCandidateNodes = useMemo(
+    () => {
+      if (nodeType !== 'profile_query_transform') return [] as Array<{
+        id: string
+        label: string
+        uniqueIdField: string
+        variables: string[]
+      }>
+      const currentCanvasCandidates = extractWorkflowMapperCandidatesFromNodes(nodes)
+      const merged = new Map<string, { id: string; label: string; uniqueIdField: string; variables: string[] }>()
+      ;[...currentCanvasCandidates, ...dataQueryWorkflowMapperParentCandidates].forEach((item) => {
+        const id = String(item?.id || '').trim()
+        if (!id || merged.has(id)) return
+        merged.set(id, item)
+      })
+      return Array.from(merged.values())
+    },
+    [nodeType, nodes, dataQueryWorkflowMapperParentCandidates, extractWorkflowMapperCandidatesFromNodes],
+  )
+  const dataQueryWorkflowMapperWorkflowOptions = useMemo(
+    () => dataQueryWorkflowMapperCandidateNodes.map((item) => ({
+      value: item.id,
+      label: `${item.label}${item.uniqueIdField ? ` (${item.uniqueIdField})` : ''}`,
+    })),
+    [dataQueryWorkflowMapperCandidateNodes],
+  )
+  const dataQueryWorkflowMapperSelectedWorkflow = useMemo(
+    () => dataQueryWorkflowMapperCandidateNodes.find((item) => item.id === String(dataQueryWorkflowMapperWorkflowNodeIdDraft || '').trim()) || null,
+    [dataQueryWorkflowMapperCandidateNodes, dataQueryWorkflowMapperWorkflowNodeIdDraft],
+  )
+  const dataQueryWorkflowMapperVariableOptions = useMemo(
+    () => (dataQueryWorkflowMapperSelectedWorkflow?.variables || []).map((value) => ({ value, label: value })),
+    [dataQueryWorkflowMapperSelectedWorkflow],
+  )
   const dataQueryFieldOptions = useMemo(
     () => filterUserFacingFieldNames([
       ...mapInputFieldOptions,
@@ -14885,6 +15093,23 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       ...dataQueryRemoteFieldHints,
     ].map((field) => normalizeDataQueryPickerPath(field))),
     [mapInputFieldOptions, upstreamReferenceFields, upstreamPreviewReferenceFields, dataQueryRemoteFieldHints]
+  )
+  const dataQueryWorkflowMapperWorkflowUniqueIdOptions = useMemo(
+    () => uniqueFieldNames([
+      dataQueryWorkflowMapperSelectedWorkflow?.uniqueIdField || '',
+      'customer_account',
+      'customer_id',
+      'account',
+      'account_no',
+      'account_number',
+      'entity',
+      'entity_token',
+      'TRANSACTIONID',
+      ...dataQueryFieldOptions,
+    ])
+      .filter(Boolean)
+      .map((value) => ({ value, label: value })),
+    [dataQueryWorkflowMapperSelectedWorkflow, dataQueryFieldOptions],
   )
   const dataQueryFieldOptionsLimited = useMemo(
     () => dataQueryFieldOptions.slice(0, DATA_QUERY_FIELD_TREE_FIELD_LIMIT),
@@ -17373,6 +17598,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     profile_patch_value: dataQueryProfilePatchValueDraft,
     profile_patch_target_path: dataQueryProfilePatchTargetPathDraft,
     profile_patch_merge_mode: dataQueryProfilePatchMergeModeDraft,
+    workflow_instance_mapper_enabled: dataQueryWorkflowMapperEnabledDraft,
+    workflow_instance_mapper_workflow_node_id: dataQueryWorkflowMapperWorkflowNodeIdDraft,
+    workflow_instance_mapper_query_unique_id_field: dataQueryWorkflowMapperQueryUniqueIdFieldDraft,
+    workflow_instance_mapper_workflow_unique_id_field: dataQueryWorkflowMapperWorkflowUniqueIdFieldDraft,
+    workflow_instance_mapper_variable: dataQueryWorkflowMapperVariableDraft,
+    workflow_instance_mapper_resume_policy: dataQueryWorkflowMapperResumePolicyDraft,
+    workflow_instance_mapper_terminal_policy: dataQueryWorkflowMapperTerminalPolicyDraft,
   }), [
     dataQueryModeDraft,
     dataQueryCriteriaDraft,
@@ -17400,6 +17632,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     dataQueryProfilePatchValueDraft,
     dataQueryProfilePatchTargetPathDraft,
     dataQueryProfilePatchMergeModeDraft,
+    dataQueryWorkflowMapperEnabledDraft,
+    dataQueryWorkflowMapperWorkflowNodeIdDraft,
+    dataQueryWorkflowMapperQueryUniqueIdFieldDraft,
+    dataQueryWorkflowMapperWorkflowUniqueIdFieldDraft,
+    dataQueryWorkflowMapperVariableDraft,
+    dataQueryWorkflowMapperResumePolicyDraft,
+    dataQueryWorkflowMapperTerminalPolicyDraft,
   ])
   const dataQueryCriteriaPayloadText = useMemo(
     () => safeJsonText({
@@ -17426,6 +17665,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       profile_patch_value: dataQueryProfilePatchValueDraft,
       profile_patch_target_path: dataQueryProfilePatchTargetPathDraft,
       profile_patch_merge_mode: dataQueryProfilePatchMergeModeDraft,
+      workflow_instance_mapper_enabled: dataQueryWorkflowMapperEnabledDraft,
+      workflow_instance_mapper_workflow_node_id: dataQueryWorkflowMapperWorkflowNodeIdDraft,
+      workflow_instance_mapper_query_unique_id_field: dataQueryWorkflowMapperQueryUniqueIdFieldDraft,
+      workflow_instance_mapper_workflow_unique_id_field: dataQueryWorkflowMapperWorkflowUniqueIdFieldDraft,
+      workflow_instance_mapper_variable: dataQueryWorkflowMapperVariableDraft,
+      workflow_instance_mapper_resume_policy: dataQueryWorkflowMapperResumePolicyDraft,
+      workflow_instance_mapper_terminal_policy: dataQueryWorkflowMapperTerminalPolicyDraft,
     }, '{}'),
     [
       dataQueryModeDraft,
@@ -17451,6 +17697,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       dataQueryProfilePatchValueDraft,
       dataQueryProfilePatchTargetPathDraft,
       dataQueryProfilePatchMergeModeDraft,
+      dataQueryWorkflowMapperEnabledDraft,
+      dataQueryWorkflowMapperWorkflowNodeIdDraft,
+      dataQueryWorkflowMapperQueryUniqueIdFieldDraft,
+      dataQueryWorkflowMapperWorkflowUniqueIdFieldDraft,
+      dataQueryWorkflowMapperVariableDraft,
+      dataQueryWorkflowMapperResumePolicyDraft,
+      dataQueryWorkflowMapperTerminalPolicyDraft,
     ]
   )
   const dataQueryStudioHasUnsavedChanges = useMemo(() => {
@@ -17503,6 +17756,31 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     dataQueryProfilePatchEnabledDraft,
     dataQueryProfilePatchNodeIdDraft,
     dataQueryProfilePatchNodeOptions,
+  ])
+  useEffect(() => {
+    if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform') return
+    if (!dataQueryWorkflowMapperEnabledDraft) return
+    const selected = String(dataQueryWorkflowMapperWorkflowNodeIdDraft || '').trim()
+    const selectedWorkflow = dataQueryWorkflowMapperCandidateNodes.find((item) => item.id === selected) || null
+    const fallbackWorkflow = selectedWorkflow || dataQueryWorkflowMapperCandidateNodes[0] || null
+    if (fallbackWorkflow && fallbackWorkflow.id !== selected) {
+      setDataQueryWorkflowMapperWorkflowNodeIdDraft(fallbackWorkflow.id)
+    }
+    const effectiveWorkflow = fallbackWorkflow
+    if (effectiveWorkflow?.uniqueIdField && !String(dataQueryWorkflowMapperWorkflowUniqueIdFieldDraft || '').trim()) {
+      setDataQueryWorkflowMapperWorkflowUniqueIdFieldDraft(effectiveWorkflow.uniqueIdField)
+    }
+    if (effectiveWorkflow?.variables?.length && !String(dataQueryWorkflowMapperVariableDraft || '').trim()) {
+      setDataQueryWorkflowMapperVariableDraft(effectiveWorkflow.variables[0])
+    }
+  }, [
+    dataQueryStudioOpen,
+    nodeType,
+    dataQueryWorkflowMapperEnabledDraft,
+    dataQueryWorkflowMapperWorkflowNodeIdDraft,
+    dataQueryWorkflowMapperWorkflowUniqueIdFieldDraft,
+    dataQueryWorkflowMapperVariableDraft,
+    dataQueryWorkflowMapperCandidateNodes,
   ])
   const detectDataQuerySourceFieldOptions = useCallback(async () => {
     if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform') return
@@ -20109,6 +20387,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       profile_patch_value: String(firstPatchOp?.value ?? ''),
       profile_patch_target_path: String(firstPatchOp?.target_path || '').trim(),
       profile_patch_merge_mode: String(firstPatchOp?.merge_mode || 'merge').trim().toLowerCase() === 'replace' ? 'replace' : 'merge',
+      workflow_instance_mapper_enabled: Boolean(dataQueryWorkflowMapperEnabledDraft),
+      workflow_instance_mapper_workflow_node_id: String(dataQueryWorkflowMapperWorkflowNodeIdDraft || '').trim(),
+      workflow_instance_mapper_query_unique_id_field: String(dataQueryWorkflowMapperQueryUniqueIdFieldDraft || '').trim(),
+      workflow_instance_mapper_workflow_unique_id_field: String(dataQueryWorkflowMapperWorkflowUniqueIdFieldDraft || dataQueryWorkflowMapperSelectedWorkflow?.uniqueIdField || '').trim(),
+      workflow_instance_mapper_variable: String(dataQueryWorkflowMapperVariableDraft || '').trim(),
+      workflow_instance_mapper_resume_policy: dataQueryWorkflowMapperResumePolicyDraft,
+      workflow_instance_mapper_terminal_policy: dataQueryWorkflowMapperTerminalPolicyDraft,
     })
 
     notification.success({
@@ -20147,6 +20432,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     dataQueryProfilePatchValueDraft,
     dataQueryProfilePatchTargetPathDraft,
     dataQueryProfilePatchMergeModeDraft,
+    dataQueryWorkflowMapperEnabledDraft,
+    dataQueryWorkflowMapperWorkflowNodeIdDraft,
+    dataQueryWorkflowMapperQueryUniqueIdFieldDraft,
+    dataQueryWorkflowMapperWorkflowUniqueIdFieldDraft,
+    dataQueryWorkflowMapperVariableDraft,
+    dataQueryWorkflowMapperResumePolicyDraft,
+    dataQueryWorkflowMapperTerminalPolicyDraft,
+    dataQueryWorkflowMapperSelectedWorkflow,
     updateNodeConfig,
   ])
 
@@ -20186,6 +20479,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const profilePatchValue = String(profilePatchLegacy?.value || dataQueryProfilePatchValueConfigured || '')
     const profilePatchTargetPath = String(profilePatchLegacy?.targetPath || dataQueryProfilePatchTargetPathConfigured || '')
     const profilePatchMergeMode: 'merge' | 'replace' = String(profilePatchLegacy?.mergeMode || dataQueryProfilePatchMergeModeConfigured || 'merge').trim().toLowerCase() === 'replace' ? 'replace' : 'merge'
+    const workflowMapperEnabled = dataQueryWorkflowMapperEnabledConfigured
+    const workflowMapperWorkflowNodeId = dataQueryWorkflowMapperWorkflowNodeIdConfigured
+    const workflowMapperQueryUniqueIdField = dataQueryWorkflowMapperQueryUniqueIdFieldConfigured
+    const workflowMapperWorkflowUniqueIdField = dataQueryWorkflowMapperWorkflowUniqueIdFieldConfigured
+    const workflowMapperVariable = dataQueryWorkflowMapperVariableConfigured
+    const workflowMapperResumePolicy = dataQueryWorkflowMapperResumePolicyConfigured
+    const workflowMapperTerminalPolicy = dataQueryWorkflowMapperTerminalPolicyConfigured
 
     setDataQueryCriteriaDraft(criteria)
     setDataQueryModeDraft(queryMode)
@@ -20215,6 +20515,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setDataQueryProfilePatchValueDraft(profilePatchValue)
     setDataQueryProfilePatchTargetPathDraft(profilePatchTargetPath)
     setDataQueryProfilePatchMergeModeDraft(profilePatchMergeMode)
+    setDataQueryWorkflowMapperEnabledDraft(workflowMapperEnabled)
+    setDataQueryWorkflowMapperWorkflowNodeIdDraft(workflowMapperWorkflowNodeId)
+    setDataQueryWorkflowMapperQueryUniqueIdFieldDraft(workflowMapperQueryUniqueIdField)
+    setDataQueryWorkflowMapperWorkflowUniqueIdFieldDraft(workflowMapperWorkflowUniqueIdField)
+    setDataQueryWorkflowMapperVariableDraft(workflowMapperVariable)
+    setDataQueryWorkflowMapperResumePolicyDraft(workflowMapperResumePolicy)
+    setDataQueryWorkflowMapperTerminalPolicyDraft(workflowMapperTerminalPolicy)
     setDataQueryActiveRuleId(String(criteria[0]?.id || ''))
     setDataQueryManualFieldPath('')
     setDataQueryFieldSearchQuery('')
@@ -20262,6 +20569,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       profile_patch_value: profilePatchValue,
       profile_patch_target_path: profilePatchTargetPath,
       profile_patch_merge_mode: profilePatchMergeMode,
+      workflow_instance_mapper_enabled: workflowMapperEnabled,
+      workflow_instance_mapper_workflow_node_id: workflowMapperWorkflowNodeId,
+      workflow_instance_mapper_query_unique_id_field: workflowMapperQueryUniqueIdField,
+      workflow_instance_mapper_workflow_unique_id_field: workflowMapperWorkflowUniqueIdField,
+      workflow_instance_mapper_variable: workflowMapperVariable,
+      workflow_instance_mapper_resume_policy: workflowMapperResumePolicy,
+      workflow_instance_mapper_terminal_policy: workflowMapperTerminalPolicy,
     })
     setDataQueryStudioOpen(true)
   }, [
@@ -20293,6 +20607,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     dataQueryProfilePatchValueConfigured,
     dataQueryProfilePatchTargetPathConfigured,
     dataQueryProfilePatchMergeModeConfigured,
+    dataQueryWorkflowMapperEnabledConfigured,
+    dataQueryWorkflowMapperWorkflowNodeIdConfigured,
+    dataQueryWorkflowMapperQueryUniqueIdFieldConfigured,
+    dataQueryWorkflowMapperWorkflowUniqueIdFieldConfigured,
+    dataQueryWorkflowMapperVariableConfigured,
+    dataQueryWorkflowMapperResumePolicyConfigured,
+    dataQueryWorkflowMapperTerminalPolicyConfigured,
   ])
 
   const requestCloseDataQueryStudio = useCallback(() => {
@@ -27844,7 +28165,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     if (nodeType === 'oracle_destination' && (f.name === 'table' || f.name === 'if_exists')) {
       return false
     }
-    if (nodeType === 'business_workflow' && f.name === 'workflow_id') {
+    if (nodeType === 'business_workflow') {
       return false
     }
     if (nodeType === 'file_viewer') {
@@ -34591,6 +34912,144 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 )
               })}
             </div>
+          </div>
+
+          <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 10, padding: dataQueryCompactView ? 6 : 8, background: 'var(--app-card-bg)', display: 'grid', gap: dataQueryCompactView ? 6 : 8 }}>
+            <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+              <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Workflow Instance Mapper</Text>
+              <Space size={8}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                  State-aware resume
+                </Text>
+                <Switch
+                  size="small"
+                  checked={Boolean(dataQueryWorkflowMapperEnabledDraft)}
+                  onChange={(checked) => setDataQueryWorkflowMapperEnabledDraft(Boolean(checked))}
+                />
+              </Space>
+            </Space>
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+              Stores each Data Query output row into the matching BLW workflow instance variable, then resumes that instance when it is waiting or safe to continue.
+            </Text>
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(220px,1fr) minmax(180px,0.75fr)', gap: 10, alignItems: 'start' }}>
+              <div style={{ minWidth: 0, display: 'grid', gap: 4 }}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Workflow</Text>
+                <Select
+                  size="small"
+                  showSearch
+                  allowClear
+                  value={dataQueryWorkflowMapperWorkflowNodeIdDraft || undefined}
+                  onChange={(value) => {
+                    const next = String(value || '').trim()
+                    setDataQueryWorkflowMapperWorkflowNodeIdDraft(next)
+                    const selected = dataQueryWorkflowMapperCandidateNodes.find((item) => item.id === next)
+                    if (selected?.uniqueIdField && !String(dataQueryWorkflowMapperWorkflowUniqueIdFieldDraft || '').trim()) {
+                      setDataQueryWorkflowMapperWorkflowUniqueIdFieldDraft(selected.uniqueIdField)
+                    }
+                    if (selected?.variables?.length && !String(dataQueryWorkflowMapperVariableDraft || '').trim()) {
+                      setDataQueryWorkflowMapperVariableDraft(selected.variables[0])
+                    }
+                  }}
+                  options={dataQueryWorkflowMapperWorkflowOptions}
+                  placeholder="Select BLW workflow"
+                  style={{ width: '100%' }}
+                  disabled={!dataQueryWorkflowMapperEnabledDraft}
+                  filterOption={(inputValue, option) => String(option?.label || option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                />
+              </div>
+              <div style={{ minWidth: 0, display: 'grid', gap: 4 }}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Instance variable</Text>
+                <AutoComplete
+                  value={dataQueryWorkflowMapperVariableDraft}
+                  options={dataQueryWorkflowMapperVariableOptions}
+                  onChange={(value) => setDataQueryWorkflowMapperVariableDraft(String(value || ''))}
+                  filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                  style={{ width: '100%' }}
+                >
+                  <Input
+                    size="small"
+                    placeholder="example: WF_STATUS"
+                    disabled={!dataQueryWorkflowMapperEnabledDraft}
+                  />
+                </AutoComplete>
+              </div>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px,1fr) minmax(180px,1fr)', gap: 10, alignItems: 'start' }}>
+              <div style={{ minWidth: 0, display: 'grid', gap: 4 }}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Query Studio unique id field</Text>
+                <AutoComplete
+                  value={dataQueryWorkflowMapperQueryUniqueIdFieldDraft}
+                  options={dataQueryFieldAutoCompleteOptions}
+                  onChange={(value) => setDataQueryWorkflowMapperQueryUniqueIdFieldDraft(String(value || ''))}
+                  filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                  style={{ width: '100%' }}
+                >
+                  <Input
+                    size="small"
+                    placeholder="example: customer_account"
+                    disabled={!dataQueryWorkflowMapperEnabledDraft}
+                  />
+                </AutoComplete>
+              </div>
+              <div style={{ minWidth: 0, display: 'grid', gap: 4 }}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Workflow unique id field</Text>
+                <AutoComplete
+                  value={dataQueryWorkflowMapperWorkflowUniqueIdFieldDraft}
+                  options={dataQueryWorkflowMapperWorkflowUniqueIdOptions}
+                  onChange={(value) => setDataQueryWorkflowMapperWorkflowUniqueIdFieldDraft(String(value || ''))}
+                  filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(String(inputValue || '').toLowerCase())}
+                  style={{ width: '100%' }}
+                >
+                  <Input
+                    size="small"
+                    placeholder={dataQueryWorkflowMapperSelectedWorkflow?.uniqueIdField || 'example: customer_account'}
+                    disabled={!dataQueryWorkflowMapperEnabledDraft}
+                  />
+                </AutoComplete>
+              </div>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px,1fr) minmax(180px,1fr)', gap: 10, alignItems: 'start' }}>
+              <div style={{ minWidth: 0, display: 'grid', gap: 4 }}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Resume policy</Text>
+                <Select
+                  size="small"
+                  value={dataQueryWorkflowMapperResumePolicyDraft}
+                  onChange={(value) => setDataQueryWorkflowMapperResumePolicyDraft(String(value || '').trim().toLowerCase() === 'safe_non_terminal' ? 'safe_non_terminal' : 'waiting_only')}
+                  options={[
+                    { value: 'waiting_only', label: 'Waiting only' },
+                    { value: 'safe_non_terminal', label: 'Safe non-terminal' },
+                  ]}
+                  style={{ width: '100%' }}
+                  disabled={!dataQueryWorkflowMapperEnabledDraft}
+                />
+              </div>
+              <div style={{ minWidth: 0, display: 'grid', gap: 4 }}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Terminal instances</Text>
+                <Select
+                  size="small"
+                  value={dataQueryWorkflowMapperTerminalPolicyDraft}
+                  onChange={(value) => {
+                    const raw = String(value || '').trim().toLowerCase()
+                    setDataQueryWorkflowMapperTerminalPolicyDraft(raw === 'update_only' ? 'update_only' : raw === 'retry' ? 'retry' : 'skip')
+                  }}
+                  options={[
+                    { value: 'skip', label: 'Skip terminal runs' },
+                    { value: 'update_only', label: 'Update context only' },
+                    { value: 'retry', label: 'Re-run terminal runs' },
+                  ]}
+                  style={{ width: '100%' }}
+                  disabled={!dataQueryWorkflowMapperEnabledDraft}
+                />
+              </div>
+            </div>
+            <Space size={6} wrap>
+              <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9', marginInlineEnd: 0 }}>
+                workflows: {dataQueryWorkflowMapperCandidateNodes.length}
+              </Tag>
+              <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e', marginInlineEnd: 0 }}>
+                variables: {dataQueryWorkflowMapperSelectedWorkflow?.variables?.length || 0}
+              </Tag>
+            </Space>
           </div>
         </div>
 
