@@ -38,6 +38,7 @@ from email.utils import make_msgid
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -318,6 +319,7 @@ threadsafe_ws_manager = ThreadSafeWebSocketProxy()
 # ─── SCHEDULER ────────────────────────────────────────────────────────────────
 
 SCHEDULE_JOB_PREFIX = "pipeline_schedule:"
+DATA_OPS_SYNC_JOB_PREFIX = "data_ops_mapper_sync:"
 SCHEDULE_PRESET_TO_CRON = {
     "every_1_min": "* * * * *",
     "every_5_min": "*/5 * * * *",
@@ -2773,6 +2775,118 @@ class SourceFieldOptionsRequest(BaseModel):
     preview_compact: bool = True
     preview_max_cell_chars: int = 2000
     preview_max_collection_items: int = 64
+
+
+class DataOpsOracleCatalogRequest(BaseModel):
+    config: dict = {}
+    schema_name: Optional[str] = Field(default=None, alias="schema")
+    object_name: Optional[str] = Field(default=None, alias="object")
+    search: Optional[str] = None
+    limit: int = 500
+
+
+class DataOpsOracleObjectDataRequest(BaseModel):
+    config: dict = {}
+    schema_name: Optional[str] = Field(default=None, alias="schema")
+    object_name: str = Field(alias="object")
+    limit: int = 100
+
+
+class DataOpsOracleExecuteRequest(BaseModel):
+    config: dict = {}
+    sql: str
+    confirm: bool = False
+
+
+class DataOpsOracleQueryPreviewRequest(BaseModel):
+    config: dict = {}
+    sql: str
+    limit: int = 100
+
+
+class DataOpsOracleSyncScheduleRequest(BaseModel):
+    config: dict = {}
+    sql: str = ""
+    job_id: str
+    enabled: bool = False
+    deploy_enabled: bool = False
+    schedule_type: str = "interval"
+    interval_minutes: int = 60
+    cron: Optional[str] = None
+    timezone: Optional[str] = None
+    max_instances: int = 1
+    misfire_policy: str = "skip"
+
+
+class DataOpsConnectionTestRequest(BaseModel):
+    connection: dict = {}
+
+
+def _data_ops_oracle_config(raw_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    cfg = dict(raw_config or {})
+    return {
+        "host": cfg.get("oracle_host") or cfg.get("host") or _os.getenv("BLW_ORACLE_HOST") or "localhost",
+        "port": cfg.get("oracle_port") or cfg.get("port") or _os.getenv("BLW_ORACLE_PORT") or 1521,
+        "service_name": cfg.get("oracle_service_name") or cfg.get("service_name") or _os.getenv("BLW_ORACLE_SERVICE_NAME") or _os.getenv("BLW_ORACLE_DATABASE"),
+        "sid": cfg.get("oracle_sid") or cfg.get("sid") or _os.getenv("BLW_ORACLE_SID"),
+        "dsn": cfg.get("oracle_dsn") or cfg.get("dsn") or _os.getenv("BLW_ORACLE_DSN"),
+        "user": cfg.get("oracle_user") or cfg.get("user") or _os.getenv("BLW_ORACLE_USER") or "",
+        "password": cfg.get("oracle_password") or cfg.get("password") or _os.getenv("BLW_ORACLE_PASSWORD") or "",
+        "schema": cfg.get("oracle_schema") or cfg.get("schema") or _os.getenv("BLW_ORACLE_SCHEMA") or "",
+    }
+
+
+def _data_ops_oracle_connect(raw_config: Optional[Dict[str, Any]]):
+    try:
+        import oracledb  # type: ignore  # noqa: F401
+    except Exception as exc:
+        raise HTTPException(400, "Oracle object management requires python-oracledb.") from exc
+    oracle_cfg = _data_ops_oracle_config(raw_config)
+    dsn = str(oracle_cfg.get("dsn") or "").strip() or etl_engine._build_oracle_dsn(oracle_cfg)  # pylint: disable=protected-access
+    return oracledb.connect(
+        user=str(oracle_cfg.get("user") or "").strip(),
+        password=str(oracle_cfg.get("password") or ""),
+        dsn=dsn,
+    )
+
+
+def _data_ops_validate_oracle_identifier(value: str, label: str) -> str:
+    token = str(value or "").strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9_$#]*", token):
+        raise HTTPException(400, f"Invalid Oracle {label}.")
+    return token
+
+
+def _data_ops_oracle_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if hasattr(value, "read") and callable(getattr(value, "read", None)):
+        try:
+            value = value.read()
+        except Exception:
+            return str(value)
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode("ascii")
+    return value
+
+
+def _data_ops_first_sql_keyword(sql: str) -> str:
+    cleaned = re.sub(r"(?s)/\*.*?\*/", " ", str(sql or ""))
+    cleaned = re.sub(r"(?m)^\s*--.*$", " ", cleaned).strip()
+    match = re.match(r"([A-Za-z]+)", cleaned)
+    return match.group(1).upper() if match else ""
+
+
+def _data_ops_sql_allowed_for_execute(sql: str) -> bool:
+    keyword = _data_ops_first_sql_keyword(sql)
+    return keyword in {
+        "CREATE", "ALTER", "DROP", "TRUNCATE", "COMMENT", "RENAME",
+        "GRANT", "REVOKE", "BEGIN", "DECLARE", "INSERT", "UPDATE", "DELETE", "MERGE",
+    }
 
 
 class LmdbEnvPathOptionsRequest(BaseModel):
@@ -5683,6 +5797,48 @@ def _mlops_run_real_evaluation(
         "sample_predictions": sample_predictions,
         "output_preview": _mlops_sanitize_sample_rows(tabular_rows),
     }
+
+
+def _mlops_resolve_encoded_feature_columns(
+    available_columns: List[str],
+    target_column: Optional[str],
+    selected_fields: List[str],
+) -> List[str]:
+    available = [str(item or "").strip() for item in (available_columns or []) if str(item or "").strip()]
+    available_set = set(available)
+    target = str(target_column or "").strip()
+
+    encoded_by_base: Dict[str, List[str]] = {}
+    for col in available:
+        if "__" not in col:
+            continue
+        base = col.split("__", 1)[0].strip()
+        if not base:
+            continue
+        encoded_by_base.setdefault(base, []).append(col)
+
+    resolved: List[str] = []
+    for raw_field in selected_fields or []:
+        field = str(raw_field or "").strip()
+        if not field or field == target:
+            continue
+
+        if "__" in field:
+            if field in available_set:
+                resolved.append(field)
+            else:
+                # Keep stale explicit encoded fields visible to the existing
+                # availability diagnostic instead of silently dropping them.
+                resolved.append(field)
+            continue
+
+        encoded = [col for col in encoded_by_base.get(field, []) if col != target]
+        if encoded:
+            resolved.extend(encoded)
+        else:
+            resolved.append(field)
+
+    return list(dict.fromkeys(resolved))
 
 
 def _mlops_stage3_path_tokens(path: str) -> List[Any]:
@@ -14807,6 +14963,107 @@ async def execution_websocket(execution_id: str, ws: WebSocket):
 
 # ─── TEMPLATES ────────────────────────────────────────────────────────────────
 
+class RRETemplatePayload(BaseModel):
+    id: Optional[str] = None
+    name: str
+    responsibility: str = ""
+    body: str = ""
+
+
+def _rre_template_to_dict(template: models.Template) -> Dict[str, Any]:
+    node_data = template.nodes if isinstance(template.nodes, dict) else {}
+    return {
+        "id": template.id,
+        "name": template.name,
+        "responsibility": str(node_data.get("responsibility") or template.description or ""),
+        "body": str(node_data.get("body") or ""),
+        "created_at": template.created_at.isoformat() if template.created_at else None,
+    }
+
+
+@app.get("/api/mlops/rre/templates")
+async def list_rre_templates(db: Session = Depends(get_db)):
+    rows = (
+        db.query(models.Template)
+        .filter(models.Template.category == "mlops_rre")
+        .order_by(models.Template.created_at.desc())
+        .all()
+    )
+    return [_rre_template_to_dict(row) for row in rows]
+
+
+@app.post("/api/mlops/rre/templates", status_code=201)
+async def create_rre_template(body: RRETemplatePayload, db: Session = Depends(get_db)):
+    template_id = str(body.id or "").strip() or f"rre_tpl_{uuid.uuid4().hex[:12]}"
+    existing = db.query(models.Template).filter(models.Template.id == template_id).first()
+    if existing:
+        if existing.category != "mlops_rre":
+            raise HTTPException(status_code=409, detail="Template id already exists")
+        existing.name = str(body.name or existing.name or "Untitled Template").strip() or "Untitled Template"
+        existing.description = str(body.responsibility or "").strip()
+        existing.nodes = {
+            "responsibility": str(body.responsibility or "").strip(),
+            "body": str(body.body or ""),
+        }
+        existing.tags = ["mlops", "rre"]
+        db.commit()
+        db.refresh(existing)
+        return _rre_template_to_dict(existing)
+    template = models.Template(
+        id=template_id,
+        name=str(body.name or "Untitled Template").strip() or "Untitled Template",
+        description=str(body.responsibility or "").strip(),
+        category="mlops_rre",
+        nodes={
+            "responsibility": str(body.responsibility or "").strip(),
+            "body": str(body.body or ""),
+        },
+        edges=[],
+        tags=["mlops", "rre"],
+    )
+    db.add(template)
+    db.commit()
+    db.refresh(template)
+    return _rre_template_to_dict(template)
+
+
+@app.put("/api/mlops/rre/templates/{template_id}")
+async def update_rre_template(template_id: str, body: RRETemplatePayload, db: Session = Depends(get_db)):
+    clean_template_id = str(template_id or body.id or "").strip() or f"rre_tpl_{uuid.uuid4().hex[:12]}"
+    template = db.query(models.Template).filter(models.Template.id == clean_template_id).first()
+    if template and template.category != "mlops_rre":
+        raise HTTPException(status_code=409, detail="Template id already exists")
+    if not template:
+        template = models.Template(
+            id=clean_template_id,
+            name=str(body.name or "Untitled Template").strip() or "Untitled Template",
+            description=str(body.responsibility or "").strip(),
+            category="mlops_rre",
+            nodes={},
+            edges=[],
+            tags=["mlops", "rre"],
+        )
+        db.add(template)
+    template.name = str(body.name or template.name or "Untitled Template").strip() or "Untitled Template"
+    template.description = str(body.responsibility or "").strip()
+    template.nodes = {
+        "responsibility": str(body.responsibility or "").strip(),
+        "body": str(body.body or ""),
+    }
+    template.tags = ["mlops", "rre"]
+    db.commit()
+    db.refresh(template)
+    return _rre_template_to_dict(template)
+
+
+@app.delete("/api/mlops/rre/templates/{template_id}", status_code=204)
+async def delete_rre_template(template_id: str, db: Session = Depends(get_db)):
+    template = db.query(models.Template).filter(models.Template.id == template_id).first()
+    if template and template.category == "mlops_rre":
+        db.delete(template)
+        db.commit()
+
+
 @app.get("/api/templates")
 async def list_templates():
     return [
@@ -16269,6 +16526,687 @@ async def detect_source_field_options(body: SourceFieldOptionsRequest):
         "preview_rows": len(preview),
         "has_more": len(normalized_rows) > len(preview),
     }
+
+
+@app.post("/api/data-ops/oracle/catalog")
+async def data_ops_oracle_catalog(body: DataOpsOracleCatalogRequest):
+    cfg = dict(body.config or {})
+    schema_filter = (
+        str(body.schema_name or "").strip().upper()
+        if body.schema_name is not None
+        else str(cfg.get("oracle_schema") or cfg.get("schema") or _os.getenv("BLW_ORACLE_SCHEMA") or "").strip().upper()
+    )
+    object_filter = str(body.object_name or cfg.get("selected_object") or "").strip().upper()
+    search = str(body.search or "").strip().upper()
+    limit = max(1, min(int(body.limit or 500), 2000))
+    conn = None
+    try:
+        conn = _data_ops_oracle_connect(cfg)
+        cur = conn.cursor()
+        cur.execute("SELECT SYS_CONTEXT('USERENV','CURRENT_SCHEMA'), SYS_CONTEXT('USERENV','SESSION_USER') FROM dual")
+        current_schema, session_user = (cur.fetchone() or ("", ""))
+        current_schema = str(current_schema or "").upper()
+        session_user = str(session_user or "").upper()
+
+        owner_where = "AND owner = :owner" if schema_filter else ""
+        object_where = "AND object_name = :object_name" if object_filter else ""
+        search_where = "AND object_name LIKE :search" if search else ""
+        base_params: Dict[str, Any] = {}
+        if schema_filter:
+            base_params["owner"] = schema_filter
+        if search:
+            base_params["search"] = f"%{search}%"
+        object_params: Dict[str, Any] = dict(base_params)
+        if object_filter:
+            object_params["object_name"] = object_filter
+
+        cur.execute(
+            f"""
+            SELECT owner
+            FROM (
+              SELECT owner
+              FROM all_objects
+              WHERE object_type IN ('TABLE','VIEW','MATERIALIZED VIEW','INDEX','SEQUENCE','TRIGGER','SYNONYM','PROCEDURE','FUNCTION','PACKAGE')
+                {owner_where}
+                {search_where}
+              GROUP BY owner
+              ORDER BY CASE WHEN owner = :current_schema THEN 0 WHEN owner = :session_user THEN 1 ELSE 2 END, owner
+            )
+            WHERE ROWNUM <= 500
+            """,
+            {**base_params, "current_schema": current_schema, "session_user": session_user},
+        )
+        schemas = [str(row[0] or "") for row in cur.fetchall()]
+
+        cur.execute(
+            f"""
+            SELECT owner, object_name, object_type, status, created, last_ddl_time
+            FROM (
+              SELECT owner, object_name, object_type, status, created, last_ddl_time
+              FROM all_objects
+              WHERE object_type IN ('TABLE','VIEW','MATERIALIZED VIEW','INDEX','SEQUENCE','TRIGGER','SYNONYM','PROCEDURE','FUNCTION','PACKAGE')
+                {owner_where}
+                {object_where}
+                {search_where}
+              ORDER BY CASE WHEN owner = :current_schema THEN 0 WHEN owner = :session_user THEN 1 ELSE 2 END,
+                       owner,
+                       CASE object_type
+                         WHEN 'TABLE' THEN 0
+                         WHEN 'VIEW' THEN 1
+                         WHEN 'MATERIALIZED VIEW' THEN 2
+                         WHEN 'INDEX' THEN 3
+                         WHEN 'TRIGGER' THEN 4
+                         WHEN 'SEQUENCE' THEN 5
+                         ELSE 9
+                       END,
+                       object_name
+            )
+            WHERE ROWNUM <= :limit
+            """,
+            {**object_params, "limit": limit, "current_schema": current_schema, "session_user": session_user},
+        )
+        objects = [
+            {
+                "schema": str(row[0] or ""),
+                "name": str(row[1] or ""),
+                "type": str(row[2] or ""),
+                "status": str(row[3] or ""),
+                "created": row[4].isoformat() if hasattr(row[4], "isoformat") else str(row[4] or ""),
+                "last_ddl_time": row[5].isoformat() if hasattr(row[5], "isoformat") else str(row[5] or ""),
+            }
+            for row in cur.fetchall()
+        ]
+        selected = objects[0] if objects and not object_filter else next((obj for obj in objects if obj["name"] == object_filter), None)
+        selected_schema = schema_filter or str((selected or {}).get("schema") or current_schema or session_user)
+        selected_object = object_filter or str((selected or {}).get("name") or "")
+        selected_type = str((selected or {}).get("type") or "").upper()
+
+        columns: List[Dict[str, Any]] = []
+        constraints: List[Dict[str, Any]] = []
+        indexes: List[Dict[str, Any]] = []
+        partitions: List[Dict[str, Any]] = []
+        triggers: List[Dict[str, Any]] = []
+        source_text = ""
+        if selected_object:
+            cur.execute(
+                """
+                SELECT column_name, data_type, data_length, data_precision, data_scale, nullable, column_id
+                FROM all_tab_columns
+                WHERE owner = :owner AND table_name = :table_name
+                ORDER BY column_id
+                """,
+                {"owner": selected_schema, "table_name": selected_object},
+            )
+            for row in cur.fetchall():
+                data_type = str(row[1] or "")
+                if data_type in {"VARCHAR2", "CHAR", "NVARCHAR2", "NCHAR"} and row[2]:
+                    data_type = f"{data_type}({int(row[2])})"
+                elif data_type == "NUMBER" and row[3] is not None:
+                    data_type = f"NUMBER({int(row[3])}{',' + str(int(row[4])) if row[4] is not None else ''})"
+                columns.append({
+                    "name": str(row[0] or ""),
+                    "type": data_type,
+                    "nullable": str(row[5] or "Y").upper(),
+                    "position": int(row[6] or 0),
+                })
+
+            cur.execute(
+                """
+                SELECT c.constraint_name, c.constraint_type, c.status, LISTAGG(cc.column_name, ', ') WITHIN GROUP (ORDER BY cc.position) columns
+                FROM all_constraints c
+                LEFT JOIN all_cons_columns cc ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name AND cc.table_name = c.table_name
+                WHERE c.owner = :owner AND c.table_name = :table_name
+                GROUP BY c.constraint_name, c.constraint_type, c.status
+                ORDER BY c.constraint_name
+                """,
+                {"owner": selected_schema, "table_name": selected_object},
+            )
+            constraints = [{"name": str(r[0] or ""), "type": str(r[1] or ""), "status": str(r[2] or ""), "columns": str(r[3] or "")} for r in cur.fetchall()]
+            key_by_column: Dict[str, str] = {}
+            for constraint in constraints:
+                label = {
+                    "P": "PK",
+                    "U": "UK",
+                    "R": "FK",
+                    "C": "CHECK",
+                }.get(str(constraint.get("type") or "").upper(), str(constraint.get("type") or ""))
+                for column_name in str(constraint.get("columns") or "").split(","):
+                    col_key = column_name.strip().upper()
+                    if col_key and label and not key_by_column.get(col_key):
+                        key_by_column[col_key] = label
+            for column in columns:
+                column["key"] = key_by_column.get(str(column.get("name") or "").upper(), "")
+
+            cur.execute(
+                """
+                SELECT i.index_name, i.uniqueness, i.status, LISTAGG(ic.column_name, ', ') WITHIN GROUP (ORDER BY ic.column_position) columns
+                FROM all_indexes i
+                LEFT JOIN all_ind_columns ic ON ic.index_owner = i.owner AND ic.index_name = i.index_name
+                WHERE i.owner = :owner AND i.table_name = :table_name
+                GROUP BY i.index_name, i.uniqueness, i.status
+                ORDER BY i.index_name
+                """,
+                {"owner": selected_schema, "table_name": selected_object},
+            )
+            indexes = [{"name": str(r[0] or ""), "uniqueness": str(r[1] or ""), "status": str(r[2] or ""), "columns": str(r[3] or "")} for r in cur.fetchall()]
+
+            cur.execute(
+                """
+                SELECT partition_name, high_value, num_rows, tablespace_name
+                FROM all_tab_partitions
+                WHERE table_owner = :owner AND table_name = :table_name
+                ORDER BY partition_position
+                """,
+                {"owner": selected_schema, "table_name": selected_object},
+            )
+            for row in cur.fetchall():
+                high_value = row[1]
+                try:
+                    high_value = high_value.read() if hasattr(high_value, "read") else high_value
+                except Exception:
+                    high_value = ""
+                partitions.append({"name": str(row[0] or ""), "high_value": str(high_value or ""), "num_rows": row[2], "tablespace": str(row[3] or "")})
+
+            cur.execute(
+                """
+                SELECT trigger_name, status, triggering_event, trigger_type, description
+                FROM all_triggers
+                WHERE table_owner = :owner AND table_name = :table_name
+                ORDER BY trigger_name
+                """,
+                {"owner": selected_schema, "table_name": selected_object},
+            )
+            triggers = [{"name": str(r[0] or ""), "status": str(r[1] or ""), "event": str(r[2] or ""), "type": str(r[3] or ""), "description": str(r[4] or "")} for r in cur.fetchall()]
+
+            if selected_type in {"VIEW", "MATERIALIZED VIEW"}:
+                view_name = "all_views" if selected_type == "VIEW" else "all_mviews"
+                text_col = "text" if view_name == "all_views" else "query"
+                cur.execute(f"SELECT {text_col} FROM {view_name} WHERE owner = :owner AND view_name = :name", {"owner": selected_schema, "name": selected_object})
+                row = cur.fetchone()
+                if row:
+                    value = row[0]
+                    source_text = value.read() if hasattr(value, "read") else str(value or "")
+            try:
+                cur.execute(
+                    "SELECT DBMS_METADATA.GET_DDL(:object_type, :object_name, :owner) FROM dual",
+                    {
+                        "object_type": "MATERIALIZED_VIEW" if selected_type == "MATERIALIZED VIEW" else selected_type.replace(" ", "_"),
+                        "object_name": selected_object,
+                        "owner": selected_schema,
+                    },
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    value = row[0]
+                    source_text = value.read() if hasattr(value, "read") else str(value or source_text)
+            except Exception:
+                pass
+
+        ddl_preview = f"CREATE TABLE {selected_schema}.{selected_object} (\n  " + ",\n  ".join(
+            f"{col['name']} {col['type']}{' NOT NULL' if col['nullable'] == 'N' else ''}" for col in columns
+        ) + "\n);" if selected_object and columns else ""
+
+        cur.close()
+        return {
+            "current_schema": current_schema,
+            "session_user": session_user,
+            "schemas": schemas,
+            "objects": objects,
+            "selected": {"schema": selected_schema, "name": selected_object, "type": selected_type},
+            "columns": columns,
+            "constraints": constraints,
+            "indexes": indexes,
+            "partitions": partitions,
+            "triggers": triggers,
+            "source_text": source_text,
+            "ddl_preview": ddl_preview,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"Oracle catalog discovery failed: {exc}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+@app.post("/api/data-ops/oracle/object-data")
+async def data_ops_oracle_object_data(body: DataOpsOracleObjectDataRequest):
+    cfg = dict(body.config or {})
+    schema = _data_ops_validate_oracle_identifier(
+        str(body.schema_name or cfg.get("oracle_schema") or cfg.get("schema") or _os.getenv("BLW_ORACLE_SCHEMA") or ""),
+        "schema",
+    )
+    object_name = _data_ops_validate_oracle_identifier(body.object_name, "object name")
+    limit = max(1, min(int(body.limit or 100), 1000))
+    conn = None
+    try:
+        conn = _data_ops_oracle_connect(cfg)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT object_type
+            FROM all_objects
+            WHERE owner = :owner
+              AND object_name = :object_name
+              AND object_type IN ('TABLE','VIEW','MATERIALIZED VIEW')
+              AND ROWNUM = 1
+            """,
+            {"owner": schema, "object_name": object_name},
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(400, "Data preview is available for tables, views, and materialized views.")
+        query = f'SELECT * FROM "{schema}"."{object_name}" WHERE ROWNUM <= :limit'
+        cur.execute(query, {"limit": limit})
+        columns = [str(desc[0] or "") for desc in (cur.description or [])]
+        rows = [
+            {columns[idx]: _data_ops_oracle_value(value) for idx, value in enumerate(record)}
+            for record in cur.fetchall()
+        ]
+        cur.close()
+        return {
+            "schema": schema,
+            "object": object_name,
+            "object_type": str(row[0] or ""),
+            "columns": columns,
+            "rows": rows,
+            "limit": limit,
+            "row_count": len(rows),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"Oracle data preview failed: {exc}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+@app.post("/api/data-ops/oracle/query-preview")
+async def data_ops_oracle_query_preview(body: DataOpsOracleQueryPreviewRequest):
+    sql = str(body.sql or "").strip().rstrip(";").strip()
+    if not sql:
+        raise HTTPException(400, "SQL is required.")
+    first = _data_ops_first_sql_keyword(sql)
+    if first not in {"SELECT", "WITH"}:
+        raise HTTPException(400, "Query preview only supports SELECT statements.")
+    if ";" in sql:
+        raise HTTPException(400, "Query preview accepts one SELECT statement at a time.")
+    limit = max(1, min(int(body.limit or 100), 1000))
+    conn = None
+    started = datetime.utcnow()
+    try:
+        conn = _data_ops_oracle_connect(body.config)
+        cur = conn.cursor()
+        cur.execute(f"SELECT * FROM ({sql}) WHERE ROWNUM <= :limit", {"limit": limit})
+        columns = [str(desc[0] or "") for desc in (cur.description or [])]
+        rows = [
+            {columns[idx]: _data_ops_oracle_value(value) for idx, value in enumerate(record)}
+            for record in cur.fetchall()
+        ]
+        cur.close()
+        return {
+            "ok": True,
+            "columns": columns,
+            "rows": rows,
+            "limit": limit,
+            "row_count": len(rows),
+            "executed_at": started.isoformat(),
+            "duration_ms": int((datetime.utcnow() - started).total_seconds() * 1000),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"Oracle query preview failed: {exc}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _execute_data_ops_oracle_sql(config: Dict[str, Any], sql: str) -> Dict[str, Any]:
+    raw_sql = str(sql or "").strip()
+    if not raw_sql:
+        raise ValueError("SQL is required.")
+    if not _data_ops_sql_allowed_for_execute(raw_sql):
+        raise ValueError("Only Oracle object management statements can be executed here.")
+    conn = None
+    started = datetime.utcnow()
+    try:
+        conn = _data_ops_oracle_connect(config)
+        cur = conn.cursor()
+        cur.execute(raw_sql.rstrip().rstrip(";"))
+        rowcount = int(cur.rowcount or 0) if cur.rowcount is not None and cur.rowcount >= 0 else 0
+        conn.commit()
+        cur.close()
+        return {
+            "ok": True,
+            "operation": _data_ops_first_sql_keyword(raw_sql),
+            "rowcount": rowcount,
+            "executed_at": started.isoformat(),
+            "duration_ms": int((datetime.utcnow() - started).total_seconds() * 1000),
+        }
+    except Exception:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+@app.post("/api/data-ops/oracle/execute")
+async def data_ops_oracle_execute(body: DataOpsOracleExecuteRequest):
+    sql = str(body.sql or "").strip()
+    if not sql:
+        raise HTTPException(400, "SQL is required.")
+    if not body.confirm:
+        raise HTTPException(400, "Execution requires confirmation.")
+    try:
+        return _execute_data_ops_oracle_sql(body.config, sql)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"Oracle SQL execution failed: {exc}")
+
+
+def _data_ops_mapper_sync_schedule_is_active(config: Dict[str, Any]) -> bool:
+    if "_data_ops_mapper_scheduler_enabled" in config:
+        return bool(config.get("_data_ops_mapper_scheduler_enabled"))
+    explicit_flags = (
+        "data_ops_schedule_enabled",
+        "schedule_enabled",
+        "scheduleEnabled",
+        "_data_ops_mapper_deploy_enabled",
+        "data_ops_pipeline_deploy_enabled",
+        "deploy_enabled",
+        "deployEnabled",
+    )
+    for key in explicit_flags:
+        if key in config and config.get(key) is False:
+            return False
+    return True
+
+
+async def _run_scheduled_data_ops_mapper_sync(job_id: str, config: Dict[str, Any], sql: str):
+    if not _data_ops_mapper_sync_schedule_is_active(config):
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
+        logger.debug(f"Removed inactive scheduled Data Ops mapper sync {job_id}")
+        return
+    try:
+        result = await asyncio.to_thread(_execute_data_ops_oracle_sql, config, sql)
+        logger.info(f"Scheduled Data Ops mapper sync {job_id} completed: {result.get('rowcount', 0)} row(s)")
+    except Exception as exc:
+        logger.error(f"Scheduled Data Ops mapper sync {job_id} failed: {exc}")
+
+
+def _remove_data_ops_mapper_sync_jobs(raw_job_id: str, remove_pipeline_jobs: bool = False) -> int:
+    job_id = f"{DATA_OPS_SYNC_JOB_PREFIX}{raw_job_id}"
+    prefixes = [job_id]
+    if remove_pipeline_jobs and ":" in raw_job_id:
+        pipeline_node_id = raw_job_id.split(":", 1)[0]
+        if pipeline_node_id:
+            prefixes.append(f"{DATA_OPS_SYNC_JOB_PREFIX}{pipeline_node_id}:")
+    removed = 0
+    seen: set[str] = set()
+    for job in list(scheduler.get_jobs()):
+        if job.id in seen:
+            continue
+        if any(job.id == prefix or job.id.startswith(prefix) for prefix in prefixes):
+            scheduler.remove_job(job.id)
+            seen.add(job.id)
+            removed += 1
+    return removed
+
+
+@app.post("/api/data-ops/oracle/sync-schedule")
+async def data_ops_oracle_sync_schedule(body: DataOpsOracleSyncScheduleRequest):
+    raw_job_id = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(body.job_id or "").strip())
+    if not raw_job_id:
+        raise HTTPException(400, "job_id is required.")
+    job_id = f"{DATA_OPS_SYNC_JOB_PREFIX}{raw_job_id}"
+    if not body.enabled or not body.deploy_enabled:
+        removed = _remove_data_ops_mapper_sync_jobs(raw_job_id, remove_pipeline_jobs=raw_job_id.count(":") < 2)
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "enabled": False,
+            "next_run_at": None,
+            "removed_jobs": removed,
+            "message": f"Data Ops mapper sync scheduler disabled. Removed {removed} backend job(s).",
+        }
+    _remove_data_ops_mapper_sync_jobs(raw_job_id, remove_pipeline_jobs=False)
+    sql = str(body.sql or "").strip()
+    if not sql:
+        raise HTTPException(400, "SQL is required to schedule mapper sync.")
+    if not _data_ops_sql_allowed_for_execute(sql):
+        raise HTTPException(400, "Only executable mapper sync SQL can be scheduled.")
+    schedule_type = str(body.schedule_type or "interval").strip().lower()
+    if schedule_type in {"manual", "event"}:
+        removed = _remove_data_ops_mapper_sync_jobs(raw_job_id, remove_pipeline_jobs=False)
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "enabled": False,
+            "next_run_at": None,
+            "removed_jobs": removed,
+            "message": f"Schedule type '{schedule_type}' does not create a time-based backend job.",
+        }
+    timezone_name = str(body.timezone or "Asia/Kolkata").strip() or "Asia/Kolkata"
+    try:
+        if schedule_type == "cron":
+            cron = _ensure_valid_cron_expr(body.cron or "")
+            trigger = CronTrigger.from_crontab(cron, timezone=timezone_name)
+            schedule_text = cron
+        else:
+            interval_minutes = max(1, int(body.interval_minutes or 60))
+            trigger = IntervalTrigger(minutes=interval_minutes, timezone=timezone_name)
+            schedule_text = f"every {interval_minutes} minute(s)"
+        scheduled_config = dict(body.config or {})
+        scheduled_config["_data_ops_mapper_scheduler_enabled"] = True
+        scheduled_config["_data_ops_mapper_deploy_enabled"] = True
+        scheduler.add_job(
+            _run_scheduled_data_ops_mapper_sync,
+            trigger=trigger,
+            args=[job_id, scheduled_config, sql],
+            id=job_id,
+            replace_existing=True,
+            max_instances=max(1, int(body.max_instances or 1)),
+            coalesce=str(body.misfire_policy or "skip") != "catch_up",
+        )
+    except Exception as exc:
+        raise HTTPException(400, f"Failed to schedule mapper sync: {exc}")
+    job = scheduler.get_job(job_id)
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "enabled": True,
+        "schedule": schedule_text,
+        "next_run_at": job.next_run_time.isoformat() if job and job.next_run_time else None,
+        "message": "Data Ops mapper sync scheduler registered.",
+    }
+
+
+@app.post("/api/data-ops/connection/test")
+async def data_ops_connection_test(body: DataOpsConnectionTestRequest):
+    connection = dict(body.connection or {})
+    conn_type = str(connection.get("type") or "oracle").strip().lower()
+    started = datetime.utcnow()
+
+    def _done(ok: bool, message: str, **extra: Any) -> Dict[str, Any]:
+        return {
+            "ok": ok,
+            "type": conn_type,
+            "message": message,
+            "tested_at": datetime.utcnow().isoformat(),
+            "duration_ms": int((datetime.utcnow() - started).total_seconds() * 1000),
+            **extra,
+        }
+
+    try:
+        if conn_type == "oracle":
+            conn = None
+            try:
+                conn = _data_ops_oracle_connect({
+                    "host": connection.get("host"),
+                    "port": connection.get("port") or 1521,
+                    "service_name": connection.get("service") or connection.get("service_name"),
+                    "sid": connection.get("sid"),
+                    "dsn": connection.get("dsn"),
+                    "user": connection.get("user"),
+                    "password": connection.get("password"),
+                })
+                cur = conn.cursor()
+                cur.execute("SELECT 1 FROM dual")
+                row = cur.fetchone()
+                cur.close()
+                return _done(True, "Oracle connection succeeded.", sample=str(row[0] if row else ""))
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        if conn_type == "jdbc":
+            import socket
+            jdbc_url = str(connection.get("jdbcUrl") or connection.get("jdbc_url") or "").strip()
+            host = str(connection.get("host") or "").strip()
+            if not host and jdbc_url:
+                match = re.search(r"//([^/:;?]+)(?::(\d+))?", jdbc_url)
+                if match:
+                    host = match.group(1)
+                    if not connection.get("port") and match.group(2):
+                        connection["port"] = match.group(2)
+            port = int(connection.get("port") or 0)
+            if not host or port <= 0:
+                raise HTTPException(400, "JDBC test requires host and port, or a JDBC URL containing host:port.")
+            with socket.create_connection((host, port), timeout=8):
+                pass
+            return _done(True, f"TCP connection to {host}:{port} succeeded. JDBC driver login is not available in this Python backend.")
+
+        if conn_type in {"csv", "excel"}:
+            raw_path = str(connection.get("filePath") or connection.get("file_path") or "").strip()
+            if not raw_path:
+                raise HTTPException(400, f"{conn_type.upper()} test requires a file path.")
+            resolved = _resolve_backend_source_file_path(raw_path)
+            if not _os.path.isfile(resolved):
+                raise HTTPException(400, f"File not found: {resolved}")
+            size = _os.path.getsize(resolved)
+            if conn_type == "csv":
+                try:
+                    import pandas as pd  # type: ignore
+                    delimiter = str(connection.get("delimiter") or ",")
+                    frame = pd.read_csv(resolved, sep=delimiter, nrows=5)
+                    return _done(True, "CSV file is readable.", path=resolved, size=size, columns=list(map(str, frame.columns)), sample_rows=int(len(frame)))
+                except Exception as exc:
+                    raise HTTPException(400, f"CSV read failed: {exc}") from exc
+            try:
+                import pandas as pd  # type: ignore
+                sheet = connection.get("sheet") or 0
+                frame = pd.read_excel(resolved, sheet_name=sheet, nrows=5)
+                return _done(True, "Excel file is readable.", path=resolved, size=size, columns=list(map(str, frame.columns)), sample_rows=int(len(frame)))
+            except Exception as exc:
+                raise HTTPException(400, f"Excel read failed: {exc}") from exc
+
+        if conn_type in {"rest", "soap", "graphql"}:
+            import httpx
+            url = str(connection.get("apiUrl") or connection.get("api_url") or "").strip()
+            if not url:
+                raise HTTPException(400, f"{conn_type.upper()} test requires a URL.")
+            method = str(connection.get("method") or "GET").strip().upper()
+            token = str(connection.get("authToken") or connection.get("auth_token") or "").strip()
+            headers: Dict[str, str] = {}
+            raw_headers = str(connection.get("headers") or "").strip()
+            if raw_headers:
+                try:
+                    parsed_headers = json.loads(raw_headers)
+                    if isinstance(parsed_headers, dict):
+                        headers.update({str(k): str(v) for k, v in parsed_headers.items()})
+                except Exception as exc:
+                    raise HTTPException(400, f"Headers JSON is invalid: {exc}") from exc
+            if token:
+                headers["Authorization"] = token if token.lower().startswith(("bearer ", "basic ")) else f"Bearer {token}"
+            payload = str(connection.get("query") or "").strip()
+            timeout = httpx.Timeout(12.0, connect=8.0)
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                if conn_type == "graphql":
+                    variables: Any = None
+                    raw_variables = str(connection.get("variables") or "").strip()
+                    if raw_variables:
+                        try:
+                            variables = json.loads(raw_variables)
+                        except Exception as exc:
+                            raise HTTPException(400, f"GraphQL variables JSON is invalid: {exc}") from exc
+                    body: Dict[str, Any] = {"query": payload or "{ __typename }"}
+                    if variables is not None:
+                        body["variables"] = variables
+                    response = await client.post(url, headers={**headers, "Content-Type": "application/json"}, json=body)
+                elif conn_type == "soap":
+                    soap_action = str(connection.get("soapAction") or connection.get("soap_action") or "").strip()
+                    if soap_action:
+                        headers["SOAPAction"] = soap_action
+                    if method == "GET" and not payload:
+                        response = await client.get(url, headers=headers)
+                    else:
+                        response = await client.request(method if method in {"POST", "PUT", "PATCH"} else "POST", url, headers={**headers, "Content-Type": "text/xml"}, content=payload)
+                else:
+                    response = await client.request(method if method in {"GET", "POST", "PUT", "PATCH"} else "GET", url, headers=headers, content=payload if method in {"POST", "PUT", "PATCH"} and payload else None)
+            ok = 200 <= int(response.status_code) < 400
+            return _done(ok, f"HTTP {response.status_code} from {url}.", status_code=int(response.status_code), content_type=response.headers.get("content-type", ""))
+
+        if conn_type == "s3":
+            bucket = str(connection.get("bucket") or "").strip()
+            key = str(connection.get("objectKey") or connection.get("object_key") or "").strip()
+            raw_path = str(connection.get("filePath") or connection.get("file_path") or "").strip()
+            if not raw_path and bucket and key:
+                raw_path = f"s3://{bucket}/{key}"
+            if not raw_path.startswith("s3://"):
+                raise HTTPException(400, "S3 test requires an s3://bucket/key path.")
+            try:
+                import boto3  # type: ignore
+            except Exception as exc:
+                raise HTTPException(400, "S3 test requires boto3 in the backend environment.") from exc
+            bucket_key = raw_path.replace("s3://", "", 1)
+            bucket, _, key = bucket_key.partition("/")
+            if not bucket or not key:
+                raise HTTPException(400, "S3 path must include bucket and key.")
+            client_kwargs: Dict[str, Any] = {}
+            region = str(connection.get("region") or "").strip()
+            access_key = str(connection.get("accessKey") or connection.get("access_key") or "").strip()
+            secret_key = str(connection.get("secretKey") or connection.get("secret_key") or "").strip()
+            if region:
+                client_kwargs["region_name"] = region
+            if access_key and secret_key:
+                client_kwargs["aws_access_key_id"] = access_key
+                client_kwargs["aws_secret_access_key"] = secret_key
+            client = boto3.client("s3", **client_kwargs)
+            meta = client.head_object(Bucket=bucket, Key=key)
+            return _done(True, "S3 object is accessible.", bucket=bucket, key=key, size=int(meta.get("ContentLength") or 0))
+
+        raise HTTPException(400, f"Unsupported connection type: {conn_type}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"Connection test failed: {exc}")
 
 
 def _discover_lmdb_env_paths(

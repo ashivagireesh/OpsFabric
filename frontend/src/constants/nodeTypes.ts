@@ -513,6 +513,31 @@ const sourceNodes: NodeTypeDefinition[] = [
 
 const transformNodes: NodeTypeDefinition[] = [
   {
+    type: 'data_ops',
+    label: 'Data Ops',
+    category: 'transform',
+    icon: '▦',
+    color: '#06b6d4',
+    bgColor: 'rgba(6,182,212,0.1)',
+    description: 'Data Vault Studio for database object management, ETL pipeline design, and runtime monitoring',
+    inputs: 1,
+    outputs: 1,
+    tags: ['data', 'etl', 'database', 'oracle', 'studio'],
+    configFields: [
+      { name: 'studio_name', label: 'Studio Name', type: 'text', defaultValue: 'Data Vault Studio' },
+      { name: 'oracle_connection_name', label: 'Oracle Connection Name', type: 'text', defaultValue: 'Oracle19c-Docker' },
+      { name: 'oracle_host', label: 'Oracle Host', type: 'text', defaultValue: 'localhost' },
+      { name: 'oracle_port', label: 'Oracle Port', type: 'number', defaultValue: 1521 },
+      { name: 'oracle_service_name', label: 'Oracle Service Name', type: 'text', defaultValue: 'ORCLCDB' },
+      { name: 'oracle_user', label: 'Oracle User', type: 'text', defaultValue: 'system' },
+      { name: 'oracle_password', label: 'Oracle Password', type: 'password' },
+      { name: 'oracle_schema', label: 'Oracle Schema', type: 'text', defaultValue: 'SYSTEM' },
+      { name: 'managed_objects', label: 'Managed Objects', type: 'textarea', placeholder: 'F_CUSTOMER_TXN\nD_CUSTOMER\nMV_DAILY_SUMMARY' },
+      { name: 'pipeline_steps', label: 'Pipeline Steps', type: 'textarea', placeholder: 'Oracle Source\nSelect Fields\nValidator\nOracle Output' },
+      { name: 'monitoring_enabled', label: 'Monitoring Enabled', type: 'toggle', defaultValue: true },
+    ],
+  },
+  {
     type: 'profile_query_transform',
     label: 'Data Query',
     category: 'transform',

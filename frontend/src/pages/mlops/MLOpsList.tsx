@@ -13,6 +13,7 @@ import {
   Row,
   Space,
   Spin,
+  Tabs,
   Tag,
   Typography,
   notification,
@@ -29,6 +30,7 @@ import {
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
 import { useMLOpsCatalogStore } from '../../store/mlopsStore'
+import RREStudio from '../../components/mlops/RREStudio'
 import type { MLOpsWorkflow } from '../../types'
 
 dayjs.extend(relativeTime)
@@ -113,61 +115,79 @@ export default function MLOpsList() {
         </Button>
       </div>
 
-      <Input
-        placeholder="Search by workflow name, description, or tag..."
-        prefix={<SearchOutlined style={{ color: 'var(--app-text-subtle)' }} />}
-        value={search}
-        onChange={(e) => setSearch(e.target.value)}
-        style={{
-          background: 'var(--app-card-bg)',
-          border: '1px solid var(--app-border-strong)',
-          color: 'var(--app-text)',
-          borderRadius: 8,
-          marginBottom: 20,
-          maxWidth: 520,
-        }}
-        allowClear
-      />
+      <Tabs
+        defaultActiveKey="workflows"
+        items={[
+          {
+            key: 'workflows',
+            label: 'MLOps Workflows',
+            children: (
+              <>
+                <Input
+                  placeholder="Search by workflow name, description, or tag..."
+                  prefix={<SearchOutlined style={{ color: 'var(--app-text-subtle)' }} />}
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  style={{
+                    background: 'var(--app-card-bg)',
+                    border: '1px solid var(--app-border-strong)',
+                    color: 'var(--app-text)',
+                    borderRadius: 8,
+                    marginBottom: 20,
+                    maxWidth: 520,
+                  }}
+                  allowClear
+                />
 
-      {loading ? (
-        <div style={{ textAlign: 'center', padding: 80 }}>
-          <Spin size="large" />
-        </div>
-      ) : filtered.length === 0 ? (
-        <Empty
-          description={<Text style={{ color: 'var(--app-text-subtle)' }}>No MLOps workflows found</Text>}
-          style={{ padding: 80 }}
-        >
-          <Button
-            type="primary"
-            icon={<PlusOutlined />}
-            onClick={() => setModalOpen(true)}
-            style={{ background: 'linear-gradient(135deg, #22c55e, #16a34a)', border: 'none' }}
-          >
-            Create MLOps Workflow
-          </Button>
-        </Empty>
-      ) : (
-        <Row gutter={[16, 16]}>
-          {filtered.map((workflow) => (
-            <Col xs={24} sm={12} xl={8} key={workflow.id}>
-              <MLOpsWorkflowCard
-                workflow={workflow}
-                onEdit={() => navigate(`/mlops/${workflow.id}/edit`)}
-                onDelete={() => handleDelete(workflow.id, workflow.name)}
-                onDuplicate={async () => {
-                  await duplicateWorkflow(workflow.id)
-                  notification.success({
-                    message: 'Duplicated',
-                    description: 'A copy has been added to MLOps workflows.',
-                    placement: 'bottomRight',
-                  })
-                }}
-              />
-            </Col>
-          ))}
-        </Row>
-      )}
+                {loading ? (
+                  <div style={{ textAlign: 'center', padding: 80 }}>
+                    <Spin size="large" />
+                  </div>
+                ) : filtered.length === 0 ? (
+                  <Empty
+                    description={<Text style={{ color: 'var(--app-text-subtle)' }}>No MLOps workflows found</Text>}
+                    style={{ padding: 80 }}
+                  >
+                    <Button
+                      type="primary"
+                      icon={<PlusOutlined />}
+                      onClick={() => setModalOpen(true)}
+                      style={{ background: 'linear-gradient(135deg, #22c55e, #16a34a)', border: 'none' }}
+                    >
+                      Create MLOps Workflow
+                    </Button>
+                  </Empty>
+                ) : (
+                  <Row gutter={[16, 16]}>
+                    {filtered.map((workflow) => (
+                      <Col xs={24} sm={12} xl={8} key={workflow.id}>
+                        <MLOpsWorkflowCard
+                          workflow={workflow}
+                          onEdit={() => navigate(`/mlops/${workflow.id}/edit`)}
+                          onDelete={() => handleDelete(workflow.id, workflow.name)}
+                          onDuplicate={async () => {
+                            await duplicateWorkflow(workflow.id)
+                            notification.success({
+                              message: 'Duplicated',
+                              description: 'A copy has been added to MLOps workflows.',
+                              placement: 'bottomRight',
+                            })
+                          }}
+                        />
+                      </Col>
+                    ))}
+                  </Row>
+                )}
+              </>
+            ),
+          },
+          {
+            key: 'rre',
+            label: 'Recommendate Rule Engine (RRE)',
+            children: <RREStudio />,
+          },
+        ]}
+      />
 
       <Modal
         title={<span style={{ color: 'var(--app-text)' }}>New MLOps Workflow</span>}

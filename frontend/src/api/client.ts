@@ -8,6 +8,7 @@ const H2O_LONG_TIMEOUT_MS = 10 * 60 * 1000
 // ─── In-memory store for offline pipeline creation ──────────────────────────
 const localPipelineStore: Record<string, any> = {}
 const localMLOpsStore: Record<string, any> = {}
+const RRE_TEMPLATES_STORAGE_KEY = 'etl_flow_rre_templates'
 const localBusinessStore: Record<string, any> = {}
 
 // ─── Mock data ───────────────────────────────────────────────────────────────
@@ -395,6 +396,202 @@ const api = {
         ? detail
         : String(err?.message || 'Failed to detect source fields')
       throw new Error(message)
+    }
+  },
+
+  discoverDataOpsOracleCatalog: async (config: Record<string, unknown>, options?: {
+    schema?: string
+    object?: string
+    search?: string
+    limit?: number
+  }) => {
+    try {
+      const r = await http.post('/api/data-ops/oracle/catalog', {
+        config,
+        schema: String(options?.schema || ''),
+        object: String(options?.object || ''),
+        search: String(options?.search || ''),
+        limit: Math.max(1, Number(options?.limit || 500)),
+      })
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to discover Oracle catalog')
+      throw new Error(message)
+    }
+  },
+
+  previewDataOpsOracleObjectData: async (config: Record<string, unknown>, options: {
+    schema?: string
+    object: string
+    limit?: number
+  }) => {
+    const schema = String(options?.schema || config?.oracle_schema || config?.schema || '').trim()
+    const objectName = String(options?.object || '').trim()
+    const limit = Math.max(1, Number(options?.limit || 100))
+    try {
+      const r = await http.post('/api/data-ops/oracle/object-data', {
+        config,
+        schema,
+        object: objectName,
+        limit,
+      })
+      return r.data
+    } catch (err: any) {
+      const status = Number(err?.response?.status || 0)
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to preview Oracle object data')
+      if (status === 404 || message.toLowerCase() === 'not found') {
+        try {
+          const qualified = schema
+            ? `"${schema.replace(/"/g, '""')}"."${objectName.replace(/"/g, '""')}"`
+            : `"${objectName.replace(/"/g, '""')}"`
+          const fallbackConfig = {
+            ...config,
+            host: config.oracle_host || config.host,
+            port: config.oracle_port || config.port || 1521,
+            service_name: config.oracle_service_name || config.service_name,
+            sid: config.oracle_sid || config.sid,
+            dsn: config.oracle_dsn || config.dsn,
+            user: config.oracle_user || config.user,
+            password: config.oracle_password || config.password || 'Oracle#2026',
+            query: `SELECT * FROM ${qualified}`,
+            limit,
+          }
+          const fallback = await http.post('/api/source/field-options', {
+            node_type: 'oracle_source',
+            config: fallbackConfig,
+            max_rows: limit,
+            page: 1,
+            preview_rows: limit,
+            include_schema_scan: false,
+            schema_scan_limit: limit,
+            preview_compact: true,
+            preview_max_cell_chars: 2000,
+            preview_max_collection_items: 64,
+            search: '',
+            filters: [],
+            sort_by: '',
+            sort_dir: 'asc',
+          })
+          const rows = Array.isArray(fallback.data?.preview) ? fallback.data.preview : []
+          const columns = Array.isArray(fallback.data?.columns)
+            ? fallback.data.columns.map((item: any) => typeof item === 'string' ? item : String(item?.name || item?.field || item?.key || '')).filter(Boolean)
+            : rows.length > 0 ? Object.keys(rows[0] || {}) : []
+          return {
+            schema,
+            object: objectName,
+            object_type: 'TABLE',
+            columns,
+            rows,
+            limit,
+            row_count: Number(fallback.data?.row_count || rows.length || 0),
+            fallback_used: true,
+          }
+        } catch (fallbackErr: any) {
+          const fallbackDetail = fallbackErr?.response?.data?.detail
+          const fallbackMessage = typeof fallbackDetail === 'string'
+            ? fallbackDetail
+            : String(fallbackErr?.message || message)
+          throw new Error(fallbackMessage)
+        }
+      }
+      throw new Error(message)
+    }
+  },
+
+  previewDataOpsOracleQuery: async (config: Record<string, unknown>, sql: string, limit = 100) => {
+    try {
+      const r = await http.post('/api/data-ops/oracle/query-preview', {
+        config,
+        sql,
+        limit: Math.max(1, Number(limit || 100)),
+      })
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to preview Oracle query')
+      throw new Error(message)
+    }
+  },
+
+  executeDataOpsOracleSql: async (config: Record<string, unknown>, sql: string, confirm = true) => {
+    try {
+      const r = await http.post('/api/data-ops/oracle/execute', {
+        config,
+        sql,
+        confirm,
+      })
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to execute Oracle SQL')
+      throw new Error(message)
+    }
+  },
+
+  scheduleDataOpsOracleSync: async (payload: Record<string, unknown>) => {
+    try {
+      const r = await http.post('/api/data-ops/oracle/sync-schedule', payload)
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to schedule Oracle sync')
+      throw new Error(message)
+    }
+  },
+
+  testDataOpsConnection: async (connection: Record<string, unknown>) => {
+    try {
+      const r = await http.post('/api/data-ops/connection/test', { connection }, { timeout: 45000 })
+      return r.data
+    } catch (err: any) {
+      const status = Number(err?.response?.status || 0)
+      const connectionType = String(connection?.type || '').trim().toLowerCase()
+      if (status === 404 && connectionType === 'oracle') {
+        try {
+          const r = await http.post('/api/data-ops/oracle/catalog', {
+            config: {
+              host: connection.host,
+              port: connection.port || 1521,
+              service_name: connection.service,
+              sid: connection.sid,
+              dsn: connection.dsn,
+              user: connection.user,
+              password: connection.password,
+              schema: connection.schema,
+            },
+            limit: 1,
+          }, { timeout: 45000 })
+          return {
+            ok: true,
+            type: 'oracle',
+            message: `Oracle connection succeeded. Current schema: ${String(r.data?.current_schema || '-')}`,
+            tested_at: new Date().toISOString(),
+          }
+        } catch (oracleErr: any) {
+          const oracleDetail = oracleErr?.response?.data?.detail
+          const oracleMessage = typeof oracleDetail === 'string'
+            ? oracleDetail
+            : String(oracleErr?.message || 'Oracle connection test failed')
+          throw new Error(oracleMessage)
+        }
+      }
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Connection test failed')
+      throw new Error(status === 404 ? 'Connection test API is not available on the running backend. Restart the backend to load the latest route.' : message)
     }
   },
 
@@ -1283,6 +1480,63 @@ const api = {
   listTemplates: () => safeGet(async () => {
     const r = await http.get('/api/templates'); return r.data
   }, []),
+
+  listRRETemplates: () => safeGet(async () => {
+    const r = await http.get('/api/mlops/rre/templates')
+    const rows = Array.isArray(r.data) ? r.data : []
+    try { localStorage.setItem(RRE_TEMPLATES_STORAGE_KEY, JSON.stringify(rows)) } catch { /* ignore */ }
+    return rows
+  }, (() => {
+    try {
+      const rows = JSON.parse(localStorage.getItem(RRE_TEMPLATES_STORAGE_KEY) || '[]')
+      return Array.isArray(rows) ? rows : []
+    } catch {
+      return []
+    }
+  })()),
+
+  saveRRETemplate: async (template: Record<string, unknown>) => {
+    const id = String(template.id || '').trim()
+    const persistLocal = (saved: any) => {
+      try {
+        const rows = JSON.parse(localStorage.getItem(RRE_TEMPLATES_STORAGE_KEY) || '[]')
+        const list = Array.isArray(rows) ? rows : []
+        const next = list.some((item: any) => item?.id === saved.id)
+          ? list.map((item: any) => item?.id === saved.id ? saved : item)
+          : [...list, saved]
+        localStorage.setItem(RRE_TEMPLATES_STORAGE_KEY, JSON.stringify(next))
+      } catch { /* ignore */ }
+    }
+    try {
+      let r
+      if (id) {
+        try {
+          r = await http.put(`/api/mlops/rre/templates/${encodeURIComponent(id)}`, template)
+        } catch (err: any) {
+          const status = Number(err?.response?.status || 0)
+          if (status !== 404) throw err
+          r = await http.post('/api/mlops/rre/templates', template)
+        }
+      } else {
+        r = await http.post('/api/mlops/rre/templates', template)
+      }
+      const saved = r.data
+      persistLocal(saved)
+      return saved
+    } catch (err: any) {
+      const message = err?.response?.data?.detail || err?.message || 'Failed to save RRE template permanently'
+      throw new Error(String(message))
+    }
+  },
+
+  deleteRRETemplate: async (id: string) => {
+    try { await http.delete(`/api/mlops/rre/templates/${encodeURIComponent(id)}`) } catch { /* offline */ }
+    try {
+      const rows = JSON.parse(localStorage.getItem(RRE_TEMPLATES_STORAGE_KEY) || '[]')
+      const list = Array.isArray(rows) ? rows : []
+      localStorage.setItem(RRE_TEMPLATES_STORAGE_KEY, JSON.stringify(list.filter((item: any) => item?.id !== id)))
+    } catch { /* ignore */ }
+  },
 
   // ── File download ───────────────────────────────────────────────────────────
   downloadOutputFile: (serverPath: string) => {

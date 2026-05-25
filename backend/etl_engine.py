@@ -7809,6 +7809,8 @@ END;"""
                 config,
                 execution_context=execution_context,
             )
+        elif node_type == "data_ops":
+            return self._transform_data_ops(upstream, config, execution_context=execution_context)
         elif node_type == "python_script_transform":
             return await self._transform_python(upstream, config)
         elif node_type == "sql_transform":
@@ -10149,6 +10151,469 @@ END;"""
             return split.get("output") if isinstance(split.get("output"), list) else []
         passed_rows, _ = self._flow_condition_split(data, config)
         return passed_rows
+
+    def _transform_data_ops(
+        self,
+        data: list,
+        config: dict,
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> list:
+        """Execute the Data Vault Studio pipeline design as lightweight ETL steps.
+
+        Database object operations stay behind explicit Data Ops API calls. During a
+        normal pipeline run this node applies configured pipeline-step semantics to
+        upstream rows and records an execution summary in the node config/runtime
+        context when available.
+        """
+        rows: List[Any] = list(data) if isinstance(data, list) else []
+        raw_steps = config.get("data_ops_pipeline_nodes") if isinstance(config, dict) else []
+        if not isinstance(raw_steps, list):
+            legacy_steps = [
+                item.strip()
+                for item in str(config.get("pipeline_steps") or "").splitlines()
+                if item.strip()
+            ] if isinstance(config, dict) else []
+            raw_steps = [{"name": name, "kind": "", "enabled": True} for name in legacy_steps]
+        if not raw_steps:
+            return rows
+
+        def _parse_fields(value: Any) -> List[str]:
+            if isinstance(value, list):
+                return [str(item).strip() for item in value if str(item).strip()]
+            text = str(value or "").strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            except Exception:
+                pass
+            return [item.strip() for item in re.split(r"[,\n]", text) if item.strip()]
+
+        def _parse_mapping_rules(*values: Any) -> Dict[str, str]:
+            mapping: Dict[str, str] = {}
+            for value in values:
+                for item in _parse_fields(value):
+                    if ":" in item:
+                        left, right = item.split(":", 1)
+                    elif "=>" in item:
+                        left, right = item.split("=>", 1)
+                    else:
+                        continue
+                    source_name = left.strip()
+                    target_name = right.strip()
+                    if source_name and target_name:
+                        mapping[source_name] = target_name
+            return mapping
+
+        def _enabled_rows(value: Any) -> List[Dict[str, Any]]:
+            if not isinstance(value, list):
+                return []
+            return [
+                item for item in value
+                if isinstance(item, dict) and self._parse_bool_like(item.get("enabled", True), True)
+            ]
+
+        def _kind(step: Dict[str, Any]) -> str:
+            raw = str(step.get("kind") or "").strip().lower()
+            name = str(step.get("name") or step.get("label") or "").strip().lower()
+            if raw:
+                return raw
+            if re.search(r"source|read|api|rest|soap|graphql|csv|excel", name):
+                return "source"
+            if re.search(r"valid|quality|filter|reject", name):
+                return "validate"
+            if re.search(r"map|mapper|lookup|join", name):
+                return "map"
+            if re.search(r"load|output|archive|purge|write", name):
+                return "load"
+            if re.search(r"monitor|audit|stat", name):
+                return "monitor"
+            return "prepare"
+
+        def _simple_condition_config(expression: str) -> Dict[str, Any]:
+            text = str(expression or "").strip()
+            if not text:
+                return {}
+            match = re.match(r"^([A-Za-z_][A-Za-z0-9_.]*)\s*(==|=|!=|>=|<=|>|<)\s*['\"]?(.+?)['\"]?$", text)
+            if not match:
+                return {}
+            op_map = {
+                "=": "equals",
+                "==": "equals",
+                "!=": "not_equals",
+                ">": "greater_than",
+                "<": "less_than",
+                ">=": "greater_or_equal",
+                "<=": "less_or_equal",
+            }
+            return {
+                "field": match.group(1),
+                "operator": op_map.get(match.group(2), "equals"),
+                "value": match.group(3),
+            }
+
+        summary_steps: List[Dict[str, Any]] = []
+        for idx, raw_step in enumerate(raw_steps):
+            if not isinstance(raw_step, dict):
+                continue
+            step = raw_step
+            enabled = self._parse_bool_like(step.get("enabled", True), True)
+            name = str(step.get("name") or step.get("label") or f"Step {idx + 1}").strip() or f"Step {idx + 1}"
+            step_kind = _kind(step)
+            operation = str(step.get("operation") or "").strip().lower()
+            before_count = len(rows)
+            if not enabled:
+                summary_steps.append({"name": name, "kind": step_kind, "status": "skipped", "input_rows": before_count, "output_rows": before_count})
+                continue
+
+            fields = _parse_fields(step.get("fields"))
+            expression = str(step.get("expression") or "").strip()
+            if step_kind == "source":
+                source_meta = {
+                    "source_type": str(step.get("sourceType") or step.get("source_type") or "upstream"),
+                    "source": str(step.get("source") or ""),
+                    "query": str(step.get("query") or ""),
+                    "file_path": str(step.get("filePath") or step.get("file_path") or ""),
+                    "api_url": str(step.get("apiUrl") or step.get("api_url") or ""),
+                    "connections": _enabled_rows(step.get("connections")),
+                }
+                rows = [
+                    {**row, "_data_ops_source": source_meta}
+                    if isinstance(row, dict) else row
+                    for row in rows
+                ]
+            elif step_kind == "prepare" or operation in {"select_fields", "drop_fields", "rename_fields"}:
+                projection_mode = str(step.get("projectionMode") or step.get("projection_mode") or "keep").strip().lower()
+                if operation == "drop_fields":
+                    projection_mode = "drop"
+                select_rows = _enabled_rows(step.get("selectFields") or step.get("select_fields"))
+                if select_rows:
+                    fields = [str(item.get("field") or "").strip() for item in select_rows if str(item.get("field") or "").strip()]
+                alias_by_field = {
+                    str(item.get("field") or "").strip(): str(item.get("alias") or "").strip()
+                    for item in select_rows
+                    if str(item.get("field") or "").strip() and str(item.get("alias") or "").strip()
+                }
+                rename_rules = _parse_mapping_rules(step.get("renameRules"), step.get("rename_rules"))
+                rename_rules.update(alias_by_field)
+                projected = []
+                for row in rows:
+                    if not isinstance(row, dict):
+                        projected.append(row)
+                        continue
+                    if fields:
+                        if projection_mode == "drop":
+                            drop_names = {field.split(".")[-1] for field in fields}
+                            next_row = {key: value for key, value in row.items() if key not in drop_names}
+                        else:
+                            next_row = {}
+                            for field_name in fields:
+                                value, found = self._extract_row_value_by_path(row, field_name)
+                                if found:
+                                    next_row[field_name.split(".")[-1]] = value
+                    else:
+                        next_row = dict(row)
+                    for source_field, target_field in rename_rules.items():
+                        value, found = self._extract_row_value_by_path(next_row, source_field)
+                        if not found:
+                            value, found = self._extract_row_value_by_path(row, source_field)
+                        if found:
+                            next_row.pop(source_field, None)
+                            next_row[target_field] = value
+                    projected.append(next_row)
+                rows = projected
+
+                filter_rule_rows = _enabled_rows(step.get("filterRules") or step.get("filter_rules"))
+                if filter_rule_rows:
+                    condition_cfg = {
+                        "criteria": [
+                            {
+                                "field": str(item.get("field") or "").strip(),
+                                "operator": str(item.get("operator") or "equals").strip(),
+                                "value": item.get("value"),
+                            }
+                            for item in filter_rule_rows
+                            if str(item.get("field") or "").strip()
+                        ],
+                        "criteria_mode": "all",
+                    }
+                    rows = [
+                        row for row in rows
+                        if self._flow_condition_match_row(row, condition_cfg)
+                    ]
+
+                mapping = _parse_mapping_rules(step.get("mappingRules"), step.get("mapping_rules"))
+                mapping_rows = _enabled_rows(step.get("mappingRows") or step.get("mapping_rows"))
+                for item in mapping_rows:
+                    source_name = str(item.get("source") or "").strip()
+                    target_name = str(item.get("target") or "").strip()
+                    if source_name and target_name:
+                        mapping[source_name] = target_name
+                if mapping:
+                    mapped_rows: List[Any] = []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            mapped_rows.append(row)
+                            continue
+                        next_row = dict(row)
+                        for source_field, target_field in mapping.items():
+                            value, found = self._extract_row_value_by_path(row, source_field)
+                            if not found:
+                                default_value = ""
+                                for map_row in mapping_rows:
+                                    if str(map_row.get("source") or "").strip() == source_field:
+                                        default_value = str(map_row.get("defaultValue") or map_row.get("default_value") or "")
+                                        break
+                                if default_value:
+                                    value = default_value
+                                    found = True
+                            if found and target_field:
+                                next_row[target_field] = value
+                        mapped_rows.append(next_row)
+                    rows = mapped_rows
+
+                order_rows = _enabled_rows(step.get("orderByRows") or step.get("order_by_rows"))
+                for item in reversed(order_rows):
+                    field_name = str(item.get("field") or "").strip()
+                    if not field_name:
+                        continue
+                    descending = str(item.get("direction") or "").strip().lower() == "desc"
+                    def _sort_key(row: Any) -> tuple:
+                        if not isinstance(row, dict):
+                            return (1, "")
+                        value, found = self._extract_row_value_by_path(row, field_name)
+                        if not found or value is None:
+                            return (1, "")
+                        return (0, str(value))
+                    rows = sorted(
+                        rows,
+                        key=_sort_key,
+                        reverse=descending,
+                    )
+
+                limit_rows = step.get("limitRows", step.get("limit_rows"))
+                try:
+                    limit_number = int(limit_rows)
+                except Exception:
+                    limit_number = 0
+                if limit_number > 0:
+                    rows = rows[:limit_number]
+
+                output_mapping_rows = _enabled_rows(step.get("outputMappings") or step.get("output_mappings"))
+                if output_mapping_rows:
+                    output_mapped: List[Any] = []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            output_mapped.append(row)
+                            continue
+                        next_row: Dict[str, Any] = {}
+                        for item in output_mapping_rows:
+                            source_name = str(item.get("source") or "").strip()
+                            target_name = str(item.get("target") or source_name).strip()
+                            if not source_name or not target_name:
+                                continue
+                            value, found = self._extract_row_value_by_path(row, source_name)
+                            if found:
+                                next_row[target_name] = value
+                        output_mapped.append(next_row)
+                    rows = output_mapped
+
+                join_keys = [
+                    {
+                        "left_field": str(item.get("leftField") or item.get("left_field") or "").strip(),
+                        "right_field": str(item.get("rightField") or item.get("right_field") or "").strip(),
+                    }
+                    for item in _enabled_rows(step.get("joinKeys") or step.get("join_keys"))
+                ]
+                lookup_meta = {
+                    "lookup_source": str(step.get("lookupSource") or step.get("lookup_source") or ""),
+                    "join_keys": [item for item in join_keys if item.get("left_field") and item.get("right_field")],
+                    "tables": _enabled_rows(step.get("tables")),
+                    "group_by": [
+                        str(item.get("field") or "").strip()
+                        for item in _enabled_rows(step.get("groupByFields") or step.get("group_by_fields"))
+                        if str(item.get("field") or "").strip()
+                    ],
+                    "having": [
+                        {
+                            "field": str(item.get("field") or "").strip(),
+                            "operator": str(item.get("operator") or "equals").strip(),
+                            "value": item.get("value"),
+                        }
+                        for item in _enabled_rows(step.get("havingRules") or step.get("having_rules"))
+                        if str(item.get("field") or "").strip()
+                    ],
+                    "order_by": [
+                        {
+                            "field": str(item.get("field") or "").strip(),
+                            "direction": str(item.get("direction") or "asc").strip().lower(),
+                        }
+                        for item in order_rows
+                        if str(item.get("field") or "").strip()
+                    ],
+                    "limit": limit_number if limit_number > 0 else None,
+                    "target": str(step.get("target") or ""),
+                }
+                if lookup_meta.get("lookup_source") or lookup_meta.get("join_keys") or lookup_meta.get("tables") or lookup_meta.get("group_by") or lookup_meta.get("having") or lookup_meta.get("order_by") or lookup_meta.get("limit") or lookup_meta.get("target"):
+                    rows = [
+                        {**row, "_data_ops_lookup": lookup_meta}
+                        if isinstance(row, dict) else row
+                        for row in rows
+                    ]
+            elif step_kind == "validate" or operation in {"filter", "validate", "tag", "reject"}:
+                filter_rule_rows = _enabled_rows(step.get("filterRules") or step.get("filter_rules"))
+                condition_cfg = {
+                    "criteria": [
+                        {
+                            "field": str(item.get("field") or "").strip(),
+                            "operator": str(item.get("operator") or "equals").strip(),
+                            "value": item.get("value"),
+                        }
+                        for item in filter_rule_rows
+                        if str(item.get("field") or "").strip()
+                    ],
+                    "criteria_mode": "all",
+                } if filter_rule_rows else _simple_condition_config(expression)
+                required_rule_rows = _enabled_rows(step.get("requiredFieldRules") or step.get("required_field_rules"))
+                required_fields = [
+                    str(item.get("field") or "").strip()
+                    for item in required_rule_rows
+                    if str(item.get("field") or "").strip()
+                ] or _parse_fields(step.get("requiredFields") or step.get("required_fields") or step.get("fields"))
+                validation_mode = str(step.get("validationMode") or step.get("validation_mode") or operation or "filter").strip().lower()
+                if validation_mode not in {"tag", "reject"}:
+                    validation_mode = "filter"
+                reject_field = str(step.get("rejectField") or step.get("reject_field") or "_data_ops_valid").strip() or "_data_ops_valid"
+                validated_rows: List[Any] = []
+                rejected_rows = 0
+                for row in rows:
+                    expression_ok = self._flow_condition_match_row(row, condition_cfg) if condition_cfg else True
+                    required_ok = True
+                    if required_fields:
+                        required_ok = isinstance(row, dict) and all(
+                            self._extract_row_value_by_path(row, field)[1]
+                            for field in required_fields
+                        )
+                    is_valid = bool(expression_ok and required_ok)
+                    if is_valid:
+                        if validation_mode == "tag" and isinstance(row, dict):
+                            tagged = dict(row)
+                            tagged[reject_field] = True
+                            validated_rows.append(tagged)
+                        else:
+                            validated_rows.append(row)
+                    elif validation_mode == "tag" and isinstance(row, dict):
+                        tagged = dict(row)
+                        tagged[reject_field] = False
+                        tagged[f"{reject_field}_reason"] = "validation_failed"
+                        validated_rows.append(tagged)
+                        rejected_rows += 1
+                    else:
+                        rejected_rows += 1
+                rows = validated_rows
+            elif step_kind == "map" or operation == "map_fields":
+                mapping = _parse_mapping_rules(step.get("mappingRules"), step.get("mapping_rules"), step.get("fields"))
+                mapping_rows = _enabled_rows(step.get("mappingRows") or step.get("mapping_rows"))
+                for item in mapping_rows:
+                    source_name = str(item.get("source") or "").strip()
+                    target_name = str(item.get("target") or "").strip()
+                    if source_name and target_name:
+                        mapping[source_name] = target_name
+                if mapping:
+                    mapped: List[Any] = []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            mapped.append(row)
+                            continue
+                        next_row = dict(row)
+                        for source_field, target_field in mapping.items():
+                            value, found = self._extract_row_value_by_path(row, source_field)
+                            if not found:
+                                default_value = ""
+                                for map_row in mapping_rows:
+                                    if str(map_row.get("source") or "").strip() == source_field:
+                                        default_value = str(map_row.get("defaultValue") or map_row.get("default_value") or "")
+                                        break
+                                if default_value:
+                                    value = default_value
+                                    found = True
+                            if found and target_field:
+                                next_row[target_field] = value
+                        mapped.append(next_row)
+                    rows = mapped
+            elif step_kind == "load":
+                output_mapping_rows = _enabled_rows(step.get("outputMappings") or step.get("output_mappings"))
+                if output_mapping_rows:
+                    output_mapped: List[Any] = []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            output_mapped.append(row)
+                            continue
+                        next_row: Dict[str, Any] = {}
+                        for item in output_mapping_rows:
+                            source_name = str(item.get("source") or "").strip()
+                            target_name = str(item.get("target") or source_name).strip()
+                            if not source_name or not target_name:
+                                continue
+                            value, found = self._extract_row_value_by_path(row, source_name)
+                            if found:
+                                next_row[target_name] = value
+                        output_mapped.append(next_row)
+                    rows = output_mapped
+                load_meta = {
+                    "target_mode": str(step.get("targetMode") or step.get("target_mode") or "oracle"),
+                    "write_mode": str(step.get("writeMode") or step.get("write_mode") or operation or "upsert"),
+                    "target": str(step.get("target") or ""),
+                    "key_fields": _parse_fields(step.get("keyFields") or step.get("key_fields")) or [
+                        str(item.get("target") or item.get("source") or "").strip()
+                        for item in output_mapping_rows
+                        if self._parse_bool_like(item.get("key", False), False)
+                    ],
+                }
+                rows = [
+                    {**row, "_data_ops_load": load_meta}
+                    if isinstance(row, dict) else row
+                    for row in rows
+                ]
+            elif step_kind == "monitor":
+                metrics = _parse_fields(step.get("metrics") or "row_count,error_count,duplicate_count")
+                audit_field = str(step.get("auditField") or step.get("audit_field") or "_data_ops_audit").strip() or "_data_ops_audit"
+                audit = {
+                    "metrics": metrics,
+                    "row_count": len(rows),
+                    "step": name,
+                    "at": datetime.utcnow().isoformat(),
+                }
+                rows = [
+                    {**row, audit_field: audit}
+                    if isinstance(row, dict) else row
+                    for row in rows
+                ]
+
+            summary_steps.append({
+                "name": name,
+                "kind": step_kind,
+                "operation": operation or "pass_through",
+                "status": "success",
+                "input_rows": before_count,
+                "output_rows": len(rows),
+                "checkpoint": self._parse_bool_like(step.get("checkpoint", True), True),
+            })
+
+        if isinstance(execution_context, dict):
+            warnings = execution_context.get("node_warnings")
+            if isinstance(warnings, list) and not any(str(item).startswith("Data Ops:") for item in warnings):
+                warnings.append(f"Data Ops: executed {len(summary_steps)} configured pipeline step(s).")
+        if isinstance(config, dict):
+            config["_data_ops_last_run"] = {
+                "steps": summary_steps,
+                "input_rows": len(data) if isinstance(data, list) else 0,
+                "output_rows": len(rows),
+                "ran_at": datetime.utcnow().isoformat(),
+            }
+        return rows
 
     async def _transform_profile_query(
         self,
@@ -19863,12 +20328,13 @@ END;"""
         bundle = self._load_mlops_runtime_model_bundle(bundle_cfg)
         predictor_kind = str(bundle.get("predictor_kind") or "pipeline").strip().lower() or "pipeline"
         if predictor_kind == "ensemble_pipeline":
-            return self._transform_mlops_ensemble_pipeline(
+            ensemble_rows = self._transform_mlops_ensemble_pipeline(
                 rows,
                 bundle,
                 config or {},
                 execution_context=execution_context,
             )
+            return self._mlops_runtime_apply_rre_rules(ensemble_rows, config or {})
         raw_feature_fields = bundle.get("feature_fields")
         if not raw_feature_fields:
             raw_feature_fields = (config or {}).get("mlops_stage3_feature_fields")
@@ -20293,8 +20759,11 @@ END;"""
                     if mode_msg not in node_warnings:
                         node_warnings.append(mode_msg)
             if forecast_mode == "future_only":
-                return [row for row in output_rows if isinstance(row, dict) and row.get("mlops_segment") == "future_forecast"]
-            return output_rows
+                return self._mlops_runtime_apply_rre_rules(
+                    [row for row in output_rows if isinstance(row, dict) and row.get("mlops_segment") == "future_forecast"],
+                    config or {},
+                )
+            return self._mlops_runtime_apply_rre_rules(output_rows, config or {})
 
         if not feature_fields:
             raise RuntimeError("MLOps production mode requires feature fields from Stage 3 training.")
@@ -20869,7 +21338,7 @@ END;"""
                 )
                 if mode_msg not in node_warnings:
                     node_warnings.append(mode_msg)
-        return out_rows
+        return self._mlops_runtime_apply_rre_rules(out_rows, config or {})
 
     def _mlops_runtime_rule_get(self, row: Dict[str, Any], field_path: str) -> Any:
         path = str(field_path or "").strip()
@@ -20996,6 +21465,163 @@ END;"""
         for row in rows:
             next_row = dict(row)
             self._mlops_runtime_rule_set(next_row, field, self._mlops_runtime_rule_template(template, next_row))
+            out.append(next_row)
+        return out
+
+    def _mlops_runtime_rre_get(self, row: Dict[str, Any], field_path: str) -> Any:
+        path = str(field_path or "").strip()
+        if not path:
+            return None
+        value = self._mlops_runtime_rule_get(row, path)
+        if value is not None:
+            return value
+        for prefix in ("source.", "predictions."):
+            if path.startswith(prefix):
+                value = self._mlops_runtime_rule_get(row, path[len(prefix):])
+                if value is not None:
+                    return value
+        return None
+
+    def _mlops_runtime_rre_matches(self, left: Any, operator: str, right: Any) -> bool:
+        op = str(operator or "exists").strip().lower()
+        if op in {"exists", "not_empty", "is_not_empty"}:
+            return left is not None and str(left).strip() != ""
+        if op in {"empty", "is_empty"}:
+            return left is None or str(left).strip() == ""
+        if op in {">", ">=", "<", "<=", "gt", "gte", "lt", "lte"}:
+            left_num = self._mlops_runtime_rule_float(left)
+            right_num = self._mlops_runtime_rule_float(right)
+            if left_num is None or right_num is None:
+                return False
+            if op in {">", "gt"}:
+                return left_num > right_num
+            if op in {">=", "gte"}:
+                return left_num >= right_num
+            if op in {"<", "lt"}:
+                return left_num < right_num
+            return left_num <= right_num
+        if op == "contains":
+            return str(right).lower() in str(left).lower()
+        matched = str(left).lower() == str(right).lower()
+        if op in {"!=", "not_equals", "neq"}:
+            return not matched
+        return matched
+
+    def _mlops_runtime_rre_group_matches(self, row: Dict[str, Any], group: Any) -> bool:
+        if not isinstance(group, dict):
+            return False
+        results: List[bool] = []
+        conditions = group.get("conditions") if isinstance(group.get("conditions"), list) else []
+        for condition in conditions:
+            if not isinstance(condition, dict):
+                continue
+            field = str(condition.get("field") or "").strip()
+            operator = str(condition.get("operator") or "exists").strip()
+            value = condition.get("value")
+            results.append(self._mlops_runtime_rre_matches(self._mlops_runtime_rre_get(row, field), operator, value))
+        groups = group.get("groups") if isinstance(group.get("groups"), list) else []
+        for child in groups:
+            results.append(self._mlops_runtime_rre_group_matches(row, child))
+        if not results:
+            return False
+        join = str(group.get("join") or "and").strip().lower()
+        return any(results) if join == "or" else all(results)
+
+    def _mlops_runtime_render_rre_template(self, row: Dict[str, Any], rule: Dict[str, Any]) -> str:
+        template = str(
+            rule.get("templateBody")
+            or rule.get("template_body")
+            or rule.get("body")
+            or ""
+        )
+        if not template:
+            return ""
+        values: Dict[str, str] = {
+            "responsibility": str(rule.get("templateResponsibility") or rule.get("template_responsibility") or ""),
+        }
+        mappings = rule.get("templateMappings") if isinstance(rule.get("templateMappings"), list) else []
+        for mapping in mappings:
+            if not isinstance(mapping, dict):
+                continue
+            placeholder = str(mapping.get("placeholder") or "").strip()
+            if not placeholder:
+                continue
+            source = str(mapping.get("source") or "field").strip().lower()
+            if source == "custom":
+                values[placeholder] = str(mapping.get("value") or "")
+            else:
+                values[placeholder] = "" if self._mlops_runtime_rre_get(row, str(mapping.get("field") or "")) is None else str(
+                    self._mlops_runtime_rre_get(row, str(mapping.get("field") or ""))
+                )
+
+        def _replace(match: Any) -> str:
+            key = str(match.group(1) or "").strip()
+            return values.get(key, "")
+
+        try:
+            return re.sub(r"\{\{\s*([^{}]+?)\s*\}\}", _replace, template)
+        except Exception:
+            return template
+
+    def _mlops_runtime_apply_rre_rules(self, rows: List[Any], config: Dict[str, Any]) -> List[Any]:
+        legacy_fields = {
+            "rre_recommendation_text",
+            "rre_template_id",
+            "rre_template_name",
+            "rre_template_responsibility",
+            "rre_selected_rule_id",
+            "rre_selected_rule_name",
+            "rre_matched_rule_ids",
+            "rre_matched_rule_names",
+        }
+
+        def _without_legacy_fields(items: List[Any]) -> List[Any]:
+            cleaned: List[Any] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    cleaned.append(item)
+                    continue
+                next_item = dict(item)
+                for field in legacy_fields:
+                    next_item.pop(field, None)
+                cleaned.append(next_item)
+            return cleaned
+
+        rules = config.get("mlops_rre_rules") if isinstance(config, dict) else None
+        if isinstance(rules, str) and rules.strip():
+            try:
+                parsed = json.loads(rules)
+                rules = parsed if isinstance(parsed, list) else []
+            except Exception:
+                rules = []
+        if not isinstance(rules, list) or not rules:
+            return _without_legacy_fields(rows)
+        active_rules = [
+            rule for rule in rules
+            if isinstance(rule, dict) and rule.get("enabled") is not False
+        ]
+        if not active_rules:
+            return _without_legacy_fields(rows)
+        active_rules.sort(key=lambda rule: float(rule.get("priority") or 999999))
+        out: List[Any] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                out.append(row)
+                continue
+            next_row = dict(row)
+            for field in legacy_fields:
+                next_row.pop(field, None)
+            matched = [
+                rule for rule in active_rules
+                if self._mlops_runtime_rre_group_matches(next_row, rule.get("rootGroup") or rule.get("root_group"))
+            ]
+            matched_ids = {str(rule.get("id") or "") for rule in matched}
+            for rule in active_rules:
+                column = str(rule.get("name") or rule.get("id") or "").strip()
+                if not column:
+                    continue
+                value = self._mlops_runtime_render_rre_template(next_row, rule) if str(rule.get("id") or "") in matched_ids else ""
+                self._mlops_runtime_rule_set(next_row, column, value)
             out.append(next_row)
         return out
 

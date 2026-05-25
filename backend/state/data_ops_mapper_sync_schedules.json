@@ -1,0 +1,40 @@
+{
+  "data_ops_mapper_sync:cb7a346c-26bf-4f5f-862b-6b2a5e8fa1ec:data_ops_step_1779644898832_3": {
+    "deploy_enabled": false,
+    "enabled": false,
+    "schedule_type": "interval",
+    "sql_sha256": "",
+    "updated_at": "2026-05-25T09:34:43.237222"
+  },
+  "data_ops_mapper_sync:cb7a346c-26bf-4f5f-862b-6b2a5e8fa1ec:data_ops_step_1779644898832_3:mapper_1779702748798_bf0274": {
+    "deploy_enabled": false,
+    "enabled": false,
+    "schedule_type": "interval",
+    "sql_sha256": "e5c74c1eff88bc8b0393dc6599f18aa226d743cf172b7d4750f891b363efb2e0",
+    "updated_at": "2026-05-25T10:07:22.099313"
+  },
+  "data_ops_mapper_sync:cb7a346c-26bf-4f5f-862b-6b2a5e8fa1ec:data_ops_step_1779644898832_3:mapper_1779702810397_e664d9": {
+    "deploy_enabled": false,
+    "enabled": false,
+    "schedule_type": "interval",
+    "sql_sha256": "661c188404ee22bbb9ec5ac6f56dfbe0f684434e26d999572fb94db5b9c601f4",
+    "updated_at": "2026-05-25T10:01:27.035641"
+  },
+  "data_ops_mapper_sync:cb7a346c-26bf-4f5f-862b-6b2a5e8fa1ec:data_ops_step_1779644898832_3:mapper_1779704148794_a20840": {
+    "deploy_enabled": false,
+    "enabled": false,
+    "schedule_type": "interval",
+    "sql_sha256": "",
+    "updated_at": "2026-05-25T10:18:37.503414"
+  },
+  "data_ops_mapper_sync:cb7a346c-26bf-4f5f-862b-6b2a5e8fa1ec:data_ops_step_1779698469224_4": {
+    "deploy_enabled": true,
+    "enabled": true,
+    "max_instances": 2,
+    "misfire_policy": "skip",
+    "schedule": "every 3 minute(s)",
+    "schedule_type": "interval",
+    "sql_sha256": "e5c74c1eff88bc8b0393dc6599f18aa226d743cf172b7d4750f891b363efb2e0",
+    "updated_at": "2026-05-25T08:54:10.943480"
+  }
+}
