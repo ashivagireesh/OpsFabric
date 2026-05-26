@@ -3,7 +3,7 @@ import {
   Drawer, Form, Input, Select, Switch, InputNumber,
   Button, Typography, Space, Tabs, Divider, Tag, Tooltip, Table, notification, Modal, Popover, AutoComplete, Tree, Popconfirm, Collapse
 } from 'antd'
-import { ArrowDownOutlined, ArrowUpOutlined, ArrowsAltOutlined, CloseOutlined, CopyOutlined, DeleteOutlined, InfoCircleOutlined, MinusSquareOutlined, PlusSquareOutlined, ReloadOutlined, SaveOutlined } from '@ant-design/icons'
+import { ArrowDownOutlined, ArrowUpOutlined, ArrowsAltOutlined, CloseOutlined, CopyOutlined, DeleteOutlined, EyeOutlined, InfoCircleOutlined, MinusSquareOutlined, PlusSquareOutlined, ReloadOutlined, SaveOutlined } from '@ant-design/icons'
 import Editor, { type Monaco } from '@monaco-editor/react'
 import Plot from 'react-plotly.js'
 import ReactFlow, {
@@ -10217,6 +10217,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [fileViewerDatasetView, setFileViewerDatasetView] = useState<'data' | 'summary'>('data')
   const [fileViewerTableResetKey, setFileViewerTableResetKey] = useState(0)
   const [fileViewerVisibleTableRows, setFileViewerVisibleTableRows] = useState<Record<string, unknown>[]>([])
+  const [fileViewerExpandedColumns, setFileViewerExpandedColumns] = useState<string[]>([])
+  const [fileViewerRecordOverlay, setFileViewerRecordOverlay] = useState<{
+    tabKey: string
+    rowIndex: number
+    row: Record<string, unknown>
+  } | null>(null)
   const fileViewerBrowseInputRef = useRef<HTMLInputElement>(null)
   const [fileViewerBrowseUploading, setFileViewerBrowseUploading] = useState(false)
   const [customFieldStudioOpen, setCustomFieldStudioOpen] = useState(false)
@@ -10445,6 +10451,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [mlopsRemoteRowsLoading, setMLOpsRemoteRowsLoading] = useState(false)
   const [mlopsRemoteRowsError, setMLOpsRemoteRowsError] = useState<string | null>(null)
   const [mlopsRemoteRows, setMLOpsRemoteRows] = useState<Array<Record<string, unknown>>>([])
+  const [mlopsRemoteRowsRequestKey, setMLOpsRemoteRowsRequestKey] = useState(0)
   const [mlopsStage2FieldConfigsByFieldDraft, setMLOpsStage2FieldConfigsByFieldDraft] = useState<Record<string, MLOpsStage2FieldConfig>>({})
   const [mlopsStage2PreviewLimitDraft, setMLOpsStage2PreviewLimitDraft] = useState<number>(200)
   const [mlopsStage2TargetFieldDraft, setMLOpsStage2TargetFieldDraft] = useState('')
@@ -10841,6 +10848,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     setFileViewerStudioOpen(false)
     setFileViewerTabs([])
     setFileViewerActiveTabKey('')
+    setFileViewerExpandedColumns([])
+    setFileViewerRecordOverlay(null)
     setCustomFieldStudioOpen(false)
     setOracleStudioOpen(false)
     setLmdbStudioOpen(false)
@@ -11107,14 +11116,40 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       return String(value)
     }
   }, [])
+  const toggleFileViewerColumnExpanded = useCallback((tabKey: string, column: string) => {
+    const token = `${tabKey}:${column}`
+    setFileViewerExpandedColumns((current) => (
+      current.includes(token)
+        ? current.filter((item) => item !== token)
+        : [...current, token]
+    ))
+  }, [])
   const activeFileViewerGridColumns = useMemo(() => {
     const tabKey = activeFileViewerTab?.key || ''
-    return activeFileViewerDisplayColumns.slice(0, 180).map((key) => ({
-      title: key,
+    const dataColumns = activeFileViewerDisplayColumns.slice(0, 180).map((key) => {
+      const expanded = fileViewerExpandedColumns.includes(`${tabKey}:${key}`)
+      return ({
+      title: (
+        <Space size={4} style={{ maxWidth: '100%' }}>
+          <Tooltip title={expanded ? 'Collapse column' : 'Expand column'}>
+            <Button
+              type="text"
+              size="small"
+              icon={<ArrowsAltOutlined />}
+              onClick={(event) => {
+                event.stopPropagation()
+                toggleFileViewerColumnExpanded(tabKey, key)
+              }}
+              style={{ width: 22, height: 22 }}
+            />
+          </Tooltip>
+          <Text style={{ color: 'var(--app-text)', fontSize: 12 }} ellipsis>{key}</Text>
+        </Space>
+      ),
       dataIndex: key,
       key,
-      width: 160,
-      ellipsis: true,
+      width: expanded ? 380 : 160,
+      ellipsis: !expanded,
       sorter: (a: Record<string, unknown>, b: Record<string, unknown>) => String(a?.[key] ?? '').localeCompare(String(b?.[key] ?? ''), undefined, { numeric: true }),
       filterSearch: true,
       filters: Array.from(new Set((activeFileViewerTab?.rows || [])
@@ -11140,14 +11175,46 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         const text = formatFileViewerCellText(value)
         return (
           <Tooltip title={text.length > 80 ? text : undefined}>
-            <Text style={{ color: 'var(--app-text)', fontSize: 11, fontFamily: 'monospace' }} ellipsis>
+            <Text
+              style={{
+                color: 'var(--app-text)',
+                fontSize: 11,
+                fontFamily: 'monospace',
+                whiteSpace: expanded ? 'normal' : 'nowrap',
+                wordBreak: expanded ? 'break-word' : 'normal',
+              }}
+              ellipsis={!expanded}
+            >
               {text}
             </Text>
           </Tooltip>
         )
       },
-    }))
-  }, [activeFileViewerTab, activeFileViewerDisplayColumns, fileViewerSelectedCell, formatFileViewerCellText])
+    })
+    })
+    return [
+      {
+        title: 'Record',
+        key: '__record_view',
+        fixed: 'left' as const,
+        width: 88,
+        render: (_value: unknown, record: Record<string, unknown>, rowIndex?: number) => (
+          <Button
+            size="small"
+            icon={<EyeOutlined />}
+            onClick={() => setFileViewerRecordOverlay({
+              tabKey,
+              rowIndex: Number(rowIndex ?? -1),
+              row: record,
+            })}
+          >
+            View
+          </Button>
+        ),
+      },
+      ...dataColumns,
+    ]
+  }, [activeFileViewerTab, activeFileViewerDisplayColumns, fileViewerExpandedColumns, fileViewerSelectedCell, formatFileViewerCellText, toggleFileViewerColumnExpanded])
   const fileViewerFieldOptions = useMemo(() => {
     return activeFileViewerBaseColumns.map((column) => ({ value: column, label: column }))
   }, [activeFileViewerBaseColumns])
@@ -16407,6 +16474,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       setMLOpsRemoteRows([])
       return
     }
+    if (mlopsRemoteRowsRequestKey <= 0) {
+      setMLOpsRemoteRowsLoading(false)
+      return
+    }
     if (mlopsPreviewRowsLocal.length > 0) {
       setMLOpsRemoteRowsLoading(false)
       setMLOpsRemoteRowsError(null)
@@ -16422,13 +16493,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     }
     let cancelled = false
     const fetchRows = async () => {
+      const latestOutputPreviewLimit = 500
       setMLOpsRemoteRowsLoading(true)
       setMLOpsRemoteRowsError(null)
       try {
         const merged: Array<Record<string, unknown>> = []
         const seen = new Set<string>()
         for (const sourceNodeId of mlopsPreferredSourceNodeIds) {
-          if (cancelled || merged.length >= 5000) break
+          if (cancelled || merged.length >= latestOutputPreviewLimit) break
           let response: any = null
           try {
             response = await api.runTabularQuery({
@@ -16436,6 +16508,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               pipeline_id: pipelineId,
               pipeline_node_id: String(sourceNodeId || '').trim(),
               strict_node_output: true,
+              limit: latestOutputPreviewLimit,
             })
           } catch {
             continue
@@ -16444,7 +16517,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             ? response.data.filter((row: unknown) => !!row && typeof row === 'object' && !Array.isArray(row)) as Array<Record<string, unknown>>
             : []
           for (const row of rows) {
-            if (merged.length >= 5000) break
+            if (merged.length >= latestOutputPreviewLimit) break
             let sig = ''
             try {
               sig = JSON.stringify(row) || ''
@@ -16457,7 +16530,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           }
         }
         if (!cancelled) {
-          setMLOpsRemoteRows(merged.slice(0, 5000))
+          setMLOpsRemoteRows(merged.slice(0, latestOutputPreviewLimit))
           if (merged.length <= 0) {
             setMLOpsRemoteRowsError(
               mlopsDataQuerySourceNodeIds.length > 0
@@ -16484,6 +16557,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     nodeType,
     selectedNodeId,
     activePipelineId,
+    mlopsRemoteRowsRequestKey,
     mlopsPreferredSourceNodeIds,
     mlopsDataQuerySourceNodeIds,
     mlopsPreviewRowsLocal,
@@ -18342,6 +18416,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_stage4_monitor_enabled: mlopsStage4MonitorEnabledDraft,
       mlops_stage4_monitor_sample_size: mlopsStage4MonitorSampleSizeDraft,
       mlops_stage4_monitor_numeric_fields: mlopsStage4SelectedMonitorFields,
+      mlops_rre_rules: Array.isArray(nodeConfig.mlops_rre_rules) ? nodeConfig.mlops_rre_rules : [],
+      mlops_rre_feature_dictionary: Array.isArray(nodeConfig.mlops_rre_feature_dictionary) ? nodeConfig.mlops_rre_feature_dictionary : [],
+      mlops_rre_auto_signal_json_fields: Array.isArray(nodeConfig.mlops_rre_auto_signal_json_fields) ? nodeConfig.mlops_rre_auto_signal_json_fields : [],
+      mlops_rre_cluster_config: Array.isArray(nodeConfig.mlops_rre_cluster_config) ? nodeConfig.mlops_rre_cluster_config : [],
     }),
     [
       mlopsSampleSizeDraft,
@@ -18412,6 +18490,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlopsStage4MonitorEnabledDraft,
       mlopsStage4MonitorSampleSizeDraft,
       mlopsStage4SelectedMonitorFields,
+      nodeConfig.mlops_rre_rules,
+      nodeConfig.mlops_rre_feature_dictionary,
+      nodeConfig.mlops_rre_auto_signal_json_fields,
+      nodeConfig.mlops_rre_cluster_config,
     ],
   )
   const mlopsStudioHasUnsavedChanges = useMemo(() => {
@@ -22778,7 +22860,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage4SelectedMonitorFields,
   ])
 
-  const saveMLOpsStudioConfig = useCallback(() => {
+  const saveMLOpsStudioConfig = useCallback(async () => {
     if (nodeType !== 'mlops_transform' || !selectedNodeId) return
     const safeStage2PreviewLimit = Number.isFinite(mlopsStage2PreviewLimitDraft)
       ? Math.max(10, Math.min(Math.trunc(mlopsStage2PreviewLimitDraft), 5000))
@@ -22873,11 +22955,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_stage4_monitor_numeric_fields: mlopsStage4SelectedMonitorFields,
       mlops_stage4_last_run_summary: mlopsStage4Summary || null,
       mlops_rre_rules: Array.isArray(nodeConfig.mlops_rre_rules) ? nodeConfig.mlops_rre_rules : [],
+      mlops_rre_feature_dictionary: Array.isArray(nodeConfig.mlops_rre_feature_dictionary) ? nodeConfig.mlops_rre_feature_dictionary : [],
+      mlops_rre_auto_signal_json_fields: Array.isArray(nodeConfig.mlops_rre_auto_signal_json_fields) ? nodeConfig.mlops_rre_auto_signal_json_fields : [],
+      mlops_rre_cluster_config: Array.isArray(nodeConfig.mlops_rre_cluster_config) ? nodeConfig.mlops_rre_cluster_config : [],
       mlops_rre_output_fields: [],
     })
+    await savePipeline()
     notification.success({
       message: 'MLOps Studio saved',
-      description: 'EDA, Pre-Processing, Model Training, and Deploy/Monitor configuration saved.',
+      description: 'Configuration was written to the pipeline permanently.',
       placement: 'bottomRight',
       duration: 2,
     })
@@ -22960,6 +23046,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     mlopsStage4SelectedMonitorFields,
     mlopsStage4Summary,
     nodeConfig,
+    savePipeline,
     pruneMLOpsStage3FeatureFields,
     updateNodeConfig,
   ])
@@ -23232,6 +23319,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               .filter(Boolean)
         ).slice(0, 12),
     }
+    setMLOpsRemoteRowsRequestKey(0)
+    setMLOpsRemoteRowsLoading(false)
+    setMLOpsRemoteRowsError(null)
+    setMLOpsRemoteRows([])
     setMLOpsStudioOpen(true)
   }, [
     nodeType,
@@ -23329,7 +23420,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       cancelText: 'Discard',
       centered: true,
       onOk: () => {
-        saveMLOpsStudioConfig()
+        return saveMLOpsStudioConfig()
       },
       onCancel: () => {
         mlopsStudioInitialConfigRef.current = null
@@ -40350,16 +40441,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       onCancel={requestCloseMLOpsStudio}
       footer={null}
       closable={false}
-      centered
-      width="96vw"
+      width="100vw"
+      style={{ top: 0, paddingBottom: 0, maxWidth: '100vw' }}
       styles={{
         content: {
           padding: 0,
-          borderRadius: 12,
+          borderRadius: 0,
           overflow: 'hidden',
           border: '1px solid var(--app-border-strong)',
           background: 'var(--app-panel-bg)',
-          height: '94vh',
+          height: '100vh',
           display: 'flex',
           flexDirection: 'column',
         },
@@ -40413,6 +40504,19 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               loading latest Data Query output…
             </Tag>
           )}
+          {mlopsPreviewRowsLocal.length <= 0 && String(activePipelineId || '').trim() && mlopsPreferredSourceNodeIds.length > 0 ? (
+            <Button
+              size="small"
+              loading={mlopsRemoteRowsLoading}
+              onClick={() => {
+                setMLOpsRemoteRows([])
+                setMLOpsRemoteRowsError(null)
+                setMLOpsRemoteRowsRequestKey(Date.now())
+              }}
+            >
+              Load Latest Output
+            </Button>
+          ) : null}
           <Space size={6}>
             <Switch size="small" checked={mlopsCompactView} onChange={(checked) => setMLOpsCompactView(Boolean(checked))} />
             <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Compact</Text>
@@ -43648,12 +43752,27 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               predictionFields={mlopsRREPredictionFields}
               predictionRows={mlopsRREPredictionRows}
               rulesConfig={Array.isArray(nodeConfig.mlops_rre_rules) ? nodeConfig.mlops_rre_rules as any[] : undefined}
+              featureDictionary={Array.isArray(nodeConfig.mlops_rre_feature_dictionary) ? nodeConfig.mlops_rre_feature_dictionary as any[] : undefined}
+              autoSignalJsonFields={Array.isArray(nodeConfig.mlops_rre_auto_signal_json_fields) ? nodeConfig.mlops_rre_auto_signal_json_fields as string[] : undefined}
+              clusterConfig={Array.isArray(nodeConfig.mlops_rre_cluster_config) ? nodeConfig.mlops_rre_cluster_config as any[] : undefined}
               onRulesConfigChange={(rules) => {
                 if (!selectedNodeId) return
                 updateNodeConfig(selectedNodeId, {
                   mlops_rre_rules: rules,
                   mlops_rre_output_fields: [],
                 })
+              }}
+              onFeatureDictionaryChange={(dictionary) => {
+                if (!selectedNodeId) return
+                updateNodeConfig(selectedNodeId, { mlops_rre_feature_dictionary: dictionary })
+              }}
+              onAutoSignalJsonFieldsChange={(fields) => {
+                if (!selectedNodeId) return
+                updateNodeConfig(selectedNodeId, { mlops_rre_auto_signal_json_fields: fields })
+              }}
+              onClusterConfigChange={(clusters) => {
+                if (!selectedNodeId) return
+                updateNodeConfig(selectedNodeId, { mlops_rre_cluster_config: clusters })
               }}
             />
           </div>
@@ -45378,6 +45497,93 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 	        </div>
 	      </Modal>
 	    )}
+	    <Modal
+	      open={Boolean(fileViewerRecordOverlay)}
+	      title={fileViewerRecordOverlay ? `Record ${fileViewerRecordOverlay.rowIndex + 1}` : 'Record'}
+	      onCancel={() => setFileViewerRecordOverlay(null)}
+	      footer={[
+	        <Button key="close" onClick={() => setFileViewerRecordOverlay(null)}>Close</Button>,
+	      ]}
+	      width="84vw"
+	      centered={false}
+	      zIndex={2600}
+	      style={{ top: 48 }}
+	      maskStyle={{ zIndex: 2599 }}
+	      styles={{
+	        content: {
+	          height: '84vh',
+	          borderRadius: 8,
+	          display: 'flex',
+	          flexDirection: 'column',
+	          background: 'var(--app-panel-bg)',
+	        },
+	        body: {
+	          flex: 1,
+	          overflowY: 'auto',
+	          padding: 12,
+	        },
+	      }}
+	    >
+	      {fileViewerRecordOverlay ? (
+	        <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, overflow: 'hidden', background: 'var(--app-card-bg)' }}>
+	          {Array.from(new Set([
+	            ...activeFileViewerBaseColumns,
+	            ...Object.keys(fileViewerRecordOverlay.row || {}),
+	          ])).map((field, index) => {
+	            const value = fileViewerRecordOverlay.row?.[field]
+	            const text = formatFileViewerCellText(value)
+	            const tall = text.length > 160 || /[\r\n{}[\]]/.test(text)
+	            return (
+	              <div
+	                key={field}
+	                style={{
+	                  display: 'grid',
+	                  gridTemplateColumns: '220px minmax(0, 1fr)',
+	                  gap: 10,
+	                  alignItems: tall ? 'start' : 'center',
+	                  padding: '7px 10px',
+	                  borderTop: index === 0 ? 'none' : '1px solid var(--app-border)',
+	                }}
+	              >
+	                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, fontWeight: 700, lineHeight: '18px' }} ellipsis>
+	                  {field}
+	                </Text>
+	                {tall ? (
+	                  <Input.TextArea
+	                    readOnly
+	                    value={text}
+	                    rows={3}
+	                    autoSize={{ minRows: 3, maxRows: 8 }}
+	                    style={{
+	                      background: 'var(--app-input-bg)',
+	                      color: 'var(--app-text)',
+	                      border: '1px solid var(--app-border)',
+	                      fontFamily: 'monospace',
+	                      fontSize: 12,
+	                      lineHeight: '18px',
+	                      resize: 'vertical',
+	                    }}
+	                  />
+	                ) : (
+	                  <Text
+	                    copyable={text ? { text } : false}
+	                    style={{
+	                      color: text ? 'var(--app-text)' : 'var(--app-text-dim)',
+	                      fontSize: 12,
+	                      fontFamily: 'monospace',
+	                      lineHeight: '18px',
+	                    }}
+	                    ellipsis={{ tooltip: text.length > 120 ? text : undefined }}
+	                  >
+	                    {text || '-'}
+	                  </Text>
+	                )}
+	              </div>
+	            )
+	          })}
+	        </div>
+	      ) : null}
+	    </Modal>
 	    {isLmdbSource && (
       <Modal
         open={lmdbStudioOpen}

@@ -3,6 +3,7 @@ import {
   Alert,
   Button,
   Card,
+  Checkbox,
   Form,
   Input,
   InputNumber,
@@ -29,6 +30,7 @@ const { Text, Title } = Typography
 type RuleOperator = '>' | '>=' | '<' | '<=' | '=' | '!=' | 'contains' | 'exists'
 type ConditionJoin = 'and' | 'or'
 type TemplateMappingSource = 'field' | 'custom'
+type RRESeverity = 'HIGH' | 'MEDIUM' | 'LOW'
 
 interface RRECondition {
   id: string
@@ -51,6 +53,31 @@ interface RRETemplateMapping {
   value: string
 }
 
+interface RREFeatureDictionaryEntry {
+  field: string
+  business_name: string
+  meaning: string
+  unit: string
+  direction: string
+  auto_signal_enabled: boolean
+  warning_threshold: string
+  critical_threshold: string
+  default_recommendation: string
+}
+
+interface RRESignalConfig {
+  enabled: boolean
+  feature: string
+  severity: RRESeverity
+  valueField: string
+  peerValueField: string
+  impactSource: TemplateMappingSource
+  impactField: string
+  impactValue: string
+  recommendation: string
+  jsonFields: string[]
+}
+
 interface RRERule {
   id: string
   name: string
@@ -61,6 +88,7 @@ interface RRERule {
   templateName?: string
   templateBody?: string
   templateResponsibility?: string
+  signalConfig?: RRESignalConfig
   templateMappings: RRETemplateMapping[]
 }
 
@@ -71,6 +99,16 @@ interface RRETemplate {
   body: string
 }
 
+interface RREClusterConfig {
+  id: string
+  name: string
+  enabled: boolean
+  features: string[]
+  observation: string
+  recommendation: string
+  priority: number
+}
+
 interface RREStudioProps {
   sourceFields?: string[]
   predictionFields?: string[]
@@ -78,6 +116,12 @@ interface RREStudioProps {
   predictionRows?: Array<Record<string, unknown>>
   rulesConfig?: RRERule[]
   onRulesConfigChange?: (rules: RRERule[]) => void
+  featureDictionary?: RREFeatureDictionaryEntry[]
+  onFeatureDictionaryChange?: (dictionary: RREFeatureDictionaryEntry[]) => void
+  autoSignalJsonFields?: string[]
+  onAutoSignalJsonFieldsChange?: (fields: string[]) => void
+  clusterConfig?: RREClusterConfig[]
+  onClusterConfigChange?: (clusters: RREClusterConfig[]) => void
 }
 
 const sampleModelOutput = {
@@ -117,6 +161,39 @@ const joinOptions: { label: string; value: ConditionJoin }[] = [
   { label: 'AND', value: 'and' },
   { label: 'OR', value: 'or' },
 ]
+
+const severityOptions: { label: string; value: RRESeverity }[] = [
+  { label: 'HIGH', value: 'HIGH' },
+  { label: 'MEDIUM', value: 'MEDIUM' },
+  { label: 'LOW', value: 'LOW' },
+]
+
+const directionOptions = [
+  { label: 'Higher is risky', value: 'higher_is_risky' },
+  { label: 'Lower is risky', value: 'lower_is_risky' },
+  { label: 'Deviation is risky', value: 'deviation_is_risky' },
+  { label: 'Informational', value: 'informational' },
+]
+
+const signalJsonFieldOptions = [
+  { label: 'Summary', value: 'summary' },
+  { label: 'Observation', value: 'observation' },
+  { label: 'Recommendation', value: 'recommendation' },
+  { label: 'Default Recommendation', value: 'default_recommendation' },
+  { label: 'Risk Band', value: 'risk_band' },
+  { label: 'Feature', value: 'feature' },
+  { label: 'Business Name', value: 'business_name' },
+  { label: 'Meaning', value: 'meaning' },
+  { label: 'Severity', value: 'severity' },
+  { label: 'Value', value: 'value' },
+  { label: 'Peer Value', value: 'peer_value' },
+  { label: 'Impact', value: 'impact' },
+  { label: 'Unit', value: 'unit' },
+  { label: 'Direction', value: 'direction' },
+]
+
+const defaultSignalJsonFields = ['summary', 'observation', 'recommendation', 'default_recommendation', 'risk_band', 'feature', 'severity', 'value', 'peer_value', 'impact']
+const defaultAutoSignalJsonFields = ['business_name', 'severity', 'value', 'threshold', 'threshold_type', 'observation', 'recommendation']
 
 function newCondition(seed?: Partial<RRECondition>): RRECondition {
   return {
@@ -169,6 +246,125 @@ function normalizeMappings(raw: any): RRETemplateMapping[] {
   })).filter((item) => item.placeholder)
 }
 
+function normalizeSignalConfig(raw: any): RRESignalConfig {
+  const jsonFields = Array.isArray(raw?.jsonFields || raw?.json_fields)
+    ? (raw?.jsonFields || raw?.json_fields).map((item: unknown) => String(item || '').trim()).filter(Boolean)
+    : defaultSignalJsonFields
+  return {
+    enabled: raw?.enabled !== false,
+    feature: String(raw?.feature || ''),
+    severity: ['HIGH', 'MEDIUM', 'LOW'].includes(String(raw?.severity || '')) ? raw.severity : 'MEDIUM',
+    valueField: String(raw?.valueField || raw?.value_field || ''),
+    peerValueField: String(raw?.peerValueField || raw?.peer_value_field || ''),
+    impactSource: raw?.impactSource === 'custom' || raw?.impact_source === 'custom' ? 'custom' : 'field',
+    impactField: String(raw?.impactField || raw?.impact_field || ''),
+    impactValue: String(raw?.impactValue || raw?.impact_value || ''),
+    recommendation: String(raw?.recommendation || ''),
+    jsonFields,
+  }
+}
+
+function normalizeFeatureDictionary(raw: unknown): RREFeatureDictionaryEntry[] {
+  if (!Array.isArray(raw)) return []
+  return raw.map((item: any) => ({
+    field: String(item?.field || ''),
+    business_name: String(item?.business_name || item?.businessName || ''),
+    meaning: String(item?.meaning || ''),
+    unit: String(item?.unit || ''),
+    direction: String(item?.direction || 'higher_is_risky'),
+    auto_signal_enabled: Boolean(item?.auto_signal_enabled || item?.autoSignalEnabled || false),
+    warning_threshold: String(item?.warning_threshold || item?.warningThreshold || ''),
+    critical_threshold: String(item?.critical_threshold || item?.criticalThreshold || ''),
+    default_recommendation: String(item?.default_recommendation || item?.defaultRecommendation || ''),
+  })).filter((item) => item.field)
+}
+
+function titleCase(value: string): string {
+  return value
+    .replace(/^(source|predictions)\./, '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[_\-.]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase())
+}
+
+function inferFeatureMetadata(field: string): RREFeatureDictionaryEntry {
+  const key = field.toLowerCase()
+  let meaning = 'possible business exception or behavior requiring review'
+  let unit = ''
+  let direction = 'higher_is_risky'
+  let defaultRecommendation = `Review ${titleCase(field).toLowerCase()} and validate supporting evidence.`
+
+  if (key.includes('ratio') || key.includes('rate') || key.includes('percent') || key.includes('success')) unit = '%'
+  if (key.includes('count')) unit = 'count'
+  if (key.includes('amount') || key.includes('amt')) unit = 'amount'
+  if (key.includes('score')) unit = 'score'
+  if (key.includes('velocity')) unit = 'txn/min'
+
+  if (key.includes('fail')) {
+    meaning = 'possible authentication issue, retry pattern, or process friction'
+    defaultRecommendation = 'Review failed transactions and validate the authentication process.'
+  } else if (key.includes('location') || key.includes('geo') || key.includes('gps')) {
+    meaning = 'possible location inconsistency, GPS mismatch, shared device usage, or field misuse'
+    defaultRecommendation = 'Verify device, GPS, and agent operating location.'
+  } else if (key.includes('velocity') || key.includes('burst')) {
+    meaning = 'possible bulk, scripted, or abnormal transaction behavior'
+    defaultRecommendation = 'Monitor burst transactions and check for scripted behavior.'
+  } else if (key.includes('repeat') || key.includes('customer_concentration')) {
+    meaning = 'possible customer concentration, repeated customer usage, or limited customer dependency'
+    defaultRecommendation = 'Review repeated customer usage and account concentration.'
+  } else if (key.includes('risk')) {
+    meaning = 'elevated model risk signal requiring operational review'
+    defaultRecommendation = 'Review high-risk cases and validate the rule evidence.'
+  } else if (key.includes('confidence')) {
+    meaning = 'model certainty signal used to support decision confidence'
+    direction = 'informational'
+    defaultRecommendation = 'Use confidence level with rule evidence before taking action.'
+  } else if (key.includes('drift')) {
+    meaning = 'possible model or data distribution drift'
+    defaultRecommendation = 'Review recent data distribution and model monitoring signals.'
+  }
+
+  return {
+    field,
+    business_name: titleCase(field),
+    meaning,
+    unit,
+    direction,
+    auto_signal_enabled: false,
+    warning_threshold: '',
+    critical_threshold: '',
+    default_recommendation: defaultRecommendation,
+  }
+}
+
+function parseDictionaryImport(text: string): RREFeatureDictionaryEntry[] {
+  const trimmed = text.trim()
+  if (!trimmed) return []
+  try {
+    const parsed = JSON.parse(trimmed)
+    if (Array.isArray(parsed)) return normalizeFeatureDictionary(parsed)
+    if (parsed && typeof parsed === 'object') {
+      return normalizeFeatureDictionary(Object.entries(parsed).map(([field, meta]) => ({ field, ...(meta as Record<string, unknown>) })))
+    }
+  } catch {
+    // Fall through to CSV/TSV parsing.
+  }
+
+  const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  if (lines.length < 2) return []
+  const delimiter = lines[0].includes('\t') ? '\t' : ','
+  const headers = lines[0].split(delimiter).map((item) => item.trim())
+  return normalizeFeatureDictionary(lines.slice(1).map((line) => {
+    const cells = line.split(delimiter).map((item) => item.trim())
+    return headers.reduce<Record<string, string>>((acc, header, index) => {
+      acc[header] = cells[index] || ''
+      return acc
+    }, {})
+  }))
+}
+
 function normalizeRulesConfig(raw: unknown): RRERule[] {
   if (!Array.isArray(raw)) return initialRules
   if (raw.length === 0) return []
@@ -182,8 +378,22 @@ function normalizeRulesConfig(raw: unknown): RRERule[] {
     templateName: String(item?.templateName || item?.template_name || ''),
     templateBody: String(item?.templateBody || item?.template_body || ''),
     templateResponsibility: String(item?.templateResponsibility || item?.template_responsibility || ''),
+    signalConfig: item?.signalConfig || item?.signal_config ? normalizeSignalConfig(item?.signalConfig || item?.signal_config) : undefined,
     templateMappings: normalizeMappings(item?.templateMappings),
   }))
+}
+
+function normalizeClusterConfig(raw: unknown): RREClusterConfig[] {
+  if (!Array.isArray(raw)) return []
+  return raw.map((item: any, index) => ({
+    id: String(item?.id || `cluster-${index + 1}`),
+    name: String(item?.name || item?.cluster || `Cluster ${index + 1}`),
+    enabled: item?.enabled !== false,
+    features: Array.isArray(item?.features) ? item.features.map((field: unknown) => String(field || '').trim()).filter(Boolean) : [],
+    observation: String(item?.observation || ''),
+    recommendation: String(item?.recommendation || ''),
+    priority: Number(item?.priority || index + 1),
+  })).filter((item) => item.name)
 }
 
 function cloneRule(rule: RRERule): RRERule {
@@ -198,6 +408,11 @@ function ruleOutputColumn(rule: RRERule): string {
   return String(rule.name || rule.id || '').trim()
 }
 
+function signalOutputColumn(rule: RRERule): string {
+  const base = ruleOutputColumn(rule)
+  return base ? `${base}_Generate_XAI_signal` : ''
+}
+
 function templateFromRuleSnapshot(rule: RRERule): RRETemplate | null {
   const id = String(rule.templateId || '').trim()
   const body = String(rule.templateBody || '').trim()
@@ -209,6 +424,20 @@ function templateFromRuleSnapshot(rule: RRERule): RRETemplate | null {
     responsibility: String(rule.templateResponsibility || ''),
     body,
   }
+}
+
+function severityWord(severity: string): string {
+  if (severity === 'HIGH') return 'significantly'
+  if (severity === 'LOW') return 'slightly'
+  return 'moderately'
+}
+
+function riskBand(score: unknown): string {
+  const n = Number(score)
+  if (!Number.isFinite(n)) return ''
+  if (n >= 80 || (n <= 1 && n >= 0.8)) return 'HIGH'
+  if (n >= 60 || (n <= 1 && n >= 0.6)) return 'MEDIUM'
+  return 'LOW'
 }
 
 function readField(row: Record<string, unknown>, path: string): unknown {
@@ -295,6 +524,16 @@ function collectOutputFields(value: unknown, prefix = ''): string[] {
   })
 }
 
+function uniqueOptions(options: Array<{ label: string; value: string; group?: string }>) {
+  const seen = new Set<string>()
+  return options.filter((option) => {
+    const value = String(option.value || '').trim()
+    if (!value || seen.has(value)) return false
+    seen.add(value)
+    return true
+  })
+}
+
 function extractPlaceholders(template: RRETemplate | undefined): string[] {
   const body = template?.body || ''
   return Array.from(new Set(Array.from(body.matchAll(/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g)).map((m) => m[1])))
@@ -311,11 +550,14 @@ function renderTemplate(
   template: RRETemplate | undefined,
   rule: RRERule | undefined,
   output: Record<string, unknown>,
+  dictionary: RREFeatureDictionaryEntry[] = [],
 ): string {
   if (!template || !rule) return 'No template matched the satisfied rules.'
   const values: Record<string, string> = {
     responsibility: template.responsibility,
   }
+  const signal = buildNarrative(rule, output, dictionary)
+  Object.assign(values, signal.placeholders)
   rule.templateMappings.forEach((mapping) => {
     if (!mapping.placeholder) return
     values[mapping.placeholder] = resolveMappedValue(output, mapping)
@@ -323,6 +565,199 @@ function renderTemplate(
   return template.body.replace(/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g, (_match, key: string) => (
     values[key] ?? ''
   ))
+}
+
+function buildNarrative(rule: RRERule, output: Record<string, unknown>, dictionary: RREFeatureDictionaryEntry[]) {
+  const cfg = rule.signalConfig
+  const feature = String(cfg?.feature || '').trim()
+  const meta = dictionary.find((item) => item.field === feature)
+  const businessName = meta?.business_name || feature || rule.name
+  const severity = cfg?.severity || 'MEDIUM'
+  const value = cfg?.valueField ? readField(output, cfg.valueField) : undefined
+  const peerValue = cfg?.peerValueField ? readField(output, cfg.peerValueField) : undefined
+  const impact = cfg?.impactSource === 'custom'
+    ? cfg.impactValue
+    : (cfg?.impactField ? formatScalar(readField(output, cfg.impactField)) : '')
+  const defaultRecommendation = meta?.default_recommendation || ''
+  const recommendation = cfg?.recommendation || defaultRecommendation
+  const risk = riskBand(readField(output, 'predictions.risk_score') ?? readField(output, 'risk_score') ?? readField(output, 'prediction_score'))
+  const summary = risk ? `${rule.name} classified this record as ${risk} risk.` : `${rule.name} matched this record.`
+  let observation = ''
+  if (feature && peerValue !== undefined && peerValue !== null && String(peerValue).trim() !== '') {
+    observation = `${businessName.charAt(0).toUpperCase()}${businessName.slice(1)} is ${severityWord(severity)} higher than peer behavior, with observed value ${formatScalar(value)} compared to peer average ${formatScalar(peerValue)}.`
+  } else if (feature) {
+    observation = `${businessName.charAt(0).toUpperCase()}${businessName.slice(1)} is ${severityWord(severity)} abnormal, with observed value ${formatScalar(value)}.`
+  }
+  if (meta?.meaning) observation = `${observation} This indicates ${meta.meaning}.`
+  const signalRecommendations = recommendation ? `- ${recommendation}` : ''
+  const signalOutput = [
+    summary,
+    observation ? `Observation: ${observation}` : '',
+    impact ? `Impact: ${impact}` : '',
+    recommendation ? `Recommendation: ${recommendation}` : '',
+  ].filter(Boolean).join('\n')
+  return {
+    observation,
+    recommendation,
+    json: {
+      summary,
+      observation,
+      recommendation,
+      default_recommendation: defaultRecommendation,
+      risk_band: risk,
+      feature,
+      business_name: businessName,
+      meaning: meta?.meaning || '',
+      severity,
+      value: formatScalar(value),
+      peer_value: formatScalar(peerValue),
+      impact: String(impact || ''),
+      unit: meta?.unit || '',
+      direction: meta?.direction || '',
+    },
+    placeholders: {
+      signal_output: signalOutput,
+      summary,
+      signal_observations: observation ? `- ${observation}` : '',
+      signal_recommendations: signalRecommendations,
+      signal_default_recommendation: defaultRecommendation,
+      top_signal: businessName,
+      risk_band: risk,
+      signal_feature: feature,
+      signal_business_name: businessName,
+      signal_meaning: meta?.meaning || '',
+      signal_unit: meta?.unit || '',
+      signal_direction: meta?.direction || '',
+      signal_severity: severity,
+      signal_value: formatScalar(value),
+      signal_peer_value: formatScalar(peerValue),
+      signal_impact: String(impact || ''),
+      signal_action: recommendation,
+    },
+  }
+}
+
+function buildSignalJsonOutput(rule: RRERule, output: Record<string, unknown>, dictionary: RREFeatureDictionaryEntry[]): string {
+  const cfg = normalizeSignalConfig(rule.signalConfig)
+  if (cfg.enabled === false) return ''
+  const narrative = buildNarrative(rule, output, dictionary)
+  const fields = cfg.jsonFields.length > 0 ? cfg.jsonFields : defaultSignalJsonFields
+  const selected = fields.reduce<Record<string, string>>((acc, field) => {
+    const key = String(field || '').trim()
+    if (!key) return acc
+    acc[key] = String((narrative.json as Record<string, unknown>)[key] ?? '')
+    return acc
+  }, {})
+  return JSON.stringify(selected)
+}
+
+function evaluateAutoSignal(entry: RREFeatureDictionaryEntry, output: Record<string, unknown>) {
+  if (!entry.auto_signal_enabled) return null
+  const value = readField(output, entry.field)
+  const num = Number(value)
+  if (!Number.isFinite(num)) return null
+  const warning = Number(entry.warning_threshold)
+  const critical = Number(entry.critical_threshold)
+  const hasWarning = Number.isFinite(warning)
+  const hasCritical = Number.isFinite(critical)
+  if (!hasWarning && !hasCritical) return null
+  const direction = String(entry.direction || 'higher_is_risky')
+  const criticalHit = hasCritical && (
+    direction === 'lower_is_risky' ? num <= critical : num >= critical
+  )
+  const warningHit = hasWarning && (
+    direction === 'lower_is_risky' ? num <= warning : num >= warning
+  )
+  if (!criticalHit && !warningHit) return null
+  const severity = criticalHit ? 'HIGH' : 'MEDIUM'
+  const threshold = criticalHit ? entry.critical_threshold : entry.warning_threshold
+  const businessName = entry.business_name || titleCase(entry.field)
+  const relation = direction === 'lower_is_risky' ? 'below' : 'above'
+  const observation = `${businessName} is ${severity === 'HIGH' ? 'significantly' : 'moderately'} ${relation} ${criticalHit ? 'critical' : 'warning'} threshold ${threshold}, with observed value ${formatScalar(value)}.`
+  return {
+    feature: entry.field,
+    business_name: businessName,
+    severity,
+    value: formatScalar(value),
+    threshold: String(threshold || ''),
+    threshold_type: criticalHit ? 'critical' : 'warning',
+    direction,
+    unit: entry.unit || '',
+    meaning: entry.meaning || '',
+    observation: entry.meaning ? `${observation} This indicates ${entry.meaning}.` : observation,
+    recommendation: entry.default_recommendation || '',
+  }
+}
+
+function buildAutoSignalJsonOutput(output: Record<string, unknown>, dictionary: RREFeatureDictionaryEntry[]): string {
+  const signals = dictionary.map((entry) => evaluateAutoSignal(entry, output)).filter(Boolean)
+  if (!signals.length) return ''
+  return JSON.stringify({ signals })
+}
+
+function buildSelectedAutoSignalJsonOutput(output: Record<string, unknown>, dictionary: RREFeatureDictionaryEntry[], selectedFields: string[]): string {
+  const fields = selectedFields.length > 0 ? selectedFields : defaultAutoSignalJsonFields
+  const signals = dictionary
+    .map((entry) => evaluateAutoSignal(entry, output))
+    .filter(Boolean)
+    .map((signal) => fields.reduce<Record<string, string>>((acc, field) => {
+      const key = String(field || '').trim()
+      if (key) acc[key] = String((signal as Record<string, unknown>)[key] ?? '')
+      return acc
+    }, {}))
+  if (!signals.length) return ''
+  return JSON.stringify({ signals })
+}
+
+function buildAutoSignalPreview(entry: RREFeatureDictionaryEntry, output: Record<string, unknown> | null): Record<string, unknown> {
+  if (!output) {
+    return {
+      status: 'no_sample',
+      reason: 'No preview row is available. Use Load Latest Output to preview against actual data.',
+      field: entry.field,
+    }
+  }
+  const signal = evaluateAutoSignal(entry, output)
+  if (signal) return signal
+  const value = entry.field ? readField(output, entry.field) : undefined
+  return {
+    status: 'not_triggered',
+    reason: value === undefined || value === null || String(value).trim() === ''
+      ? `No sample value found for ${entry.field || 'selected field'}. Use Load Latest Output or select a field available in preview data.`
+      : 'Sample value does not cross the configured warning or critical threshold.',
+    field: entry.field,
+    sample_value: formatScalar(value),
+    direction: entry.direction || 'higher_is_risky',
+    warning_threshold: entry.warning_threshold || '',
+    critical_threshold: entry.critical_threshold || '',
+    auto_signal_enabled: Boolean(entry.auto_signal_enabled),
+  }
+}
+
+function buildClusterRecommendationOutput(output: Record<string, unknown>, dictionary: RREFeatureDictionaryEntry[], clusters: RREClusterConfig[]): string {
+  const signals = dictionary.map((entry) => evaluateAutoSignal(entry, output)).filter(Boolean) as Array<Record<string, string>>
+  if (!signals.length) return ''
+  const signalByFeature = new Map(signals.map((signal) => [String(signal.feature || ''), signal]))
+  const matchedClusters = clusters
+    .filter((cluster) => cluster.enabled !== false)
+    .sort((a, b) => Number(a.priority || 999999) - Number(b.priority || 999999))
+    .map((cluster) => {
+      const matchedSignals = cluster.features.map((field) => signalByFeature.get(field)).filter(Boolean) as Array<Record<string, string>>
+      if (!matchedSignals.length) return null
+      const severity = matchedSignals.some((signal) => signal.severity === 'HIGH') ? 'HIGH' : 'MEDIUM'
+      const names = matchedSignals.map((signal) => signal.business_name || signal.feature).filter(Boolean).join(', ')
+      return {
+        cluster: cluster.name,
+        severity,
+        features: matchedSignals.map((signal) => signal.feature),
+        observation: cluster.observation || `${cluster.name} matched ${matchedSignals.length} signal(s): ${names}.`,
+        recommendation: cluster.recommendation || matchedSignals.map((signal) => signal.recommendation).filter(Boolean).join(' '),
+        signals: matchedSignals,
+      }
+    })
+    .filter(Boolean)
+  if (!matchedClusters.length) return ''
+  return JSON.stringify({ clusters: matchedClusters })
 }
 
 function updateGroupById(group: RREConditionGroup, groupId: string, patcher: (group: RREConditionGroup) => RREConditionGroup): RREConditionGroup {
@@ -450,10 +885,21 @@ function RuleConditionGroupEditor({
 
 export default function RREStudio(props: RREStudioProps) {
   const [rules, setRulesState] = useState<RRERule[]>(() => normalizeRulesConfig(props.rulesConfig))
+  const [featureDictionary, setFeatureDictionaryState] = useState<RREFeatureDictionaryEntry[]>(() => normalizeFeatureDictionary(props.featureDictionary))
+  const [clusterConfig, setClusterConfigState] = useState<RREClusterConfig[]>(() => normalizeClusterConfig(props.clusterConfig))
   const [ruleConfigDraft, setRuleConfigDraft] = useState<RRERule | null>(null)
   const [templates, setTemplates] = useState<RRETemplate[]>(initialTemplates)
   const [templatesLoading, setTemplatesLoading] = useState(false)
   const [templateSaving, setTemplateSaving] = useState(false)
+  const [dictionaryImportOpen, setDictionaryImportOpen] = useState(false)
+  const [dictionaryImportText, setDictionaryImportText] = useState('')
+  const [featureConfigDraft, setFeatureConfigDraft] = useState<{ index: number; item: RREFeatureDictionaryEntry } | null>(null)
+  const [autoSignalFieldsOpen, setAutoSignalFieldsOpen] = useState(false)
+  const [clusterConfigOpen, setClusterConfigOpen] = useState(false)
+  const [clusterDraft, setClusterDraft] = useState<RREClusterConfig | null>(null)
+  const [autoSignalJsonFields, setAutoSignalJsonFieldsState] = useState<string[]>(() => (
+    Array.isArray(props.autoSignalJsonFields) && props.autoSignalJsonFields.length > 0 ? props.autoSignalJsonFields : defaultAutoSignalJsonFields
+  ))
   const externalModelOutput = useMemo(() => buildModelOutputFromFields(props), [
     props.sourceFields,
     props.predictionFields,
@@ -470,6 +916,10 @@ export default function RREStudio(props: RREStudioProps) {
     body: '',
   })
   const externalRulesSignature = useMemo(() => JSON.stringify(props.rulesConfig || null), [props.rulesConfig])
+  const externalDictionarySignature = useMemo(() => JSON.stringify(props.featureDictionary || null), [props.featureDictionary])
+  const externalAutoSignalFieldsSignature = useMemo(() => JSON.stringify(props.autoSignalJsonFields || null), [props.autoSignalJsonFields])
+  const externalClusterSignature = useMemo(() => JSON.stringify(props.clusterConfig || null), [props.clusterConfig])
+  const dictionaryLocalSignature = useMemo(() => JSON.stringify(featureDictionary), [featureDictionary])
 
   const parsedOutput = useMemo(() => {
     try {
@@ -490,6 +940,20 @@ export default function RREStudio(props: RREStudioProps) {
   useEffect(() => {
     if (props.rulesConfig) setRulesState(normalizeRulesConfig(props.rulesConfig))
   }, [externalRulesSignature])
+
+  useEffect(() => {
+    if (props.featureDictionary) setFeatureDictionaryState(normalizeFeatureDictionary(props.featureDictionary))
+  }, [externalDictionarySignature])
+
+  useEffect(() => {
+    if (props.autoSignalJsonFields) {
+      setAutoSignalJsonFieldsState(props.autoSignalJsonFields.length > 0 ? props.autoSignalJsonFields : defaultAutoSignalJsonFields)
+    }
+  }, [externalAutoSignalFieldsSignature])
+
+  useEffect(() => {
+    if (props.clusterConfig) setClusterConfigState(normalizeClusterConfig(props.clusterConfig))
+  }, [externalClusterSignature])
 
   useEffect(() => {
     let active = true
@@ -514,15 +978,19 @@ export default function RREStudio(props: RREStudioProps) {
     return () => { active = false }
   }, [])
 
-  const outputFields = useMemo(() => parsedOutput.row ? collectOutputFields(parsedOutput.row) : [], [parsedOutput.row])
+  const outputFields = useMemo(() => Array.from(new Set(parsedOutput.row ? collectOutputFields(parsedOutput.row) : [])), [parsedOutput.row])
   const sourceFields = outputFields.filter((field) => field.startsWith('source.'))
   const predictionFields = outputFields.filter((field) => field.startsWith('predictions.'))
   const otherOutputFields = outputFields.filter((field) => !field.startsWith('source.') && !field.startsWith('predictions.'))
-  const fieldOptions = [
-    ...sourceFields.map((field) => ({ label: field.replace(/^source\./, ''), value: field, group: 'Source Fields' })),
-    ...predictionFields.map((field) => ({ label: field.replace(/^predictions\./, ''), value: field, group: 'Prediction Fields' })),
+  const fieldOptions = useMemo(() => uniqueOptions([
+    ...sourceFields.map((field) => ({ label: `${field.replace(/^source\./, '')} (${field})`, value: field, group: 'Source Fields' })),
+    ...predictionFields.map((field) => ({ label: `${field.replace(/^predictions\./, '')} (${field})`, value: field, group: 'Prediction Fields' })),
     ...otherOutputFields.map((field) => ({ label: field, value: field, group: 'Other Output Fields' })),
-  ]
+  ]), [sourceFields, predictionFields, otherOutputFields])
+  const signalFeatureOptions = useMemo(() => uniqueOptions([
+    ...featureDictionary.map((item) => ({ label: item.business_name ? `${item.business_name} (${item.field})` : item.field, value: item.field })),
+    ...fieldOptions,
+  ]), [featureDictionary, fieldOptions])
   const allTemplates = useMemo(() => {
     const byId = new Map<string, RRETemplate>()
     templates.forEach((template) => {
@@ -554,6 +1022,83 @@ export default function RREStudio(props: RREStudioProps) {
       props.onRulesConfigChange?.(next)
       return next
     })
+  }
+
+  const commitFeatureDictionary = (nextItems: RREFeatureDictionaryEntry[] | ((current: RREFeatureDictionaryEntry[]) => RREFeatureDictionaryEntry[])) => {
+    setFeatureDictionaryState((current) => {
+      const next = typeof nextItems === 'function' ? nextItems(current) : nextItems
+      props.onFeatureDictionaryChange?.(next)
+      return next
+    })
+  }
+
+  const commitAutoSignalJsonFields = (fields: string[]) => {
+    const next = fields.map((item) => String(item || '').trim()).filter(Boolean)
+    setAutoSignalJsonFieldsState(next)
+    props.onAutoSignalJsonFieldsChange?.(next)
+  }
+
+  const commitClusterConfig = (nextItems: RREClusterConfig[] | ((current: RREClusterConfig[]) => RREClusterConfig[])) => {
+    setClusterConfigState((current) => {
+      const next = typeof nextItems === 'function' ? nextItems(current) : nextItems
+      props.onClusterConfigChange?.(next)
+      return next
+    })
+  }
+
+  const saveClusterDraft = () => {
+    if (!clusterDraft) return
+    commitClusterConfig((current) => {
+      const exists = current.some((item) => item.id === clusterDraft.id)
+      return exists ? current.map((item) => item.id === clusterDraft.id ? clusterDraft : item) : [...current, clusterDraft]
+    })
+    setClusterDraft(null)
+  }
+
+  const mergeFeatureDictionary = (incoming: RREFeatureDictionaryEntry[]) => {
+    if (!incoming.length) return
+    commitFeatureDictionary((current) => {
+      const byField = new Map<string, RREFeatureDictionaryEntry>()
+      current.forEach((item) => {
+        if (item.field) byField.set(item.field, item)
+      })
+      incoming.forEach((item) => {
+        if (!item.field) return
+        byField.set(item.field, { ...(byField.get(item.field) || inferFeatureMetadata(item.field)), ...item })
+      })
+      return Array.from(byField.values())
+    })
+  }
+
+  const generateMissingFeatureDictionary = () => {
+    const existing = new Set(featureDictionary.map((item) => item.field).filter(Boolean))
+    const incoming = outputFields.filter((field) => !existing.has(field)).map(inferFeatureMetadata)
+    if (!incoming.length) {
+      notification.info({ message: 'Feature dictionary already has all output fields.' })
+      return
+    }
+    mergeFeatureDictionary(incoming)
+    notification.success({ message: `Added ${incoming.length} feature dictionary rows.` })
+  }
+
+  const applyDictionaryImport = () => {
+    const imported = parseDictionaryImport(dictionaryImportText)
+    if (!imported.length) {
+      notification.warning({ message: 'No valid feature dictionary rows found.' })
+      return
+    }
+    mergeFeatureDictionary(imported)
+    setDictionaryImportText('')
+    setDictionaryImportOpen(false)
+    notification.success({ message: `Imported ${imported.length} feature dictionary rows.` })
+  }
+
+  const saveFeatureConfigDraft = () => {
+    if (!featureConfigDraft) return
+    commitFeatureDictionary((current) => current.map((item, index) => (
+      index === featureConfigDraft.index ? featureConfigDraft.item : item
+    )))
+    setFeatureConfigDraft(null)
   }
 
   const validationErrors = useMemo(() => {
@@ -591,9 +1136,9 @@ export default function RREStudio(props: RREStudioProps) {
     return {
       matched,
       template,
-      explanation: renderTemplate(template, selectedRule, parsedOutput.row),
+      explanation: renderTemplate(template, selectedRule, parsedOutput.row, featureDictionary),
     }
-  }, [parsedOutput.row, rules, allTemplates, validationErrors.length])
+  }, [parsedOutput.row, rules, allTemplates, validationErrors.length, featureDictionary])
 
   const recommendationOutput = useMemo(() => {
     const out: Record<string, string> = {}
@@ -602,10 +1147,18 @@ export default function RREStudio(props: RREStudioProps) {
       if (!column) return
       const matched = evaluation.matched.some((item) => item.id === rule.id)
       const template = allTemplates.find((item) => item.id === rule.templateId)
-      out[column] = matched && parsedOutput.row ? renderTemplate(template, rule, parsedOutput.row) : ''
+      out[column] = matched && parsedOutput.row ? renderTemplate(template, rule, parsedOutput.row, featureDictionary) : ''
+      const signalColumn = signalOutputColumn(rule)
+      if (signalColumn) {
+        out[signalColumn] = matched && parsedOutput.row && normalizeSignalConfig(rule.signalConfig).enabled
+          ? buildSignalJsonOutput(rule, parsedOutput.row, featureDictionary)
+          : ''
+      }
     })
+    if (parsedOutput.row) out.Auto_Generate_XAI_signal = buildSelectedAutoSignalJsonOutput(parsedOutput.row, featureDictionary, autoSignalJsonFields)
+    if (parsedOutput.row) out.Auto_Cluster_Recommendation = buildClusterRecommendationOutput(parsedOutput.row, featureDictionary, clusterConfig)
     return out
-  }, [evaluation.matched, parsedOutput.row, rules, allTemplates])
+  }, [evaluation.matched, parsedOutput.row, rules, allTemplates, featureDictionary, autoSignalJsonFields, clusterConfig])
 
   const addRule = () => {
     const id = `rule-${Date.now()}`
@@ -616,6 +1169,18 @@ export default function RREStudio(props: RREStudioProps) {
         priority: rules.length + 1,
         rootGroup: newGroup({ join: 'and', conditions: [newCondition({ field: predictionFields[0] || outputFields[0] || 'predictions.ensemble_prediction', operator: 'exists', value: '' })] }),
         templateId: templates[0]?.id || '',
+        signalConfig: {
+          enabled: true,
+          feature: predictionFields[0]?.replace(/^predictions\./, '') || outputFields[0] || '',
+          severity: 'MEDIUM',
+          valueField: predictionFields[0] || outputFields[0] || '',
+          peerValueField: '',
+          impactSource: 'custom',
+          impactField: '',
+          impactValue: '',
+          recommendation: '',
+          jsonFields: defaultSignalJsonFields,
+        },
         templateMappings: [],
     }
     commitRules((current) => [...current, nextRule])
@@ -860,7 +1425,7 @@ export default function RREStudio(props: RREStudioProps) {
                         rows={6}
                         value={templateDraft.body}
                         onChange={(event) => setTemplateDraft((current) => ({ ...current, body: event.target.value }))}
-                        placeholder="Use {{prediction}}, {{riskScore}}, {{confidenceValue}}, {{review_reason}}, {{responsibility}}"
+                        placeholder="Use {{summary}}, {{signal_observations}}, {{signal_recommendations}}, {{top_signal}}, {{risk_band}}, plus mapped fields like {{prediction}}"
                       />
                     </Form.Item>
                     <Button type="primary" loading={templateSaving} onClick={() => void saveTemplate()}>Save Template</Button>
@@ -900,8 +1465,386 @@ export default function RREStudio(props: RREStudioProps) {
               </div>
             ),
           },
+          {
+            key: 'dictionary',
+            label: 'Feature Dictionary',
+            children: (
+              <Space direction="vertical" size={12} style={{ width: '100%' }}>
+              <Card
+                size="small"
+                title="Feature Dictionary"
+                extra={(
+                  <Space wrap>
+                    <Button size="small" onClick={generateMissingFeatureDictionary}>Generate Missing</Button>
+                    <Button size="small" onClick={() => setAutoSignalFieldsOpen(true)}>Auto Signal JSON Fields</Button>
+                    <Button size="small" onClick={() => setClusterConfigOpen(true)}>Cluster Config</Button>
+                    <Button size="small" icon={<FileTextOutlined />} onClick={() => setDictionaryImportOpen(true)}>Paste Import</Button>
+                    <Button size="small" icon={<PlusOutlined />} onClick={() => commitFeatureDictionary((current) => [...current, inferFeatureMetadata(outputFields[0] || '')])}>Feature</Button>
+                  </Space>
+                )}
+                style={{ background: 'var(--app-input-bg)', borderColor: 'var(--app-border-strong)' }}
+              >
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 10 }}
+                  message="Use Generate Missing to create rows. Enable Auto Signal and set warning/critical thresholds to generate Auto_Generate_XAI_signal without manual rules."
+                />
+                <Table
+                  size="small"
+                  rowKey={(_row, index) => `feature_${index}`}
+                  pagination={{ pageSize: 12, size: 'small' }}
+                  dataSource={featureDictionary}
+                  columns={[
+                    {
+                      title: 'Field',
+                      dataIndex: 'field',
+                      width: 260,
+                      ellipsis: true,
+                      render: (field) => <Text style={{ color: 'var(--app-text)', fontFamily: 'monospace', fontSize: 12 }} ellipsis>{String(field || '')}</Text>,
+                    },
+                    {
+                      title: 'Business Name',
+                      dataIndex: 'business_name',
+                      width: 180,
+                      ellipsis: true,
+                    },
+                    {
+                      title: 'Direction',
+                      width: 150,
+                      render: (_value, row) => directionOptions.find((item) => item.value === row.direction)?.label || row.direction || '',
+                    },
+                    {
+                      title: 'Unit',
+                      dataIndex: 'unit',
+                      width: 90,
+                    },
+                    {
+                      title: 'Auto Signal',
+                      width: 110,
+                      render: (_value, row) => <Tag color={row.auto_signal_enabled ? 'blue' : 'default'}>{row.auto_signal_enabled ? 'Enabled' : 'Off'}</Tag>,
+                    },
+                    {
+                      title: 'Warning',
+                      dataIndex: 'warning_threshold',
+                      width: 110,
+                    },
+                    {
+                      title: 'Critical',
+                      dataIndex: 'critical_threshold',
+                      width: 110,
+                    },
+                    {
+                      title: 'Default Recommendation',
+                      dataIndex: 'default_recommendation',
+                      ellipsis: true,
+                    },
+                    {
+                      title: 'Action',
+                      width: 150,
+                      render: (_value, row, index) => (
+                        <Space>
+                          <Button size="small" onClick={() => setFeatureConfigDraft({ index: Number(index ?? -1), item: { ...row } })}>Configure</Button>
+                          <Button size="small" danger icon={<DeleteOutlined />} onClick={() => commitFeatureDictionary((current) => current.filter((_item, idx) => idx !== index))} />
+                        </Space>
+                      ),
+                    },
+                  ]}
+                  locale={{ emptyText: 'Create feature metadata to generate dynamic XAI observations.' }}
+                />
+              </Card>
+              <Card
+                size="small"
+                title="Sample Output"
+                style={{ background: 'var(--app-input-bg)', borderColor: 'var(--app-border-strong)' }}
+              >
+                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(320px, 0.9fr) minmax(420px, 1.1fr)', gap: 12 }}>
+                  <div>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Sample Input Row</Text>
+                    <Input.TextArea
+                      readOnly
+                      rows={8}
+                      value={JSON.stringify(parsedOutput.row || {}, null, 2)}
+                      style={{ marginTop: 6, fontFamily: 'monospace', background: 'var(--app-card-bg)', color: 'var(--app-text)' }}
+                    />
+                  </div>
+                  <div>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Recommendation Output</Text>
+                    <Input.TextArea
+                      readOnly
+                      rows={8}
+                      value={JSON.stringify(recommendationOutput, null, 2)}
+                      style={{ marginTop: 6, fontFamily: 'monospace', background: 'var(--app-card-bg)', color: 'var(--app-text)' }}
+                    />
+                  </div>
+                </div>
+              </Card>
+              </Space>
+            ),
+          },
         ]}
       />
+      <Modal
+        open={dictionaryImportOpen}
+        title="Import Feature Dictionary"
+        okText="Import"
+        onOk={applyDictionaryImport}
+        onCancel={() => setDictionaryImportOpen(false)}
+        width={820}
+      >
+        <Space direction="vertical" size={10} style={{ width: '100%' }}>
+          <Alert
+            type="info"
+            showIcon
+            message="Paste JSON array/object or CSV with headers: field,business_name,meaning,unit,direction,default_recommendation."
+          />
+          <Input.TextArea
+            value={dictionaryImportText}
+            onChange={(event) => setDictionaryImportText(event.target.value)}
+            rows={14}
+            placeholder={`field,business_name,meaning,unit,direction,default_recommendation
+predictions.risk_score,Risk Score,elevated model risk signal requiring operational review,score,higher_is_risky,Review high-risk cases and validate the rule evidence.`}
+            style={{ fontFamily: 'monospace' }}
+          />
+        </Space>
+      </Modal>
+      <Modal
+        open={autoSignalFieldsOpen}
+        title="Auto Signal JSON Fields"
+        okText="Done"
+        onOk={() => setAutoSignalFieldsOpen(false)}
+        onCancel={() => setAutoSignalFieldsOpen(false)}
+        width={760}
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Alert
+            type="info"
+            showIcon
+            message="Select the fields to include inside each Auto_Generate_XAI_signal JSON signal. This is a global setting for all Feature Dictionary auto signals."
+          />
+          <Checkbox.Group
+            value={autoSignalJsonFields}
+            options={[
+              { label: 'Feature', value: 'feature' },
+              { label: 'Business Name', value: 'business_name' },
+              { label: 'Severity', value: 'severity' },
+              { label: 'Value', value: 'value' },
+              { label: 'Threshold', value: 'threshold' },
+              { label: 'Threshold Type', value: 'threshold_type' },
+              { label: 'Direction', value: 'direction' },
+              { label: 'Unit', value: 'unit' },
+              { label: 'Meaning', value: 'meaning' },
+              { label: 'Observation', value: 'observation' },
+              { label: 'Recommendation', value: 'recommendation' },
+            ]}
+            onChange={(fields) => commitAutoSignalJsonFields(fields.map((item) => String(item)))}
+            style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(170px, 1fr))', gap: '10px 14px' }}
+          />
+          <Input.TextArea
+            readOnly
+            rows={5}
+            value={JSON.stringify({ Auto_Generate_XAI_signal: { selected_fields: autoSignalJsonFields } }, null, 2)}
+            style={{ fontFamily: 'monospace', background: 'var(--app-card-bg)', color: 'var(--app-text)' }}
+          />
+        </Space>
+      </Modal>
+      <Modal
+        open={clusterConfigOpen}
+        title="Auto Signal Cluster Config"
+        footer={null}
+        onCancel={() => {
+          setClusterConfigOpen(false)
+          setClusterDraft(null)
+        }}
+        width="96vw"
+        style={{ top: 16, paddingBottom: 0, maxWidth: '96vw' }}
+        styles={{
+          body: {
+            maxHeight: '82vh',
+            overflow: 'auto',
+          },
+        }}
+      >
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(340px, 420px)', gap: 12 }}>
+          <Table
+            size="small"
+            rowKey="id"
+            pagination={{ pageSize: 8, size: 'small' }}
+            dataSource={clusterConfig}
+            columns={[
+              { title: 'Cluster', dataIndex: 'name', ellipsis: true },
+              { title: 'Enabled', width: 90, render: (_value, row) => <Tag color={row.enabled ? 'blue' : 'default'}>{row.enabled ? 'Enabled' : 'Off'}</Tag> },
+              { title: 'Features', width: 220, render: (_value, row) => <Text ellipsis>{row.features.join(', ')}</Text> },
+              { title: 'Priority', dataIndex: 'priority', width: 80 },
+              {
+                title: 'Action',
+                width: 145,
+                render: (_value, row) => (
+                  <Space>
+                    <Button size="small" onClick={() => setClusterDraft({ ...row })}>Edit</Button>
+                    <Button size="small" danger icon={<DeleteOutlined />} onClick={() => commitClusterConfig((current) => current.filter((item) => item.id !== row.id))} />
+                  </Space>
+                ),
+              },
+            ]}
+            locale={{ emptyText: 'Create clusters to group related auto signals into high-level recommendations.' }}
+          />
+          <Card
+            size="small"
+            title={clusterDraft ? 'Configure Cluster' : 'New Cluster'}
+            extra={<Button size="small" icon={<PlusOutlined />} onClick={() => setClusterDraft({
+              id: `cluster-${Date.now()}`,
+              name: 'Transaction Risk Cluster',
+              enabled: true,
+              features: [],
+              observation: '',
+              recommendation: '',
+              priority: clusterConfig.length + 1,
+            })}>New</Button>}
+            style={{ background: 'var(--app-card-bg)', borderColor: 'var(--app-border-strong)' }}
+          >
+            {clusterDraft ? (
+              <Form layout="vertical" size="small">
+                <Form.Item label="Cluster Name">
+                  <Input value={clusterDraft.name} onChange={(event) => setClusterDraft((current) => current ? { ...current, name: event.target.value } : current)} />
+                </Form.Item>
+                <Space style={{ width: '100%', justifyContent: 'space-between', marginBottom: 8 }}>
+                  <Text style={{ color: 'var(--app-text)' }}>Enabled</Text>
+                  <Switch checked={clusterDraft.enabled} onChange={(enabled) => setClusterDraft((current) => current ? { ...current, enabled } : current)} />
+                </Space>
+                <Form.Item label="Priority">
+                  <InputNumber min={1} value={clusterDraft.priority} onChange={(priority) => setClusterDraft((current) => current ? { ...current, priority: Number(priority || 1) } : current)} style={{ width: '100%' }} />
+                </Form.Item>
+                <Form.Item label="Features">
+                  <Select
+                    mode="multiple"
+                    showSearch
+                    optionFilterProp="label"
+                    value={clusterDraft.features}
+                    options={featureDictionary.map((item) => ({ label: item.business_name ? `${item.business_name} (${item.field})` : item.field, value: item.field }))}
+                    onChange={(features) => setClusterDraft((current) => current ? { ...current, features: features.map((item) => String(item)) } : current)}
+                  />
+                </Form.Item>
+                <Form.Item label="Cluster Observation">
+                  <Input.TextArea rows={3} value={clusterDraft.observation} onChange={(event) => setClusterDraft((current) => current ? { ...current, observation: event.target.value } : current)} />
+                </Form.Item>
+                <Form.Item label="Cluster Recommendation">
+                  <Input.TextArea rows={3} value={clusterDraft.recommendation} onChange={(event) => setClusterDraft((current) => current ? { ...current, recommendation: event.target.value } : current)} />
+                </Form.Item>
+                <Button type="primary" block onClick={saveClusterDraft}>Save Cluster</Button>
+              </Form>
+            ) : (
+              <Text style={{ color: 'var(--app-text-subtle)' }}>Select Edit or create a new cluster.</Text>
+            )}
+          </Card>
+        </div>
+      </Modal>
+      <Modal
+        open={Boolean(featureConfigDraft)}
+        title="Configure Feature Dictionary Record"
+        width={980}
+        centered
+        onCancel={() => setFeatureConfigDraft(null)}
+        onOk={saveFeatureConfigDraft}
+        okText="Save Feature"
+        styles={{
+          body: {
+            paddingTop: 12,
+            maxHeight: '72vh',
+            overflowY: 'auto',
+          },
+        }}
+      >
+        {featureConfigDraft ? (
+          <Form layout="vertical" size="small">
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 300px', gap: 14, alignItems: 'start' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(220px, 1fr))', gap: '8px 12px' }}>
+                <Form.Item label="Field" style={{ marginBottom: 8 }}>
+                  <Select
+                    showSearch
+                    allowClear
+                    optionFilterProp="label"
+                    value={featureConfigDraft.item.field || undefined}
+                    options={fieldOptions}
+                    onChange={(field) => setFeatureConfigDraft((current) => current ? { ...current, item: { ...current.item, field: String(field || '') } } : current)}
+                    style={{ width: '100%' }}
+                  />
+                </Form.Item>
+                <Form.Item label="Business Name" style={{ marginBottom: 8 }}>
+                  <Input
+                    value={featureConfigDraft.item.business_name}
+                    placeholder={titleCase(featureConfigDraft.item.field)}
+                    onChange={(event) => setFeatureConfigDraft((current) => current ? { ...current, item: { ...current.item, business_name: event.target.value } } : current)}
+                  />
+                </Form.Item>
+                <Form.Item label="Direction" style={{ marginBottom: 8 }}>
+                  <Select
+                    value={featureConfigDraft.item.direction || 'higher_is_risky'}
+                    options={directionOptions}
+                    onChange={(direction) => setFeatureConfigDraft((current) => current ? { ...current, item: { ...current.item, direction } } : current)}
+                  />
+                </Form.Item>
+                <Form.Item label="Unit" style={{ marginBottom: 8 }}>
+                  <Input
+                    value={featureConfigDraft.item.unit}
+                    onChange={(event) => setFeatureConfigDraft((current) => current ? { ...current, item: { ...current.item, unit: event.target.value } } : current)}
+                  />
+                </Form.Item>
+                <Form.Item label="Warning Threshold (MEDIUM)" style={{ marginBottom: 8 }}>
+                  <Input
+                    value={featureConfigDraft.item.warning_threshold}
+                    onChange={(event) => setFeatureConfigDraft((current) => current ? { ...current, item: { ...current.item, warning_threshold: event.target.value } } : current)}
+                  />
+                </Form.Item>
+                <Form.Item label="Critical Threshold (HIGH)" style={{ marginBottom: 8 }}>
+                  <Input
+                    value={featureConfigDraft.item.critical_threshold}
+                    onChange={(event) => setFeatureConfigDraft((current) => current ? { ...current, item: { ...current.item, critical_threshold: event.target.value } } : current)}
+                  />
+                </Form.Item>
+                <Form.Item label="Meaning" style={{ gridColumn: '1 / -1', marginBottom: 8 }}>
+                  <Input.TextArea
+                    rows={3}
+                    value={featureConfigDraft.item.meaning}
+                    onChange={(event) => setFeatureConfigDraft((current) => current ? { ...current, item: { ...current.item, meaning: event.target.value } } : current)}
+                  />
+                </Form.Item>
+                <Form.Item label="Default Recommendation" style={{ gridColumn: '1 / -1', marginBottom: 0 }}>
+                  <Input.TextArea
+                    rows={2}
+                    value={featureConfigDraft.item.default_recommendation}
+                    onChange={(event) => setFeatureConfigDraft((current) => current ? { ...current, item: { ...current.item, default_recommendation: event.target.value } } : current)}
+                  />
+                </Form.Item>
+              </div>
+              <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, padding: 10, background: 'var(--app-card-bg)' }}>
+                <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                  <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                    <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Auto Signal</Text>
+                    <Switch
+                      checked={Boolean(featureConfigDraft.item.auto_signal_enabled)}
+                      onChange={(auto_signal_enabled) => setFeatureConfigDraft((current) => current ? { ...current, item: { ...current.item, auto_signal_enabled } } : current)}
+                    />
+                  </Space>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Uses direction and thresholds to populate Auto_Generate_XAI_signal.
+                  </Text>
+                  {parsedOutput.row ? (
+                    <Input.TextArea
+                      readOnly
+                      rows={9}
+                      value={JSON.stringify(buildAutoSignalPreview(featureConfigDraft.item, parsedOutput.row), null, 2)}
+                      style={{ fontFamily: 'monospace', background: 'var(--app-input-bg)', color: 'var(--app-text)' }}
+                    />
+                  ) : (
+                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Load latest output to preview auto signal.</Text>
+                  )}
+                </Space>
+              </div>
+            </div>
+          </Form>
+        ) : null}
+      </Modal>
       <Modal
         open={Boolean(ruleConfigDraft)}
         title="Configure Rule"
@@ -952,6 +1895,135 @@ export default function RREStudio(props: RREStudioProps) {
               fieldOptions={fieldOptions}
               onChange={(rootGroup) => setRuleConfigDraft((current) => current ? { ...current, rootGroup } : current)}
             />
+
+            <Card size="small" title="Signal Output" style={{ background: 'var(--app-input-bg)', borderColor: 'var(--app-border-strong)' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 240px) repeat(3, minmax(190px, 1fr))', gap: 10, alignItems: 'end' }}>
+                <Space style={{ minHeight: 32 }}>
+                  <Switch
+                    checked={ruleConfigDraft.signalConfig?.enabled !== false}
+                    onChange={(enabled) => setRuleConfigDraft((current) => current ? { ...current, signalConfig: { ...normalizeSignalConfig(current.signalConfig), enabled } } : current)}
+                  />
+                  <Text style={{ color: 'var(--app-text)' }}>Generate XAI signal</Text>
+                </Space>
+                <div>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Signal feature</Text>
+                  <Select
+                    showSearch
+                    allowClear
+                    optionFilterProp="label"
+                    value={ruleConfigDraft.signalConfig?.feature || undefined}
+                    options={signalFeatureOptions}
+                    onChange={(feature) => setRuleConfigDraft((current) => current ? { ...current, signalConfig: { ...normalizeSignalConfig(current.signalConfig), feature: String(feature || '') } } : current)}
+                    placeholder="Select feature"
+                    style={{ width: '100%', marginTop: 4 }}
+                  />
+                </div>
+                <div>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Severity</Text>
+                  <Select
+                    value={ruleConfigDraft.signalConfig?.severity || 'MEDIUM'}
+                    options={severityOptions}
+                    onChange={(severity) => setRuleConfigDraft((current) => current ? { ...current, signalConfig: { ...normalizeSignalConfig(current.signalConfig), severity } } : current)}
+                    placeholder="Severity"
+                    style={{ width: '100%', marginTop: 4 }}
+                  />
+                </div>
+                <div>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Observed value field</Text>
+                  <Select
+                    showSearch
+                    allowClear
+                    optionFilterProp="label"
+                    value={ruleConfigDraft.signalConfig?.valueField || undefined}
+                    options={fieldOptions}
+                    onChange={(valueField) => setRuleConfigDraft((current) => current ? { ...current, signalConfig: { ...normalizeSignalConfig(current.signalConfig), valueField: String(valueField || '') } } : current)}
+                    placeholder="Observed value"
+                    style={{ width: '100%', marginTop: 4 }}
+                  />
+                </div>
+                <div>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Peer value field</Text>
+                  <Select
+                    showSearch
+                    allowClear
+                    optionFilterProp="label"
+                    value={ruleConfigDraft.signalConfig?.peerValueField || undefined}
+                    options={fieldOptions}
+                    onChange={(peerValueField) => setRuleConfigDraft((current) => current ? { ...current, signalConfig: { ...normalizeSignalConfig(current.signalConfig), peerValueField: String(peerValueField || '') } } : current)}
+                    placeholder="Peer value"
+                    style={{ width: '100%', marginTop: 4 }}
+                  />
+                </div>
+                <div>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Impact source</Text>
+                  <Select
+                    value={ruleConfigDraft.signalConfig?.impactSource || 'custom'}
+                    options={[
+                      { label: 'Impact Field', value: 'field' },
+                      { label: 'Custom Impact', value: 'custom' },
+                    ]}
+                    onChange={(impactSource: TemplateMappingSource) => setRuleConfigDraft((current) => current ? { ...current, signalConfig: { ...normalizeSignalConfig(current.signalConfig), impactSource } } : current)}
+                    style={{ width: '100%', marginTop: 4 }}
+                  />
+                </div>
+                <div>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{(ruleConfigDraft.signalConfig?.impactSource || 'custom') === 'field' ? 'Impact field' : 'Impact value'}</Text>
+                  {(ruleConfigDraft.signalConfig?.impactSource || 'custom') === 'field' ? (
+                  <Select
+                    showSearch
+                    allowClear
+                    optionFilterProp="label"
+                    value={ruleConfigDraft.signalConfig?.impactField || undefined}
+                    options={fieldOptions}
+                    onChange={(impactField) => setRuleConfigDraft((current) => current ? { ...current, signalConfig: { ...normalizeSignalConfig(current.signalConfig), impactField: String(impactField || '') } } : current)}
+                    placeholder="Impact field"
+                    style={{ width: '100%', marginTop: 4 }}
+                  />
+                ) : (
+                  <Input
+                    value={ruleConfigDraft.signalConfig?.impactValue || ''}
+                    onChange={(event) => setRuleConfigDraft((current) => current ? { ...current, signalConfig: { ...normalizeSignalConfig(current.signalConfig), impactValue: event.target.value } } : current)}
+                    placeholder="Impact value"
+                    style={{ marginTop: 4 }}
+                  />
+                )}
+                </div>
+                <div>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Recommendation override</Text>
+                  <Input
+                    value={ruleConfigDraft.signalConfig?.recommendation || ''}
+                    onChange={(event) => setRuleConfigDraft((current) => current ? { ...current, signalConfig: { ...normalizeSignalConfig(current.signalConfig), recommendation: event.target.value } } : current)}
+                    placeholder="Optional override"
+                    style={{ marginTop: 4 }}
+                  />
+                </div>
+              </div>
+              <div style={{ marginTop: 12, border: '1px solid var(--app-border)', borderRadius: 6, padding: 10, background: 'var(--app-card-bg)' }}>
+                <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>
+                  JSON fields for {signalOutputColumn(ruleConfigDraft) || 'rule_Generate_XAI_signal'}
+                </Text>
+                <Checkbox.Group
+                  value={normalizeSignalConfig(ruleConfigDraft.signalConfig).jsonFields}
+                  options={signalJsonFieldOptions}
+                  onChange={(jsonFields) => setRuleConfigDraft((current) => current ? {
+                    ...current,
+                    signalConfig: {
+                      ...normalizeSignalConfig(current.signalConfig),
+                      jsonFields: jsonFields.map((item) => String(item)),
+                    },
+                  } : current)}
+                  style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(150px, 1fr))', gap: '8px 12px', marginTop: 8 }}
+                />
+              </div>
+              {parsedOutput.row ? (
+                <Input.TextArea
+                  readOnly
+                  rows={6}
+                  value={buildSignalJsonOutput(ruleConfigDraft, parsedOutput.row, featureDictionary)}
+                  style={{ marginTop: 10, fontFamily: 'monospace', background: 'var(--app-card-bg)', color: 'var(--app-text)' }}
+                />
+              ) : null}
+            </Card>
 
             <div style={{ borderTop: '1px solid var(--app-border)', paddingTop: 10 }}>
               <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>

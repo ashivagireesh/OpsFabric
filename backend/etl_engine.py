@@ -21527,7 +21527,273 @@ END;"""
         join = str(group.get("join") or "and").strip().lower()
         return any(results) if join == "or" else all(results)
 
-    def _mlops_runtime_render_rre_template(self, row: Dict[str, Any], rule: Dict[str, Any]) -> str:
+    def _mlops_runtime_rre_severity_word(self, severity: Any) -> str:
+        sev = str(severity or "").strip().upper()
+        if sev == "HIGH":
+            return "significantly"
+        if sev == "LOW":
+            return "slightly"
+        return "moderately"
+
+    def _mlops_runtime_rre_risk_band(self, row: Dict[str, Any]) -> str:
+        for field in ("predictions.risk_score", "risk_score", "prediction_score", "model_1_prediction_score"):
+            value = self._mlops_runtime_rre_get(row, field)
+            num = self._mlops_runtime_rule_float(value)
+            if num is None:
+                continue
+            if num >= 80 or (0 <= num <= 1 and num >= 0.8):
+                return "HIGH"
+            if num >= 60 or (0 <= num <= 1 and num >= 0.6):
+                return "MEDIUM"
+            return "LOW"
+        return ""
+
+    def _mlops_runtime_rre_feature_dictionary(self, config: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        raw = config.get("mlops_rre_feature_dictionary") if isinstance(config, dict) else None
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                raw = parsed
+            except Exception:
+                raw = []
+        out: Dict[str, Dict[str, Any]] = {}
+        if not isinstance(raw, list):
+            return out
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            field = str(item.get("field") or "").strip()
+            if field:
+                out[field] = item
+        return out
+
+    def _mlops_runtime_rre_narrative(self, row: Dict[str, Any], rule: Dict[str, Any], feature_dictionary: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+        cfg = rule.get("signalConfig") or rule.get("signal_config")
+        if not isinstance(cfg, dict) or cfg.get("enabled") is False:
+            cfg = {}
+        feature = str(cfg.get("feature") or "").strip()
+        meta = feature_dictionary.get(feature, {}) if feature else {}
+        business_name = str(meta.get("business_name") or meta.get("businessName") or feature or rule.get("name") or "").strip()
+        severity = str(cfg.get("severity") or "MEDIUM").strip().upper() or "MEDIUM"
+        value_field = str(cfg.get("valueField") or cfg.get("value_field") or "").strip()
+        peer_field = str(cfg.get("peerValueField") or cfg.get("peer_value_field") or "").strip()
+        value = self._mlops_runtime_rre_get(row, value_field) if value_field else None
+        peer_value = self._mlops_runtime_rre_get(row, peer_field) if peer_field else None
+        impact_source = str(cfg.get("impactSource") or cfg.get("impact_source") or "custom").strip().lower()
+        impact = cfg.get("impactValue") or cfg.get("impact_value") or ""
+        if impact_source == "field":
+            impact_field = str(cfg.get("impactField") or cfg.get("impact_field") or "").strip()
+            impact = self._mlops_runtime_rre_get(row, impact_field) if impact_field else ""
+        default_action = str(meta.get("default_recommendation") or meta.get("defaultRecommendation") or "").strip()
+        action = str(cfg.get("recommendation") or default_action).strip()
+        risk = self._mlops_runtime_rre_risk_band(row)
+        summary = f"{rule.get('name') or 'Rule'} classified this record as {risk} risk." if risk else f"{rule.get('name') or 'Rule'} matched this record."
+        observation = ""
+        if business_name and peer_value is not None and str(peer_value).strip() != "":
+            observation = (
+                f"{business_name[:1].upper()}{business_name[1:]} is {self._mlops_runtime_rre_severity_word(severity)} "
+                f"higher than peer behavior, with observed value {'' if value is None else value} compared to peer average {peer_value}."
+            )
+        elif business_name:
+            observation = (
+                f"{business_name[:1].upper()}{business_name[1:]} is {self._mlops_runtime_rre_severity_word(severity)} abnormal, "
+                f"with observed value {'' if value is None else value}."
+            )
+        meaning = str(meta.get("meaning") or "").strip()
+        if observation and meaning:
+            observation = f"{observation} This indicates {meaning}."
+        signal_output = "\n".join([
+            part for part in [
+                summary,
+                f"Observation: {observation}" if observation else "",
+                f"Impact: {impact}" if str(impact or "").strip() else "",
+                f"Recommendation: {action}" if action else "",
+            ]
+            if part
+        ])
+        return {
+            "signal_output": signal_output,
+            "summary": summary,
+            "signal_observations": f"- {observation}" if observation else "",
+            "signal_recommendations": f"- {action}" if action else "",
+            "signal_default_recommendation": default_action,
+            "top_signal": business_name,
+            "risk_band": risk,
+            "signal_feature": feature,
+            "signal_business_name": business_name,
+            "signal_meaning": meaning,
+            "signal_unit": str(meta.get("unit") or ""),
+            "signal_direction": str(meta.get("direction") or ""),
+            "signal_severity": severity,
+            "signal_value": "" if value is None else str(value),
+            "signal_peer_value": "" if peer_value is None else str(peer_value),
+            "signal_impact": "" if impact is None else str(impact),
+            "signal_action": action,
+        }
+
+    def _mlops_runtime_rre_signal_json(self, row: Dict[str, Any], rule: Dict[str, Any], feature_dictionary: Dict[str, Dict[str, Any]]) -> str:
+        cfg = rule.get("signalConfig") or rule.get("signal_config")
+        if not isinstance(cfg, dict) or cfg.get("enabled") is False:
+            return ""
+        values = self._mlops_runtime_rre_narrative(row, rule, feature_dictionary)
+        field_map = {
+            "summary": values.get("summary", ""),
+            "observation": str(values.get("signal_observations", "")).lstrip("- ").strip(),
+            "recommendation": str(values.get("signal_recommendations", "")).lstrip("- ").strip(),
+            "default_recommendation": values.get("signal_default_recommendation", ""),
+            "risk_band": values.get("risk_band", ""),
+            "feature": values.get("signal_feature", ""),
+            "business_name": values.get("signal_business_name", ""),
+            "meaning": values.get("signal_meaning", ""),
+            "severity": values.get("signal_severity", ""),
+            "value": values.get("signal_value", ""),
+            "peer_value": values.get("signal_peer_value", ""),
+            "impact": values.get("signal_impact", ""),
+            "unit": values.get("signal_unit", ""),
+            "direction": values.get("signal_direction", ""),
+        }
+        raw_fields = cfg.get("jsonFields") or cfg.get("json_fields")
+        if not isinstance(raw_fields, list) or not raw_fields:
+            raw_fields = ["summary", "observation", "recommendation", "default_recommendation", "risk_band", "feature", "severity", "value", "peer_value", "impact"]
+        selected: Dict[str, Any] = {}
+        for field in raw_fields:
+            key = str(field or "").strip()
+            if key:
+                selected[key] = field_map.get(key, "")
+        try:
+            return json.dumps(selected, ensure_ascii=False)
+        except Exception:
+            return str(selected)
+
+    def _mlops_runtime_rre_signal_column(self, rule: Dict[str, Any]) -> str:
+        base = str(rule.get("name") or rule.get("id") or "").strip()
+        return f"{base}_Generate_XAI_signal" if base else ""
+
+    def _mlops_runtime_rre_auto_signal_json(self, row: Dict[str, Any], feature_dictionary: Dict[str, Dict[str, Any]], selected_fields: Optional[List[str]] = None) -> str:
+        fields = [
+            str(field or "").strip()
+            for field in (selected_fields or ["business_name", "severity", "value", "threshold", "threshold_type", "observation", "recommendation"])
+            if str(field or "").strip()
+        ]
+        signals: List[Dict[str, Any]] = []
+        for field, meta in feature_dictionary.items():
+            if not isinstance(meta, dict) or not bool(meta.get("auto_signal_enabled") or meta.get("autoSignalEnabled")):
+                continue
+            value = self._mlops_runtime_rre_get(row, field)
+            num = self._mlops_runtime_rule_float(value)
+            if num is None:
+                continue
+            direction = str(meta.get("direction") or "higher_is_risky").strip().lower()
+            warning_raw = meta.get("warning_threshold") or meta.get("warningThreshold")
+            critical_raw = meta.get("critical_threshold") or meta.get("criticalThreshold")
+            warning = self._mlops_runtime_rule_float(warning_raw)
+            critical = self._mlops_runtime_rule_float(critical_raw)
+            critical_hit = critical is not None and (num <= critical if direction == "lower_is_risky" else num >= critical)
+            warning_hit = warning is not None and (num <= warning if direction == "lower_is_risky" else num >= warning)
+            if not critical_hit and not warning_hit:
+                continue
+            severity = "HIGH" if critical_hit else "MEDIUM"
+            threshold = critical_raw if critical_hit else warning_raw
+            business_name = str(meta.get("business_name") or meta.get("businessName") or field).strip()
+            relation = "below" if direction == "lower_is_risky" else "above"
+            observation = (
+                f"{business_name} is {self._mlops_runtime_rre_severity_word(severity)} {relation} "
+                f"{'critical' if critical_hit else 'warning'} threshold {threshold}, with observed value {value}."
+            )
+            meaning = str(meta.get("meaning") or "").strip()
+            if meaning:
+                observation = f"{observation} This indicates {meaning}."
+            signal = {
+                "feature": field,
+                "business_name": business_name,
+                "severity": severity,
+                "value": "" if value is None else str(value),
+                "threshold": "" if threshold is None else str(threshold),
+                "threshold_type": "critical" if critical_hit else "warning",
+                "direction": direction,
+                "unit": str(meta.get("unit") or ""),
+                "meaning": meaning,
+                "observation": observation,
+                "recommendation": str(meta.get("default_recommendation") or meta.get("defaultRecommendation") or ""),
+            }
+            signals.append({key: signal.get(key, "") for key in fields})
+        if not signals:
+            return ""
+        try:
+            return json.dumps({"signals": signals}, ensure_ascii=False)
+        except Exception:
+            return str({"signals": signals})
+
+    def _mlops_runtime_rre_auto_signals_full(self, row: Dict[str, Any], feature_dictionary: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        raw = self._mlops_runtime_rre_auto_signal_json(row, feature_dictionary, [
+            "feature", "business_name", "severity", "value", "threshold", "threshold_type", "direction", "unit", "meaning", "observation", "recommendation"
+        ])
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+            signals = parsed.get("signals") if isinstance(parsed, dict) else []
+            return signals if isinstance(signals, list) else []
+        except Exception:
+            return []
+
+    def _mlops_runtime_rre_cluster_config(self, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        raw = config.get("mlops_rre_cluster_config") if isinstance(config, dict) else None
+        if isinstance(raw, str) and raw.strip():
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = []
+        if not isinstance(raw, list):
+            return []
+        clusters: List[Dict[str, Any]] = []
+        for idx, item in enumerate(raw):
+            if not isinstance(item, dict):
+                continue
+            features = item.get("features")
+            clusters.append({
+                "id": str(item.get("id") or f"cluster-{idx + 1}"),
+                "name": str(item.get("name") or item.get("cluster") or f"Cluster {idx + 1}"),
+                "enabled": item.get("enabled") is not False,
+                "features": [str(field or "").strip() for field in features] if isinstance(features, list) else [],
+                "observation": str(item.get("observation") or ""),
+                "recommendation": str(item.get("recommendation") or ""),
+                "priority": float(item.get("priority") or idx + 1),
+            })
+        return clusters
+
+    def _mlops_runtime_rre_cluster_json(self, row: Dict[str, Any], feature_dictionary: Dict[str, Dict[str, Any]], clusters: List[Dict[str, Any]]) -> str:
+        if not clusters:
+            return ""
+        signals = self._mlops_runtime_rre_auto_signals_full(row, feature_dictionary)
+        if not signals:
+            return ""
+        signal_by_feature = {str(signal.get("feature") or ""): signal for signal in signals if isinstance(signal, dict)}
+        out: List[Dict[str, Any]] = []
+        for cluster in sorted(clusters, key=lambda item: float(item.get("priority") or 999999)):
+            if cluster.get("enabled") is False:
+                continue
+            matched = [signal_by_feature[field] for field in cluster.get("features", []) if field in signal_by_feature]
+            if not matched:
+                continue
+            severity = "HIGH" if any(str(signal.get("severity") or "").upper() == "HIGH" for signal in matched) else "MEDIUM"
+            names = ", ".join([str(signal.get("business_name") or signal.get("feature") or "") for signal in matched if signal])
+            out.append({
+                "cluster": cluster.get("name") or "Cluster",
+                "severity": severity,
+                "features": [signal.get("feature") for signal in matched],
+                "observation": cluster.get("observation") or f"{cluster.get('name') or 'Cluster'} matched {len(matched)} signal(s): {names}.",
+                "recommendation": cluster.get("recommendation") or " ".join([str(signal.get("recommendation") or "") for signal in matched if signal.get("recommendation")]),
+                "signals": matched,
+            })
+        if not out:
+            return ""
+        try:
+            return json.dumps({"clusters": out}, ensure_ascii=False)
+        except Exception:
+            return str({"clusters": out})
+
+    def _mlops_runtime_render_rre_template(self, row: Dict[str, Any], rule: Dict[str, Any], feature_dictionary: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
         template = str(
             rule.get("templateBody")
             or rule.get("template_body")
@@ -21539,6 +21805,7 @@ END;"""
         values: Dict[str, str] = {
             "responsibility": str(rule.get("templateResponsibility") or rule.get("template_responsibility") or ""),
         }
+        values.update(self._mlops_runtime_rre_narrative(row, rule, feature_dictionary or {}))
         mappings = rule.get("templateMappings") if isinstance(rule.get("templateMappings"), list) else []
         for mapping in mappings:
             if not isinstance(mapping, dict):
@@ -21588,6 +21855,42 @@ END;"""
             return cleaned
 
         rules = config.get("mlops_rre_rules") if isinstance(config, dict) else None
+        feature_dictionary = self._mlops_runtime_rre_feature_dictionary(config)
+        raw_auto_fields = config.get("mlops_rre_auto_signal_json_fields") if isinstance(config, dict) else None
+        if isinstance(raw_auto_fields, str) and raw_auto_fields.strip():
+            try:
+                parsed_auto_fields = json.loads(raw_auto_fields)
+                raw_auto_fields = parsed_auto_fields
+            except Exception:
+                raw_auto_fields = []
+        auto_signal_json_fields = [
+            str(field or "").strip()
+            for field in (raw_auto_fields if isinstance(raw_auto_fields, list) else [])
+            if str(field or "").strip()
+        ]
+        cluster_config = self._mlops_runtime_rre_cluster_config(config)
+        auto_signal_configured = any(
+            isinstance(meta, dict) and bool(meta.get("auto_signal_enabled") or meta.get("autoSignalEnabled"))
+            for meta in feature_dictionary.values()
+        )
+
+        def _apply_auto_signal(items: List[Any]) -> List[Any]:
+            if not feature_dictionary or not auto_signal_configured:
+                return items
+            applied: List[Any] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    applied.append(item)
+                    continue
+                next_item = dict(item)
+                auto_value = self._mlops_runtime_rre_auto_signal_json(next_item, feature_dictionary, auto_signal_json_fields)
+                self._mlops_runtime_rule_set(next_item, "Auto_Generate_XAI_signal", auto_value or "")
+                if cluster_config:
+                    cluster_value = self._mlops_runtime_rre_cluster_json(next_item, feature_dictionary, cluster_config)
+                    self._mlops_runtime_rule_set(next_item, "Auto_Cluster_Recommendation", cluster_value or "")
+                applied.append(next_item)
+            return applied
+
         if isinstance(rules, str) and rules.strip():
             try:
                 parsed = json.loads(rules)
@@ -21595,13 +21898,13 @@ END;"""
             except Exception:
                 rules = []
         if not isinstance(rules, list) or not rules:
-            return _without_legacy_fields(rows)
+            return _apply_auto_signal(_without_legacy_fields(rows))
         active_rules = [
             rule for rule in rules
             if isinstance(rule, dict) and rule.get("enabled") is not False
         ]
         if not active_rules:
-            return _without_legacy_fields(rows)
+            return _apply_auto_signal(_without_legacy_fields(rows))
         active_rules.sort(key=lambda rule: float(rule.get("priority") or 999999))
         out: List[Any] = []
         for row in rows:
@@ -21611,6 +21914,12 @@ END;"""
             next_row = dict(row)
             for field in legacy_fields:
                 next_row.pop(field, None)
+            auto_value = self._mlops_runtime_rre_auto_signal_json(next_row, feature_dictionary, auto_signal_json_fields)
+            if auto_signal_configured:
+                self._mlops_runtime_rule_set(next_row, "Auto_Generate_XAI_signal", auto_value or "")
+            if cluster_config:
+                cluster_value = self._mlops_runtime_rre_cluster_json(next_row, feature_dictionary, cluster_config)
+                self._mlops_runtime_rule_set(next_row, "Auto_Cluster_Recommendation", cluster_value or "")
             matched = [
                 rule for rule in active_rules
                 if self._mlops_runtime_rre_group_matches(next_row, rule.get("rootGroup") or rule.get("root_group"))
@@ -21620,8 +21929,12 @@ END;"""
                 column = str(rule.get("name") or rule.get("id") or "").strip()
                 if not column:
                     continue
-                value = self._mlops_runtime_render_rre_template(next_row, rule) if str(rule.get("id") or "") in matched_ids else ""
+                value = self._mlops_runtime_render_rre_template(next_row, rule, feature_dictionary) if str(rule.get("id") or "") in matched_ids else ""
                 self._mlops_runtime_rule_set(next_row, column, value)
+                signal_column = self._mlops_runtime_rre_signal_column(rule)
+                if signal_column:
+                    signal_value = self._mlops_runtime_rre_signal_json(next_row, rule, feature_dictionary) if str(rule.get("id") or "") in matched_ids else ""
+                    self._mlops_runtime_rule_set(next_row, signal_column, signal_value)
             out.append(next_row)
         return out
 
