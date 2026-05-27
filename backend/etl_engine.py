@@ -22210,7 +22210,7 @@ END;"""
         tokens = re.findall(r"\b[A-Za-z_][A-Za-z0-9_.]*\b", str(expression or ""))
         fields = [token for token in tokens if token not in funcs]
         if not fields:
-            return ""
+            return self._mlops_runtime_rre_expression_value(row, expression) if re.search(r"[0-9)]\s*[+\-*/%]\s*[0-9(]", str(expression or "")) else ""
         for field in fields:
             if self._mlops_runtime_rre_get(row, field) is None:
                 return ""

@@ -746,7 +746,8 @@ function evaluateTemplateMathExpressionStrict(expression: string, output: Record
   const functionNames = new Set(['abs', 'ceil', 'floor', 'max', 'min', 'pow', 'round', 'sqrt'])
   const identifiers = Array.from(expression.matchAll(/\b[A-Za-z_][A-Za-z0-9_.]*\b/g)).map((match) => match[0])
   const fields = identifiers.filter((token) => !functionNames.has(token))
-  if (!fields.length || fields.some((field) => readField(output, field) === undefined)) return ''
+  if (!fields.length) return /[0-9)]\s*[+\-*/%]\s*[0-9(]/.test(expression) ? evaluateTemplateMathExpression(expression, output) : ''
+  if (fields.some((field) => readField(output, field) === undefined)) return ''
   return evaluateTemplateMathExpression(expression, output)
 }
 
