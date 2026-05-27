@@ -279,6 +279,10 @@ class ETLEngine:
         self._profile_redis_url_cached: Optional[str] = None
         self._mlops_runtime_model_cache: Dict[str, Dict[str, Any]] = {}
         self._mlops_runtime_model_cache_lock = threading.Lock()
+        self._mlops_rre_transformer_pipeline = None
+        self._mlops_rre_transformer_failed = False
+        self._mlops_rre_transformer_lock = threading.Lock()
+        self._mlops_rre_transformer_text_cache: Dict[str, str] = {}
         self._oracle_full_scan_block_until: Dict[str, float] = {}
         self._oracle_profile_schema_lock = threading.Lock()
         self._oracle_profile_schema_checked_tables: set = set()
@@ -21737,6 +21741,36 @@ END;"""
         except Exception:
             return []
 
+    def _mlops_runtime_rre_configured_cluster_signal(
+        self,
+        row: Dict[str, Any],
+        field: str,
+        meta: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not field:
+            return None
+        value = self._mlops_runtime_rre_get(row, field)
+        if value is None or str(value).strip() == "":
+            return None
+        if isinstance(meta, dict) and bool(meta.get("auto_signal_enabled") or meta.get("autoSignalEnabled")):
+            auto_signals = self._mlops_runtime_rre_auto_signals_full(row, {field: meta})
+            if auto_signals:
+                return auto_signals[0]
+        business_name = str(meta.get("business_name") or meta.get("businessName") or field).strip()
+        return {
+            "feature": field,
+            "business_name": business_name,
+            "severity": "CONFIGURED",
+            "value": str(value),
+            "threshold": "",
+            "threshold_type": "",
+            "direction": str(meta.get("direction") or ""),
+            "unit": str(meta.get("unit") or ""),
+            "meaning": str(meta.get("meaning") or ""),
+            "observation": f"{business_name} is included in this configured cluster with observed value {value}.",
+            "recommendation": str(meta.get("default_recommendation") or meta.get("defaultRecommendation") or ""),
+        }
+
     def _mlops_runtime_rre_cluster_config(self, config: Dict[str, Any]) -> List[Dict[str, Any]]:
         raw = config.get("mlops_rre_cluster_config") if isinstance(config, dict) else None
         if isinstance(raw, str) and raw.strip():
@@ -21751,6 +21785,11 @@ END;"""
             if not isinstance(item, dict):
                 continue
             features = item.get("features")
+            try:
+                summary_max_chars = int(float(item.get("summary_max_chars") or item.get("summaryMaxChars") or 240))
+            except Exception:
+                summary_max_chars = 240
+            summary_max_chars = max(100, min(summary_max_chars, 2000))
             clusters.append({
                 "id": str(item.get("id") or f"cluster-{idx + 1}"),
                 "name": str(item.get("name") or item.get("cluster") or f"Cluster {idx + 1}"),
@@ -21759,16 +21798,265 @@ END;"""
                 "observation": str(item.get("observation") or ""),
                 "recommendation": str(item.get("recommendation") or ""),
                 "priority": float(item.get("priority") or idx + 1),
+                "summary_max_chars": summary_max_chars,
             })
         return clusters
 
-    def _mlops_runtime_rre_cluster_json(self, row: Dict[str, Any], feature_dictionary: Dict[str, Dict[str, Any]], clusters: List[Dict[str, Any]]) -> str:
+    def _mlops_runtime_select_rre_signal_fields(self, signal: Dict[str, Any], selected_fields: List[str]) -> Dict[str, Any]:
+        fields = selected_fields or [
+            "business_name", "severity", "value", "threshold", "threshold_type", "observation", "recommendation"
+        ]
+        return {
+            str(field): signal.get(str(field))
+            for field in fields
+            if str(field or "").strip()
+        }
+
+    def _mlops_runtime_rre_cumulative_cluster_observation(
+        self,
+        cluster_name: str,
+        signals: List[Dict[str, Any]],
+        scenario: str = "",
+    ) -> str:
+        factors: List[str] = []
+        for signal in signals:
+            name = str(signal.get("business_name") or signal.get("feature") or "factor")
+            value = str(signal.get("value") or "")
+            unit = str(signal.get("unit") or "")
+            threshold_type = str(signal.get("threshold_type") or "").strip()
+            threshold = str(signal.get("threshold") or "").strip()
+            direction = str(signal.get("direction") or "").strip()
+            value_text = f"{value}{(' ' + unit) if unit else ''}" if value else "present"
+            if threshold_type and threshold:
+                relation = "below" if direction == "lower_is_risky" else "above"
+                factors.append(
+                    f"{name} is {value_text}, {relation} the {threshold_type} threshold of {threshold}{(' ' + unit) if unit else ''}"
+                )
+            else:
+                factors.append(f"{name} is {value_text}")
+        if any(str(signal.get("severity") or "").upper() == "HIGH" for signal in signals):
+            severity = "high-risk"
+        elif any(str(signal.get("severity") or "").upper() == "MEDIUM" for signal in signals):
+            severity = "warning-level"
+        else:
+            severity = "configured"
+        lead = scenario or cluster_name
+        return (
+            f"{lead}: {', and '.join(factors)}. Together, these criteria form a {severity} "
+            f"{cluster_name} pattern that should be reviewed as one scenario."
+        )
+
+    def _mlops_runtime_rre_cumulative_cluster_recommendation(
+        self,
+        cluster_name: str,
+        signals: List[Dict[str, Any]],
+        instruction: str = "",
+    ) -> str:
+        critical = [
+            str(signal.get("business_name") or signal.get("feature") or "")
+            for signal in signals
+            if str(signal.get("severity") or "").upper() == "HIGH"
+            and str(signal.get("business_name") or signal.get("feature") or "").strip()
+        ]
+        warning = [
+            str(signal.get("business_name") or signal.get("feature") or "")
+            for signal in signals
+            if str(signal.get("severity") or "").upper() == "MEDIUM"
+            and str(signal.get("business_name") or signal.get("feature") or "").strip()
+        ]
+        if critical:
+            focus = f"Prioritize {', '.join(critical)} because {'it has' if len(critical) == 1 else 'they have'} crossed critical criteria"
+        elif warning:
+            focus = f"Review {', '.join(warning)} because {'it has' if len(warning) == 1 else 'they have'} crossed warning criteria"
+        else:
+            focus = "Review the configured factors together"
+        base = (
+            f"{focus}. Validate the source transactions, compare against recent customer/entity behavior, "
+            f"and decide whether the {cluster_name} pattern is expected or requires action."
+        )
+        return f"{instruction}. {base}" if instruction else base
+
+    def _mlops_runtime_compact_cluster_text_rule_based(self, text: str, max_chars: int = 320) -> str:
+        cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(cleaned) <= max_chars:
+            return cleaned
+        lead_match = re.match(r"^([^:]{1,80}):\s*(.+)$", cleaned)
+        if lead_match:
+            lead = lead_match.group(1).strip()
+            body = re.sub(r"\bTogether,.*$", "", lead_match.group(2), flags=re.IGNORECASE).strip()
+            breaches: List[str] = []
+            for match in re.finditer(
+                r"([^,.]+?)\s+is\s+([^,.]+?),\s+(above|below)\s+the\s+([^,.]+?)\s+threshold\s+of\s+([^,.]+)",
+                body,
+                flags=re.IGNORECASE,
+            ):
+                factor = match.group(1).strip()
+                observed = match.group(2).strip()
+                relation = match.group(3).lower()
+                threshold_type = match.group(4).strip()
+                threshold = match.group(5).strip()
+                breaches.append(f"{factor} {relation} {threshold_type} ({observed} vs {threshold})")
+            if breaches:
+                summary = f"{lead}: {'; '.join(breaches[:2])}. Review as one cluster scenario."
+                if len(summary) <= max_chars:
+                    return summary
+                simple = "; ".join(re.sub(r"\s*\([^)]*\)", "", item) for item in breaches[:2])
+                return f"{lead}: {simple}."
+        priority_match = re.match(r"^(Prioritize|Review)\s+([^.]*)\.\s*(.*)$", cleaned, flags=re.IGNORECASE)
+        if priority_match:
+            action = "Prioritize" if priority_match.group(1).lower() == "prioritize" else "Review"
+            focus = re.sub(r"\sbecause\b.*$", "", priority_match.group(2), flags=re.IGNORECASE).strip()
+            summary = f"{action} {focus}; validate source transactions and recent behavior."
+            return summary if len(summary) <= max_chars else f"{action} {focus}."
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()]
+        picked: List[str] = []
+        size = 0
+        for sentence in sentences:
+            if len(picked) >= 2:
+                break
+            if picked and size + len(sentence) + 1 > max_chars:
+                continue
+            picked.append(sentence)
+            size += len(sentence) + 1
+        summary = " ".join(picked).strip() if picked else cleaned
+        if len(summary) <= max_chars:
+            return summary
+        words = [word for word in re.split(r"\s+", summary) if word]
+        compact = " ".join(words[:14]).strip()
+        return f"{compact}." if compact and len(compact) < len(summary) else summary
+
+    def _mlops_runtime_get_rre_transformer_summarizer(self):
+        if self._mlops_rre_transformer_failed:
+            return None
+        if self._mlops_rre_transformer_pipeline is not None:
+            return self._mlops_rre_transformer_pipeline
+        with self._mlops_rre_transformer_lock:
+            if self._mlops_rre_transformer_pipeline is not None:
+                return self._mlops_rre_transformer_pipeline
+            if self._mlops_rre_transformer_failed:
+                return None
+            try:
+                from transformers import pipeline  # type: ignore
+                model_name = str(os.getenv("MLOPS_RRE_CLUSTER_TRANSFORMER_MODEL", "t5-small") or "").strip()
+                self._mlops_rre_transformer_pipeline = pipeline("summarization", model=model_name or None)
+                return self._mlops_rre_transformer_pipeline
+            except Exception as pipeline_exc:
+                logger.warning(f"MLOps RRE summarization pipeline unavailable; trying direct seq2seq model: {pipeline_exc}")
+            try:
+                from transformers import AutoModelForSeq2SeqLM, AutoTokenizer  # type: ignore
+                model_name = str(os.getenv("MLOPS_RRE_CLUSTER_TRANSFORMER_MODEL", "t5-small") or "").strip()
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+                self._mlops_rre_transformer_pipeline = {
+                    "kind": "seq2seq",
+                    "model_name": model_name,
+                    "tokenizer": tokenizer,
+                    "model": model,
+                }
+                return self._mlops_rre_transformer_pipeline
+            except Exception as exc:
+                self._mlops_rre_transformer_failed = True
+                logger.warning(f"MLOps RRE transformer smart wording unavailable; using rule-based fallback: {exc}")
+                return None
+
+    def _mlops_runtime_smart_cluster_text(self, text: str, enabled: bool, max_chars: int = 240) -> str:
+        cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+        trigger_chars = 100
+        if not enabled or len(cleaned) <= trigger_chars:
+            return cleaned
+        word_count = len([word for word in re.split(r"\s+", cleaned) if word])
+        if word_count <= 64:
+            return self._mlops_runtime_compact_cluster_text_rule_based(cleaned, max_chars)
+        cache_key = hashlib.sha256(f"{max_chars}:{cleaned}".encode("utf-8", errors="ignore")).hexdigest()
+        cached = self._mlops_rre_transformer_text_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        summarizer = self._mlops_runtime_get_rre_transformer_summarizer()
+        summary = ""
+        if summarizer is not None:
+            try:
+                max_summary_tokens = max(12, min(80, max_chars // 4, word_count - 1))
+                min_summary_tokens = max(5, min(16, max_summary_tokens - 4))
+                if callable(summarizer):
+                    result = summarizer(
+                        cleaned[:1800],
+                        max_length=max_summary_tokens,
+                        min_length=min_summary_tokens,
+                        do_sample=False,
+                        truncation=True,
+                    )
+                    if isinstance(result, list) and result:
+                        summary = str(result[0].get("summary_text") or "").strip()
+                elif isinstance(summarizer, dict) and summarizer.get("kind") == "seq2seq":
+                    tokenizer = summarizer.get("tokenizer")
+                    model = summarizer.get("model")
+                    prompt = f"summarize: {cleaned[:1800]}"
+                    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+                    generated = model.generate(
+                        **inputs,
+                        max_new_tokens=max_summary_tokens,
+                        num_beams=4,
+                        do_sample=False,
+                    )
+                    summary = str(tokenizer.decode(generated[0], skip_special_tokens=True) or "").strip()
+            except Exception as exc:
+                logger.warning(f"MLOps RRE transformer smart wording failed; using rule-based fallback: {exc}")
+        if not summary or len(summary) >= len(cleaned):
+            summary = self._mlops_runtime_compact_cluster_text_rule_based(cleaned, max_chars)
+        if len(summary) > max_chars:
+            summary = self._mlops_runtime_compact_cluster_text_rule_based(summary, max_chars)
+        if len(self._mlops_rre_transformer_text_cache) > 512:
+            self._mlops_rre_transformer_text_cache.clear()
+        self._mlops_rre_transformer_text_cache[cache_key] = summary
+        return summary
+
+    def _mlops_runtime_rre_cluster_evidence(self, signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [
+            {
+                "field": signal.get("feature") or "",
+                "factor": signal.get("business_name") or signal.get("feature") or "",
+                "value": signal.get("value") or "",
+                "unit": signal.get("unit") or "",
+                "severity": signal.get("severity") or "",
+                "threshold": signal.get("threshold") or "",
+                "threshold_type": signal.get("threshold_type") or "",
+                "direction": signal.get("direction") or "",
+            }
+            for signal in signals
+        ]
+
+    def _mlops_runtime_rre_cluster_json(
+        self,
+        row: Dict[str, Any],
+        feature_dictionary: Dict[str, Dict[str, Any]],
+        clusters: List[Dict[str, Any]],
+        selected_signal_fields: Optional[List[str]] = None,
+        selected_cluster_fields: Optional[List[str]] = None,
+        transformer_wording_enabled: bool = False,
+    ) -> str:
         if not clusters:
             return ""
-        signals = self._mlops_runtime_rre_auto_signals_full(row, feature_dictionary)
-        if not signals:
+        cluster_fields = [
+            str(field or "").strip()
+            for field in (selected_cluster_fields or ["cluster", "severity", "features", "observation", "recommendation", "evidence"])
+            if str(field or "").strip()
+        ]
+        if not cluster_fields:
+            cluster_fields = ["cluster", "severity", "features", "observation", "recommendation", "evidence"]
+        signal_by_feature: Dict[str, Dict[str, Any]] = {}
+        for cluster in clusters:
+            if not isinstance(cluster, dict) or cluster.get("enabled") is False:
+                continue
+            for field_raw in cluster.get("features", []):
+                field = str(field_raw or "").strip()
+                if not field or field in signal_by_feature:
+                    continue
+                meta = feature_dictionary.get(field, {}) if isinstance(feature_dictionary, dict) else {}
+                signal = self._mlops_runtime_rre_configured_cluster_signal(row, field, meta if isinstance(meta, dict) else {})
+                if signal:
+                    signal_by_feature[field] = signal
+        if not signal_by_feature:
             return ""
-        signal_by_feature = {str(signal.get("feature") or ""): signal for signal in signals if isinstance(signal, dict)}
         out: List[Dict[str, Any]] = []
         for cluster in sorted(clusters, key=lambda item: float(item.get("priority") or 999999)):
             if cluster.get("enabled") is False:
@@ -21776,15 +22064,52 @@ END;"""
             matched = [signal_by_feature[field] for field in cluster.get("features", []) if field in signal_by_feature]
             if not matched:
                 continue
-            severity = "HIGH" if any(str(signal.get("severity") or "").upper() == "HIGH" for signal in matched) else "MEDIUM"
-            names = ", ".join([str(signal.get("business_name") or signal.get("feature") or "") for signal in matched if signal])
-            out.append({
-                "cluster": cluster.get("name") or "Cluster",
+            if any(str(signal.get("severity") or "").upper() == "HIGH" for signal in matched):
+                severity = "HIGH"
+            elif any(str(signal.get("severity") or "").upper() == "MEDIUM" for signal in matched):
+                severity = "MEDIUM"
+            else:
+                severity = "CONFIGURED"
+            cluster_name = str(cluster.get("name") or "Cluster")
+            configured_observation = str(cluster.get("observation") or "").strip()
+            configured_recommendation = str(cluster.get("recommendation") or "").strip()
+            try:
+                summary_max_chars = int(float(cluster.get("summary_max_chars") or 240))
+            except Exception:
+                summary_max_chars = 240
+            summary_max_chars = max(100, min(summary_max_chars, 2000))
+            cumulative_observation = self._mlops_runtime_rre_cumulative_cluster_observation(
+                cluster_name,
+                matched,
+                configured_observation,
+            )
+            cumulative_recommendation = self._mlops_runtime_rre_cumulative_cluster_recommendation(
+                cluster_name,
+                matched,
+                configured_recommendation,
+            )
+            cumulative_observation = self._mlops_runtime_smart_cluster_text(
+                cumulative_observation,
+                bool(transformer_wording_enabled),
+                summary_max_chars,
+            )
+            cumulative_recommendation = self._mlops_runtime_smart_cluster_text(
+                cumulative_recommendation,
+                bool(transformer_wording_enabled),
+                summary_max_chars,
+            )
+            full_payload = {
+                "cluster": cluster_name,
                 "severity": severity,
                 "features": [signal.get("feature") for signal in matched],
-                "observation": cluster.get("observation") or f"{cluster.get('name') or 'Cluster'} matched {len(matched)} signal(s): {names}.",
-                "recommendation": cluster.get("recommendation") or " ".join([str(signal.get("recommendation") or "") for signal in matched if signal.get("recommendation")]),
-                "signals": matched,
+                "observation": cumulative_observation,
+                "recommendation": cumulative_recommendation,
+                "evidence": self._mlops_runtime_rre_cluster_evidence(matched),
+            }
+            out.append({
+                field: full_payload.get(field)
+                for field in cluster_fields
+                if field in full_payload
             })
         if not out:
             return ""
@@ -21792,6 +22117,165 @@ END;"""
             return json.dumps({"clusters": out}, ensure_ascii=False)
         except Exception:
             return str({"clusters": out})
+
+    def _mlops_runtime_safe_output_key(self, value: Any) -> str:
+        raw = str(value or "cluster").strip().lower()
+        key = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+        return key or "cluster"
+
+    def _mlops_runtime_rre_set_cluster_columns(self, row: Dict[str, Any], cluster_json: str) -> None:
+        if not isinstance(row, dict):
+            return
+        if not str(cluster_json or "").strip():
+            return
+        try:
+            parsed = json.loads(cluster_json)
+        except Exception:
+            parsed = {}
+        clusters = parsed.get("clusters") if isinstance(parsed, dict) else []
+        if not isinstance(clusters, list):
+            return
+        for idx, cluster in enumerate(clusters, start=1):
+            if not isinstance(cluster, dict):
+                continue
+            cluster_name = str(cluster.get("cluster") or f"Cluster {idx}").strip()
+            key = self._mlops_runtime_safe_output_key(cluster_name)
+            try:
+                payload = json.dumps(cluster, ensure_ascii=False)
+            except Exception:
+                payload = str(cluster)
+            self._mlops_runtime_rule_set(row, f"cluster_{key}", payload)
+
+    def _mlops_runtime_rre_expression_value(self, row: Dict[str, Any], expression: str) -> str:
+        funcs = {
+            "abs": abs,
+            "ceil": math.ceil,
+            "floor": math.floor,
+            "max": max,
+            "min": min,
+            "pow": pow,
+            "round": round,
+            "sqrt": math.sqrt,
+        }
+        expr = str(expression or "").strip()
+        if not expr:
+            return ""
+
+        def _token_value(match: Any) -> str:
+            token = str(match.group(0) or "").strip()
+            if token in funcs:
+                return token
+            value = self._mlops_runtime_rre_get(row, token)
+            num = self._mlops_runtime_rule_float(value)
+            return str(num) if num is not None else "0"
+
+        executable = re.sub(r"\b[A-Za-z_][A-Za-z0-9_.]*\b", _token_value, expr)
+        try:
+            tree = ast.parse(executable, mode="eval")
+            allowed_nodes = (
+                ast.Expression,
+                ast.BinOp,
+                ast.UnaryOp,
+                ast.Call,
+                ast.Name,
+                ast.Load,
+                ast.Constant,
+                ast.Add,
+                ast.Sub,
+                ast.Mult,
+                ast.Div,
+                ast.Mod,
+                ast.Pow,
+                ast.USub,
+                ast.UAdd,
+            )
+            for node in ast.walk(tree):
+                if not isinstance(node, allowed_nodes):
+                    return ""
+                if isinstance(node, ast.Name) and node.id not in funcs:
+                    return ""
+                if isinstance(node, ast.Call) and not (isinstance(node.func, ast.Name) and node.func.id in funcs):
+                    return ""
+            result = eval(compile(tree, "<rre-expression>", "eval"), {"__builtins__": {}}, funcs)
+            if result is None:
+                return ""
+            if isinstance(result, float) and result.is_integer():
+                return str(int(result))
+            return str(result)
+        except Exception:
+            return ""
+
+    def _mlops_runtime_rre_expression_value_strict(self, row: Dict[str, Any], expression: str) -> str:
+        funcs = {"abs", "ceil", "floor", "max", "min", "pow", "round", "sqrt"}
+        tokens = re.findall(r"\b[A-Za-z_][A-Za-z0-9_.]*\b", str(expression or ""))
+        fields = [token for token in tokens if token not in funcs]
+        if not fields:
+            return ""
+        for field in fields:
+            if self._mlops_runtime_rre_get(row, field) is None:
+                return ""
+        return self._mlops_runtime_rre_expression_value(row, expression)
+
+    def _mlops_runtime_render_rre_plain_template_text(self, row: Dict[str, Any], text: str) -> str:
+        raw = str(text or "")
+        stripped = raw.strip()
+        if not stripped:
+            return ""
+        direct_value = self._mlops_runtime_rre_get(row, stripped)
+        if direct_value is not None:
+            return str(direct_value)
+
+        def _replace_expression(match: Any) -> str:
+            candidate = str(match.group(0) or "")
+            evaluated = self._mlops_runtime_rre_expression_value_strict(row, candidate)
+            return evaluated if evaluated != "" else candidate
+
+        atom = r"(?:[A-Za-z_][A-Za-z0-9_.]*|\d+(?:\.\d+)?)"
+        rendered = re.sub(
+            r"\[([^\][\n]+)\]",
+            lambda match: (
+                self._mlops_runtime_rre_expression_value_strict(row, str(match.group(1) or ""))
+                or str(match.group(1) or "")
+            ),
+            raw,
+        )
+        rendered = re.sub(
+            r"\b(?:round|abs|ceil|floor|min|max|sqrt|pow)\s*\([^()]*[+\-*/%][^()]*\)",
+            _replace_expression,
+            rendered,
+        )
+        rendered = re.sub(
+            rf"\b{atom}(?:\s*[+\-*/%]\s*{atom})+\b",
+            _replace_expression,
+            rendered,
+        )
+
+        def _replace_field(match: Any) -> str:
+            token = str(match.group(0) or "")
+            value = self._mlops_runtime_rre_get(row, token)
+            return str(value) if value is not None else token
+
+        return re.sub(r"\b[A-Za-z_][A-Za-z0-9_.]*\b", _replace_field, rendered)
+
+    def _mlops_runtime_render_rre_mapping_template(self, row: Dict[str, Any], template: str) -> str:
+        text = str(template or "")
+        if "{{" not in text:
+            return self._mlops_runtime_render_rre_plain_template_text(row, text)
+
+        def _replace(match: Any) -> str:
+            is_expression = bool(match.group(1))
+            body = str(match.group(2) or "").strip()
+            if not body:
+                return ""
+            if is_expression:
+                return self._mlops_runtime_rre_expression_value(row, body)
+            value = self._mlops_runtime_rre_get(row, body)
+            return "" if value is None else str(value)
+
+        try:
+            return re.sub(r"\{\{\s*(=)?\s*([^{}]+?)\s*\}\}", _replace, text)
+        except Exception:
+            return text
 
     def _mlops_runtime_render_rre_template(self, row: Dict[str, Any], rule: Dict[str, Any], feature_dictionary: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
         template = str(
@@ -21816,17 +22300,27 @@ END;"""
             source = str(mapping.get("source") or "field").strip().lower()
             if source == "custom":
                 values[placeholder] = str(mapping.get("value") or "")
+            elif source == "template":
+                values[placeholder] = self._mlops_runtime_render_rre_mapping_template(row, str(mapping.get("value") or ""))
             else:
                 values[placeholder] = "" if self._mlops_runtime_rre_get(row, str(mapping.get("field") or "")) is None else str(
                     self._mlops_runtime_rre_get(row, str(mapping.get("field") or ""))
                 )
 
         def _replace(match: Any) -> str:
-            key = str(match.group(1) or "").strip()
-            return values.get(key, "")
+            is_expression = bool(match.group(1))
+            key = str(match.group(2) or "").strip()
+            if not key:
+                return ""
+            if is_expression:
+                return self._mlops_runtime_rre_expression_value(row, key)
+            if key in values:
+                return values.get(key, "")
+            value = self._mlops_runtime_rre_get(row, key)
+            return "" if value is None else str(value)
 
         try:
-            return re.sub(r"\{\{\s*([^{}]+?)\s*\}\}", _replace, template)
+            return re.sub(r"\{\{\s*(=)?\s*([^{}]+?)\s*\}\}", _replace, template)
         except Exception:
             return template
 
@@ -21868,6 +22362,20 @@ END;"""
             for field in (raw_auto_fields if isinstance(raw_auto_fields, list) else [])
             if str(field or "").strip()
         ]
+        raw_cluster_fields = config.get("mlops_rre_cluster_json_fields") if isinstance(config, dict) else None
+        if isinstance(raw_cluster_fields, str) and raw_cluster_fields.strip():
+            try:
+                parsed_cluster_fields = json.loads(raw_cluster_fields)
+                raw_cluster_fields = parsed_cluster_fields
+            except Exception:
+                raw_cluster_fields = []
+        cluster_json_fields = [
+            str(field or "").strip()
+            for field in (raw_cluster_fields if isinstance(raw_cluster_fields, list) else [])
+            if str(field or "").strip()
+        ]
+        include_auto_cluster_recommendation = config.get("mlops_rre_include_auto_cluster_recommendation") is not False if isinstance(config, dict) else True
+        cluster_transformers_enabled = config.get("mlops_rre_cluster_transformers_enabled") is True if isinstance(config, dict) else False
         cluster_config = self._mlops_runtime_rre_cluster_config(config)
         auto_signal_configured = any(
             isinstance(meta, dict) and bool(meta.get("auto_signal_enabled") or meta.get("autoSignalEnabled"))
@@ -21886,8 +22394,10 @@ END;"""
                 auto_value = self._mlops_runtime_rre_auto_signal_json(next_item, feature_dictionary, auto_signal_json_fields)
                 self._mlops_runtime_rule_set(next_item, "Auto_Generate_XAI_signal", auto_value or "")
                 if cluster_config:
-                    cluster_value = self._mlops_runtime_rre_cluster_json(next_item, feature_dictionary, cluster_config)
-                    self._mlops_runtime_rule_set(next_item, "Auto_Cluster_Recommendation", cluster_value or "")
+                    cluster_value = self._mlops_runtime_rre_cluster_json(next_item, feature_dictionary, cluster_config, auto_signal_json_fields, cluster_json_fields, cluster_transformers_enabled)
+                    if include_auto_cluster_recommendation:
+                        self._mlops_runtime_rule_set(next_item, "Auto_Cluster_Recommendation", cluster_value or "")
+                    self._mlops_runtime_rre_set_cluster_columns(next_item, cluster_value)
                 applied.append(next_item)
             return applied
 
@@ -21918,8 +22428,10 @@ END;"""
             if auto_signal_configured:
                 self._mlops_runtime_rule_set(next_row, "Auto_Generate_XAI_signal", auto_value or "")
             if cluster_config:
-                cluster_value = self._mlops_runtime_rre_cluster_json(next_row, feature_dictionary, cluster_config)
-                self._mlops_runtime_rule_set(next_row, "Auto_Cluster_Recommendation", cluster_value or "")
+                cluster_value = self._mlops_runtime_rre_cluster_json(next_row, feature_dictionary, cluster_config, auto_signal_json_fields, cluster_json_fields, cluster_transformers_enabled)
+                if include_auto_cluster_recommendation:
+                    self._mlops_runtime_rule_set(next_row, "Auto_Cluster_Recommendation", cluster_value or "")
+                self._mlops_runtime_rre_set_cluster_columns(next_row, cluster_value)
             matched = [
                 rule for rule in active_rules
                 if self._mlops_runtime_rre_group_matches(next_row, rule.get("rootGroup") or rule.get("root_group"))

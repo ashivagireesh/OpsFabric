@@ -4,6 +4,7 @@ import {
   Button,
   Card,
   Checkbox,
+  Collapse,
   Form,
   Input,
   InputNumber,
@@ -18,10 +19,12 @@ import {
   notification,
 } from 'antd'
 import {
+  CopyOutlined,
   DeleteOutlined,
   FileTextOutlined,
   PlusOutlined,
   SafetyCertificateOutlined,
+  SettingOutlined,
 } from '@ant-design/icons'
 import api from '../../api/client'
 
@@ -29,7 +32,7 @@ const { Text, Title } = Typography
 
 type RuleOperator = '>' | '>=' | '<' | '<=' | '=' | '!=' | 'contains' | 'exists'
 type ConditionJoin = 'and' | 'or'
-type TemplateMappingSource = 'field' | 'custom'
+type TemplateMappingSource = 'field' | 'custom' | 'template'
 type RRESeverity = 'HIGH' | 'MEDIUM' | 'LOW'
 
 interface RRECondition {
@@ -107,6 +110,7 @@ interface RREClusterConfig {
   observation: string
   recommendation: string
   priority: number
+  summary_max_chars: number
 }
 
 interface RREStudioProps {
@@ -122,6 +126,12 @@ interface RREStudioProps {
   onAutoSignalJsonFieldsChange?: (fields: string[]) => void
   clusterConfig?: RREClusterConfig[]
   onClusterConfigChange?: (clusters: RREClusterConfig[]) => void
+  clusterJsonFields?: string[]
+  onClusterJsonFieldsChange?: (fields: string[]) => void
+  includeAutoClusterRecommendation?: boolean
+  onIncludeAutoClusterRecommendationChange?: (enabled: boolean) => void
+  clusterTransformersEnabled?: boolean
+  onClusterTransformersEnabledChange?: (enabled: boolean) => void
 }
 
 const sampleModelOutput = {
@@ -194,6 +204,16 @@ const signalJsonFieldOptions = [
 
 const defaultSignalJsonFields = ['summary', 'observation', 'recommendation', 'default_recommendation', 'risk_band', 'feature', 'severity', 'value', 'peer_value', 'impact']
 const defaultAutoSignalJsonFields = ['business_name', 'severity', 'value', 'threshold', 'threshold_type', 'observation', 'recommendation']
+const defaultClusterJsonFields = ['cluster', 'severity', 'features', 'observation', 'recommendation', 'evidence']
+const defaultClusterSummaryMaxChars = 240
+const clusterJsonFieldOptions = [
+  { label: 'Cluster Name', value: 'cluster' },
+  { label: 'Severity', value: 'severity' },
+  { label: 'Selected Features', value: 'features' },
+  { label: 'Observation Sentence', value: 'observation' },
+  { label: 'Recommendation Sentence', value: 'recommendation' },
+  { label: 'Evidence Details', value: 'evidence' },
+]
 
 function newCondition(seed?: Partial<RRECondition>): RRECondition {
   return {
@@ -240,7 +260,7 @@ function normalizeMappings(raw: any): RRETemplateMapping[] {
   if (!Array.isArray(raw)) return []
   return raw.map((item): RRETemplateMapping => ({
     placeholder: String(item?.placeholder || ''),
-    source: item?.source === 'custom' ? 'custom' : 'field',
+    source: item?.source === 'custom' || item?.source === 'template' ? item.source : 'field',
     field: String(item?.field || ''),
     value: String(item?.value ?? ''),
   })).filter((item) => item.placeholder)
@@ -393,6 +413,7 @@ function normalizeClusterConfig(raw: unknown): RREClusterConfig[] {
     observation: String(item?.observation || ''),
     recommendation: String(item?.recommendation || ''),
     priority: Number(item?.priority || index + 1),
+    summary_max_chars: Math.max(100, Math.min(2000, Number(item?.summary_max_chars || item?.summaryMaxChars || defaultClusterSummaryMaxChars))),
   })).filter((item) => item.name)
 }
 
@@ -441,10 +462,21 @@ function riskBand(score: unknown): string {
 }
 
 function readField(row: Record<string, unknown>, path: string): unknown {
-  return path.split('.').reduce<unknown>((current, key) => {
+  const cleanPath = String(path || '').trim()
+  if (!cleanPath) return undefined
+  const nested = cleanPath.split('.').reduce<unknown>((current, key) => {
     if (!current || typeof current !== 'object' || Array.isArray(current)) return undefined
     return (current as Record<string, unknown>)[key]
   }, row)
+  if (nested !== undefined) return nested
+  if (Object.prototype.hasOwnProperty.call(row, cleanPath)) return row[cleanPath]
+  for (const prefix of ['source.', 'predictions.']) {
+    if (cleanPath.startsWith(prefix)) {
+      const flatPath = cleanPath.slice(prefix.length)
+      if (Object.prototype.hasOwnProperty.call(row, flatPath)) return row[flatPath]
+    }
+  }
+  return undefined
 }
 
 function assignPath(target: Record<string, unknown>, path: string, value: unknown) {
@@ -479,6 +511,159 @@ function formatScalar(value: unknown): string {
   if (value === null || value === undefined) return ''
   if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value)
   return JSON.stringify(value)
+}
+
+function decodeJsonStrings(value: unknown): unknown {
+  if (typeof value === 'string') {
+    const text = value.trim()
+    if (
+      (text.startsWith('{') && text.endsWith('}'))
+      || (text.startsWith('[') && text.endsWith(']'))
+    ) {
+      try {
+        return decodeJsonStrings(JSON.parse(text))
+      } catch {
+        return value
+      }
+    }
+    return value
+  }
+  if (Array.isArray(value)) return value.map(decodeJsonStrings)
+  if (value && typeof value === 'object') {
+    return Object.entries(value as Record<string, unknown>).reduce<Record<string, unknown>>((acc, [key, item]) => {
+      acc[key] = decodeJsonStrings(item)
+      return acc
+    }, {})
+  }
+  return value
+}
+
+function JsonValue({ value, depth, expanded }: { value: unknown; depth: number; expanded: boolean }) {
+  const [localExpanded, setLocalExpanded] = useState(expanded)
+  useEffect(() => setLocalExpanded(expanded), [expanded])
+
+  const isArray = Array.isArray(value)
+  const isObject = Boolean(value && typeof value === 'object' && !isArray)
+  const entries = isArray
+    ? (value as unknown[]).map((item, index) => [String(index), item] as const)
+    : isObject
+      ? Object.entries(value as Record<string, unknown>)
+      : []
+
+  if (!isArray && !isObject) {
+    const type = value === null ? 'null' : typeof value
+    const color = type === 'string'
+      ? '#86efac'
+      : type === 'number'
+        ? '#93c5fd'
+        : type === 'boolean'
+          ? '#fbbf24'
+          : '#94a3b8'
+    const display = type === 'string' ? JSON.stringify(value) : String(value)
+    return <span style={{ color }}>{display}</span>
+  }
+
+  if (entries.length === 0) {
+    return <span style={{ color: '#94a3b8' }}>{isArray ? '[]' : '{}'}</span>
+  }
+
+  const opener = isArray ? '[' : '{'
+  const closer = isArray ? ']' : '}'
+  return (
+    <span>
+      <button
+        type="button"
+        onClick={() => setLocalExpanded((current) => !current)}
+        style={{
+          width: 18,
+          height: 18,
+          padding: 0,
+          marginRight: 4,
+          border: '1px solid var(--app-border)',
+          borderRadius: 4,
+          background: 'var(--app-card-bg)',
+          color: 'var(--app-text-subtle)',
+          cursor: 'pointer',
+          lineHeight: '14px',
+        }}
+        aria-label={localExpanded ? 'Collapse JSON node' : 'Expand JSON node'}
+      >
+        {localExpanded ? '-' : '+'}
+      </button>
+      <span style={{ color: '#cbd5e1' }}>{opener}</span>
+      {!localExpanded ? (
+        <>
+          <span style={{ color: '#94a3b8' }}> {entries.length} {isArray ? 'items' : 'keys'} </span>
+          <span style={{ color: '#cbd5e1' }}>{closer}</span>
+        </>
+      ) : (
+        <>
+          <div>
+            {entries.map(([key, item], index) => (
+              <div key={`${depth}_${key}_${index}`} style={{ paddingLeft: Math.min(28, 14 + depth * 2), lineHeight: '20px' }}>
+                {!isArray ? (
+                  <>
+                    <span style={{ color: '#67e8f9' }}>{JSON.stringify(key)}</span>
+                    <span style={{ color: '#cbd5e1' }}>: </span>
+                  </>
+                ) : (
+                  <span style={{ color: '#64748b' }}>{key}: </span>
+                )}
+                <JsonValue value={item} depth={depth + 1} expanded={expanded} />
+                {index < entries.length - 1 ? <span style={{ color: '#cbd5e1' }}>,</span> : null}
+              </div>
+            ))}
+          </div>
+          <span style={{ color: '#cbd5e1' }}>{closer}</span>
+        </>
+      )}
+    </span>
+  )
+}
+
+function JsonViewerCard({ title, value }: { title: string; value: unknown }) {
+  const [expanded, setExpanded] = useState(true)
+  const displayValue = useMemo(() => decodeJsonStrings(value), [value])
+  const rawText = useMemo(() => JSON.stringify(displayValue, null, 2), [displayValue])
+
+  return (
+    <div style={{ minWidth: 0 }}>
+      <Space size={6} wrap style={{ width: '100%', justifyContent: 'space-between', marginBottom: 6 }}>
+        <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 12 }}>{title}</Text>
+        <Space size={6}>
+          <Button size="small" onClick={() => setExpanded(true)}>Expand</Button>
+          <Button size="small" onClick={() => setExpanded(false)}>Collapse</Button>
+          <Button
+            size="small"
+            icon={<CopyOutlined />}
+            onClick={() => {
+              void navigator.clipboard?.writeText(rawText)
+              notification.success({ message: `${title} copied`, placement: 'bottomRight', duration: 1.5 })
+            }}
+          >
+            Copy
+          </Button>
+        </Space>
+      </Space>
+      <div
+        style={{
+          minHeight: 260,
+          maxHeight: 420,
+          overflow: 'auto',
+          border: '1px solid var(--app-border-strong)',
+          borderRadius: 8,
+          background: '#0f172a',
+          padding: 12,
+          color: '#cbd5e1',
+          fontFamily: 'monospace',
+          fontSize: 12,
+          whiteSpace: 'pre-wrap',
+        }}
+      >
+        <JsonValue value={displayValue} depth={0} expanded={expanded} />
+      </div>
+    </div>
+  )
 }
 
 function compareValue(actual: unknown, operator: RuleOperator, expectedRaw: string): boolean {
@@ -539,8 +724,351 @@ function extractPlaceholders(template: RRETemplate | undefined): string[] {
   return Array.from(new Set(Array.from(body.matchAll(/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g)).map((m) => m[1])))
 }
 
+function evaluateTemplateMathExpression(expression: string, output: Record<string, unknown>): string {
+  const functionNames = new Set(['abs', 'ceil', 'floor', 'max', 'min', 'pow', 'round', 'sqrt'])
+  const expressionWithValues = expression.replace(/\b[A-Za-z_][A-Za-z0-9_.]*\b/g, (token) => {
+    if (functionNames.has(token)) return token
+    const value = readField(output, token)
+    const numeric = Number(value)
+    return Number.isFinite(numeric) ? String(numeric) : '0'
+  })
+  const executable = expressionWithValues.replace(/\b(abs|ceil|floor|max|min|pow|round|sqrt)\b/g, 'Math.$1')
+  if (!/^[\d\s+\-*/%().,Mathceilfloormaxminpowroundabsqrt]+$/.test(executable)) return ''
+  try {
+    const result = Function(`"use strict"; return (${executable})`)()
+    return result === undefined || result === null ? '' : formatScalar(result)
+  } catch {
+    return ''
+  }
+}
+
+function evaluateTemplateMathExpressionStrict(expression: string, output: Record<string, unknown>): string {
+  const functionNames = new Set(['abs', 'ceil', 'floor', 'max', 'min', 'pow', 'round', 'sqrt'])
+  const identifiers = Array.from(expression.matchAll(/\b[A-Za-z_][A-Za-z0-9_.]*\b/g)).map((match) => match[0])
+  const fields = identifiers.filter((token) => !functionNames.has(token))
+  if (!fields.length || fields.some((field) => readField(output, field) === undefined)) return ''
+  return evaluateTemplateMathExpression(expression, output)
+}
+
+function renderPlainTemplateText(text: string, output: Record<string, unknown>): string {
+  const directValue = readField(output, text.trim())
+  if (directValue !== undefined) return formatScalar(directValue)
+  const expressionAtom = String.raw`(?:[A-Za-z_][A-Za-z0-9_.]*|\d+(?:\.\d+)?)`
+  const binaryExpressionPattern = new RegExp(String.raw`\b${expressionAtom}(?:\s*[+\-*/%]\s*${expressionAtom})+\b`, 'g')
+  const functionExpressionPattern = /\b(?:round|abs|ceil|floor|min|max|sqrt|pow)\s*\([^()]*[+\-*/%][^()]*\)/g
+  let rendered = text.replace(/\[([^\][\n]+)\]/g, (match, expression: string) => {
+    const evaluated = evaluateTemplateMathExpressionStrict(expression, output)
+    return evaluated || expression
+  })
+  rendered = rendered.replace(functionExpressionPattern, (candidate) => {
+    const evaluated = evaluateTemplateMathExpressionStrict(candidate, output)
+    return evaluated || candidate
+  })
+  rendered = rendered.replace(binaryExpressionPattern, (candidate) => {
+    const evaluated = evaluateTemplateMathExpressionStrict(candidate, output)
+    return evaluated || candidate
+  })
+  rendered = rendered.replace(/\b[A-Za-z_][A-Za-z0-9_.]*\b/g, (token) => {
+    const value = readField(output, token)
+    return value === undefined ? token : formatScalar(value)
+  })
+  return rendered
+}
+
+function templateDisplayParts(value: string) {
+  const text = String(value || '')
+  const parts: Array<{ type: 'text' | 'expression'; value: string }> = []
+  let cursor = 0
+  Array.from(text.matchAll(/\[([^\][\n]+)\]/g)).forEach((match) => {
+    const index = match.index ?? 0
+    if (index > cursor) parts.push({ type: 'text', value: text.slice(cursor, index) })
+    parts.push({ type: 'expression', value: match[1] || '' })
+    cursor = index + match[0].length
+  })
+  if (cursor < text.length) parts.push({ type: 'text', value: text.slice(cursor) })
+  if (!parts.length && text) parts.push({ type: 'text', value: text })
+  return parts
+}
+
+function renderMappingTemplate(template: string, output: Record<string, unknown>): string {
+  const text = String(template || '')
+  if (!text.includes('{{')) {
+    return renderPlainTemplateText(text, output)
+  }
+  return text.replace(/\{\{\s*(=)?\s*([^{}]+?)\s*\}\}/g, (_match, isExpression: string, body: string) => {
+    const content = String(body || '').trim()
+    if (!content) return ''
+    if (isExpression) return evaluateTemplateMathExpression(content, output)
+    return formatScalar(readField(output, content))
+  })
+}
+
+function appendTemplateToken(value: string, token: string): string {
+  const current = String(value || '').trimEnd()
+  return `${current}${current ? ' ' : ''}${token}`
+}
+
+function appendExpressionSnippet(value: string, snippet: string): string {
+  const current = String(value || '').trimEnd()
+  const expressionMatch = current.match(/\{\{\s*=\s*([^{}]*?)\s*\}\}\s*$/)
+  if (!expressionMatch || expressionMatch.index === undefined) {
+    return appendTemplateToken(current, `{{= ${snippet} }}`)
+  }
+  const prefix = current.slice(0, expressionMatch.index)
+  const expression = String(expressionMatch[1] || '').trimEnd()
+  return `${prefix}{{= ${expression}${expression ? ' ' : ''}${snippet} }}`
+}
+
+function insertExpressionSnippetAt(value: string, snippet: string, cursor: number): string {
+  const text = String(value || '')
+  const cursorIndex = Math.max(0, Math.min(Number.isFinite(cursor) ? cursor : text.length, text.length))
+  const draft = templateInlineDraftAt(text, cursorIndex)
+  if (draft) {
+    const before = text.slice(0, cursorIndex).trimEnd()
+    const after = text.slice(cursorIndex)
+    return `${before}${before.endsWith('=') || before.endsWith('(') ? ' ' : ' '}${snippet}${after}`
+  }
+  return `${text.slice(0, cursorIndex)}${snippet}${text.slice(cursorIndex)}`
+}
+
+function templateInlineDraftAt(value: string, cursor: number): { mode: 'field' | 'expression'; query: string; start: number; cursor: number } | null {
+  const text = String(value || '')
+  const cursorIndex = Math.max(0, Math.min(Number.isFinite(cursor) ? cursor : text.length, text.length))
+  const beforeCursor = text.slice(0, cursorIndex)
+  const start = beforeCursor.lastIndexOf('{{')
+  if (start < 0) {
+    const bracketStart = beforeCursor.lastIndexOf('[')
+    if (bracketStart >= 0 && beforeCursor.lastIndexOf(']') < bracketStart && !beforeCursor.slice(bracketStart + 1).includes('\n')) {
+      const expression = beforeCursor.slice(bracketStart + 1)
+      const match = expression.match(/([A-Za-z_][A-Za-z0-9_.]*)$/)
+      return { mode: 'expression', query: match?.[1] || '', start: bracketStart, cursor: cursorIndex }
+    }
+    const match = beforeCursor.match(/([A-Za-z_][A-Za-z0-9_.]*)$/)
+    const operatorNearCursor = /[+\-*/%(,]\s*[A-Za-z_][A-Za-z0-9_.]*$/.test(beforeCursor)
+    if (!match && !operatorNearCursor) return null
+    return { mode: 'expression', query: match?.[1] || '', start: cursorIndex - (match?.[1]?.length || 0), cursor: cursorIndex }
+  }
+  if (beforeCursor.lastIndexOf('}}') > start) return null
+  const nextClose = text.indexOf('}}', start + 2)
+  if (nextClose >= 0 && nextClose < cursorIndex) return null
+  const body = text.slice(start + 2, cursorIndex)
+  if (body.includes('\n')) return null
+  const trimmedStart = body.trimStart()
+  if (trimmedStart.startsWith('=')) {
+    const expression = trimmedStart.slice(1)
+    const match = expression.match(/([A-Za-z_][A-Za-z0-9_.]*)$/)
+    return { mode: 'expression', query: match?.[1] || '', start, cursor: cursorIndex }
+  }
+  const match = body.match(/([A-Za-z_][A-Za-z0-9_.]*)$/)
+  return { mode: 'field', query: match?.[1] || '', start, cursor: cursorIndex }
+}
+
+function templateInlineDraft(value: string): { mode: 'field' | 'expression'; query: string; start: number; cursor: number } | null {
+  return templateInlineDraftAt(value, String(value || '').length)
+}
+
+function replaceTemplateInlineDraftAt(value: string, field: string, cursor: number): string {
+  const text = String(value || '')
+  const draft = templateInlineDraftAt(text, cursor)
+  if (!draft) return `${text.slice(0, cursor)}${field}${text.slice(cursor)}`
+  const braceMode = text.slice(draft.start, draft.start + 2) === '{{'
+  const bracketMode = text.slice(draft.start, draft.start + 1) === '['
+  const prefix = text.slice(0, draft.start)
+  const body = text.slice(draft.start + (braceMode ? 2 : bracketMode ? 1 : 0), draft.cursor)
+  const suffix = text.slice(draft.cursor)
+  if (!braceMode && !bracketMode) {
+    const replaced = draft.query
+      ? body.replace(new RegExp(`${draft.query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`), field)
+      : field
+    return `${prefix}${replaced}${suffix}`
+  }
+  if (bracketMode) {
+    const replacedBody = draft.query
+      ? body.replace(new RegExp(`${draft.query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`), field)
+      : `${body}${field}`
+    return `${prefix}[${replacedBody}${suffix}`
+  }
+  if (draft.mode === 'expression') {
+    const replacedBody = draft.query
+      ? body.replace(new RegExp(`${draft.query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`), field)
+      : `${body}${body.trim().endsWith('=') ? ' ' : ''}${field}`
+    return `${prefix}{{${replacedBody}${suffix}`
+  }
+  return `${prefix}{{${field}}}${suffix}`
+}
+
+function replaceTemplateInlineDraft(value: string, field: string): string {
+  return replaceTemplateInlineDraftAt(value, field, String(value || '').length)
+}
+
+function replaceTemplateExpressionFunctionDraftAt(value: string, fn: string, cursor: number): string {
+  const text = String(value || '')
+  const draft = templateInlineDraftAt(text, cursor)
+  if (!draft || draft.mode !== 'expression') return insertExpressionSnippetAt(text, `${fn}()`, cursor)
+  const braceMode = text.slice(draft.start, draft.start + 2) === '{{'
+  const bracketMode = text.slice(draft.start, draft.start + 1) === '['
+  const prefix = text.slice(0, draft.start)
+  const body = text.slice(draft.start + (braceMode ? 2 : bracketMode ? 1 : 0), draft.cursor)
+  const suffix = text.slice(draft.cursor)
+  const snippet = `${fn}()`
+  const replacedBody = draft.query
+    ? body.replace(new RegExp(`${draft.query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`), snippet)
+    : `${body}${body.trim().endsWith('=') ? ' ' : ''}${snippet}`
+  return `${prefix}${braceMode ? '{{' : bracketMode ? '[' : ''}${replacedBody}${suffix}`
+}
+
+function checkTemplateSyntax(value: string, fieldOptions: Array<{ label: string; value: string }>): { errors: string[]; warnings: string[] } {
+  const text = String(value || '')
+  const errors: string[] = []
+  const warnings: string[] = []
+  const fieldSet = new Set(fieldOptions.map((option) => String(option.value || '').trim()).filter(Boolean))
+  const knownFunctions = new Set(['round', 'abs', 'ceil', 'floor', 'min', 'max', 'sqrt', 'pow'])
+
+  const openCount = (text.match(/\{\{/g) || []).length
+  const closeCount = (text.match(/\}\}/g) || []).length
+  if (openCount > closeCount) errors.push('Missing closing }}.')
+  if (closeCount > openCount) errors.push('Extra closing }}.')
+  const squareOpenCount = (text.match(/\[/g) || []).length
+  const squareCloseCount = (text.match(/\]/g) || []).length
+  if (squareOpenCount > squareCloseCount) errors.push('Missing closing ] for expression.')
+  if (squareCloseCount > squareOpenCount) errors.push('Extra closing ].')
+
+  if (!text.includes('{{')) {
+    const trimmed = text.trim()
+    if (!trimmed) return { errors, warnings }
+    Array.from(trimmed.matchAll(/\[([^\][\n]*)\]/g)).forEach((match) => {
+      const expression = String(match[1] || '').trim()
+      if (!expression) errors.push('Expression block [] is empty.')
+      const leftParens = (expression.match(/\(/g) || []).length
+      const rightParens = (expression.match(/\)/g) || []).length
+      if (leftParens !== rightParens) errors.push('Expression parentheses are not balanced.')
+    })
+    const expressionLike = /[+\-*/%()]|\b(round|abs|ceil|floor|min|max|sqrt|pow)\s*\(/.test(trimmed)
+    const directFieldLike = /^[A-Za-z_][A-Za-z0-9_.]*$/.test(trimmed)
+    if (expressionLike) {
+      const leftParens = (trimmed.match(/\(/g) || []).length
+      const rightParens = (trimmed.match(/\)/g) || []).length
+      if (leftParens !== rightParens) errors.push('Expression parentheses are not balanced.')
+      Array.from(trimmed.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)).forEach((fnMatch) => {
+        const fn = String(fnMatch[1] || '')
+        if (!knownFunctions.has(fn)) warnings.push(`Unknown function ${fn}().`)
+      })
+      Array.from(trimmed.matchAll(/\b[A-Za-z_][A-Za-z0-9_.]*\b/g)).forEach((tokenMatch) => {
+        const token = String(tokenMatch[0] || '')
+        if (knownFunctions.has(token) || fieldSet.has(token)) return
+        const before = trimmed.slice(Math.max(0, (tokenMatch.index || 0) - 3), tokenMatch.index || 0)
+        const after = trimmed.slice((tokenMatch.index || 0) + token.length, (tokenMatch.index || 0) + token.length + 3)
+        if (/[+\-*/%(,]\s*$/.test(before) || /^\s*[+\-*/%),]/.test(after)) warnings.push(`Field ${token} is not in current output fields.`)
+      })
+    } else if (directFieldLike && !fieldSet.has(trimmed)) {
+      warnings.push(`Field ${trimmed} is not in current output fields.`)
+    }
+    return {
+      errors: Array.from(new Set(errors)),
+      warnings: Array.from(new Set(warnings)).slice(0, 4),
+    }
+  }
+
+  Array.from(text.matchAll(/\{\{\s*([^{}]*?)\s*\}\}/g)).forEach((match) => {
+    const body = String(match[1] || '').trim()
+    if (!body) {
+      errors.push('Empty template token.')
+      return
+    }
+    if (body.startsWith('=')) {
+      const expression = body.slice(1).trim()
+      if (!expression) errors.push('Expression is empty after =.')
+      const leftParens = (expression.match(/\(/g) || []).length
+      const rightParens = (expression.match(/\)/g) || []).length
+      if (leftParens !== rightParens) errors.push('Expression parentheses are not balanced.')
+      Array.from(expression.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)).forEach((fnMatch) => {
+        const fn = String(fnMatch[1] || '')
+        if (!knownFunctions.has(fn)) warnings.push(`Unknown function ${fn}().`)
+      })
+      Array.from(expression.matchAll(/\b[A-Za-z_][A-Za-z0-9_.]*\b/g)).forEach((tokenMatch) => {
+        const token = String(tokenMatch[0] || '')
+        if (knownFunctions.has(token)) return
+        if (!fieldSet.has(token)) warnings.push(`Field ${token} is not in current output fields.`)
+      })
+    } else if (!fieldSet.has(body)) {
+      warnings.push(`Field ${body} is not in current output fields.`)
+    }
+  })
+
+  return {
+    errors: Array.from(new Set(errors)),
+    warnings: Array.from(new Set(warnings)).slice(0, 4),
+  }
+}
+
+function autoCorrectTemplateSyntax(value: string): string {
+  let text = String(value || '')
+  text = text.replace(/\{=\s*([^{}]+?)\}/g, '{{= $1 }}')
+  text = text.replace(/\{([A-Za-z_][A-Za-z0-9_.]*)\}/g, '{{$1}}')
+  text = text.replace(/\{\{\s*=\s*([^{}]*?)$/g, '{{= $1 }}')
+  text = text.replace(/\{\{\s*([^{}]*?)$/g, '{{$1}}')
+  const openCount = (text.match(/\{\{/g) || []).length
+  const closeCount = (text.match(/\}\}/g) || []).length
+  if (openCount > closeCount) text = `${text}${'}}'.repeat(openCount - closeCount)}`
+  if (closeCount > openCount) {
+    let excess = closeCount - openCount
+    text = text.replace(/\}\}/g, (match) => {
+      if (excess <= 0) return match
+      excess -= 1
+      return ''
+    })
+  }
+  return text
+}
+
+function textareaCaretPosition(textarea: HTMLTextAreaElement): { left: number; top: number } {
+  const style = window.getComputedStyle(textarea)
+  const mirror = document.createElement('div')
+  const properties = [
+    'boxSizing',
+    'width',
+    'fontFamily',
+    'fontSize',
+    'fontWeight',
+    'fontStyle',
+    'letterSpacing',
+    'textTransform',
+    'wordSpacing',
+    'textIndent',
+    'lineHeight',
+    'paddingTop',
+    'paddingRight',
+    'paddingBottom',
+    'paddingLeft',
+    'borderTopWidth',
+    'borderRightWidth',
+    'borderBottomWidth',
+    'borderLeftWidth',
+  ]
+  properties.forEach((property) => {
+    mirror.style.setProperty(property, style.getPropertyValue(property))
+  })
+  mirror.style.position = 'absolute'
+  mirror.style.visibility = 'hidden'
+  mirror.style.whiteSpace = 'pre-wrap'
+  mirror.style.overflowWrap = 'break-word'
+  mirror.style.top = '0'
+  mirror.style.left = '-9999px'
+  mirror.textContent = textarea.value.slice(0, textarea.selectionStart || 0)
+  const marker = document.createElement('span')
+  marker.textContent = textarea.value.slice(textarea.selectionStart || 0, (textarea.selectionStart || 0) + 1) || '.'
+  mirror.appendChild(marker)
+  document.body.appendChild(mirror)
+  const lineHeight = Number.parseFloat(style.lineHeight) || 18
+  const left = marker.offsetLeft - textarea.scrollLeft
+  const top = marker.offsetTop - textarea.scrollTop + lineHeight + 4
+  document.body.removeChild(mirror)
+  return { left: Math.max(6, left), top: Math.max(6, top) }
+}
+
 function resolveMappedValue(output: Record<string, unknown>, mapping: RRETemplateMapping): string {
   if (mapping.source === 'custom') return String(mapping.value ?? '')
+  if (mapping.source === 'template') return renderMappingTemplate(String(mapping.value ?? ''), output)
   const path = String(mapping.field || '').trim()
   if (!path) return ''
   return formatScalar(readField(output, path))
@@ -562,9 +1090,12 @@ function renderTemplate(
     if (!mapping.placeholder) return
     values[mapping.placeholder] = resolveMappedValue(output, mapping)
   })
-  return template.body.replace(/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g, (_match, key: string) => (
-    values[key] ?? ''
-  ))
+  return template.body.replace(/\{\{\s*(=)?\s*([^{}]+?)\s*\}\}/g, (_match, isExpression: string, body: string) => {
+    const key = String(body || '').trim()
+    if (!key) return ''
+    if (isExpression) return evaluateTemplateMathExpression(key, output)
+    return values[key] ?? formatScalar(readField(output, key))
+  })
 }
 
 function buildNarrative(rule: RRERule, output: Record<string, unknown>, dictionary: RREFeatureDictionaryEntry[]) {
@@ -689,6 +1220,27 @@ function evaluateAutoSignal(entry: RREFeatureDictionaryEntry, output: Record<str
   }
 }
 
+function buildConfiguredClusterSignal(entry: RREFeatureDictionaryEntry, output: Record<string, unknown>) {
+  const value = readField(output, entry.field)
+  if (value === undefined || value === null || String(value).trim() === '') return null
+  const autoSignal = evaluateAutoSignal(entry, output)
+  if (autoSignal) return autoSignal
+  const businessName = entry.business_name || titleCase(entry.field)
+  return {
+    feature: entry.field,
+    business_name: businessName,
+    severity: 'CONFIGURED',
+    value: formatScalar(value),
+    threshold: '',
+    threshold_type: '',
+    direction: entry.direction || '',
+    unit: entry.unit || '',
+    meaning: entry.meaning || '',
+    observation: `${businessName} is included in this configured cluster with observed value ${formatScalar(value)}.`,
+    recommendation: entry.default_recommendation || '',
+  }
+}
+
 function buildAutoSignalJsonOutput(output: Record<string, unknown>, dictionary: RREFeatureDictionaryEntry[]): string {
   const signals = dictionary.map((entry) => evaluateAutoSignal(entry, output)).filter(Boolean)
   if (!signals.length) return ''
@@ -734,30 +1286,221 @@ function buildAutoSignalPreview(entry: RREFeatureDictionaryEntry, output: Record
   }
 }
 
-function buildClusterRecommendationOutput(output: Record<string, unknown>, dictionary: RREFeatureDictionaryEntry[], clusters: RREClusterConfig[]): string {
-  const signals = dictionary.map((entry) => evaluateAutoSignal(entry, output)).filter(Boolean) as Array<Record<string, string>>
-  if (!signals.length) return ''
-  const signalByFeature = new Map(signals.map((signal) => [String(signal.feature || ''), signal]))
+function selectSignalFields(signal: Record<string, string>, selectedFields: string[]): Record<string, string> {
+  const fields = selectedFields.length > 0 ? selectedFields : defaultAutoSignalJsonFields
+  return fields.reduce<Record<string, string>>((acc, field) => {
+    const key = String(field || '').trim()
+    if (!key) return acc
+    acc[key] = String(signal[key] ?? '')
+    return acc
+  }, {})
+}
+
+function clusterFactorSentence(signal: Record<string, string>): string {
+  const name = signal.business_name || signal.feature || 'factor'
+  const value = signal.value ? `${signal.value}${signal.unit ? ` ${signal.unit}` : ''}` : ''
+  const thresholdType = String(signal.threshold_type || '').trim()
+  const threshold = String(signal.threshold || '').trim()
+  const direction = String(signal.direction || '').trim()
+  if (thresholdType && threshold) {
+    const relation = direction === 'lower_is_risky' ? 'below' : 'above'
+    return `${name} is ${value || 'present'}, ${relation} the ${thresholdType} threshold of ${threshold}${signal.unit ? ` ${signal.unit}` : ''}`
+  }
+  return `${name}${value ? ` is ${value}` : ' is present'}`
+}
+
+function buildClusterEvidence(signals: Array<Record<string, string>>) {
+  return signals.map((signal) => ({
+    field: signal.feature || '',
+    factor: signal.business_name || signal.feature || '',
+    value: signal.value || '',
+    unit: signal.unit || '',
+    severity: signal.severity || '',
+    threshold: signal.threshold || '',
+    threshold_type: signal.threshold_type || '',
+    direction: signal.direction || '',
+  }))
+}
+
+function buildCumulativeClusterObservation(clusterName: string, signals: Array<Record<string, string>>, scenario = ''): string {
+  const factors = signals.map(clusterFactorSentence)
+  const lead = scenario || clusterName
+  const severity = signals.some((signal) => signal.severity === 'HIGH')
+    ? 'high-risk'
+    : signals.some((signal) => signal.severity === 'MEDIUM')
+      ? 'warning-level'
+      : 'configured'
+  return `${lead}: ${factors.join(', and ')}. Together, these criteria form a ${severity} ${clusterName} pattern that should be reviewed as one scenario.`
+}
+
+function buildCumulativeClusterRecommendation(clusterName: string, signals: Array<Record<string, string>>, instruction = ''): string {
+  const critical = signals
+    .filter((signal) => signal.severity === 'HIGH')
+    .map((signal) => signal.business_name || signal.feature)
+    .filter(Boolean)
+  const warning = signals
+    .filter((signal) => signal.severity === 'MEDIUM')
+    .map((signal) => signal.business_name || signal.feature)
+    .filter(Boolean)
+  const focus = critical.length > 0
+    ? `Prioritize ${critical.join(', ')} because ${critical.length === 1 ? 'it has' : 'they have'} crossed critical criteria`
+    : warning.length > 0
+      ? `Review ${warning.join(', ')} because ${warning.length === 1 ? 'it has' : 'they have'} crossed warning criteria`
+      : 'Review the configured factors together'
+  const base = `${focus}. Validate the source transactions, compare against recent customer/entity behavior, and decide whether the ${clusterName} pattern is expected or requires action.`
+  return instruction ? `${instruction}. ${base}` : base
+}
+
+function compactClusterWording(text: string, maxChars = 280): string {
+  const cleaned = String(text || '').replace(/\s+/g, ' ').trim()
+  if (cleaned.length <= 100) return cleaned
+  const leadMatch = cleaned.match(/^([^:]{1,80}):\s*(.+)$/)
+  if (leadMatch) {
+    const lead = leadMatch[1].trim()
+    const body = leadMatch[2].replace(/\bTogether,.*$/i, '').trim()
+    const breaches = Array.from(body.matchAll(/([^,.]+?)\s+is\s+([^,.]+?),\s+(above|below)\s+the\s+([^,.]+?)\s+threshold\s+of\s+([^,.]+)/gi))
+      .map((match) => `${match[1].trim()} ${match[3].toLowerCase()} ${match[4].trim()} (${match[2].trim()} vs ${match[5].trim()})`)
+    if (breaches.length > 0) {
+      const summary = `${lead}: ${breaches.slice(0, 2).join('; ')}. Review as one cluster scenario.`
+      return summary.length <= maxChars ? summary : `${lead}: ${breaches.slice(0, 2).map((item) => item.replace(/\s*\([^)]*\)/g, '')).join('; ')}.`
+    }
+  }
+  const priorityMatch = cleaned.match(/^(Prioritize|Review)\s+([^.]*)\.\s*(.*)$/i)
+  if (priorityMatch) {
+    const action = priorityMatch[1].toLowerCase() === 'prioritize' ? 'Prioritize' : 'Review'
+    const focus = priorityMatch[2].replace(/\sbecause\b.*$/i, '').trim()
+    const summary = `${action} ${focus}; validate source transactions and recent behavior.`
+    return summary.length <= maxChars ? summary : `${action} ${focus}.`
+  }
+  const sentences = cleaned
+    .split(/(?<=[.!?])\s+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+  const picked: string[] = []
+  let size = 0
+  sentences.forEach((sentence) => {
+    if (picked.length >= 2) return
+    if (size + sentence.length > maxChars && picked.length > 0) return
+    picked.push(sentence)
+    size += sentence.length + 1
+  })
+  const summary = (picked.length > 0 ? picked.join(' ') : cleaned).trim()
+  if (summary.length <= maxChars) return summary
+  const words = summary.split(/\s+/).filter(Boolean)
+  const compact = words.slice(0, 14).join(' ')
+  return compact.length < summary.length ? `${compact}.` : summary
+}
+
+function buildLegacyCumulativeClusterObservation(clusterName: string, signals: Array<Record<string, string>>): string {
+  const factors = signals.map((signal) => {
+    const name = signal.business_name || signal.feature || 'factor'
+    const value = signal.value ? `${signal.value}${signal.unit ? ` ${signal.unit}` : ''}` : ''
+    const severity = String(signal.severity || '').toUpperCase()
+    const severityText = severity === 'HIGH'
+      ? 'critical'
+      : severity === 'MEDIUM'
+        ? 'warning'
+        : 'observed'
+    return `${name}${value ? ` is ${value}` : ''}${severityText ? ` (${severityText})` : ''}`
+  })
+  const highCount = signals.filter((signal) => signal.severity === 'HIGH').length
+  const mediumCount = signals.filter((signal) => signal.severity === 'MEDIUM').length
+  const driver = highCount > 0
+    ? `${highCount} critical factor${highCount === 1 ? '' : 's'}`
+    : mediumCount > 0
+      ? `${mediumCount} warning factor${mediumCount === 1 ? '' : 's'}`
+      : 'the configured factor combination'
+  return `${clusterName} flagged a combined pattern across ${factors.join(' and ')}. The cluster is driven by ${driver}, so review these factors together rather than as separate exceptions.`
+}
+
+function buildLegacyCumulativeClusterRecommendation(clusterName: string, signals: Array<Record<string, string>>): string {
+  const recommendations = Array.from(new Set(signals.map((signal) => String(signal.recommendation || '').trim()).filter(Boolean)))
+  const factorNames = signals.map((signal) => signal.business_name || signal.feature).filter(Boolean).join(', ')
+  const base = `Check whether the combined ${clusterName} pattern is expected for this customer/entity across ${factorNames || 'the selected factors'}. Validate the source transactions, compare with recent behavior, and prioritize the highest-severity factor first.`
+  if (!recommendations.length) return base
+  return `${base} Suggested follow-up: ${recommendations.join(' ')}`
+}
+
+function buildClusterRecommendationOutput(
+  output: Record<string, unknown>,
+  dictionary: RREFeatureDictionaryEntry[],
+  clusters: RREClusterConfig[],
+  selectedFields: string[] = defaultClusterJsonFields,
+  smartWordingEnabled = false,
+): string {
+  const outputFields = selectedFields.length > 0 ? selectedFields : defaultClusterJsonFields
+  const signalByFeature = new Map(
+    dictionary
+      .map((entry) => buildConfiguredClusterSignal(entry, output))
+      .filter(Boolean)
+      .map((signal) => [String((signal as Record<string, string>).feature || ''), signal as Record<string, string>])
+  )
+  if (signalByFeature.size <= 0) return ''
   const matchedClusters = clusters
     .filter((cluster) => cluster.enabled !== false)
     .sort((a, b) => Number(a.priority || 999999) - Number(b.priority || 999999))
     .map((cluster) => {
       const matchedSignals = cluster.features.map((field) => signalByFeature.get(field)).filter(Boolean) as Array<Record<string, string>>
       if (!matchedSignals.length) return null
-      const severity = matchedSignals.some((signal) => signal.severity === 'HIGH') ? 'HIGH' : 'MEDIUM'
-      const names = matchedSignals.map((signal) => signal.business_name || signal.feature).filter(Boolean).join(', ')
-      return {
-        cluster: cluster.name,
+      const severity = matchedSignals.some((signal) => signal.severity === 'HIGH')
+        ? 'HIGH'
+        : (matchedSignals.some((signal) => signal.severity === 'MEDIUM') ? 'MEDIUM' : 'CONFIGURED')
+      const clusterName = cluster.name || 'Cluster'
+      const configuredObservation = String(cluster.observation || '').trim()
+      const configuredRecommendation = String(cluster.recommendation || '').trim()
+      const summaryMaxChars = Math.max(100, Math.min(2000, Number(cluster.summary_max_chars || defaultClusterSummaryMaxChars)))
+      const rawObservation = buildCumulativeClusterObservation(clusterName, matchedSignals, configuredObservation)
+      const rawRecommendation = buildCumulativeClusterRecommendation(clusterName, matchedSignals, configuredRecommendation)
+      const cumulativeObservation = smartWordingEnabled ? compactClusterWording(rawObservation, summaryMaxChars) : rawObservation
+      const cumulativeRecommendation = smartWordingEnabled ? compactClusterWording(rawRecommendation, summaryMaxChars) : rawRecommendation
+      const fullCluster = {
+        cluster: clusterName,
         severity,
         features: matchedSignals.map((signal) => signal.feature),
-        observation: cluster.observation || `${cluster.name} matched ${matchedSignals.length} signal(s): ${names}.`,
-        recommendation: cluster.recommendation || matchedSignals.map((signal) => signal.recommendation).filter(Boolean).join(' '),
-        signals: matchedSignals,
+        observation: cumulativeObservation,
+        recommendation: cumulativeRecommendation,
+        evidence: buildClusterEvidence(matchedSignals),
       }
+      return outputFields.reduce<Record<string, unknown>>((acc, field) => {
+        const key = String(field || '').trim()
+        if (key) acc[key] = (fullCluster as Record<string, unknown>)[key]
+        return acc
+      }, {})
     })
     .filter(Boolean)
   if (!matchedClusters.length) return ''
   return JSON.stringify({ clusters: matchedClusters })
+}
+
+function safeOutputKey(value: string): string {
+  return String(value || 'cluster')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    || 'cluster'
+}
+
+function buildClusterRecommendationColumns(
+  output: Record<string, unknown>,
+  dictionary: RREFeatureDictionaryEntry[],
+  clusters: RREClusterConfig[],
+  selectedFields: string[] = defaultClusterJsonFields,
+  smartWordingEnabled = false,
+): Record<string, string> {
+  const raw = buildClusterRecommendationOutput(output, dictionary, clusters, selectedFields, smartWordingEnabled)
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw)
+    const rows: any[] = Array.isArray(parsed?.clusters) ? parsed.clusters : []
+    return rows.reduce<Record<string, string>>((acc, cluster: any, index: number) => {
+      const key = safeOutputKey(cluster?.cluster || `cluster_${index + 1}`)
+      acc[`cluster_${key}`] = JSON.stringify(cluster)
+      return acc
+    }, {})
+  } catch {
+    return {}
+  }
 }
 
 function updateGroupById(group: RREConditionGroup, groupId: string, patcher: (group: RREConditionGroup) => RREConditionGroup): RREConditionGroup {
@@ -896,10 +1639,19 @@ export default function RREStudio(props: RREStudioProps) {
   const [featureConfigDraft, setFeatureConfigDraft] = useState<{ index: number; item: RREFeatureDictionaryEntry } | null>(null)
   const [autoSignalFieldsOpen, setAutoSignalFieldsOpen] = useState(false)
   const [clusterConfigOpen, setClusterConfigOpen] = useState(false)
+  const [clusterEditorOpen, setClusterEditorOpen] = useState(false)
+  const [clusterJsonFieldsOpen, setClusterJsonFieldsOpen] = useState(false)
   const [clusterDraft, setClusterDraft] = useState<RREClusterConfig | null>(null)
+  const [templateCursorByPlaceholder, setTemplateCursorByPlaceholder] = useState<Record<string, number>>({})
+  const [templatePickerPositionByPlaceholder, setTemplatePickerPositionByPlaceholder] = useState<Record<string, { left: number; top: number }>>({})
   const [autoSignalJsonFields, setAutoSignalJsonFieldsState] = useState<string[]>(() => (
     Array.isArray(props.autoSignalJsonFields) && props.autoSignalJsonFields.length > 0 ? props.autoSignalJsonFields : defaultAutoSignalJsonFields
   ))
+  const [clusterJsonFields, setClusterJsonFieldsState] = useState<string[]>(() => (
+    Array.isArray(props.clusterJsonFields) && props.clusterJsonFields.length > 0 ? props.clusterJsonFields : defaultClusterJsonFields
+  ))
+  const [includeAutoClusterRecommendation, setIncludeAutoClusterRecommendationState] = useState<boolean>(() => props.includeAutoClusterRecommendation !== false)
+  const [clusterTransformersEnabled, setClusterTransformersEnabledState] = useState<boolean>(() => props.clusterTransformersEnabled === true)
   const externalModelOutput = useMemo(() => buildModelOutputFromFields(props), [
     props.sourceFields,
     props.predictionFields,
@@ -919,6 +1671,9 @@ export default function RREStudio(props: RREStudioProps) {
   const externalDictionarySignature = useMemo(() => JSON.stringify(props.featureDictionary || null), [props.featureDictionary])
   const externalAutoSignalFieldsSignature = useMemo(() => JSON.stringify(props.autoSignalJsonFields || null), [props.autoSignalJsonFields])
   const externalClusterSignature = useMemo(() => JSON.stringify(props.clusterConfig || null), [props.clusterConfig])
+  const externalClusterJsonFieldsSignature = useMemo(() => JSON.stringify(props.clusterJsonFields || null), [props.clusterJsonFields])
+  const externalIncludeAutoClusterRecommendationSignature = useMemo(() => JSON.stringify(props.includeAutoClusterRecommendation ?? true), [props.includeAutoClusterRecommendation])
+  const externalClusterTransformersSignature = useMemo(() => JSON.stringify(props.clusterTransformersEnabled === true), [props.clusterTransformersEnabled])
   const dictionaryLocalSignature = useMemo(() => JSON.stringify(featureDictionary), [featureDictionary])
 
   const parsedOutput = useMemo(() => {
@@ -950,6 +1705,20 @@ export default function RREStudio(props: RREStudioProps) {
       setAutoSignalJsonFieldsState(props.autoSignalJsonFields.length > 0 ? props.autoSignalJsonFields : defaultAutoSignalJsonFields)
     }
   }, [externalAutoSignalFieldsSignature])
+
+  useEffect(() => {
+    if (props.clusterJsonFields) {
+      setClusterJsonFieldsState(props.clusterJsonFields.length > 0 ? props.clusterJsonFields : defaultClusterJsonFields)
+    }
+  }, [externalClusterJsonFieldsSignature])
+
+  useEffect(() => {
+    setIncludeAutoClusterRecommendationState(props.includeAutoClusterRecommendation !== false)
+  }, [externalIncludeAutoClusterRecommendationSignature])
+
+  useEffect(() => {
+    setClusterTransformersEnabledState(props.clusterTransformersEnabled === true)
+  }, [externalClusterTransformersSignature])
 
   useEffect(() => {
     if (props.clusterConfig) setClusterConfigState(normalizeClusterConfig(props.clusterConfig))
@@ -1038,6 +1807,22 @@ export default function RREStudio(props: RREStudioProps) {
     props.onAutoSignalJsonFieldsChange?.(next)
   }
 
+  const commitClusterJsonFields = (fields: string[]) => {
+    const next = fields.map((item) => String(item || '').trim()).filter(Boolean)
+    setClusterJsonFieldsState(next.length > 0 ? next : defaultClusterJsonFields)
+    props.onClusterJsonFieldsChange?.(next.length > 0 ? next : defaultClusterJsonFields)
+  }
+
+  const commitIncludeAutoClusterRecommendation = (enabled: boolean) => {
+    setIncludeAutoClusterRecommendationState(enabled)
+    props.onIncludeAutoClusterRecommendationChange?.(enabled)
+  }
+
+  const commitClusterTransformersEnabled = (enabled: boolean) => {
+    setClusterTransformersEnabledState(enabled)
+    props.onClusterTransformersEnabledChange?.(enabled)
+  }
+
   const commitClusterConfig = (nextItems: RREClusterConfig[] | ((current: RREClusterConfig[]) => RREClusterConfig[])) => {
     setClusterConfigState((current) => {
       const next = typeof nextItems === 'function' ? nextItems(current) : nextItems
@@ -1053,6 +1838,11 @@ export default function RREStudio(props: RREStudioProps) {
       return exists ? current.map((item) => item.id === clusterDraft.id ? clusterDraft : item) : [...current, clusterDraft]
     })
     setClusterDraft(null)
+    setClusterEditorOpen(false)
+  }
+
+  const openClusterConfig = () => {
+    setClusterConfigOpen(true)
   }
 
   const mergeFeatureDictionary = (incoming: RREFeatureDictionaryEntry[]) => {
@@ -1156,9 +1946,14 @@ export default function RREStudio(props: RREStudioProps) {
       }
     })
     if (parsedOutput.row) out.Auto_Generate_XAI_signal = buildSelectedAutoSignalJsonOutput(parsedOutput.row, featureDictionary, autoSignalJsonFields)
-    if (parsedOutput.row) out.Auto_Cluster_Recommendation = buildClusterRecommendationOutput(parsedOutput.row, featureDictionary, clusterConfig)
+    if (parsedOutput.row) {
+      if (includeAutoClusterRecommendation) {
+        out.Auto_Cluster_Recommendation = buildClusterRecommendationOutput(parsedOutput.row, featureDictionary, clusterConfig, clusterJsonFields, clusterTransformersEnabled)
+      }
+      Object.assign(out, buildClusterRecommendationColumns(parsedOutput.row, featureDictionary, clusterConfig, clusterJsonFields, clusterTransformersEnabled))
+    }
     return out
-  }, [evaluation.matched, parsedOutput.row, rules, allTemplates, featureDictionary, autoSignalJsonFields, clusterConfig])
+  }, [evaluation.matched, parsedOutput.row, rules, allTemplates, featureDictionary, autoSignalJsonFields, clusterConfig, clusterJsonFields, includeAutoClusterRecommendation, clusterTransformersEnabled])
 
   const addRule = () => {
     const id = `rule-${Date.now()}`
@@ -1477,7 +2272,7 @@ export default function RREStudio(props: RREStudioProps) {
                   <Space wrap>
                     <Button size="small" onClick={generateMissingFeatureDictionary}>Generate Missing</Button>
                     <Button size="small" onClick={() => setAutoSignalFieldsOpen(true)}>Auto Signal JSON Fields</Button>
-                    <Button size="small" onClick={() => setClusterConfigOpen(true)}>Cluster Config</Button>
+                    <Button size="small" onClick={openClusterConfig}>Cluster Config</Button>
                     <Button size="small" icon={<FileTextOutlined />} onClick={() => setDictionaryImportOpen(true)}>Paste Import</Button>
                     <Button size="small" icon={<PlusOutlined />} onClick={() => commitFeatureDictionary((current) => [...current, inferFeatureMetadata(outputFields[0] || '')])}>Feature</Button>
                   </Space>
@@ -1559,24 +2354,8 @@ export default function RREStudio(props: RREStudioProps) {
                 style={{ background: 'var(--app-input-bg)', borderColor: 'var(--app-border-strong)' }}
               >
                 <div style={{ display: 'grid', gridTemplateColumns: 'minmax(320px, 0.9fr) minmax(420px, 1.1fr)', gap: 12 }}>
-                  <div>
-                    <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Sample Input Row</Text>
-                    <Input.TextArea
-                      readOnly
-                      rows={8}
-                      value={JSON.stringify(parsedOutput.row || {}, null, 2)}
-                      style={{ marginTop: 6, fontFamily: 'monospace', background: 'var(--app-card-bg)', color: 'var(--app-text)' }}
-                    />
-                  </div>
-                  <div>
-                    <Text style={{ color: 'var(--app-text)', fontWeight: 600, fontSize: 12 }}>Recommendation Output</Text>
-                    <Input.TextArea
-                      readOnly
-                      rows={8}
-                      value={JSON.stringify(recommendationOutput, null, 2)}
-                      style={{ marginTop: 6, fontFamily: 'monospace', background: 'var(--app-card-bg)', color: 'var(--app-text)' }}
-                    />
-                  </div>
+                  <JsonViewerCard title="Sample Input Row" value={parsedOutput.row || {}} />
+                  <JsonViewerCard title="Recommendation Output" value={recommendationOutput} />
                 </div>
               </Card>
               </Space>
@@ -1655,56 +2434,126 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
         onCancel={() => {
           setClusterConfigOpen(false)
           setClusterDraft(null)
+          setClusterEditorOpen(false)
         }}
-        width="96vw"
-        style={{ top: 16, paddingBottom: 0, maxWidth: '96vw' }}
+        width="100vw"
+        style={{ top: 0, margin: 0, paddingBottom: 0, maxWidth: '100vw' }}
         styles={{
+          content: {
+            height: '100vh',
+            borderRadius: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            background: 'var(--app-panel-bg)',
+          },
           body: {
-            maxHeight: '82vh',
+            flex: 1,
+            minHeight: 0,
             overflow: 'auto',
           },
         }}
       >
-        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(340px, 420px)', gap: 12 }}>
+        <Space direction="vertical" size={10} style={{ width: '100%', minHeight: 'calc(100vh - 130px)' }}>
+          <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+            <Space size={8} wrap>
+              <Tag color="blue" style={{ marginInlineEnd: 0 }}>clusters: {clusterConfig.length}</Tag>
+              <Tag style={{ marginInlineEnd: 0 }}>json fields: {clusterJsonFields.length}</Tag>
+              <Tag color={includeAutoClusterRecommendation ? 'green' : 'default'} style={{ marginInlineEnd: 0 }}>
+                Auto_Cluster_Recommendation: {includeAutoClusterRecommendation ? 'on' : 'off'}
+              </Tag>
+              <Tag color={clusterTransformersEnabled ? 'purple' : 'default'} style={{ marginInlineEnd: 0 }}>
+                smart wording: {clusterTransformersEnabled ? 'on' : 'off'}
+              </Tag>
+            </Space>
+            <Space size={8} wrap>
+              <Space size={6}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Aggregate column</Text>
+                <Switch size="small" checked={includeAutoClusterRecommendation} onChange={commitIncludeAutoClusterRecommendation} />
+              </Space>
+              <Space size={6}>
+                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Smart wording</Text>
+                <Switch size="small" checked={clusterTransformersEnabled} onChange={commitClusterTransformersEnabled} />
+              </Space>
+              <Button size="small" icon={<SettingOutlined />} onClick={() => setClusterJsonFieldsOpen(true)}>
+                JSON Output Fields
+              </Button>
+              <Button size="small" icon={<PlusOutlined />} onClick={() => {
+                setClusterDraft({
+                  id: `cluster-${Date.now()}`,
+                  name: 'Transaction Risk Cluster',
+                  enabled: true,
+                  features: [],
+                  observation: '',
+                  recommendation: '',
+                  priority: clusterConfig.length + 1,
+                  summary_max_chars: defaultClusterSummaryMaxChars,
+                })
+                setClusterEditorOpen(true)
+              }}>
+                New Cluster
+              </Button>
+            </Space>
+          </Space>
           <Table
             size="small"
             rowKey="id"
             pagination={{ pageSize: 8, size: 'small' }}
             dataSource={clusterConfig}
             columns={[
-              { title: 'Cluster', dataIndex: 'name', ellipsis: true },
+              { title: 'Cluster', dataIndex: 'name', width: 220, ellipsis: true },
               { title: 'Enabled', width: 90, render: (_value, row) => <Tag color={row.enabled ? 'blue' : 'default'}>{row.enabled ? 'Enabled' : 'Off'}</Tag> },
               { title: 'Features', width: 220, render: (_value, row) => <Text ellipsis>{row.features.join(', ')}</Text> },
+              { title: 'Observation', dataIndex: 'observation', width: 320, ellipsis: true },
+              { title: 'Recommendation', dataIndex: 'recommendation', width: 320, ellipsis: true },
+              { title: 'Summary Chars', dataIndex: 'summary_max_chars', width: 110 },
               { title: 'Priority', dataIndex: 'priority', width: 80 },
               {
                 title: 'Action',
                 width: 145,
                 render: (_value, row) => (
                   <Space>
-                    <Button size="small" onClick={() => setClusterDraft({ ...row })}>Edit</Button>
+                    <Button size="small" onClick={() => {
+                      setClusterDraft({ ...row })
+                      setClusterEditorOpen(true)
+                    }}>Configure</Button>
                     <Button size="small" danger icon={<DeleteOutlined />} onClick={() => commitClusterConfig((current) => current.filter((item) => item.id !== row.id))} />
                   </Space>
                 ),
               },
             ]}
             locale={{ emptyText: 'Create clusters to group related auto signals into high-level recommendations.' }}
+            scroll={{ x: 1240, y: 'calc(100vh - 245px)' }}
           />
-          <Card
-            size="small"
-            title={clusterDraft ? 'Configure Cluster' : 'New Cluster'}
-            extra={<Button size="small" icon={<PlusOutlined />} onClick={() => setClusterDraft({
-              id: `cluster-${Date.now()}`,
-              name: 'Transaction Risk Cluster',
-              enabled: true,
-              features: [],
-              observation: '',
-              recommendation: '',
-              priority: clusterConfig.length + 1,
-            })}>New</Button>}
-            style={{ background: 'var(--app-card-bg)', borderColor: 'var(--app-border-strong)' }}
-          >
-            {clusterDraft ? (
-              <Form layout="vertical" size="small">
+        </Space>
+      </Modal>
+      <Modal
+        open={clusterEditorOpen}
+        title={clusterDraft ? 'Configure Cluster' : 'New Cluster'}
+        okText="Save Cluster"
+        onOk={saveClusterDraft}
+        onCancel={() => {
+          setClusterEditorOpen(false)
+          setClusterDraft(null)
+        }}
+        width={760}
+        centered
+        zIndex={2600}
+        styles={{
+          content: {
+            borderRadius: 8,
+            background: 'var(--app-panel-bg)',
+            border: '1px solid var(--app-border-strong)',
+          },
+          body: {
+            maxHeight: '72vh',
+            overflowY: 'auto',
+          },
+        }}
+      >
+        {clusterDraft ? (
+          <Form layout="vertical" size="small">
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(260px, 0.75fr)', gap: 12, alignItems: 'start' }}>
+              <div>
                 <Form.Item label="Cluster Name">
                   <Input value={clusterDraft.name} onChange={(event) => setClusterDraft((current) => current ? { ...current, name: event.target.value } : current)} />
                 </Form.Item>
@@ -1714,6 +2563,19 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
                 </Space>
                 <Form.Item label="Priority">
                   <InputNumber min={1} value={clusterDraft.priority} onChange={(priority) => setClusterDraft((current) => current ? { ...current, priority: Number(priority || 1) } : current)} style={{ width: '100%' }} />
+                </Form.Item>
+                <Form.Item label="Smart Wording Character Limit">
+                  <InputNumber
+                    min={100}
+                    max={2000}
+                    step={20}
+                    value={clusterDraft.summary_max_chars || defaultClusterSummaryMaxChars}
+                    onChange={(summaryMaxChars) => setClusterDraft((current) => current ? {
+                      ...current,
+                      summary_max_chars: Math.max(100, Math.min(2000, Number(summaryMaxChars || defaultClusterSummaryMaxChars))),
+                    } : current)}
+                    style={{ width: '100%' }}
+                  />
                 </Form.Item>
                 <Form.Item label="Features">
                   <Select
@@ -1731,13 +2593,90 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
                 <Form.Item label="Cluster Recommendation">
                   <Input.TextArea rows={3} value={clusterDraft.recommendation} onChange={(event) => setClusterDraft((current) => current ? { ...current, recommendation: event.target.value } : current)} />
                 </Form.Item>
-                <Button type="primary" block onClick={saveClusterDraft}>Save Cluster</Button>
-              </Form>
-            ) : (
-              <Text style={{ color: 'var(--app-text-subtle)' }}>Select Edit or create a new cluster.</Text>
-            )}
-          </Card>
-        </div>
+              </div>
+              <div style={{ display: 'grid', gap: 10 }}>
+                <Card size="small" title="Cluster JSON Fields" style={{ background: 'var(--app-card-bg)', borderColor: 'var(--app-border-strong)' }}>
+                  <Checkbox.Group
+                    value={clusterJsonFields}
+                    options={clusterJsonFieldOptions}
+                    onChange={(fields) => commitClusterJsonFields(fields.map((item) => String(item)))}
+                    style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 8 }}
+                  />
+                </Card>
+                {parsedOutput.row ? (
+                  <Input.TextArea
+                    readOnly
+                    rows={8}
+                    value={JSON.stringify({
+                      ...(includeAutoClusterRecommendation ? {
+                        Auto_Cluster_Recommendation: buildClusterRecommendationOutput(parsedOutput.row, featureDictionary, [clusterDraft], clusterJsonFields, clusterTransformersEnabled),
+                      } : {}),
+                      ...buildClusterRecommendationColumns(parsedOutput.row, featureDictionary, [clusterDraft], clusterJsonFields, clusterTransformersEnabled),
+                    }, null, 2)}
+                    style={{ fontFamily: 'monospace', background: 'var(--app-input-bg)', color: 'var(--app-text)' }}
+                  />
+                ) : null}
+              </div>
+            </div>
+          </Form>
+        ) : (
+          <Text style={{ color: 'var(--app-text-subtle)' }}>Select a cluster or create a new one.</Text>
+        )}
+      </Modal>
+      <Modal
+        open={clusterJsonFieldsOpen}
+        title="Cluster JSON Output Fields"
+        okText="Done"
+        onOk={() => setClusterJsonFieldsOpen(false)}
+        onCancel={() => setClusterJsonFieldsOpen(false)}
+        width={640}
+        centered
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Alert
+            type="info"
+            showIcon
+            message="Choose whether to emit the aggregate Auto_Cluster_Recommendation column, and select the high-level fields for enabled cluster JSON outputs."
+          />
+          <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+            <Text style={{ color: 'var(--app-text)' }}>Emit Auto_Cluster_Recommendation column</Text>
+            <Switch checked={includeAutoClusterRecommendation} onChange={commitIncludeAutoClusterRecommendation} />
+          </Space>
+          <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+            <div>
+              <Text style={{ color: 'var(--app-text)' }}>Use transformer smart wording for long cluster text</Text>
+              <br />
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                Uses optional backend transformers summarization when installed; otherwise falls back to compact rule-based shortening.
+              </Text>
+            </div>
+            <Switch checked={clusterTransformersEnabled} onChange={commitClusterTransformersEnabled} />
+          </Space>
+          <Checkbox.Group
+            value={clusterJsonFields}
+            options={clusterJsonFieldOptions}
+            onChange={(fields) => commitClusterJsonFields(fields.map((item) => String(item)))}
+            style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(180px, 1fr))', gap: '10px 14px' }}
+          />
+          <Input.TextArea
+            readOnly
+            rows={5}
+            value={JSON.stringify({
+              Auto_Cluster_Recommendation: {
+                enabled: includeAutoClusterRecommendation,
+                selected_fields: includeAutoClusterRecommendation ? clusterJsonFields : [],
+              },
+              smart_wording: {
+                transformers_enabled: clusterTransformersEnabled,
+              },
+              cluster_columns: {
+                enabled: true,
+                selected_fields: clusterJsonFields,
+              },
+            }, null, 2)}
+            style={{ fontFamily: 'monospace', background: 'var(--app-card-bg)', color: 'var(--app-text)' }}
+          />
+        </Space>
       </Modal>
       <Modal
         open={Boolean(featureConfigDraft)}
@@ -1896,7 +2835,17 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
               onChange={(rootGroup) => setRuleConfigDraft((current) => current ? { ...current, rootGroup } : current)}
             />
 
-            <Card size="small" title="Signal Output" style={{ background: 'var(--app-input-bg)', borderColor: 'var(--app-border-strong)' }}>
+            <Collapse
+              size="small"
+              bordered
+              defaultActiveKey={[]}
+              style={{ background: 'var(--app-input-bg)', borderColor: 'var(--app-border-strong)' }}
+              items={[
+                {
+                  key: 'signal-output',
+                  label: <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Signal Output</Text>,
+                  children: (
+                    <>
               <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 240px) repeat(3, minmax(190px, 1fr))', gap: 10, alignItems: 'end' }}>
                 <Space style={{ minHeight: 32 }}>
                   <Switch
@@ -2023,7 +2972,11 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
                   style={{ marginTop: 10, fontFamily: 'monospace', background: 'var(--app-card-bg)', color: 'var(--app-text)' }}
                 />
               ) : null}
-            </Card>
+                    </>
+                  ),
+                },
+              ]}
+            />
 
             <div style={{ borderTop: '1px solid var(--app-border)', paddingTop: 10 }}>
               <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
@@ -2074,6 +3027,7 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
                         options={[
                           { label: 'Field', value: 'field' },
                           { label: 'Custom Value', value: 'custom' },
+                          { label: 'Template', value: 'template' },
                         ]}
                         onChange={(source: TemplateMappingSource) => setRuleConfigDraft((current) => current ? {
                           ...current,
@@ -2084,40 +3038,278 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
                     ),
                   },
                   {
-                    title: 'Map From Ensemble Field / Custom Value',
-                    render: (_value, row) => row.source === 'custom' ? (
-                      <Input
-                        value={row.value || ''}
-                        onChange={(event) => setRuleConfigDraft((current) => current ? {
-                          ...current,
-                          templateMappings: upsertMapping(current.templateMappings, row.placeholder, {
-                            source: 'custom',
-                            value: event.target.value,
-                          }),
-                        } : current)}
-                        placeholder="Enter custom value"
-                      />
-                    ) : (
-                      <Select
-                        allowClear
-                        showSearch
-                        optionFilterProp="label"
-                        value={row.field || undefined}
-                        options={fieldOptions}
-                        onChange={(field) => setRuleConfigDraft((current) => current ? {
-                          ...current,
-                          templateMappings: upsertMapping(current.templateMappings, row.placeholder, {
-                            source: 'field',
-                            field: String(field || ''),
-                          }),
-                        } : current)}
-                        placeholder="Select output field"
-                        style={{ width: '100%' }}
-                      />
-                    ),
+                    title: 'Map From Ensemble Field / Custom Value / Template',
+                    render: (_value, row) => {
+                      const source = (row.source || 'field') as TemplateMappingSource
+                      if (source === 'custom') {
+                        return (
+                          <Input
+                            value={row.value || ''}
+                            onChange={(event) => setRuleConfigDraft((current) => current ? {
+                              ...current,
+                              templateMappings: upsertMapping(current.templateMappings, row.placeholder, {
+                                source: 'custom',
+                                value: event.target.value,
+                              }),
+                            } : current)}
+                            placeholder="Enter custom value"
+                          />
+                        )
+                      }
+                      if (source === 'template') {
+                        const cursor = templateCursorByPlaceholder[row.placeholder] ?? String(row.value || '').length
+                        const inlineDraft = templateInlineDraftAt(row.value || '', cursor)
+                        const inlineFieldOptions = inlineDraft?.query
+                          ? fieldOptions.filter((option) => (
+                            String(option.value || '').toLowerCase().includes(inlineDraft.query.toLowerCase())
+                            || String(option.label || '').toLowerCase().includes(inlineDraft.query.toLowerCase())
+                          ))
+                          : fieldOptions
+                        const expressionFunctions = ['round', 'abs', 'ceil', 'floor', 'min', 'max', 'sqrt', 'pow']
+                        const functionOptions = inlineDraft?.mode === 'expression'
+                          ? expressionFunctions
+                            .filter((fn) => !inlineDraft.query || fn.toLowerCase().includes(inlineDraft.query.toLowerCase()))
+                            .map((fn) => ({ type: 'function' as const, label: `${fn}()`, value: fn }))
+                          : []
+                        const autocompleteOptions = [
+                          ...functionOptions,
+                          ...inlineFieldOptions.slice(0, 12).map((option) => ({
+                            type: 'field' as const,
+                            label: String(option.label || option.value || ''),
+                            value: String(option.value || ''),
+                          })),
+                        ]
+                        const syntax = checkTemplateSyntax(row.value || '', fieldOptions)
+                        const displayParts = templateDisplayParts(row.value || '')
+                        const pickerPosition = templatePickerPositionByPlaceholder[row.placeholder] || { left: 8, top: 42 }
+                        const updateTemplateCaret = (target: HTMLTextAreaElement) => {
+                          const nextCursor = target.selectionStart ?? String(row.value || '').length
+                          setTemplateCursorByPlaceholder((current) => ({ ...current, [row.placeholder]: nextCursor }))
+                          setTemplatePickerPositionByPlaceholder((current) => ({ ...current, [row.placeholder]: textareaCaretPosition(target) }))
+                        }
+                        return (
+                          <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                            <div style={{ position: 'relative' }}>
+                              <Input.TextArea
+                                autoSize={{ minRows: 2, maxRows: 5 }}
+                                value={row.value || ''}
+                                status={syntax.errors.length > 0 ? 'error' : syntax.warnings.length > 0 ? 'warning' : undefined}
+                                onChange={(event) => {
+                                  const target = event.currentTarget
+                                  const nextValue = target.value
+                                  updateTemplateCaret(target)
+                                  setRuleConfigDraft((current) => current ? {
+                                    ...current,
+                                    templateMappings: upsertMapping(current.templateMappings, row.placeholder, {
+                                      source: 'template',
+                                      value: nextValue,
+                                    }),
+                                  } : current)
+                                }}
+                                onSelect={(event) => updateTemplateCaret(event.currentTarget)}
+                                onKeyUp={(event) => updateTemplateCaret(event.currentTarget)}
+                                onClick={(event) => updateTemplateCaret(event.currentTarget)}
+                                onScroll={(event) => updateTemplateCaret(event.currentTarget)}
+                                placeholder="Type plain text and wrap expressions in [ ], e.g. achieved [total_txn_count * 100]"
+                              />
+                              {inlineDraft && autocompleteOptions.length > 0 ? (
+                                <div
+                                  style={{
+                                    position: 'absolute',
+                                    left: Math.min(pickerPosition.left, 720),
+                                    top: pickerPosition.top,
+                                    width: 320,
+                                    maxHeight: 220,
+                                    overflowY: 'auto',
+                                    zIndex: 20,
+                                    border: '1px solid var(--app-border-strong)',
+                                    borderRadius: 6,
+                                    background: 'var(--app-panel-bg)',
+                                    boxShadow: '0 12px 30px rgba(0,0,0,0.35)',
+                                    padding: 4,
+                                  }}
+                                >
+                                  {autocompleteOptions.map((option) => (
+                                    <button
+                                      key={`${option.type}_${option.value}`}
+                                      type="button"
+                                      onMouseDown={(event) => {
+                                        event.preventDefault()
+                                        const nextValue = option.type === 'function'
+                                          ? replaceTemplateExpressionFunctionDraftAt(row.value || '', option.value, cursor)
+                                          : replaceTemplateInlineDraftAt(row.value || '', option.value, cursor)
+                                        setRuleConfigDraft((current) => current ? {
+                                          ...current,
+                                          templateMappings: upsertMapping(current.templateMappings, row.placeholder, {
+                                            source: 'template',
+                                            value: nextValue,
+                                          }),
+                                        } : current)
+                                        setTemplateCursorByPlaceholder((current) => ({ ...current, [row.placeholder]: nextValue.length }))
+                                      }}
+                                      style={{
+                                        display: 'flex',
+                                        width: '100%',
+                                        alignItems: 'center',
+                                        gap: 8,
+                                        border: 0,
+                                        borderRadius: 4,
+                                        background: 'transparent',
+                                        color: 'var(--app-text)',
+                                        padding: '6px 8px',
+                                        cursor: 'pointer',
+                                        textAlign: 'left',
+                                      }}
+                                    >
+                                      <Tag color={option.type === 'function' ? 'purple' : 'blue'} style={{ marginInlineEnd: 0, minWidth: 54, textAlign: 'center' }}>
+                                        {option.type === 'function' ? 'fn' : 'field'}
+                                      </Tag>
+                                      <Text ellipsis style={{ color: 'var(--app-text)', flex: 1 }}>{option.label}</Text>
+                                    </button>
+                                  ))}
+                                </div>
+                              ) : null}
+                            </div>
+                            {row.value ? (
+                              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, alignItems: 'center' }}>
+                                {displayParts.map((part, index) => (
+                                  <span
+                                    key={`${part.type}_${index}_${part.value}`}
+                                    style={{
+                                      border: `1px solid ${part.type === 'expression' ? '#7c3aed' : 'var(--app-border)'}`,
+                                      background: part.type === 'expression' ? 'rgba(124, 58, 237, 0.16)' : 'var(--app-card-bg)',
+                                      color: part.type === 'expression' ? '#c4b5fd' : 'var(--app-text-subtle)',
+                                      borderRadius: 4,
+                                      padding: '2px 6px',
+                                      fontFamily: part.type === 'expression' ? 'monospace' : undefined,
+                                      fontSize: 12,
+                                    }}
+                                  >
+                                    {part.type === 'expression' ? `[${part.value}]` : part.value || ' '}
+                                  </span>
+                                ))}
+                              </div>
+                            ) : null}
+                            {syntax.errors.length > 0 || syntax.warnings.length > 0 ? (
+                              <Alert
+                                type={syntax.errors.length > 0 ? 'error' : 'warning'}
+                                showIcon
+                                message={
+                                  <Space size={8} wrap style={{ width: '100%', justifyContent: 'space-between' }}>
+                                    <Text style={{ color: 'inherit' }}>
+                                      {[...syntax.errors, ...syntax.warnings].join(' ')}
+                                    </Text>
+                                    <Button
+                                      size="small"
+                                      onClick={() => {
+                                        const nextValue = autoCorrectTemplateSyntax(row.value || '')
+                                        setRuleConfigDraft((current) => current ? {
+                                          ...current,
+                                          templateMappings: upsertMapping(current.templateMappings, row.placeholder, {
+                                            source: 'template',
+                                            value: nextValue,
+                                          }),
+                                        } : current)
+                                        setTemplateCursorByPlaceholder((current) => ({ ...current, [row.placeholder]: nextValue.length }))
+                                      }}
+                                    >
+                                      Auto Correct
+                                    </Button>
+                                  </Space>
+                                }
+                              />
+                            ) : (
+                              row.value ? <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Expression OK</Text> : null
+                            )}
+                            <Space size={4} wrap>
+                              {['+', '-', '*', '/', '%', '(', ')'].map((snippet) => (
+                                <Button
+                                  key={snippet}
+                                  size="small"
+                                  onClick={() => setRuleConfigDraft((current) => current ? {
+                                    ...current,
+                                    templateMappings: upsertMapping(current.templateMappings, row.placeholder, {
+                                      source: 'template',
+                                      value: insertExpressionSnippetAt(row.value || '', snippet, cursor),
+                                    }),
+                                  } : current)}
+                                >
+                                  {snippet}
+                                </Button>
+                              ))}
+                              {['round', 'abs', 'min', 'max'].map((fn) => (
+                                <Button
+                                  key={fn}
+                                  size="small"
+                                  onClick={() => setRuleConfigDraft((current) => current ? {
+                                    ...current,
+                                    templateMappings: upsertMapping(current.templateMappings, row.placeholder, {
+                                      source: 'template',
+                                      value: insertExpressionSnippetAt(row.value || '', `${fn}()`, cursor),
+                                    }),
+                                  } : current)}
+                                >
+                                  {fn}
+                                </Button>
+                              ))}
+                            </Space>
+                          </Space>
+                        )
+                      }
+                      return (
+                        <Select
+                          allowClear
+                          showSearch
+                          optionFilterProp="label"
+                          value={row.field || undefined}
+                          options={fieldOptions}
+                          onChange={(field) => setRuleConfigDraft((current) => current ? {
+                            ...current,
+                            templateMappings: upsertMapping(current.templateMappings, row.placeholder, {
+                              source: 'field',
+                              field: String(field || ''),
+                            }),
+                          } : current)}
+                          placeholder="Select output field"
+                          style={{ width: '100%' }}
+                        />
+                      )
+                    },
                   },
                 ]}
                 locale={{ emptyText: 'Selected template has no custom field placeholders.' }}
+              />
+              <Collapse
+                size="small"
+                ghost
+                style={{ marginTop: 8 }}
+                items={[
+                  {
+                    key: 'template-expression-reference',
+                    label: <Text style={{ color: 'var(--app-text)', fontWeight: 600 }}>Expression Examples</Text>,
+                    children: (
+                      <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                        <Alert
+                          type="info"
+                          showIcon
+                          message="Use these examples in the template body or in a placeholder row with Value Source = Template."
+                        />
+                        <Input.TextArea
+                          readOnly
+                          autoSize={{ minRows: 6, maxRows: 9 }}
+                          value={[
+                            'Direct field only: total_txn_count',
+                            'Text + expression: Target set is 100, achieved [total_txn_count * 100]',
+                            'Percentage: [round(risk_score * 100)]%',
+                            'Difference: Gap is [target_count - total_txn_count]',
+                            'Plain text stays unchanged; expression blocks in [ ] are evaluated.',
+                          ].join('\n')}
+                          style={{ fontFamily: 'monospace', background: 'var(--app-card-bg)', color: 'var(--app-text)' }}
+                        />
+                      </Space>
+                    ),
+                  },
+                ]}
               />
             </div>
           </Space>

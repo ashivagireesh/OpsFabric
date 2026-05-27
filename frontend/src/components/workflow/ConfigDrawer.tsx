@@ -18420,6 +18420,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_rre_feature_dictionary: Array.isArray(nodeConfig.mlops_rre_feature_dictionary) ? nodeConfig.mlops_rre_feature_dictionary : [],
       mlops_rre_auto_signal_json_fields: Array.isArray(nodeConfig.mlops_rre_auto_signal_json_fields) ? nodeConfig.mlops_rre_auto_signal_json_fields : [],
       mlops_rre_cluster_config: Array.isArray(nodeConfig.mlops_rre_cluster_config) ? nodeConfig.mlops_rre_cluster_config : [],
+      mlops_rre_cluster_json_fields: Array.isArray(nodeConfig.mlops_rre_cluster_json_fields) ? nodeConfig.mlops_rre_cluster_json_fields : [],
+      mlops_rre_include_auto_cluster_recommendation: nodeConfig.mlops_rre_include_auto_cluster_recommendation !== false,
+      mlops_rre_cluster_transformers_enabled: nodeConfig.mlops_rre_cluster_transformers_enabled === true,
     }),
     [
       mlopsSampleSizeDraft,
@@ -18494,6 +18497,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       nodeConfig.mlops_rre_feature_dictionary,
       nodeConfig.mlops_rre_auto_signal_json_fields,
       nodeConfig.mlops_rre_cluster_config,
+      nodeConfig.mlops_rre_cluster_json_fields,
+      nodeConfig.mlops_rre_include_auto_cluster_recommendation,
+      nodeConfig.mlops_rre_cluster_transformers_enabled,
     ],
   )
   const mlopsStudioHasUnsavedChanges = useMemo(() => {
@@ -22958,6 +22964,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mlops_rre_feature_dictionary: Array.isArray(nodeConfig.mlops_rre_feature_dictionary) ? nodeConfig.mlops_rre_feature_dictionary : [],
       mlops_rre_auto_signal_json_fields: Array.isArray(nodeConfig.mlops_rre_auto_signal_json_fields) ? nodeConfig.mlops_rre_auto_signal_json_fields : [],
       mlops_rre_cluster_config: Array.isArray(nodeConfig.mlops_rre_cluster_config) ? nodeConfig.mlops_rre_cluster_config : [],
+      mlops_rre_cluster_json_fields: Array.isArray(nodeConfig.mlops_rre_cluster_json_fields) ? nodeConfig.mlops_rre_cluster_json_fields : [],
+      mlops_rre_include_auto_cluster_recommendation: nodeConfig.mlops_rre_include_auto_cluster_recommendation !== false,
+      mlops_rre_cluster_transformers_enabled: nodeConfig.mlops_rre_cluster_transformers_enabled === true,
       mlops_rre_output_fields: [],
     })
     await savePipeline()
@@ -31540,7 +31549,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       closable={false}
       centered={false}
       width="100vw"
-      style={{ top: 0, paddingBottom: 0, maxWidth: '100vw' }}
+      style={{ top: 0, margin: 0, paddingBottom: 0, maxWidth: '100vw' }}
       styles={{
         content: {
           padding: 0,
@@ -40442,7 +40451,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       footer={null}
       closable={false}
       width="100vw"
-      style={{ top: 0, paddingBottom: 0, maxWidth: '100vw' }}
+      style={{ top: 0, margin: 0, paddingBottom: 0, maxWidth: '100vw' }}
       styles={{
         content: {
           padding: 0,
@@ -43755,6 +43764,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               featureDictionary={Array.isArray(nodeConfig.mlops_rre_feature_dictionary) ? nodeConfig.mlops_rre_feature_dictionary as any[] : undefined}
               autoSignalJsonFields={Array.isArray(nodeConfig.mlops_rre_auto_signal_json_fields) ? nodeConfig.mlops_rre_auto_signal_json_fields as string[] : undefined}
               clusterConfig={Array.isArray(nodeConfig.mlops_rre_cluster_config) ? nodeConfig.mlops_rre_cluster_config as any[] : undefined}
+              clusterJsonFields={Array.isArray(nodeConfig.mlops_rre_cluster_json_fields) ? nodeConfig.mlops_rre_cluster_json_fields as string[] : undefined}
+              includeAutoClusterRecommendation={nodeConfig.mlops_rre_include_auto_cluster_recommendation !== false}
+              clusterTransformersEnabled={nodeConfig.mlops_rre_cluster_transformers_enabled === true}
               onRulesConfigChange={(rules) => {
                 if (!selectedNodeId) return
                 updateNodeConfig(selectedNodeId, {
@@ -43773,6 +43785,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               onClusterConfigChange={(clusters) => {
                 if (!selectedNodeId) return
                 updateNodeConfig(selectedNodeId, { mlops_rre_cluster_config: clusters })
+              }}
+              onClusterJsonFieldsChange={(fields) => {
+                if (!selectedNodeId) return
+                updateNodeConfig(selectedNodeId, { mlops_rre_cluster_json_fields: fields })
+              }}
+              onIncludeAutoClusterRecommendationChange={(enabled) => {
+                if (!selectedNodeId) return
+                updateNodeConfig(selectedNodeId, { mlops_rre_include_auto_cluster_recommendation: enabled })
+              }}
+              onClusterTransformersEnabledChange={(enabled) => {
+                if (!selectedNodeId) return
+                updateNodeConfig(selectedNodeId, { mlops_rre_cluster_transformers_enabled: enabled })
               }}
             />
           </div>

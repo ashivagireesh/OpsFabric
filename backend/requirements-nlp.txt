@@ -5,4 +5,5 @@
 # Already included in requirements.txt:
 # rapidfuzz
 # scikit-learn
+transformers>=4.41.0,<5
 sentence-transformers>=3.0.0
