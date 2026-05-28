@@ -12642,6 +12642,13 @@ END;"""
             path_parts.append(part)
         return "$." + ".".join(path_parts) if path_parts else ""
 
+    def _profile_query_oracle_patch_column_name(self, raw_path: Any) -> str:
+        path_text = str(raw_path or "").strip()
+        normalized = path_text.upper()
+        if normalized in {"DOCUMENT_JSON", "META_JSON", "STATS_JSON"}:
+            return normalized
+        return ""
+
     def _profile_query_oracle_partial_bind_scalar(
         self,
         raw_value: Any,
@@ -12692,7 +12699,8 @@ END;"""
             return "", [], "patch operations are empty"
 
         op_specs: List[Dict[str, Any]] = []
-        transform_ops: List[str] = []
+        column_set_fragments: List[str] = []
+        json_transform_ops: List[str] = []
         where_clauses: List[str] = []
         set_where_count = 0
         seen_targets: set = set()
@@ -12705,26 +12713,37 @@ END;"""
             if op_type not in {"set", "unset", "inc", "set_where"}:
                 return "", [], f"operation {op_type or 'unknown'} requires full-document fallback"
 
-            target_json_path = self._profile_query_oracle_json_transform_path(op_cfg.get("target_path"))
-            if not target_json_path:
+            target_column = self._profile_query_oracle_patch_column_name(op_cfg.get("target_path"))
+            if target_column and op_type == "inc":
+                return "", [], "inc operation is not supported for top-level Oracle JSON columns"
+            target_json_path = "" if target_column else self._profile_query_oracle_json_transform_path(op_cfg.get("target_path"))
+            target_key = f"column:{target_column}" if target_column else f"json:{target_json_path}"
+            if not target_column and not target_json_path:
                 return "", [], "target path is not a simple Oracle JSON object path"
-            if target_json_path in seen_targets:
+            if target_key in seen_targets:
                 return "", [], "multiple patch operations target the same JSON path"
-            seen_targets.add(target_json_path)
+            seen_targets.add(target_key)
 
             bind_name = f"patch_value_{idx}"
             spec: Dict[str, Any] = {
                 "op": op_type,
                 "target_json_path": target_json_path,
+                "target_column": target_column,
                 "bind_name": bind_name,
                 "op_cfg": op_cfg,
             }
             if op_type == "set":
-                transform_ops.append(f"SET '{target_json_path}' = :{bind_name}")
+                if target_column:
+                    column_set_fragments.append(f"{target_column} = :{bind_name}")
+                else:
+                    json_transform_ops.append(f"SET '{target_json_path}' = :{bind_name}")
             elif op_type == "unset":
-                transform_ops.append(f"REMOVE '{target_json_path}'")
+                if target_column:
+                    column_set_fragments.append(f"{target_column} = NULL")
+                else:
+                    json_transform_ops.append(f"REMOVE '{target_json_path}'")
             elif op_type == "inc":
-                transform_ops.append(
+                json_transform_ops.append(
                     f"SET '{target_json_path}' = "
                     f"COALESCE(JSON_VALUE(DOCUMENT_JSON, '{target_json_path}' RETURNING NUMBER NULL ON ERROR), 0) "
                     f"+ :{bind_name}"
@@ -12739,7 +12758,10 @@ END;"""
                 where_bind_name = f"where_value_{idx}"
                 spec["where_json_path"] = where_json_path
                 spec["where_bind_name"] = where_bind_name
-                transform_ops.append(f"SET '{target_json_path}' = :{bind_name}")
+                if target_column:
+                    column_set_fragments.append(f"{target_column} = :{bind_name}")
+                else:
+                    json_transform_ops.append(f"SET '{target_json_path}' = :{bind_name}")
                 where_clauses.append(
                     f"JSON_VALUE(DOCUMENT_JSON, '{where_json_path}' RETURNING VARCHAR2(4000) NULL ON ERROR) "
                     f"= :{where_bind_name}"
@@ -12749,15 +12771,26 @@ END;"""
         if set_where_count > 1:
             return "", [], "only one set_where operation can use Oracle partial update"
 
-        set_fragments = [
-            "DOCUMENT_JSON = JSON_TRANSFORM("
-            "NVL(DOCUMENT_JSON, TO_CLOB('{}')), "
-            f"{', '.join(transform_ops)} RETURNING CLOB"
-            ")",
-            "UPDATED_AT = SYSTIMESTAMP",
-        ]
+        set_fragments = list(column_set_fragments)
+        if json_transform_ops:
+            set_fragments.append(
+                "DOCUMENT_JSON = JSON_TRANSFORM("
+                "NVL(DOCUMENT_JSON, TO_CLOB('{}')), "
+                f"{', '.join(json_transform_ops)} RETURNING CLOB"
+                ")"
+            )
+        set_fragments.append("UPDATED_AT = SYSTIMESTAMP")
         if has_hash_columns:
-            set_fragments.append("DOC_SHA1 = NULL")
+            touched_columns = {
+                str(spec.get("target_column") or "DOCUMENT_JSON").upper()
+                for spec in op_specs
+            }
+            if "DOCUMENT_JSON" in touched_columns:
+                set_fragments.append("DOC_SHA1 = NULL")
+            if "META_JSON" in touched_columns:
+                set_fragments.append("META_SHA1 = NULL")
+            if "STATS_JSON" in touched_columns:
+                set_fragments.append("STATS_SHA1 = NULL")
 
         key_clauses = []
         if require_pipeline_id:
@@ -21698,6 +21731,13 @@ END;"""
                 continue
             severity = "HIGH" if critical_hit else "MEDIUM"
             threshold = critical_raw if critical_hit else warning_raw
+            threshold_num = self._mlops_runtime_rule_float(threshold)
+            breach_amount = abs(num - threshold_num) if threshold_num is not None else 0
+            breach_percent = (
+                (breach_amount / abs(threshold_num)) * 100
+                if threshold_num not in (None, 0)
+                else 0
+            )
             business_name = str(meta.get("business_name") or meta.get("businessName") or field).strip()
             relation = "below" if direction == "lower_is_risky" else "above"
             observation = (
@@ -21714,6 +21754,10 @@ END;"""
                 "value": "" if value is None else str(value),
                 "threshold": "" if threshold is None else str(threshold),
                 "threshold_type": "critical" if critical_hit else "warning",
+                "breach_amount": "" if breach_amount is None else str(breach_amount),
+                "breach_percent": "" if breach_percent is None else str(breach_percent),
+                "impact_role": self._mlops_runtime_rre_feature_impact_role(field, meta),
+                "impact_weight": str(self._mlops_runtime_rre_feature_impact_weight(field, meta)),
                 "direction": direction,
                 "unit": str(meta.get("unit") or ""),
                 "meaning": meaning,
@@ -21730,7 +21774,7 @@ END;"""
 
     def _mlops_runtime_rre_auto_signals_full(self, row: Dict[str, Any], feature_dictionary: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
         raw = self._mlops_runtime_rre_auto_signal_json(row, feature_dictionary, [
-            "feature", "business_name", "severity", "value", "threshold", "threshold_type", "direction", "unit", "meaning", "observation", "recommendation"
+            "feature", "business_name", "severity", "value", "threshold", "threshold_type", "breach_amount", "breach_percent", "impact_role", "impact_weight", "direction", "unit", "meaning", "observation", "recommendation"
         ])
         if not raw:
             return []
@@ -21764,6 +21808,10 @@ END;"""
             "value": str(value),
             "threshold": "",
             "threshold_type": "",
+            "breach_amount": "",
+            "breach_percent": "",
+            "impact_role": self._mlops_runtime_rre_feature_impact_role(field, meta),
+            "impact_weight": str(self._mlops_runtime_rre_feature_impact_weight(field, meta)),
             "direction": str(meta.get("direction") or ""),
             "unit": str(meta.get("unit") or ""),
             "meaning": str(meta.get("meaning") or ""),
@@ -21790,6 +21838,14 @@ END;"""
             except Exception:
                 summary_max_chars = 240
             summary_max_chars = max(100, min(summary_max_chars, 2000))
+            rank_by = str(item.get("rank_by") or item.get("rankBy") or "balanced_score").strip().lower()
+            if rank_by not in {"balanced_score", "intelligent_impact", "configured_order", "severity", "breach_percent", "absolute_breach", "value"}:
+                rank_by = "balanced_score"
+            try:
+                feature_limit = int(float(item.get("feature_limit") if item.get("feature_limit") is not None else item.get("featureLimit") if item.get("featureLimit") is not None else 3))
+            except Exception:
+                feature_limit = 3
+            feature_limit = max(0, min(100, feature_limit))
             clusters.append({
                 "id": str(item.get("id") or f"cluster-{idx + 1}"),
                 "name": str(item.get("name") or item.get("cluster") or f"Cluster {idx + 1}"),
@@ -21799,6 +21855,9 @@ END;"""
                 "recommendation": str(item.get("recommendation") or ""),
                 "priority": float(item.get("priority") or idx + 1),
                 "summary_max_chars": summary_max_chars,
+                "feature_filter": "all_selected" if str(item.get("feature_filter") or item.get("featureFilter") or "breached_only").strip().lower() == "all_selected" else "breached_only",
+                "rank_by": rank_by,
+                "feature_limit": feature_limit,
             })
         return clusters
 
@@ -21818,6 +21877,46 @@ END;"""
         signals: List[Dict[str, Any]],
         scenario: str = "",
     ) -> str:
+        classified = self._mlops_runtime_rre_classify_cluster_signals(signals)
+        primary_name = str(classified.get("primary_driver") or "").strip()
+        if primary_name:
+            primary_signal = next(
+                (
+                    signal for signal in signals
+                    if str(signal.get("business_name") or signal.get("feature") or "").strip() == primary_name
+                ),
+                signals[0] if signals else {},
+            )
+            threshold_type = str(primary_signal.get("threshold_type") or "configured").strip()
+            breach_percent = str(primary_signal.get("breach_percent") or "").strip()
+            reason = f"{primary_name} is the primary impact driver because it crossed {threshold_type} criteria"
+            if breach_percent:
+                reason = f"{reason} by {breach_percent}%"
+            outcomes = classified.get("impacted_outcomes") if isinstance(classified.get("impacted_outcomes"), list) else []
+            outcome_text = ""
+            if outcomes:
+                outcome_text = (
+                    f" {', '.join(str(item) for item in outcomes)} "
+                    f"{'is' if len(outcomes) == 1 else 'are'} impacted outcome{'s' if len(outcomes) != 1 else ''}."
+                )
+            evidence_factors: List[str] = []
+            for signal in signals:
+                name = str(signal.get("business_name") or signal.get("feature") or "factor")
+                value = str(signal.get("value") or "")
+                unit = str(signal.get("unit") or "")
+                threshold_type = str(signal.get("threshold_type") or "").strip()
+                threshold = str(signal.get("threshold") or "").strip()
+                direction = str(signal.get("direction") or "").strip()
+                value_text = f"{value}{(' ' + unit) if unit else ''}" if value else "present"
+                if threshold_type and threshold:
+                    relation = "below" if direction == "lower_is_risky" else "above"
+                    evidence_factors.append(
+                        f"{name} is {value_text}, {relation} the {threshold_type} threshold of {threshold}{(' ' + unit) if unit else ''}"
+                    )
+                else:
+                    evidence_factors.append(f"{name} is {value_text}")
+            evidence_text = f" Evidence: {'; '.join(evidence_factors)}." if evidence_factors else ""
+            return f"{scenario or cluster_name}: {reason}.{outcome_text}{evidence_text}"
         factors: List[str] = []
         for signal in signals:
             name = str(signal.get("business_name") or signal.get("feature") or "factor")
@@ -21852,6 +21951,35 @@ END;"""
         signals: List[Dict[str, Any]],
         instruction: str = "",
     ) -> str:
+        classified = self._mlops_runtime_rre_classify_cluster_signals(signals)
+        primary_name = str(classified.get("primary_driver") or "").strip()
+        if primary_name:
+            secondary = classified.get("secondary_drivers") if isinstance(classified.get("secondary_drivers"), list) else []
+            outcomes = classified.get("impacted_outcomes") if isinstance(classified.get("impacted_outcomes"), list) else []
+            support = f" Supporting drivers: {', '.join(str(item) for item in secondary)}." if secondary else ""
+            outcome = f" Check downstream impact on {', '.join(str(item) for item in outcomes)}." if outcomes else ""
+            evidence_factors: List[str] = []
+            for signal in signals[:3]:
+                name = str(signal.get("business_name") or signal.get("feature") or "factor")
+                value = str(signal.get("value") or "")
+                unit = str(signal.get("unit") or "")
+                threshold_type = str(signal.get("threshold_type") or "").strip()
+                threshold = str(signal.get("threshold") or "").strip()
+                direction = str(signal.get("direction") or "").strip()
+                value_text = f"{value}{(' ' + unit) if unit else ''}" if value else "present"
+                if threshold_type and threshold:
+                    relation = "below" if direction == "lower_is_risky" else "above"
+                    evidence_factors.append(
+                        f"{name} is {value_text}, {relation} the {threshold_type} threshold of {threshold}{(' ' + unit) if unit else ''}"
+                    )
+                else:
+                    evidence_factors.append(f"{name} is {value_text}")
+            evidence = f" Evidence to validate: {'; '.join(evidence_factors)}." if evidence_factors else ""
+            base = (
+                f"Prioritize {primary_name}; validate source transactions and compare recent customer/entity behavior."
+                f"{support}{outcome}{evidence}"
+            )
+            return f"{instruction}. {base}" if instruction else base
         critical = [
             str(signal.get("business_name") or signal.get("feature") or "")
             for signal in signals
@@ -21876,10 +22004,74 @@ END;"""
         )
         return f"{instruction}. {base}" if instruction else base
 
+    def _mlops_runtime_rre_classify_cluster_signals(self, signals: List[Dict[str, Any]]) -> Dict[str, Any]:
+        drivers = [
+            signal for signal in signals
+            if self._mlops_runtime_rre_signal_impact_role(signal) == "driver"
+        ]
+        outcomes = [
+            signal for signal in signals
+            if self._mlops_runtime_rre_signal_impact_role(signal) == "outcome"
+        ]
+        context = [
+            signal for signal in signals
+            if self._mlops_runtime_rre_signal_impact_role(signal) in {"context", "identifier"}
+        ]
+        primary = drivers[0] if drivers else (signals[0] if signals else None)
+        primary_name = str((primary or {}).get("business_name") or (primary or {}).get("feature") or "").strip()
+        return {
+            "primary_driver": primary_name,
+            "secondary_drivers": [
+                str(signal.get("business_name") or signal.get("feature") or "").strip()
+                for signal in drivers
+                if signal is not primary and str(signal.get("business_name") or signal.get("feature") or "").strip()
+            ],
+            "impacted_outcomes": [
+                str(signal.get("business_name") or signal.get("feature") or "").strip()
+                for signal in outcomes
+                if str(signal.get("business_name") or signal.get("feature") or "").strip()
+            ],
+            "context_fields": [
+                str(signal.get("business_name") or signal.get("feature") or "").strip()
+                for signal in context
+                if str(signal.get("business_name") or signal.get("feature") or "").strip()
+            ],
+        }
+
     def _mlops_runtime_compact_cluster_text_rule_based(self, text: str, max_chars: int = 320) -> str:
         cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
         if len(cleaned) <= max_chars:
             return cleaned
+        if re.search(r"\bprimary impact driver\b", cleaned, flags=re.IGNORECASE):
+            parts = re.split(r"\s+Evidence:\s+", cleaned, maxsplit=1, flags=re.IGNORECASE)
+            driver_part = parts[0].strip()
+            evidence_part = parts[1].strip().rstrip(".") if len(parts) > 1 else ""
+            evidence_items: List[str] = []
+            for item in re.split(r"\s*;\s*", evidence_part):
+                item = item.strip()
+                if not item:
+                    continue
+                match = re.match(
+                    r"^(.+?)\s+is\s+(.+?),\s+(above|below)\s+the\s+(.+?)\s+threshold\s+of\s+(.+)$",
+                    item,
+                    flags=re.IGNORECASE,
+                )
+                if match:
+                    evidence_items.append(
+                        f"{match.group(1).strip()} {match.group(2).strip()} vs {match.group(4).strip()} {match.group(5).strip()}"
+                    )
+                else:
+                    evidence_items.append(item)
+                if len(evidence_items) >= 2:
+                    break
+            summary = (
+                f"{driver_part}. Evidence: {'; '.join(evidence_items)}."
+                if evidence_items else driver_part
+            )
+            if len(summary) <= max_chars:
+                return summary
+            first_sentence = re.split(r"(?<=[.!?])\s+", driver_part)[0].strip() or driver_part
+            return f"{first_sentence} Evidence: {evidence_items[0]}." if evidence_items else first_sentence
         lead_match = re.match(r"^([^:]{1,80}):\s*(.+)$", cleaned)
         if lead_match:
             lead = lead_match.group(1).strip()
@@ -21964,6 +22156,8 @@ END;"""
         trigger_chars = 100
         if not enabled or len(cleaned) <= trigger_chars:
             return cleaned
+        if re.search(r"\bprimary impact driver\b", cleaned, flags=re.IGNORECASE):
+            return self._mlops_runtime_compact_cluster_text_rule_based(cleaned, max_chars)
         word_count = len([word for word in re.split(r"\s+", cleaned) if word])
         if word_count <= 64:
             return self._mlops_runtime_compact_cluster_text_rule_based(cleaned, max_chars)
@@ -22020,10 +22214,139 @@ END;"""
                 "severity": signal.get("severity") or "",
                 "threshold": signal.get("threshold") or "",
                 "threshold_type": signal.get("threshold_type") or "",
+                "breach_amount": signal.get("breach_amount") or "",
+                "breach_percent": signal.get("breach_percent") or "",
+                "impact_role": self._mlops_runtime_rre_signal_impact_role(signal),
+                "impact_weight": signal.get("impact_weight") or "",
+                "impact_score": str(self._mlops_runtime_rre_signal_intelligent_impact_score(signal)),
                 "direction": signal.get("direction") or "",
             }
             for signal in signals
         ]
+
+    def _mlops_runtime_rre_feature_impact_role(self, field: str, meta: Dict[str, Any]) -> str:
+        role = str(meta.get("impact_role") or meta.get("impactRole") or "").strip().lower() if isinstance(meta, dict) else ""
+        if role in {"driver", "outcome", "context", "identifier"}:
+            return role
+        key = str(field or "").strip().lower()
+        if any(part in key for part in ["account", "customer", "agent", "entity", "token"]) or key.endswith("_id"):
+            return "identifier"
+        if any(part in key for part in ["total_", "overall", "aggregate"]):
+            return "outcome"
+        if any(part in key for part in ["segment", "branch", "region", "category"]):
+            return "context"
+        return "driver"
+
+    def _mlops_runtime_rre_feature_impact_weight(self, field: str, meta: Dict[str, Any]) -> float:
+        if isinstance(meta, dict):
+            raw = meta.get("impact_weight") if meta.get("impact_weight") is not None else meta.get("impactWeight")
+            if raw is not None and str(raw).strip() != "":
+                try:
+                    return max(0.0, min(10.0, float(str(raw).replace(",", ""))))
+                except Exception:
+                    pass
+        key = str(field or "").strip().lower()
+        role = self._mlops_runtime_rre_feature_impact_role(field, meta if isinstance(meta, dict) else {})
+        if role == "identifier":
+            return 0.0
+        if any(part in key for part in ["amount", "risk", "score", "prediction"]):
+            return 8.0
+        if any(part in key for part in ["count", "rate", "repeat", "velocity"]):
+            return 7.0
+        if role == "outcome":
+            return 6.0
+        if role == "context":
+            return 3.0
+        return 5.0
+
+    def _mlops_runtime_rre_signal_severity_rank(self, signal: Dict[str, Any]) -> int:
+        severity = str(signal.get("severity") or "").strip().upper()
+        if severity == "HIGH":
+            return 3
+        if severity == "MEDIUM":
+            return 2
+        if severity == "LOW":
+            return 1
+        return 0
+
+    def _mlops_runtime_rre_signal_numeric(self, signal: Dict[str, Any], key: str) -> float:
+        value = signal.get(key)
+        if value is None:
+            return 0.0
+        try:
+            return float(str(value).replace(",", ""))
+        except Exception:
+            return 0.0
+
+    def _mlops_runtime_rre_signal_balanced_score(self, signal: Dict[str, Any]) -> float:
+        severity = self._mlops_runtime_rre_signal_severity_rank(signal)
+        severity_weight = 1000.0 if severity == 3 else 500.0 if severity == 2 else 100.0 if severity == 1 else 0.0
+        return severity_weight + self._mlops_runtime_rre_signal_numeric(signal, "breach_percent")
+
+    def _mlops_runtime_rre_signal_impact_role(self, signal: Dict[str, Any]) -> str:
+        role = str(signal.get("impact_role") or signal.get("impactRole") or "").strip().lower()
+        return role if role in {"driver", "outcome", "context", "identifier"} else "driver"
+
+    def _mlops_runtime_rre_signal_impact_role_weight(self, signal: Dict[str, Any]) -> float:
+        role = self._mlops_runtime_rre_signal_impact_role(signal)
+        if role == "driver":
+            return 300.0
+        if role == "outcome":
+            return 100.0
+        if role == "context":
+            return 20.0
+        return 0.0
+
+    def _mlops_runtime_rre_signal_intelligent_impact_score(self, signal: Dict[str, Any]) -> float:
+        return (
+            self._mlops_runtime_rre_signal_balanced_score(signal)
+            + self._mlops_runtime_rre_signal_impact_role_weight(signal)
+            + (self._mlops_runtime_rre_signal_numeric(signal, "impact_weight") * 25.0)
+        )
+
+    def _mlops_runtime_rre_rank_cluster_signals(
+        self,
+        cluster: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        feature_order = {
+            str(field or "").strip(): idx
+            for idx, field in enumerate(cluster.get("features", []) if isinstance(cluster.get("features"), list) else [])
+        }
+        feature_filter = str(cluster.get("feature_filter") or "breached_only").strip().lower()
+        filtered = list(signals) if feature_filter == "all_selected" else [
+            signal for signal in signals if self._mlops_runtime_rre_signal_severity_rank(signal) > 0
+        ]
+        rank_by = str(cluster.get("rank_by") or "balanced_score").strip().lower()
+
+        def sort_key(signal: Dict[str, Any]) -> Tuple[float, float, int]:
+            severity = self._mlops_runtime_rre_signal_severity_rank(signal)
+            metric = 0.0
+            if rank_by == "balanced_score":
+                severity = 0
+                metric = self._mlops_runtime_rre_signal_balanced_score(signal)
+            elif rank_by == "intelligent_impact":
+                severity = 0
+                metric = self._mlops_runtime_rre_signal_intelligent_impact_score(signal)
+            elif rank_by == "breach_percent":
+                metric = self._mlops_runtime_rre_signal_numeric(signal, "breach_percent")
+            elif rank_by == "absolute_breach":
+                severity = 0
+                metric = self._mlops_runtime_rre_signal_numeric(signal, "breach_amount")
+            elif rank_by == "value":
+                severity = 0
+                metric = self._mlops_runtime_rre_signal_numeric(signal, "value")
+            elif rank_by == "configured_order":
+                severity = 0
+            order = feature_order.get(str(signal.get("feature") or "").strip(), 999999)
+            return (-severity, -metric, order)
+
+        ranked = sorted(filtered, key=sort_key)
+        try:
+            limit = int(float(cluster.get("feature_limit") or 0))
+        except Exception:
+            limit = 0
+        return ranked[:limit] if limit > 0 else ranked
 
     def _mlops_runtime_rre_cluster_json(
         self,
@@ -22038,11 +22361,11 @@ END;"""
             return ""
         cluster_fields = [
             str(field or "").strip()
-            for field in (selected_cluster_fields or ["cluster", "severity", "features", "observation", "recommendation", "evidence"])
+            for field in (selected_cluster_fields or ["cluster", "severity", "features", "primary_driver", "secondary_drivers", "impacted_outcomes", "context_fields", "observation", "recommendation", "evidence"])
             if str(field or "").strip()
         ]
         if not cluster_fields:
-            cluster_fields = ["cluster", "severity", "features", "observation", "recommendation", "evidence"]
+            cluster_fields = ["cluster", "severity", "features", "primary_driver", "secondary_drivers", "impacted_outcomes", "context_fields", "observation", "recommendation", "evidence"]
         signal_by_feature: Dict[str, Dict[str, Any]] = {}
         for cluster in clusters:
             if not isinstance(cluster, dict) or cluster.get("enabled") is False:
@@ -22061,7 +22384,8 @@ END;"""
         for cluster in sorted(clusters, key=lambda item: float(item.get("priority") or 999999)):
             if cluster.get("enabled") is False:
                 continue
-            matched = [signal_by_feature[field] for field in cluster.get("features", []) if field in signal_by_feature]
+            cluster_signals = [signal_by_feature[field] for field in cluster.get("features", []) if field in signal_by_feature]
+            matched = self._mlops_runtime_rre_rank_cluster_signals(cluster, cluster_signals)
             if not matched:
                 continue
             if any(str(signal.get("severity") or "").upper() == "HIGH" for signal in matched):
@@ -22098,10 +22422,15 @@ END;"""
                 bool(transformer_wording_enabled),
                 summary_max_chars,
             )
+            classified = self._mlops_runtime_rre_classify_cluster_signals(matched)
             full_payload = {
                 "cluster": cluster_name,
                 "severity": severity,
                 "features": [signal.get("feature") for signal in matched],
+                "primary_driver": classified.get("primary_driver") or "",
+                "secondary_drivers": classified.get("secondary_drivers") or [],
+                "impacted_outcomes": classified.get("impacted_outcomes") or [],
+                "context_fields": classified.get("context_fields") or [],
                 "observation": cumulative_observation,
                 "recommendation": cumulative_recommendation,
                 "evidence": self._mlops_runtime_rre_cluster_evidence(matched),

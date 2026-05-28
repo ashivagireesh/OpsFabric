@@ -34,6 +34,7 @@ type RuleOperator = '>' | '>=' | '<' | '<=' | '=' | '!=' | 'contains' | 'exists'
 type ConditionJoin = 'and' | 'or'
 type TemplateMappingSource = 'field' | 'custom' | 'template'
 type RRESeverity = 'HIGH' | 'MEDIUM' | 'LOW'
+type RREImpactRole = 'driver' | 'outcome' | 'context' | 'identifier'
 
 interface RRECondition {
   id: string
@@ -62,6 +63,8 @@ interface RREFeatureDictionaryEntry {
   meaning: string
   unit: string
   direction: string
+  impact_role: RREImpactRole
+  impact_weight: number
   auto_signal_enabled: boolean
   warning_threshold: string
   critical_threshold: string
@@ -111,6 +114,9 @@ interface RREClusterConfig {
   recommendation: string
   priority: number
   summary_max_chars: number
+  feature_filter: 'all_selected' | 'breached_only'
+  rank_by: 'balanced_score' | 'intelligent_impact' | 'configured_order' | 'severity' | 'breach_percent' | 'absolute_breach' | 'value'
+  feature_limit: number
 }
 
 interface RREStudioProps {
@@ -185,6 +191,13 @@ const directionOptions = [
   { label: 'Informational', value: 'informational' },
 ]
 
+const impactRoleOptions: { label: string; value: RREImpactRole }[] = [
+  { label: 'Driver', value: 'driver' },
+  { label: 'Outcome', value: 'outcome' },
+  { label: 'Context', value: 'context' },
+  { label: 'Identifier', value: 'identifier' },
+]
+
 const signalJsonFieldOptions = [
   { label: 'Summary', value: 'summary' },
   { label: 'Observation', value: 'observation' },
@@ -204,12 +217,16 @@ const signalJsonFieldOptions = [
 
 const defaultSignalJsonFields = ['summary', 'observation', 'recommendation', 'default_recommendation', 'risk_band', 'feature', 'severity', 'value', 'peer_value', 'impact']
 const defaultAutoSignalJsonFields = ['business_name', 'severity', 'value', 'threshold', 'threshold_type', 'observation', 'recommendation']
-const defaultClusterJsonFields = ['cluster', 'severity', 'features', 'observation', 'recommendation', 'evidence']
+const defaultClusterJsonFields = ['cluster', 'severity', 'features', 'primary_driver', 'secondary_drivers', 'impacted_outcomes', 'context_fields', 'observation', 'recommendation', 'evidence']
 const defaultClusterSummaryMaxChars = 240
 const clusterJsonFieldOptions = [
   { label: 'Cluster Name', value: 'cluster' },
   { label: 'Severity', value: 'severity' },
   { label: 'Selected Features', value: 'features' },
+  { label: 'Primary Driver', value: 'primary_driver' },
+  { label: 'Secondary Drivers', value: 'secondary_drivers' },
+  { label: 'Impacted Outcomes', value: 'impacted_outcomes' },
+  { label: 'Context Fields', value: 'context_fields' },
   { label: 'Observation Sentence', value: 'observation' },
   { label: 'Recommendation Sentence', value: 'recommendation' },
   { label: 'Evidence Details', value: 'evidence' },
@@ -292,11 +309,33 @@ function normalizeFeatureDictionary(raw: unknown): RREFeatureDictionaryEntry[] {
     meaning: String(item?.meaning || ''),
     unit: String(item?.unit || ''),
     direction: String(item?.direction || 'higher_is_risky'),
+    impact_role: ['driver', 'outcome', 'context', 'identifier'].includes(String(item?.impact_role || item?.impactRole || '').toLowerCase())
+      ? String(item?.impact_role || item?.impactRole).toLowerCase() as RREImpactRole
+      : inferImpactRole(String(item?.field || '')),
+    impact_weight: Math.max(0, Math.min(10, Number(item?.impact_weight ?? item?.impactWeight ?? inferImpactWeight(String(item?.field || ''))) || 0)),
     auto_signal_enabled: Boolean(item?.auto_signal_enabled || item?.autoSignalEnabled || false),
     warning_threshold: String(item?.warning_threshold || item?.warningThreshold || ''),
     critical_threshold: String(item?.critical_threshold || item?.criticalThreshold || ''),
     default_recommendation: String(item?.default_recommendation || item?.defaultRecommendation || ''),
   })).filter((item) => item.field)
+}
+
+function inferImpactRole(field: string): RREImpactRole {
+  const key = field.toLowerCase()
+  if (key.includes('account') || key.includes('customer') || key.includes('agent') || key.includes('entity') || key.endsWith('_id') || key.includes('token')) return 'identifier'
+  if (key.includes('total_') || key.includes('overall') || key.includes('aggregate')) return 'outcome'
+  if (key.includes('segment') || key.includes('branch') || key.includes('region') || key.includes('category')) return 'context'
+  return 'driver'
+}
+
+function inferImpactWeight(field: string): number {
+  const key = field.toLowerCase()
+  if (inferImpactRole(field) === 'identifier') return 0
+  if (key.includes('amount') || key.includes('risk') || key.includes('score') || key.includes('prediction')) return 8
+  if (key.includes('count') || key.includes('rate') || key.includes('repeat') || key.includes('velocity')) return 7
+  if (inferImpactRole(field) === 'outcome') return 6
+  if (inferImpactRole(field) === 'context') return 3
+  return 5
 }
 
 function titleCase(value: string): string {
@@ -352,6 +391,8 @@ function inferFeatureMetadata(field: string): RREFeatureDictionaryEntry {
     meaning,
     unit,
     direction,
+    impact_role: inferImpactRole(field),
+    impact_weight: inferImpactWeight(field),
     auto_signal_enabled: false,
     warning_threshold: '',
     critical_threshold: '',
@@ -414,6 +455,11 @@ function normalizeClusterConfig(raw: unknown): RREClusterConfig[] {
     recommendation: String(item?.recommendation || ''),
     priority: Number(item?.priority || index + 1),
     summary_max_chars: Math.max(100, Math.min(2000, Number(item?.summary_max_chars || item?.summaryMaxChars || defaultClusterSummaryMaxChars))),
+    feature_filter: (String(item?.feature_filter || item?.featureFilter || 'breached_only') === 'all_selected' ? 'all_selected' : 'breached_only') as RREClusterConfig['feature_filter'],
+    rank_by: ['balanced_score', 'intelligent_impact', 'configured_order', 'severity', 'breach_percent', 'absolute_breach', 'value'].includes(String(item?.rank_by || item?.rankBy || 'balanced_score'))
+      ? String(item?.rank_by || item?.rankBy || 'balanced_score') as RREClusterConfig['rank_by']
+      : 'balanced_score',
+    feature_limit: Math.max(0, Math.min(100, Number(item?.feature_limit ?? item?.featureLimit ?? 3) || 0)),
   })).filter((item) => item.name)
 }
 
@@ -1289,6 +1335,13 @@ function evaluateAutoSignal(entry: RREFeatureDictionaryEntry, output: Record<str
   if (!criticalHit && !warningHit) return null
   const severity = criticalHit ? 'HIGH' : 'MEDIUM'
   const threshold = criticalHit ? entry.critical_threshold : entry.warning_threshold
+  const thresholdNum = Number(threshold)
+  const breachAmount = Number.isFinite(thresholdNum)
+    ? Math.abs(num - thresholdNum)
+    : 0
+  const breachPercent = Number.isFinite(thresholdNum) && thresholdNum !== 0
+    ? (breachAmount / Math.abs(thresholdNum)) * 100
+    : 0
   const businessName = entry.business_name || titleCase(entry.field)
   const relation = direction === 'lower_is_risky' ? 'below' : 'above'
   const observation = `${businessName} is ${severity === 'HIGH' ? 'significantly' : 'moderately'} ${relation} ${criticalHit ? 'critical' : 'warning'} threshold ${threshold}, with observed value ${formatScalar(value)}.`
@@ -1299,6 +1352,10 @@ function evaluateAutoSignal(entry: RREFeatureDictionaryEntry, output: Record<str
     value: formatScalar(value),
     threshold: String(threshold || ''),
     threshold_type: criticalHit ? 'critical' : 'warning',
+    breach_amount: Number.isFinite(breachAmount) ? formatScalar(breachAmount) : '',
+    breach_percent: Number.isFinite(breachPercent) ? formatScalar(breachPercent) : '',
+    impact_role: entry.impact_role || 'driver',
+    impact_weight: formatScalar(entry.impact_weight ?? 5),
     direction,
     unit: entry.unit || '',
     meaning: entry.meaning || '',
@@ -1320,12 +1377,91 @@ function buildConfiguredClusterSignal(entry: RREFeatureDictionaryEntry, output: 
     value: formatScalar(value),
     threshold: '',
     threshold_type: '',
+    breach_amount: '',
+    breach_percent: '',
+    impact_role: entry.impact_role || 'driver',
+    impact_weight: formatScalar(entry.impact_weight ?? 5),
     direction: entry.direction || '',
     unit: entry.unit || '',
     meaning: entry.meaning || '',
     observation: `${businessName} is included in this configured cluster with observed value ${formatScalar(value)}.`,
     recommendation: entry.default_recommendation || '',
   }
+}
+
+function signalSeverityRank(signal: Record<string, string>): number {
+  const severity = String(signal.severity || '').toUpperCase()
+  if (severity === 'HIGH') return 3
+  if (severity === 'MEDIUM') return 2
+  if (severity === 'LOW') return 1
+  return 0
+}
+
+function signalNumericValue(signal: Record<string, string>, key: string): number {
+  const value = Number(String(signal[key] || '').replace(/,/g, ''))
+  return Number.isFinite(value) ? value : 0
+}
+
+function signalBalancedScore(signal: Record<string, string>): number {
+  const severity = signalSeverityRank(signal)
+  const severityWeight = severity === 3 ? 1000 : severity === 2 ? 500 : severity === 1 ? 100 : 0
+  return severityWeight + signalNumericValue(signal, 'breach_percent')
+}
+
+function signalImpactRole(signal: Record<string, string>): RREImpactRole {
+  const role = String(signal.impact_role || '').toLowerCase()
+  return ['driver', 'outcome', 'context', 'identifier'].includes(role) ? role as RREImpactRole : 'driver'
+}
+
+function signalImpactRoleWeight(signal: Record<string, string>): number {
+  const role = signalImpactRole(signal)
+  if (role === 'driver') return 300
+  if (role === 'outcome') return 100
+  if (role === 'context') return 20
+  return 0
+}
+
+function signalIntelligentImpactScore(signal: Record<string, string>): number {
+  return signalBalancedScore(signal) + signalImpactRoleWeight(signal) + (signalNumericValue(signal, 'impact_weight') * 25)
+}
+
+function rankClusterSignals(cluster: RREClusterConfig, signals: Array<Record<string, string>>): Array<Record<string, string>> {
+  const featureOrder = new Map(cluster.features.map((field, index) => [field, index]))
+  const filtered = (cluster.feature_filter || 'breached_only') === 'all_selected'
+    ? signals
+    : signals.filter((signal) => signalSeverityRank(signal) > 0)
+  const rankBy = cluster.rank_by || 'balanced_score'
+  const ranked = [...filtered].sort((a, b) => {
+    if (rankBy === 'configured_order') {
+      return (featureOrder.get(String(a.feature || '')) ?? 999999) - (featureOrder.get(String(b.feature || '')) ?? 999999)
+    }
+    if (rankBy === 'balanced_score') {
+      const scoreDelta = signalBalancedScore(b) - signalBalancedScore(a)
+      if (scoreDelta !== 0) return scoreDelta
+    }
+    if (rankBy === 'intelligent_impact') {
+      const scoreDelta = signalIntelligentImpactScore(b) - signalIntelligentImpactScore(a)
+      if (scoreDelta !== 0) return scoreDelta
+    }
+    const severityDelta = signalSeverityRank(b) - signalSeverityRank(a)
+    if (rankBy === 'severity' && severityDelta !== 0) return severityDelta
+    if (rankBy === 'breach_percent' && severityDelta !== 0) return severityDelta
+    const metricKey = rankBy === 'breach_percent'
+      ? 'breach_percent'
+      : rankBy === 'absolute_breach'
+        ? 'breach_amount'
+        : rankBy === 'value'
+          ? 'value'
+          : ''
+    if (metricKey) {
+      const metricDelta = signalNumericValue(b, metricKey) - signalNumericValue(a, metricKey)
+      if (metricDelta !== 0) return metricDelta
+    }
+    if (severityDelta !== 0) return severityDelta
+    return (featureOrder.get(String(a.feature || '')) ?? 999999) - (featureOrder.get(String(b.feature || '')) ?? 999999)
+  })
+  const limit = Math.max(0, Math.trunc(Number(cluster.feature_limit || 0)))
+  return limit > 0 ? ranked.slice(0, limit) : ranked
 }
 
 function buildAutoSignalJsonOutput(output: Record<string, unknown>, dictionary: RREFeatureDictionaryEntry[]): string {
@@ -1405,11 +1541,50 @@ function buildClusterEvidence(signals: Array<Record<string, string>>) {
     severity: signal.severity || '',
     threshold: signal.threshold || '',
     threshold_type: signal.threshold_type || '',
+    breach_amount: signal.breach_amount || '',
+    breach_percent: signal.breach_percent || '',
+    impact_role: signalImpactRole(signal),
+    impact_weight: signal.impact_weight || '',
+    impact_score: formatScalar(signalIntelligentImpactScore(signal)),
     direction: signal.direction || '',
   }))
 }
 
+function classifyClusterSignals(signals: Array<Record<string, string>>) {
+  const drivers = signals.filter((signal) => signalImpactRole(signal) === 'driver')
+  const outcomes = signals.filter((signal) => signalImpactRole(signal) === 'outcome')
+  const context = signals.filter((signal) => ['context', 'identifier'].includes(signalImpactRole(signal)))
+  const primary = drivers[0] || signals[0] || null
+  return {
+    primary_driver: primary ? (primary.business_name || primary.feature || '') : '',
+    secondary_drivers: drivers
+      .filter((signal) => signal !== primary)
+      .map((signal) => signal.business_name || signal.feature)
+      .filter(Boolean),
+    impacted_outcomes: outcomes
+      .map((signal) => signal.business_name || signal.feature)
+      .filter(Boolean),
+    context_fields: context
+      .map((signal) => signal.business_name || signal.feature)
+      .filter(Boolean),
+  }
+}
+
 function buildCumulativeClusterObservation(clusterName: string, signals: Array<Record<string, string>>, scenario = ''): string {
+  const classified = classifyClusterSignals(signals)
+  if (classified.primary_driver) {
+    const primary = signals.find((signal) => (signal.business_name || signal.feature) === classified.primary_driver) || signals[0]
+    const driverReason = primary
+      ? `${classified.primary_driver} is the primary impact driver because it crossed ${primary.threshold_type || 'configured'} criteria${primary.breach_percent ? ` by ${primary.breach_percent}%` : ''}`
+      : `${classified.primary_driver} is the primary impact driver`
+    const evidenceText = signals.length
+      ? ` Evidence: ${signals.map(clusterFactorSentence).join('; ')}.`
+      : ''
+    const outcomeText = classified.impacted_outcomes.length
+      ? ` ${classified.impacted_outcomes.join(', ')} ${classified.impacted_outcomes.length === 1 ? 'is' : 'are'} impacted outcome${classified.impacted_outcomes.length === 1 ? '' : 's'}.`
+      : ''
+    return `${scenario || clusterName}: ${driverReason}.${outcomeText}${evidenceText}`
+  }
   const factors = signals.map(clusterFactorSentence)
   const lead = scenario || clusterName
   const severity = signals.some((signal) => signal.severity === 'HIGH')
@@ -1421,6 +1596,22 @@ function buildCumulativeClusterObservation(clusterName: string, signals: Array<R
 }
 
 function buildCumulativeClusterRecommendation(clusterName: string, signals: Array<Record<string, string>>, instruction = ''): string {
+  const classified = classifyClusterSignals(signals)
+  if (classified.primary_driver) {
+    const support = classified.secondary_drivers.length
+      ? ` Supporting drivers: ${classified.secondary_drivers.join(', ')}.`
+      : ''
+    const outcome = classified.impacted_outcomes.length
+      ? ` Check downstream impact on ${classified.impacted_outcomes.join(', ')}.`
+      : ''
+    const absoluteEvidence = signals
+      .slice(0, 3)
+      .map(clusterFactorSentence)
+      .join('; ')
+    const evidence = absoluteEvidence ? ` Evidence to validate: ${absoluteEvidence}.` : ''
+    const base = `Prioritize ${classified.primary_driver}; validate source transactions and compare recent customer/entity behavior.${support}${outcome}${evidence}`
+    return instruction ? `${instruction}. ${base}` : base
+  }
   const critical = signals
     .filter((signal) => signal.severity === 'HIGH')
     .map((signal) => signal.business_name || signal.feature)
@@ -1441,6 +1632,24 @@ function buildCumulativeClusterRecommendation(clusterName: string, signals: Arra
 function compactClusterWording(text: string, maxChars = 280): string {
   const cleaned = String(text || '').replace(/\s+/g, ' ').trim()
   if (cleaned.length <= 100) return cleaned
+  if (/primary impact driver/i.test(cleaned)) {
+    const [driverPart, evidencePart = ''] = cleaned.split(/\s+Evidence:\s+/i)
+    const evidence = evidencePart
+      .replace(/\.$/, '')
+      .split(/\s*;\s*/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((item) => {
+        const match = item.match(/^(.+?)\s+is\s+(.+?),\s+(above|below)\s+the\s+(.+?)\s+threshold\s+of\s+(.+)$/i)
+        if (!match) return item
+        return `${match[1].trim()} ${match[2].trim()} vs ${match[4].trim()} ${match[5].trim()}`
+      })
+    const summary = evidence.length ? `${driverPart}. Evidence: ${evidence.join('; ')}.` : driverPart
+    if (summary.length <= maxChars) return summary
+    const firstSentence = driverPart.split(/(?<=[.!?])\s+/)[0] || driverPart
+    return evidence.length ? `${firstSentence} Evidence: ${evidence[0]}.` : firstSentence
+  }
   const leadMatch = cleaned.match(/^([^:]{1,80}):\s*(.+)$/)
   if (leadMatch) {
     const lead = leadMatch[1].trim()
@@ -1527,7 +1736,8 @@ function buildClusterRecommendationOutput(
     .filter((cluster) => cluster.enabled !== false)
     .sort((a, b) => Number(a.priority || 999999) - Number(b.priority || 999999))
     .map((cluster) => {
-      const matchedSignals = cluster.features.map((field) => signalByFeature.get(field)).filter(Boolean) as Array<Record<string, string>>
+      const allSignals = cluster.features.map((field) => signalByFeature.get(field)).filter(Boolean) as Array<Record<string, string>>
+      const matchedSignals = rankClusterSignals(cluster, allSignals)
       if (!matchedSignals.length) return null
       const severity = matchedSignals.some((signal) => signal.severity === 'HIGH')
         ? 'HIGH'
@@ -1540,10 +1750,15 @@ function buildClusterRecommendationOutput(
       const rawRecommendation = buildCumulativeClusterRecommendation(clusterName, matchedSignals, configuredRecommendation)
       const cumulativeObservation = smartWordingEnabled ? compactClusterWording(rawObservation, summaryMaxChars) : rawObservation
       const cumulativeRecommendation = smartWordingEnabled ? compactClusterWording(rawRecommendation, summaryMaxChars) : rawRecommendation
+      const classified = classifyClusterSignals(matchedSignals)
       const fullCluster = {
         cluster: clusterName,
         severity,
         features: matchedSignals.map((signal) => signal.feature),
+        primary_driver: classified.primary_driver,
+        secondary_drivers: classified.secondary_drivers,
+        impacted_outcomes: classified.impacted_outcomes,
+        context_fields: classified.context_fields,
         observation: cumulativeObservation,
         recommendation: cumulativeRecommendation,
         evidence: buildClusterEvidence(matchedSignals),
@@ -2403,6 +2618,16 @@ export default function RREStudio(props: RREStudioProps) {
                       width: 90,
                     },
                     {
+                      title: 'Impact Role',
+                      width: 120,
+                      render: (_value, row) => <Tag color={row.impact_role === 'driver' ? 'blue' : row.impact_role === 'outcome' ? 'purple' : 'default'}>{impactRoleOptions.find((item) => item.value === row.impact_role)?.label || row.impact_role || 'Driver'}</Tag>,
+                    },
+                    {
+                      title: 'Weight',
+                      dataIndex: 'impact_weight',
+                      width: 80,
+                    },
+                    {
                       title: 'Auto Signal',
                       width: 110,
                       render: (_value, row) => <Tag color={row.auto_signal_enabled ? 'blue' : 'default'}>{row.auto_signal_enabled ? 'Enabled' : 'Off'}</Tag>,
@@ -2463,14 +2688,14 @@ export default function RREStudio(props: RREStudioProps) {
           <Alert
             type="info"
             showIcon
-            message="Paste JSON array/object or CSV with headers: field,business_name,meaning,unit,direction,default_recommendation."
+            message="Paste JSON array/object or CSV with headers: field,business_name,meaning,unit,direction,impact_role,impact_weight,default_recommendation."
           />
           <Input.TextArea
             value={dictionaryImportText}
             onChange={(event) => setDictionaryImportText(event.target.value)}
             rows={14}
-            placeholder={`field,business_name,meaning,unit,direction,default_recommendation
-predictions.risk_score,Risk Score,elevated model risk signal requiring operational review,score,higher_is_risky,Review high-risk cases and validate the rule evidence.`}
+            placeholder={`field,business_name,meaning,unit,direction,impact_role,impact_weight,default_recommendation
+predictions.risk_score,Risk Score,elevated model risk signal requiring operational review,score,higher_is_risky,driver,8,Review high-risk cases and validate the rule evidence.`}
             style={{ fontFamily: 'monospace' }}
           />
         </Space>
@@ -2575,6 +2800,9 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
                   recommendation: '',
                   priority: clusterConfig.length + 1,
                   summary_max_chars: defaultClusterSummaryMaxChars,
+                  feature_filter: 'breached_only',
+                  rank_by: 'intelligent_impact',
+                  feature_limit: 3,
                 })
                 setClusterEditorOpen(true)
               }}>
@@ -2591,6 +2819,8 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
               { title: 'Cluster', dataIndex: 'name', width: 220, ellipsis: true },
               { title: 'Enabled', width: 90, render: (_value, row) => <Tag color={row.enabled ? 'blue' : 'default'}>{row.enabled ? 'Enabled' : 'Off'}</Tag> },
               { title: 'Features', width: 220, render: (_value, row) => <Text ellipsis>{row.features.join(', ')}</Text> },
+              { title: 'Ranking', width: 150, render: (_value, row) => <Text ellipsis>{`${row.rank_by || 'balanced_score'} / ${row.feature_filter || 'breached_only'}`}</Text> },
+              { title: 'Limit', dataIndex: 'feature_limit', width: 80 },
               { title: 'Observation', dataIndex: 'observation', width: 320, ellipsis: true },
               { title: 'Recommendation', dataIndex: 'recommendation', width: 320, ellipsis: true },
               { title: 'Summary Chars', dataIndex: 'summary_max_chars', width: 110 },
@@ -2665,6 +2895,45 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
                     style={{ width: '100%' }}
                   />
                 </Form.Item>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 130px', gap: 8 }}>
+                  <Form.Item label="Feature Inclusion">
+                    <Select
+                      value={clusterDraft.feature_filter || 'breached_only'}
+                      options={[
+                        { value: 'breached_only', label: 'Breached only' },
+                        { value: 'all_selected', label: 'All selected' },
+                      ]}
+                      onChange={(feature_filter) => setClusterDraft((current) => current ? { ...current, feature_filter } : current)}
+                    />
+                  </Form.Item>
+                  <Form.Item label="Rank Features By">
+                    <Select
+                      value={clusterDraft.rank_by || 'balanced_score'}
+                      options={[
+        { value: 'balanced_score', label: 'Balanced Score' },
+        { value: 'intelligent_impact', label: 'Intelligent Impact' },
+                        { value: 'severity', label: 'Severity' },
+                        { value: 'breach_percent', label: 'Breach %' },
+                        { value: 'absolute_breach', label: 'Breach amount' },
+                        { value: 'value', label: 'Observed value' },
+                        { value: 'configured_order', label: 'Selected order' },
+                      ]}
+                      onChange={(rank_by) => setClusterDraft((current) => current ? { ...current, rank_by } : current)}
+                    />
+                  </Form.Item>
+                  <Form.Item label="Max Features">
+                    <InputNumber
+                      min={0}
+                      max={100}
+                      value={clusterDraft.feature_limit ?? 3}
+                      onChange={(featureLimit) => setClusterDraft((current) => current ? {
+                        ...current,
+                        feature_limit: Math.max(0, Math.min(100, Number(featureLimit || 0))),
+                      } : current)}
+                      style={{ width: '100%' }}
+                    />
+                  </Form.Item>
+                </div>
                 <Form.Item label="Features">
                   <Select
                     mode="multiple"
@@ -2815,6 +3084,26 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
                   <Input
                     value={featureConfigDraft.item.unit}
                     onChange={(event) => setFeatureConfigDraft((current) => current ? { ...current, item: { ...current.item, unit: event.target.value } } : current)}
+                  />
+                </Form.Item>
+                <Form.Item label="Impact Role" style={{ marginBottom: 8 }}>
+                  <Select
+                    value={featureConfigDraft.item.impact_role || 'driver'}
+                    options={impactRoleOptions}
+                    onChange={(impact_role) => setFeatureConfigDraft((current) => current ? { ...current, item: { ...current.item, impact_role } } : current)}
+                  />
+                </Form.Item>
+                <Form.Item label="Impact Weight" style={{ marginBottom: 8 }}>
+                  <InputNumber
+                    min={0}
+                    max={10}
+                    step={1}
+                    value={featureConfigDraft.item.impact_weight ?? 5}
+                    onChange={(impactWeight) => setFeatureConfigDraft((current) => current ? {
+                      ...current,
+                      item: { ...current.item, impact_weight: Math.max(0, Math.min(10, Number(impactWeight ?? 0))) },
+                    } : current)}
+                    style={{ width: '100%' }}
                   />
                 </Form.Item>
                 <Form.Item label="Warning Threshold (MEDIUM)" style={{ marginBottom: 8 }}>

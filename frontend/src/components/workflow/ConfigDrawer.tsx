@@ -9346,34 +9346,59 @@ function extractMLOpsOutputFieldsFromConfig(cfg: Record<string, unknown>): strin
     const field = String(value || '').trim()
     if (field) fields.push(field)
   }
+  const parseJsonArray = (value: unknown): unknown[] => {
+    if (Array.isArray(value)) return value
+    if (typeof value === 'string' && value.trim()) {
+      try {
+        const parsed = JSON.parse(value)
+        return Array.isArray(parsed) ? parsed : []
+      } catch {
+        return []
+      }
+    }
+    return []
+  }
+  const safeOutputKey = (value: unknown): string => {
+    const raw = String(value || 'cluster').trim().toLowerCase()
+    const key = raw.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '')
+    return key || 'cluster'
+  }
   add(cfg.mlops_prediction_field)
   add(cfg.mlops_prediction_score_field)
-  const rawRules = cfg.mlops_rre_rules
-  const rules = Array.isArray(rawRules)
-    ? rawRules
-    : (typeof rawRules === 'string' && rawRules.trim()
-      ? (() => {
-        try {
-          const parsed = JSON.parse(rawRules)
-          return Array.isArray(parsed) ? parsed : []
-        } catch {
-          return []
-        }
-      })()
-      : [])
-  if (rules.length > 0) rules.forEach((rule: any) => add(rule?.name || rule?.id))
-  const ensembleRaw = cfg.mlops_stage3_ensemble_models
-  let ensembleModels: unknown[] = []
-  if (Array.isArray(ensembleRaw)) {
-    ensembleModels = ensembleRaw
-  } else if (typeof ensembleRaw === 'string' && ensembleRaw.trim()) {
-    try {
-      const parsed = JSON.parse(ensembleRaw)
-      if (Array.isArray(parsed)) ensembleModels = parsed
-    } catch {
-      ensembleModels = []
-    }
+  const rules = parseJsonArray(cfg.mlops_rre_rules)
+  if (rules.length > 0) {
+    rules.forEach((rule: any) => {
+      if (!rule || typeof rule !== 'object' || Array.isArray(rule) || rule.enabled === false) return
+      const base = String(rule.name || rule.id || '').trim()
+      add(base)
+      if (base) add(`${base}_Generate_XAI_signal`)
+    })
   }
+
+  const featureDictionary = parseJsonArray(cfg.mlops_rre_feature_dictionary)
+  const autoSignalConfigured = featureDictionary.some((item) => (
+    item
+    && typeof item === 'object'
+    && !Array.isArray(item)
+    && Boolean((item as Record<string, unknown>).auto_signal_enabled || (item as Record<string, unknown>).autoSignalEnabled)
+  ))
+  if (autoSignalConfigured) add('Auto_Generate_XAI_signal')
+
+  const clusterConfig = parseJsonArray(cfg.mlops_rre_cluster_config)
+  const enabledClusters = clusterConfig.filter((item) => (
+    item
+    && typeof item === 'object'
+    && !Array.isArray(item)
+    && (item as Record<string, unknown>).enabled !== false
+  )) as Array<Record<string, unknown>>
+  if (enabledClusters.length > 0) {
+    if (cfg.mlops_rre_include_auto_cluster_recommendation !== false) add('Auto_Cluster_Recommendation')
+    enabledClusters.forEach((cluster, index) => {
+      add(`cluster_${safeOutputKey(cluster.name || cluster.cluster || `Cluster ${index + 1}`)}`)
+    })
+  }
+
+  const ensembleModels = parseJsonArray(cfg.mlops_stage3_ensemble_models)
   ensembleModels.forEach((item, index) => {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return
     const model = item as Record<string, unknown>
