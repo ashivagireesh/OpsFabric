@@ -22216,8 +22216,114 @@ END;"""
                 return ""
         return self._mlops_runtime_rre_expression_value(row, expression)
 
+    def _mlops_runtime_rre_condition_matches(self, row: Dict[str, Any], expression: str) -> bool:
+        funcs = {"abs", "ceil", "floor", "max", "min", "pow", "round", "sqrt"}
+
+        def _token_value(match: Any) -> str:
+            token = str(match.group(0) or "").strip()
+            lower = token.lower()
+            if token in funcs:
+                return token
+            if lower == "and":
+                return "and"
+            if lower == "or":
+                return "or"
+            value = self._mlops_runtime_rre_get(row, token)
+            num = self._mlops_runtime_rule_float(value)
+            return str(num) if num is not None else "0"
+
+        executable = re.sub(r"\b[A-Za-z_][A-Za-z0-9_.]*\b", _token_value, str(expression or ""))
+        executable = re.sub(r"(?<![<>=!])=(?!=)", "==", executable)
+        try:
+            tree = ast.parse(executable, mode="eval")
+            allowed_nodes = (
+                ast.Expression,
+                ast.BoolOp,
+                ast.BinOp,
+                ast.UnaryOp,
+                ast.Compare,
+                ast.Call,
+                ast.Name,
+                ast.Load,
+                ast.Constant,
+                ast.And,
+                ast.Or,
+                ast.Add,
+                ast.Sub,
+                ast.Mult,
+                ast.Div,
+                ast.Mod,
+                ast.Pow,
+                ast.USub,
+                ast.UAdd,
+                ast.Eq,
+                ast.NotEq,
+                ast.Lt,
+                ast.LtE,
+                ast.Gt,
+                ast.GtE,
+            )
+            for node in ast.walk(tree):
+                if not isinstance(node, allowed_nodes):
+                    return False
+                if isinstance(node, ast.Name) and node.id not in funcs:
+                    return False
+                if isinstance(node, ast.Call) and not (isinstance(node.func, ast.Name) and node.func.id in funcs):
+                    return False
+            env = {
+                "abs": abs,
+                "ceil": math.ceil,
+                "floor": math.floor,
+                "max": max,
+                "min": min,
+                "pow": pow,
+                "round": round,
+                "sqrt": math.sqrt,
+            }
+            return bool(eval(compile(tree, "<rre-condition>", "eval"), {"__builtins__": {}}, env))
+        except Exception:
+            return False
+
+    def _mlops_runtime_render_rre_conditionals(self, row: Dict[str, Any], text: str) -> str:
+        def _render_control_block(first_condition: str, body: str) -> str:
+            clauses: List[Tuple[Optional[str], str]] = []
+            current_condition: Optional[str] = first_condition
+            cursor = 0
+            for marker in re.finditer(r"\[(elseif)\s+([^\]\n]+)\]|\[(else)\]", body, flags=re.IGNORECASE):
+                clauses.append((current_condition, body[cursor:marker.start()]))
+                current_condition = str(marker.group(2) or "") if str(marker.group(1) or "").lower() == "elseif" else None
+                cursor = marker.end()
+            clauses.append((current_condition, body[cursor:]))
+            for condition, content in clauses:
+                if condition is None or self._mlops_runtime_rre_condition_matches(row, condition):
+                    return self._mlops_runtime_render_rre_plain_template_text(row, content)
+            return ""
+
+        def _replace_block(match: Any) -> str:
+            return _render_control_block(str(match.group(1) or ""), str(match.group(2) or ""))
+
+        def _render_innermost_cluster(value: str) -> Tuple[str, bool]:
+            stack: List[Tuple[int, int, str]] = []
+            for token in re.finditer(r"\[\[if\s+([^\]\n]+)\]|\[end\]\]", value, flags=re.IGNORECASE):
+                raw = str(token.group(0) or "")
+                if raw.lower().startswith("[[if"):
+                    stack.append((token.start(), token.end(), str(token.group(1) or "")))
+                elif stack:
+                    start, body_start, condition = stack.pop()
+                    body = value[body_start:token.start()]
+                    replacement = _render_control_block(condition, body)
+                    return value[:start] + replacement + value[token.end():], True
+            return value, False
+
+        rendered = str(text or "")
+        for _ in range(50):
+            rendered, changed = _render_innermost_cluster(rendered)
+            if not changed:
+                break
+        return re.sub(r"\[if\s+([^\]\n]+)\]([\s\S]*?)\[end\]", _replace_block, rendered, flags=re.IGNORECASE)
+
     def _mlops_runtime_render_rre_plain_template_text(self, row: Dict[str, Any], text: str) -> str:
-        raw = str(text or "")
+        raw = self._mlops_runtime_render_rre_conditionals(row, str(text or ""))
         stripped = raw.strip()
         if not stripped:
             return ""
@@ -22234,6 +22340,9 @@ END;"""
         rendered = re.sub(
             r"\[([^\][\n]+)\]",
             lambda match: (
+                str(self._mlops_runtime_rre_get(row, str(match.group(1) or "").strip()))
+                if self._mlops_runtime_rre_get(row, str(match.group(1) or "").strip()) is not None
+                else
                 self._mlops_runtime_rre_expression_value_strict(row, str(match.group(1) or ""))
                 or str(match.group(1) or "")
             ),

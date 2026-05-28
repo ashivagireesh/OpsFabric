@@ -751,13 +751,85 @@ function evaluateTemplateMathExpressionStrict(expression: string, output: Record
   return evaluateTemplateMathExpression(expression, output)
 }
 
+function evaluateTemplateCondition(expression: string, output: Record<string, unknown>): boolean {
+  const functionNames = new Set(['abs', 'ceil', 'floor', 'max', 'min', 'pow', 'round', 'sqrt'])
+  const expressionWithValues = String(expression || '')
+    .replace(/\band\b/gi, '&&')
+    .replace(/\bor\b/gi, '||')
+    .replace(/\b[A-Za-z_][A-Za-z0-9_.]*\b/g, (token) => {
+      if (functionNames.has(token)) return token
+      const value = readField(output, token)
+      const numeric = Number(value)
+      return Number.isFinite(numeric) ? String(numeric) : '0'
+    })
+    .replace(/\b(abs|ceil|floor|max|min|pow|round|sqrt)\b/g, 'Math.$1')
+  const executable = expressionWithValues.replace(/(?<![<>=!])=(?![=])/g, '==')
+  if (!/^[\d\s+\-*/%().,Mathceilfloormaxminpowroundabsqrt<>=!&|]+$/.test(executable)) return false
+  try {
+    return Boolean(Function(`"use strict"; return (${executable})`)())
+  } catch {
+    return false
+  }
+}
+
+function renderTemplateConditionals(text: string, output: Record<string, unknown>): string {
+  const renderControlBlock = (firstCondition: string, body: string) => {
+    const clauses: Array<{ condition: string | null; content: string }> = []
+    let currentCondition: string | null = firstCondition
+    let cursor = 0
+    const markerPattern = /\[(elseif)\s+([^\]\n]+)\]|\[(else)\]/gi
+    let marker: RegExpExecArray | null
+    while ((marker = markerPattern.exec(body)) !== null) {
+      clauses.push({ condition: currentCondition, content: body.slice(cursor, marker.index) })
+      currentCondition = marker[1]?.toLowerCase() === 'elseif' ? marker[2] : null
+      cursor = marker.index + marker[0].length
+    }
+    clauses.push({ condition: currentCondition, content: body.slice(cursor) })
+    const selected = clauses.find((clause) => clause.condition === null || evaluateTemplateCondition(clause.condition, output))
+    return selected ? renderPlainTemplateText(selected.content, output) : ''
+  }
+  let rendered = String(text || '')
+  const renderInnermostCluster = (value: string): { value: string; changed: boolean } => {
+    const stack: Array<{ index: number; bodyStart: number; condition: string }> = []
+    const tokenPattern = /\[\[if\s+([^\]\n]+)\]|\[end\]\]/gi
+    let token: RegExpExecArray | null
+    while ((token = tokenPattern.exec(value)) !== null) {
+      if (/^\[\[if\s/i.test(token[0])) {
+        stack.push({ index: token.index, bodyStart: token.index + token[0].length, condition: token[1] || '' })
+      } else if (stack.length > 0) {
+        const opener = stack.pop()
+        if (!opener) continue
+        const body = value.slice(opener.bodyStart, token.index)
+        const replacement = renderControlBlock(opener.condition, body)
+        return {
+          value: `${value.slice(0, opener.index)}${replacement}${value.slice(token.index + token[0].length)}`,
+          changed: true,
+        }
+      }
+    }
+    return { value, changed: false }
+  }
+  for (let guard = 0; guard < 50; guard += 1) {
+    const next = renderInnermostCluster(rendered)
+    rendered = next.value
+    if (!next.changed) break
+  }
+  rendered = rendered.replace(/\[if\s+([^\]\n]+)\]([\s\S]*?)\[end\]/gi, (_match, firstCondition: string, body: string) => {
+    return renderControlBlock(firstCondition, body)
+  })
+  return rendered
+}
+
 function renderPlainTemplateText(text: string, output: Record<string, unknown>): string {
-  const directValue = readField(output, text.trim())
+  const conditionRendered = renderTemplateConditionals(text, output)
+  const directValue = readField(output, conditionRendered.trim())
   if (directValue !== undefined) return formatScalar(directValue)
   const expressionAtom = String.raw`(?:[A-Za-z_][A-Za-z0-9_.]*|\d+(?:\.\d+)?)`
   const binaryExpressionPattern = new RegExp(String.raw`\b${expressionAtom}(?:\s*[+\-*/%]\s*${expressionAtom})+\b`, 'g')
   const functionExpressionPattern = /\b(?:round|abs|ceil|floor|min|max|sqrt|pow)\s*\([^()]*[+\-*/%][^()]*\)/g
-  let rendered = text.replace(/\[([^\][\n]+)\]/g, (match, expression: string) => {
+  let rendered = conditionRendered.replace(/\[([^\][\n]+)\]/g, (match, expression: string) => {
+    const fieldValue = readField(output, expression.trim())
+    if (fieldValue !== undefined) return formatScalar(fieldValue)
     const evaluated = evaluateTemplateMathExpressionStrict(expression, output)
     return evaluated || expression
   })
@@ -778,17 +850,30 @@ function renderPlainTemplateText(text: string, output: Record<string, unknown>):
 
 function templateDisplayParts(value: string) {
   const text = String(value || '')
-  const parts: Array<{ type: 'text' | 'expression'; value: string }> = []
+  const parts: Array<{ type: 'text' | 'expression' | 'field' | 'control'; value: string }> = []
   let cursor = 0
-  Array.from(text.matchAll(/\[([^\][\n]+)\]/g)).forEach((match) => {
+  Array.from(text.matchAll(/\[\[if\s+[^\]\n]+\]|\[if\s+[^\]\n]+\]|\[elseif\s+[^\]\n]+\]|\[else\]|\[end\]\]|\[end\]|\[([^\][\n]+)\]/gi)).forEach((match) => {
     const index = match.index ?? 0
     if (index > cursor) parts.push({ type: 'text', value: text.slice(cursor, index) })
-    parts.push({ type: 'expression', value: match[1] || '' })
+    if (/^\[\[?if\s/i.test(match[0]) || /^\[elseif\s/i.test(match[0]) || /^\[(else|end)\]?\]/i.test(match[0])) {
+      parts.push({ type: 'control', value: match[0] })
+    } else {
+      const inner = match[1] || ''
+      const isExpression = /[+\-*/%()]|\b(round|abs|ceil|floor|min|max|sqrt|pow)\s*\(/.test(inner)
+      parts.push({ type: isExpression ? 'expression' : 'field', value: match[0] })
+    }
     cursor = index + match[0].length
   })
   if (cursor < text.length) parts.push({ type: 'text', value: text.slice(cursor) })
   if (!parts.length && text) parts.push({ type: 'text', value: text })
   return parts
+}
+
+function templatePartStyle(type: 'text' | 'expression' | 'field' | 'control') {
+  if (type === 'control') return { color: '#fbbf24', fontWeight: 700 }
+  if (type === 'expression') return { color: '#c4b5fd', fontWeight: 650 }
+  if (type === 'field') return { color: '#93c5fd', fontWeight: 650 }
+  return { color: 'var(--app-text)' }
 }
 
 function renderMappingTemplate(template: string, output: Record<string, unknown>): string {
@@ -939,6 +1024,7 @@ function checkTemplateSyntax(value: string, fieldOptions: Array<{ label: string;
     if (!trimmed) return { errors, warnings }
     Array.from(trimmed.matchAll(/\[([^\][\n]*)\]/g)).forEach((match) => {
       const expression = String(match[1] || '').trim()
+      if (/^(if|elseif)\s+/i.test(expression) || /^(else|end)$/i.test(expression)) return
       if (!expression) errors.push('Expression block [] is empty.')
       const leftParens = (expression.match(/\(/g) || []).length
       const rightParens = (expression.match(/\)/g) || []).length
@@ -1645,6 +1731,7 @@ export default function RREStudio(props: RREStudioProps) {
   const [clusterDraft, setClusterDraft] = useState<RREClusterConfig | null>(null)
   const [templateCursorByPlaceholder, setTemplateCursorByPlaceholder] = useState<Record<string, number>>({})
   const [templatePickerPositionByPlaceholder, setTemplatePickerPositionByPlaceholder] = useState<Record<string, { left: number; top: number }>>({})
+  const [templateScrollByPlaceholder, setTemplateScrollByPlaceholder] = useState<Record<string, { left: number; top: number }>>({})
   const [autoSignalJsonFields, setAutoSignalJsonFieldsState] = useState<string[]>(() => (
     Array.isArray(props.autoSignalJsonFields) && props.autoSignalJsonFields.length > 0 ? props.autoSignalJsonFields : defaultAutoSignalJsonFields
   ))
@@ -3083,6 +3170,7 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
                         const syntax = checkTemplateSyntax(row.value || '', fieldOptions)
                         const displayParts = templateDisplayParts(row.value || '')
                         const pickerPosition = templatePickerPositionByPlaceholder[row.placeholder] || { left: 8, top: 42 }
+                        const editorScroll = templateScrollByPlaceholder[row.placeholder] || { left: 0, top: 0 }
                         const updateTemplateCaret = (target: HTMLTextAreaElement) => {
                           const nextCursor = target.selectionStart ?? String(row.value || '').length
                           setTemplateCursorByPlaceholder((current) => ({ ...current, [row.placeholder]: nextCursor }))
@@ -3091,9 +3179,39 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
                         return (
                           <Space direction="vertical" size={6} style={{ width: '100%' }}>
                             <div style={{ position: 'relative' }}>
+                              <pre
+                                aria-hidden
+                                style={{
+                                  position: 'absolute',
+                                  inset: 0,
+                                  margin: 0,
+                                  padding: '7px 11px',
+                                  border: '1px solid transparent',
+                                  borderRadius: 6,
+                                  fontFamily: 'monospace',
+                                  fontSize: 14,
+                                  lineHeight: '22px',
+                                  whiteSpace: 'pre-wrap',
+                                  wordBreak: 'break-word',
+                                  overflow: 'hidden',
+                                  pointerEvents: 'none',
+                                  transform: `translate(${-editorScroll.left}px, ${-editorScroll.top}px)`,
+                                }}
+                              >
+                                {displayParts.length > 0 ? displayParts.map((part, index) => (
+                                  <span key={`editor_${part.type}_${index}_${part.value}`} style={templatePartStyle(part.type)}>
+                                    {part.value}
+                                  </span>
+                                )) : (
+                                  <span style={{ color: 'transparent' }}>{' '}</span>
+                                )}
+                              </pre>
                               <Input.TextArea
                                 autoSize={{ minRows: 2, maxRows: 5 }}
                                 value={row.value || ''}
+                                spellCheck={false}
+                                autoCorrect="off"
+                                autoCapitalize="off"
                                 status={syntax.errors.length > 0 ? 'error' : syntax.warnings.length > 0 ? 'warning' : undefined}
                                 onChange={(event) => {
                                   const target = event.currentTarget
@@ -3110,8 +3228,27 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
                                 onSelect={(event) => updateTemplateCaret(event.currentTarget)}
                                 onKeyUp={(event) => updateTemplateCaret(event.currentTarget)}
                                 onClick={(event) => updateTemplateCaret(event.currentTarget)}
-                                onScroll={(event) => updateTemplateCaret(event.currentTarget)}
+                                onScroll={(event) => {
+                                  updateTemplateCaret(event.currentTarget)
+                                  setTemplateScrollByPlaceholder((current) => ({
+                                    ...current,
+                                    [row.placeholder]: {
+                                      left: event.currentTarget.scrollLeft,
+                                      top: event.currentTarget.scrollTop,
+                                    },
+                                  }))
+                                }}
                                 placeholder="Type plain text and wrap expressions in [ ], e.g. achieved [total_txn_count * 100]"
+                                style={{
+                                  position: 'relative',
+                                  background: 'transparent',
+                                  color: 'transparent',
+                                  caretColor: 'var(--app-text)',
+                                  fontFamily: 'monospace',
+                                  fontSize: 14,
+                                  lineHeight: '22px',
+                                  WebkitTextFillColor: 'transparent',
+                                }}
                               />
                               {inlineDraft && autocompleteOptions.length > 0 ? (
                                 <div
@@ -3177,16 +3314,30 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
                                   <span
                                     key={`${part.type}_${index}_${part.value}`}
                                     style={{
-                                      border: `1px solid ${part.type === 'expression' ? '#7c3aed' : 'var(--app-border)'}`,
-                                      background: part.type === 'expression' ? 'rgba(124, 58, 237, 0.16)' : 'var(--app-card-bg)',
-                                      color: part.type === 'expression' ? '#c4b5fd' : 'var(--app-text-subtle)',
+                                      border: `1px solid ${
+                                        part.type === 'control' ? '#f59e0b' : part.type === 'expression' ? '#7c3aed' : part.type === 'field' ? '#2563eb' : 'var(--app-border)'
+                                      }`,
+                                      background: part.type === 'control'
+                                        ? 'rgba(245, 158, 11, 0.14)'
+                                        : part.type === 'expression'
+                                          ? 'rgba(124, 58, 237, 0.16)'
+                                          : part.type === 'field'
+                                            ? 'rgba(37, 99, 235, 0.14)'
+                                            : 'var(--app-card-bg)',
+                                      color: part.type === 'control'
+                                        ? '#fbbf24'
+                                        : part.type === 'expression'
+                                          ? '#c4b5fd'
+                                          : part.type === 'field'
+                                            ? '#93c5fd'
+                                            : 'var(--app-text-subtle)',
                                       borderRadius: 4,
                                       padding: '2px 6px',
-                                      fontFamily: part.type === 'expression' ? 'monospace' : undefined,
+                                      fontFamily: part.type === 'expression' || part.type === 'field' || part.type === 'control' ? 'monospace' : undefined,
                                       fontSize: 12,
                                     }}
                                   >
-                                    {part.type === 'expression' ? `[${part.value}]` : part.value || ' '}
+                                    {part.value || ' '}
                                   </span>
                                 ))}
                               </div>
@@ -3303,6 +3454,7 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
                             'Text + expression: Target set is 100, achieved [total_txn_count * 100]',
                             'Percentage: [round(risk_score * 100)]%',
                             'Difference: Gap is [target_count - total_txn_count]',
+                            'Conditional: [[if total_txn_count >= 100]Target reached[elseif total_txn_count > 0]In progress[else]No progress[end]]',
                             'Plain text stays unchanged; expression blocks in [ ] are evaluated.',
                           ].join('\n')}
                           style={{ fontFamily: 'monospace', background: 'var(--app-card-bg)', color: 'var(--app-text)' }}
