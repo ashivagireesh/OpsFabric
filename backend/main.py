@@ -77,16 +77,23 @@ async def lifespan(app: FastAPI):
     if recovered:
         logger.warning(f"Recovered {recovered} stale running execution(s) on startup")
     _run_execution_history_maintenance(context="startup")
-    if not scheduler.running:
+    scheduler_owner = _try_acquire_scheduler_leader_lock()
+    if scheduler_owner and not scheduler.running:
         scheduler.start()
-    _reload_all_pipeline_schedule_jobs()
-    _sync_all_gateway_routes()
-    _sync_sqlite_cleanup_schedule_job()
-    _sync_blw_async_worker_job()
+        _reload_all_pipeline_schedule_jobs()
+        _sync_data_ops_schedule_registry_job()
+        _sync_all_gateway_routes()
+        _sync_sqlite_cleanup_schedule_job()
+        _sync_blw_async_worker_job()
+        logger.info(f"Scheduler leader acquired by PID {_os.getpid()}")
+    elif not scheduler_owner:
+        logger.info(f"Scheduler disabled in worker PID {_os.getpid()}; another worker owns scheduler lock")
     logger.info("✅ ETL Flow Platform started")
     yield
-    if scheduler.running:
+    if scheduler_owner and scheduler.running:
         scheduler.shutdown(wait=False)
+    if scheduler_owner:
+        _release_scheduler_leader_lock()
     _app_main_loop = None
     logger.info("ETL Flow Platform shutting down")
 
@@ -107,6 +114,60 @@ app.add_middleware(
 
 etl_engine = ETLEngine()
 scheduler = AsyncIOScheduler()
+_scheduler_leader_lock_handle = None
+
+
+def _scheduler_leader_lock_path() -> Path:
+    return _BACKEND_DIR / "state" / "scheduler_leader.lock"
+
+
+def _try_acquire_scheduler_leader_lock() -> bool:
+    """Allow exactly one multi-worker process to run in-memory scheduled jobs."""
+    global _scheduler_leader_lock_handle
+    if _scheduler_leader_lock_handle is not None:
+        return True
+    lock_path = _scheduler_leader_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+")
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(handle.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        elif _msvcrt is not None:
+            _msvcrt.locking(handle.fileno(), _msvcrt.LK_NBLCK, 1)
+        else:
+            logger.warning("No process lock implementation available; scheduler will run in this worker.")
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{_os.getpid()}\n")
+        handle.flush()
+        _scheduler_leader_lock_handle = handle
+        return True
+    except Exception:
+        try:
+            handle.close()
+        except Exception:
+            pass
+        return False
+
+
+def _release_scheduler_leader_lock() -> None:
+    global _scheduler_leader_lock_handle
+    handle = _scheduler_leader_lock_handle
+    _scheduler_leader_lock_handle = None
+    if handle is None:
+        return
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
+        elif _msvcrt is not None:
+            handle.seek(0)
+            _msvcrt.locking(handle.fileno(), _msvcrt.LK_UNLCK, 1)
+    except Exception:
+        pass
+    try:
+        handle.close()
+    except Exception:
+        pass
 H2O_MODELS_DIR = _BACKEND_DIR / "outputs" / "mlops_h2o_models"
 H2O_MOJO_DIR = _BACKEND_DIR / "outputs" / "mlops_h2o_mojo"
 H2O_REQUEST_SOURCE_TYPES = {"pipeline", "file", "sample", "workflow", "rows", "etl"}
@@ -320,6 +381,8 @@ threadsafe_ws_manager = ThreadSafeWebSocketProxy()
 
 SCHEDULE_JOB_PREFIX = "pipeline_schedule:"
 DATA_OPS_SYNC_JOB_PREFIX = "data_ops_mapper_sync:"
+DATA_OPS_ROUTER_JOB_PREFIX = "data_ops_router:"
+DATA_OPS_SCHEDULE_REGISTRY_SYNC_JOB_ID = "data_ops_schedule_registry_sync"
 SCHEDULE_PRESET_TO_CRON = {
     "every_1_min": "* * * * *",
     "every_5_min": "*/5 * * * *",
@@ -1247,11 +1310,29 @@ def _ensure_valid_cron_expr(cron_expr: Optional[str]) -> str:
     return normalized
 
 
+def _scheduler_job_next_run_at(job: Any, trigger: Any = None) -> Optional[str]:
+    if job is not None:
+        try:
+            next_obj = getattr(job, "next_run_time", None)
+            if next_obj is not None:
+                return next_obj.isoformat()
+        except Exception:
+            pass
+    if trigger is not None:
+        try:
+            timezone = getattr(trigger, "timezone", None)
+            now = datetime.now(timezone) if timezone is not None else datetime.now()
+            next_obj = trigger.get_next_fire_time(None, now)
+            if next_obj is not None:
+                return next_obj.isoformat()
+        except Exception:
+            pass
+    return None
+
+
 def _pipeline_next_scheduled_at(pipeline_id: str) -> Optional[str]:
     job = scheduler.get_job(_schedule_job_id(pipeline_id))
-    if not job or not job.next_run_time:
-        return None
-    return job.next_run_time.isoformat()
+    return _scheduler_job_next_run_at(job)
 
 
 def _extract_schedule_from_nodes(nodes: Any) -> Dict[str, Any]:
@@ -2808,6 +2889,26 @@ class DataOpsOracleSyncScheduleRequest(BaseModel):
     config: dict = {}
     sql: str = ""
     job_id: str
+    pipeline_id: Optional[str] = None
+    data_ops_node_id: Optional[str] = None
+    mapper_step_id: Optional[str] = None
+    mapper_config_id: Optional[str] = None
+    enabled: bool = False
+    deploy_enabled: bool = False
+    schedule_type: str = "interval"
+    interval_minutes: int = 60
+    cron: Optional[str] = None
+    timezone: Optional[str] = None
+    max_instances: int = 1
+    misfire_policy: str = "skip"
+
+
+class DataOpsRouterScheduleRequest(BaseModel):
+    pipeline_id: str
+    job_id: str
+    data_ops_node_id: Optional[str] = None
+    router_step_id: Optional[str] = None
+    router_config_id: Optional[str] = None
     enabled: bool = False
     deploy_enabled: bool = False
     schedule_type: str = "interval"
@@ -2872,6 +2973,73 @@ def _data_ops_oracle_value(value: Any) -> Any:
     if isinstance(value, bytes):
         return base64.b64encode(value).decode("ascii")
     return value
+
+
+def _data_ops_json_preview_paths(rows: List[Dict[str, Any]], limit: int = 500) -> List[Dict[str, str]]:
+    paths: List[Dict[str, str]] = []
+    seen: set[str] = set()
+
+    def _parse_json_candidate(value: Any) -> Any:
+        if isinstance(value, (dict, list)):
+            return value
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        if not text or text[0] not in "[{":
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
+    def _add(column: str, path: str) -> None:
+        if len(paths) >= max(1, limit):
+            return
+        key = f"{column}.{path}".strip(".")
+        if not column or not path or key in seen:
+            return
+        seen.add(key)
+        leaf = path.split(".")[-1].replace("[]", "").strip() or path
+        paths.append({
+            "column": column,
+            "path": path,
+            "field": key,
+            "name": leaf,
+            "label": f"{column} -> {path}",
+        })
+
+    def _walk(column: str, value: Any, path: str = "", depth: int = 0) -> None:
+        if depth > 8 or len(paths) >= max(1, limit):
+            return
+        parsed = _parse_json_candidate(value)
+        if parsed is not None:
+            _walk(column, parsed, path, depth + 1)
+            return
+        if isinstance(value, dict):
+            for raw_key, child in list(value.items())[:80]:
+                key = str(raw_key or "").strip()
+                if not key:
+                    continue
+                child_path = f"{path}.{key}" if path else key
+                _add(column, child_path)
+                _walk(column, child, child_path, depth + 1)
+        elif isinstance(value, list):
+            _add(column, f"{path}[]" if path else "[]")
+            exemplar = next((item for item in value if item is not None), None)
+            if exemplar is not None:
+                _walk(column, exemplar, path, depth + 1)
+
+    for row in rows[:100]:
+        if not isinstance(row, dict):
+            continue
+        for column, value in row.items():
+            parsed = _parse_json_candidate(value)
+            if parsed is None:
+                continue
+            _walk(str(column), parsed)
+            if len(paths) >= max(1, limit):
+                return paths
+    return paths
 
 
 def _data_ops_first_sql_keyword(sql: str) -> str:
@@ -14949,6 +15117,210 @@ async def get_stats(db: Session = Depends(get_db)):
     }
 
 
+_data_ops_schedule_activity_lock = threading.Lock()
+_data_ops_schedule_activity_rows: List[Dict[str, Any]] = []
+
+
+def _data_ops_schedule_activity_path() -> Path:
+    return _BACKEND_DIR / "state" / "data_ops_schedule_activity.json"
+
+
+def _data_ops_schedule_activity_lock_path() -> Path:
+    return _BACKEND_DIR / "state" / "data_ops_schedule_activity.lock"
+
+
+def _load_data_ops_schedule_activity_rows_unlocked() -> List[Dict[str, Any]]:
+    path = _data_ops_schedule_activity_path()
+    try:
+        if not path.exists():
+            return []
+        parsed = json.loads(path.read_text(encoding="utf-8") or "[]")
+        if not isinstance(parsed, list):
+            return []
+        return [row for row in parsed if isinstance(row, dict)]
+    except Exception as exc:
+        logger.warning(f"Failed loading Data Ops schedule activity: {exc}")
+        return []
+
+
+def _write_data_ops_schedule_activity_rows_unlocked(rows: List[Dict[str, Any]]) -> None:
+    path = _data_ops_schedule_activity_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{_os.getpid()}.tmp")
+    tmp_path.write_text(
+        json.dumps(rows[:80], indent=2, ensure_ascii=False, sort_keys=True, default=str),
+        encoding="utf-8",
+    )
+    _os.replace(tmp_path, path)
+
+
+def _load_data_ops_schedule_activity_rows() -> List[Dict[str, Any]]:
+    lock_path = _data_ops_schedule_activity_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+        _lock_data_ops_schedule_registry(lock_handle)
+        try:
+            return _load_data_ops_schedule_activity_rows_unlocked()
+        finally:
+            _unlock_data_ops_schedule_registry(lock_handle)
+
+
+def _record_data_ops_schedule_activity(job_id: str, status: str, message: str = "", **extra: Any) -> None:
+    row = {
+        "job_id": str(job_id or ""),
+        "status": str(status or "idle"),
+        "message": str(message or ""),
+        "at": datetime.utcnow().isoformat() + "Z",
+        **extra,
+    }
+    with _data_ops_schedule_activity_lock:
+        _data_ops_schedule_activity_rows.insert(0, row)
+        del _data_ops_schedule_activity_rows[80:]
+    lock_path = _data_ops_schedule_activity_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+        _lock_data_ops_schedule_registry(lock_handle)
+        try:
+            rows = _load_data_ops_schedule_activity_rows_unlocked()
+            rows.insert(0, row)
+            _write_data_ops_schedule_activity_rows_unlocked(rows)
+        finally:
+            _unlock_data_ops_schedule_registry(lock_handle)
+
+
+def _parse_data_ops_job_id(job_id: str) -> Dict[str, str]:
+    if job_id.startswith(DATA_OPS_ROUTER_JOB_PREFIX):
+        raw = job_id[len(DATA_OPS_ROUTER_JOB_PREFIX):]
+        parts = raw.split(":")
+        return {
+            "kind": "router",
+            "pipeline_id": parts[0] if len(parts) > 0 else "",
+            "data_ops_node_id": parts[1] if len(parts) > 1 else "",
+            "step_id": parts[2] if len(parts) > 2 else "",
+            "config_id": parts[3] if len(parts) > 3 else "",
+        }
+    if job_id.startswith(DATA_OPS_SYNC_JOB_PREFIX):
+        raw = job_id[len(DATA_OPS_SYNC_JOB_PREFIX):]
+        parts = raw.split(":")
+        return {
+            "kind": "mapper",
+            "pipeline_id": parts[0] if len(parts) > 3 else "",
+            "data_ops_node_id": parts[0] if len(parts) > 0 else "",
+            "step_id": parts[1] if len(parts) > 1 else "",
+            "config_id": parts[2] if len(parts) > 2 else "",
+        }
+    return {"kind": "scheduler", "pipeline_id": "", "data_ops_node_id": "", "step_id": "", "config_id": ""}
+
+
+def _data_ops_schedule_monitor_rows(scheduler_jobs: List[Dict[str, Any]], checked_at: str) -> List[Dict[str, Any]]:
+    try:
+        registry = _load_data_ops_schedule_registry()
+    except Exception:
+        registry = {}
+    data_ops_jobs = [
+        job for job in scheduler_jobs
+        if str(job.get("id", "")).startswith((DATA_OPS_SYNC_JOB_PREFIX, DATA_OPS_ROUTER_JOB_PREFIX))
+    ]
+    rows: List[Dict[str, Any]] = []
+    for job in data_ops_jobs:
+        job_id = str(job.get("id") or "")
+        record = registry.get(job_id) if isinstance(registry.get(job_id), dict) else {}
+        parsed = _parse_data_ops_job_id(job_id)
+        row = {
+            **parsed,
+            **record,
+            "job_id": job_id,
+            "name": str(job.get("name") or record.get("name") or parsed.get("kind") or "Data Ops job"),
+            "kind": str(record.get("kind") or parsed.get("kind") or "scheduler"),
+            "status": "scheduled",
+            "next_run_at": job.get("next_run_at") or record.get("next_run_at"),
+            "schedule_type": record.get("schedule_type") or "interval",
+            "interval_minutes": record.get("interval_minutes"),
+            "cron": record.get("cron"),
+            "timezone": record.get("timezone") or "Asia/Kolkata",
+            "last_checked_at": checked_at,
+        }
+        rows.append(row)
+    recent_activity = _load_data_ops_schedule_activity_rows()
+    latest_by_job: Dict[str, Dict[str, Any]] = {}
+    for row in recent_activity:
+        row_job_id = str(row.get("job_id") or "")
+        if row_job_id and row_job_id not in latest_by_job:
+            latest_by_job[row_job_id] = row
+    checked_dt = datetime.utcnow()
+    for row in rows:
+        activity = latest_by_job.get(str(row.get("job_id") or ""))
+        if not activity:
+            continue
+        row["last_activity_at"] = activity.get("at")
+        row["last_message"] = activity.get("message")
+        row["last_status"] = activity.get("status")
+        activity_status = str(activity.get("status") or "").lower()
+        activity_at_raw = str(activity.get("at") or "")
+        activity_age_seconds = 999999.0
+        try:
+            activity_dt = datetime.fromisoformat(activity_at_raw.replace("Z", "+00:00"))
+            if activity_dt.tzinfo is not None:
+                activity_dt = activity_dt.astimezone(timezone.utc).replace(tzinfo=None)
+            activity_age_seconds = max(0.0, (checked_dt - activity_dt).total_seconds())
+        except Exception:
+            pass
+        if activity_status == "running" and activity_age_seconds > 20:
+            row["status"] = "scheduled"
+        elif activity_status in {"running", "success", "failed", "skipped"}:
+            row["status"] = activity.get("status")
+        for key in ("execution_id", "duration_ms", "rows_processed"):
+            if key in activity:
+                row[key] = activity.get(key)
+    rows.sort(key=lambda item: str(item.get("next_run_at") or item.get("last_activity_at") or ""), reverse=False)
+    return rows
+
+
+@app.get("/api/runtime/monitor")
+async def get_runtime_monitor(db: Session = Depends(get_db)):
+    total_executions = db.query(models.Execution).count()
+    successful = db.query(models.Execution).filter(models.Execution.status == "success").count()
+    failed = db.query(models.Execution).filter(models.Execution.status.in_(["failed", "error"])).count()
+    running = db.query(models.Execution).filter(models.Execution.status == "running").count()
+    total_rows = db.query(models.Execution).with_entities(models.Execution.rows_processed).all()
+    total_rows_processed = sum(row[0] or 0 for row in total_rows)
+    scheduler_jobs = []
+    try:
+        for job in scheduler.get_jobs() if scheduler.running else []:
+            scheduler_jobs.append({
+                "id": str(job.id),
+                "name": str(getattr(job, "name", "") or job.id),
+                "next_run_at": _scheduler_job_next_run_at(job),
+            })
+    except Exception:
+        scheduler_jobs = []
+    checked_at = datetime.utcnow().isoformat() + "Z"
+    data_ops_schedules = _data_ops_schedule_monitor_rows(scheduler_jobs, checked_at)
+    data_ops_activity = _load_data_ops_schedule_activity_rows()[:25]
+    return {
+        "ok": True,
+        "pid": _os.getpid(),
+        "status": "running",
+        "checked_at": checked_at,
+        "scheduler": {
+            "running": bool(scheduler.running),
+            "leader": _scheduler_leader_lock_handle is not None,
+            "jobs": len(scheduler_jobs),
+            "data_ops_jobs": len(data_ops_schedules),
+            "next_run_at": next((job.get("next_run_at") for job in scheduler_jobs if job.get("next_run_at")), None),
+        },
+        "executions": {
+            "total": total_executions,
+            "running": running,
+            "success": successful,
+            "failed": failed,
+            "rows_processed": total_rows_processed,
+        },
+        "data_ops_schedules": data_ops_schedules,
+        "data_ops_activity": data_ops_activity,
+    }
+
+
 # ─── WEBSOCKET ────────────────────────────────────────────────────────────────
 
 @app.websocket("/ws/executions/{execution_id}")
@@ -16813,6 +17185,7 @@ async def data_ops_oracle_object_data(body: DataOpsOracleObjectDataRequest):
             "object": object_name,
             "object_type": str(row[0] or ""),
             "columns": columns,
+            "json_paths": _data_ops_json_preview_paths(rows),
             "rows": rows,
             "limit": limit,
             "row_count": len(rows),
@@ -16855,6 +17228,7 @@ async def data_ops_oracle_query_preview(body: DataOpsOracleQueryPreviewRequest):
         return {
             "ok": True,
             "columns": columns,
+            "json_paths": _data_ops_json_preview_paths(rows),
             "rows": rows,
             "limit": limit,
             "row_count": len(rows),
@@ -16943,19 +17317,99 @@ def _data_ops_mapper_sync_schedule_is_active(config: Dict[str, Any]) -> bool:
     return True
 
 
-async def _run_scheduled_data_ops_mapper_sync(job_id: str, config: Dict[str, Any], sql: str):
+async def _run_scheduled_data_ops_mapper_sync(
+    job_id: str,
+    config: Dict[str, Any],
+    sql: str,
+    pipeline_id: str = "",
+    data_ops_node_id: str = "",
+    mapper_step_id: str = "",
+    mapper_config_id: str = "",
+):
+    started_at = datetime.utcnow()
+    _record_data_ops_schedule_activity(
+        job_id,
+        "running",
+        "Mapper sync started",
+        kind="mapper",
+        pipeline_id=pipeline_id,
+        data_ops_node_id=data_ops_node_id,
+        step_id=mapper_step_id,
+        config_id=mapper_config_id,
+        last_run_started_at=started_at.isoformat() + "Z",
+    )
     if not _data_ops_mapper_sync_schedule_is_active(config):
         try:
             scheduler.remove_job(job_id)
         except Exception:
             pass
+        _record_data_ops_schedule_activity(
+            job_id,
+            "skipped",
+            "Mapper sync scheduler is inactive",
+            kind="mapper",
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_id=mapper_step_id,
+            config_id=mapper_config_id,
+            last_run_started_at=started_at.isoformat() + "Z",
+            last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+        )
         logger.debug(f"Removed inactive scheduled Data Ops mapper sync {job_id}")
         return
+    _persist_data_ops_schedule_next_run_at(
+        pipeline_id=pipeline_id,
+        data_ops_node_id=data_ops_node_id,
+        step_kind="map",
+        step_id=mapper_step_id,
+        config_id=mapper_config_id,
+        config_collection_key="mapperConfigs",
+        active_config_key="activeMapperConfigId",
+        job_id=job_id,
+    )
     try:
         result = await asyncio.to_thread(_execute_data_ops_oracle_sql, config, sql)
+        _record_data_ops_schedule_activity(
+            job_id,
+            "success",
+            f"Mapper sync completed: {result.get('rowcount', 0)} row(s)",
+            kind="mapper",
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_id=mapper_step_id,
+            config_id=mapper_config_id,
+            rows_processed=int(result.get("rowcount") or 0),
+            duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
+            last_run_started_at=started_at.isoformat() + "Z",
+            last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+        )
         logger.info(f"Scheduled Data Ops mapper sync {job_id} completed: {result.get('rowcount', 0)} row(s)")
     except Exception as exc:
+        _record_data_ops_schedule_activity(
+            job_id,
+            "failed",
+            f"Mapper sync failed: {exc}",
+            kind="mapper",
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_id=mapper_step_id,
+            config_id=mapper_config_id,
+            duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
+            last_run_started_at=started_at.isoformat() + "Z",
+            last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+        )
         logger.error(f"Scheduled Data Ops mapper sync {job_id} failed: {exc}")
+    finally:
+        _persist_data_ops_schedule_next_run_at(
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_kind="map",
+            step_id=mapper_step_id,
+            config_id=mapper_config_id,
+            config_collection_key="mapperConfigs",
+            active_config_key="activeMapperConfigId",
+            job_id=job_id,
+        )
 
 
 def _remove_data_ops_mapper_sync_jobs(raw_job_id: str, remove_pipeline_jobs: bool = False) -> int:
@@ -16983,15 +17437,20 @@ async def data_ops_oracle_sync_schedule(body: DataOpsOracleSyncScheduleRequest):
     if not raw_job_id:
         raise HTTPException(400, "job_id is required.")
     job_id = f"{DATA_OPS_SYNC_JOB_PREFIX}{raw_job_id}"
+    scope = _data_ops_mapper_schedule_scope_from_job(raw_job_id, body)
     if not body.enabled or not body.deploy_enabled:
         removed = _remove_data_ops_mapper_sync_jobs(raw_job_id, remove_pipeline_jobs=raw_job_id.count(":") < 2)
+        registry_prefixes = [job_id]
+        if raw_job_id.count(":") < 2 and ":" in raw_job_id:
+            registry_prefixes.append(f"{DATA_OPS_SYNC_JOB_PREFIX}{raw_job_id.split(':', 1)[0]}:")
+        registry_removed = _remove_data_ops_schedule_registry_records(registry_prefixes)
         return {
             "ok": True,
             "job_id": job_id,
             "enabled": False,
             "next_run_at": None,
-            "removed_jobs": removed,
-            "message": f"Data Ops mapper sync scheduler disabled. Removed {removed} backend job(s).",
+            "removed_jobs": removed + registry_removed,
+            "message": f"Data Ops mapper sync scheduler disabled. Removed {removed + registry_removed} backend job(s).",
         }
     _remove_data_ops_mapper_sync_jobs(raw_job_id, remove_pipeline_jobs=False)
     sql = str(body.sql or "").strip()
@@ -17002,12 +17461,13 @@ async def data_ops_oracle_sync_schedule(body: DataOpsOracleSyncScheduleRequest):
     schedule_type = str(body.schedule_type or "interval").strip().lower()
     if schedule_type in {"manual", "event"}:
         removed = _remove_data_ops_mapper_sync_jobs(raw_job_id, remove_pipeline_jobs=False)
+        registry_removed = _remove_data_ops_schedule_registry_records([job_id])
         return {
             "ok": True,
             "job_id": job_id,
             "enabled": False,
             "next_run_at": None,
-            "removed_jobs": removed,
+            "removed_jobs": removed + registry_removed,
             "message": f"Schedule type '{schedule_type}' does not create a time-based backend job.",
         }
     timezone_name = str(body.timezone or "Asia/Kolkata").strip() or "Asia/Kolkata"
@@ -17023,25 +17483,1136 @@ async def data_ops_oracle_sync_schedule(body: DataOpsOracleSyncScheduleRequest):
         scheduled_config = dict(body.config or {})
         scheduled_config["_data_ops_mapper_scheduler_enabled"] = True
         scheduled_config["_data_ops_mapper_deploy_enabled"] = True
-        scheduler.add_job(
-            _run_scheduled_data_ops_mapper_sync,
-            trigger=trigger,
-            args=[job_id, scheduled_config, sql],
-            id=job_id,
-            replace_existing=True,
-            max_instances=max(1, int(body.max_instances or 1)),
-            coalesce=str(body.misfire_policy or "skip") != "catch_up",
-        )
+        schedule_record = {
+            "kind": "mapper",
+            "job_id": job_id,
+            "pipeline_id": str(body.pipeline_id or "").strip(),
+            "data_ops_node_id": scope.get("data_ops_node_id") or "",
+            "mapper_step_id": scope.get("mapper_step_id") or "",
+            "mapper_config_id": scope.get("mapper_config_id") or "",
+            "enabled": True,
+            "deploy_enabled": True,
+            "schedule_type": schedule_type,
+            "interval_minutes": int(body.interval_minutes or 60),
+            "cron": body.cron or "0 * * * *",
+            "timezone": timezone_name,
+            "max_instances": max(1, int(body.max_instances or 1)),
+            "misfire_policy": str(body.misfire_policy or "skip"),
+            "config": scheduled_config,
+            "sql": sql,
+        }
+        _upsert_data_ops_schedule_registry_record(schedule_record)
+        next_run_at = _ensure_data_ops_schedule_record_job(schedule_record, force=True)
     except Exception as exc:
         raise HTTPException(400, f"Failed to schedule mapper sync: {exc}")
-    job = scheduler.get_job(job_id)
+    _persist_data_ops_schedule_next_run_at(
+        pipeline_id=str(body.pipeline_id or "").strip(),
+        data_ops_node_id=scope.get("data_ops_node_id") or "",
+        step_kind="map",
+        step_id=scope.get("mapper_step_id") or "",
+        config_id=scope.get("mapper_config_id") or "",
+        config_collection_key="mapperConfigs",
+        active_config_key="activeMapperConfigId",
+        job_id=job_id,
+        next_run_at=next_run_at,
+    )
     return {
         "ok": True,
         "job_id": job_id,
         "enabled": True,
         "schedule": schedule_text,
-        "next_run_at": job.next_run_time.isoformat() if job and job.next_run_time else None,
+        "next_run_at": next_run_at,
         "message": "Data Ops mapper sync scheduler registered.",
+    }
+
+
+def _data_ops_router_schedule_is_active(pipeline_id: str, job_id: str) -> bool:
+    db = SessionLocal()
+    try:
+        pipeline = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
+        if not pipeline:
+            return False
+        for node in pipeline.nodes or []:
+            if not isinstance(node, dict):
+                continue
+            data = node.get("data") if isinstance(node.get("data"), dict) else {}
+            cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
+            steps = cfg.get("data_ops_pipeline_nodes") if isinstance(cfg.get("data_ops_pipeline_nodes"), list) else []
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                if str(step.get("kind") or "").strip().lower() != "router":
+                    continue
+                candidates = [step]
+                router_configs = step.get("routerConfigs") or step.get("router_configs") or []
+                if isinstance(router_configs, list):
+                    candidates.extend([item for item in router_configs if isinstance(item, dict)])
+                for candidate in candidates:
+                    candidate_job_id = str(candidate.get("scheduleBackendJobId") or candidate.get("schedule_backend_job_id") or "").strip()
+                    if candidate_job_id != job_id:
+                        continue
+                    return (
+                        bool(candidate.get("deployEnabled") or candidate.get("deploy_enabled"))
+                        and bool(candidate.get("scheduleEnabled") or candidate.get("schedule_enabled"))
+                        and str(candidate.get("scheduleStatus") or candidate.get("schedule_status") or "").strip().lower() != "disabled"
+                    )
+        return False
+    except Exception as exc:
+        logger.warning(f"Failed checking Data Ops router schedule state for {job_id}: {exc}")
+        return False
+    finally:
+        db.close()
+
+
+def _data_ops_router_schedule_scope_from_job(
+    raw_job_id: str,
+    body: Optional[DataOpsRouterScheduleRequest] = None,
+) -> Dict[str, str]:
+    data_ops_node_id = str(getattr(body, "data_ops_node_id", "") or "").strip()
+    router_step_id = str(getattr(body, "router_step_id", "") or "").strip()
+    router_config_id = str(getattr(body, "router_config_id", "") or "").strip()
+    parts = str(raw_job_id or "").split(":")
+    # Current UI job id shape:
+    #   pipeline_id:data_ops_node_id:router_step_id:router_config_id
+    if not data_ops_node_id and len(parts) >= 2:
+        data_ops_node_id = parts[1].strip()
+    if not router_step_id and len(parts) >= 3:
+        router_step_id = parts[2].strip()
+    if not router_config_id and len(parts) >= 4:
+        router_config_id = parts[3].strip()
+    if router_config_id == "active":
+        router_config_id = ""
+    return {
+        "data_ops_node_id": data_ops_node_id,
+        "router_step_id": router_step_id,
+        "router_config_id": router_config_id,
+    }
+
+
+def _data_ops_step_kind_for_scheduler(step: Dict[str, Any]) -> str:
+    raw = str(step.get("kind") or "").strip().lower()
+    if raw:
+        return raw
+    name = str(step.get("name") or step.get("label") or "").strip().lower()
+    if re.search(r"query\s*result\s*router|router|routing", name):
+        return "router"
+    if re.search(r"source|read|api|rest|soap|graphql|csv|excel", name):
+        return "source"
+    if re.search(r"map|mapper|lookup|join", name):
+        return "map"
+    if re.search(r"valid|quality|filter|reject", name):
+        return "validate"
+    return "prepare"
+
+
+def _data_ops_mapper_schedule_scope_from_job(
+    raw_job_id: str,
+    body: Optional[DataOpsOracleSyncScheduleRequest] = None,
+) -> Dict[str, str]:
+    data_ops_node_id = str(getattr(body, "data_ops_node_id", "") or "").strip()
+    mapper_step_id = str(getattr(body, "mapper_step_id", "") or "").strip()
+    mapper_config_id = str(getattr(body, "mapper_config_id", "") or "").strip()
+    parts = str(raw_job_id or "").split(":")
+    # Current UI mapper job id shape:
+    #   data_ops_node_id:mapper_step_id:mapper_config_id
+    if not data_ops_node_id and len(parts) >= 1:
+        data_ops_node_id = parts[0].strip()
+    if not mapper_step_id and len(parts) >= 2:
+        mapper_step_id = parts[1].strip()
+    if not mapper_config_id and len(parts) >= 3:
+        mapper_config_id = parts[2].strip()
+    if mapper_config_id == "active":
+        mapper_config_id = ""
+    return {
+        "data_ops_node_id": data_ops_node_id,
+        "mapper_step_id": mapper_step_id,
+        "mapper_config_id": mapper_config_id,
+    }
+
+
+def _persist_data_ops_schedule_next_run_at(
+    pipeline_id: str,
+    data_ops_node_id: str,
+    step_kind: str,
+    step_id: str,
+    config_id: str,
+    config_collection_key: str,
+    active_config_key: str,
+    job_id: str,
+    next_run_at: Optional[str] = None,
+) -> bool:
+    pipeline_id = str(pipeline_id or "").strip()
+    if not pipeline_id:
+        return False
+    resolved_next_run_at = next_run_at
+    if resolved_next_run_at is None:
+        resolved_next_run_at = _scheduler_job_next_run_at(scheduler.get_job(job_id))
+    if resolved_next_run_at is None:
+        return False
+    db = SessionLocal()
+    try:
+        pipeline = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
+        if not pipeline or not isinstance(pipeline.nodes, list):
+            return False
+        next_nodes = copy.deepcopy(pipeline.nodes)
+        changed = False
+        snake_collection_key = re.sub(r"([A-Z])", r"_\1", config_collection_key).lower()
+        snake_active_key = re.sub(r"([A-Z])", r"_\1", active_config_key).lower()
+        update_patch = {
+            "scheduleStatus": "scheduled",
+            "scheduleBackendJobId": job_id,
+            "scheduleNextRunAt": resolved_next_run_at,
+        }
+        for node in next_nodes:
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("id") or "").strip()
+            if data_ops_node_id and node_id != data_ops_node_id:
+                continue
+            data = node.get("data") if isinstance(node.get("data"), dict) else {}
+            cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
+            steps = cfg.get("data_ops_pipeline_nodes") if isinstance(cfg.get("data_ops_pipeline_nodes"), list) else []
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                if step_kind and _data_ops_step_kind_for_scheduler(step) != step_kind:
+                    continue
+                current_step_id = str(step.get("id") or "").strip()
+                if step_id and current_step_id != step_id:
+                    continue
+                for key, value in update_patch.items():
+                    if step.get(key) != value:
+                        step[key] = value
+                        changed = True
+                config_rows = step.get(config_collection_key)
+                active_config_id = str(step.get(active_config_key) or step.get(snake_active_key) or "").strip()
+                if not isinstance(config_rows, list):
+                    config_rows = step.get(snake_collection_key)
+                if isinstance(config_rows, list):
+                    matched_config = False
+                    target_config_id = config_id or active_config_id
+                    if not target_config_id:
+                        first_config = next((item for item in config_rows if isinstance(item, dict) and str(item.get("id") or "").strip()), None)
+                        target_config_id = str(first_config.get("id") or "").strip() if isinstance(first_config, dict) else ""
+                    for config_row in config_rows:
+                        if not isinstance(config_row, dict):
+                            continue
+                        current_config_id = str(config_row.get("id") or "").strip()
+                        should_update = bool(target_config_id) and current_config_id == target_config_id
+                        if not should_update:
+                            continue
+                        matched_config = True
+                        for key, value in update_patch.items():
+                            if config_row.get(key) != value:
+                                config_row[key] = value
+                                changed = True
+                    if config_id and not matched_config:
+                        # Keep the step-level tag correct even if an old save lacks the config row.
+                        changed = True
+                if changed:
+                    break
+            if changed and (not data_ops_node_id or node_id == data_ops_node_id):
+                break
+        if not changed:
+            return False
+        pipeline.nodes = next_nodes
+        pipeline.updated_at = datetime.utcnow()
+        db.commit()
+        return True
+    except Exception as exc:
+        logger.warning(f"Failed persisting Data Ops schedule next run for {job_id}: {exc}")
+        return False
+    finally:
+        db.close()
+
+
+_data_ops_schedule_job_fingerprints: Dict[str, str] = {}
+
+
+def _data_ops_schedule_registry_path() -> Path:
+    return _BACKEND_DIR / "state" / "data_ops_schedules.json"
+
+
+def _data_ops_schedule_registry_lock_path() -> Path:
+    return _BACKEND_DIR / "state" / "data_ops_schedules.lock"
+
+
+def _lock_data_ops_schedule_registry(handle: Any) -> None:
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(handle.fileno(), _fcntl.LOCK_EX)
+        elif _msvcrt is not None:
+            handle.seek(0)
+            _msvcrt.locking(handle.fileno(), _msvcrt.LK_LOCK, 1)
+    except Exception:
+        pass
+
+
+def _unlock_data_ops_schedule_registry(handle: Any) -> None:
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
+        elif _msvcrt is not None:
+            handle.seek(0)
+            _msvcrt.locking(handle.fileno(), _msvcrt.LK_UNLCK, 1)
+    except Exception:
+        pass
+
+
+def _load_data_ops_schedule_registry_unlocked() -> Dict[str, Dict[str, Any]]:
+    path = _data_ops_schedule_registry_path()
+    try:
+        if not path.exists():
+            return {}
+        parsed = json.loads(path.read_text(encoding="utf-8") or "{}")
+        if not isinstance(parsed, dict):
+            return {}
+        return {
+            str(key): value
+            for key, value in parsed.items()
+            if str(key).strip() and isinstance(value, dict)
+        }
+    except Exception as exc:
+        logger.warning(f"Failed loading Data Ops schedule registry: {exc}")
+        return {}
+
+
+def _load_data_ops_schedule_registry() -> Dict[str, Dict[str, Any]]:
+    lock_path = _data_ops_schedule_registry_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+        _lock_data_ops_schedule_registry(lock_handle)
+        try:
+            return _load_data_ops_schedule_registry_unlocked()
+        finally:
+            _unlock_data_ops_schedule_registry(lock_handle)
+
+
+def _write_data_ops_schedule_registry_unlocked(registry: Dict[str, Dict[str, Any]]) -> None:
+    path = _data_ops_schedule_registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{_os.getpid()}.tmp")
+    tmp_path.write_text(
+        json.dumps(registry, indent=2, ensure_ascii=False, sort_keys=True, default=str),
+        encoding="utf-8",
+    )
+    _os.replace(tmp_path, path)
+
+
+def _mutate_data_ops_schedule_registry(mutator: Any) -> Dict[str, Dict[str, Any]]:
+    lock_path = _data_ops_schedule_registry_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+        _lock_data_ops_schedule_registry(lock_handle)
+        try:
+            registry = _load_data_ops_schedule_registry_unlocked()
+            next_registry = mutator(registry) or registry
+            _write_data_ops_schedule_registry_unlocked(next_registry)
+            return next_registry
+        finally:
+            _unlock_data_ops_schedule_registry(lock_handle)
+
+
+def _upsert_data_ops_schedule_registry_record(record: Dict[str, Any]) -> None:
+    job_id = str(record.get("job_id") or "").strip()
+    if not job_id:
+        return
+
+    def _mutator(registry: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        registry[job_id] = {
+            **copy.deepcopy(record),
+            "job_id": job_id,
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+        }
+        return registry
+
+    _mutate_data_ops_schedule_registry(_mutator)
+
+
+def _remove_data_ops_schedule_registry_records(prefixes: List[str]) -> int:
+    normalized = [str(item or "").strip() for item in prefixes if str(item or "").strip()]
+    if not normalized:
+        return 0
+    removed = 0
+
+    def _mutator(registry: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        nonlocal removed
+        for job_id in list(registry.keys()):
+            if any(job_id == prefix or job_id.startswith(prefix) for prefix in normalized):
+                registry.pop(job_id, None)
+                removed += 1
+        return registry
+
+    _mutate_data_ops_schedule_registry(_mutator)
+    for prefix in normalized:
+        for job_id in list(_data_ops_schedule_job_fingerprints.keys()):
+            if job_id == prefix or job_id.startswith(prefix):
+                _data_ops_schedule_job_fingerprints.pop(job_id, None)
+    return removed
+
+
+def _data_ops_schedule_record_fingerprint(record: Dict[str, Any]) -> str:
+    compact = {
+        "kind": record.get("kind"),
+        "job_id": record.get("job_id"),
+        "pipeline_id": record.get("pipeline_id"),
+        "data_ops_node_id": record.get("data_ops_node_id"),
+        "step_id": record.get("router_step_id") or record.get("mapper_step_id"),
+        "config_id": record.get("router_config_id") or record.get("mapper_config_id"),
+        "enabled": bool(record.get("enabled")),
+        "deploy_enabled": bool(record.get("deploy_enabled")),
+        "schedule_type": record.get("schedule_type"),
+        "interval_minutes": int(record.get("interval_minutes") or 60),
+        "cron": record.get("cron"),
+        "timezone": record.get("timezone"),
+        "max_instances": int(record.get("max_instances") or 1),
+        "misfire_policy": record.get("misfire_policy"),
+        "sql_sha256": hashlib.sha256(str(record.get("sql") or "").encode("utf-8")).hexdigest(),
+        "config_sha256": hashlib.sha256(json.dumps(record.get("config") or {}, sort_keys=True, default=str).encode("utf-8")).hexdigest(),
+    }
+    return hashlib.sha256(json.dumps(compact, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _data_ops_schedule_record_trigger(record: Dict[str, Any]) -> Tuple[Any, str]:
+    schedule_type = str(record.get("schedule_type") or "interval").strip().lower()
+    timezone_name = str(record.get("timezone") or "Asia/Kolkata").strip() or "Asia/Kolkata"
+    if schedule_type == "cron":
+        cron = _ensure_valid_cron_expr(record.get("cron") or "")
+        return CronTrigger.from_crontab(cron, timezone=timezone_name), cron
+    interval_minutes = max(1, int(record.get("interval_minutes") or 60))
+    return IntervalTrigger(minutes=interval_minutes, timezone=timezone_name), f"every {interval_minutes} minute(s)"
+
+
+def _data_ops_schedule_record_enabled(record: Dict[str, Any]) -> bool:
+    if not bool(record.get("enabled")) or not bool(record.get("deploy_enabled")):
+        return False
+    return str(record.get("schedule_type") or "interval").strip().lower() not in {"manual", "event"}
+
+
+def _persist_data_ops_schedule_record_next_run(record: Dict[str, Any], job_id: str, next_run_at: Optional[str]) -> None:
+    kind = str(record.get("kind") or "").strip().lower()
+    if kind == "mapper":
+        _persist_data_ops_schedule_next_run_at(
+            pipeline_id=str(record.get("pipeline_id") or "").strip(),
+            data_ops_node_id=str(record.get("data_ops_node_id") or "").strip(),
+            step_kind="map",
+            step_id=str(record.get("mapper_step_id") or "").strip(),
+            config_id=str(record.get("mapper_config_id") or "").strip(),
+            config_collection_key="mapperConfigs",
+            active_config_key="activeMapperConfigId",
+            job_id=job_id,
+            next_run_at=next_run_at,
+        )
+    elif kind == "router":
+        _persist_data_ops_schedule_next_run_at(
+            pipeline_id=str(record.get("pipeline_id") or "").strip(),
+            data_ops_node_id=str(record.get("data_ops_node_id") or "").strip(),
+            step_kind="router",
+            step_id=str(record.get("router_step_id") or "").strip(),
+            config_id=str(record.get("router_config_id") or "").strip(),
+            config_collection_key="routerConfigs",
+            active_config_key="activeRouterConfigId",
+            job_id=job_id,
+            next_run_at=next_run_at,
+        )
+
+
+def _ensure_data_ops_schedule_record_job(record: Dict[str, Any], force: bool = False) -> Optional[str]:
+    if not _data_ops_schedule_record_enabled(record):
+        return None
+    job_id = str(record.get("job_id") or "").strip()
+    if not job_id:
+        return None
+    trigger, _schedule_text = _data_ops_schedule_record_trigger(record)
+    fingerprint = _data_ops_schedule_record_fingerprint(record)
+    existing = scheduler.get_job(job_id) if scheduler.running else None
+    if existing is not None and not force and _data_ops_schedule_job_fingerprints.get(job_id) == fingerprint:
+        next_run_at = _scheduler_job_next_run_at(existing, trigger)
+        _persist_data_ops_schedule_record_next_run(record, job_id, next_run_at)
+        return next_run_at
+    if not scheduler.running:
+        return _scheduler_job_next_run_at(None, trigger)
+    kind = str(record.get("kind") or "").strip().lower()
+    max_instances = max(1, int(record.get("max_instances") or 1))
+    coalesce = str(record.get("misfire_policy") or "skip") != "catch_up"
+    if kind == "mapper":
+        sql = str(record.get("sql") or "").strip()
+        if not sql:
+            logger.warning(f"Skipping Data Ops mapper schedule {job_id}: SQL missing from registry")
+            return None
+        scheduled_config = dict(record.get("config") or {})
+        scheduled_config["_data_ops_mapper_scheduler_enabled"] = True
+        scheduled_config["_data_ops_mapper_deploy_enabled"] = True
+        scheduler.add_job(
+            _run_scheduled_data_ops_mapper_sync,
+            trigger=trigger,
+            args=[
+                job_id,
+                scheduled_config,
+                sql,
+                str(record.get("pipeline_id") or "").strip(),
+                str(record.get("data_ops_node_id") or "").strip(),
+                str(record.get("mapper_step_id") or "").strip(),
+                str(record.get("mapper_config_id") or "").strip(),
+            ],
+            id=job_id,
+            replace_existing=True,
+            max_instances=max_instances,
+            coalesce=coalesce,
+        )
+    elif kind == "router":
+        scheduler.add_job(
+            _run_scheduled_data_ops_router,
+            trigger=trigger,
+            args=[
+                job_id,
+                str(record.get("pipeline_id") or "").strip(),
+                str(record.get("data_ops_node_id") or "").strip(),
+                str(record.get("router_step_id") or "").strip(),
+                str(record.get("router_config_id") or "").strip(),
+            ],
+            id=job_id,
+            replace_existing=True,
+            max_instances=max_instances,
+            coalesce=coalesce,
+        )
+    else:
+        return None
+    _data_ops_schedule_job_fingerprints[job_id] = fingerprint
+    next_run_at = _scheduler_job_next_run_at(scheduler.get_job(job_id), trigger)
+    _persist_data_ops_schedule_record_next_run(record, job_id, next_run_at)
+    logger.info(f"Registered Data Ops {kind} schedule {job_id}; next={next_run_at}")
+    return next_run_at
+
+
+def _router_schedule_record_from_config(
+    pipeline_id: str,
+    data_ops_node_id: str,
+    step: Dict[str, Any],
+    config: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    step_id = str(step.get("id") or "").strip()
+    config_id = str(config.get("id") or "").strip()
+    if not pipeline_id or not data_ops_node_id or not step_id or not config_id:
+        return None
+    deploy_enabled = bool(config.get("deployEnabled") or config.get("deploy_enabled"))
+    schedule_enabled = bool(config.get("scheduleEnabled") or config.get("schedule_enabled"))
+    status = str(config.get("scheduleStatus") or config.get("schedule_status") or "").strip().lower()
+    if not deploy_enabled or not schedule_enabled or status == "disabled":
+        return None
+    job_id = str(config.get("scheduleBackendJobId") or config.get("schedule_backend_job_id") or "").strip()
+    if not job_id:
+        job_id = f"{DATA_OPS_ROUTER_JOB_PREFIX}{pipeline_id}:{data_ops_node_id}:{step_id}:{config_id}"
+    return {
+        "kind": "router",
+        "job_id": job_id,
+        "pipeline_id": pipeline_id,
+        "data_ops_node_id": data_ops_node_id,
+        "router_step_id": step_id,
+        "router_config_id": config_id,
+        "enabled": schedule_enabled,
+        "deploy_enabled": deploy_enabled,
+        "schedule_type": config.get("scheduleType") or config.get("schedule_type") or step.get("scheduleType") or "interval",
+        "interval_minutes": config.get("scheduleIntervalMinutes") or config.get("schedule_interval_minutes") or step.get("scheduleIntervalMinutes") or 60,
+        "cron": config.get("scheduleCron") or config.get("schedule_cron") or step.get("scheduleCron") or "0 * * * *",
+        "timezone": config.get("scheduleTimezone") or config.get("schedule_timezone") or step.get("scheduleTimezone") or "Asia/Kolkata",
+        "max_instances": config.get("scheduleMaxParallelRuns") or config.get("schedule_max_parallel_runs") or step.get("scheduleMaxParallelRuns") or 1,
+        "misfire_policy": config.get("scheduleMisfirePolicy") or config.get("schedule_misfire_policy") or step.get("scheduleMisfirePolicy") or "skip",
+    }
+
+
+def _collect_data_ops_router_schedule_records_from_db() -> Dict[str, Dict[str, Any]]:
+    records: Dict[str, Dict[str, Any]] = {}
+    db = SessionLocal()
+    try:
+        pipelines = db.query(models.Pipeline).all()
+        for pipeline in pipelines:
+            pipeline_id = str(pipeline.id or "").strip()
+            for node in pipeline.nodes or []:
+                if not isinstance(node, dict):
+                    continue
+                data_ops_node_id = str(node.get("id") or "").strip()
+                data = node.get("data") if isinstance(node.get("data"), dict) else {}
+                cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
+                steps = cfg.get("data_ops_pipeline_nodes") if isinstance(cfg.get("data_ops_pipeline_nodes"), list) else []
+                for step in steps:
+                    if not isinstance(step, dict) or _data_ops_step_kind_for_scheduler(step) != "router":
+                        continue
+                    config_rows = step.get("routerConfigs") or step.get("router_configs") or []
+                    if not isinstance(config_rows, list):
+                        config_rows = []
+                    for config in config_rows:
+                        if not isinstance(config, dict):
+                            continue
+                        record = _router_schedule_record_from_config(pipeline_id, data_ops_node_id, step, config)
+                        if record:
+                            records[str(record["job_id"])] = record
+    except Exception as exc:
+        logger.warning(f"Failed collecting Data Ops router schedules from DB: {exc}")
+    finally:
+        db.close()
+    return records
+
+
+def _sync_data_ops_registered_schedule_jobs() -> None:
+    if not scheduler.running:
+        return
+    desired: Dict[str, Dict[str, Any]] = {}
+    registry = _load_data_ops_schedule_registry()
+    for job_id, record in registry.items():
+        if not isinstance(record, dict) or not _data_ops_schedule_record_enabled(record):
+            continue
+        if str(record.get("kind") or "").strip().lower() == "router" and not _data_ops_router_schedule_is_active(
+            str(record.get("pipeline_id") or "").strip(),
+            job_id,
+        ):
+            continue
+        desired[job_id] = {**record, "job_id": job_id}
+    desired.update(_collect_data_ops_router_schedule_records_from_db())
+
+    for job in list(scheduler.get_jobs()):
+        if not (job.id.startswith(DATA_OPS_SYNC_JOB_PREFIX) or job.id.startswith(DATA_OPS_ROUTER_JOB_PREFIX)):
+            continue
+        if job.id not in desired:
+            scheduler.remove_job(job.id)
+            _data_ops_schedule_job_fingerprints.pop(job.id, None)
+            logger.info(f"Removed stale Data Ops schedule {job.id}")
+
+    for job_id, record in desired.items():
+        try:
+            _ensure_data_ops_schedule_record_job({**record, "job_id": job_id}, force=False)
+        except Exception as exc:
+            logger.warning(f"Failed syncing Data Ops schedule {job_id}: {exc}")
+
+
+def _sync_data_ops_schedule_registry_job() -> None:
+    if not scheduler.running:
+        return
+    existing = scheduler.get_job(DATA_OPS_SCHEDULE_REGISTRY_SYNC_JOB_ID)
+    if existing is None:
+        scheduler.add_job(
+            _sync_data_ops_registered_schedule_jobs,
+            trigger=IntervalTrigger(seconds=10),
+            id=DATA_OPS_SCHEDULE_REGISTRY_SYNC_JOB_ID,
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+    _sync_data_ops_registered_schedule_jobs()
+
+
+def _data_ops_enabled_router_route_rows(router_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_rows = (
+        router_config.get("routeRows")
+        or router_config.get("route_rows")
+        or router_config.get("routes")
+        or []
+    )
+    if not isinstance(raw_rows, list):
+        return []
+    return [
+        item for item in raw_rows
+        if isinstance(item, dict) and item.get("enabled", True) is not False
+    ]
+
+
+def _build_data_ops_router_schedule_pipeline_override(
+    pipeline: models.Pipeline,
+    data_ops_node_id: str,
+    router_step_id: str,
+    router_config_id: str,
+) -> Optional[Dict[str, Any]]:
+    raw_nodes = pipeline.nodes if isinstance(pipeline.nodes, list) else []
+    if not raw_nodes:
+        return None
+    raw_edges = pipeline.edges if isinstance(pipeline.edges, list) else []
+    node_map: Dict[str, Dict[str, Any]] = {
+        str(node.get("id") or ""): copy.deepcopy(node)
+        for node in raw_nodes
+        if isinstance(node, dict) and str(node.get("id") or "")
+    }
+
+    def _node_type(node: Dict[str, Any]) -> str:
+        data = node.get("data") if isinstance(node.get("data"), dict) else {}
+        return str(data.get("nodeType") or data.get("type") or node.get("type") or "").strip()
+
+    candidate_nodes: List[Dict[str, Any]] = []
+    if data_ops_node_id and data_ops_node_id in node_map:
+        candidate_nodes = [node_map[data_ops_node_id]]
+    else:
+        candidate_nodes = [
+            node for node in node_map.values()
+            if _node_type(node) == "data_ops"
+        ]
+
+    selected_node: Optional[Dict[str, Any]] = None
+    selected_step: Optional[Dict[str, Any]] = None
+    selected_config: Optional[Dict[str, Any]] = None
+    selected_steps: List[Dict[str, Any]] = []
+
+    for node in candidate_nodes:
+        data = node.get("data") if isinstance(node.get("data"), dict) else {}
+        cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
+        steps = cfg.get("data_ops_pipeline_nodes") if isinstance(cfg.get("data_ops_pipeline_nodes"), list) else []
+        if not steps:
+            continue
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            if _data_ops_step_kind_for_scheduler(step) != "router":
+                continue
+            step_id = str(step.get("id") or "").strip()
+            if router_step_id and step_id != router_step_id:
+                continue
+            configs = [
+                item for item in (step.get("routerConfigs") or step.get("router_configs") or [])
+                if isinstance(item, dict)
+            ] if isinstance(step.get("routerConfigs") or step.get("router_configs") or [], list) else []
+            matching_config = None
+            if router_config_id:
+                matching_config = next(
+                    (
+                        item for item in configs
+                        if str(item.get("id") or "").strip() == router_config_id
+                    ),
+                    None,
+                )
+                if configs and matching_config is None:
+                    continue
+            elif configs:
+                active_config_id = str(step.get("activeRouterConfigId") or step.get("active_router_config_id") or "").strip()
+                matching_config = next(
+                    (item for item in configs if str(item.get("id") or "").strip() == active_config_id),
+                    None,
+                ) or configs[0]
+            selected_node = node
+            selected_step = step
+            selected_config = matching_config
+            selected_steps = steps
+            break
+        if selected_node is not None:
+            break
+
+    if selected_node is None or selected_step is None:
+        return None
+
+    resolved_node_id = str(selected_node.get("id") or data_ops_node_id or "").strip()
+    resolved_step_id = str(selected_step.get("id") or router_step_id or "").strip()
+    route_source = str(
+        (selected_config or {}).get("routeSource")
+        or (selected_config or {}).get("route_source")
+        or selected_step.get("routeSource")
+        or selected_step.get("route_source")
+        or ""
+    ).strip()
+    route_source_step_ids: set[str] = set()
+    if route_source.startswith("step:"):
+        route_source_step_ids.add(route_source[len("step:"):].strip())
+    elif route_source.startswith("query:"):
+        parts = route_source.split(":")
+        if len(parts) >= 2 and parts[1].strip():
+            route_source_step_ids.add(parts[1].strip())
+
+    scoped_steps: List[Dict[str, Any]] = []
+    router_inserted = False
+    for step in selected_steps:
+        if not isinstance(step, dict):
+            continue
+        step_id = str(step.get("id") or "").strip()
+        step_kind = _data_ops_step_kind_for_scheduler(step)
+        keep_step = False
+        if step_id == resolved_step_id:
+            keep_step = True
+        elif step_kind == "source":
+            keep_step = True
+        elif step_kind == "prepare" and (not route_source_step_ids or step_id in route_source_step_ids):
+            keep_step = True
+        if not keep_step:
+            continue
+        scoped_step = copy.deepcopy(step)
+        if step_id == resolved_step_id:
+            scoped_step["enabled"] = True
+            router_configs = [
+                item for item in (scoped_step.get("routerConfigs") or scoped_step.get("router_configs") or [])
+                if isinstance(item, dict)
+            ] if isinstance(scoped_step.get("routerConfigs") or scoped_step.get("router_configs") or [], list) else []
+            if selected_config is not None:
+                scoped_config = copy.deepcopy(selected_config)
+                scoped_config["enabled"] = True
+                scoped_step["routerConfigs"] = [scoped_config]
+                scoped_step["activeRouterConfigId"] = str(scoped_config.get("id") or router_config_id or "")
+            elif router_config_id and router_configs:
+                scoped_step["routerConfigs"] = [
+                    item for item in router_configs
+                    if str(item.get("id") or "").strip() == router_config_id
+                ]
+                scoped_step["activeRouterConfigId"] = router_config_id
+            router_inserted = True
+        scoped_steps.append(scoped_step)
+
+    if not router_inserted:
+        scoped_router_step = copy.deepcopy(selected_step)
+        scoped_router_step["enabled"] = True
+        if selected_config is not None:
+            scoped_config = copy.deepcopy(selected_config)
+            scoped_config["enabled"] = True
+            scoped_router_step["routerConfigs"] = [scoped_config]
+            scoped_router_step["activeRouterConfigId"] = str(scoped_config.get("id") or router_config_id or "")
+        scoped_steps.append(scoped_router_step)
+
+    selected_route_sources: List[Dict[str, Any]] = []
+    if selected_config is not None:
+        selected_route_sources.append(selected_config)
+    else:
+        selected_route_sources.append(selected_step)
+    target_node_ids: set[str] = set()
+    for route_source_cfg in selected_route_sources:
+        for route in _data_ops_enabled_router_route_rows(route_source_cfg):
+            target_type = str(route.get("targetType") or route.get("target_type") or "").strip()
+            if target_type != "main_pipeline_node":
+                continue
+            target_id = str(route.get("targetNodeId") or route.get("target_node_id") or "").strip()
+            if target_id and target_id in node_map and target_id != resolved_node_id:
+                target_node_ids.add(target_id)
+
+    scoped_node = copy.deepcopy(selected_node)
+    scoped_data = scoped_node.setdefault("data", {})
+    if not isinstance(scoped_data, dict):
+        scoped_data = {}
+        scoped_node["data"] = scoped_data
+    scoped_cfg = scoped_data.setdefault("config", {})
+    if not isinstance(scoped_cfg, dict):
+        scoped_cfg = {}
+        scoped_data["config"] = scoped_cfg
+    scoped_cfg["data_ops_pipeline_nodes"] = scoped_steps
+    scoped_cfg["_data_ops_router_schedule_scope"] = {
+        "data_ops_node_id": resolved_node_id,
+        "router_step_id": resolved_step_id,
+        "router_config_id": router_config_id,
+        "job_scope": "router_config",
+    }
+
+    override_nodes = [scoped_node]
+    for node in raw_nodes:
+        if not isinstance(node, dict):
+            continue
+        node_id = str(node.get("id") or "").strip()
+        if node_id in target_node_ids:
+            override_nodes.append(copy.deepcopy(node))
+
+    override_edges: List[Dict[str, Any]] = []
+    for target_id in target_node_ids:
+        existing = next(
+            (
+                edge for edge in raw_edges
+                if isinstance(edge, dict)
+                and str(edge.get("source") or "").strip() == resolved_node_id
+                and str(edge.get("target") or "").strip() == target_id
+                and (
+                    str((edge.get("data") or {}).get("routerConfigId") or "") == router_config_id
+                    if isinstance(edge.get("data"), dict) and router_config_id
+                    else True
+                )
+            ),
+            None,
+        )
+        if isinstance(existing, dict):
+            scoped_edge = copy.deepcopy(existing)
+            scoped_edge.setdefault("data", {})
+            if isinstance(scoped_edge.get("data"), dict):
+                scoped_edge["data"]["dataOpsRouterManaged"] = True
+            scoped_edge["id"] = str(scoped_edge.get("id") or f"data_ops_router_{resolved_node_id}_{router_config_id or resolved_step_id}_{target_id}")
+        else:
+            scoped_edge = {
+                "id": f"data_ops_router_{resolved_node_id}_{router_config_id or resolved_step_id}_{target_id}",
+                "source": resolved_node_id,
+                "target": target_id,
+                "sourceHandle": "output",
+                "targetHandle": "input",
+                "data": {
+                    "dataOpsRouterManaged": True,
+                    "routerConfigId": router_config_id,
+                    "routerStepId": resolved_step_id,
+                },
+            }
+        override_edges.append(scoped_edge)
+
+    return {"nodes": override_nodes, "edges": override_edges}
+
+
+async def _run_scheduled_data_ops_router(
+    job_id: str,
+    pipeline_id: str,
+    data_ops_node_id: str = "",
+    router_step_id: str = "",
+    router_config_id: str = "",
+):
+    started_at = datetime.utcnow()
+    _record_data_ops_schedule_activity(
+        job_id,
+        "running",
+        "Router schedule started",
+        kind="router",
+        pipeline_id=pipeline_id,
+        data_ops_node_id=data_ops_node_id,
+        step_id=router_step_id,
+        config_id=router_config_id,
+        last_run_started_at=started_at.isoformat() + "Z",
+    )
+    if not _data_ops_router_schedule_is_active(pipeline_id, job_id):
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
+        _record_data_ops_schedule_activity(
+            job_id,
+            "skipped",
+            "Router schedule is inactive",
+            kind="router",
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_id=router_step_id,
+            config_id=router_config_id,
+            duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
+            last_run_started_at=started_at.isoformat() + "Z",
+            last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+        )
+        logger.info(f"Removed inactive scheduled Data Ops router {job_id}")
+        return
+    _persist_data_ops_schedule_next_run_at(
+        pipeline_id=pipeline_id,
+        data_ops_node_id=data_ops_node_id,
+        step_kind="router",
+        step_id=router_step_id,
+        config_id=router_config_id,
+        config_collection_key="routerConfigs",
+        active_config_key="activeRouterConfigId",
+        job_id=job_id,
+    )
+    db = SessionLocal()
+    try:
+        pipeline = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
+        if not pipeline:
+            _record_data_ops_schedule_activity(
+                job_id,
+                "skipped",
+                "Pipeline not found",
+                kind="router",
+                pipeline_id=pipeline_id,
+                data_ops_node_id=data_ops_node_id,
+                step_id=router_step_id,
+                config_id=router_config_id,
+                duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
+                last_run_started_at=started_at.isoformat() + "Z",
+                last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+            )
+            logger.info(f"Skipping scheduled Data Ops router {job_id}: pipeline not found")
+            return
+        pipeline_override = _build_data_ops_router_schedule_pipeline_override(
+            pipeline,
+            data_ops_node_id=data_ops_node_id,
+            router_step_id=router_step_id,
+            router_config_id=router_config_id,
+        )
+    finally:
+        db.close()
+    if not pipeline_override:
+        _record_data_ops_schedule_activity(
+            job_id,
+            "skipped",
+            "Scoped router config was not found",
+            kind="router",
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_id=router_step_id,
+            config_id=router_config_id,
+            duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
+            last_run_started_at=started_at.isoformat() + "Z",
+            last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+        )
+        logger.warning(
+            f"Skipping scheduled Data Ops router {job_id}: scoped router config was not found"
+        )
+        return
+    try:
+        execution_id = _start_pipeline_execution(
+            pipeline_id=pipeline_id,
+            triggered_by="data_ops_router_schedule",
+            skip_if_running=True,
+            pipeline_override=pipeline_override,
+        )
+    except Exception as exc:
+        _record_data_ops_schedule_activity(
+            job_id,
+            "skipped",
+            f"Router schedule skipped: {exc}",
+            kind="router",
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_id=router_step_id,
+            config_id=router_config_id,
+            duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
+            last_run_started_at=started_at.isoformat() + "Z",
+            last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+        )
+        logger.info(f"Skipping scheduled Data Ops router {job_id}: {exc}")
+        return
+    if execution_id:
+        _record_data_ops_schedule_activity(
+            job_id,
+            "success",
+            f"Router started execution {execution_id}",
+            kind="router",
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_id=router_step_id,
+            config_id=router_config_id,
+            execution_id=execution_id,
+            duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
+            last_run_started_at=started_at.isoformat() + "Z",
+            last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+        )
+        logger.info(f"Scheduled Data Ops router {job_id} started scoped pipeline execution {execution_id}")
+    else:
+        _record_data_ops_schedule_activity(
+            job_id,
+            "skipped",
+            "Pipeline execution was already running",
+            kind="router",
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_id=router_step_id,
+            config_id=router_config_id,
+            duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
+            last_run_started_at=started_at.isoformat() + "Z",
+            last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+        )
+    _persist_data_ops_schedule_next_run_at(
+        pipeline_id=pipeline_id,
+        data_ops_node_id=data_ops_node_id,
+        step_kind="router",
+        step_id=router_step_id,
+        config_id=router_config_id,
+        config_collection_key="routerConfigs",
+        active_config_key="activeRouterConfigId",
+        job_id=job_id,
+    )
+
+
+def _remove_data_ops_router_jobs(raw_job_id: str, remove_pipeline_jobs: bool = False) -> int:
+    job_id = f"{DATA_OPS_ROUTER_JOB_PREFIX}{raw_job_id}"
+    prefixes = [job_id]
+    if remove_pipeline_jobs and ":" in raw_job_id:
+        pipeline_id = raw_job_id.split(":", 1)[0]
+        if pipeline_id:
+            prefixes.append(f"{DATA_OPS_ROUTER_JOB_PREFIX}{pipeline_id}:")
+    removed = 0
+    seen: set[str] = set()
+    for job in list(scheduler.get_jobs()):
+        if job.id in seen:
+            continue
+        if any(job.id == prefix or job.id.startswith(prefix) for prefix in prefixes):
+            scheduler.remove_job(job.id)
+            seen.add(job.id)
+            removed += 1
+    return removed
+
+
+@app.post("/api/data-ops/router/schedule")
+async def data_ops_router_schedule(body: DataOpsRouterScheduleRequest):
+    pipeline_id = str(body.pipeline_id or "").strip()
+    if not pipeline_id:
+        raise HTTPException(400, "pipeline_id is required.")
+    db = SessionLocal()
+    try:
+        pipeline = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
+        if not pipeline:
+            raise HTTPException(404, "Pipeline not found.")
+    finally:
+        db.close()
+
+    raw_job_id = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(body.job_id or "").strip())
+    if not raw_job_id:
+        raise HTTPException(400, "job_id is required.")
+    job_id = f"{DATA_OPS_ROUTER_JOB_PREFIX}{raw_job_id}"
+    scope = _data_ops_router_schedule_scope_from_job(raw_job_id, body)
+    if not body.enabled or not body.deploy_enabled:
+        removed = _remove_data_ops_router_jobs(raw_job_id, remove_pipeline_jobs=raw_job_id.count(":") < 2)
+        registry_prefixes = [job_id]
+        if raw_job_id.count(":") < 2 and ":" in raw_job_id:
+            registry_prefixes.append(f"{DATA_OPS_ROUTER_JOB_PREFIX}{raw_job_id.split(':', 1)[0]}:")
+        registry_removed = _remove_data_ops_schedule_registry_records(registry_prefixes)
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "enabled": False,
+            "next_run_at": None,
+            "removed_jobs": removed + registry_removed,
+            "message": f"Data Ops router scheduler disabled. Removed {removed + registry_removed} backend job(s).",
+        }
+
+    schedule_type = str(body.schedule_type or "interval").strip().lower()
+    if schedule_type in {"manual", "event"}:
+        removed = _remove_data_ops_router_jobs(raw_job_id, remove_pipeline_jobs=False)
+        registry_removed = _remove_data_ops_schedule_registry_records([job_id])
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "enabled": False,
+            "next_run_at": None,
+            "removed_jobs": removed + registry_removed,
+            "message": f"Schedule type '{schedule_type}' does not create a time-based backend job.",
+        }
+
+    _remove_data_ops_router_jobs(raw_job_id, remove_pipeline_jobs=False)
+    timezone_name = str(body.timezone or "Asia/Kolkata").strip() or "Asia/Kolkata"
+    try:
+        if schedule_type == "cron":
+            cron = _ensure_valid_cron_expr(body.cron or "")
+            trigger = CronTrigger.from_crontab(cron, timezone=timezone_name)
+            schedule_text = cron
+        else:
+            interval_minutes = max(1, int(body.interval_minutes or 60))
+            trigger = IntervalTrigger(minutes=interval_minutes, timezone=timezone_name)
+            schedule_text = f"every {interval_minutes} minute(s)"
+        schedule_record = {
+            "kind": "router",
+            "job_id": job_id,
+            "pipeline_id": pipeline_id,
+            "data_ops_node_id": scope.get("data_ops_node_id") or "",
+            "router_step_id": scope.get("router_step_id") or "",
+            "router_config_id": scope.get("router_config_id") or "",
+            "enabled": True,
+            "deploy_enabled": True,
+            "schedule_type": schedule_type,
+            "interval_minutes": int(body.interval_minutes or 60),
+            "cron": body.cron or "0 * * * *",
+            "timezone": timezone_name,
+            "max_instances": max(1, int(body.max_instances or 1)),
+            "misfire_policy": str(body.misfire_policy or "skip"),
+        }
+        _upsert_data_ops_schedule_registry_record(schedule_record)
+        next_run_at = _ensure_data_ops_schedule_record_job(schedule_record, force=True)
+    except Exception as exc:
+        raise HTTPException(400, f"Failed to schedule Data Ops router: {exc}")
+    _persist_data_ops_schedule_next_run_at(
+        pipeline_id=pipeline_id,
+        data_ops_node_id=scope.get("data_ops_node_id") or "",
+        step_kind="router",
+        step_id=scope.get("router_step_id") or "",
+        config_id=scope.get("router_config_id") or "",
+        config_collection_key="routerConfigs",
+        active_config_key="activeRouterConfigId",
+        job_id=job_id,
+        next_run_at=next_run_at,
+    )
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "enabled": True,
+        "schedule": schedule_text,
+        "next_run_at": next_run_at,
+        "message": "Data Ops router scheduler registered.",
     }
 
 

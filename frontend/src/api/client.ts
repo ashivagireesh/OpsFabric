@@ -551,6 +551,32 @@ const api = {
     }
   },
 
+  scheduleDataOpsRouter: async (payload: Record<string, unknown>) => {
+    try {
+      const r = await http.post('/api/data-ops/router/schedule', payload)
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to schedule Data Ops router')
+      throw new Error(message)
+    }
+  },
+
+  getRuntimeMonitor: async () => {
+    try {
+      const r = await http.get('/api/runtime/monitor')
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to load runtime monitor')
+      throw new Error(message)
+    }
+  },
+
   testDataOpsConnection: async (connection: Record<string, unknown>) => {
     try {
       const r = await http.post('/api/data-ops/connection/test', { connection }, { timeout: 45000 })

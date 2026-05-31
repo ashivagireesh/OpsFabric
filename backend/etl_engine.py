@@ -6374,6 +6374,8 @@ END;"""
             pass_results: Dict[str, Any] = {}
             pass_results_by_handle: Dict[str, Dict[str, Any]] = {}
             pass_row_fanout: Dict[str, bool] = {}
+            dynamic_route_inputs_by_node: Dict[str, List[Any]] = {}
+            managed_data_ops_route_pairs: set[tuple[str, str]] = set()
             pass_rows = 0
 
             def _sample_rows_for_log(rows: Any, limit: int = 5) -> List[Dict[str, Any]]:
@@ -6415,11 +6417,37 @@ END;"""
                 incoming_order: List[str] = []
                 seen_incoming_bindings: set[tuple[str, str]] = set()
                 incoming_handles_by_source: Dict[str, set[str]] = {}
+
+                def _is_managed_query_result_router_edge(edge: Dict[str, Any]) -> bool:
+                    edge_data = edge.get("data") if isinstance(edge, dict) else {}
+                    edge_id = str(edge.get("id") or "").strip()
+                    if edge_id.startswith("data_ops_router_"):
+                        return True
+                    if not isinstance(edge_data, dict):
+                        return False
+                    return bool(
+                        edge_data.get("dataOpsRouterManaged")
+                        or edge_data.get("data_ops_router_managed")
+                    )
+
+                if not managed_data_ops_route_pairs:
+                    for route_edge in edges:
+                        if not _is_managed_query_result_router_edge(route_edge):
+                            continue
+                        route_source = str(route_edge.get("source") or "").strip()
+                        route_target = str(route_edge.get("target") or "").strip()
+                        if route_source and route_target:
+                            managed_data_ops_route_pairs.add((route_source, route_target))
+
                 for edge in edges:
+                    if _is_managed_query_result_router_edge(edge):
+                        continue
                     if edge["target"] != nid or edge["source"] not in pass_results:
                         continue
                     src = str(edge["source"] or "").strip()
                     if not src:
+                        continue
+                    if (src, str(nid)) in managed_data_ops_route_pairs:
                         continue
                     handle = str(edge.get("sourceHandle") or "output").strip() or "output"
                     handle_set = incoming_handles_by_source.get(src)
@@ -6428,8 +6456,12 @@ END;"""
                         incoming_handles_by_source[src] = handle_set
                     handle_set.add(handle)
                 for edge in edges:
+                    if _is_managed_query_result_router_edge(edge):
+                        continue
                     if edge["target"] == nid and edge["source"] in pass_results:
                         source_id = edge["source"]
+                        if (str(source_id), str(nid)) in managed_data_ops_route_pairs:
+                            continue
                         source_handle = str(edge.get("sourceHandle") or "output").strip() or "output"
                         source_node = nodes.get(source_id) if isinstance(nodes, dict) else None
                         source_node_type = str(
@@ -6475,6 +6507,12 @@ END;"""
                         if source_id not in incoming_order:
                             incoming_order.append(source_id)
                         upstream_data.extend(source_rows)
+                routed_rows = dynamic_route_inputs_by_node.get(nid) or []
+                if routed_rows:
+                    incoming_by_source["__query_result_router__"] = list(routed_rows)
+                    if "__query_result_router__" not in incoming_order:
+                        incoming_order.append("__query_result_router__")
+                    upstream_data.extend(routed_rows)
                 if node_type == "condition_node" and isinstance(config, dict):
                     preferred_source_ids_raw = config.get("condition_source_node_ids")
                     preferred_source_ids: List[str] = []
@@ -7176,6 +7214,41 @@ END;"""
                             "output": output if isinstance(output, list) else [],
                             "output_false": [],
                         }
+                    if node_type == "data_ops" and isinstance(output, list):
+                        route_target_by_handle: Dict[str, str] = {}
+                        for item in output:
+                            if not isinstance(item, dict):
+                                continue
+                            route_meta = item.get("_data_ops_route")
+                            if not isinstance(route_meta, dict):
+                                continue
+                            for route_row in route_meta.get("routes") or []:
+                                if not isinstance(route_row, dict):
+                                    continue
+                                if str(route_row.get("target_type") or "") != "main_pipeline_node":
+                                    continue
+                                handle = str(route_row.get("handle") or "").strip()
+                                target_node_id = str(route_row.get("target_node_id") or "").strip()
+                                if handle and target_node_id:
+                                    route_target_by_handle[handle] = target_node_id
+                            if route_target_by_handle:
+                                break
+                        if route_target_by_handle:
+                            dynamic_counts: Dict[str, int] = {}
+                            for item in output:
+                                if not isinstance(item, dict):
+                                    continue
+                                raw_handles = item.get("_data_ops_route_handles")
+                                handles = raw_handles if isinstance(raw_handles, list) else []
+                                for handle_value in handles:
+                                    handle = str(handle_value or "").strip()
+                                    target_node_id = route_target_by_handle.get(handle)
+                                    if not target_node_id:
+                                        continue
+                                    dynamic_route_inputs_by_node.setdefault(target_node_id, []).append(item)
+                                    dynamic_counts[target_node_id] = dynamic_counts.get(target_node_id, 0) + 1
+                            if dynamic_counts:
+                                log_entry["query_result_router_targets"] = dict(dynamic_counts)
                     pass_results[nid] = output
                     pass_row_fanout[nid] = bool(
                         cursor_explicit_row_fanout
@@ -10226,6 +10299,8 @@ END;"""
                 return raw
             if re.search(r"source|read|api|rest|soap|graphql|csv|excel", name):
                 return "source"
+            if re.search(r"query\s*result\s*router|router|routing", name):
+                return "router"
             if re.search(r"valid|quality|filter|reject", name):
                 return "validate"
             if re.search(r"map|mapper|lookup|join", name):
@@ -10257,6 +10332,439 @@ END;"""
                 "operator": op_map.get(match.group(2), "equals"),
                 "value": match.group(3),
             }
+
+        def _query_field_output_names(field_row: Dict[str, Any]) -> List[str]:
+            raw_field = str(field_row.get("field") or "").strip()
+            alias = str(field_row.get("alias") or "").strip()
+            names: List[str] = []
+            if alias:
+                names.append(alias)
+            elif str(field_row.get("mode") or "").strip().lower() == "case":
+                names.append("case_value")
+            else:
+                aggregate = str(field_row.get("aggregate") or "").strip().lower()
+                if aggregate and raw_field:
+                    base_name = re.sub(r"\W+", "_", raw_field.split(".")[-1]).strip("_") or "value"
+                    names.append(f"{aggregate}_{base_name}")
+                elif raw_field:
+                    names.append(raw_field.split(".")[-1])
+            return [name for name in names if name]
+
+        def _positive_row_count(value: Any) -> Optional[int]:
+            if value is None or value == "":
+                return None
+            try:
+                row_count = int(float(value))
+            except Exception:
+                return None
+            return row_count if row_count > 0 else None
+
+        def _query_result_row_limit() -> int:
+            row_count_candidates: List[Any] = [
+                config.get("data_ops_preview_input_rows"),
+                config.get("executionRows"),
+                config.get("execution_rows"),
+                config.get("max_rows"),
+                config.get("maxRows"),
+            ]
+            for step in raw_steps:
+                if not isinstance(step, dict):
+                    continue
+                step_kind = _kind(step)
+                if step_kind == "prepare":
+                    row_count_candidates.extend([
+                        step.get("limitRows"),
+                        step.get("limit_rows"),
+                        step.get("maxRows"),
+                        step.get("max_rows"),
+                    ])
+                    query_configs = step.get("queryBuilders") or step.get("query_builders") or []
+                    if isinstance(query_configs, list):
+                        active_query_id = str(step.get("activeQueryBuilderId") or step.get("active_query_builder_id") or "").strip()
+                        for query_config in query_configs:
+                            if not isinstance(query_config, dict):
+                                continue
+                            if active_query_id and str(query_config.get("id") or "") != active_query_id:
+                                continue
+                            row_count_candidates.extend([
+                                query_config.get("limitRows"),
+                                query_config.get("limit_rows"),
+                                query_config.get("maxRows"),
+                                query_config.get("max_rows"),
+                            ])
+                if step_kind in {"prepare", "router", "map"}:
+                    row_count_candidates.extend([
+                        step.get("syncBatchSize"),
+                        step.get("sync_batch_size"),
+                        step.get("batchSize"),
+                        step.get("batch_size"),
+                    ])
+            for candidate in row_count_candidates:
+                row_count = _positive_row_count(candidate)
+                if row_count is not None:
+                    return max(1, min(row_count, 50000))
+            return 1000
+
+        def _query_result_total_limit() -> int:
+            # This is the hard SQL cap for saved Data Ops query execution.
+            # Preview/execution counters are display state, and sync batch size is
+            # only a fetch chunk size; neither should limit the full result set.
+            row_count_candidates: List[Any] = []
+            for step in raw_steps:
+                if not isinstance(step, dict):
+                    continue
+                step_kind = _kind(step)
+                if step_kind != "prepare":
+                    continue
+                row_count_candidates.extend([
+                    step.get("limitRows"),
+                    step.get("limit_rows"),
+                    step.get("maxRows"),
+                    step.get("max_rows"),
+                ])
+                query_configs = step.get("queryBuilders") or step.get("query_builders") or []
+                if not isinstance(query_configs, list):
+                    continue
+                active_query_id = str(step.get("activeQueryBuilderId") or step.get("active_query_builder_id") or "").strip()
+                for query_config in query_configs:
+                    if not isinstance(query_config, dict):
+                        continue
+                    if active_query_id and str(query_config.get("id") or "") != active_query_id:
+                        continue
+                    row_count_candidates.extend([
+                        query_config.get("limitRows"),
+                        query_config.get("limit_rows"),
+                        query_config.get("maxRows"),
+                        query_config.get("max_rows"),
+                    ])
+            for candidate in row_count_candidates:
+                row_count = _positive_row_count(candidate)
+                if row_count is not None:
+                    return max(1, min(row_count, 50000))
+            return 50000
+
+        def _data_ops_saved_oracle_config(route_source_override: str = "") -> Dict[str, Any]:
+            connections: List[Dict[str, Any]] = []
+            for step in raw_steps:
+                if not isinstance(step, dict):
+                    continue
+                raw_connections = step.get("connections")
+                if not isinstance(raw_connections, list):
+                    continue
+                for connection in raw_connections:
+                    if not isinstance(connection, dict):
+                        continue
+                    connection_type = str(connection.get("type") or connection.get("connectionType") or "").strip().lower()
+                    if connection_type and connection_type != "oracle":
+                        continue
+                    connections.append(connection)
+            if not connections:
+                return {}
+
+            steps_by_id = {
+                str(step.get("id") or ""): step
+                for step in raw_steps
+                if isinstance(step, dict) and str(step.get("id") or "")
+            }
+            preferred_connections: List[str] = []
+
+            def _collect_query_connection_names(step: Optional[Dict[str, Any]], query_id: str = "") -> None:
+                if not isinstance(step, dict):
+                    return
+                query_rows = step.get("queryBuilders") or step.get("query_builders") or []
+                if isinstance(query_rows, list):
+                    selected_id = query_id or str(step.get("activeQueryBuilderId") or step.get("active_query_builder_id") or "").strip()
+                    candidates = [
+                        item for item in query_rows
+                        if isinstance(item, dict) and (not selected_id or str(item.get("id") or "") == selected_id)
+                    ]
+                    if not candidates and query_rows:
+                        candidates = [item for item in query_rows if isinstance(item, dict)]
+                    for query_config in candidates:
+                        for table_row in query_config.get("tables") or []:
+                            if not isinstance(table_row, dict):
+                                continue
+                            name = str(table_row.get("connection") or table_row.get("connectionId") or table_row.get("connection_id") or "").strip()
+                            if name:
+                                preferred_connections.append(name)
+                    if candidates:
+                        return
+                for table_row in step.get("tables") or []:
+                    if not isinstance(table_row, dict):
+                        continue
+                    name = str(table_row.get("connection") or table_row.get("connectionId") or table_row.get("connection_id") or "").strip()
+                    if name:
+                        preferred_connections.append(name)
+
+            route_source = str(route_source_override or "").strip()
+            for step in raw_steps:
+                if route_source:
+                    break
+                if isinstance(step, dict) and _kind(step) == "router":
+                    route_source = str(step.get("routeSource") or step.get("route_source") or "").strip()
+                    if route_source:
+                        break
+            if route_source.startswith("query:"):
+                parts = route_source.split(":")
+                if len(parts) >= 3:
+                    _collect_query_connection_names(steps_by_id.get(parts[1]), parts[2])
+            elif route_source.startswith("step:"):
+                _collect_query_connection_names(steps_by_id.get(route_source[len("step:"):]))
+
+            if not preferred_connections:
+                for step in raw_steps:
+                    if isinstance(step, dict) and _kind(step) == "prepare":
+                        _collect_query_connection_names(step)
+
+            def _connection_names(connection: Dict[str, Any]) -> set[str]:
+                return {
+                    str(value or "").strip()
+                    for value in (
+                        connection.get("id"),
+                        connection.get("name"),
+                        connection.get("label"),
+                        connection.get("connection"),
+                    )
+                    if str(value or "").strip()
+                }
+
+            selected_connection: Dict[str, Any] = connections[0]
+            for preferred in preferred_connections:
+                for connection in connections:
+                    if preferred in _connection_names(connection):
+                        selected_connection = connection
+                        break
+                else:
+                    continue
+                break
+
+            return {
+                "host": selected_connection.get("oracle_host") or selected_connection.get("host"),
+                "port": selected_connection.get("oracle_port") or selected_connection.get("port"),
+                "service_name": (
+                    selected_connection.get("oracle_service_name")
+                    or selected_connection.get("service_name")
+                    or selected_connection.get("service")
+                ),
+                "sid": selected_connection.get("oracle_sid") or selected_connection.get("sid"),
+                "dsn": selected_connection.get("oracle_dsn") or selected_connection.get("dsn"),
+                "user": selected_connection.get("oracle_user") or selected_connection.get("user") or selected_connection.get("username"),
+                "password": selected_connection.get("oracle_password") or selected_connection.get("password"),
+            }
+
+        def _data_ops_query_sql_from_config(route_source_override: str = "") -> str:
+            steps_by_id = {
+                str(step.get("id") or ""): step
+                for step in raw_steps
+                if isinstance(step, dict) and str(step.get("id") or "")
+            }
+
+            def _step_query(step: Optional[Dict[str, Any]], query_id: str = "") -> str:
+                if not isinstance(step, dict):
+                    return ""
+                query_rows = step.get("queryBuilders") or step.get("query_builders") or []
+                if isinstance(query_rows, list):
+                    selected_id = query_id or str(step.get("activeQueryBuilderId") or step.get("active_query_builder_id") or "").strip()
+                    candidates = [
+                        item for item in query_rows
+                        if isinstance(item, dict) and (not selected_id or str(item.get("id") or "") == selected_id)
+                    ]
+                    if not candidates and query_rows:
+                        candidates = [item for item in query_rows if isinstance(item, dict)]
+                    for item in candidates:
+                        sql = str(item.get("query") or item.get("expression") or "").strip()
+                        if sql:
+                            return sql
+                return str(step.get("query") or step.get("expression") or "").strip()
+
+            route_source = str(route_source_override or "").strip()
+            for step in raw_steps:
+                if route_source:
+                    break
+                if isinstance(step, dict) and _kind(step) == "router":
+                    route_source = str(step.get("routeSource") or step.get("route_source") or "").strip()
+                    if route_source:
+                        break
+            if route_source.startswith("query:"):
+                parts = route_source.split(":")
+                if len(parts) >= 3:
+                    return _step_query(steps_by_id.get(parts[1]), parts[2])
+            if route_source.startswith("step:"):
+                return _step_query(steps_by_id.get(route_source[len("step:"):]))
+
+            for step in raw_steps:
+                if isinstance(step, dict) and _kind(step) == "prepare":
+                    sql = _step_query(step)
+                    if sql:
+                        return sql
+            return ""
+
+        def _oracle_query_value(value: Any) -> Any:
+            if hasattr(value, "read"):
+                try:
+                    value = value.read()
+                except Exception:
+                    value = str(value)
+            if isinstance(value, (datetime, date, time)):
+                return value.isoformat()
+            if isinstance(value, bytes):
+                try:
+                    return value.decode("utf-8")
+                except Exception:
+                    return base64.b64encode(value).decode("ascii")
+            return value
+
+        def _try_fetch_data_ops_query_rows(route_source_override: str = "") -> Tuple[List[Dict[str, Any]], bool]:
+            sql = _data_ops_query_sql_from_config(route_source_override).strip().rstrip(";").strip()
+            if not sql:
+                return [], False
+            first_word = re.match(r"^\s*([A-Za-z]+)", sql)
+            if not first_word or first_word.group(1).upper() not in {"SELECT", "WITH"}:
+                return [], False
+            if ";" in sql:
+                return [], False
+            try:
+                import oracledb  # type: ignore
+
+                saved_oracle_cfg = _data_ops_saved_oracle_config(route_source_override)
+                oracle_cfg = {
+                    "host": config.get("oracle_host") or config.get("host") or saved_oracle_cfg.get("host") or os.getenv("BLW_ORACLE_HOST") or "localhost",
+                    "port": config.get("oracle_port") or config.get("port") or saved_oracle_cfg.get("port") or os.getenv("BLW_ORACLE_PORT") or 1521,
+                    "service_name": config.get("oracle_service_name") or config.get("service_name") or saved_oracle_cfg.get("service_name") or os.getenv("BLW_ORACLE_SERVICE_NAME") or os.getenv("BLW_ORACLE_DATABASE"),
+                    "sid": config.get("oracle_sid") or config.get("sid") or saved_oracle_cfg.get("sid") or os.getenv("BLW_ORACLE_SID"),
+                    "dsn": config.get("oracle_dsn") or config.get("dsn") or saved_oracle_cfg.get("dsn") or os.getenv("BLW_ORACLE_DSN"),
+                    "user": config.get("oracle_user") or config.get("user") or saved_oracle_cfg.get("user") or os.getenv("BLW_ORACLE_USER") or "",
+                    "password": config.get("oracle_password") or config.get("password") or saved_oracle_cfg.get("password") or os.getenv("BLW_ORACLE_PASSWORD") or "",
+                }
+                dsn = str(oracle_cfg.get("dsn") or "").strip() or self._build_oracle_dsn(oracle_cfg)
+                conn = oracledb.connect(
+                    user=str(oracle_cfg.get("user") or "").strip(),
+                    password=str(oracle_cfg.get("password") or ""),
+                    dsn=dsn,
+                )
+                try:
+                    cursor = conn.cursor()
+                    try:
+                        batch_size = _query_result_row_limit()
+                        total_limit = _query_result_total_limit()
+                        cursor.arraysize = max(1, min(batch_size, 5000))
+                        cursor.execute(
+                            f"SELECT * FROM ({sql}) WHERE ROWNUM <= :limit",
+                            {"limit": total_limit},
+                        )
+                        columns = [str(desc[0] or "") for desc in (cursor.description or [])]
+                        fetched = []
+                        while len(fetched) < total_limit:
+                            chunk = cursor.fetchmany(batch_size)
+                            if not chunk:
+                                break
+                            fetched.extend(chunk)
+                        return [
+                            {columns[idx]: _oracle_query_value(value) for idx, value in enumerate(record)}
+                            for record in fetched
+                        ], True
+                    finally:
+                        cursor.close()
+                finally:
+                    conn.close()
+            except Exception as exc:
+                if isinstance(execution_context, dict):
+                    execution_context.setdefault("data_ops_warnings", []).append({
+                        "message": f"Data Ops saved query execution failed; using configured row-count fallback. {exc}",
+                    })
+                return [], False
+
+        query_result_seed_source = ""
+
+        def _seed_query_result_rows() -> List[Dict[str, Any]]:
+            nonlocal query_result_seed_source
+            """Seed Data Ops query-result rows when the node has no upstream feed.
+
+            Data Vault query-builder/router nodes are often used as the source for a
+            main pipeline branch. In that topology the Data Ops node may have zero
+            incoming rows, but the saved query configuration still represents a row
+            set. Seed lightweight placeholder rows so routing, mapping, and row-count
+            accounting can proceed instead of collapsing to zero.
+            """
+            if rows:
+                return []
+            has_query_or_router = any(
+                isinstance(step, dict) and _kind(step) in {"prepare", "router", "map"}
+                for step in raw_steps
+            )
+            if not has_query_or_router:
+                return []
+
+            fetched_rows, fetched = _try_fetch_data_ops_query_rows()
+            if fetched:
+                query_result_seed_source = "saved_query"
+                return fetched_rows
+
+            field_names: List[str] = []
+            for step in raw_steps:
+                if not isinstance(step, dict) or _kind(step) != "prepare":
+                    continue
+                query_configs = step.get("queryBuilders") or step.get("query_builders") or []
+                if isinstance(query_configs, list):
+                    active_query_id = str(step.get("activeQueryBuilderId") or step.get("active_query_builder_id") or "").strip()
+                    active_query_configs = [
+                        item for item in query_configs
+                        if isinstance(item, dict) and active_query_id and str(item.get("id") or "") == active_query_id
+                    ]
+                    if not active_query_configs and len(query_configs) == 1 and isinstance(query_configs[0], dict):
+                        active_query_configs = [query_configs[0]]
+                else:
+                    active_query_configs = []
+                if active_query_configs:
+                    for query_config in active_query_configs:
+                        for field_row in _enabled_rows(query_config.get("selectFields") or query_config.get("select_fields")):
+                            field_names.extend(_query_field_output_names(field_row))
+                    continue
+                select_rows = _enabled_rows(step.get("selectFields") or step.get("select_fields"))
+                for field_row in select_rows:
+                    field_names.extend(_query_field_output_names(field_row))
+                field_names.extend(_parse_fields(step.get("fields")))
+
+            deduped_fields: List[str] = []
+            seen_fields: set[str] = set()
+            for name in field_names:
+                field_name = str(name or "").strip()
+                if not field_name:
+                    continue
+                key = field_name.lower()
+                if key in seen_fields:
+                    continue
+                seen_fields.add(key)
+                deduped_fields.append(field_name)
+
+            row_count = _query_result_row_limit()
+
+            seeded_rows: List[Dict[str, Any]] = []
+            for _index in range(row_count):
+                seed: Dict[str, Any] = {}
+                for field_name in deduped_fields:
+                    seed[field_name] = None
+                    leaf = field_name.split(".")[-1]
+                    if leaf:
+                        seed.setdefault(leaf, None)
+                seed["_data_ops_seeded_query_result"] = True
+                seeded_rows.append(seed)
+            query_result_seed_source = "placeholder"
+            return seeded_rows
+
+        seeded_rows = _seed_query_result_rows()
+        if seeded_rows:
+            rows = seeded_rows
+            if isinstance(execution_context, dict):
+                seed_message = (
+                    "Data Ops node had no upstream rows; loaded query-result rows from saved query configuration."
+                    if query_result_seed_source == "saved_query"
+                    else "Data Ops node had no upstream rows; seeded query-result placeholder rows from saved configuration."
+                )
+                execution_context.setdefault("data_ops_warnings", []).append({
+                    "message": seed_message,
+                    "rows": len(seeded_rows),
+                })
 
         summary_steps: List[Dict[str, Any]] = []
         for idx, raw_step in enumerate(raw_steps):
@@ -10466,6 +10974,218 @@ END;"""
                         if isinstance(row, dict) else row
                         for row in rows
                     ]
+            elif step_kind == "router" or operation in {"route_query_result", "route_conditional", "route_main_pipeline"}:
+                route_bundles: Dict[str, List[Any]] = {}
+                route_summaries: List[Dict[str, Any]] = []
+                routed_output_rows: List[Any] = []
+                query_rows_by_source: Dict[str, Tuple[List[Dict[str, Any]], bool]] = {}
+
+                raw_router_configs = step.get("routerConfigs") or step.get("router_configs") or []
+                router_configs = [item for item in raw_router_configs if isinstance(item, dict)] if isinstance(raw_router_configs, list) else []
+                runtime_configs = [
+                    item for item in router_configs
+                    if self._parse_bool_like(item.get("enabled", True), True)
+                    and _enabled_rows(item.get("routeRows") or item.get("route_rows") or item.get("routes"))
+                ]
+                if not runtime_configs:
+                    runtime_configs = [step]
+
+                def _safe_handle(value: str, fallback: str) -> str:
+                    safe = re.sub(r"[^a-z0-9_]+", "_", str(value or "").strip().lower()).strip("_")
+                    return safe or fallback
+
+                def _route_target(route: Dict[str, Any]) -> Dict[str, str]:
+                    target_type = str(route.get("targetType") or route.get("target_type") or "data_ops_step").strip()
+                    return {
+                        "target_type": target_type,
+                        "target_step_id": str(route.get("targetStepId") or route.get("target_step_id") or "").strip(),
+                        "target_node_id": str(route.get("targetNodeId") or route.get("target_node_id") or "").strip(),
+                        "endpoint": str(route.get("endpoint") or route.get("url") or "").strip(),
+                    }
+
+                def _route_id(route: Dict[str, Any], route_index: int) -> str:
+                    return str(route.get("id") or route.get("name") or f"route_{route_index + 1}").strip() or f"route_{route_index + 1}"
+
+                def _route_condition_config(route: Dict[str, Any], match_mode: str) -> Dict[str, Any]:
+                    raw_criteria = route.get("criteria")
+                    criteria: List[Dict[str, Any]] = []
+                    if isinstance(raw_criteria, list):
+                        for item in raw_criteria:
+                            if not isinstance(item, dict):
+                                continue
+                            field_name = str(item.get("field") or "").strip()
+                            if not field_name:
+                                continue
+                            criteria.append({
+                                "field": field_name,
+                                "operator": str(item.get("operator") or "equals").strip(),
+                                "value": item.get("value"),
+                            })
+                    if not criteria:
+                        field_name = str(route.get("field") or "").strip()
+                        if field_name:
+                            criteria.append({
+                                "field": field_name,
+                                "operator": str(route.get("operator") or "equals").strip(),
+                                "value": route.get("value"),
+                            })
+                    return {
+                        "criteria": criteria,
+                        "criteria_mode": "any" if match_mode == "any" else "all",
+                    } if criteria else {}
+
+                def _rows_for_router_config(router_config: Dict[str, Any]) -> List[Any]:
+                    route_source = str(router_config.get("routeSource") or router_config.get("route_source") or "").strip()
+                    if not route_source:
+                        return rows
+                    if route_source not in query_rows_by_source:
+                        query_rows_by_source[route_source] = _try_fetch_data_ops_query_rows(route_source)
+                    fetched_rows, fetched = query_rows_by_source[route_source]
+                    return fetched_rows if fetched else rows
+
+                for config_index, router_config in enumerate(runtime_configs):
+                    config_id = str(router_config.get("id") or step.get("id") or f"router_{config_index + 1}").strip() or f"router_{config_index + 1}"
+                    config_name = str(router_config.get("name") or name or config_id).strip() or config_id
+                    config_prefix = _safe_handle(config_name or config_id, f"router_{config_index + 1}")
+                    if len(runtime_configs) == 1 and router_config is step:
+                        config_prefix = ""
+                    route_rows = _enabled_rows(router_config.get("routeRows") or router_config.get("route_rows") or router_config.get("routes"))
+                    route_mode = str(router_config.get("routeMode") or router_config.get("route_mode") or "multi").strip().lower()
+                    if route_mode not in {"single", "multi", "conditional"}:
+                        route_mode = "multi"
+                    default_payload_mode = str(router_config.get("payloadMode") or router_config.get("payload_mode") or "all_rows").strip().lower()
+                    if default_payload_mode not in {"all_rows", "batch", "row_by_row", "first_row", "grouped"}:
+                        default_payload_mode = "all_rows"
+
+                    config_rows = _rows_for_router_config(router_config)
+                    config_matched_indices: set[int] = set()
+                    config_row_handles_by_index: Dict[int, List[str]] = {}
+                    default_routes: List[Dict[str, Any]] = []
+
+                    def _route_handle(route: Dict[str, Any], route_index: int) -> str:
+                        raw_name = str(route.get("name") or route.get("id") or f"route_{route_index + 1}").strip()
+                        route_handle = _safe_handle(raw_name, f"route_{route_index + 1}")
+                        return f"{config_prefix}__{route_handle}" if config_prefix else route_handle
+
+                    for route_index, route in enumerate(route_rows):
+                        match_mode = str(route.get("matchMode") or route.get("match_mode") or "all").strip().lower()
+                        if match_mode not in {"always", "all", "any", "default"}:
+                            match_mode = "all"
+                        if match_mode == "default":
+                            default_routes.append(route)
+                            continue
+                        if match_mode == "always":
+                            matched_pairs = list(enumerate(config_rows))
+                        else:
+                            condition_cfg = _route_condition_config(route, match_mode)
+                            matched_pairs = list(enumerate(config_rows)) if not condition_cfg else [
+                                (row_index, row)
+                                for row_index, row in enumerate(config_rows)
+                                if self._flow_condition_match_row(row, condition_cfg)
+                            ]
+                        handle = _route_handle(route, route_index)
+                        route_id = _route_id(route, route_index)
+                        bundle_rows = [row for _row_index, row in matched_pairs]
+                        if bundle_rows:
+                            config_matched_indices.update(row_index for row_index, _row in matched_pairs)
+                            for row_index, _row in matched_pairs:
+                                config_row_handles_by_index.setdefault(row_index, []).append(handle)
+                        route_bundles[handle] = bundle_rows
+                        route_summaries.append({
+                            "id": route_id,
+                            "name": str(route.get("name") or route_id),
+                            "handle": handle,
+                            "router_config_id": config_id,
+                            "router_config_name": config_name,
+                            "route_source": str(router_config.get("routeSource") or router_config.get("route_source") or ""),
+                            "match_mode": match_mode,
+                            "payload_mode": str(route.get("payloadMode") or route.get("payload_mode") or default_payload_mode),
+                            "row_count": len(bundle_rows),
+                            **_route_target(route),
+                        })
+                        if route_mode == "single" and bundle_rows:
+                            break
+
+                    for default_index, route in enumerate(default_routes):
+                        unmatched_pairs = [
+                            (row_index, row)
+                            for row_index, row in enumerate(config_rows)
+                            if row_index not in config_matched_indices
+                        ]
+                        route_index = len(route_summaries) + default_index
+                        handle = _route_handle(route, route_index)
+                        route_id = _route_id(route, route_index)
+                        bundle_rows = [row for _row_index, row in unmatched_pairs]
+                        for row_index, _row in unmatched_pairs:
+                            config_row_handles_by_index.setdefault(row_index, []).append(handle)
+                        route_bundles[handle] = bundle_rows
+                        route_summaries.append({
+                            "id": route_id,
+                            "name": str(route.get("name") or route_id),
+                            "handle": handle,
+                            "router_config_id": config_id,
+                            "router_config_name": config_name,
+                            "route_source": str(router_config.get("routeSource") or router_config.get("route_source") or ""),
+                            "match_mode": "default",
+                            "payload_mode": str(route.get("payloadMode") or route.get("payload_mode") or default_payload_mode),
+                            "row_count": len(bundle_rows),
+                            **_route_target(route),
+                        })
+
+                    for row_index, row in enumerate(config_rows):
+                        if isinstance(row, dict):
+                            routed_output_rows.append({
+                                **row,
+                                "_data_ops_router_config_id": config_id,
+                                "_data_ops_router_config_name": config_name,
+                                "_data_ops_route_handles": config_row_handles_by_index.get(row_index, []),
+                                "_data_ops_route_primary": (config_row_handles_by_index.get(row_index, []) or [""])[0],
+                            })
+                        else:
+                            routed_output_rows.append(row)
+
+                route_meta = {
+                    "step": name,
+                    "route_source": str(step.get("routeSource") or step.get("route_source") or ""),
+                    "router_configs": [
+                        {
+                            "id": str(item.get("id") or ""),
+                            "name": str(item.get("name") or ""),
+                            "route_source": str(item.get("routeSource") or item.get("route_source") or ""),
+                            "route_count": len(_enabled_rows(item.get("routeRows") or item.get("route_rows") or item.get("routes"))),
+                        }
+                        for item in runtime_configs
+                    ],
+                    "route_mode": "multi_config" if len(runtime_configs) > 1 else str(runtime_configs[0].get("routeMode") or runtime_configs[0].get("route_mode") or "multi").strip().lower(),
+                    "payload_mode": str(runtime_configs[0].get("payloadMode") or runtime_configs[0].get("payload_mode") or "all_rows").strip().lower(),
+                    "input_rows": before_count,
+                    "output_rows": len(routed_output_rows),
+                    "routes": route_summaries,
+                    "route_counts": {
+                        str(item.get("handle") or item.get("id")): int(item.get("row_count") or 0)
+                        for item in route_summaries
+                    },
+                    "main_pipeline_targets": [
+                        item for item in route_summaries
+                        if str(item.get("target_type") or "") == "main_pipeline_node" and str(item.get("target_node_id") or "")
+                    ],
+                    "data_ops_targets": [
+                        item for item in route_summaries
+                        if str(item.get("target_type") or "") == "data_ops_step" and str(item.get("target_step_id") or "")
+                    ],
+                    "external_targets": [
+                        item for item in route_summaries
+                        if str(item.get("target_type") or "") == "external" and str(item.get("endpoint") or "")
+                    ],
+                }
+                if isinstance(execution_context, dict):
+                    execution_context.setdefault("data_ops_route_bundles", {})[str(step.get("id") or name)] = route_bundles
+                    execution_context.setdefault("data_ops_route_metadata", {})[str(step.get("id") or name)] = route_meta
+                rows = [
+                    {**row, "_data_ops_route": route_meta}
+                    if isinstance(row, dict) else row
+                    for row in routed_output_rows
+                ]
             elif step_kind == "validate" or operation in {"filter", "validate", "tag", "reject"}:
                 filter_rule_rows = _enabled_rows(step.get("filterRules") or step.get("filter_rules"))
                 condition_cfg = {
@@ -21604,6 +22324,54 @@ END;"""
                 out[field] = item
         return out
 
+    def _mlops_runtime_rre_smart_wording_max_chars(self, rule: Dict[str, Any], default: int = 180) -> int:
+        raw = None
+        if isinstance(rule, dict):
+            raw = (
+                rule.get("smartWordingMaxChars")
+                if rule.get("smartWordingMaxChars") is not None
+                else rule.get("smart_wording_max_chars")
+                if rule.get("smart_wording_max_chars") is not None
+                else rule.get("smartWordingChars")
+                if rule.get("smartWordingChars") is not None
+                else rule.get("smart_wording_chars")
+            )
+        try:
+            value = int(float(raw))
+        except Exception:
+            value = int(default)
+        return max(40, min(2000, value))
+
+    def _mlops_runtime_compact_rule_text(self, text: Any, max_chars: int = 240) -> str:
+        try:
+            limit = max(40, min(2000, int(float(max_chars))))
+        except Exception:
+            limit = 240
+        cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(cleaned) <= limit:
+            return cleaned
+        meaning_match = re.match(r"^(.*?\.)\s+This indicates\s+(.+?)\.?$", cleaned, flags=re.IGNORECASE)
+        if meaning_match:
+            summary = f"{meaning_match.group(1).strip()} Indicates {meaning_match.group(2).strip().rstrip('.')}."
+            if len(summary) <= limit:
+                return summary
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()]
+        first = sentences[0] if sentences else cleaned
+        if len(first) <= limit:
+            return first
+        words = [word for word in re.split(r"\s+", first) if word]
+        suffix = "."
+        max_body_len = max(1, limit - len(suffix))
+        body = ""
+        for word in words:
+            next_body = f"{body} {word}" if body else word
+            if len(next_body) > max_body_len:
+                break
+            body = next_body
+        if not body:
+            body = first[:max_body_len].rstrip()
+        return f"{body}{suffix}"
+
     def _mlops_runtime_rre_narrative(self, row: Dict[str, Any], rule: Dict[str, Any], feature_dictionary: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
         cfg = rule.get("signalConfig") or rule.get("signal_config")
         if not isinstance(cfg, dict) or cfg.get("enabled") is False:
@@ -21639,6 +22407,10 @@ END;"""
         meaning = str(meta.get("meaning") or "").strip()
         if observation and meaning:
             observation = f"{observation} This indicates {meaning}."
+        if bool(rule.get("smartWordingEnabled") or rule.get("smart_wording_enabled") or cfg.get("smartWordingEnabled") or cfg.get("smart_wording_enabled")):
+            smart_wording_max_chars = self._mlops_runtime_rre_smart_wording_max_chars(rule, 180)
+            observation = self._mlops_runtime_compact_rule_text(observation, smart_wording_max_chars)
+            action = self._mlops_runtime_compact_rule_text(action, smart_wording_max_chars)
         signal_output = "\n".join([
             part for part in [
                 summary,
@@ -21889,10 +22661,13 @@ END;"""
             )
             threshold_type = str(primary_signal.get("threshold_type") or "configured").strip()
             breach_percent = str(primary_signal.get("breach_percent") or "").strip()
-            reason = f"{primary_name} is the primary impact driver because it crossed {threshold_type} criteria"
+            primary_role = self._mlops_runtime_rre_signal_impact_role(primary_signal)
+            role_text = "primary impacted outcome" if primary_role == "outcome" else "primary impact driver"
+            reason = f"{primary_name} is the {role_text} because it crossed {threshold_type} criteria"
             if breach_percent:
                 reason = f"{reason} by {breach_percent}%"
             outcomes = classified.get("impacted_outcomes") if isinstance(classified.get("impacted_outcomes"), list) else []
+            outcomes = [str(item) for item in outcomes if str(item) != primary_name]
             outcome_text = ""
             if outcomes:
                 outcome_text = (
@@ -21954,8 +22729,17 @@ END;"""
         classified = self._mlops_runtime_rre_classify_cluster_signals(signals)
         primary_name = str(classified.get("primary_driver") or "").strip()
         if primary_name:
+            primary_signal = next(
+                (
+                    signal for signal in signals
+                    if str(signal.get("business_name") or signal.get("feature") or "").strip() == primary_name
+                ),
+                signals[0] if signals else {},
+            )
+            primary_role = self._mlops_runtime_rre_signal_impact_role(primary_signal)
             secondary = classified.get("secondary_drivers") if isinstance(classified.get("secondary_drivers"), list) else []
             outcomes = classified.get("impacted_outcomes") if isinstance(classified.get("impacted_outcomes"), list) else []
+            outcomes = [str(item) for item in outcomes if str(item) != primary_name]
             support = f" Supporting drivers: {', '.join(str(item) for item in secondary)}." if secondary else ""
             outcome = f" Check downstream impact on {', '.join(str(item) for item in outcomes)}." if outcomes else ""
             evidence_factors: List[str] = []
@@ -21975,8 +22759,13 @@ END;"""
                 else:
                     evidence_factors.append(f"{name} is {value_text}")
             evidence = f" Evidence to validate: {'; '.join(evidence_factors)}." if evidence_factors else ""
+            action = (
+                f"Review {primary_name} as the breached outcome"
+                if primary_role == "outcome"
+                else f"Prioritize {primary_name}"
+            )
             base = (
-                f"Prioritize {primary_name}; validate source transactions and compare recent customer/entity behavior."
+                f"{action}; validate source transactions and compare recent customer/entity behavior."
                 f"{support}{outcome}{evidence}"
             )
             return f"{instruction}. {base}" if instruction else base
@@ -22366,6 +23155,8 @@ END;"""
         ]
         if not cluster_fields:
             cluster_fields = ["cluster", "severity", "features", "primary_driver", "secondary_drivers", "impacted_outcomes", "context_fields", "observation", "recommendation", "evidence"]
+        if "cluster" not in cluster_fields:
+            cluster_fields = ["cluster", *cluster_fields]
         signal_by_feature: Dict[str, Dict[str, Any]] = {}
         for cluster in clusters:
             if not isinstance(cluster, dict) or cluster.get("enabled") is False:
@@ -22728,6 +23519,8 @@ END;"""
             "responsibility": str(rule.get("templateResponsibility") or rule.get("template_responsibility") or ""),
         }
         values.update(self._mlops_runtime_rre_narrative(row, rule, feature_dictionary or {}))
+        smart_wording_enabled = bool(rule.get("smartWordingEnabled") or rule.get("smart_wording_enabled"))
+        smart_wording_max_chars = self._mlops_runtime_rre_smart_wording_max_chars(rule, 180)
         mappings = rule.get("templateMappings") if isinstance(rule.get("templateMappings"), list) else []
         for mapping in mappings:
             if not isinstance(mapping, dict):
@@ -22737,13 +23530,18 @@ END;"""
                 continue
             source = str(mapping.get("source") or "field").strip().lower()
             if source == "custom":
-                values[placeholder] = str(mapping.get("value") or "")
+                value = str(mapping.get("value") or "")
             elif source == "template":
-                values[placeholder] = self._mlops_runtime_render_rre_mapping_template(row, str(mapping.get("value") or ""))
+                value = self._mlops_runtime_render_rre_mapping_template(row, str(mapping.get("value") or ""))
             else:
-                values[placeholder] = "" if self._mlops_runtime_rre_get(row, str(mapping.get("field") or "")) is None else str(
+                value = "" if self._mlops_runtime_rre_get(row, str(mapping.get("field") or "")) is None else str(
                     self._mlops_runtime_rre_get(row, str(mapping.get("field") or ""))
                 )
+            values[placeholder] = (
+                self._mlops_runtime_compact_rule_text(value, smart_wording_max_chars)
+                if smart_wording_enabled
+                else value
+            )
 
         def _replace(match: Any) -> str:
             is_expression = bool(match.group(1))
@@ -22758,7 +23556,8 @@ END;"""
             return "" if value is None else str(value)
 
         try:
-            return re.sub(r"\{\{\s*(=)?\s*([^{}]+?)\s*\}\}", _replace, template)
+            rendered = re.sub(r"\{\{\s*(=)?\s*([^{}]+?)\s*\}\}", _replace, template)
+            return self._mlops_runtime_compact_rule_text(rendered, smart_wording_max_chars) if smart_wording_enabled else rendered
         except Exception:
             return template
 
@@ -23036,7 +23835,17 @@ END;"""
         import pandas as pd
         if not data:
             return []
-        df = pd.DataFrame(data)
+        def _strip_internal_output_fields(row: Any) -> Any:
+            if not isinstance(row, dict):
+                return row
+            return {
+                key: value
+                for key, value in row.items()
+                if not str(key or "").startswith("_data_ops_")
+            }
+
+        output_data = [_strip_internal_output_fields(row) for row in data]
+        df = pd.DataFrame(output_data)
         group_by = [f.strip() for f in config.get("group_by", "").split(",") if f.strip()]
         agg_field = config.get("agg_field", "")
         agg_func = config.get("agg_func", "sum")
@@ -28442,7 +29251,17 @@ INSERT INTO {table_name} (
         if not data:
             return [{"status": "loaded", "rows": 0, "destination": node_type, "note": "No data to write"}]
 
-        df = pd.DataFrame(data)
+        def _strip_internal_destination_fields(row: Any) -> Any:
+            if not isinstance(row, dict):
+                return row
+            return {
+                key: value
+                for key, value in row.items()
+                if not str(key or "").startswith("_data_ops_")
+            }
+
+        output_data = [_strip_internal_destination_fields(row) for row in data]
+        df = pd.DataFrame(output_data)
 
         # ── File destinations ───────────────────────────────────────────────
         if node_type == "csv_destination":
@@ -28667,13 +29486,13 @@ INSERT INTO {table_name} (
             return await self._dest_oracle(config, df, execution_context=execution_context)
 
         elif node_type == "mongodb_destination":
-            return await self._dest_mongodb(config, data)
+            return await self._dest_mongodb(config, output_data)
 
         elif node_type == "elasticsearch_destination":
-            return await self._dest_elasticsearch(config, data)
+            return await self._dest_elasticsearch(config, output_data)
 
         elif node_type == "redis_destination":
-            return await self._dest_redis(config, data)
+            return await self._dest_redis(config, output_data)
 
         elif node_type == "s3_destination":
             return await self._dest_s3(config, df)

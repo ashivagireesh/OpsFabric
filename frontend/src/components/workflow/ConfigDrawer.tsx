@@ -1,4 +1,4 @@
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type ChangeEvent, type KeyboardEvent, type ReactNode } from 'react'
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEvent, type KeyboardEvent, type ReactNode } from 'react'
 import {
   Drawer, Form, Input, Select, Switch, InputNumber,
   Button, Typography, Space, Tabs, Divider, Tag, Tooltip, Table, notification, Modal, Popover, AutoComplete, Tree, Popconfirm, Collapse
@@ -14,10 +14,12 @@ import ReactFlow, {
   ReactFlowProvider,
   addEdge,
   applyEdgeChanges,
+  MarkerType,
   type Connection,
   type Edge,
   type EdgeChange,
   type Node,
+  type ReactFlowInstance,
 } from 'reactflow'
 import { useWorkflowStore } from '../../store'
 import { SourceFilePicker, DestinationPathPicker } from './FilePicker'
@@ -142,14 +144,16 @@ const DATA_QUERY_FIELD_TREE_FIELD_LIMIT = 1200
 const DATA_QUERY_FIELD_SEARCH_RESULT_LIMIT = 300
 const DATA_QUERY_AUTOCOMPLETE_OPTION_LIMIT = 500
 
-type DataOpsPipelineStepKind = 'source' | 'prepare' | 'validate' | 'map' | 'load' | 'monitor'
+type DataOpsPipelineStepKind = 'source' | 'prepare' | 'router' | 'validate' | 'map' | 'load' | 'monitor'
 
 type DataOpsFieldRow = {
   id: string
   field?: string
   alias?: string
   aggregate?: string
-  mode?: 'field' | 'case'
+  mode?: 'field' | 'case' | 'json'
+  jsonPath?: string
+  jsonReturnType?: string
   caseWhen?: string
   caseThen?: string
   caseElse?: string
@@ -296,6 +300,53 @@ type DataOpsMapperConfig = {
   updatedAt?: string
 }
 
+type DataOpsRouterRouteRow = {
+  id: string
+  name?: string
+  matchMode?: 'always' | 'all' | 'any' | 'default'
+  field?: string
+  operator?: string
+  value?: string
+  criteria?: DataOpsRuleRow[]
+  targetType?: 'data_ops_step' | 'main_pipeline_node' | 'external'
+  targetStepId?: string
+  targetNodeId?: string
+  endpoint?: string
+  payloadMode?: 'all_rows' | 'batch' | 'row_by_row' | 'first_row' | 'grouped'
+  enabled?: boolean
+}
+
+type DataOpsRouterConfig = {
+  id: string
+  name: string
+  description?: string
+  routeSource?: string
+  routeMode?: 'single' | 'multi' | 'conditional'
+  payloadMode?: DataOpsRouterRouteRow['payloadMode']
+  routeRows?: DataOpsRouterRouteRow[]
+  syncProcessingMode?: DataOpsPipelineStep['syncProcessingMode']
+  syncBatchSize?: number
+  syncCommitEvery?: number
+  syncParallelEnabled?: boolean
+  syncParallelWorkers?: number
+  syncIncrementalField?: string
+  syncCursorField?: string
+  syncErrorMode?: DataOpsPipelineStep['syncErrorMode']
+  deployEnabled?: boolean
+  scheduleEnabled?: boolean
+  scheduleType?: 'manual' | 'interval' | 'cron' | 'event'
+  scheduleIntervalMinutes?: number
+  scheduleCron?: string
+  scheduleTimezone?: string
+  scheduleMaxParallelRuns?: number
+  scheduleMisfirePolicy?: 'skip' | 'run_once' | 'catch_up'
+  scheduleStatus?: string
+  scheduleBackendJobId?: string
+  scheduleNextRunAt?: string
+  scheduleLastRegisteredAt?: string
+  updatedAt?: string
+}
+
 type DataOpsPipelineStep = {
   id: string
   name: string
@@ -350,6 +401,10 @@ type DataOpsPipelineStep = {
   mappingRows?: DataOpsMapRow[]
   outputMappings?: DataOpsMapRow[]
   lookupSource?: string
+  routeSource?: string
+  routeMode?: 'single' | 'multi' | 'conditional'
+  payloadMode?: DataOpsRouterRouteRow['payloadMode']
+  routeRows?: DataOpsRouterRouteRow[]
   connections?: DataOpsConnectionRow[]
   tables?: DataOpsTableRow[]
   groupByFields?: DataOpsFieldRow[]
@@ -359,6 +414,8 @@ type DataOpsPipelineStep = {
   activeQueryBuilderId?: string
   mapperConfigs?: DataOpsMapperConfig[]
   activeMapperConfigId?: string
+  routerConfigs?: DataOpsRouterConfig[]
+  activeRouterConfigId?: string
   limitRows?: number
   retry?: boolean
   checkpoint?: boolean
@@ -372,6 +429,7 @@ type DataOpsPipelineSnapshot = {
 const DATA_OPS_STEP_LIBRARY: Array<{ name: string; kind: DataOpsPipelineStepKind; caption: string }> = [
   { name: 'Data Source', kind: 'source', caption: 'Connections for Oracle, files, and APIs' },
   { name: 'Query Builder', kind: 'prepare', caption: 'Tables, fields, joins, filters, grouping, mapping, output' },
+  { name: 'Query Result Router', kind: 'router', caption: 'Route saved query results to Data Vault steps or main pipeline nodes' },
   { name: 'Data Mapper / Sync', kind: 'map', caption: 'Map incoming fields to target table columns and sync rows' },
   { name: 'Filter / Validate', kind: 'validate', caption: 'Reusable row filter and validation rules' },
 ]
@@ -379,6 +437,7 @@ const DATA_OPS_STEP_LIBRARY: Array<{ name: string; kind: DataOpsPipelineStepKind
 const DATA_OPS_STEP_KIND_META: Record<DataOpsPipelineStepKind, { color: string; icon: string; label: string }> = {
   source: { color: '#38bdf8', icon: '⤓', label: 'Data Source' },
   prepare: { color: '#22c55e', icon: '▦', label: 'Query Builder' },
+  router: { color: '#f97316', icon: '⇄', label: 'Query Result Router' },
   validate: { color: '#f59e0b', icon: '◇', label: 'Validate' },
   map: { color: '#a78bfa', icon: '↔', label: 'Data Mapper / Sync' },
   load: { color: '#14b8a6', icon: '⇥', label: 'Load' },
@@ -398,6 +457,12 @@ const DATA_OPS_STEP_OPERATION_OPTIONS: Record<DataOpsPipelineStepKind, Array<{ v
     { value: 'drop_fields', label: 'Drop Fields' },
     { value: 'rename_fields', label: 'Rename Fields' },
     { value: 'join_lookup', label: 'Join / Lookup' },
+    { value: 'pass_through', label: 'Pass Through' },
+  ],
+  router: [
+    { value: 'route_query_result', label: 'Route Query Result' },
+    { value: 'route_conditional', label: 'Conditional Split' },
+    { value: 'route_main_pipeline', label: 'Main Pipeline Node Route' },
     { value: 'pass_through', label: 'Pass Through' },
   ],
   validate: [
@@ -429,6 +494,7 @@ const DATA_OPS_STEP_OPERATION_OPTIONS: Record<DataOpsPipelineStepKind, Array<{ v
 function defaultDataOpsStepOperation(kind: DataOpsPipelineStepKind): string {
   if (kind === 'source') return 'read_upstream'
   if (kind === 'prepare') return 'query_builder'
+  if (kind === 'router') return 'route_query_result'
   if (kind === 'validate') return 'filter'
   if (kind === 'map') return 'sync_mapper'
   if (kind === 'load') return 'upsert'
@@ -472,7 +538,9 @@ function normalizeDataOpsFieldRows(value: unknown): DataOpsFieldRow[] {
         field: String(row.field || ''),
         alias: String(row.alias || ''),
         aggregate: String(row.aggregate || row.agg || ''),
-        mode: row.mode === 'case' ? 'case' : 'field',
+        mode: row.mode === 'case' ? 'case' : row.mode === 'json' ? 'json' : 'field',
+        jsonPath: String(row.jsonPath || row.json_path || ''),
+        jsonReturnType: String(row.jsonReturnType || row.json_return_type || 'VARCHAR2(4000)'),
         caseWhen: String(row.caseWhen || row.case_when || ''),
         caseThen: String(row.caseThen || row.case_then || ''),
         caseElse: String(row.caseElse || row.case_else || ''),
@@ -674,10 +742,77 @@ function normalizeDataOpsMapperConfigs(value: unknown): DataOpsMapperConfig[] {
     : []
 }
 
+function normalizeDataOpsRouterRouteRows(value: unknown): DataOpsRouterRouteRow[] {
+  return Array.isArray(value)
+    ? value.map((item, idx) => {
+      const row = item && typeof item === 'object' ? item as Record<string, unknown> : {}
+      const targetType = String(row.targetType || row.target_type || 'data_ops_step')
+      const payloadMode = String(row.payloadMode || row.payload_mode || 'all_rows')
+      const matchMode = String(row.matchMode || row.match_mode || (idx === 0 ? 'always' : 'all'))
+      return {
+        id: String(row.id || `route_${idx + 1}`),
+        name: String(row.name || row.label || `Route ${idx + 1}`),
+        matchMode: (['always', 'any', 'default'].includes(matchMode) ? matchMode : 'all') as DataOpsRouterRouteRow['matchMode'],
+        field: String(row.field || ''),
+        operator: String(row.operator || 'equals'),
+        value: String(row.value || ''),
+        criteria: normalizeDataOpsRuleRows(row.criteria || row.conditions),
+        targetType: (['main_pipeline_node', 'external'].includes(targetType) ? targetType : 'data_ops_step') as DataOpsRouterRouteRow['targetType'],
+        targetStepId: String(row.targetStepId || row.target_step_id || ''),
+        targetNodeId: String(row.targetNodeId || row.target_node_id || ''),
+        endpoint: String(row.endpoint || row.url || ''),
+        payloadMode: (['batch', 'row_by_row', 'first_row', 'grouped'].includes(payloadMode) ? payloadMode : 'all_rows') as DataOpsRouterRouteRow['payloadMode'],
+        enabled: row.enabled !== false,
+      }
+    })
+    : []
+}
+
+function normalizeDataOpsRouterConfigs(value: unknown): DataOpsRouterConfig[] {
+  return Array.isArray(value)
+    ? value.map((item, idx) => {
+      const row = item && typeof item === 'object' ? item as Record<string, unknown> : {}
+      const routeMode = String(row.routeMode || row.route_mode || 'multi')
+      const payloadMode = String(row.payloadMode || row.payload_mode || 'all_rows')
+      return {
+        id: String(row.id || `router_config_${idx + 1}`),
+        name: String(row.name || row.label || `Router ${idx + 1}`),
+        description: String(row.description || ''),
+        routeSource: String(row.routeSource || row.route_source || row.lookupSource || row.lookup_source || ''),
+        routeMode: (['single', 'conditional'].includes(routeMode) ? routeMode : 'multi') as DataOpsRouterConfig['routeMode'],
+        payloadMode: (['batch', 'row_by_row', 'first_row', 'grouped'].includes(payloadMode) ? payloadMode : 'all_rows') as DataOpsRouterConfig['payloadMode'],
+        routeRows: normalizeDataOpsRouterRouteRows(row.routeRows || row.route_rows || row.routes),
+        syncProcessingMode: (['incremental_batch', 'cursor', 'row_by_row'].includes(String(row.syncProcessingMode || row.sync_processing_mode || '')) ? String(row.syncProcessingMode || row.sync_processing_mode) : 'batch') as DataOpsPipelineStep['syncProcessingMode'],
+        syncBatchSize: Number.isFinite(Number(row.syncBatchSize || row.sync_batch_size)) ? Math.max(1, Math.trunc(Number(row.syncBatchSize || row.sync_batch_size))) : 1000,
+        syncCommitEvery: Number.isFinite(Number(row.syncCommitEvery || row.sync_commit_every)) ? Math.max(1, Math.trunc(Number(row.syncCommitEvery || row.sync_commit_every))) : 5000,
+        syncParallelEnabled: Boolean(row.syncParallelEnabled || row.sync_parallel_enabled),
+        syncParallelWorkers: Number.isFinite(Number(row.syncParallelWorkers || row.sync_parallel_workers)) ? Math.max(1, Math.trunc(Number(row.syncParallelWorkers || row.sync_parallel_workers))) : 4,
+        syncIncrementalField: String(row.syncIncrementalField || row.sync_incremental_field || ''),
+        syncCursorField: String(row.syncCursorField || row.sync_cursor_field || ''),
+        syncErrorMode: (['skip', 'reject'].includes(String(row.syncErrorMode || row.sync_error_mode || '')) ? String(row.syncErrorMode || row.sync_error_mode) : 'stop') as DataOpsPipelineStep['syncErrorMode'],
+        deployEnabled: Boolean(row.deployEnabled || row.deploy_enabled),
+        scheduleEnabled: Boolean(row.scheduleEnabled || row.schedule_enabled),
+        scheduleType: (['manual', 'cron', 'event'].includes(String(row.scheduleType || row.schedule_type || '')) ? String(row.scheduleType || row.schedule_type) : 'interval') as DataOpsRouterConfig['scheduleType'],
+        scheduleIntervalMinutes: Number.isFinite(Number(row.scheduleIntervalMinutes || row.schedule_interval_minutes)) ? Math.max(1, Math.trunc(Number(row.scheduleIntervalMinutes || row.schedule_interval_minutes))) : 60,
+        scheduleCron: String(row.scheduleCron || row.schedule_cron || '0 * * * *'),
+        scheduleTimezone: String(row.scheduleTimezone || row.schedule_timezone || 'Asia/Kolkata'),
+        scheduleMaxParallelRuns: Number.isFinite(Number(row.scheduleMaxParallelRuns || row.schedule_max_parallel_runs)) ? Math.max(1, Math.trunc(Number(row.scheduleMaxParallelRuns || row.schedule_max_parallel_runs))) : 1,
+        scheduleMisfirePolicy: (['run_once', 'catch_up'].includes(String(row.scheduleMisfirePolicy || row.schedule_misfire_policy || '')) ? String(row.scheduleMisfirePolicy || row.schedule_misfire_policy) : 'skip') as DataOpsRouterConfig['scheduleMisfirePolicy'],
+        scheduleStatus: String(row.scheduleStatus || row.schedule_status || ''),
+        scheduleBackendJobId: String(row.scheduleBackendJobId || row.schedule_backend_job_id || ''),
+        scheduleNextRunAt: String(row.scheduleNextRunAt || row.schedule_next_run_at || ''),
+        scheduleLastRegisteredAt: String(row.scheduleLastRegisteredAt || row.schedule_last_registered_at || ''),
+        updatedAt: String(row.updatedAt || row.updated_at || ''),
+      }
+    })
+    : []
+}
+
 function normalizeDataOpsStepKind(value: unknown, fallbackName = ''): DataOpsPipelineStepKind {
   const raw = String(value || '').trim().toLowerCase()
   const name = fallbackName.toLowerCase()
   if (raw === 'source' || /source|read|api|rest|soap|graphql|csv|excel/.test(name)) return 'source'
+  if (raw === 'router' || /query\s*result\s*router|router|routing/.test(name)) return 'router'
   if (raw === 'validate' || /valid|quality|filter|reject/.test(name)) return 'validate'
   if (raw === 'map' || /mapper|mapping|sync/.test(name)) return 'map'
   if (raw === 'load' || /load|output|write/.test(name)) return 'load'
@@ -694,13 +829,8 @@ function isUnsupportedDataOpsStep(value: unknown): boolean {
 
 function canonicalDataOpsStepName(kind: DataOpsPipelineStepKind, name: string): string {
   const rawName = String(name || '').trim()
-  if (kind === 'source') return 'Data Source'
-  if (kind === 'prepare') return 'Query Builder'
-  if (kind === 'map') return 'Data Mapper / Sync'
-  if (kind === 'validate') return 'Filter / Validate'
-  if (kind === 'load') return 'Load'
-  if (kind === 'monitor') return 'Monitor'
-  return rawName || 'Step'
+  if (rawName) return rawName
+  return DATA_OPS_STEP_KIND_META[kind]?.label || 'Step'
 }
 
 function normalizeDataOpsPipelineSteps(value: unknown, legacyText: unknown): DataOpsPipelineStep[] {
@@ -770,6 +900,10 @@ function normalizeDataOpsPipelineSteps(value: unknown, legacyText: unknown): Dat
       mappingRows: normalizeDataOpsMapRows(item.mappingRows || item.mapping_rows),
       outputMappings: normalizeDataOpsMapRows(item.outputMappings || item.output_mappings),
       lookupSource: String(item.lookupSource || item.lookup_source || ''),
+      routeSource: String(item.routeSource || item.route_source || item.lookupSource || item.lookup_source || ''),
+      routeMode: (['single', 'conditional'].includes(String(item.routeMode || item.route_mode || '')) ? String(item.routeMode || item.route_mode) : 'multi') as DataOpsPipelineStep['routeMode'],
+      payloadMode: (['batch', 'row_by_row', 'first_row', 'grouped'].includes(String(item.payloadMode || item.payload_mode || '')) ? String(item.payloadMode || item.payload_mode) : 'all_rows') as DataOpsPipelineStep['payloadMode'],
+      routeRows: normalizeDataOpsRouterRouteRows(item.routeRows || item.route_rows || item.routes),
       connections: normalizeDataOpsConnectionRows(item.connections),
       tables: normalizeDataOpsTableRows(item.tables),
       groupByFields: normalizeDataOpsFieldRows(item.groupByFields || item.group_by_fields),
@@ -779,6 +913,8 @@ function normalizeDataOpsPipelineSteps(value: unknown, legacyText: unknown): Dat
       activeQueryBuilderId: String(item.activeQueryBuilderId || item.active_query_builder_id || ''),
       mapperConfigs: normalizeDataOpsMapperConfigs(item.mapperConfigs || item.mapper_configs),
       activeMapperConfigId: String(item.activeMapperConfigId || item.active_mapper_config_id || ''),
+      routerConfigs: normalizeDataOpsRouterConfigs(item.routerConfigs || item.router_configs),
+      activeRouterConfigId: String(item.activeRouterConfigId || item.active_router_config_id || ''),
       limitRows: Number.isFinite(Number(item.limitRows || item.limit_rows)) ? Number(item.limitRows || item.limit_rows) : undefined,
       retry: Boolean(item.retry),
       checkpoint: item.checkpoint !== false,
@@ -835,6 +971,10 @@ function normalizeDataOpsPipelineSteps(value: unknown, legacyText: unknown): Dat
     mappingRows: [],
     outputMappings: [],
     lookupSource: '',
+    routeSource: '',
+    routeMode: 'multi',
+    payloadMode: 'all_rows',
+    routeRows: [],
     connections: [],
     tables: [],
     groupByFields: [],
@@ -844,6 +984,8 @@ function normalizeDataOpsPipelineSteps(value: unknown, legacyText: unknown): Dat
     activeQueryBuilderId: '',
     mapperConfigs: [],
     activeMapperConfigId: '',
+    routerConfigs: [],
+    activeRouterConfigId: '',
     limitRows: undefined,
     retry: idx > 0,
     checkpoint: true,
@@ -866,18 +1008,12 @@ function normalizeDataOpsPipelineEdges(value: unknown, steps: DataOpsPipelineSte
       targetHandle: String(item.targetHandle || 'input'),
       animated: true,
       type: 'smoothstep',
+      markerEnd: { type: MarkerType.ArrowClosed, color: '#8b98aa', width: 12, height: 12 },
+      interactionWidth: 44,
       style: { stroke: '#8b98aa', strokeWidth: 1.4, strokeDasharray: '2 5' },
     } as Edge
   }).filter(Boolean) as Edge[]
-  if (edges.length) return edges
-  return steps.slice(1).map((step, idx) => ({
-    id: `data_ops_edge_${idx + 1}_${steps[idx].id}_${step.id}`,
-    source: steps[idx].id,
-    target: step.id,
-    animated: true,
-    type: 'smoothstep',
-    style: { stroke: '#8b98aa', strokeWidth: 1.4, strokeDasharray: '2 5' },
-  }))
+  return edges
 }
 
 function dataOpsPipelineText(steps: DataOpsPipelineStep[]): string {
@@ -886,6 +1022,60 @@ function dataOpsPipelineText(steps: DataOpsPipelineStep[]): string {
 
 function cloneDataOpsPipelineSteps(steps: DataOpsPipelineStep[]): DataOpsPipelineStep[] {
   return steps.map((step) => ({ ...step, position: { ...step.position } }))
+}
+
+const DATA_OPS_LIVE_SCHEDULE_KEYS = [
+  'scheduleStatus',
+  'scheduleBackendJobId',
+  'scheduleNextRunAt',
+  'scheduleLastRegisteredAt',
+] as const
+
+function mergeDataOpsLiveScheduleFields<T extends Partial<DataOpsPipelineStep & DataOpsMapperConfig & DataOpsRouterConfig>>(
+  localItem: T,
+  savedItem: Partial<DataOpsPipelineStep & DataOpsMapperConfig & DataOpsRouterConfig> | undefined,
+): { item: T; changed: boolean } {
+  if (!savedItem) return { item: localItem, changed: false }
+  let changed = false
+  const nextItem = { ...localItem } as T
+  DATA_OPS_LIVE_SCHEDULE_KEYS.forEach((key) => {
+    if (!Object.prototype.hasOwnProperty.call(savedItem, key)) return
+    const savedValue = String(savedItem[key] || '')
+    if (String(nextItem[key] || '') !== savedValue) {
+      ;(nextItem as Record<string, unknown>)[key] = savedValue
+      changed = true
+    }
+  })
+  return { item: changed ? nextItem : localItem, changed }
+}
+
+function mergeDataOpsLiveScheduleStep(localStep: DataOpsPipelineStep, savedStep: DataOpsPipelineStep | undefined): { step: DataOpsPipelineStep; changed: boolean } {
+  if (!savedStep) return { step: localStep, changed: false }
+  const stepMerge = mergeDataOpsLiveScheduleFields(localStep, savedStep)
+  let nextStep = stepMerge.item
+  let changed = stepMerge.changed
+  const mergeConfigRows = <T extends DataOpsMapperConfig | DataOpsRouterConfig>(localRows: T[] | undefined, savedRows: T[] | undefined): { rows: T[] | undefined; changed: boolean } => {
+    if (!Array.isArray(localRows) || !Array.isArray(savedRows)) return { rows: localRows, changed: false }
+    let rowsChanged = false
+    const rows = localRows.map((row) => {
+      const savedRow = savedRows.find((item) => String(item.id || '') === String(row.id || ''))
+      const merged = mergeDataOpsLiveScheduleFields(row, savedRow)
+      rowsChanged = rowsChanged || merged.changed
+      return merged.item
+    })
+    return { rows: rowsChanged ? rows : localRows, changed: rowsChanged }
+  }
+  const mapperMerge = mergeConfigRows(nextStep.mapperConfigs, savedStep.mapperConfigs)
+  if (mapperMerge.changed) {
+    nextStep = { ...nextStep, mapperConfigs: mapperMerge.rows }
+    changed = true
+  }
+  const routerMerge = mergeConfigRows(nextStep.routerConfigs, savedStep.routerConfigs)
+  if (routerMerge.changed) {
+    nextStep = { ...nextStep, routerConfigs: routerMerge.rows }
+    changed = true
+  }
+  return { step: nextStep, changed }
 }
 
 function cloneDataOpsPipelineEdges(edges: Edge[]): Edge[] {
@@ -2410,6 +2600,166 @@ function ensureCustomEditorTheme(monaco: Monaco): void {
       'editorError.foreground': '#CF222E',
       'editorWarning.foreground': '#9A6700',
     },
+  })
+}
+
+const DATA_OPS_SQL_LANGUAGE_ID = 'data-ops-sql'
+const DATA_OPS_SQL_FUNCTIONS = [
+  'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'ROUND', 'TRUNC', 'NVL', 'COALESCE', 'NULLIF',
+  'CASE', 'DECODE', 'TO_CHAR', 'TO_DATE', 'TO_TIMESTAMP', 'CAST', 'EXTRACT',
+  'SUBSTR', 'INSTR', 'UPPER', 'LOWER', 'TRIM', 'LTRIM', 'RTRIM', 'REPLACE',
+  'REGEXP_REPLACE', 'REGEXP_SUBSTR', 'JSON_VALUE', 'JSON_QUERY', 'JSON_TABLE',
+  'SYSDATE', 'SYSTIMESTAMP', 'ROW_NUMBER', 'RANK', 'DENSE_RANK', 'LAG', 'LEAD',
+]
+const DATA_OPS_SQL_KEYWORDS = [
+  'SELECT', 'FROM', 'WHERE', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER', 'ON',
+  'GROUP', 'BY', 'HAVING', 'ORDER', 'ASC', 'DESC', 'DISTINCT', 'UNION', 'ALL',
+  'WITH', 'AS', 'AND', 'OR', 'NOT', 'IN', 'EXISTS', 'BETWEEN', 'LIKE', 'IS', 'NULL',
+  'INSERT', 'INTO', 'VALUES', 'UPDATE', 'SET', 'DELETE', 'MERGE', 'WHEN', 'MATCHED',
+  'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'TABLE', 'VIEW', 'MATERIALIZED', 'INDEX',
+  'PRIMARY', 'KEY', 'FOREIGN', 'REFERENCES', 'CONSTRAINT', 'BEGIN', 'END', 'DECLARE',
+  'RETURNING', 'OVER', 'PARTITION', 'FETCH', 'FIRST', 'ROWS', 'ONLY', 'OFFSET',
+]
+const DATA_OPS_SQL_SNIPPETS = [
+  { label: 'select-from', detail: 'SELECT query', insertText: 'SELECT ${1:*}\nFROM ${2:table}\nWHERE ${3:condition}' },
+  { label: 'join-on', detail: 'JOIN clause', insertText: 'JOIN ${1:table} ${2:alias}\n  ON ${3:left_column} = ${4:right_column}' },
+  { label: 'group-by', detail: 'GROUP BY query', insertText: 'SELECT ${1:column}, COUNT(*) AS total_count\nFROM ${2:table}\nGROUP BY ${1:column}' },
+  { label: 'json-value', detail: 'Oracle JSON_VALUE expression', insertText: "JSON_VALUE(${1:json_column}, '$.${2:path}' RETURNING VARCHAR2(4000) NULL ON ERROR) AS ${3:alias}" },
+  { label: 'row-number', detail: 'ROW_NUMBER analytic expression', insertText: 'ROW_NUMBER() OVER (PARTITION BY ${1:partition_column} ORDER BY ${2:order_column}) AS ${3:rn}' },
+]
+let dataOpsSqlLanguageRegistered = false
+let dataOpsSqlCompletionCatalog: { tables: string[]; columns: string[]; functions: string[] } = {
+  tables: [],
+  columns: [],
+  functions: DATA_OPS_SQL_FUNCTIONS,
+}
+
+function setDataOpsSqlCompletionCatalog(catalog: Partial<typeof dataOpsSqlCompletionCatalog>): void {
+  dataOpsSqlCompletionCatalog = {
+    tables: uniqueFieldNames(catalog.tables || dataOpsSqlCompletionCatalog.tables || []),
+    columns: uniqueFieldNames(catalog.columns || dataOpsSqlCompletionCatalog.columns || []),
+    functions: uniqueFieldNames(catalog.functions || dataOpsSqlCompletionCatalog.functions || DATA_OPS_SQL_FUNCTIONS),
+  }
+}
+
+function buildDataOpsSqlCompletionSuggestions(monaco: Monaco, model: any, position: any) {
+  const source = String(model?.getValue?.() || '')
+  const cursorOffset = Number(model?.getOffsetAt?.(position) || 0)
+  const leftContext = source.slice(Math.max(0, cursorOffset - 160), cursorOffset)
+  const wantsTable = /\b(from|join|update|into|merge\s+into|table)\s+["\w.$#]*$/i.test(leftContext)
+  const wantsColumn = /\b(select|where|and|or|on|by|set|having|order\s+by|group\s+by)\b[\s\S]*$/i.test(leftContext) && !wantsTable
+  const word = model?.getWordUntilPosition?.(position) || { word: '', startColumn: position.column, endColumn: position.column }
+  const range = {
+    startLineNumber: position.lineNumber,
+    endLineNumber: position.lineNumber,
+    startColumn: word.startColumn,
+    endColumn: word.endColumn,
+  }
+  const completionKind = (monaco as any)?.languages?.CompletionItemKind || {}
+  const snippetInsertRule = (monaco as any)?.languages?.CompletionItemInsertTextRule?.InsertAsSnippet
+  const keywordItems = DATA_OPS_SQL_KEYWORDS.map((label) => ({
+    label,
+    kind: completionKind.Keyword ?? completionKind.Text ?? 18,
+    insertText: label,
+    detail: 'SQL keyword',
+    sortText: `4_${label}`,
+    range,
+  }))
+  const tableItems = uniqueFieldNames(dataOpsSqlCompletionCatalog.tables || []).map((label) => ({
+    label,
+    kind: completionKind.Class ?? completionKind.Struct ?? completionKind.Module ?? 7,
+    insertText: label,
+    detail: 'Oracle table/view',
+    sortText: `${wantsTable ? '0' : '2'}_${label}`,
+    range,
+  }))
+  const columnItems = uniqueFieldNames(dataOpsSqlCompletionCatalog.columns || []).map((label) => ({
+    label,
+    kind: completionKind.Field ?? completionKind.Property ?? completionKind.Variable ?? 5,
+    insertText: label,
+    detail: 'Column / JSON field',
+    sortText: `${wantsColumn ? '0' : '1'}_${label}`,
+    range,
+  }))
+  const functionItems = uniqueFieldNames(dataOpsSqlCompletionCatalog.functions || DATA_OPS_SQL_FUNCTIONS).map((label) => ({
+    label,
+    kind: completionKind.Function ?? completionKind.Method ?? 1,
+    insertText: `${label}($1)`,
+    insertTextRules: snippetInsertRule,
+    detail: 'SQL function',
+    sortText: `3_${label}`,
+    range,
+  }))
+  const snippetItems = DATA_OPS_SQL_SNIPPETS.map((snippet) => ({
+    label: snippet.label,
+    kind: completionKind.Snippet ?? completionKind.Text ?? 18,
+    insertText: snippet.insertText,
+    insertTextRules: snippetInsertRule,
+    detail: snippet.detail,
+    sortText: `5_${snippet.label}`,
+    range,
+  }))
+  return {
+    suggestions: [...tableItems, ...columnItems, ...functionItems, ...snippetItems, ...keywordItems],
+  }
+}
+
+function ensureDataOpsSqlLanguage(monaco: Monaco): void {
+  ensureCustomEditorTheme(monaco)
+  if (dataOpsSqlLanguageRegistered) return
+  dataOpsSqlLanguageRegistered = true
+  monaco.languages.register({ id: DATA_OPS_SQL_LANGUAGE_ID })
+  monaco.languages.setLanguageConfiguration(DATA_OPS_SQL_LANGUAGE_ID, {
+    comments: {
+      lineComment: '--',
+      blockComment: ['/*', '*/'],
+    },
+    brackets: [['(', ')'], ['[', ']']],
+    autoClosingPairs: [
+      { open: '(', close: ')' },
+      { open: '[', close: ']' },
+      { open: "'", close: "'" },
+      { open: '"', close: '"' },
+    ],
+    surroundingPairs: [
+      { open: '(', close: ')' },
+      { open: "'", close: "'" },
+      { open: '"', close: '"' },
+    ],
+  })
+  monaco.languages.setMonarchTokensProvider(DATA_OPS_SQL_LANGUAGE_ID, {
+    defaultToken: 'identifier',
+    ignoreCase: true,
+    keywords: DATA_OPS_SQL_KEYWORDS,
+    functions: DATA_OPS_SQL_FUNCTIONS,
+    tokenizer: {
+      root: [
+        [/--.*$/, 'comment'],
+        [/\/\*/, 'comment', '@comment'],
+        [/'([^']|'')*'/, 'string'],
+        [/"([^"]|"")*"/, 'string'],
+        [/\b\d+(\.\d+)?\b/, 'number'],
+        [/[;,.]/, 'delimiter'],
+        [/[()]/, '@brackets'],
+        [/[<>=!+\-*/%]+/, 'operator'],
+        [/[a-zA-Z_][\w$#]*/, {
+          cases: {
+            '@keywords': 'keyword',
+            '@functions': 'predefined',
+            '@default': 'identifier',
+          },
+        }],
+      ],
+      comment: [
+        [/[^/*]+/, 'comment'],
+        [/\*\//, 'comment', '@pop'],
+        [/[/*]/, 'comment'],
+      ],
+    },
+  } as any)
+  monaco.languages.registerCompletionItemProvider(DATA_OPS_SQL_LANGUAGE_ID, {
+    triggerCharacters: ['.', ' ', '(', ','],
+    provideCompletionItems: (model: any, position: any) => buildDataOpsSqlCompletionSuggestions(monaco, model, position),
   })
 }
 
@@ -8283,6 +8633,70 @@ function gatewayTimestampText(value: unknown): string {
   return date.toLocaleString()
 }
 
+function dataOpsNumber(value: unknown, fallback = 0): number {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : fallback
+}
+
+function dataOpsCompactNumber(value: unknown): string {
+  return dataOpsNumber(value, 0).toLocaleString()
+}
+
+function dataOpsTimestampText(value: unknown): string {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  const date = new Date(raw)
+  if (Number.isNaN(date.getTime())) return raw
+  return date.toLocaleString()
+}
+
+function dataOpsDurationText(value: unknown): string {
+  const ms = dataOpsNumber(value, 0)
+  if (ms <= 0) return ''
+  if (ms < 1000) return `${Math.round(ms)} ms`
+  const totalSeconds = Math.floor(ms / 1000)
+  const seconds = totalSeconds % 60
+  const minutes = Math.floor(totalSeconds / 60) % 60
+  const hours = Math.floor(totalSeconds / 3600)
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`
+  if (minutes > 0) return `${minutes}m ${seconds}s`
+  return `${seconds}s`
+}
+
+function dataOpsCountdownText(value: unknown, nowMs = Date.now()): string {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  const targetMs = Date.parse(raw)
+  if (!Number.isFinite(targetMs)) return ''
+  const deltaMs = targetMs - nowMs
+  const totalSeconds = Math.max(0, Math.floor(Math.abs(deltaMs) / 1000))
+  const seconds = totalSeconds % 60
+  const minutes = Math.floor(totalSeconds / 60) % 60
+  const hours = Math.floor(totalSeconds / 3600)
+  const text = hours > 0 ? `${hours}h ${minutes}m` : minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`
+  return deltaMs >= 0 ? `in ${text}` : `${text} overdue`
+}
+
+function dataOpsStatusColor(value: unknown): string {
+  const status = String(value || '').trim().toLowerCase()
+  if (status === 'running' || status === 'queued' || status === 'pending') return 'blue'
+  if (status === 'scheduled' || status === 'registered') return 'cyan'
+  if (status === 'success' || status === 'complete' || status === 'completed') return 'green'
+  if (status === 'warning' || status === 'skipped' || status === 'skip') return 'orange'
+  if (status === 'error' || status === 'failed' || status === 'failure') return 'red'
+  return 'default'
+}
+
+function dataOpsStatusHex(value: unknown): string {
+  const status = String(value || '').trim().toLowerCase()
+  if (status === 'running' || status === 'queued' || status === 'pending') return '#60a5fa'
+  if (status === 'scheduled' || status === 'registered') return '#38bdf8'
+  if (status === 'success' || status === 'complete' || status === 'completed') return '#22c55e'
+  if (status === 'warning' || status === 'skipped' || status === 'skip') return '#f59e0b'
+  if (status === 'error' || status === 'failed' || status === 'failure') return '#ef4444'
+  return '#64748b'
+}
+
 function gatewayProtocolColor(protocol: unknown): string {
   const text = String(protocol || '').trim().toLowerCase()
   if (text === 'graphql') return '#a855f7'
@@ -9279,11 +9693,426 @@ function appendPathSegment(basePath: string, segment: string): string {
   return `${base}["${token.replace(/"/g, '\\"')}"]`
 }
 
+function dataOpsFieldOutputNames(fieldRow: Partial<DataOpsFieldRow> | Record<string, unknown>, includeSourcePath = false): string[] {
+  const rawField = String(fieldRow.field || '').trim()
+  const alias = String(fieldRow.alias || '').trim()
+  const aggregate = String(fieldRow.aggregate || (fieldRow as Record<string, unknown>).agg || '').trim().toLowerCase()
+  const mode = String(fieldRow.mode || '').trim().toLowerCase()
+  const names: string[] = []
+  if (alias) {
+    names.push(alias)
+  } else if (mode === 'json') {
+    const jsonPath = String((fieldRow as Record<string, unknown>).jsonPath || (fieldRow as Record<string, unknown>).json_path || '').trim()
+    const leaf = (jsonPath || rawField).split('.').pop()?.replace(/\W+/g, '_').replace(/^_+|_+$/g, '').trim()
+    if (leaf) names.push(leaf)
+  } else if (mode === 'case') {
+    names.push('case_value')
+  } else if (aggregate && rawField) {
+    const leaf = rawField.split('.').pop()?.trim() || 'value'
+    const safeLeaf = leaf.replace(/\W+/g, '_').replace(/^_+|_+$/g, '') || 'value'
+    names.push(`${aggregate}_${safeLeaf}`)
+  } else if (rawField) {
+    const leaf = rawField.split('.').pop()?.trim()
+    if (leaf) names.push(leaf)
+  }
+  if (includeSourcePath && rawField) {
+    names.push(rawField)
+    const leaf = rawField.split('.').pop()?.trim()
+    if (leaf) names.push(leaf)
+  }
+  return uniqueFieldNames(names)
+}
+
+function dataOpsMappingOutputNames(rows: DataOpsMapRow[] | undefined, includeSources = true): string[] {
+  const fields: string[] = []
+  ;(rows || []).forEach((row) => {
+    if (row.enabled === false) return
+    const source = String(row.source || '').trim()
+    const target = String(row.target || source).trim()
+    if (includeSources && source) fields.push(source, source.split('.').pop() || source)
+    if (target) fields.push(target)
+  })
+  return uniqueFieldNames(fields)
+}
+
+function dataOpsQueryBuilderOutputFields(queryConfig: Partial<DataOpsQueryBuilderConfig> | undefined): string[] {
+  if (!queryConfig) return []
+  const fields: string[] = []
+  ;(queryConfig.selectFields || []).forEach((fieldRow) => {
+    if (fieldRow.enabled === false) return
+    fields.push(...dataOpsFieldOutputNames(fieldRow))
+  })
+  fields.push(...parseFieldList((queryConfig as Record<string, unknown>).fields))
+  return uniqueFieldNames(fields)
+}
+
+function dataOpsActiveQueryBuilderOutputFields(step: DataOpsPipelineStep): string[] {
+  const queryBuilders = step.queryBuilders || []
+  const activeId = String(step.activeQueryBuilderId || '').trim()
+  let activeConfig: DataOpsQueryBuilderConfig | undefined
+  if (activeId) {
+    activeConfig = queryBuilders.find((queryConfig) => String(queryConfig.id || '') === activeId)
+  }
+  if (!activeConfig && queryBuilders.length === 1) {
+    activeConfig = queryBuilders[0]
+  }
+  return dataOpsQueryBuilderOutputFields(activeConfig)
+}
+
+function dataOpsActiveQuerySqlFromStep(step: DataOpsPipelineStep): string {
+  const queryBuilders = step.queryBuilders || []
+  const activeId = String(step.activeQueryBuilderId || '').trim()
+  let activeConfig: DataOpsQueryBuilderConfig | undefined
+  if (activeId) {
+    activeConfig = queryBuilders.find((queryConfig) => String(queryConfig.id || '') === activeId)
+  }
+  if (!activeConfig && queryBuilders.length === 1) {
+    activeConfig = queryBuilders[0]
+  }
+  return String(activeConfig?.query || activeConfig?.expression || step.query || step.expression || '').trim()
+}
+
+function dataOpsSqlIdent(value: string): string {
+  return String(value || '').trim()
+}
+
+function dataOpsSqlLiteral(value: string): string {
+  const raw = String(value ?? '').trim()
+  if (!raw) return "''"
+  if (/^-?\d+(\.\d+)?$/.test(raw)) return raw
+  if (/^'.*'$/.test(raw)) return raw
+  return `'${raw.replace(/'/g, "''")}'`
+}
+
+function dataOpsSqlOperator(operator: string, value: string): string {
+  const op = String(operator || 'equals')
+  if (op === 'not_equals') return `<> ${dataOpsSqlLiteral(value)}`
+  if (op === 'greater_than') return `> ${dataOpsSqlLiteral(value)}`
+  if (op === 'less_than') return `< ${dataOpsSqlLiteral(value)}`
+  if (op === 'greater_or_equal') return `>= ${dataOpsSqlLiteral(value)}`
+  if (op === 'less_or_equal') return `<= ${dataOpsSqlLiteral(value)}`
+  if (op === 'contains') return `LIKE '%' || ${dataOpsSqlLiteral(value)} || '%'`
+  if (op === 'exists') return 'IS NOT NULL'
+  if (op === 'empty') return 'IS NULL'
+  return `= ${dataOpsSqlLiteral(value)}`
+}
+
+function dataOpsSqlCaseResultByMode(mode: string | undefined, value: string): string {
+  const raw = String(value ?? '').trim()
+  if (!raw) return "''"
+  if (mode === 'field') return dataOpsSqlIdent(raw)
+  if (mode === 'expression') return raw
+  if (/^-?\d+(\.\d+)?$/.test(raw)) return raw
+  if (/^'.*'$/.test(raw)) return raw
+  if (/^[A-Za-z_][\w$#]*(\.[A-Za-z_][\w$#]*)?$/.test(raw)) return raw
+  return dataOpsSqlLiteral(raw)
+}
+
+function dataOpsSqlJsonPathLiteral(path: string): string {
+  const clean = String(path || '').trim().replace(/^\$\.?/, '').replace(/^\.*/, '')
+  const normalized = clean
+    .split('.')
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+    .map((segment) => /^[A-Za-z_][\w$#]*$/.test(segment) ? `.${segment}` : `."${segment.replace(/"/g, '\\"')}"`)
+    .join('')
+  return `'${`$${normalized || ''}`.replace(/'/g, "''")}'`
+}
+
+function dataOpsSqlJsonValue(field: string, jsonPath: string, returnType = 'VARCHAR2(4000)'): string {
+  const source = dataOpsSqlIdent(field)
+  const path = dataOpsSqlJsonPathLiteral(jsonPath)
+  const type = String(returnType || 'VARCHAR2(4000)').trim().replace(/[^\w() ,]/g, '') || 'VARCHAR2(4000)'
+  return source ? `JSON_VALUE(${source}, ${path} RETURNING ${type} NULL ON ERROR)` : ''
+}
+
+function buildDataOpsQueryBuilderSql(step: DataOpsPipelineStep): string {
+  const selectFields = step.selectFields || []
+  const selectedSelectRows = selectFields.filter((item) => item.enabled !== false && (String(item.field || '').trim() || item.mode === 'case'))
+  const selectedGroupRows = (step.groupByFields || []).filter((item) => item.enabled !== false && String(item.field || '').trim())
+  const selectedOrderRows = (step.orderByRows || []).filter((item) => String(item.field || '').trim())
+  const hasAggregate = selectedSelectRows.some((item) => String(item.aggregate || '').trim())
+  const caseConditionSql = (branch: NonNullable<DataOpsFieldRow['caseBranches']>[number]) => {
+    const field = dataOpsSqlIdent(String(branch.field || ''))
+    if (!field) return ''
+    return `${field} ${dataOpsSqlOperator(String(branch.operator || 'equals'), String(branch.value || ''))}`
+  }
+  const fieldExpression = (item: DataOpsFieldRow) => {
+    const agg = String(item.aggregate || '').trim().toUpperCase()
+    const applyAggregate = (expr: string) => {
+      if (agg === 'COUNT_DISTINCT') return `COUNT(DISTINCT ${expr})`
+      if (agg === 'SUM') return `NVL(SUM(${expr}), 0)`
+      return agg ? `${agg}(${expr})` : expr
+    }
+    if (item.mode === 'case') {
+      const branches = (item.caseBranches || [])
+        .filter((branch) => branch.enabled !== false && String(branch.field || '').trim())
+        .map((branch) => `WHEN ${caseConditionSql(branch)} THEN ${dataOpsSqlCaseResultByMode(branch.thenMode, String(branch.then || ''))}`)
+      if (branches.length > 0) {
+        return applyAggregate(`CASE ${branches.join(' ')} ELSE ${dataOpsSqlCaseResultByMode(item.caseElseMode, String(item.caseElse || ''))} END`)
+      }
+      const condition = String(item.caseWhen || '').trim() || '1 = 1'
+      return applyAggregate(`CASE WHEN ${condition} THEN ${dataOpsSqlCaseResultByMode(undefined, String(item.caseThen || ''))} ELSE ${dataOpsSqlCaseResultByMode(item.caseElseMode, String(item.caseElse || ''))} END`)
+    }
+    if (item.mode === 'json') {
+      return applyAggregate(dataOpsSqlJsonValue(String(item.field || ''), String(item.jsonPath || ''), String(item.jsonReturnType || 'VARCHAR2(4000)')))
+    }
+    return applyAggregate(dataOpsSqlIdent(String(item.field || '')))
+  }
+  const selectSql = selectedSelectRows.length > 0
+    ? selectedSelectRows.map((item) => {
+      const expr = fieldExpression(item)
+      const agg = String(item.aggregate || '').trim().toUpperCase()
+      const aliasSource = item.mode === 'json' ? String(item.jsonPath || item.field || 'json_value') : String(item.field || 'case_value')
+      const baseAlias = aliasSource.replace(/^[^.]+\./, '').replace(/\W+/g, '_').replace(/^_+|_+$/g, '')
+      const alias = String(item.alias || (agg ? `${agg.toLowerCase()}_${baseAlias || 'value'}` : '')).trim()
+      return alias ? `${expr} AS ${alias}` : expr
+    }).join(',\n  ')
+    : '*'
+  const fromTables = (step.tables || []).filter((item) => item.enabled !== false && String(item.table || '').trim())
+  const enabledJoinRows = (step.joinKeys || []).filter((item) => item.enabled !== false && String(item.leftField || '').trim() && String(item.rightField || '').trim())
+  const tableSql = (item: DataOpsTableRow, index: number) => {
+    const schema = String(item.schema || '').trim()
+    const name = `${schema ? `${schema}.` : ''}${String(item.table || '').trim()}`
+    const alias = String(item.alias || `t${index + 1}`).trim()
+    return `${name}${alias ? ` ${alias}` : ''}`
+  }
+  const fromSql = (() => {
+    if (fromTables.length <= 0) return '<source_table>'
+    const usedJoinIds = new Set<string>()
+    const lines = [tableSql(fromTables[0], 0)]
+    fromTables.slice(1).forEach((table, index) => {
+      const alias = String(table.alias || `t${index + 2}`).trim()
+      const join = enabledJoinRows.find((row) => {
+        if (usedJoinIds.has(row.id)) return false
+        const left = String(row.leftField || '')
+        const right = String(row.rightField || '')
+        return left.startsWith(`${alias}.`) || right.startsWith(`${alias}.`)
+      }) || enabledJoinRows.find((row) => !usedJoinIds.has(row.id))
+      if (join) usedJoinIds.add(join.id)
+      const condition = join ? `${dataOpsSqlIdent(String(join.leftField || ''))} = ${dataOpsSqlIdent(String(join.rightField || ''))}` : '<join condition required>'
+      const joinType = String(join?.joinType || 'left').toUpperCase()
+      const joinKeyword = joinType === 'INNER' ? 'INNER JOIN' : joinType === 'RIGHT' ? 'RIGHT JOIN' : joinType === 'FULL' ? 'FULL OUTER JOIN' : 'LEFT JOIN'
+      lines.push(`${joinKeyword} ${tableSql(table, index + 1)} ON ${condition}`)
+    })
+    return lines.join('\n  ')
+  })()
+  const whereSql = (step.filterRules || [])
+    .filter((item) => item.enabled !== false && String(item.field || '').trim())
+    .map((item) => `${dataOpsSqlIdent(String(item.field || ''))} ${dataOpsSqlOperator(String(item.operator || 'equals'), String(item.value || ''))}`)
+  const groupSql = selectedGroupRows.map((item) => dataOpsSqlIdent(String(item.field || '')))
+  const havingSql = (step.havingRules || [])
+    .filter((item) => item.enabled !== false && String(item.field || '').trim())
+    .map((item) => `${dataOpsSqlIdent(String(item.field || ''))} ${dataOpsSqlOperator(String(item.operator || 'greater_than'), String(item.value || ''))}`)
+  const orderSql = selectedOrderRows.map((item) => `${dataOpsSqlIdent(String(item.field || ''))} ${String(item.direction || 'asc').toUpperCase()}`)
+  return [
+    `SELECT\n  ${selectSql}`,
+    `FROM\n  ${fromSql}`,
+    whereSql.length ? `WHERE\n  ${whereSql.join('\n  AND ')}` : '',
+    groupSql.length ? `GROUP BY\n  ${groupSql.join(', ')}` : (hasAggregate ? '-- Add GROUP BY fields for non-aggregated dimensions when needed.' : ''),
+    havingSql.length ? `HAVING\n  ${havingSql.join('\n  AND ')}` : '',
+    orderSql.length ? `ORDER BY\n  ${orderSql.join(', ')}` : '',
+    step.limitRows ? `FETCH FIRST ${Number(step.limitRows)} ROWS ONLY` : '',
+  ].filter(Boolean).join('\n')
+}
+
+function materializeDataOpsStepConfigsForSave(steps: DataOpsPipelineStep[]): DataOpsPipelineStep[] {
+  const now = new Date().toISOString()
+  return steps.map((step) => {
+    if (step.kind === 'prepare') {
+      const rows = step.queryBuilders || []
+      const targetId = String(step.activeQueryBuilderId || rows[0]?.id || dataOpsId('query'))
+      const existing = rows.find((item) => item.id === targetId)
+      const querySql = buildDataOpsQueryBuilderSql(step)
+      const nextConfig: DataOpsQueryBuilderConfig = {
+        id: targetId,
+        name: String(existing?.name || step.name || `Query ${rows.length + 1}`),
+        description: String(existing?.description || ''),
+        query: querySql,
+        expression: querySql,
+        tables: step.tables || [],
+        selectFields: step.selectFields || [],
+        filterRules: step.filterRules || [],
+        joinKeys: step.joinKeys || [],
+        groupByFields: step.groupByFields || [],
+        havingRules: step.havingRules || [],
+        orderByRows: step.orderByRows || [],
+        limitRows: step.limitRows,
+        updatedAt: now,
+      }
+      return {
+        ...step,
+        query: querySql,
+        expression: querySql,
+        activeQueryBuilderId: targetId,
+        queryBuilders: existing ? rows.map((item) => item.id === targetId ? nextConfig : item) : [...rows, nextConfig],
+      }
+    }
+    if (step.kind === 'router') {
+      const rows = step.routerConfigs || []
+      const targetId = String(step.activeRouterConfigId || rows[0]?.id || dataOpsId('router'))
+      const existing = rows.find((item) => item.id === targetId)
+      const nextConfig: DataOpsRouterConfig = {
+        id: targetId,
+        name: String(existing?.name || step.name || `Router ${rows.length + 1}`),
+        description: String(existing?.description || ''),
+        routeSource: step.routeSource || '',
+        routeMode: step.routeMode || 'multi',
+        payloadMode: step.payloadMode || 'all_rows',
+        routeRows: step.routeRows || [],
+        syncProcessingMode: step.syncProcessingMode || 'batch',
+        syncBatchSize: step.syncBatchSize || 1000,
+        syncCommitEvery: step.syncCommitEvery || 5000,
+        syncParallelEnabled: Boolean(step.syncParallelEnabled),
+        syncParallelWorkers: step.syncParallelWorkers || 4,
+        syncIncrementalField: step.syncIncrementalField || '',
+        syncCursorField: step.syncCursorField || '',
+        syncErrorMode: step.syncErrorMode || 'stop',
+        deployEnabled: Boolean(step.deployEnabled),
+        scheduleEnabled: Boolean(step.scheduleEnabled),
+        scheduleType: step.scheduleType || 'interval',
+        scheduleIntervalMinutes: step.scheduleIntervalMinutes || 60,
+        scheduleCron: step.scheduleCron || '0 * * * *',
+        scheduleTimezone: step.scheduleTimezone || 'Asia/Kolkata',
+        scheduleMaxParallelRuns: step.scheduleMaxParallelRuns || 1,
+        scheduleMisfirePolicy: step.scheduleMisfirePolicy || 'skip',
+        scheduleStatus: step.scheduleStatus || '',
+        scheduleBackendJobId: step.scheduleBackendJobId || '',
+        scheduleNextRunAt: step.scheduleNextRunAt || '',
+        scheduleLastRegisteredAt: step.scheduleLastRegisteredAt || '',
+        updatedAt: now,
+      }
+      return {
+        ...step,
+        activeRouterConfigId: targetId,
+        routerConfigs: existing ? rows.map((item) => item.id === targetId ? nextConfig : item) : [...rows, nextConfig],
+      }
+    }
+    if (step.kind === 'map') {
+      const rows = step.mapperConfigs || []
+      const targetId = String(step.activeMapperConfigId || rows[0]?.id || dataOpsId('mapper'))
+      const existing = rows.find((item) => item.id === targetId)
+      const nextConfig: DataOpsMapperConfig = {
+        id: targetId,
+        name: String(existing?.name || step.name || `Mapper ${rows.length + 1}`),
+        description: String(existing?.description || ''),
+        targetMode: step.targetMode || 'oracle',
+        writeMode: step.writeMode || 'upsert',
+        lookupSource: step.lookupSource || '',
+        target: step.target || '',
+        keyFields: step.keyFields || '',
+        mappingRows: step.mappingRows || [],
+        syncProcessingMode: step.syncProcessingMode || 'batch',
+        syncBatchSize: step.syncBatchSize || 1000,
+        syncCommitEvery: step.syncCommitEvery || 5000,
+        syncParallelEnabled: Boolean(step.syncParallelEnabled),
+        syncParallelWorkers: step.syncParallelWorkers || 4,
+        syncIncrementalField: step.syncIncrementalField || '',
+        syncCursorField: step.syncCursorField || '',
+        syncErrorMode: step.syncErrorMode || 'stop',
+        auditField: step.auditField || '_data_ops_audit',
+        expression: step.expression || '',
+        deployEnabled: Boolean(step.deployEnabled),
+        scheduleEnabled: Boolean(step.scheduleEnabled),
+        scheduleType: step.scheduleType || 'interval',
+        scheduleIntervalMinutes: step.scheduleIntervalMinutes || 60,
+        scheduleCron: step.scheduleCron || '0 * * * *',
+        scheduleTimezone: step.scheduleTimezone || 'Asia/Kolkata',
+        scheduleMaxParallelRuns: step.scheduleMaxParallelRuns || 1,
+        scheduleMisfirePolicy: step.scheduleMisfirePolicy || 'skip',
+        scheduleStatus: step.scheduleStatus || '',
+        scheduleBackendJobId: step.scheduleBackendJobId || '',
+        scheduleNextRunAt: step.scheduleNextRunAt || '',
+        scheduleLastRegisteredAt: step.scheduleLastRegisteredAt || '',
+        updatedAt: now,
+      }
+      return {
+        ...step,
+        activeMapperConfigId: targetId,
+        mapperConfigs: existing ? rows.map((item) => item.id === targetId ? nextConfig : item) : [...rows, nextConfig],
+      }
+    }
+    return step
+  })
+}
+
+function dataOpsActiveQuerySqlFromConfig(cfg: Record<string, unknown>): string {
+  const steps = normalizeDataOpsPipelineSteps(cfg.data_ops_pipeline_nodes, cfg.pipeline_steps)
+  const prepareStep = steps.find((step) => step.enabled !== false && step.kind === 'prepare')
+  return prepareStep ? dataOpsActiveQuerySqlFromStep(prepareStep) : ''
+}
+
+function extractDataOpsOutputFieldsFromConfig(cfg: Record<string, unknown>): string[] {
+  const fallbackFields = uniqueFieldNames([
+    ...parseFieldList(cfg._detected_columns),
+    ...parseFieldList(cfg.fields),
+    ...parseFieldList(cfg.output_fields),
+    ...extractSampleFieldPaths(cfg._preview_rows),
+  ])
+
+  const steps = normalizeDataOpsPipelineSteps(cfg.data_ops_pipeline_nodes, cfg.pipeline_steps)
+  let currentFields: string[] = []
+  steps.forEach((step) => {
+    if (step.enabled === false) return
+    if (step.kind === 'prepare') {
+      const selected = uniqueFieldNames((step.selectFields || [])
+        .filter((fieldRow) => fieldRow.enabled !== false)
+        .flatMap((fieldRow) => dataOpsFieldOutputNames(fieldRow)))
+      const activeQueryFields = dataOpsActiveQueryBuilderOutputFields(step)
+      const explicit = parseFieldList(step.fields)
+      const preparedFields = activeQueryFields.length > 0
+        ? activeQueryFields
+        : uniqueFieldNames([...selected, ...explicit])
+      if (preparedFields.length > 0) {
+        currentFields = step.projectionMode === 'drop'
+          ? uniqueFieldNames([...currentFields, ...preparedFields])
+          : preparedFields
+      }
+      const mapped = dataOpsMappingOutputNames(step.mappingRows)
+      if (mapped.length > 0) {
+        currentFields = uniqueFieldNames([...currentFields, ...mapped])
+      }
+      const outputMapped = dataOpsMappingOutputNames(step.outputMappings, false)
+      if (outputMapped.length > 0) {
+        currentFields = outputMapped
+      }
+      return
+    }
+    if (step.kind === 'validate') {
+      if (step.validationMode === 'tag') {
+        const rejectField = String(step.rejectField || '_data_ops_valid').trim() || '_data_ops_valid'
+        currentFields = uniqueFieldNames([...currentFields, rejectField, `${rejectField}_reason`])
+      }
+      return
+    }
+    if (step.kind === 'map') {
+      const mapped = dataOpsMappingOutputNames(step.mappingRows)
+      if (mapped.length > 0) {
+        currentFields = uniqueFieldNames([...currentFields, ...mapped])
+      }
+      return
+    }
+    if (step.kind === 'load') {
+      const outputMapped = dataOpsMappingOutputNames(step.outputMappings, false)
+      if (outputMapped.length > 0) {
+        currentFields = outputMapped
+      }
+    }
+  })
+
+  return filterUserFacingFieldNames(uniqueFieldNames(currentFields.length > 0 ? currentFields : fallbackFields))
+}
+
 function extractDirectNodeFields(node: ETLNode | undefined): string[] {
   if (!node?.data) return []
   const cfg = (node.data.config && typeof node.data.config === 'object'
     ? node.data.config
     : {}) as Record<string, unknown>
+  const nodeType = String(node.data.nodeType || '').trim().toLowerCase()
+  if (nodeType === 'data_ops') {
+    const dataOpsFields = extractDataOpsOutputFieldsFromConfig(cfg)
+    if (dataOpsFields.length > 0) return dataOpsFields
+  }
 
   const fields: string[] = []
   fields.push(...parseFieldList(cfg._detected_columns))
@@ -9506,6 +10335,11 @@ function inferNodeOutputFields(
       ...passthroughFields,
       ...extractMLOpsOutputFieldsFromConfig(cfg),
     ])
+  } else if (nodeType === 'data_ops') {
+    const dataOpsFields = extractDataOpsOutputFieldsFromConfig(cfg)
+    result = dataOpsFields.length > 0
+      ? dataOpsFields
+      : passthroughFields
   }
 
   result = filterUserFacingFieldNames(result)
@@ -10444,6 +11278,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [dataOpsQueryError, setDataOpsQueryError] = useState<string | null>(null)
   const [dataOpsSqlExecuting, setDataOpsSqlExecuting] = useState(false)
   const [dataOpsLastExecution, setDataOpsLastExecution] = useState<Record<string, any> | null>(null)
+  const [dataOpsStudioActiveTab, setDataOpsStudioActiveTab] = useState<'dashboard' | 'objects' | 'pipeline'>('pipeline')
   const [dataOpsSelectedObject, setDataOpsSelectedObject] = useState<{ schema: string; name: string; type: string } | null>(null)
   const [dataOpsDataTarget, setDataOpsDataTarget] = useState<{ schema: string; name: string; type: string } | null>(null)
   const [dataOpsActionOpen, setDataOpsActionOpen] = useState(false)
@@ -10453,10 +11288,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [dataOpsPipelineConfigOpen, setDataOpsPipelineConfigOpen] = useState(false)
   const [dataOpsQueryBuilderConfigOpen, setDataOpsQueryBuilderConfigOpen] = useState(false)
   const [dataOpsMapperConfigOpen, setDataOpsMapperConfigOpen] = useState(false)
+  const [dataOpsRouterConfigOpen, setDataOpsRouterConfigOpen] = useState(false)
+  const [dataOpsRouterRouteConfigId, setDataOpsRouterRouteConfigId] = useState('')
   const [dataOpsPipelineCanvasActive, setDataOpsPipelineCanvasActive] = useState(false)
   const [dataOpsNodeDragging, setDataOpsNodeDragging] = useState(false)
+  const [dataOpsFlowInstance, setDataOpsFlowInstance] = useState<ReactFlowInstance | null>(null)
+  const [dataOpsFlowViewport, setDataOpsFlowViewport] = useState({ x: 0, y: 0, zoom: 1 })
+  const dataOpsPipelineFitKeyRef = useRef('')
+  const [dataOpsRuntimeTick, setDataOpsRuntimeTick] = useState(() => Date.now())
+  const [dataOpsBackendMonitor, setDataOpsBackendMonitor] = useState<Record<string, any> | null>(null)
   const [dataOpsConnectionTestingById, setDataOpsConnectionTestingById] = useState<Record<string, boolean>>({})
   const [dataOpsConnectionConfigTarget, setDataOpsConnectionConfigTarget] = useState<{ stepId: string; connectionId: string } | null>(null)
+  const [dataOpsStepNameDraft, setDataOpsStepNameDraft] = useState<{ stepId: string; value: string } | null>(null)
   const [dataOpsPipelineUndoStack, setDataOpsPipelineUndoStack] = useState<DataOpsPipelineSnapshot[]>([])
   const [dataOpsPipelineRedoStack, setDataOpsPipelineRedoStack] = useState<DataOpsPipelineSnapshot[]>([])
   const [mlopsStudioOpen, setMLOpsStudioOpen] = useState(false)
@@ -16048,12 +16891,32 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         const sourceId = String(src.id || '').trim()
         const sourceLabel = String(src.label || sourceId).trim() || sourceId
         const sourceType = String(src.nodeType || '').trim().toLowerCase() || 'upstream'
+        const sourceNode = nodes.find((node) => node.id === sourceId)
+        const sourceDataOpsFields = sourceType === 'data_ops'
+          ? extractDataOpsOutputFieldsFromConfig(
+            (sourceNode?.data?.config && typeof sourceNode.data.config === 'object'
+              ? sourceNode.data.config
+              : {}) as Record<string, unknown>,
+          )
+          : []
         if (!sourceId) {
           return {
             sourceId: '',
             sourceLabel: '',
             sourceType: 'upstream',
             fields: [] as string[],
+          }
+        }
+        if (sourceType === 'data_ops') {
+          const remoteSourceFields = dataQueryRemoteFieldHintsBySource[sourceId] || []
+          const fields = filterUserFacingFieldNames(uniqueFieldNames([
+            ...(remoteSourceFields.length > 0 ? remoteSourceFields : sourceDataOpsFields),
+          ].map((field) => normalizeDataQueryPickerPath(field)))).slice(0, DATA_QUERY_FIELD_TREE_FIELD_LIMIT)
+          return {
+            sourceId,
+            sourceLabel,
+            sourceType,
+            fields,
           }
         }
         const inferred = inferUpstreamInputFields(
@@ -16093,6 +16956,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           edges,
         )
         const fields = filterUserFacingFieldNames(uniqueFieldNames([
+          ...sourceDataOpsFields,
           ...inferred,
           ...sourceInputHints,
           ...discovered,
@@ -16180,6 +17044,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         const sourceRootKey = `dqsrc::${sourceCluster.sourceId}`
         const sourcePrefix = sourceCluster.sourceType === 'profile_query_transform'
           ? 'Data Query'
+          : sourceCluster.sourceType === 'data_ops'
+            ? 'Data Ops'
           : (sourceCluster.sourceType === 'lmdb_source' ? 'LMDB' : 'Profile')
         const sourceTitle = `${sourcePrefix} · ${sourceCluster.sourceLabel}`
         const sourceRoot = getOrCreateNode(
@@ -18750,7 +19616,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const detectDataQuerySourceFieldOptions = useCallback(async () => {
     if (!dataQueryStudioOpen || nodeType !== 'profile_query_transform') return
     const sourceNodes = dataQueryUpstreamCandidateNodes
-      .filter((item) => String(item.nodeType || '').trim().toLowerCase().endsWith('_source'))
+      .filter((item) => {
+        const kind = String(item.nodeType || '').trim().toLowerCase()
+        return kind.endsWith('_source') || kind === 'data_ops'
+      })
       .slice(0, 25)
     if (sourceNodes.length <= 0) {
       setDataQueryRemoteFieldHints([])
@@ -18781,30 +19650,38 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     try {
       for (const sourceNode of sourceNodes) {
         let response: any = null
+        const sourceNodeType = String(sourceNode.nodeType || '').trim().toLowerCase()
+        const isDataOpsSource = sourceNodeType === 'data_ops'
         try {
           const requestConfig: Record<string, unknown> = {
             ...((sourceNode.config && typeof sourceNode.config === 'object'
               ? sourceNode.config
               : {}) as Record<string, unknown>),
           }
-          if (String(sourceNode.nodeType || '').trim().toLowerCase() === 'lmdb_source') {
+          if (sourceNodeType === 'lmdb_source') {
             if (pipelineId) requestConfig._schema_pipeline_id = pipelineId
             if (upstreamProfileNodeIds.length > 0) {
               requestConfig._schema_profile_node_ids = upstreamProfileNodeIds
             }
           }
-          response = await api.detectSourceFieldOptions(
-            sourceNode.nodeType,
-            requestConfig,
-            5000,
-            {
-              previewRows: 300,
-              includeSchemaScan: true,
-              schemaScanLimit: 10000,
-              previewCompact: false,
-              timeoutMs: 45000,
-            },
-          )
+          if (isDataOpsSource) {
+            const sql = dataOpsActiveQuerySqlFromConfig(requestConfig)
+            if (!sql) continue
+            response = await api.previewDataOpsOracleQuery(requestConfig, sql, 300)
+          } else {
+            response = await api.detectSourceFieldOptions(
+              sourceNode.nodeType,
+              requestConfig,
+              5000,
+              {
+                previewRows: 300,
+                includeSchemaScan: true,
+                schemaScanLimit: 10000,
+                previewCompact: false,
+                timeoutMs: 45000,
+              },
+            )
+          }
         } catch {
           continue
         }
@@ -18820,13 +19697,26 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           fieldSet.add(name)
           sourceFields.add(name)
         })
-        const previewRows = Array.isArray(response?.preview)
-          ? response.preview.filter((row: unknown) => !!row && typeof row === 'object' && !Array.isArray(row)) as Array<Record<string, unknown>>
+        const previewCandidate = Array.isArray(response?.preview) ? response.preview : response?.rows
+        const previewRows = Array.isArray(previewCandidate)
+          ? previewCandidate.filter((row: unknown) => !!row && typeof row === 'object' && !Array.isArray(row)) as Array<Record<string, unknown>>
           : []
-        const discovered = uniqueFieldNames([
+        const discoveredRaw = uniqueFieldNames([
           ...extractPriorityJsonFieldPaths(previewRows),
-          ...extractSampleFieldPaths(previewRows),
+          ...(isDataOpsSource ? [] : extractSampleFieldPaths(previewRows)),
         ])
+        const dataOpsOutputColumnSet = new Set(cols.map((name) => String(name || '').trim().toLowerCase()).filter(Boolean))
+        const dataOpsJsonColumnSet = new Set(PRIORITY_JSON_FIELD_NAMES.map((name) => name.toLowerCase()))
+        const discovered = isDataOpsSource
+          ? discoveredRaw.filter((name) => {
+            const path = String(name || '').trim()
+            if (!path) return false
+            const root = splitPathSegments(path)[0] || path
+            const rootLower = String(root || '').trim().toLowerCase()
+            return dataOpsOutputColumnSet.has(path.toLowerCase())
+              || (dataOpsOutputColumnSet.has(rootLower) && dataOpsJsonColumnSet.has(rootLower) && path.includes('.'))
+          })
+          : discoveredRaw
         discovered.forEach((name) => {
           fieldSet.add(name)
           sourceFields.add(name)
@@ -28669,6 +29559,119 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     border: '1px solid var(--app-border-strong)',
     color: 'var(--app-text)',
   }
+  const dataOpsSectionColors: Record<string, string> = {
+    source: '#38bdf8',
+    select: '#22c55e',
+    output: '#22c55e',
+    join: '#a78bfa',
+    where: '#f59e0b',
+    filter: '#f59e0b',
+    group: '#14b8a6',
+    having: '#f472b6',
+    order: '#818cf8',
+    schedule: '#f97316',
+    sql: '#e2e8f0',
+    action: '#60a5fa',
+  }
+  const dataOpsQueryLegendItems = [
+    ['Tables', dataOpsSectionColors.source],
+    ['Select', dataOpsSectionColors.select],
+    ['Join', dataOpsSectionColors.join],
+    ['Where', dataOpsSectionColors.where],
+    ['Group', dataOpsSectionColors.group],
+    ['Having', dataOpsSectionColors.having],
+    ['Order', dataOpsSectionColors.order],
+    ['SQL', dataOpsSectionColors.sql],
+  ] as const
+  const dataOpsLegendItems = [
+    ['Source', dataOpsSectionColors.source],
+    ['Output', dataOpsSectionColors.output],
+    ['Join', dataOpsSectionColors.join],
+    ['Filter', dataOpsSectionColors.filter],
+    ['Group', dataOpsSectionColors.group],
+    ['Schedule', dataOpsSectionColors.schedule],
+    ['SQL', dataOpsSectionColors.sql],
+  ] as const
+  const dataOpsPanelColor = (title: string): string => {
+    const text = String(title || '').toLowerCase()
+    if (/source|table/.test(text)) return dataOpsSectionColors.source
+    if (/select|output|target|mapping|column/.test(text)) return dataOpsSectionColors.output
+    if (/join|lookup/.test(text)) return dataOpsSectionColors.join
+    if (/where|filter/.test(text)) return dataOpsSectionColors.where
+    if (/having/.test(text)) return dataOpsSectionColors.having
+    if (/group/.test(text)) return dataOpsSectionColors.group
+    if (/order|limit/.test(text)) return dataOpsSectionColors.order
+    if (/deploy|schedule/.test(text)) return dataOpsSectionColors.schedule
+    if (/sql|query/.test(text)) return dataOpsSectionColors.sql
+    return dataOpsSectionColors.action
+  }
+  const dataOpsControlStyle = (color: string, base: CSSProperties = {}): CSSProperties => ({
+    ...base,
+    color,
+    '--data-ops-field-color': color,
+  } as CSSProperties)
+  const dataOpsInputStyle = (color: string, base: CSSProperties = {}): CSSProperties => ({
+    ...commonInputStyle,
+    ...base,
+    color,
+    '--data-ops-field-color': color,
+  } as CSSProperties)
+  const dataOpsSqlKeywords = new Set([
+    'ADD', 'ALL', 'ALTER', 'AND', 'AS', 'ASC', 'BETWEEN', 'BY', 'CASE', 'COUNT', 'CREATE', 'DELETE', 'DESC', 'DISTINCT',
+    'DROP', 'ELSE', 'END', 'EXISTS', 'FROM', 'FULL', 'GROUP', 'HAVING', 'IN', 'INNER', 'INSERT', 'INTO', 'IS', 'JOIN',
+    'LEFT', 'LIKE', 'MAX', 'MERGE', 'MIN', 'NOT', 'NULL', 'NVL', 'ON', 'OR', 'ORDER', 'OUTER', 'RIGHT', 'SELECT', 'SET',
+    'SUM', 'TABLE', 'THEN', 'TRUNCATE', 'UNION', 'UPDATE', 'USING', 'VALUES', 'WHEN', 'WHERE',
+  ])
+  const dataOpsSqlKeywordClass = (keyword: string): string => {
+    if (['SELECT', 'DISTINCT', 'AS'].includes(keyword)) return 'data-ops-sql-select'
+    if (['FROM', 'INTO', 'USING', 'TABLE'].includes(keyword)) return 'data-ops-sql-source'
+    if (['JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER', 'ON'].includes(keyword)) return 'data-ops-sql-join'
+    if (['WHERE', 'AND', 'OR', 'BETWEEN', 'LIKE', 'IN', 'IS', 'NOT', 'NULL', 'EXISTS'].includes(keyword)) return 'data-ops-sql-where'
+    if (['GROUP', 'BY'].includes(keyword)) return 'data-ops-sql-group'
+    if (['HAVING'].includes(keyword)) return 'data-ops-sql-having'
+    if (['ORDER', 'ASC', 'DESC'].includes(keyword)) return 'data-ops-sql-order'
+    if (['INSERT', 'UPDATE', 'DELETE', 'MERGE', 'SET', 'VALUES', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE'].includes(keyword)) return 'data-ops-sql-action'
+    return 'data-ops-sql-keyword'
+  }
+  const renderDataOpsSqlPreview = (sql: string, maxHeight = 300) => {
+    const text = String(sql || '').trim() || '-- No SQL generated yet.'
+    const tokens = text.match(/(--[^\n]*|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|\b\d+(?:\.\d+)?\b|\b[A-Za-z_][\w$#]*\b|\s+|[^\sA-Za-z_0-9]+)/g) || [text]
+    let identifierContext: 'column' | 'table' = 'column'
+    const nearestToken = (fromIndex: number, direction: -1 | 1) => {
+      for (let cursor = fromIndex + direction; cursor >= 0 && cursor < tokens.length; cursor += direction) {
+        const value = tokens[cursor]
+        if (!/^\s+$/.test(value)) return value
+      }
+      return ''
+    }
+    return (
+      <pre className="data-ops-sql-preview" style={{ maxHeight }}>
+        {tokens.map((token, index) => {
+          const upper = token.toUpperCase()
+          const previousToken = nearestToken(index, -1)
+          const nextToken = nearestToken(index, 1)
+          let className = 'data-ops-sql-operator'
+          if (/^\s+$/.test(token)) className = ''
+          else if (/^(--|\/\*)/.test(token)) className = 'data-ops-sql-comment'
+          else if (/^'/.test(token)) className = 'data-ops-sql-string'
+          else if (/^\d/.test(token)) className = 'data-ops-sql-number'
+          else if (dataOpsSqlKeywords.has(upper)) {
+            className = dataOpsSqlKeywordClass(upper)
+            if (['FROM', 'JOIN', 'INTO', 'USING', 'UPDATE', 'MERGE', 'TABLE'].includes(upper)) identifierContext = 'table'
+            else if (['SELECT', 'WHERE', 'ON', 'GROUP', 'HAVING', 'ORDER', 'BY', 'SET', 'VALUES', 'AS', 'AND', 'OR'].includes(upper)) identifierContext = 'column'
+          }
+          else if (/^[A-Za-z_]/.test(token) && nextToken === '(' && identifierContext !== 'table') className = 'data-ops-sql-function'
+          else if (/^[A-Za-z_]/.test(token)) {
+            if (nextToken === '.') className = 'data-ops-sql-table'
+            else if (previousToken === '.') className = identifierContext === 'table' ? 'data-ops-sql-table' : 'data-ops-sql-column'
+            else className = identifierContext === 'table' ? 'data-ops-sql-table' : 'data-ops-sql-column'
+            if (identifierContext === 'table' && nextToken === '(') identifierContext = 'column'
+          }
+          return <span key={`data_ops_sql_${index}`} className={className || undefined}>{token}</span>
+        })}
+      </pre>
+    )
+  }
 
   const renderField = (field: ConfigField) => {
     const val = nodeConfig[field.name]
@@ -29158,13 +30161,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   })
   const canUseCustomFieldStudio = nodeType === 'map_transform'
   const gatewayRuntimePath = gatewayDraftRuntimePath(gatewayStudioDraft)
-  const loadDataOpsOracleCatalog = async (objectName = '', searchOverride?: string) => {
+  const loadDataOpsOracleCatalog = async (objectName = '', searchOverride?: string, schemaOverride?: string) => {
     if (!selectedNodeId) return
     setDataOpsCatalogLoading(true)
     setDataOpsCatalogError(null)
     try {
       const response = await api.discoverDataOpsOracleCatalog(nodeConfig, {
-        schema: String(nodeConfig.oracle_schema || ''),
+        schema: schemaOverride !== undefined ? schemaOverride : String(nodeConfig.oracle_schema || ''),
         object: objectName,
         search: searchOverride ?? dataOpsCatalogSearch,
         limit: 1000,
@@ -29238,8 +30241,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const dataOpsCatalogTriggers = Array.isArray(dataOpsCatalog?.triggers) ? dataOpsCatalog.triggers : []
   const dataOpsObjectDataRows = Array.isArray(dataOpsObjectData?.rows) ? dataOpsObjectData.rows : []
   const dataOpsObjectDataColumns = Array.isArray(dataOpsObjectData?.columns) ? dataOpsObjectData.columns : []
+  const dataOpsObjectDataJsonPaths = parseDetectedJsonPaths((dataOpsObjectData as any)?.json_paths || (dataOpsObjectData as any)?._json_paths)
   const dataOpsQueryResultRows = Array.isArray(dataOpsQueryResult?.rows) ? dataOpsQueryResult.rows : []
   const dataOpsQueryResultColumns = Array.isArray(dataOpsQueryResult?.columns) ? dataOpsQueryResult.columns : []
+  const dataOpsQueryResultJsonPaths = parseDetectedJsonPaths((dataOpsQueryResult as any)?.json_paths || (dataOpsQueryResult as any)?._json_paths)
   const dataOpsSelectedObjectName = String(dataOpsSelectedObject?.name || (dataOpsCatalog?.selected as any)?.name || String(nodeConfig.managed_objects || '').split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean)[0] || 'NEW_DATA_VAULT_OBJECT').trim()
   const dataOpsSelectedSchemaName = String(dataOpsSelectedObject?.schema || (dataOpsCatalog?.selected as any)?.schema || nodeConfig.oracle_schema || 'SYSTEM').trim()
   const dataOpsSelectedObjectType = String(dataOpsSelectedObject?.type || (dataOpsCatalog?.selected as any)?.type || nodeConfig.data_ops_object_type || 'TABLE').trim()
@@ -29647,6 +30652,54 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       .filter(Boolean),
     [nodeConfig.managed_objects],
   )
+  const dataOpsSqlCompletionTables = useMemo(() => uniqueFieldNames([
+    ...dataOpsCatalogObjects.flatMap((item: any) => {
+      const schema = String(item.schema || dataOpsSelectedSchemaName || '').trim()
+      const name = String(item.name || '').trim()
+      if (!name) return []
+      return schema ? [name, `${schema}.${name}`] : [name]
+    }),
+    ...dataOpsManagedObjects.flatMap((name) => {
+      const raw = String(name || '').trim()
+      if (!raw) return []
+      return raw.includes('.') ? [raw] : [raw, `${dataOpsDataTargetSchema || dataOpsSelectedSchemaName}.${raw}`]
+    }),
+    dataOpsDataTargetName,
+    dataOpsDataTargetName ? `${dataOpsDataTargetSchema}.${dataOpsDataTargetName}` : '',
+    dataOpsSelectedObjectName,
+    dataOpsSelectedObjectName ? `${dataOpsSelectedSchemaName}.${dataOpsSelectedObjectName}` : '',
+  ].filter(Boolean)), [
+    dataOpsCatalogObjects,
+    dataOpsDataTargetName,
+    dataOpsDataTargetSchema,
+    dataOpsManagedObjects,
+    dataOpsSelectedObjectName,
+    dataOpsSelectedSchemaName,
+  ])
+  const dataOpsSqlCompletionColumns = useMemo(() => uniqueFieldNames([
+    ...dataOpsCatalogColumns.flatMap((item: any) => {
+      const name = String(item.column_name || item.name || item.field || '').trim()
+      const owner = String(item.table_name || item.object_name || '').trim()
+      return name ? [name, owner ? `${owner}.${name}` : ''] : []
+    }),
+    ...dataOpsObjectDataColumns.map((item: unknown) => String(item || '').trim()),
+    ...dataOpsObjectDataJsonPaths,
+    ...dataOpsQueryResultColumns.map((item: unknown) => String(item || '').trim()),
+    ...dataOpsQueryResultJsonPaths,
+  ].filter(Boolean)), [
+    dataOpsCatalogColumns,
+    dataOpsObjectDataColumns,
+    dataOpsObjectDataJsonPaths,
+    dataOpsQueryResultColumns,
+    dataOpsQueryResultJsonPaths,
+  ])
+  useEffect(() => {
+    setDataOpsSqlCompletionCatalog({
+      tables: dataOpsSqlCompletionTables,
+      columns: dataOpsSqlCompletionColumns,
+      functions: DATA_OPS_SQL_FUNCTIONS,
+    })
+  }, [dataOpsSqlCompletionColumns, dataOpsSqlCompletionTables])
   const dataOpsPipelineSteps = useMemo(
     () => normalizeDataOpsPipelineSteps(nodeConfig.data_ops_pipeline_nodes, nodeConfig.pipeline_steps),
     [nodeConfig.data_ops_pipeline_nodes, nodeConfig.pipeline_steps],
@@ -29655,6 +30708,99 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => normalizeDataOpsPipelineEdges(nodeConfig.data_ops_pipeline_edges, dataOpsPipelineSteps),
     [dataOpsPipelineSteps, nodeConfig.data_ops_pipeline_edges],
   )
+  useEffect(() => {
+    if (!open || nodeType !== 'data_ops' || !activePipelineId || !selectedNodeId) return
+    let cancelled = false
+    const refreshLiveScheduleFields = async () => {
+      try {
+        const freshPipeline = await api.getPipeline(activePipelineId)
+        if (cancelled) return
+        const freshNode = Array.isArray(freshPipeline?.nodes)
+          ? freshPipeline.nodes.find((item: any) => String(item?.id || '') === String(selectedNodeId || ''))
+          : null
+        const freshConfig = freshNode?.data?.config && typeof freshNode.data.config === 'object'
+          ? freshNode.data.config as Record<string, unknown>
+          : null
+        if (!freshConfig) return
+        const savedSteps = normalizeDataOpsPipelineSteps(freshConfig.data_ops_pipeline_nodes, freshConfig.pipeline_steps)
+        if (!savedSteps.length) return
+        const state = useWorkflowStore.getState()
+        const currentNode = state.nodes.find((item) => String(item.id || '') === String(selectedNodeId || ''))
+        const currentConfig = currentNode?.data?.config && typeof currentNode.data.config === 'object'
+          ? currentNode.data.config as Record<string, unknown>
+          : nodeConfig
+        const currentSteps = normalizeDataOpsPipelineSteps(currentConfig.data_ops_pipeline_nodes, currentConfig.pipeline_steps)
+        let changed = false
+        const nextSteps = currentSteps.map((step) => {
+          const savedStep = savedSteps.find((item) => String(item.id || '') === String(step.id || ''))
+          const merged = mergeDataOpsLiveScheduleStep(step, savedStep)
+          changed = changed || merged.changed
+          return merged.step
+        })
+        if (!changed || cancelled) return
+        updateNodeConfigSilent(selectedNodeId, {
+          data_ops_pipeline_nodes: cloneDataOpsPipelineSteps(nextSteps),
+          pipeline_steps: dataOpsPipelineText(nextSteps),
+        })
+      } catch {
+        // Live schedule refresh is best-effort; registration and execution paths remain authoritative.
+      }
+    }
+    void refreshLiveScheduleFields()
+    const timer = window.setInterval(refreshLiveScheduleFields, 15000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [activePipelineId, nodeConfig, nodeType, open, selectedNodeId, updateNodeConfigSilent])
+  useEffect(() => {
+    if (!open || nodeType !== 'data_ops' || !dataOpsStudioOpen) return
+    let cancelled = false
+    const refreshBackendMonitor = async () => {
+      try {
+        const response = await api.getRuntimeMonitor()
+        if (!cancelled) setDataOpsBackendMonitor(response && typeof response === 'object' ? response : null)
+      } catch {
+        if (!cancelled) setDataOpsBackendMonitor(null)
+      }
+    }
+    void refreshBackendMonitor()
+    const timer = window.setInterval(refreshBackendMonitor, 10000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [dataOpsStudioOpen, nodeType, open])
+  const saveDataOpsStudioConfig = useCallback(async () => {
+    if (!selectedNodeId) return
+    const storeState = useWorkflowStore.getState()
+    const targetNode = storeState.nodes.find((node) => node.id === selectedNodeId)
+    const cfg = targetNode?.data?.config && typeof targetNode.data.config === 'object'
+      ? targetNode.data.config as Record<string, unknown>
+      : nodeConfig
+    const rawSteps = normalizeDataOpsPipelineSteps(cfg.data_ops_pipeline_nodes, cfg.pipeline_steps)
+    const draftAppliedSteps = dataOpsStepNameDraft?.stepId
+      ? rawSteps.map((step) => step.id === dataOpsStepNameDraft.stepId ? { ...step, name: dataOpsStepNameDraft.value } : step)
+      : rawSteps
+    const materializedSteps = materializeDataOpsStepConfigsForSave(draftAppliedSteps)
+    const materializedEdges = normalizeDataOpsPipelineEdges(cfg.data_ops_pipeline_edges, materializedSteps)
+    const patch = {
+      ...cfg,
+      data_ops_pipeline_nodes: cloneDataOpsPipelineSteps(materializedSteps),
+      data_ops_pipeline_edges: serializeDataOpsPipelineEdges(materializedEdges),
+      pipeline_steps: dataOpsPipelineText(materializedSteps),
+    }
+    updateNodeConfig(selectedNodeId, patch)
+    setDataOpsStepNameDraft(null)
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
+    await useWorkflowStore.getState().savePipeline()
+    notification.success({
+      message: 'Data Vault Studio saved permanently',
+      description: 'Query Builder, Router, and Mapper configurations were snapshot-saved.',
+      placement: 'bottomRight',
+      duration: 3,
+    })
+  }, [dataOpsStepNameDraft, nodeConfig, selectedNodeId, updateNodeConfig])
   const dataOpsPreviewMetrics = useMemo(() => (
     nodeConfig.data_ops_preview_metrics && typeof nodeConfig.data_ops_preview_metrics === 'object'
       ? nodeConfig.data_ops_preview_metrics as Record<string, unknown>
@@ -29689,6 +30835,39 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => Array.isArray(nodeConfig.data_ops_preview_reject_reasons) ? nodeConfig.data_ops_preview_reject_reasons as Array<Record<string, unknown>> : [],
     [nodeConfig.data_ops_preview_reject_reasons],
   )
+  const dataOpsParentRuntime = useMemo(() => {
+    const normalizeStatus = (value: unknown) => {
+      const status = String(value || '').trim().toLowerCase()
+      if (status === 'running' || status === 'queued' || status === 'pending') return 'running'
+      if (status === 'success' || status === 'complete' || status === 'completed') return 'success'
+      if (status === 'warning' || status === 'skipped' || status === 'skip') return 'warning'
+      if (status === 'error' || status === 'failed' || status === 'failure') return 'error'
+      return 'idle'
+    }
+    const latestParentLog = [...(executionLogs || [])].reverse().find((log: any) => String(log?.nodeId || log?.node_id || '') === String(selectedNodeId || '')) as Record<string, unknown> | undefined
+    const status = normalizeStatus(latestParentLog?.status || data?.status)
+    const startedRaw = latestParentLog?.started_at || latestParentLog?.timestamp || data?.executionStartedAt
+    const startedMs = Date.parse(String(startedRaw || ''))
+    return {
+      status,
+      startedMs: Number.isFinite(startedMs) ? startedMs : Date.now(),
+      rows: Number.isFinite(Number(latestParentLog?.rows ?? data?.executionRows)) ? Number(latestParentLog?.rows ?? data?.executionRows) : undefined,
+      processedRows: Number.isFinite(Number(latestParentLog?.processed_rows ?? data?.executionProcessedRows)) ? Number(latestParentLog?.processed_rows ?? data?.executionProcessedRows) : undefined,
+    }
+  }, [
+    data?.executionProcessedRows,
+    data?.executionRows,
+    data?.executionStartedAt,
+    data?.status,
+    executionLogs,
+    selectedNodeId,
+  ])
+  useEffect(() => {
+    if (nodeType !== 'data_ops' || dataOpsParentRuntime.status !== 'running') return
+    setDataOpsRuntimeTick(Date.now())
+    const timer = window.setInterval(() => setDataOpsRuntimeTick(Date.now()), 700)
+    return () => window.clearInterval(timer)
+  }, [dataOpsParentRuntime.status, nodeType, selectedNodeId])
   useEffect(() => {
     if (nodeType !== 'data_ops' || !selectedNodeId) return
     const rawSteps = Array.isArray(nodeConfig.data_ops_pipeline_nodes) ? nodeConfig.data_ops_pipeline_nodes : []
@@ -29839,6 +31018,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       mappingRows: [],
       outputMappings: [],
       lookupSource: '',
+      routeSource: '',
+      routeMode: 'multi',
+      payloadMode: 'all_rows',
+      routeRows: [],
       connections: [],
       tables: [],
       groupByFields: [],
@@ -29846,31 +31029,79 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       orderByRows: [],
       queryBuilders: [],
       activeQueryBuilderId: '',
+      mapperConfigs: [],
+      activeMapperConfigId: '',
+      routerConfigs: [],
+      activeRouterConfigId: '',
       limitRows: undefined,
       retry: kind !== 'source',
       checkpoint: true,
     }
     const nextSteps = [...dataOpsPipelineSteps, nextStep]
-    const nextEdges = dataOpsPipelineSteps.length
-      ? [
-        ...dataOpsPipelineEdges,
-        {
-          id: `data_ops_edge_${Date.now()}`,
-          source: dataOpsPipelineSteps[dataOpsPipelineSteps.length - 1].id,
-          target: id,
-          animated: true,
-          type: 'smoothstep',
-          style: { stroke: '#8b98aa', strokeWidth: 1.4, strokeDasharray: '2 5' },
-        } as Edge,
-      ]
-      : dataOpsPipelineEdges
-    persistDataOpsPipeline(nextSteps, nextEdges)
+    persistDataOpsPipeline(nextSteps, dataOpsPipelineEdges)
     setDataOpsSelectedPipelineStepId(id)
   }, [dataOpsPipelineEdges, dataOpsPipelineSteps, persistDataOpsPipeline])
-  const patchDataOpsPipelineStep = useCallback((stepId: string, patch: Partial<DataOpsPipelineStep>) => {
+  const patchDataOpsPipelineStep = useCallback((stepId: string, patch: Partial<DataOpsPipelineStep>, recordHistory = true) => {
     const nextSteps = dataOpsPipelineSteps.map((step) => step.id === stepId ? { ...step, ...patch } : step)
-    persistDataOpsPipeline(nextSteps)
-  }, [dataOpsPipelineSteps, persistDataOpsPipeline])
+    persistDataOpsPipeline(nextSteps, dataOpsPipelineEdges, recordHistory)
+  }, [dataOpsPipelineEdges, dataOpsPipelineSteps, persistDataOpsPipeline])
+  const patchDataOpsStepNameDirect = useCallback((stepId: string, value: string, persist = false) => {
+    if (!selectedNodeId) return
+    const storeState = useWorkflowStore.getState()
+    const targetNode = storeState.nodes.find((node) => node.id === selectedNodeId)
+    const cfg = targetNode?.data?.config && typeof targetNode.data.config === 'object'
+      ? targetNode.data.config as Record<string, unknown>
+      : nodeConfig
+    const currentSteps = normalizeDataOpsPipelineSteps(cfg.data_ops_pipeline_nodes, cfg.pipeline_steps)
+    const existingStep = currentSteps.find((step) => step.id === stepId)
+    if (!existingStep) return
+    const nextName = persist
+      ? (String(value || '').trim() || existingStep.name || DATA_OPS_STEP_KIND_META[existingStep.kind].label)
+      : String(value ?? '')
+    const nextSteps = currentSteps.map((step) => step.id === stepId ? { ...step, name: nextName } : step)
+    const rawEdges = Array.isArray(cfg.data_ops_pipeline_edges) ? cfg.data_ops_pipeline_edges : dataOpsPipelineEdges
+    const nextEdges = serializeDataOpsPipelineEdges(cloneDataOpsPipelineEdges(rawEdges as Edge[]))
+    const patch = {
+      data_ops_pipeline_nodes: cloneDataOpsPipelineSteps(nextSteps),
+      data_ops_pipeline_edges: nextEdges,
+      pipeline_steps: dataOpsPipelineText(nextSteps),
+    }
+    if (persist) {
+      updateNodeConfig(selectedNodeId, patch)
+    } else {
+      updateNodeConfigSilent(selectedNodeId, patch)
+    }
+  }, [dataOpsPipelineEdges, nodeConfig, selectedNodeId, updateNodeConfig, updateNodeConfigSilent])
+  const dataOpsStepNameInputValue = useCallback((step: DataOpsPipelineStep) => (
+    dataOpsStepNameDraft?.stepId === step.id ? dataOpsStepNameDraft.value : step.name
+  ), [dataOpsStepNameDraft])
+  const beginDataOpsStepNameEdit = useCallback((step: DataOpsPipelineStep) => {
+    setDataOpsStepNameDraft({ stepId: step.id, value: dataOpsStepNameDraft?.stepId === step.id ? dataOpsStepNameDraft.value : step.name })
+  }, [dataOpsStepNameDraft])
+  const changeDataOpsStepNameDraft = useCallback((stepId: string, value: string) => {
+    setDataOpsStepNameDraft({ stepId, value })
+    patchDataOpsStepNameDirect(stepId, value, false)
+  }, [patchDataOpsStepNameDirect])
+  const commitDataOpsStepNameDraft = useCallback((step: DataOpsPipelineStep) => {
+    const value = dataOpsStepNameDraft?.stepId === step.id ? dataOpsStepNameDraft.value : step.name
+    const nextName = String(value || '').trim() || step.name || DATA_OPS_STEP_KIND_META[step.kind].label
+    setDataOpsStepNameDraft({ stepId: step.id, value: nextName })
+    patchDataOpsStepNameDirect(step.id, nextName, true)
+    window.setTimeout(() => {
+      void useWorkflowStore.getState().savePipeline().then(() => {
+        notification.success({ message: 'Step name saved permanently', placement: 'bottomRight', duration: 2 })
+        window.setTimeout(() => {
+          setDataOpsStepNameDraft((current) => current?.stepId === step.id ? null : current)
+        }, 300)
+      }).catch((err) => {
+        notification.error({
+          message: 'Permanent save failed',
+          description: String(err?.message || 'Failed to save pipeline'),
+          placement: 'bottomRight',
+        })
+      })
+    }, 150)
+  }, [dataOpsStepNameDraft, patchDataOpsStepNameDirect])
   const buildDataOpsMapperSyncSql = useCallback((step: DataOpsPipelineStep): { sql: string; issue: string } => {
     const target = String(step.target || '').trim()
     const writeMode = String(step.writeMode || 'upsert')
@@ -30012,6 +31243,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         config: nextConfig,
         sql,
         job_id: `${selectedNodeId}:${step.id}:${String(nextStep.activeMapperConfigId || 'active')}`,
+        pipeline_id: activePipelineId,
+        data_ops_node_id: selectedNodeId,
+        mapper_step_id: step.id,
+        mapper_config_id: String(nextStep.activeMapperConfigId || ''),
         enabled: scheduleEnabled,
         deploy_enabled: deployEnabled,
         schedule_type: String(nextStep.scheduleType || 'interval'),
@@ -30064,7 +31299,83 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         placement: 'bottomRight',
       })
     }
-  }, [buildDataOpsMapperSyncSql, nodeConfig, patchDataOpsPipelineStep, persistPipelineAfterConfigUpdate, selectedNodeId])
+  }, [activePipelineId, buildDataOpsMapperSyncSql, nodeConfig, patchDataOpsPipelineStep, persistPipelineAfterConfigUpdate, selectedNodeId])
+
+  const deployDataOpsRouterScheduler = useCallback(async (step: DataOpsPipelineStep, schedulePatch: Record<string, unknown> = {}) => {
+    if (!activePipelineId || !selectedNodeId) {
+      notification.warning({ message: 'Scheduler not ready', description: 'Save the pipeline before registering a router schedule.', placement: 'bottomRight' })
+      return
+    }
+    const nextStep = { ...step, ...schedulePatch } as DataOpsPipelineStep
+    const deployEnabled = Boolean(nextStep.deployEnabled)
+    const scheduleEnabled = Boolean(nextStep.scheduleEnabled)
+    const activeRouterConfigId = String(
+      nextStep.activeRouterConfigId
+      || (Array.isArray(nextStep.routerConfigs) ? nextStep.routerConfigs[0]?.id : '')
+      || ''
+    )
+    try {
+      const response = await api.scheduleDataOpsRouter({
+        pipeline_id: activePipelineId,
+        job_id: `${activePipelineId}:${selectedNodeId}:${step.id}:${activeRouterConfigId || 'active'}`,
+        data_ops_node_id: selectedNodeId,
+        router_step_id: step.id,
+        router_config_id: activeRouterConfigId,
+        enabled: scheduleEnabled,
+        deploy_enabled: deployEnabled,
+        schedule_type: String(nextStep.scheduleType || 'interval'),
+        interval_minutes: Number(nextStep.scheduleIntervalMinutes || 60),
+        cron: String(nextStep.scheduleCron || '0 * * * *'),
+        timezone: String(nextStep.scheduleTimezone || 'Asia/Kolkata'),
+        max_instances: Number(nextStep.scheduleMaxParallelRuns || 1),
+        misfire_policy: String(nextStep.scheduleMisfirePolicy || 'skip'),
+      })
+      const schedulerPatch: Partial<DataOpsPipelineStep> = {
+        ...schedulePatch,
+        scheduleBackendJobId: response?.job_id || '',
+        scheduleNextRunAt: response?.enabled ? (response?.next_run_at || '') : '',
+        scheduleStatus: response?.enabled ? 'scheduled' : 'disabled',
+        scheduleLastRegisteredAt: new Date().toISOString(),
+      }
+      const activeConfigId = activeRouterConfigId
+      const schedulerConfigPatch: Partial<DataOpsRouterConfig> = {
+        deployEnabled: Boolean(nextStep.deployEnabled),
+        scheduleEnabled: Boolean(nextStep.scheduleEnabled),
+        scheduleType: nextStep.scheduleType || 'interval',
+        scheduleIntervalMinutes: nextStep.scheduleIntervalMinutes || 60,
+        scheduleCron: nextStep.scheduleCron || '0 * * * *',
+        scheduleTimezone: nextStep.scheduleTimezone || 'Asia/Kolkata',
+        scheduleMaxParallelRuns: nextStep.scheduleMaxParallelRuns || 1,
+        scheduleMisfirePolicy: nextStep.scheduleMisfirePolicy || 'skip',
+        scheduleBackendJobId: schedulerPatch.scheduleBackendJobId,
+        scheduleNextRunAt: schedulerPatch.scheduleNextRunAt,
+        scheduleStatus: schedulerPatch.scheduleStatus,
+        scheduleLastRegisteredAt: schedulerPatch.scheduleLastRegisteredAt,
+        updatedAt: new Date().toISOString(),
+      }
+      patchDataOpsPipelineStep(step.id, {
+        ...schedulerPatch,
+        activeRouterConfigId: activeConfigId || nextStep.activeRouterConfigId,
+        routerConfigs: activeConfigId && Array.isArray(nextStep.routerConfigs)
+          ? nextStep.routerConfigs.map((item) => item.id === activeConfigId ? { ...item, ...schedulerConfigPatch } : item)
+          : nextStep.routerConfigs,
+      })
+      notification.success({
+        message: response?.enabled ? 'Router scheduler enabled' : 'Router scheduler disabled',
+        description: response?.next_run_at ? `Next run: ${String(response.next_run_at)}` : String(response?.message || ''),
+        placement: 'bottomRight',
+        duration: 3,
+      })
+      persistPipelineAfterConfigUpdate('Router scheduler saved permanently')
+    } catch (err: any) {
+      notification.error({
+        message: 'Router scheduler failed',
+        description: String(err?.message || 'Failed to configure router scheduler'),
+        placement: 'bottomRight',
+      })
+    }
+  }, [activePipelineId, patchDataOpsPipelineStep, persistPipelineAfterConfigUpdate, selectedNodeId])
+
   const runDataOpsPipelinePreview = useCallback(() => {
     if (!selectedNodeId) return
     const enabledSteps = dataOpsPipelineSteps.filter((step) => step.enabled !== false)
@@ -30096,6 +31407,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         const ruleCount = (step.filterRules || []).filter((rule) => rule.enabled !== false).length
         stepRejected = ruleCount > 0 ? Math.max(1, Math.floor(before * Math.min(0.08, ruleCount * 0.02))) : 0
         if (stepRejected > 0) rejectReasons.push({ step: step.name, reason: 'validation rule reject estimate', rows: stepRejected })
+      }
+      if (step.kind === 'router') {
+        const routeCount = (step.routeRows || []).filter((row) => row.enabled !== false).length
+        if (!step.routeSource) notes.push('using upstream/active query result')
+        notes.push(routeCount > 0 ? `${routeCount} route(s) configured` : 'no active routes configured')
       }
       if (step.kind === 'map') {
         const mappingCount = (step.mappingRows || []).filter((row) => row.enabled !== false && row.source && row.target).length
@@ -30276,16 +31592,269 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     window.addEventListener('keydown', handler, true)
     return () => window.removeEventListener('keydown', handler, true)
   }, [dataOpsPipelineCanvasActive, dataOpsStudioOpen, deleteSelectedDataOpsPipelineItem, nodeType])
+  const dataOpsStepVisualStateById = useMemo(() => {
+    const normalizeRuntimeStatus = (value: unknown) => {
+      const status = String(value || '').trim().toLowerCase()
+      if (status === 'running' || status === 'queued' || status === 'pending' || status === 'retrying') return 'running'
+      if (status === 'success' || status === 'complete' || status === 'completed') return 'success'
+      if (status === 'warning' || status === 'skipped' || status === 'skip') return 'warning'
+      if (status === 'error' || status === 'failed' || status === 'failure') return 'error'
+      return ''
+    }
+    const statusColor = (status: string) => {
+      if (/run|process|active|pending|queued/i.test(status)) return '#60a5fa'
+      if (/fail|error|reject/i.test(status)) return '#ef4444'
+      if (/warn|skip/i.test(status)) return '#f59e0b'
+      return ''
+    }
+    const stepIds = new Set(dataOpsPipelineSteps.map((step) => step.id))
+    const childRuntimeByStepId = new Map<string, { status: string; rows?: number; processedRows?: number; startedAt?: string; finishedAt?: string; durationMs?: number }>()
+    for (const rawLog of executionLogs || []) {
+      const log = rawLog && typeof rawLog === 'object' ? rawLog as Record<string, unknown> : {}
+      const rawNodeId = String(log.nodeId || log.node_id || '').trim()
+      if (!rawNodeId) continue
+      let stepId = ''
+      const parentPrefix = selectedNodeId ? `${selectedNodeId}::` : ''
+      if (parentPrefix && rawNodeId.startsWith(parentPrefix)) {
+        const parts = rawNodeId.slice(parentPrefix.length).split('::').filter(Boolean)
+        stepId = parts.length === 2 && /^i\d+$/i.test(parts[0]) ? parts[1] : parts[0] || ''
+      } else if (stepIds.has(rawNodeId)) {
+        stepId = rawNodeId
+      }
+      if (!stepId || !stepIds.has(stepId)) continue
+      childRuntimeByStepId.set(stepId, {
+        status: normalizeRuntimeStatus(log.status),
+        rows: Number.isFinite(Number(log.rows)) ? Number(log.rows) : undefined,
+        processedRows: Number.isFinite(Number(log.processed_rows || log.processedRows)) ? Number(log.processed_rows || log.processedRows) : undefined,
+        startedAt: String(log.started_at || log.startedAt || log.timestamp || '').trim(),
+        finishedAt: String(log.finished_at || log.finishedAt || '').trim(),
+        durationMs: Number.isFinite(Number(log.duration_ms || log.durationMs)) ? Number(log.duration_ms || log.durationMs) : undefined,
+      })
+    }
+    const enabledStepIds = dataOpsPipelineSteps.filter((step) => step.enabled !== false).map((step) => step.id)
+    const elapsedMs = Math.max(0, dataOpsRuntimeTick - dataOpsParentRuntime.startedMs)
+    const fallbackActiveIndex = enabledStepIds.length > 0
+      ? Math.min(enabledStepIds.length - 1, Math.floor(elapsedMs / 900))
+      : -1
+    return dataOpsPipelineSteps.reduce<Record<string, {
+      configured: boolean
+      status: string
+      color: string
+      inputRows: number
+      processedRows: number
+      successRows: number
+      rejectedRows: number
+      durationMs: number
+      throughputRps: number
+      lastAt: string
+      notes: string
+      scheduleStatus: string
+      scheduleNextRunAt: string
+      scheduleLastRegisteredAt: string
+      backendJobId: string
+    }>>((acc, step) => {
+      const metric = dataOpsPreviewStepMetrics.find((row) => (
+        String(row.id || row.step_id || '') === step.id
+        || String(row.name || row.step || '') === step.name
+      ))
+      const runtime = childRuntimeByStepId.get(step.id)
+      const configured = step.kind === 'source'
+        ? Boolean((step.connections || []).length || (step.tables || []).length || step.source || step.filePath || step.apiUrl)
+        : step.kind === 'prepare'
+          ? Boolean((step.queryBuilders || []).length || step.query || step.expression || (step.selectFields || []).length)
+          : step.kind === 'router'
+            ? Boolean((step.routerConfigs || []).length || (step.routeRows || []).length || step.routeSource)
+            : step.kind === 'map'
+              ? Boolean((step.mapperConfigs || []).length || (step.mappingRows || []).some((row) => row.enabled !== false && row.source && row.target) || step.target)
+              : step.kind === 'validate'
+                ? Boolean((step.filterRules || []).length || (step.requiredFieldRules || []).length || step.requiredFields)
+                : Boolean(step.operation || step.expression)
+      const enabledIndex = enabledStepIds.indexOf(step.id)
+      const metricInputRows = dataOpsNumber(metric?.input_rows ?? metric?.inputRows)
+      const metricProcessedRows = dataOpsNumber(metric?.processed_rows ?? metric?.processedRows)
+      const metricSuccessRows = dataOpsNumber(metric?.success_rows ?? metric?.successRows)
+      const metricRejectedRows = dataOpsNumber(metric?.rejected_rows ?? metric?.rejectedRows)
+      const runtimeRows = runtime?.rows ?? runtime?.processedRows
+      const scheduleStatus = String(step.scheduleStatus || '').trim()
+      let status = runtime?.status || normalizeRuntimeStatus(metric?.status || scheduleStatus)
+      if (!runtime && dataOpsParentRuntime.status === 'running' && enabledIndex >= 0) {
+        status = enabledIndex === fallbackActiveIndex
+          ? 'running'
+          : enabledIndex < fallbackActiveIndex
+            ? 'success'
+            : ''
+      } else if (!runtime && dataOpsParentRuntime.status === 'error' && enabledIndex === Math.max(0, fallbackActiveIndex)) {
+        status = 'error'
+      } else if (!runtime && dataOpsParentRuntime.status === 'success' && enabledIndex >= 0 && configured) {
+        status = 'success'
+      }
+      const inputRows = runtimeRows !== undefined ? dataOpsNumber(runtimeRows) : metricInputRows
+      const processedRows = runtime?.processedRows !== undefined ? dataOpsNumber(runtime.processedRows) : metricProcessedRows
+      const successRows = metricSuccessRows || processedRows || inputRows
+      const rejectedRows = metricRejectedRows
+      const durationMs = dataOpsNumber(runtime?.durationMs ?? metric?.duration_ms ?? metric?.durationMs)
+      const throughputRps = dataOpsNumber(metric?.throughput_rps ?? metric?.throughputRps)
+      const lastAt = String(runtime?.finishedAt || runtime?.startedAt || metric?.finished_at || metric?.started_at || metric?.preview_at || nodeConfig.data_ops_last_preview_at || '').trim()
+      const mapperConfig = step.kind === 'map'
+        ? (step.mapperConfigs || []).find((config) => config.id === step.activeMapperConfigId)
+        : undefined
+      const routerConfig = step.kind === 'router'
+        ? (step.routerConfigs || []).find((config) => config.id === step.activeRouterConfigId)
+        : undefined
+      const scheduleSource = mapperConfig || routerConfig || step
+      acc[step.id] = {
+        configured,
+        status,
+        color: statusColor(status),
+        inputRows,
+        processedRows,
+        successRows,
+        rejectedRows,
+        durationMs,
+        throughputRps,
+        lastAt,
+        notes: String(metric?.notes || ''),
+        scheduleStatus: String((scheduleSource as any)?.scheduleStatus || scheduleStatus || ''),
+        scheduleNextRunAt: String((scheduleSource as any)?.scheduleNextRunAt || step.scheduleNextRunAt || ''),
+        scheduleLastRegisteredAt: String((scheduleSource as any)?.scheduleLastRegisteredAt || step.scheduleLastRegisteredAt || ''),
+        backendJobId: String((scheduleSource as any)?.scheduleBackendJobId || step.scheduleBackendJobId || ''),
+      }
+      return acc
+    }, {})
+  }, [
+    dataOpsParentRuntime.startedMs,
+    dataOpsParentRuntime.status,
+    dataOpsPipelineSteps,
+    dataOpsPreviewStepMetrics,
+    dataOpsRuntimeTick,
+    executionLogs,
+    nodeConfig.data_ops_last_preview_at,
+    selectedNodeId,
+  ])
+  const dataOpsEdgeRuntimeById = useMemo(() => {
+    const statusRank = (status: string) => {
+      if (/fail|error/i.test(status)) return 4
+      if (/run|process|active|pending|queued/i.test(status)) return 3
+      if (/warn|skip/i.test(status)) return 2
+      if (/success|complete/i.test(status)) return 1
+      return 0
+    }
+    const pickStatus = (sourceStatus: string, targetStatus: string) => (
+      statusRank(targetStatus) >= statusRank(sourceStatus) ? targetStatus : sourceStatus
+    )
+    return dataOpsPipelineEdges.reduce<Record<string, {
+      sourceName: string
+      targetName: string
+      status: string
+      rows: number
+      rejectedRows: number
+      lastAt: string
+      color: string
+    }>>((acc, edge) => {
+      const sourceStep = dataOpsPipelineSteps.find((step) => step.id === edge.source)
+      const targetStep = dataOpsPipelineSteps.find((step) => step.id === edge.target)
+      const sourceState = dataOpsStepVisualStateById[String(edge.source || '')]
+      const targetState = dataOpsStepVisualStateById[String(edge.target || '')]
+      const status = pickStatus(sourceState?.status || '', targetState?.status || '')
+      const rows = targetState?.inputRows || sourceState?.successRows || sourceState?.processedRows || sourceState?.inputRows || 0
+      const rejectedRows = targetState?.rejectedRows || sourceState?.rejectedRows || 0
+      const lastAt = targetState?.lastAt || sourceState?.lastAt || ''
+      acc[edge.id] = {
+        sourceName: sourceStep?.name || String(edge.source || ''),
+        targetName: targetStep?.name || String(edge.target || ''),
+        status,
+        rows,
+        rejectedRows,
+        lastAt,
+        color: targetState?.color || sourceState?.color || '',
+      }
+      return acc
+    }, {})
+  }, [dataOpsPipelineEdges, dataOpsPipelineSteps, dataOpsStepVisualStateById])
+  const selectedDataOpsPipelineEdge = useMemo(
+    () => dataOpsPipelineEdges.find((edge) => edge.id === dataOpsSelectedPipelineEdgeId) || null,
+    [dataOpsPipelineEdges, dataOpsSelectedPipelineEdgeId],
+  )
+  const selectedDataOpsPipelineStepRuntime = selectedDataOpsPipelineStep
+    ? dataOpsStepVisualStateById[selectedDataOpsPipelineStep.id]
+    : null
+  const selectedDataOpsPipelineEdgeRuntime = selectedDataOpsPipelineEdge
+    ? dataOpsEdgeRuntimeById[selectedDataOpsPipelineEdge.id]
+    : null
+  const dataOpsRuntimeSummary = useMemo(() => {
+    const backendScheduler = dataOpsBackendMonitor?.scheduler && typeof dataOpsBackendMonitor.scheduler === 'object'
+      ? dataOpsBackendMonitor.scheduler as Record<string, unknown>
+      : {}
+    const executions = dataOpsBackendMonitor?.executions && typeof dataOpsBackendMonitor.executions === 'object'
+      ? dataOpsBackendMonitor.executions as Record<string, unknown>
+      : {}
+    const schedules = Array.isArray(dataOpsBackendMonitor?.data_ops_schedules)
+      ? dataOpsBackendMonitor.data_ops_schedules as Array<Record<string, unknown>>
+      : []
+    const backendActivity = Array.isArray(dataOpsBackendMonitor?.data_ops_activity)
+      ? dataOpsBackendMonitor.data_ops_activity as Array<Record<string, unknown>>
+      : []
+    const scheduleStatus = (row: Record<string, unknown>) => String(row.status || row.last_status || '').toLowerCase()
+    const runningSchedules = schedules.filter((row) => scheduleStatus(row) === 'running').length
+    const scheduledSchedules = schedules.filter((row) => ['scheduled', 'registered'].includes(scheduleStatus(row))).length
+    const successSchedules = schedules.filter((row) => ['success', 'complete', 'completed'].includes(scheduleStatus(row))).length
+    const skippedSchedules = schedules.filter((row) => ['skipped', 'skip', 'warning'].includes(scheduleStatus(row))).length
+    const errorSchedules = schedules.filter((row) => ['error', 'failed', 'failure'].includes(scheduleStatus(row))).length
+    const nextRunAt = String(schedules.map((row) => String(row.next_run_at || '')).filter(Boolean).sort((a, b) => Date.parse(a) - Date.parse(b))[0] || dataOpsMapperScheduleSummary.scheduleNextRunAt || backendScheduler.next_run_at || '')
+    const activityRows = [...(backendActivity.length > 0 ? backendActivity : schedules)].sort((a, b) => (
+      Date.parse(String(b.at || b.last_activity_at || b.last_run_started_at || b.last_checked_at || b.next_run_at || ''))
+      - Date.parse(String(a.at || a.last_activity_at || a.last_run_started_at || a.last_checked_at || a.next_run_at || ''))
+    ))
+    const schedulerStatusChart = [
+      { label: 'Scheduled', value: scheduledSchedules, color: '#38bdf8' },
+      { label: 'Running', value: runningSchedules, color: '#60a5fa' },
+      { label: 'Success', value: successSchedules, color: '#22c55e' },
+      { label: 'Skipped', value: skippedSchedules, color: '#f59e0b' },
+      { label: 'Failed', value: errorSchedules, color: '#ef4444' },
+    ].filter((item) => item.value > 0)
+    const activityChart = activityRows.slice(0, 6).reverse().map((row, index) => ({
+      label: dataOpsTimestampText(row.at || row.last_activity_at || row.last_run_started_at || row.last_checked_at || row.next_run_at || '') || `#${index + 1}`,
+      status: String(row.status || row.last_status || 'idle'),
+      value: Math.max(1, dataOpsNumber(row.rows_processed || row.duration_ms || 1, 1)),
+      color: dataOpsStatusHex(row.status || row.last_status),
+    }))
+    return {
+      backendStatus: String(dataOpsBackendMonitor?.status || (dataOpsBackendMonitor ? 'running' : 'unknown')),
+      backendCheckedAt: String(dataOpsBackendMonitor?.checked_at || ''),
+      schedulerRunning: Boolean(backendScheduler.running),
+      schedulerJobs: dataOpsNumber(backendScheduler.jobs),
+      dataOpsJobs: dataOpsNumber(backendScheduler.data_ops_jobs),
+      runningSchedules,
+      scheduledSchedules,
+      successSchedules,
+      skippedSchedules,
+      errorSchedules,
+      runningExecutions: dataOpsNumber(executions.running),
+      rowsProcessed: dataOpsNumber(executions.rows_processed),
+      nextRunAt,
+      schedules,
+      activityRows,
+      schedulerStatusChart,
+      activityChart,
+    }
+  }, [dataOpsBackendMonitor, dataOpsMapperScheduleSummary.scheduleNextRunAt])
   const dataOpsFlowNodes = useMemo<Node[]>(
     () => dataOpsPipelineSteps.map((step, idx) => {
       const meta = DATA_OPS_STEP_KIND_META[step.kind]
       const isSelected = selectedDataOpsPipelineStep?.id === step.id
+      const visualState = dataOpsStepVisualStateById[step.id] || { configured: false, status: '', color: '' }
+      const nodeAccentColor = meta.color
+      const configuredAccentColor = visualState.configured || visualState.status || isSelected
+        ? nodeAccentColor
+        : `color-mix(in srgb, ${nodeAccentColor} 38%, var(--app-border-strong) 62%)`
       const shapeStyle = step.kind === 'validate'
         ? { width: 104, height: 82, borderRadius: 0, clipPath: 'polygon(50% 0, 100% 50%, 50% 100%, 0 50%)' }
         : step.kind === 'monitor'
           ? { width: 72, height: 72, borderRadius: 999 }
+          : step.kind === 'router'
+            ? { width: 172, minHeight: 66, borderRadius: 4, clipPath: 'polygon(12% 0, 88% 0, 100% 50%, 88% 100%, 12% 100%, 0 50%)' }
           : step.kind === 'map'
-            ? { width: 154, minHeight: 62, borderRadius: 6, clipPath: 'polygon(10% 0, 90% 0, 100% 50%, 90% 100%, 10% 100%, 0 50%)' }
+            ? { width: 166, minHeight: 66, borderRadius: 6, clipPath: 'polygon(8% 0, 100% 0, 92% 100%, 0 100%)' }
             : step.kind === 'load'
               ? { width: 154, minHeight: 62, borderRadius: 999 }
               : { width: 154, minHeight: 62, borderRadius: 8 }
@@ -30294,6 +31863,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         type: 'default',
         position: step.position,
         selected: isSelected,
+        className: [
+          isSelected ? 'data-ops-flow-node-selected' : 'data-ops-flow-node',
+          visualState.configured ? 'data-ops-flow-node-configured' : 'data-ops-flow-node-unconfigured',
+        ].filter(Boolean).join(' '),
         data: {
           label: (
             <div style={{ display: 'grid', gap: 2, justifyItems: 'center', alignContent: 'center', minWidth: 70 }}>
@@ -30304,17 +31877,33 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               <Text style={{ color: 'var(--app-text-subtle)', fontSize: 9 }}>
                 {meta.label} · {idx + 1}
               </Text>
+              <span
+                aria-hidden="true"
+                style={{
+                  width: 30,
+                  height: 3,
+                  borderRadius: 999,
+                  background: configuredAccentColor,
+                  opacity: visualState.configured || isSelected ? 1 : 0.36,
+                }}
+              />
             </div>
           ),
         },
         style: {
           ...shapeStyle,
+          ['--data-ops-node-accent' as string]: nodeAccentColor,
           background: 'var(--app-panel-bg)',
           color: 'var(--app-text)',
-          border: `1px solid ${isSelected ? meta.color : 'var(--app-border-strong)'}`,
-          borderLeft: step.kind === 'validate' ? `1px solid ${meta.color}` : `3px solid ${meta.color}`,
-          outline: isSelected ? `1px solid ${meta.color}77` : undefined,
-          boxShadow: isSelected ? `0 0 0 2px ${meta.color}33, 0 8px 18px rgba(0,0,0,.24)` : '0 5px 12px rgba(0,0,0,.18)',
+          border: `1px solid ${isSelected ? nodeAccentColor : 'var(--app-border-strong)'}`,
+          borderLeft: step.kind === 'validate' ? `1px solid ${configuredAccentColor}` : `3px solid ${configuredAccentColor}`,
+          borderTop: `3px solid ${configuredAccentColor}`,
+          outline: isSelected ? `2px solid ${meta.color}` : undefined,
+          boxShadow: isSelected
+            ? `0 0 0 3px ${meta.color}44, 0 0 18px ${meta.color}55, 0 10px 20px rgba(0,0,0,.28)`
+            : visualState.configured
+                ? `0 0 0 1px ${nodeAccentColor}24, 0 5px 12px rgba(0,0,0,.18)`
+                : '0 5px 12px rgba(0,0,0,.18)',
           opacity: step.enabled ? 1 : 0.48,
           padding: step.kind === 'validate' ? 8 : 10,
           display: 'grid',
@@ -30322,30 +31911,104 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         },
       }
     }),
-    [dataOpsPipelineSteps, selectedDataOpsPipelineStep?.id],
+    [dataOpsPipelineSteps, dataOpsStepVisualStateById, selectedDataOpsPipelineStep?.id],
   )
   const dataOpsFlowEdges = useMemo<Edge[]>(
-    () => dataOpsPipelineEdges.map((edge) => ({
-      ...edge,
-      animated: !dataOpsNodeDragging,
-      type: edge.type || 'smoothstep',
-      selected: edge.id === dataOpsSelectedPipelineEdgeId,
-      style: {
-        ...(edge.style || {}),
-        stroke: edge.id === dataOpsSelectedPipelineEdgeId ? '#38bdf8' : '#8b98aa',
-        strokeWidth: edge.id === dataOpsSelectedPipelineEdgeId ? 2.4 : 1.8,
-        strokeDasharray: edge.id === dataOpsSelectedPipelineEdgeId ? undefined : 'none',
-      },
-    })),
-    [dataOpsNodeDragging, dataOpsPipelineEdges, dataOpsSelectedPipelineEdgeId],
+    () => dataOpsPipelineEdges.map((edge) => {
+      const isSelected = edge.id === dataOpsSelectedPipelineEdgeId
+      const sourceState = dataOpsStepVisualStateById[String(edge.source || '')]
+      const targetState = dataOpsStepVisualStateById[String(edge.target || '')]
+      const edgeConfigured = Boolean(sourceState?.configured || targetState?.configured)
+      const baseStroke = String((edge.style as any)?.stroke || '#8b98aa')
+      const configuredStroke = edgeConfigured && baseStroke === '#8b98aa' ? '#a8b3c5' : baseStroke
+      const stroke = isSelected ? '#22d3ee' : configuredStroke
+      const configuredLabel = String(edge.label || '').trim()
+      return {
+        ...edge,
+        animated: Boolean(edge.animated && !dataOpsNodeDragging),
+        type: edge.type || 'smoothstep',
+        selected: isSelected,
+        className: [
+          isSelected ? 'data-ops-flow-edge-selected' : 'data-ops-flow-edge',
+          edgeConfigured ? 'data-ops-flow-edge-configured' : '',
+        ].filter(Boolean).join(' '),
+        interactionWidth: Math.max(44, Number((edge as any).interactionWidth || 36)),
+        markerEnd: {
+          type: MarkerType.ArrowClosed,
+          color: stroke,
+          width: isSelected ? 14 : 12,
+          height: isSelected ? 14 : 12,
+        },
+        label: configuredLabel || edge.label,
+        labelShowBg: Boolean(configuredLabel || edge.labelShowBg),
+        labelBgPadding: edge.labelBgPadding || [6, 2],
+        labelBgBorderRadius: edge.labelBgBorderRadius || 8,
+        labelStyle: {
+          fill: isSelected ? '#22d3ee' : 'var(--app-text-subtle)',
+          fontSize: 10,
+          fontWeight: isSelected ? 800 : 600,
+          ...(edge.labelStyle || {}),
+        },
+        style: {
+          ...(edge.style || {}),
+          stroke,
+          strokeWidth: isSelected ? 2.4 : Math.max(edgeConfigured ? 1.5 : 1.3, Number((edge.style as any)?.strokeWidth || 1.4)),
+          strokeDasharray: isSelected ? undefined : (edge.style as any)?.strokeDasharray,
+          filter: isSelected ? `drop-shadow(0 0 6px ${stroke}88)` : undefined,
+        },
+      }
+    }),
+    [dataOpsNodeDragging, dataOpsPipelineEdges, dataOpsSelectedPipelineEdgeId, dataOpsStepVisualStateById],
   )
-  const dataOpsFlowGraphKey = useMemo(
-    () => [
-      dataOpsPipelineSteps.map((step) => `${step.id}:${step.kind}:${step.name}:${step.enabled}:${Math.round(step.position.x)}:${Math.round(step.position.y)}`).join('|'),
-      dataOpsPipelineEdges.map((edge) => `${edge.id}:${edge.source}:${edge.target}`).join('|'),
-    ].join('::'),
-    [dataOpsPipelineEdges, dataOpsPipelineSteps],
-  )
+	  const dataOpsFlowGraphKey = useMemo(
+	    () => [
+	      dataOpsPipelineSteps.map((step) => `${step.id}:${step.kind}:${step.name}:${step.enabled}:${Math.round(step.position.x)}:${Math.round(step.position.y)}`).join('|'),
+	      dataOpsPipelineEdges.map((edge) => `${edge.id}:${edge.source}:${edge.target}`).join('|'),
+	      `selected-node:${dataOpsSelectedPipelineStepId || ''}`,
+	      `selected-edge:${dataOpsSelectedPipelineEdgeId || ''}`,
+	    ].join('::'),
+	    [dataOpsPipelineEdges, dataOpsPipelineSteps, dataOpsSelectedPipelineEdgeId, dataOpsSelectedPipelineStepId],
+	  )
+  const focusDataOpsPipelineView = useCallback((duration = 240) => {
+    const instance = dataOpsFlowInstance
+    if (!instance || dataOpsFlowNodes.length <= 0) return
+    window.requestAnimationFrame(() => {
+      try {
+        instance.fitView({ padding: 0.28, minZoom: 0.25, maxZoom: 1.15, duration })
+      } catch {
+        // React Flow may still be measuring the modal immediately after tab mount.
+      }
+    })
+  }, [dataOpsFlowInstance, dataOpsFlowNodes.length])
+  useEffect(() => {
+    if (!dataOpsStudioOpen || nodeType !== 'data_ops' || dataOpsStudioActiveTab !== 'pipeline') {
+      dataOpsPipelineFitKeyRef.current = ''
+      return
+    }
+    if (!dataOpsFlowInstance || dataOpsFlowNodes.length <= 0) return
+    const fitKey = [
+      selectedNodeId || '',
+      dataOpsPipelineSteps.map((step) => step.id).join('|'),
+      dataOpsPipelineEdges.map((edge) => edge.id).join('|'),
+    ].join('::')
+    if (dataOpsPipelineFitKeyRef.current === fitKey) return
+    dataOpsPipelineFitKeyRef.current = fitKey
+    const timers = [
+      window.setTimeout(() => focusDataOpsPipelineView(0), 80),
+      window.setTimeout(() => focusDataOpsPipelineView(260), 260),
+    ]
+    return () => timers.forEach((timer) => window.clearTimeout(timer))
+  }, [
+    dataOpsFlowInstance,
+    dataOpsFlowNodes.length,
+    dataOpsPipelineEdges,
+    dataOpsPipelineSteps,
+    dataOpsStudioActiveTab,
+    dataOpsStudioOpen,
+    focusDataOpsPipelineView,
+    nodeType,
+    selectedNodeId,
+  ])
   const onDataOpsNodeDragStop = useCallback((_event: unknown, node: Node) => {
     setDataOpsNodeDragging(false)
     const nextSteps = dataOpsPipelineSteps.map((step) => (
@@ -30367,8 +32030,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       ...connection,
       animated: false,
       type: 'smoothstep',
-      interactionWidth: 36,
-      style: { stroke: '#8b98aa', strokeWidth: 1.8 },
+      sourceHandle: connection.sourceHandle || 'output',
+      targetHandle: connection.targetHandle || 'input',
+      markerEnd: { type: MarkerType.ArrowClosed, color: '#8b98aa', width: 12, height: 12 },
+      interactionWidth: 44,
+      style: { stroke: '#8b98aa', strokeWidth: 1.4 },
     }, dataOpsPipelineEdges) as Edge[]
     persistDataOpsPipeline(dataOpsPipelineSteps, nextEdges)
   }, [dataOpsPipelineEdges, dataOpsPipelineSteps, persistDataOpsPipeline])
@@ -30978,12 +32644,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
                     Manage Oracle database objects and Hop/Kettle-style ETL pipeline design from one studio.
                   </Text>
-                  <Button
-                    size="small"
-                    onClick={() => setDataOpsStudioOpen(true)}
-                    style={{
-                      width: '100%',
-                      background: '#06b6d41a',
+	                  <Button
+	                    size="small"
+	                    onClick={() => {
+	                      setDataOpsStudioActiveTab('pipeline')
+	                      setDataOpsStudioOpen(true)
+	                    }}
+	                    style={{
+	                      width: '100%',
+	                      background: '#06b6d41a',
                       border: '1px solid #06b6d440',
                       color: '#06b6d4',
                     }}
@@ -31567,9 +33236,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       </div>
       </div>
     </Drawer>
-    <Modal
-      open={dataOpsStudioOpen && nodeType === 'data_ops'}
-      onCancel={() => setDataOpsStudioOpen(false)}
+	    <Modal
+	      open={dataOpsStudioOpen && nodeType === 'data_ops'}
+	      onCancel={() => {
+	        dataOpsPipelineFitKeyRef.current = ''
+	        setDataOpsStudioOpen(false)
+	      }}
       footer={null}
       closable={false}
       centered={false}
@@ -31629,26 +33301,32 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b' }}>
             monitor: {nodeConfig.monitoring_enabled === false ? 'off' : 'on'}
           </Tag>
+          <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e' }}>
+            backend: {dataOpsRuntimeSummary.backendStatus}
+          </Tag>
+          <Tag style={{ background: '#38bdf814', border: '1px solid #38bdf830', color: '#38bdf8' }}>
+            jobs: {dataOpsRuntimeSummary.dataOpsJobs.toLocaleString()}
+          </Tag>
           <Button
             type="primary"
             icon={<SaveOutlined />}
-            onClick={async () => {
-              if (!selectedNodeId) return
-              updateNodeConfig(selectedNodeId, { ...nodeConfig })
-              await savePipeline()
-              notification.success({ message: 'Data Vault Studio saved permanently' })
-            }}
+            onClick={() => { void saveDataOpsStudioConfig() }}
           >
             Save Studio
           </Button>
-          <Button onClick={() => setDataOpsStudioOpen(false)}>Close</Button>
+	          <Button onClick={() => {
+	            dataOpsPipelineFitKeyRef.current = ''
+	            setDataOpsStudioOpen(false)
+	          }}>Close</Button>
         </Space>
       </div>
 
       <div style={{ flex: 1, minHeight: 0, overflow: 'hidden', padding: 14 }}>
-        <Tabs
-          size="small"
-          style={{ height: '100%' }}
+	        <Tabs
+	          size="small"
+	          activeKey={dataOpsStudioActiveTab}
+	          onChange={(key) => setDataOpsStudioActiveTab(key as 'dashboard' | 'objects' | 'pipeline')}
+	          style={{ height: '100%' }}
           tabBarStyle={{ marginBottom: 10 }}
           items={[
             {
@@ -31656,84 +33334,143 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               label: 'Dashboard',
               children: (
                 <div style={{ height: 'calc(100vh - 128px)', overflowY: 'auto', display: 'grid', gap: 12 }}>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 10 }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(0, 1fr))', gap: 10 }}>
                     {[
-                      ['Managed Objects', String(nodeConfig.managed_objects || '').split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean).length, '#38bdf8'],
-                      ['Pipeline Steps', String(nodeConfig.pipeline_steps || '').split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean).length, '#22c55e'],
-                      ['Processed', Number(dataOpsPreviewMetrics.processed_rows || data?.executionProcessedRows || 0), '#14b8a6'],
-                      ['Rejected', Number(dataOpsPreviewMetrics.rejected_rows || 0), '#ef4444'],
+                      ['Backend', dataOpsRuntimeSummary.backendStatus, '#22c55e'],
+                      ['Data Ops Jobs', dataOpsRuntimeSummary.dataOpsJobs, '#38bdf8'],
+                      ['Live Runs', dataOpsRuntimeSummary.runningSchedules + dataOpsRuntimeSummary.runningExecutions, '#60a5fa'],
+                      ['Next Run', dataOpsRuntimeSummary.nextRunAt ? dataOpsCountdownText(dataOpsRuntimeSummary.nextRunAt, dataOpsRuntimeTick) || dataOpsTimestampText(dataOpsRuntimeSummary.nextRunAt) : 'none', '#f59e0b'],
+                      ['Preview Rows', Number(dataOpsPreviewMetrics.processed_rows || data?.executionProcessedRows || 0), '#14b8a6'],
                     ].map(([label, value, color]) => (
                       <div key={String(label)} style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 12, minHeight: 82 }}>
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{String(label)}</Text>
                         <div style={{ color: String(color), fontWeight: 800, fontSize: 24, marginTop: 4 }}>
-                          {Number(value || 0).toLocaleString()}
+                          {typeof value === 'number' ? Number(value || 0).toLocaleString() : String(value || '-')}
                         </div>
                       </div>
                     ))}
                   </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.4fr', gap: 12 }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1.35fr 1.1fr .9fr', gap: 12 }}>
                     <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 12 }}>
                       <Space style={{ width: '100%', justifyContent: 'space-between' }} align="start">
                         <div>
-                          <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Scheduler</Text>
+                          <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Backend Scheduler Jobs</Text>
                           <br />
-                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Data Mapper / Sync schedule state</Text>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Actual backend jobs registered for this Data Vault pipeline</Text>
                         </div>
-                        <Tag color={dataOpsMapperScheduleSummary.status === 'scheduled' ? 'green' : dataOpsMapperScheduleSummary.scheduleEnabled ? 'orange' : 'default'} style={{ marginInlineEnd: 0 }}>
-                          {dataOpsMapperScheduleSummary.status}
+                        <Tag color={dataOpsRuntimeSummary.dataOpsJobs > 0 ? 'cyan' : 'default'} style={{ marginInlineEnd: 0 }}>
+                          {dataOpsRuntimeSummary.dataOpsJobs.toLocaleString()} jobs
                         </Tag>
                       </Space>
-                      <div style={{ display: 'grid', gap: 7, marginTop: 10 }}>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 8, marginTop: 10 }}>
                         {[
-                          ['Mapper Rows', Number(dataOpsMapperScheduleSummary.configuredRows || 0).toLocaleString()],
-                          ['Deploy', dataOpsMapperScheduleSummary.deployEnabled ? 'on' : 'off'],
-                          ['Scheduler', dataOpsMapperScheduleSummary.scheduleEnabled ? 'on' : 'off'],
-                          ['Type', dataOpsMapperScheduleSummary.scheduleType],
-                          ['Interval', `${Number(dataOpsMapperScheduleSummary.scheduleIntervalMinutes || 60).toLocaleString()} min`],
-                          ['Cron', dataOpsMapperScheduleSummary.scheduleCron],
-                          ['Next Run', dataOpsMapperScheduleSummary.scheduleNextRunAt || 'not registered'],
-                          ['Last Registered', dataOpsMapperScheduleSummary.scheduleLastRegisteredAt || 'not saved'],
-                        ].map(([label, value]) => (
-                          <Space key={label} style={{ width: '100%', justifyContent: 'space-between' }} align="start">
-                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>{label}</Text>
-                            <Text ellipsis style={{ color: 'var(--app-text)', fontSize: 12, maxWidth: 230, textAlign: 'right' }}>{value}</Text>
-                          </Space>
+                          ['Scheduled', dataOpsRuntimeSummary.scheduledSchedules, '#38bdf8'],
+                          ['Running', dataOpsRuntimeSummary.runningSchedules, '#60a5fa'],
+                          ['Last OK', dataOpsRuntimeSummary.successSchedules, '#22c55e'],
+                          ['Issues', dataOpsRuntimeSummary.skippedSchedules + dataOpsRuntimeSummary.errorSchedules, dataOpsRuntimeSummary.errorSchedules > 0 ? '#ef4444' : '#f59e0b'],
+                        ].map(([label, value, color]) => (
+                          <div key={String(label)} style={{ border: '1px solid var(--app-border)', borderRadius: 6, background: 'var(--app-bg)', padding: 8, minWidth: 0 }}>
+                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10 }}>{String(label)}</Text>
+                            <div style={{ color: String(color), fontWeight: 800, fontSize: 18, lineHeight: 1.25 }}>{Number(value || 0).toLocaleString()}</div>
+                          </div>
                         ))}
+                      </div>
+                      <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, overflow: 'hidden', marginTop: 10 }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1.1fr .75fr .9fr .7fr', gap: 8, padding: '7px 8px', background: 'var(--app-bg)', borderBottom: '1px solid var(--app-border)' }}>
+                          {['Job', 'State', 'Next Run', 'Schedule'].map((header) => (
+                            <Text key={header} style={{ color: 'var(--app-text-subtle)', fontSize: 10, fontWeight: 700 }}>{header}</Text>
+                          ))}
+                        </div>
+                        <div style={{ display: 'grid', maxHeight: 188, overflowY: 'auto' }}>
+                        {(dataOpsRuntimeSummary.schedules.length > 0 ? dataOpsRuntimeSummary.schedules : [{ job_id: '', kind: '-', status: 'not registered', next_run_at: '', step_id: '', schedule_type: '' }]).slice(0, 6).map((schedule, index) => {
+                          const step = dataOpsPipelineSteps.find((item) => item.id === String(schedule.step_id || ''))
+                          const nextRunAt = String(schedule.next_run_at || '')
+                          return (
+                            <div key={String(schedule.job_id || index)} style={{ display: 'grid', gridTemplateColumns: '1.1fr .75fr .9fr .7fr', gap: 8, alignItems: 'center', padding: '8px', borderBottom: index < Math.min(dataOpsRuntimeSummary.schedules.length || 1, 6) - 1 ? '1px solid var(--app-border)' : undefined }}>
+                              <div style={{ minWidth: 0 }}>
+                                <Text ellipsis style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 12, maxWidth: 190 }}>{step?.name || String(schedule.kind || 'scheduler')}</Text>
+                                <br />
+                                <Text ellipsis style={{ color: 'var(--app-text-subtle)', fontSize: 10, maxWidth: 190 }}>{String(schedule.config_id || schedule.job_id || '-')}</Text>
+                              </div>
+                              <Tag color={dataOpsStatusColor(schedule.status)} style={{ marginInlineEnd: 0, width: 'fit-content' }}>{String(schedule.status || 'idle')}</Tag>
+                              <Text ellipsis style={{ color: '#f59e0b', fontWeight: 800, fontSize: 11, maxWidth: 130 }}>
+                                {nextRunAt ? `${dataOpsCountdownText(nextRunAt, dataOpsRuntimeTick) || dataOpsTimestampText(nextRunAt)}` : 'not registered'}
+                              </Text>
+                              <Text ellipsis style={{ color: 'var(--app-text-subtle)', fontSize: 11, maxWidth: 100 }}>
+                                {String(schedule.schedule_type || 'time')}{schedule.interval_minutes ? ` · ${schedule.interval_minutes}m` : ''}
+                              </Text>
+                            </div>
+                          )
+                        })}
+                        </div>
                       </div>
                     </div>
                     <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 12 }}>
                       <Space style={{ width: '100%', justifyContent: 'space-between' }} align="start">
                         <div>
-                          <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Records Processing</Text>
+                          <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Recent Backend Activity</Text>
                           <br />
-                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Latest preview and mapper sync counters</Text>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Last backend scheduler events, capped to avoid page growth</Text>
+                        </div>
+                        <Tag color={dataOpsRuntimeSummary.runningSchedules > 0 || dataOpsRuntimeSummary.runningExecutions > 0 ? 'blue' : 'default'} style={{ marginInlineEnd: 0 }}>
+                          {dataOpsRuntimeSummary.runningSchedules + dataOpsRuntimeSummary.runningExecutions} live
+                        </Tag>
+                      </Space>
+                      <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.max(1, dataOpsRuntimeSummary.activityChart.length || 1)}, minmax(0, 1fr))`, gap: 4, marginTop: 10 }}>
+                        {(dataOpsRuntimeSummary.activityChart.length > 0 ? dataOpsRuntimeSummary.activityChart : [{ label: 'Idle', status: 'idle', value: 0, color: '#64748b' }]).map((item, index) => (
+                          <Tooltip key={`${item.label}_${index}`} title={`${item.status} · ${item.label}`}>
+                            <div style={{ height: 10, borderRadius: 999, background: item.color, opacity: item.value > 0 ? 1 : 0.45 }} />
+                          </Tooltip>
+                        ))}
+                      </div>
+                      <div style={{ display: 'grid', gap: 8, marginTop: 10, maxHeight: 250, overflowY: 'auto', paddingRight: 2 }}>
+                        {(dataOpsRuntimeSummary.activityRows.length > 0 ? dataOpsRuntimeSummary.activityRows : [{ kind: '-', status: 'idle', message: 'No backend scheduler activity yet.', last_run_started_at: '', next_run_at: '' }]).slice(0, 5).map((activity, index) => {
+                          const step = dataOpsPipelineSteps.find((item) => item.id === String(activity.step_id || ''))
+                          const activityTime = String(activity.at || activity.last_activity_at || activity.last_run_finished_at || activity.last_run_started_at || activity.last_checked_at || activity.next_run_at || '')
+                          return (
+                            <div key={`${String(activity.job_id || '')}_${index}`} style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 8 }}>
+                              <Space style={{ width: '100%', justifyContent: 'space-between' }} align="start">
+                                <div style={{ minWidth: 0 }}>
+                                  <Text ellipsis style={{ color: 'var(--app-text)', fontSize: 12, fontWeight: 700, maxWidth: 260 }}>
+                                    {step?.name || String(activity.kind || 'backend')}
+                                  </Text>
+                                  <br />
+                                  <Text ellipsis style={{ color: 'var(--app-text-subtle)', fontSize: 10, maxWidth: 300 }}>
+                                    {String(activity.message || activity.execution_id || activity.job_id || 'waiting')}
+                                  </Text>
+                                </div>
+                                <Tag color={dataOpsStatusColor(activity.status)} style={{ marginInlineEnd: 0 }}>{String(activity.status || 'idle')}</Tag>
+                              </Space>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10 }}>
+                                {activityTime ? dataOpsTimestampText(activityTime) : 'not run'}
+                                {activity.duration_ms ? ` · ${dataOpsDurationText(activity.duration_ms)}` : ''}
+                              </Text>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                    <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', padding: 12 }}>
+                      <Space style={{ width: '100%', justifyContent: 'space-between' }} align="start">
+                        <div>
+                          <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Preview Output</Text>
+                          <br />
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Run Preview counters, separate from backend schedules</Text>
                         </div>
                         <Tag color={String(dataOpsPreviewMetrics.status || nodeConfig.data_ops_preview_status || '') === 'success' ? 'green' : String(dataOpsPreviewMetrics.status || '') === 'warning' ? 'orange' : 'default'} style={{ marginInlineEnd: 0 }}>
                           {String(dataOpsPreviewMetrics.status || nodeConfig.data_ops_preview_status || 'not run')}
                         </Tag>
                       </Space>
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 8, marginTop: 10 }}>
+                      <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
                         {[
                           ['Input', Number(dataOpsPreviewMetrics.input_rows || data?.executionRows || 0), '#38bdf8'],
                           ['Processed', Number(dataOpsPreviewMetrics.processed_rows || data?.executionProcessedRows || 0), '#22c55e'],
-                          ['Success', Number(dataOpsPreviewMetrics.success_rows || data?.executionProcessedRows || 0), '#14b8a6'],
                           ['Rejected', Number(dataOpsPreviewMetrics.rejected_rows || 0), '#ef4444'],
+                          ['Throughput', `${Number(dataOpsPreviewMetrics.throughput_rps || 0).toLocaleString()}/sec`, '#14b8a6'],
                         ].map(([label, value, color]) => (
-                          <div key={String(label)} style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 9 }}>
+                          <div key={String(label)} style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 9, minWidth: 0 }}>
                             <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{String(label)}</Text>
-                            <div style={{ color: String(color), fontWeight: 800, fontSize: 18 }}>{Number(value || 0).toLocaleString()}</div>
-                          </div>
-                        ))}
-                      </div>
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8, marginTop: 8 }}>
-                        {[
-                          ['Last Sync Rows', Number(nodeConfig.data_ops_last_sync_rowcount || 0).toLocaleString()],
-                          ['Last Sync At', String(nodeConfig.data_ops_last_sync_at || 'not run')],
-                          ['Throughput', `${Number(dataOpsPreviewMetrics.throughput_rps || 0).toLocaleString()} rows/sec`],
-                        ].map(([label, value]) => (
-                          <div key={label} style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 9, minWidth: 0 }}>
-                            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{label}</Text>
-                            <div><Text ellipsis style={{ color: 'var(--app-text)', fontWeight: 700, maxWidth: '100%' }}>{value}</Text></div>
+                            <div><Text ellipsis style={{ color: String(color), fontWeight: 800, maxWidth: '100%' }}>{typeof value === 'number' ? Number(value || 0).toLocaleString() : String(value || '-')}</Text></div>
                           </div>
                         ))}
                       </div>
@@ -31986,12 +33723,64 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                   </Popconfirm>
                                 </Space>
                               </Space>
-                              <Input.TextArea
-                                value={dataOpsQueryWriterSql || dataOpsDefaultQueryWriterSql}
-                                onChange={(event) => selectedNodeId && updateNodeConfig(selectedNodeId, { data_ops_query_writer_sql: event.target.value })}
-                                placeholder="SELECT * FROM SYSTEM.MY_TABLE"
-                                style={{ ...commonInputStyle, fontFamily: 'monospace', fontSize: 12, resize: 'none', height: '100%' }}
-                              />
+                              <div className="data-ops-sql-editor-shell">
+                                <Editor
+                                  height="100%"
+                                  language={DATA_OPS_SQL_LANGUAGE_ID}
+                                  value={dataOpsQueryWriterSql || dataOpsDefaultQueryWriterSql}
+                                  beforeMount={(monaco) => ensureDataOpsSqlLanguage(monaco)}
+                                  onMount={(editor, monaco) => {
+                                    ensureDataOpsSqlLanguage(monaco)
+                                    const model = editor.getModel?.()
+                                    if (model) {
+                                      monaco.editor.setModelLanguage(model, DATA_OPS_SQL_LANGUAGE_ID)
+                                    }
+                                    editor.onDidChangeCursorPosition?.(() => {
+                                      const action = editor.getAction?.('editor.action.triggerSuggest')
+                                      const position = editor.getPosition?.()
+                                      if (!position) return
+                                      const modelValue = String(editor.getValue?.() || '')
+                                      const offset = model?.getOffsetAt?.(position) ?? modelValue.length
+                                      const left = modelValue.slice(Math.max(0, Number(offset) - 80), Number(offset))
+                                      if (/\b(from|join|update|into|merge\s+into|table)\s+["\w.$#]*$/i.test(left)) {
+                                        action?.run?.()
+                                      }
+                                    })
+                                    editor.focus?.()
+                                  }}
+                                  onChange={(value) => selectedNodeId && updateNodeConfig(selectedNodeId, { data_ops_query_writer_sql: value || '' })}
+                                  theme={customEditorThemeId}
+                                  options={{
+                                    fontFamily: customEditorFontFamily,
+                                    fontSize: Math.max(12, customEditorFontSize),
+                                    lineHeight: customEditorLineHeight,
+                                    fontLigatures: customEditorLigatures,
+                                    minimap: { enabled: false },
+                                    wordWrap: 'off',
+                                    scrollBeyondLastLine: false,
+                                    automaticLayout: true,
+                                    tabCompletion: 'on',
+                                    suggestOnTriggerCharacters: true,
+                                    quickSuggestions: { other: true, comments: false, strings: false },
+                                    acceptSuggestionOnEnter: 'on',
+                                    parameterHints: { enabled: true },
+                                    suggest: {
+                                      showClasses: true,
+                                      showFields: true,
+                                      showFunctions: true,
+                                      showKeywords: true,
+                                      showSnippets: true,
+                                      showWords: false,
+                                      snippetsPreventQuickSuggestions: false,
+                                    },
+                                    lineNumbers: 'on',
+                                    glyphMargin: false,
+                                    folding: true,
+                                    padding: { top: 8, bottom: 8 },
+                                    overviewRulerLanes: 0,
+                                  }}
+                                />
+                              </div>
                               <div style={{ minHeight: 0, minWidth: 0, overflow: 'hidden' }}>
                                 <Table
                                   size="small"
@@ -32240,14 +34029,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           >
                             Configure
                           </Button>
-                          <Button size="small" onClick={() => {
-                            if (dataOpsPipelineSteps.length < 2) {
-                              notification.warning({ message: 'Pipeline needs at least two steps', placement: 'bottomRight' })
-                            } else {
-                              notification.success({ message: 'Pipeline design validated', description: `${dataOpsPipelineSteps.length} configured step(s).`, placement: 'bottomRight', duration: 2 })
-                            }
-                          }}>Validate</Button>
-                          <Button size="small" onClick={runDataOpsPipelinePreview}>Run Preview</Button>
+	                          <Button size="small" onClick={() => {
+	                            if (dataOpsPipelineSteps.length < 2) {
+	                              notification.warning({ message: 'Pipeline needs at least two steps', placement: 'bottomRight' })
+	                            } else {
+	                              notification.success({ message: 'Pipeline design validated', description: `${dataOpsPipelineSteps.length} configured step(s).`, placement: 'bottomRight', duration: 2 })
+	                            }
+	                          }}>Validate</Button>
+	                          <Tooltip title="Center pipeline">
+	                            <Button size="small" icon={<ArrowsAltOutlined />} disabled={dataOpsFlowNodes.length <= 0} onClick={() => focusDataOpsPipelineView(260)} />
+	                          </Tooltip>
+	                          <Button size="small" onClick={runDataOpsPipelinePreview}>Run Preview</Button>
                           <Button size="small" onClick={() => selectedNodeId && updateNodeConfig(selectedNodeId, { pipeline_steps: '', data_ops_pipeline_nodes: [], data_ops_pipeline_edges: [] })}>Clear</Button>
                         </Space>
                       </Space>
@@ -32276,9 +34068,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         const kind = normalizeDataOpsStepKind(payload?.kind, payload?.name)
                         const name = payload?.name || DATA_OPS_STEP_KIND_META[kind]?.label || 'Step'
                         const rect = event.currentTarget.getBoundingClientRect()
+                        const rawPosition = dataOpsFlowInstance
+                          ? dataOpsFlowInstance.screenToFlowPosition({ x: event.clientX, y: event.clientY })
+                          : { x: event.clientX - rect.left, y: event.clientY - rect.top }
+                        const snap = (value: number) => Math.round(value / 20) * 20
                         addDataOpsPipelineStep(name, kind, {
-                          x: Math.max(20, event.clientX - rect.left - 77),
-                          y: Math.max(20, event.clientY - rect.top - 31),
+                          x: snap(rawPosition.x - 80),
+                          y: snap(rawPosition.y - 34),
                         })
                       }}
                       style={{ flex: 1, minHeight: 0, background: 'var(--app-bg)' }}
@@ -32288,6 +34084,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           key={dataOpsFlowGraphKey}
                           defaultNodes={dataOpsFlowNodes}
                           defaultEdges={dataOpsFlowEdges}
+                          defaultViewport={dataOpsFlowViewport}
+                          onInit={(instance) => setDataOpsFlowInstance(instance)}
+                          onMoveEnd={(_event, viewport) => setDataOpsFlowViewport(viewport)}
                           onEdgesChange={onDataOpsEdgesChange}
                           onConnect={onDataOpsConnect}
                           onNodeDragStart={() => setDataOpsNodeDragging(true)}
@@ -32321,11 +34120,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                               setDataOpsSelectedPipelineStepId('')
                             }
                           }}
-                          fitView
-                          fitViewOptions={{ padding: 0.2 }}
                           nodesDraggable
                           nodesConnectable
                           elementsSelectable
+                          snapToGrid
+                          snapGrid={[20, 20]}
                           panActivationKeyCode={null}
                           nodeDragThreshold={1}
                           elevateNodesOnSelect
@@ -32334,10 +34133,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           defaultEdgeOptions={{
                             type: 'smoothstep',
                             animated: false,
-                            interactionWidth: 36,
-                            style: { stroke: '#8b98aa', strokeWidth: 1.8 },
+                            markerEnd: { type: MarkerType.ArrowClosed, color: '#8b98aa', width: 12, height: 12 },
+                            interactionWidth: 44,
+                            style: { stroke: '#8b98aa', strokeWidth: 1.4 },
                           }}
-                          connectionLineStyle={{ stroke: '#8b98aa', strokeWidth: 1.8 }}
+                          connectionLineStyle={{ stroke: '#22d3ee', strokeWidth: 1.5 }}
                         >
                           <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="var(--app-canvas-dot)" />
                           {!dataOpsNodeDragging ? (
@@ -32400,6 +34200,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                             </Tag>
                           </Space>
                         </div>
+                        <div>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Step Name</Text>
+                          <Input
+                            value={dataOpsStepNameInputValue(selectedDataOpsPipelineStep)}
+                            onFocus={() => beginDataOpsStepNameEdit(selectedDataOpsPipelineStep)}
+                            onChange={(event) => changeDataOpsStepNameDraft(selectedDataOpsPipelineStep.id, event.target.value)}
+                            onBlur={() => commitDataOpsStepNameDraft(selectedDataOpsPipelineStep)}
+                            onPressEnter={(event) => event.currentTarget.blur()}
+                            placeholder="Step name"
+                            style={dataOpsInputStyle(DATA_OPS_STEP_KIND_META[selectedDataOpsPipelineStep.kind].color || dataOpsSectionColors.action, { marginTop: 5 })}
+                          />
+                        </div>
                         <Button block type="primary" onClick={() => setDataOpsPipelineConfigOpen(true)}>
                           Open Configuration Overlay
                         </Button>
@@ -32459,14 +34271,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       onCancel={() => {
         setDataOpsQueryBuilderConfigOpen(false)
         setDataOpsMapperConfigOpen(false)
+        setDataOpsRouterConfigOpen(false)
+        setDataOpsRouterRouteConfigId('')
         setDataOpsPipelineConfigOpen(false)
       }}
       title={selectedDataOpsPipelineStep?.kind === 'prepare' ? 'Build Query' : selectedDataOpsPipelineStep ? `Configure ${selectedDataOpsPipelineStep.name}` : 'Configure Pipeline Step'}
-      width={selectedDataOpsPipelineStep?.kind === 'prepare' ? '100vw' : selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'map' ? '96vw' : 820}
+      wrapClassName={selectedDataOpsPipelineStep?.kind === 'prepare' ? 'data-ops-config-modal data-ops-query-modal' : selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'map' || selectedDataOpsPipelineStep?.kind === 'router' ? 'data-ops-config-modal data-ops-mapper-modal' : 'data-ops-config-modal'}
+      width={selectedDataOpsPipelineStep?.kind === 'prepare' ? '100vw' : selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'map' || selectedDataOpsPipelineStep?.kind === 'router' ? '96vw' : 820}
       centered={selectedDataOpsPipelineStep?.kind !== 'prepare'}
       style={selectedDataOpsPipelineStep?.kind === 'prepare' ? { top: 0, maxWidth: '100vw', paddingBottom: 0 } : undefined}
       footer={[
-        ...(selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'prepare' || selectedDataOpsPipelineStep?.kind === 'map' ? [] : [
+        ...(selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'prepare' || selectedDataOpsPipelineStep?.kind === 'map' || selectedDataOpsPipelineStep?.kind === 'router' ? [] : [
           <Button key="delete" danger disabled={!selectedDataOpsPipelineStep} onClick={() => selectedDataOpsPipelineStep && deleteDataOpsPipelineStep(selectedDataOpsPipelineStep.id)}>
             Delete Step
           </Button>,
@@ -32474,6 +34289,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         <Button key="close" type="primary" onClick={() => {
           setDataOpsQueryBuilderConfigOpen(false)
           setDataOpsMapperConfigOpen(false)
+          setDataOpsRouterConfigOpen(false)
+          setDataOpsRouterRouteConfigId('')
           setDataOpsPipelineConfigOpen(false)
         }}>
           Done
@@ -32484,44 +34301,47 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           background: 'var(--app-panel-bg)',
           border: '1px solid var(--app-border-strong)',
           ...(selectedDataOpsPipelineStep?.kind === 'prepare' ? { height: '100vh', borderRadius: 0, display: 'flex', flexDirection: 'column' } : {}),
-          ...(selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'map' ? { height: '92vh', display: 'flex', flexDirection: 'column' } : {}),
+          ...(selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'map' || selectedDataOpsPipelineStep?.kind === 'router' ? { height: '92vh', display: 'flex', flexDirection: 'column' } : {}),
         },
         header: { background: 'var(--app-panel-bg)' },
         body: {
           background: 'var(--app-panel-bg)',
           overflowX: 'hidden',
           ...(selectedDataOpsPipelineStep?.kind === 'prepare' ? { flex: 1, overflowY: 'auto', minHeight: 0 } : {}),
-          ...(selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'map' ? { flex: 1, overflowY: 'auto', minHeight: 0 } : {}),
+          ...(selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'map' || selectedDataOpsPipelineStep?.kind === 'router' ? { flex: 1, overflowY: 'auto', minHeight: 0 } : {}),
         },
       }}
     >
       <div onKeyDownCapture={stopDataOpsDeleteKeyPropagation} style={{ minWidth: 0 }}>
       {selectedDataOpsPipelineStep ? (
         <div style={{ display: 'grid', gap: 12 }}>
-          {selectedDataOpsPipelineStep.kind !== 'prepare' ? <div style={{ display: 'grid', gridTemplateColumns: ['source', 'map'].includes(selectedDataOpsPipelineStep.kind) ? '1fr' : '1fr 180px 180px', gap: 10 }}>
+          {selectedDataOpsPipelineStep.kind !== 'prepare' ? <div style={{ display: 'grid', gridTemplateColumns: ['source', 'map', 'router'].includes(selectedDataOpsPipelineStep.kind) ? '1fr' : '1fr 180px 180px', gap: 10 }}>
             <div>
               <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Step Name</Text>
               <Input
-                value={selectedDataOpsPipelineStep.name}
-                onChange={(event) => patchDataOpsPipelineStep(selectedDataOpsPipelineStep.id, { name: event.target.value })}
-                style={{ ...commonInputStyle, marginTop: 5 }}
+                value={dataOpsStepNameInputValue(selectedDataOpsPipelineStep)}
+                onFocus={() => beginDataOpsStepNameEdit(selectedDataOpsPipelineStep)}
+                onChange={(event) => changeDataOpsStepNameDraft(selectedDataOpsPipelineStep.id, event.target.value)}
+                onBlur={() => commitDataOpsStepNameDraft(selectedDataOpsPipelineStep)}
+                onPressEnter={(event) => event.currentTarget.blur()}
+                style={dataOpsInputStyle(DATA_OPS_STEP_KIND_META[selectedDataOpsPipelineStep.kind].color || dataOpsSectionColors.action, { marginTop: 5 })}
               />
             </div>
-            {!['source', 'map'].includes(selectedDataOpsPipelineStep.kind) ? <div>
+            {!['source', 'map', 'router'].includes(selectedDataOpsPipelineStep.kind) ? <div>
               <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Function</Text>
               <Select
                 value={selectedDataOpsPipelineStep.kind}
                 onChange={(value) => patchDataOpsPipelineStep(selectedDataOpsPipelineStep.id, { kind: value as DataOpsPipelineStepKind, operation: defaultDataOpsStepOperation(value as DataOpsPipelineStepKind) })}
-                style={{ width: '100%', marginTop: 5 }}
-                options={(['source', 'prepare', 'map', 'validate'] as DataOpsPipelineStepKind[]).map((value) => ({ value, label: DATA_OPS_STEP_KIND_META[value].label }))}
+                style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })}
+                options={(['source', 'prepare', 'router', 'map', 'validate'] as DataOpsPipelineStepKind[]).map((value) => ({ value, label: DATA_OPS_STEP_KIND_META[value].label }))}
               />
             </div> : null}
-            {!['source', 'map'].includes(selectedDataOpsPipelineStep.kind) ? <div>
+            {!['source', 'map', 'router'].includes(selectedDataOpsPipelineStep.kind) ? <div>
               <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Operation</Text>
               <Select
                 value={selectedDataOpsPipelineStep.operation || defaultDataOpsStepOperation(selectedDataOpsPipelineStep.kind)}
                 onChange={(value) => patchDataOpsPipelineStep(selectedDataOpsPipelineStep.id, { operation: String(value || '') })}
-                style={{ width: '100%', marginTop: 5 }}
+                style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })}
                 options={DATA_OPS_STEP_OPERATION_OPTIONS[selectedDataOpsPipelineStep.kind]}
               />
             </div> : null}
@@ -32588,17 +34408,21 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               .filter((item) => item.enabled !== false && String(item.name || '').trim())
             const connectionOptions = uniqueFieldNames(sourceConnections.map((item) => String(item.name || '').trim()))
               .map((value) => ({ value, label: value }))
-            const objectOptions = uniqueFieldNames([
-              ...dataOpsCatalogObjects.map((item: any) => String(item.name || '').trim()).filter(Boolean),
-              ...dataOpsManagedObjects,
-              dataOpsDataTargetName,
-            ].filter(Boolean)).map((value) => ({ value, label: value }))
+            const objectOptions = [
+              ...dataOpsCatalogObjects.map((item: any) => {
+                const schema = String(item.schema || '').trim()
+                const name = String(item.name || '').trim()
+                return name ? { value: name, label: schema ? `${schema}.${name}` : name, schema, name } : null
+              }).filter(Boolean),
+              ...uniqueFieldNames([...dataOpsManagedObjects, dataOpsDataTargetName].filter(Boolean)).map((value) => ({ value, label: value, schema: '', name: value })),
+            ].filter((item, index, list) => item && list.findIndex((candidate) => String(candidate?.schema || '').toUpperCase() === String(item.schema || '').toUpperCase() && String(candidate?.value || '').toUpperCase() === String(item.value || '').toUpperCase()) === index) as Array<{ value: string; label: string; schema?: string; name?: string }>
             const sourceTables = tables.filter((item) => item.enabled !== false && String(item.table || '').trim())
             const tableAliases = uniqueFieldNames(sourceTables.map((item, index) => String(item.alias || item.table || `t${index + 1}`).trim()).filter(Boolean))
             const tableColumnCacheKey = (schemaName: string, tableName: string) => `${String(schemaName || '').trim().toUpperCase()}.${String(tableName || '').trim().toUpperCase()}`
             const rawColumnNames = uniqueFieldNames([
               ...dataOpsCatalogColumns.map((item: any) => String(item.column_name || item.name || item.field || '').trim()).filter(Boolean),
               ...dataOpsObjectDataColumns.map((item: unknown) => String(item || '').trim()).filter(Boolean),
+              ...selectFields.map((item) => String(item.field || '').trim()).filter(Boolean),
             ])
             const sourceFieldNames = uniqueFieldNames(sourceTables.flatMap((item, index) => {
               const schema = String(item.schema || nodeConfig.oracle_schema || dataOpsSelectedSchemaName || '').trim()
@@ -32608,23 +34432,89 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               const selectedObjectColumns = tableName && tableName.toUpperCase() === dataOpsSelectedObjectName.toUpperCase()
                 ? dataOpsCatalogColumns.map((col: any) => String(col.column_name || col.name || col.field || '').trim()).filter(Boolean)
                 : []
-              const columns = uniqueFieldNames(cachedColumns.length > 0 ? cachedColumns : selectedObjectColumns)
+              const previewColumns = tableName && tableName.toUpperCase() === dataOpsDataTargetName.toUpperCase()
+                ? dataOpsObjectDataColumns.map((col: unknown) => String(col || '').trim()).filter(Boolean)
+                : []
+              const selectedFieldsForTable = selectFields
+                .map((fieldRow) => String(fieldRow.field || '').trim())
+                .filter((field) => field && (!field.includes('.') || field.startsWith(`${alias}.`)))
+                .map((field) => field.includes('.') ? field.split('.').pop() || field : field)
+              const columns = uniqueFieldNames([
+                ...(cachedColumns.length > 0 ? cachedColumns : []),
+                ...(selectedObjectColumns.length > 0 ? selectedObjectColumns : []),
+                ...(previewColumns.length > 0 ? previewColumns : []),
+                ...selectedFieldsForTable,
+              ])
               return columns.map((field) => `${alias}.${field}`)
             }))
             const fieldNames = uniqueFieldNames([
-              ...(sourceFieldNames.length > 0 ? sourceFieldNames : rawColumnNames),
+              ...sourceFieldNames,
+              ...(sourceFieldNames.length > 0 ? [] : rawColumnNames),
             ].filter(Boolean))
             const fieldOptions = fieldNames.map((value) => ({ value, label: value }))
-            const compactPanel = (title: string, extra: ReactNode, children: ReactNode) => (
-              <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, minWidth: 0 }}>
+            const jsonColumnNames = uniqueFieldNames(fieldNames.filter((field) => {
+              const leaf = String(field || '').split('.').pop() || ''
+              return /json|document|payload|meta/i.test(leaf)
+            }))
+            const jsonPathCandidates = uniqueFieldNames([
+              ...dataOpsObjectDataJsonPaths,
+              ...dataOpsQueryResultJsonPaths,
+              ...extractPriorityJsonFieldPaths(dataOpsObjectDataRows),
+              ...extractSampleFieldPaths(dataOpsObjectDataRows).filter((path) => /json|document|payload|meta/i.test(path)),
+            ])
+            const jsonFieldPathOptions = uniqueFieldNames(sourceTables.flatMap((table, index) => {
+              const alias = String(table.alias || `t${index + 1}`).trim()
+              return jsonPathCandidates.flatMap((path) => {
+                const parts = String(path || '').split('.').filter(Boolean)
+                if (parts.length < 2) return []
+                const column = parts[0]
+                const jsonPath = parts.slice(1).join('.')
+                if (!jsonPath) return []
+                const matchingColumns = jsonColumnNames.filter((field) => String(field || '').split('.').pop()?.toUpperCase() === column.toUpperCase())
+                const sourceColumns = matchingColumns.length > 0 ? matchingColumns : [`${alias}.${column}`]
+                return sourceColumns.map((field) => ({
+                  value: `${field}::${jsonPath}`,
+                  label: `${field} -> ${jsonPath}`,
+                  field,
+                  jsonPath,
+                }))
+              })
+            }).map((item) => JSON.stringify(item))).map((text) => JSON.parse(text) as { value: string; label: string; field: string; jsonPath: string })
+            const addJsonFieldFromOption = (optionValue?: string) => {
+              const selected = jsonFieldPathOptions.find((item) => item.value === optionValue)
+              const fallbackColumn = jsonColumnNames[0] || fieldNames.find((field) => /document_json/i.test(field)) || fieldNames[0] || ''
+              const field = selected?.field || fallbackColumn
+              const jsonPath = selected?.jsonPath || ''
+              const leaf = (jsonPath || field).split('.').pop()?.replace(/\W+/g, '_').replace(/^_+|_+$/g, '') || 'json_value'
+              patchDataOpsPipelineStep(step.id, {
+                selectFields: [
+                  ...selectFields,
+                  {
+                    id: dataOpsId('json_field'),
+                    field,
+                    alias: leaf,
+                    aggregate: '',
+                    mode: 'json',
+                    jsonPath,
+                    jsonReturnType: 'VARCHAR2(4000)',
+                    enabled: true,
+                  },
+                ],
+              })
+            }
+            const compactPanel = (title: string, extra: ReactNode, children: ReactNode) => {
+              const color = dataOpsPanelColor(title)
+              return (
+              <div style={{ border: '1px solid var(--app-border)', borderLeft: `3px solid ${color}`, borderRadius: 8, background: 'var(--app-bg)', padding: 10, minWidth: 0 }}>
                 <Space style={{ width: '100%', justifyContent: 'space-between', marginBottom: 8 }} align="center">
-                  <Text style={{ color: 'var(--app-text)', fontWeight: 800, fontSize: 12 }}>{title}</Text>
+                  <Text style={{ color, fontWeight: 600, fontSize: 11, letterSpacing: 0 }}>{title}</Text>
                   {extra}
                 </Space>
                 {children}
               </div>
-            )
-            const pickField = (value: string | undefined, onChange: (value: string) => void, placeholder = 'Select field') => (
+              )
+            }
+            const pickField = (value: string | undefined, onChange: (value: string) => void, placeholder = 'Select field', color = dataOpsSectionColors.action) => (
               <Select
                 size="small"
                 showSearch
@@ -32636,7 +34526,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   if (next && !fieldNames.includes(next)) onChange(next)
                 }}
                 placeholder={placeholder}
-                style={{ width: '100%' }}
+                style={dataOpsControlStyle(color, { width: '100%' })}
                 options={fieldOptions}
               />
             )
@@ -32656,6 +34546,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             ]
             const fieldModeOptions = [
               { value: 'field', label: 'Field' },
+              { value: 'json', label: 'JSON' },
               { value: 'case', label: 'CASE' },
             ]
             const caseResultModeOptions = [
@@ -32694,6 +34585,22 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               if (mode === 'field') return sqlIdent(raw)
               if (mode === 'expression') return raw
               return sqlLiteral(raw)
+            }
+            const sqlJsonPathLiteral = (path: string) => {
+              const clean = String(path || '').trim().replace(/^\$\.?/, '').replace(/^\.*/, '')
+              const normalized = clean
+                .split('.')
+                .map((segment) => segment.trim())
+                .filter(Boolean)
+                .map((segment) => /^[A-Za-z_][\w$#]*$/.test(segment) ? `.${segment}` : `."${segment.replace(/"/g, '\\"')}"`)
+                .join('')
+              return `'${`$${normalized || ''}`.replace(/'/g, "''")}'`
+            }
+            const sqlJsonValue = (field: string, jsonPath: string, returnType = 'VARCHAR2(4000)') => {
+              const source = sqlIdent(field)
+              const path = sqlJsonPathLiteral(jsonPath)
+              const type = String(returnType || 'VARCHAR2(4000)').trim().replace(/[^\w() ,]/g, '') || 'VARCHAR2(4000)'
+              return source ? `JSON_VALUE(${source}, ${path} RETURNING ${type} NULL ON ERROR)` : ''
             }
             const sqlOperator = (operator: string, value: string) => {
               const op = String(operator || 'equals')
@@ -32735,6 +34642,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 const elseValue = sqlCaseResultByMode(item.caseElseMode, String(item.caseElse || ''))
                 return applyAggregate(`CASE WHEN ${condition} THEN ${thenValue} ELSE ${elseValue} END`)
               }
+              if (item.mode === 'json') {
+                return applyAggregate(sqlJsonValue(String(item.field || ''), String(item.jsonPath || ''), String(item.jsonReturnType || 'VARCHAR2(4000)')))
+              }
               const field = sqlIdent(String(item.field || ''))
               return applyAggregate(field)
             }
@@ -32742,7 +34652,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               ? selectedSelectRows.map((item) => {
                 const expr = fieldExpression(item)
                 const agg = String(item.aggregate || '').trim().toUpperCase()
-                const baseAlias = String(item.field || 'case_value').replace(/^[^.]+\./, '').replace(/\W+/g, '_').replace(/^_+|_+$/g, '')
+                const aliasSource = item.mode === 'json' ? String(item.jsonPath || item.field || 'json_value') : String(item.field || 'case_value')
+                const baseAlias = aliasSource.replace(/^[^.]+\./, '').replace(/\W+/g, '_').replace(/^_+|_+$/g, '')
                 const alias = String(item.alias || (agg ? `${agg.toLowerCase()}_${baseAlias || 'value'}` : '')).trim()
                 return alias ? `${expr} AS ${alias}` : expr
               }).join(',\n  ')
@@ -32798,7 +34709,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               const schema = String(schemaName || nodeConfig.oracle_schema || dataOpsSelectedSchemaName || '').trim()
               setDataOpsSelectedObject({ schema, name, type: 'TABLE' })
               setDataOpsDataTarget({ schema, name, type: 'TABLE' })
-              const response = await loadDataOpsOracleCatalog(name)
+              const response = await loadDataOpsOracleCatalog(name, undefined, schema)
               const columns = Array.isArray(response?.columns)
                 ? response.columns.map((item: any) => String(item.column_name || item.name || item.field || '').trim()).filter(Boolean)
                 : []
@@ -32809,6 +34720,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 }))
               }
               void loadDataOpsObjectData(name, schema)
+            }
+            const refreshQueryBuilderFields = async () => {
+              const activeTables = sourceTables.length > 0 ? sourceTables : tables.filter((item) => String(item.table || '').trim())
+              if (activeTables.length <= 0) return
+              await Promise.all(activeTables.map((table) => {
+                const schema = String(table.schema || nodeConfig.oracle_schema || dataOpsSelectedSchemaName || '').trim()
+                return loadQueryBuilderTableMetadata(String(table.table || ''), schema)
+              }))
             }
             const addTableFromPicker = () => {
               const nextRole: DataOpsTableRow['role'] = tables.some((item) => item.role === 'from') ? 'lookup' : 'from'
@@ -32937,8 +34856,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Step Name</Text>
                   <Input
                     size="small"
-                    value={step.name}
-                    onChange={(event) => patchDataOpsPipelineStep(step.id, { name: event.target.value })}
+                    value={dataOpsStepNameInputValue(step)}
+                    onFocus={() => beginDataOpsStepNameEdit(step)}
+                    onChange={(event) => changeDataOpsStepNameDraft(step.id, event.target.value)}
+                    onBlur={() => commitDataOpsStepNameDraft(step)}
+                    onPressEnter={(event) => event.currentTarget.blur()}
                     style={{ ...commonInputStyle, marginTop: 5 }}
                     placeholder="Build query step name"
                   />
@@ -32980,11 +34902,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   </Text>
                 </div>
                 <Modal
-                  open={dataOpsQueryBuilderConfigOpen}
-                  onCancel={() => setDataOpsQueryBuilderConfigOpen(false)}
-                  title={`Query Configuration${activeQueryBuilder?.name ? `: ${activeQueryBuilder.name}` : ''}`}
-                  width="96vw"
-                  centered
+	                  open={dataOpsQueryBuilderConfigOpen}
+	                  onCancel={() => setDataOpsQueryBuilderConfigOpen(false)}
+	                  title={`Query Configuration${activeQueryBuilder?.name ? `: ${activeQueryBuilder.name}` : ''}`}
+		                  wrapClassName="data-ops-config-modal data-ops-query-modal"
+	                  width="96vw"
+	                  centered
                   footer={[
                     <Button key="save" onClick={saveCurrentQueryBuilder}>Save Configuration</Button>,
                     <Button key="done" type="primary" onClick={() => setDataOpsQueryBuilderConfigOpen(false)}>Done</Button>,
@@ -32992,11 +34915,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   styles={{
                     content: { background: 'var(--app-panel-bg)', border: '1px solid var(--app-border-strong)', height: '90vh', display: 'flex', flexDirection: 'column' },
                     header: { background: 'var(--app-panel-bg)' },
-                    body: { background: 'var(--app-panel-bg)', flex: 1, overflowY: 'auto', minHeight: 0 },
+                    body: { background: 'var(--app-panel-bg)', flex: 1, overflowY: 'auto', overflowX: 'hidden', minHeight: 0 },
                   }}
                 >
-                  <div onKeyDownCapture={stopDataOpsDeleteKeyPropagation} style={{ display: 'grid', gap: 10, minWidth: 0 }}>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 8 }}>
+	                  <div onKeyDownCapture={stopDataOpsDeleteKeyPropagation} style={{ display: 'grid', gap: 10, minWidth: 0 }}>
+	                <Space size={6} wrap>
+	                  {dataOpsQueryLegendItems.map(([label, color]) => (
+	                    <Tag key={`data_ops_query_legend_${label}`} style={{ marginInlineEnd: 0, background: `${color}14`, border: `1px solid ${color}45`, color, fontSize: 10, fontWeight: 400 }}>
+	                      {label}
+	                    </Tag>
+	                  ))}
+	                </Space>
+	                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 8 }}>
                   {[
                     ['Sources', tables.filter((item) => item.enabled !== false).length],
                     ['Fields', selectFields.filter((item) => item.enabled !== false).length],
@@ -33009,6 +34939,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     </div>
                   ))}
                 </div>
+                <div className="data-ops-query-builder-layout">
+                  <div className="data-ops-query-builder-main">
                 {compactPanel(
                   '1. Pick Source Tables',
                   <Button size="small" icon={<PlusSquareOutlined />} disabled={connectionOptions.length <= 0} onClick={addTableFromPicker}>Add Source</Button>,
@@ -33023,15 +34955,19 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     ) : tables.map((row, index) => (
                       <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '52px 1.1fr 1fr 1.3fr 92px 84px 36px', gap: 8, alignItems: 'center' }}>
                         <Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchDataOpsPipelineStep(step.id, { tables: tables.map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} />
-                        <Select size="small" showSearch optionFilterProp="label" value={connectionOptions.some((item) => item.value === row.connection) ? row.connection : undefined} onChange={(value) => patchDataOpsPipelineStep(step.id, { tables: tables.map((item) => item.id === row.id ? { ...item, connection: String(value || '') } : item) })} placeholder="configured source" options={connectionOptions} />
-                        <Input size="small" value={row.schema || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { tables: tables.map((item) => item.id === row.id ? { ...item, schema: event.target.value } : item) })} placeholder="schema" />
-                        <Select size="small" showSearch allowClear optionFilterProp="label" value={row.table || undefined} onChange={(value) => {
+	                        <Select size="small" showSearch optionFilterProp="label" value={connectionOptions.some((item) => item.value === row.connection) ? row.connection : undefined} onChange={(value) => patchDataOpsPipelineStep(step.id, { tables: tables.map((item) => item.id === row.id ? { ...item, connection: String(value || '') } : item) })} placeholder="configured source" options={connectionOptions} style={dataOpsControlStyle(dataOpsSectionColors.source)} />
+	                        <Input size="small" value={row.schema || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { tables: tables.map((item) => item.id === row.id ? { ...item, schema: event.target.value } : item) })} placeholder="schema" style={dataOpsInputStyle(dataOpsSectionColors.source)} />
+                        <Select size="small" showSearch allowClear optionFilterProp="label" value={row.table || undefined} onChange={(value, option) => {
                           const tableName = String(value || '')
-                          patchDataOpsPipelineStep(step.id, { tables: tables.map((item) => item.id === row.id ? { ...item, table: tableName, alias: item.alias || `t${index + 1}` } : item) })
-                          loadQueryBuilderTableMetadata(tableName, row.schema)
-                        }} onSearch={(value) => patchDataOpsPipelineStep(step.id, { tables: tables.map((item) => item.id === row.id ? { ...item, table: value } : item) })} placeholder="table, file, resource" options={objectOptions} />
-                        <Input size="small" value={row.alias || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { tables: tables.map((item) => item.id === row.id ? { ...item, alias: event.target.value } : item) })} placeholder="alias" />
-                        <Select size="small" value={row.role || 'from'} onChange={(value) => patchDataOpsPipelineStep(step.id, { tables: tables.map((item) => item.id === row.id ? { ...item, role: value as DataOpsTableRow['role'] } : item) })} options={[{ value: 'from', label: 'From' }, { value: 'lookup', label: 'Lookup' }]} />
+                          const selectedSchema = String((Array.isArray(option) ? option[0] : option as any)?.schema || row.schema || '').trim()
+                          patchDataOpsPipelineStep(step.id, { tables: tables.map((item) => item.id === row.id ? { ...item, schema: selectedSchema || item.schema, table: tableName, alias: item.alias || `t${index + 1}` } : item) })
+                          loadQueryBuilderTableMetadata(tableName, selectedSchema || row.schema)
+	                        }} onSearch={(value) => {
+                          patchDataOpsPipelineStep(step.id, { tables: tables.map((item) => item.id === row.id ? { ...item, table: value } : item) })
+                          if (String(value || '').trim().length >= 2) void loadDataOpsOracleCatalog('', value, String(row.schema || '').trim())
+                        }} placeholder="table, file, resource" options={objectOptions} style={dataOpsControlStyle(dataOpsSectionColors.source)} />
+	                        <Input size="small" value={row.alias || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { tables: tables.map((item) => item.id === row.id ? { ...item, alias: event.target.value } : item) })} placeholder="alias" style={dataOpsInputStyle(dataOpsSectionColors.source)} />
+	                        <Select size="small" value={row.role || 'from'} onChange={(value) => patchDataOpsPipelineStep(step.id, { tables: tables.map((item) => item.id === row.id ? { ...item, role: value as DataOpsTableRow['role'] } : item) })} options={[{ value: 'from', label: 'From' }, { value: 'lookup', label: 'Lookup' }]} style={dataOpsControlStyle(dataOpsSectionColors.source)} />
                         <Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { tables: tables.filter((item) => item.id !== row.id) })} />
                       </div>
                     ))}
@@ -33042,6 +34978,20 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   <Space size={6}>
                     <Select size="small" value={step.projectionMode || 'keep'} onChange={(value) => patchDataOpsPipelineStep(step.id, { projectionMode: value as DataOpsPipelineStep['projectionMode'] })} style={{ width: 154 }} options={[{ value: 'keep', label: 'Keep selected' }, { value: 'drop', label: 'Drop selected' }]} />
                     <Button size="small" disabled={fieldNames.length <= 0} onClick={() => syncSelectedFields(fieldNames.slice(0, 12))}>Use Loaded Fields</Button>
+                    <Button size="small" loading={dataOpsCatalogLoading || dataOpsObjectDataLoading} disabled={sourceTables.length <= 0} onClick={() => { void refreshQueryBuilderFields() }}>Refresh Fields</Button>
+                    <Select
+                      size="small"
+                      showSearch
+                      allowClear
+                      optionFilterProp="label"
+                      value={undefined}
+                      disabled={jsonColumnNames.length <= 0}
+                      onChange={(value) => addJsonFieldFromOption(String(value || ''))}
+                      placeholder="Add JSON field"
+                      options={jsonFieldPathOptions}
+                      style={{ width: 190 }}
+                    />
+                    <Button size="small" disabled={jsonColumnNames.length <= 0} onClick={() => addJsonFieldFromOption(jsonFieldPathOptions[0]?.value)}>Add JSON</Button>
                     <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { selectFields: [...selectFields, { id: dataOpsId('case'), field: '', alias: '', aggregate: '', mode: 'case', caseElse: '', caseElseMode: 'literal', caseBranches: [{ id: dataOpsId('when'), field: '', operator: 'equals', value: '', thenMode: 'literal', then: '', enabled: true }], enabled: true }] })}>Add CASE</Button>
                   </Space>,
                   <div style={{ display: 'grid', gap: 8 }}>
@@ -33050,17 +35000,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         Select a source table above to load columns here.
                       </Text>
                     ) : null}
-                    <Select
-                      mode="multiple"
+	                    <Select
+	                      mode="multiple"
                       showSearch
                       allowClear
                       optionFilterProp="label"
                       maxTagCount="responsive"
                       value={selectFields.map((item) => item.field).filter(Boolean) as string[]}
                       onChange={(values) => syncSelectedFields(values.map((item) => String(item)))}
-                      placeholder="Pick fields from selected tables"
-                      options={fieldOptions}
-                    />
+	                      placeholder="Pick fields from selected tables"
+	                      options={fieldOptions}
+	                      style={dataOpsControlStyle(dataOpsSectionColors.select)}
+	                    />
                     {selectFields.length > 0 ? (
                       <div style={{ display: 'grid', gap: 6 }}>
                         {selectFields.map((row) => (
@@ -33070,9 +35021,41 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                             <Select size="small" value={row.mode || 'field'} onChange={(value) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, mode: value as DataOpsFieldRow['mode'] } : item) })} options={fieldModeOptions} />
                             {row.mode === 'case'
                               ? <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, caseBranches: [...(item.caseBranches || []), { id: dataOpsId('when'), field: '', operator: 'equals', value: '', thenMode: 'literal', then: '', enabled: true }] } : item) })}>Add WHEN</Button>
-                              : pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'source field')}
-                            <Select size="small" value={row.aggregate || ''} onChange={(value) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, aggregate: String(value || '') } : item) })} options={aggregateOptions} />
-                            <Input size="small" value={row.alias || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, alias: event.target.value } : item) })} placeholder="output alias" />
+                              : row.mode === 'json'
+                                ? (
+                                  <div style={{ display: 'grid', gridTemplateColumns: 'minmax(130px, .85fr) minmax(160px, 1fr)', gap: 6 }}>
+                                    <Select
+                                      size="small"
+                                      showSearch
+                                      allowClear
+                                      optionFilterProp="label"
+                                      value={row.field || undefined}
+                                      onChange={(value) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, field: String(value || '') } : item) })}
+                                      placeholder="JSON column"
+                                      options={(jsonColumnNames.length > 0 ? jsonColumnNames : fieldNames).map((value) => ({ value, label: value }))}
+                                      style={dataOpsControlStyle(dataOpsSectionColors.select, { width: '100%' })}
+                                    />
+                                    <Select
+                                      size="small"
+                                      showSearch
+                                      allowClear
+                                      optionFilterProp="label"
+                                      value={row.jsonPath || undefined}
+                                      onChange={(value) => {
+                                        const jsonPath = String(value || '')
+                                        const leaf = jsonPath.split('.').pop()?.replace(/\W+/g, '_').replace(/^_+|_+$/g, '') || row.alias || ''
+                                        patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, jsonPath, alias: item.alias || leaf } : item) })
+                                      }}
+                                      onSearch={(value) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, jsonPath: value } : item) })}
+                                      placeholder="JSON path"
+                                      options={uniqueFieldNames(jsonFieldPathOptions.filter((item) => !row.field || item.field === row.field).map((item) => item.jsonPath)).map((value) => ({ value, label: value }))}
+                                      style={dataOpsControlStyle(dataOpsSectionColors.select, { width: '100%' })}
+                                    />
+                                  </div>
+                                )
+	                              : pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'source field', dataOpsSectionColors.select)}
+	                            <Select size="small" value={row.aggregate || ''} onChange={(value) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, aggregate: String(value || '') } : item) })} options={aggregateOptions} style={dataOpsControlStyle(dataOpsSectionColors.select)} />
+	                            <Input size="small" value={row.alias || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, alias: event.target.value } : item) })} placeholder="output alias" style={dataOpsInputStyle(dataOpsSectionColors.select)} />
                             <Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.filter((item) => item.id !== row.id) })} />
                             </div>
                             {row.mode === 'case' ? (
@@ -33109,7 +35092,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     ) : null}
                   </div>
                 )}
-                <div style={{ display: 'grid', gridTemplateColumns: '1.1fr 1fr', gap: 10, alignItems: 'start' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 10, alignItems: 'start' }}>
                   {compactPanel(
                     '3. Join / Lookup',
                     <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { joinKeys: [...(step.joinKeys || []), { id: dataOpsId('join'), leftField: '', rightField: '', joinType: 'left', enabled: true }] })}>Add Join</Button>,
@@ -33117,9 +35100,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       {(step.joinKeys || []).map((row) => (
                         <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px 112px 1fr 1fr 34px', gap: 8, alignItems: 'center' }}>
                           <Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchDataOpsPipelineStep(step.id, { joinKeys: (step.joinKeys || []).map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} />
-                          <Select size="small" value={row.joinType || 'left'} onChange={(value) => patchDataOpsPipelineStep(step.id, { joinKeys: (step.joinKeys || []).map((item) => item.id === row.id ? { ...item, joinType: value as DataOpsJoinRow['joinType'] } : item) })} options={[{ value: 'inner', label: 'Inner' }, { value: 'left', label: 'Left' }, { value: 'right', label: 'Right' }, { value: 'full', label: 'Full' }]} />
-                          {pickField(row.leftField, (value) => patchDataOpsPipelineStep(step.id, { joinKeys: (step.joinKeys || []).map((item) => item.id === row.id ? { ...item, leftField: value } : item) }), 'main field')}
-                          {pickField(row.rightField, (value) => patchDataOpsPipelineStep(step.id, { joinKeys: (step.joinKeys || []).map((item) => item.id === row.id ? { ...item, rightField: value } : item) }), 'lookup field')}
+	                          <Select size="small" value={row.joinType || 'left'} onChange={(value) => patchDataOpsPipelineStep(step.id, { joinKeys: (step.joinKeys || []).map((item) => item.id === row.id ? { ...item, joinType: value as DataOpsJoinRow['joinType'] } : item) })} options={[{ value: 'inner', label: 'Inner' }, { value: 'left', label: 'Left' }, { value: 'right', label: 'Right' }, { value: 'full', label: 'Full' }]} style={dataOpsControlStyle(dataOpsSectionColors.join)} />
+	                          {pickField(row.leftField, (value) => patchDataOpsPipelineStep(step.id, { joinKeys: (step.joinKeys || []).map((item) => item.id === row.id ? { ...item, leftField: value } : item) }), 'main field', dataOpsSectionColors.join)}
+	                          {pickField(row.rightField, (value) => patchDataOpsPipelineStep(step.id, { joinKeys: (step.joinKeys || []).map((item) => item.id === row.id ? { ...item, rightField: value } : item) }), 'lookup field', dataOpsSectionColors.join)}
                           <Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { joinKeys: (step.joinKeys || []).filter((item) => item.id !== row.id) })} />
                         </div>
                       ))}
@@ -33132,40 +35115,27 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       {(step.filterRules || []).map((row) => (
                         <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px 1.2fr 126px 1fr 34px', gap: 8, alignItems: 'center' }}>
                           <Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchDataOpsPipelineStep(step.id, { filterRules: (step.filterRules || []).map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} />
-                          {pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { filterRules: (step.filterRules || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'filter field')}
-                          <Select size="small" value={row.operator || 'equals'} onChange={(value) => patchDataOpsPipelineStep(step.id, { filterRules: (step.filterRules || []).map((item) => item.id === row.id ? { ...item, operator: value } : item) })} options={operatorOptions} />
-                          <Input size="small" value={row.value || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { filterRules: (step.filterRules || []).map((item) => item.id === row.id ? { ...item, value: event.target.value } : item) })} placeholder="value" />
+	                          {pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { filterRules: (step.filterRules || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'filter field', dataOpsSectionColors.where)}
+	                          <Select size="small" value={row.operator || 'equals'} onChange={(value) => patchDataOpsPipelineStep(step.id, { filterRules: (step.filterRules || []).map((item) => item.id === row.id ? { ...item, operator: value } : item) })} options={operatorOptions} style={dataOpsControlStyle(dataOpsSectionColors.where)} />
+	                          <Input size="small" value={row.value || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { filterRules: (step.filterRules || []).map((item) => item.id === row.id ? { ...item, value: event.target.value } : item) })} placeholder="value" style={dataOpsInputStyle(dataOpsSectionColors.where)} />
                           <Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { filterRules: (step.filterRules || []).filter((item) => item.id !== row.id) })} />
                         </div>
                       ))}
                     </div>
                   )}
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 270px', gap: 10, alignItems: 'start' }}>
-                  {compactPanel('5. Group By', <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { groupByFields: [...(step.groupByFields || []), { id: dataOpsId('group'), field: '', enabled: true }] })}>Add</Button>, <div style={{ display: 'grid', gap: 8 }}>{(step.groupByFields || []).map((row) => <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px 1fr 34px', gap: 8, alignItems: 'center' }}><Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchDataOpsPipelineStep(step.id, { groupByFields: (step.groupByFields || []).map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} />{pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { groupByFields: (step.groupByFields || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'group field')}<Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { groupByFields: (step.groupByFields || []).filter((item) => item.id !== row.id) })} /></div>)}</div>)}
-                  {compactPanel('Having', <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { havingRules: [...(step.havingRules || []), { id: dataOpsId('having'), field: '', operator: 'greater_than', value: '', enabled: true }] })}>Add</Button>, <div style={{ display: 'grid', gap: 8 }}>{(step.havingRules || []).map((row) => <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px 1fr 112px 86px 34px', gap: 8, alignItems: 'center' }}><Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} />{pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'metric')}<Select size="small" value={row.operator || 'greater_than'} onChange={(value) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, operator: value } : item) })} options={compareOperatorOptions} /><Input size="small" value={row.value || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, value: event.target.value } : item) })} /><Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).filter((item) => item.id !== row.id) })} /></div>)}</div>)}
-                  {compactPanel('Order / Limit', <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { orderByRows: [...(step.orderByRows || []), { id: dataOpsId('order'), field: '', direction: 'asc', enabled: true }] })}>Add</Button>, <div style={{ display: 'grid', gap: 8 }}>{(step.orderByRows || []).map((row) => <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '1fr 74px 34px', gap: 8, alignItems: 'center' }}>{pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { orderByRows: (step.orderByRows || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'sort field')}<Select size="small" value={row.direction || 'asc'} onChange={(value) => patchDataOpsPipelineStep(step.id, { orderByRows: (step.orderByRows || []).map((item) => item.id === row.id ? { ...item, direction: value as DataOpsOrderRow['direction'] } : item) })} options={[{ value: 'asc', label: 'Asc' }, { value: 'desc', label: 'Desc' }]} /><Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { orderByRows: (step.orderByRows || []).filter((item) => item.id !== row.id) })} /></div>)}<Input size="small" type="number" min={0} value={step.limitRows} onChange={(event) => patchDataOpsPipelineStep(step.id, { limitRows: event.target.value ? Number(event.target.value) : undefined })} placeholder="limit rows" /></div>)}
+                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 10, alignItems: 'start' }}>
+	                  {compactPanel('5. Group By', <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { groupByFields: [...(step.groupByFields || []), { id: dataOpsId('group'), field: '', enabled: true }] })}>Add</Button>, <div style={{ display: 'grid', gap: 8 }}>{(step.groupByFields || []).map((row) => <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px 1fr 34px', gap: 8, alignItems: 'center' }}><Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchDataOpsPipelineStep(step.id, { groupByFields: (step.groupByFields || []).map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} />{pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { groupByFields: (step.groupByFields || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'group field', dataOpsSectionColors.group)}<Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { groupByFields: (step.groupByFields || []).filter((item) => item.id !== row.id) })} /></div>)}</div>)}
+	                  {compactPanel('Having', <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { havingRules: [...(step.havingRules || []), { id: dataOpsId('having'), field: '', operator: 'greater_than', value: '', enabled: true }] })}>Add</Button>, <div style={{ display: 'grid', gap: 8 }}>{(step.havingRules || []).map((row) => <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px 1fr 112px 86px 34px', gap: 8, alignItems: 'center' }}><Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} />{pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'metric', dataOpsSectionColors.having)}<Select size="small" value={row.operator || 'greater_than'} onChange={(value) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, operator: value } : item) })} options={compareOperatorOptions} style={dataOpsControlStyle(dataOpsSectionColors.having)} /><Input size="small" value={row.value || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, value: event.target.value } : item) })} style={dataOpsInputStyle(dataOpsSectionColors.having)} /><Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).filter((item) => item.id !== row.id) })} /></div>)}</div>)}
                 </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 10, alignItems: 'start' }}>
+	                  {compactPanel('Order / Limit', <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { orderByRows: [...(step.orderByRows || []), { id: dataOpsId('order'), field: '', direction: 'asc', enabled: true }] })}>Add</Button>, <div style={{ display: 'grid', gap: 8 }}>{(step.orderByRows || []).map((row) => <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '1fr 74px 34px', gap: 8, alignItems: 'center' }}>{pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { orderByRows: (step.orderByRows || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'sort field', dataOpsSectionColors.order)}<Select size="small" value={row.direction || 'asc'} onChange={(value) => patchDataOpsPipelineStep(step.id, { orderByRows: (step.orderByRows || []).map((item) => item.id === row.id ? { ...item, direction: value as DataOpsOrderRow['direction'] } : item) })} options={[{ value: 'asc', label: 'Asc' }, { value: 'desc', label: 'Desc' }]} style={dataOpsControlStyle(dataOpsSectionColors.order)} /><Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { orderByRows: (step.orderByRows || []).filter((item) => item.id !== row.id) })} /></div>)}<Input size="small" type="number" min={0} value={step.limitRows} onChange={(event) => patchDataOpsPipelineStep(step.id, { limitRows: event.target.value ? Number(event.target.value) : undefined })} placeholder="limit rows" style={dataOpsInputStyle(dataOpsSectionColors.order)} /></div>)}
+                </div>
+                  </div>
+                  <div className="data-ops-query-result-side">
                 {compactPanel(
                   'Final Query / Test Result',
-                  <Space size={6}>
-                    <Button size="small" onClick={saveCurrentQueryBuilder}>Save SQL</Button>
-                    <Button size="small" loading={dataOpsObjectDataLoading} onClick={async () => {
-                      setDataOpsObjectDataLoading(true)
-                      setDataOpsObjectDataError(null)
-                      try {
-                        const response = await api.previewDataOpsOracleQuery(nodeConfig, builtQuerySql, Number(step.limitRows || 100))
-                        setDataOpsObjectData(response)
-                        notification.success({ message: 'Query preview loaded', description: `${Number(response?.row_count || 0).toLocaleString()} row(s) returned.`, placement: 'bottomRight', duration: 2 })
-                      } catch (err: any) {
-                        setDataOpsObjectData(null)
-                        setDataOpsObjectDataError(String(err?.message || 'Failed to preview query'))
-                        notification.error({ message: 'Query preview failed', description: String(err?.message || 'Failed to preview query'), placement: 'bottomRight' })
-                      } finally {
-                        setDataOpsObjectDataLoading(false)
-                      }
-                    }}>Test Query</Button>
-                  </Space>,
+                  null,
                   <Tabs
                     size="small"
                     items={[
@@ -33173,35 +35143,63 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         key: 'query',
                         label: 'Final Query',
                         children: (
-                          <Input.TextArea rows={10} value={builtQuerySql} readOnly style={{ ...commonInputStyle, fontFamily: 'monospace', fontSize: 12 }} />
+                          <div style={{ display: 'grid', gap: 8 }}>
+                            <Space style={{ justifyContent: 'flex-end' }}>
+                              <Button size="small" onClick={saveCurrentQueryBuilder}>Save SQL</Button>
+                            </Space>
+                            {renderDataOpsSqlPreview(builtQuerySql, 320)}
+                          </div>
                         ),
                       },
                       {
                         key: 'result',
                         label: 'Test Result',
                         children: (
-                          <Table
-                            size="small"
-                            rowKey={(_record, index) => `query_test_${index}`}
-                            loading={dataOpsObjectDataLoading}
-                            dataSource={dataOpsObjectDataRows.slice(0, 8)}
-                            pagination={false}
-                            scroll={{ x: Math.max(520, dataOpsObjectDataColumns.length * 130), y: 260 }}
-                            locale={{ emptyText: dataOpsObjectDataError || 'Build a query and click Test Query.' }}
-                            columns={dataOpsObjectDataColumns.slice(0, 8).map((name: string) => ({
-                              title: name,
-                              dataIndex: name,
-                              key: name,
-                              width: 130,
-                              ellipsis: true,
-                              render: (value: unknown) => <Text ellipsis style={{ maxWidth: 118, color: value == null ? 'var(--app-text-subtle)' : 'var(--app-text)', fontSize: 11 }}>{value == null ? 'NULL' : typeof value === 'object' ? JSON.stringify(value) : String(value)}</Text>,
-                            })) as any[]}
-                          />
+                          <div style={{ display: 'grid', gap: 8 }}>
+                            <Space style={{ justifyContent: 'flex-end' }}>
+                              <Button size="small" loading={dataOpsObjectDataLoading} onClick={async () => {
+                                setDataOpsObjectDataLoading(true)
+                                setDataOpsObjectDataError(null)
+                                try {
+                                  const response = await api.previewDataOpsOracleQuery(nodeConfig, builtQuerySql, Number(step.limitRows || 100))
+                                  setDataOpsObjectData(response)
+                                  notification.success({ message: 'Query preview loaded', description: `${Number(response?.row_count || 0).toLocaleString()} row(s) returned.`, placement: 'bottomRight', duration: 2 })
+                                } catch (err: any) {
+                                  setDataOpsObjectData(null)
+                                  setDataOpsObjectDataError(String(err?.message || 'Failed to preview query'))
+                                  notification.error({ message: 'Query preview failed', description: String(err?.message || 'Failed to preview query'), placement: 'bottomRight' })
+                                } finally {
+                                  setDataOpsObjectDataLoading(false)
+                                }
+                              }}>Test Query</Button>
+                            </Space>
+                            <Table
+                              size="small"
+                              rowKey={(_record, index) => `query_test_${index}`}
+                              loading={dataOpsObjectDataLoading}
+                              dataSource={dataOpsObjectDataRows.slice(0, 8)}
+                              pagination={false}
+                              tableLayout="fixed"
+                              style={{ width: '100%', maxWidth: '100%' }}
+                              scroll={{ x: Math.max(520, dataOpsObjectDataColumns.length * 130), y: 260 }}
+                              locale={{ emptyText: dataOpsObjectDataError || 'Build a query and click Test Query.' }}
+                              columns={dataOpsObjectDataColumns.slice(0, 8).map((name: string) => ({
+                                title: name,
+                                dataIndex: name,
+                                key: name,
+                                width: 130,
+                                ellipsis: true,
+                                render: (value: unknown) => <Text ellipsis style={{ maxWidth: 118, color: value == null ? 'var(--app-text-subtle)' : 'var(--app-text)', fontSize: 11 }}>{value == null ? 'NULL' : typeof value === 'object' ? JSON.stringify(value) : String(value)}</Text>,
+                              })) as any[]}
+                            />
+                          </div>
                         ),
                       },
                     ]}
                   />
                 )}
+                  </div>
+                </div>
                   </div>
                 </Modal>
               </div>
@@ -33253,6 +35251,840 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               />
               <Collapse size="small" ghost items={[{ key: 'expr', label: 'Optional Expression', children: <Input.TextArea rows={4} value={selectedDataOpsPipelineStep.expression || ''} onChange={(event) => patchDataOpsPipelineStep(selectedDataOpsPipelineStep.id, { expression: event.target.value })} placeholder="Optional advanced expression" style={{ ...commonInputStyle, fontFamily: 'monospace', fontSize: 12 }} /> }]} />
             </div>
+          ) : null}
+          {selectedDataOpsPipelineStep.kind === 'router' ? (
+            (() => {
+              const collectUpstreamStepIds = (stepId: string) => {
+                const seen = new Set<string>()
+                const visit = (targetId: string) => {
+                  dataOpsPipelineEdges
+                    .filter((edge) => String(edge.target || '') === targetId)
+                    .forEach((edge) => {
+                      const sourceId = String(edge.source || '')
+                      if (!sourceId || seen.has(sourceId)) return
+                      seen.add(sourceId)
+                      visit(sourceId)
+                    })
+                }
+                visit(stepId)
+                return seen
+              }
+              const upstreamStepIds = collectUpstreamStepIds(selectedDataOpsPipelineStep.id)
+              const connectedQuerySteps = dataOpsPipelineSteps.filter((item) => item.kind === 'prepare' && upstreamStepIds.has(item.id))
+              const routerQuerySourceOptions = connectedQuerySteps.flatMap((queryStep) => {
+                const configs = queryStep.queryBuilders || []
+                return [
+                  { value: `step:${queryStep.id}`, label: `${queryStep.name || 'Query Builder'} - active query` },
+                  ...configs.map((config) => ({
+                    value: `query:${queryStep.id}:${config.id}`,
+                    label: `${queryStep.name || 'Query Builder'} - ${config.name || 'Query'}`,
+                  })),
+                ]
+              })
+              const routerQuerySourceOptionValues = new Set(routerQuerySourceOptions.map((item) => String(item.value || '')))
+              const routerRouteSourceSelectValue = routerQuerySourceOptionValues.has(String(selectedDataOpsPipelineStep.routeSource || ''))
+                ? selectedDataOpsPipelineStep.routeSource
+                : undefined
+              const routerFieldLabel = (field: DataOpsFieldRow) => {
+                const alias = String(field.alias || '').trim()
+                if (alias) return alias
+                if (field.mode === 'case') return 'case_value'
+                const rawField = String(field.field || '').replace(/^[^.]+\./, '').trim()
+                const baseName = rawField.replace(/\W+/g, '_').replace(/^_+|_+$/g, '') || 'value'
+                const aggregate = String(field.aggregate || '').trim().toLowerCase()
+                return aggregate ? `${aggregate}_${baseName}` : rawField
+              }
+              const routerFieldsFromQueryConfig = (config?: DataOpsQueryBuilderConfig) => uniqueFieldNames((config?.selectFields || [])
+                .filter((field) => field.enabled !== false)
+                .map(routerFieldLabel)
+                .filter(Boolean))
+              const routerSelectedSourceValue = String(selectedDataOpsPipelineStep.routeSource || '')
+              const routerSelectedSourceFields = (() => {
+                if (routerSelectedSourceValue.startsWith('query:')) {
+                  const [, sourceStepId, queryId] = routerSelectedSourceValue.split(':')
+                  const sourceStep = dataOpsPipelineSteps.find((item) => item.id === sourceStepId)
+                  return routerFieldsFromQueryConfig((sourceStep?.queryBuilders || []).find((item) => item.id === queryId))
+                }
+                if (routerSelectedSourceValue.startsWith('step:')) {
+                  const sourceStepId = routerSelectedSourceValue.slice('step:'.length)
+                  const sourceStep = dataOpsPipelineSteps.find((item) => item.id === sourceStepId)
+                  const activeConfig = (sourceStep?.queryBuilders || []).find((item) => item.id === sourceStep?.activeQueryBuilderId)
+                  const activeFields = routerFieldsFromQueryConfig(activeConfig)
+                  return activeFields.length > 0 ? activeFields : uniqueFieldNames((sourceStep?.selectFields || []).filter((field) => field.enabled !== false).map(routerFieldLabel).filter(Boolean))
+                }
+                return []
+              })()
+              const routerSourceFields = uniqueFieldNames([
+                ...(routerSelectedSourceFields.length > 0 ? routerSelectedSourceFields : [
+                  ...dataOpsQueryResultRows.slice(0, 20).flatMap((row: any) => Object.keys(row || {})),
+                  ...dataOpsObjectDataRows.slice(0, 20).flatMap((row: any) => Object.keys(row || {})),
+                  ...dataOpsPipelineSteps.flatMap((item) => [
+                    ...(item.selectFields || []).map((field) => routerFieldLabel(field)),
+                    ...(item.queryBuilders || []).flatMap((config) => routerFieldsFromQueryConfig(config)),
+                  ]),
+                ]),
+              ].filter(Boolean))
+              const routerFieldOptions = routerSourceFields.map((value) => ({ value, label: value }))
+              const dataOpsTargetStepOptions = dataOpsPipelineSteps
+                .filter((item) => item.id !== selectedDataOpsPipelineStep.id)
+                .map((item) => ({
+                  value: item.id,
+                  label: `${item.name || item.id} (${DATA_OPS_STEP_KIND_META[item.kind]?.label || item.kind})`,
+                }))
+              const mainPipelineNodeOptions = nodes
+                .filter((node) => node.id !== selectedNodeId)
+                .map((node) => {
+                  const nodeData = node.data && typeof node.data === 'object' ? node.data as unknown as Record<string, unknown> : {}
+                  const label = String(nodeData.label || nodeData.name || node.id)
+                  const type = String(nodeData.type || node.type || 'node')
+                  return { value: node.id, label: `${label} (${type})` }
+                })
+              const patchRouter = (patch: Partial<DataOpsPipelineStep>) => patchDataOpsPipelineStep(selectedDataOpsPipelineStep.id, patch)
+              const routerConfigRows = Array.isArray(selectedDataOpsPipelineStep.routerConfigs) ? selectedDataOpsPipelineStep.routerConfigs : []
+              const activeRouterConfig = routerConfigRows.find((item) => item.id === selectedDataOpsPipelineStep.activeRouterConfigId)
+              const routerScheduleStep: DataOpsPipelineStep = {
+                ...selectedDataOpsPipelineStep,
+                activeRouterConfigId: activeRouterConfig?.id || selectedDataOpsPipelineStep.activeRouterConfigId,
+                deployEnabled: activeRouterConfig ? Boolean(activeRouterConfig.deployEnabled) : Boolean(selectedDataOpsPipelineStep.deployEnabled),
+                scheduleEnabled: activeRouterConfig ? Boolean(activeRouterConfig.scheduleEnabled) : Boolean(selectedDataOpsPipelineStep.scheduleEnabled),
+                scheduleType: activeRouterConfig?.scheduleType || selectedDataOpsPipelineStep.scheduleType || 'interval',
+                scheduleIntervalMinutes: activeRouterConfig?.scheduleIntervalMinutes || selectedDataOpsPipelineStep.scheduleIntervalMinutes || 60,
+                scheduleCron: activeRouterConfig?.scheduleCron || selectedDataOpsPipelineStep.scheduleCron || '0 * * * *',
+                scheduleTimezone: activeRouterConfig?.scheduleTimezone || selectedDataOpsPipelineStep.scheduleTimezone || 'Asia/Kolkata',
+                scheduleMaxParallelRuns: activeRouterConfig?.scheduleMaxParallelRuns || selectedDataOpsPipelineStep.scheduleMaxParallelRuns || 1,
+                scheduleMisfirePolicy: activeRouterConfig?.scheduleMisfirePolicy || selectedDataOpsPipelineStep.scheduleMisfirePolicy || 'skip',
+                scheduleStatus: activeRouterConfig ? String(activeRouterConfig.scheduleStatus || '') : String(selectedDataOpsPipelineStep.scheduleStatus || ''),
+                scheduleBackendJobId: activeRouterConfig ? String(activeRouterConfig.scheduleBackendJobId || '') : String(selectedDataOpsPipelineStep.scheduleBackendJobId || ''),
+                scheduleNextRunAt: activeRouterConfig ? String(activeRouterConfig.scheduleNextRunAt || '') : String(selectedDataOpsPipelineStep.scheduleNextRunAt || ''),
+                scheduleLastRegisteredAt: activeRouterConfig ? String(activeRouterConfig.scheduleLastRegisteredAt || '') : String(selectedDataOpsPipelineStep.scheduleLastRegisteredAt || ''),
+              }
+              const defaultRouteRows: DataOpsRouterRouteRow[] = [
+                {
+                  id: dataOpsId('route'),
+                  name: 'Primary Route',
+                  matchMode: 'always',
+                  criteria: [],
+                  targetType: 'data_ops_step',
+                  targetNodeId: '',
+                  targetStepId: dataOpsTargetStepOptions[0]?.value || '',
+                  endpoint: '',
+                  payloadMode: 'all_rows',
+                  enabled: true,
+                },
+              ]
+              const buildDataOpsRouterEdgesForConfigs = (configs: Array<{ id?: string; name?: string; routeRows?: DataOpsRouterRouteRow[] }>, baseEdges: Edge[] = dataOpsPipelineEdges) => {
+                const sourceStepId = String(selectedDataOpsPipelineStep.id || '')
+                const managedPrefix = `data_ops_route_${sourceStepId}_`
+                const nextEdges = baseEdges.filter((edge) => {
+                  const edgeId = String(edge.id || '')
+                  const edgeData = edge.data && typeof edge.data === 'object' ? edge.data as Record<string, unknown> : {}
+                  return !(edgeId.startsWith(managedPrefix) || (edgeData.dataOpsRouterManaged === true && String(edge.source || '') === sourceStepId))
+                })
+                configs.forEach((config, configIndex) => {
+                  const scope = String(config.id || config.name || `router_${configIndex + 1}`).replace(/[^A-Za-z0-9_.:-]+/g, '_')
+                  ;(config.routeRows || [])
+                    .filter((route) => route.enabled !== false && route.targetType === 'data_ops_step' && route.targetStepId && route.targetStepId !== sourceStepId)
+                    .forEach((route) => {
+                      nextEdges.push({
+                        id: `data_ops_route_${sourceStepId}_${scope}_${route.id}_${route.targetStepId}`,
+                        source: sourceStepId,
+                        target: String(route.targetStepId),
+                        sourceHandle: 'output',
+                        targetHandle: 'input',
+                        animated: true,
+                        type: 'smoothstep',
+                        label: route.name || config.name || undefined,
+                        labelShowBg: true,
+                        labelBgPadding: [6, 2] as [number, number],
+                        labelBgBorderRadius: 8,
+                        labelStyle: { fill: 'var(--app-text)', fontSize: 10, fontWeight: 700 },
+                        markerEnd: { type: MarkerType.ArrowClosed, color: DATA_OPS_STEP_KIND_META.router.color, width: 12, height: 12 },
+                        interactionWidth: 44,
+                        style: { stroke: DATA_OPS_STEP_KIND_META.router.color, strokeWidth: 1.5, strokeDasharray: '4 4' },
+                        data: {
+                          dataOpsRouterManaged: true,
+                          routerConfigId: config.id,
+                          routerRouteId: route.id,
+                          routerTargetType: route.targetType,
+                        },
+                      } as Edge)
+                    })
+                  })
+                return nextEdges
+              }
+              const buildDataOpsRouterEdges = (routes: DataOpsRouterRouteRow[], baseEdges: Edge[] = dataOpsPipelineEdges) =>
+                buildDataOpsRouterEdgesForConfigs([{ id: selectedDataOpsPipelineStep.activeRouterConfigId || 'current', routeRows: routes }], baseEdges)
+              const syncMainPipelineRouterEdgesForConfigs = (configs: Array<{ id?: string; name?: string; routeRows?: DataOpsRouterRouteRow[] }>) => {
+                const sourceNodeId = String(selectedNodeId || '')
+                if (!sourceNodeId) return
+                const state = useWorkflowStore.getState()
+                const currentEdges = ((state.edges || edges || []) as Edge[])
+                const nextEdges = currentEdges.filter((edge) => {
+                  const edgeData = edge.data && typeof edge.data === 'object' ? edge.data as Record<string, unknown> : {}
+                  return !(String(edge.source || '') === sourceNodeId && edgeData.dataOpsRouterManaged === true)
+                })
+                configs.forEach((config, configIndex) => {
+                  const scope = String(config.id || config.name || `router_${configIndex + 1}`).replace(/[^A-Za-z0-9_.:-]+/g, '_')
+                  ;(config.routeRows || [])
+                    .filter((route) => route.enabled !== false && route.targetType === 'main_pipeline_node' && route.targetNodeId && route.targetNodeId !== sourceNodeId)
+                    .forEach((route) => {
+                      nextEdges.push({
+                        id: `data_ops_router_${sourceNodeId}_${scope}_${route.id}_${route.targetNodeId}`,
+                        source: sourceNodeId,
+                        target: String(route.targetNodeId),
+                        sourceHandle: 'output',
+                        targetHandle: 'input',
+                        type: connectorType,
+                        animated: true,
+                        reconnectable: true,
+                        updatable: true,
+                        interactionWidth: 44,
+                        label: route.name || config.name || 'Route',
+                        labelShowBg: true,
+                        labelBgPadding: [6, 2] as [number, number],
+                        labelBgBorderRadius: 8,
+                        labelStyle: { fill: 'var(--app-text)', fontSize: 10, fontWeight: 700 },
+                        markerEnd: { type: MarkerType.ArrowClosed, color: DATA_OPS_STEP_KIND_META.router.color, width: 12, height: 12 },
+                        style: { stroke: DATA_OPS_STEP_KIND_META.router.color, strokeWidth: 1.5, strokeDasharray: '5 4' },
+                        data: {
+                          dataOpsRouterManaged: true,
+                          routerConfigId: config.id,
+                          routerRouteId: route.id,
+                          routerTargetType: route.targetType,
+                        },
+                      } as Edge)
+                    })
+                  })
+                state.setEdges(nextEdges as any)
+              }
+              const syncMainPipelineRouterEdges = (routes: DataOpsRouterRouteRow[]) =>
+                syncMainPipelineRouterEdgesForConfigs([{ id: selectedDataOpsPipelineStep.activeRouterConfigId || 'current', routeRows: routes }])
+              const snapshotRouterConfig = (base?: Partial<DataOpsRouterConfig>, sourceStep: DataOpsPipelineStep = selectedDataOpsPipelineStep): DataOpsRouterConfig => ({
+                id: String(base?.id || dataOpsId('router')),
+                name: String(base?.name || activeRouterConfig?.name || `Router ${routerConfigRows.length + 1}`),
+                description: String(base?.description || ''),
+                routeSource: sourceStep.routeSource || '',
+                routeMode: sourceStep.routeMode || 'multi',
+                payloadMode: sourceStep.payloadMode || 'all_rows',
+                routeRows: sourceStep.routeRows || [],
+                syncProcessingMode: sourceStep.syncProcessingMode || 'batch',
+                syncBatchSize: sourceStep.syncBatchSize || 1000,
+                syncCommitEvery: sourceStep.syncCommitEvery || 5000,
+                syncParallelEnabled: Boolean(sourceStep.syncParallelEnabled),
+                syncParallelWorkers: sourceStep.syncParallelWorkers || 4,
+                syncIncrementalField: sourceStep.syncIncrementalField || '',
+                syncCursorField: sourceStep.syncCursorField || '',
+                syncErrorMode: sourceStep.syncErrorMode || 'stop',
+                deployEnabled: Boolean(sourceStep.deployEnabled),
+                scheduleEnabled: Boolean(sourceStep.scheduleEnabled),
+                scheduleType: sourceStep.scheduleType || 'interval',
+                scheduleIntervalMinutes: sourceStep.scheduleIntervalMinutes || 60,
+                scheduleCron: sourceStep.scheduleCron || '0 * * * *',
+                scheduleTimezone: sourceStep.scheduleTimezone || 'Asia/Kolkata',
+                scheduleMaxParallelRuns: sourceStep.scheduleMaxParallelRuns || 1,
+                scheduleMisfirePolicy: sourceStep.scheduleMisfirePolicy || 'skip',
+                scheduleStatus: sourceStep.scheduleStatus || '',
+                scheduleBackendJobId: sourceStep.scheduleBackendJobId || '',
+                scheduleNextRunAt: sourceStep.scheduleNextRunAt || '',
+                scheduleLastRegisteredAt: sourceStep.scheduleLastRegisteredAt || '',
+                updatedAt: new Date().toISOString(),
+              })
+              const saveCurrentRouterConfig = (stepOverride?: DataOpsPipelineStep, notify = true) => {
+                const sourceStep = stepOverride || selectedDataOpsPipelineStep
+                const sourceRows = Array.isArray(sourceStep.routerConfigs) ? sourceStep.routerConfigs : routerConfigRows
+                const targetId = sourceStep.activeRouterConfigId || activeRouterConfig?.id || dataOpsId('router')
+                const existing = sourceRows.find((item) => item.id === targetId)
+                const nextConfig = snapshotRouterConfig({
+                  id: targetId,
+                  name: existing?.name || activeRouterConfig?.name || `Router ${routerConfigRows.length + 1}`,
+                  description: existing?.description || '',
+                }, sourceStep)
+                const nextRouterConfigs = existing
+                  ? sourceRows.map((item) => item.id === targetId ? nextConfig : item)
+                  : [...sourceRows, nextConfig]
+                const nextStep = { ...sourceStep, routerConfigs: nextRouterConfigs, activeRouterConfigId: targetId }
+                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id
+                  ? nextStep
+                  : step)
+                const nextDataOpsEdges = buildDataOpsRouterEdgesForConfigs(nextRouterConfigs)
+                syncMainPipelineRouterEdgesForConfigs(nextRouterConfigs)
+                persistDataOpsPipeline(nextSteps, nextDataOpsEdges)
+                if (notify) {
+                  notification.success({ message: 'Router configuration saved', placement: 'bottomRight', duration: 2 })
+                  persistPipelineAfterConfigUpdate('Router configuration saved permanently')
+                }
+                return nextStep
+              }
+              const loadRouterConfig = (config: DataOpsRouterConfig) => {
+                patchRouter({
+                  activeRouterConfigId: config.id,
+                  routeSource: config.routeSource || '',
+                  routeMode: config.routeMode || 'multi',
+                  payloadMode: config.payloadMode || 'all_rows',
+                  routeRows: config.routeRows || [],
+                  syncProcessingMode: config.syncProcessingMode || 'batch',
+                  syncBatchSize: config.syncBatchSize || 1000,
+                  syncCommitEvery: config.syncCommitEvery || 5000,
+                  syncParallelEnabled: Boolean(config.syncParallelEnabled),
+                  syncParallelWorkers: config.syncParallelWorkers || 4,
+                  syncIncrementalField: config.syncIncrementalField || '',
+                  syncCursorField: config.syncCursorField || '',
+                  syncErrorMode: config.syncErrorMode || 'stop',
+                  deployEnabled: Boolean(config.deployEnabled),
+                  scheduleEnabled: Boolean(config.scheduleEnabled),
+                  scheduleType: config.scheduleType || 'interval',
+                  scheduleIntervalMinutes: config.scheduleIntervalMinutes || 60,
+                  scheduleCron: config.scheduleCron || '0 * * * *',
+                  scheduleTimezone: config.scheduleTimezone || 'Asia/Kolkata',
+                  scheduleMaxParallelRuns: config.scheduleMaxParallelRuns || 1,
+                  scheduleMisfirePolicy: config.scheduleMisfirePolicy || 'skip',
+                  scheduleStatus: config.scheduleStatus || '',
+                  scheduleBackendJobId: config.scheduleBackendJobId || '',
+                  scheduleNextRunAt: config.scheduleNextRunAt || '',
+                  scheduleLastRegisteredAt: config.scheduleLastRegisteredAt || '',
+                })
+                setDataOpsRouterConfigOpen(true)
+              }
+              const addRouterConfig = () => {
+                const nextId = dataOpsId('router')
+                const nextConfig: DataOpsRouterConfig = {
+                  id: nextId,
+                  name: `Router ${routerConfigRows.length + 1}`,
+                  description: '',
+                  routeSource: routerQuerySourceOptions[0]?.value || '',
+                  routeMode: 'multi',
+                  payloadMode: 'all_rows',
+                  routeRows: defaultRouteRows,
+                  syncProcessingMode: 'batch',
+                  syncBatchSize: 1000,
+                  syncCommitEvery: 5000,
+                  syncParallelEnabled: false,
+                  syncParallelWorkers: 4,
+                  syncIncrementalField: '',
+                  syncCursorField: '',
+                  syncErrorMode: 'stop',
+                  deployEnabled: false,
+                  scheduleEnabled: false,
+                  scheduleType: 'interval',
+                  scheduleIntervalMinutes: 60,
+                  scheduleCron: '0 * * * *',
+                  scheduleTimezone: 'Asia/Kolkata',
+                  scheduleMaxParallelRuns: 1,
+                  scheduleMisfirePolicy: 'skip',
+                  scheduleStatus: '',
+                  scheduleBackendJobId: '',
+                  scheduleNextRunAt: '',
+                  scheduleLastRegisteredAt: '',
+                  updatedAt: new Date().toISOString(),
+                }
+                const nextPatch: Partial<DataOpsPipelineStep> = {
+                  routerConfigs: [...routerConfigRows, nextConfig],
+                  activeRouterConfigId: nextId,
+                  routeSource: nextConfig.routeSource,
+                  routeMode: nextConfig.routeMode,
+                  payloadMode: nextConfig.payloadMode,
+                  routeRows: nextConfig.routeRows,
+                  syncProcessingMode: 'batch',
+                  syncBatchSize: 1000,
+                  syncCommitEvery: 5000,
+                  syncParallelEnabled: false,
+                  syncParallelWorkers: 4,
+                  syncIncrementalField: '',
+                  syncCursorField: '',
+                  syncErrorMode: 'stop',
+                  deployEnabled: false,
+                  scheduleEnabled: false,
+                  scheduleType: 'interval',
+                  scheduleIntervalMinutes: 60,
+                  scheduleCron: '0 * * * *',
+                  scheduleTimezone: 'Asia/Kolkata',
+                  scheduleMaxParallelRuns: 1,
+                  scheduleMisfirePolicy: 'skip',
+                  scheduleStatus: '',
+                  scheduleBackendJobId: '',
+                  scheduleNextRunAt: '',
+                  scheduleLastRegisteredAt: '',
+                }
+                const nextRouterConfigs = [...routerConfigRows, nextConfig]
+                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, ...nextPatch, routerConfigs: nextRouterConfigs } : step)
+                const nextDataOpsEdges = buildDataOpsRouterEdgesForConfigs(nextRouterConfigs)
+                syncMainPipelineRouterEdgesForConfigs(nextRouterConfigs)
+                persistDataOpsPipeline(nextSteps, nextDataOpsEdges)
+                setDataOpsRouterConfigOpen(true)
+              }
+              const duplicateRouterConfig = (config: DataOpsRouterConfig) => {
+                const nextId = dataOpsId('router')
+                patchRouter({
+                  routerConfigs: [...routerConfigRows, { ...config, id: nextId, name: `${config.name || 'Router'} Copy`, updatedAt: new Date().toISOString() }],
+                  activeRouterConfigId: nextId,
+                })
+              }
+              const updateRouterConfig = (configId: string, patch: Partial<DataOpsRouterConfig>) => {
+                patchRouter({
+                  routerConfigs: routerConfigRows.map((item) => item.id === configId ? { ...item, ...patch, updatedAt: new Date().toISOString() } : item),
+                })
+              }
+              const deleteRouterConfig = (configId: string) => {
+                const nextRows = routerConfigRows.filter((item) => item.id !== configId)
+                patchRouter({
+                  routerConfigs: nextRows,
+                  activeRouterConfigId: selectedDataOpsPipelineStep.activeRouterConfigId === configId ? String(nextRows[0]?.id || '') : selectedDataOpsPipelineStep.activeRouterConfigId,
+                })
+              }
+              const patchRouterScheduler = (patch: Partial<DataOpsPipelineStep>, deploy = false) => {
+                const activeConfigId = String(selectedDataOpsPipelineStep.activeRouterConfigId || '')
+                const configPatch: Partial<DataOpsRouterConfig> = {
+                  ...(Object.prototype.hasOwnProperty.call(patch, 'deployEnabled') ? { deployEnabled: Boolean(patch.deployEnabled) } : {}),
+                  ...(Object.prototype.hasOwnProperty.call(patch, 'scheduleEnabled') ? { scheduleEnabled: Boolean(patch.scheduleEnabled) } : {}),
+                  ...(patch.scheduleType ? { scheduleType: patch.scheduleType } : {}),
+                  ...(Object.prototype.hasOwnProperty.call(patch, 'scheduleIntervalMinutes') ? { scheduleIntervalMinutes: Number(patch.scheduleIntervalMinutes || 60) } : {}),
+                  ...(Object.prototype.hasOwnProperty.call(patch, 'scheduleCron') ? { scheduleCron: String(patch.scheduleCron || '0 * * * *') } : {}),
+                  ...(Object.prototype.hasOwnProperty.call(patch, 'scheduleTimezone') ? { scheduleTimezone: String(patch.scheduleTimezone || 'Asia/Kolkata') } : {}),
+                  ...(Object.prototype.hasOwnProperty.call(patch, 'scheduleMaxParallelRuns') ? { scheduleMaxParallelRuns: Number(patch.scheduleMaxParallelRuns || 1) } : {}),
+                  ...(patch.scheduleMisfirePolicy ? { scheduleMisfirePolicy: patch.scheduleMisfirePolicy } : {}),
+                  ...(Object.prototype.hasOwnProperty.call(patch, 'scheduleStatus') ? { scheduleStatus: String(patch.scheduleStatus || '') } : {}),
+                  ...(Object.prototype.hasOwnProperty.call(patch, 'scheduleBackendJobId') ? { scheduleBackendJobId: String(patch.scheduleBackendJobId || '') } : {}),
+                  ...(Object.prototype.hasOwnProperty.call(patch, 'scheduleNextRunAt') ? { scheduleNextRunAt: String(patch.scheduleNextRunAt || '') } : {}),
+                  ...(Object.prototype.hasOwnProperty.call(patch, 'scheduleLastRegisteredAt') ? { scheduleLastRegisteredAt: String(patch.scheduleLastRegisteredAt || '') } : {}),
+                  updatedAt: new Date().toISOString(),
+                }
+                patchRouter({
+                  ...patch,
+                  routerConfigs: activeConfigId
+                    ? routerConfigRows.map((item) => item.id === activeConfigId ? { ...item, ...configPatch } : item)
+                    : routerConfigRows,
+                })
+                if (deploy) void deployDataOpsRouterScheduler(routerScheduleStep, patch as Record<string, unknown>)
+              }
+              const routeRows = selectedDataOpsPipelineStep.routeRows || []
+              const activeRoutes = routeRows.filter((row) => row.enabled !== false)
+              const activeRouteConfigRow = routeRows.find((row) => row.id === dataOpsRouterRouteConfigId) || null
+              const routerSampleRows = (dataOpsQueryResultRows.length > 0 ? dataOpsQueryResultRows : dataOpsObjectDataRows) as Array<Record<string, unknown>>
+              const readRouterValue = (row: Record<string, unknown>, field: string) => {
+                const path = String(field || '').trim()
+                if (!path) return undefined
+                return path.split('.').reduce<unknown>((current, key) => {
+                  if (current && typeof current === 'object') return (current as Record<string, unknown>)[key]
+                  return undefined
+                }, row)
+              }
+              const routeCriterionMatchesRow = (row: Record<string, unknown>, criterion: DataOpsRuleRow) => {
+                const field = String(criterion.field || '').trim()
+                if (!field) return false
+                const actual = readRouterValue(row, field)
+                const expected = String(criterion.value || '')
+                const actualText = actual === null || actual === undefined ? '' : String(actual)
+                const operator = String(criterion.operator || 'equals')
+                if (operator === 'exists') return actual !== null && actual !== undefined && actualText !== ''
+                if (operator === 'empty') return actual === null || actual === undefined || actualText === ''
+                if (operator === 'not_equals') return actualText !== expected
+                if (operator === 'contains') return actualText.toLowerCase().includes(expected.toLowerCase())
+                if (operator === 'greater_than') return Number(actual) > Number(expected)
+                if (operator === 'less_than') return Number(actual) < Number(expected)
+                if (operator === 'greater_or_equal') return Number(actual) >= Number(expected)
+                if (operator === 'less_or_equal') return Number(actual) <= Number(expected)
+                return actualText === expected
+              }
+              const routeCriteria = (route: DataOpsRouterRouteRow) => {
+                const configured = (route.criteria || []).filter((criterion) => criterion.enabled !== false && String(criterion.field || '').trim())
+                if (configured.length > 0) return configured
+                const field = String(route.field || '').trim()
+                return field ? [{ id: `${route.id}_legacy`, field, operator: route.operator || 'equals', value: route.value || '', enabled: true }] : []
+              }
+              const routeMatchesRow = (row: Record<string, unknown>, route: DataOpsRouterRouteRow) => {
+                const mode = route.matchMode || 'all'
+                if (mode === 'always') return true
+                if (mode === 'default') return false
+                const criteria = routeCriteria(route)
+                if (criteria.length <= 0) return true
+                return mode === 'any'
+                  ? criteria.some((criterion) => routeCriterionMatchesRow(row, criterion))
+                  : criteria.every((criterion) => routeCriterionMatchesRow(row, criterion))
+              }
+              const getRouteTargetLabel = (route: DataOpsRouterRouteRow) => {
+                if (route.targetType === 'external') return route.endpoint || 'external endpoint'
+                if (route.targetType === 'main_pipeline_node') return mainPipelineNodeOptions.find((item) => item.value === route.targetNodeId)?.label || route.targetNodeId || 'main pipeline node'
+                return dataOpsTargetStepOptions.find((item) => item.value === route.targetStepId)?.label || route.targetStepId || 'Data Vault step'
+              }
+              const routePreviewRows = activeRoutes.map((route) => {
+                const matched = route.matchMode === 'default'
+                  ? Math.max(0, routerSampleRows.length - Math.max(...activeRoutes.filter((item) => item.matchMode !== 'default').map((item) => routerSampleRows.filter((row) => routeMatchesRow(row, item)).length), 0))
+                  : routerSampleRows.filter((row) => routeMatchesRow(row, route)).length
+                return {
+                  key: route.id,
+                  name: route.name || route.id,
+                  target: getRouteTargetLabel(route),
+                  mode: route.matchMode || 'all',
+                  payload: route.payloadMode || selectedDataOpsPipelineStep.payloadMode || 'all_rows',
+                  rows: routerSampleRows.length > 0 ? matched : 'preview unavailable',
+                }
+              })
+              const patchRouterRoute = (routeId: string, patch: Partial<DataOpsRouterRouteRow>) => {
+                const nextRouteRows = routeRows.map((item) => item.id === routeId ? { ...item, ...patch } : item)
+                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, routeRows: nextRouteRows } : step)
+                const nextDataOpsEdges = buildDataOpsRouterEdges(nextRouteRows)
+                syncMainPipelineRouterEdges(nextRouteRows)
+                persistDataOpsPipeline(nextSteps, nextDataOpsEdges)
+              }
+              const addRouterRoute = () => {
+                const nextRoute: DataOpsRouterRouteRow = {
+                  id: dataOpsId('route'),
+                  name: `Route ${routeRows.length + 1}`,
+                  matchMode: 'all',
+                  field: '',
+                  operator: 'equals',
+                  value: '',
+                  criteria: [{ id: dataOpsId('criterion'), field: '', operator: 'equals', value: '', enabled: true }],
+                  targetType: 'data_ops_step',
+                  targetStepId: dataOpsTargetStepOptions[0]?.value || '',
+                  targetNodeId: '',
+                  endpoint: '',
+                  payloadMode: selectedDataOpsPipelineStep.payloadMode || 'all_rows',
+                  enabled: true,
+                }
+                const nextRouteRows = [...routeRows, nextRoute]
+                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, routeRows: nextRouteRows } : step)
+                const nextDataOpsEdges = buildDataOpsRouterEdges(nextRouteRows)
+                syncMainPipelineRouterEdges(nextRouteRows)
+                persistDataOpsPipeline(nextSteps, nextDataOpsEdges)
+                setDataOpsRouterRouteConfigId(nextRoute.id)
+              }
+              const deleteRouterRoute = (routeId: string) => {
+                const nextRouteRows = routeRows.filter((item) => item.id !== routeId)
+                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, routeRows: nextRouteRows } : step)
+                const nextDataOpsEdges = buildDataOpsRouterEdges(nextRouteRows)
+                syncMainPipelineRouterEdges(nextRouteRows)
+                persistDataOpsPipeline(nextSteps, nextDataOpsEdges)
+                if (dataOpsRouterRouteConfigId === routeId) setDataOpsRouterRouteConfigId('')
+              }
+              const routerSchedulerStatusTags = (item: Partial<DataOpsPipelineStep & DataOpsRouterConfig>) => {
+                const status = String(item.scheduleStatus || (item.scheduleEnabled ? 'enabled' : 'disabled'))
+                return (
+                  <Space size={6} wrap>
+                    <Tag color={status === 'scheduled' ? 'green' : item.scheduleEnabled ? 'orange' : 'default'} style={{ marginInlineEnd: 0 }}>
+                      {status}
+                    </Tag>
+                    {item.scheduleNextRunAt ? <Tag color="blue" style={{ marginInlineEnd: 0 }}>next: {String(item.scheduleNextRunAt)}</Tag> : null}
+                  </Space>
+                )
+              }
+              return (
+                <div style={{ display: 'grid', gap: 10 }}>
+                  <Space style={{ width: '100%', justifyContent: 'space-between' }} align="start">
+                    <div>
+                      <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Router Configuration Table</Text>
+                      <br />
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Route saved query results to one or many Data Vault steps or main pipeline workbench nodes.</Text>
+                    </div>
+                    <Button size="small" type="primary" onClick={addRouterConfig}>Add Router</Button>
+                  </Space>
+                  <Table
+                    size="small"
+                    rowKey="id"
+                    pagination={false}
+                    dataSource={routerConfigRows}
+                    locale={{
+                      emptyText: (
+                        <Space direction="vertical" size={8}>
+                          <Text style={{ color: 'var(--app-text-subtle)' }}>No router configurations saved.</Text>
+                          <Button size="small" type="primary" onClick={addRouterConfig}>Add Router</Button>
+                        </Space>
+                      ),
+                    }}
+                    columns={[
+                      { title: 'State', width: 86, render: (_value: unknown, row: DataOpsRouterConfig) => <Tag color={row.id === selectedDataOpsPipelineStep.activeRouterConfigId ? 'green' : 'default'} style={{ marginInlineEnd: 0 }}>{row.id === selectedDataOpsPipelineStep.activeRouterConfigId ? 'selected' : 'saved'}</Tag> },
+                      { title: 'Router Name', render: (_value: unknown, row: DataOpsRouterConfig) => <Input size="small" value={row.name || ''} onChange={(event) => updateRouterConfig(row.id, { name: event.target.value })} style={dataOpsInputStyle(dataOpsSectionColors.schedule)} /> },
+                      { title: 'Source Query', width: 260, render: (_value: unknown, row: DataOpsRouterConfig) => <Text ellipsis style={{ color: dataOpsSectionColors.source }}>{routerQuerySourceOptions.find((item) => item.value === row.routeSource)?.label || row.routeSource || 'upstream result'}</Text> },
+                      { title: 'Routes', width: 92, render: (_value: unknown, row: DataOpsRouterConfig) => <Tag color="orange" style={{ marginInlineEnd: 0 }}>{(row.routeRows || []).filter((item) => item.enabled !== false).length}</Tag> },
+                      { title: 'Mode', width: 104, render: (_value: unknown, row: DataOpsRouterConfig) => <Tag color="blue" style={{ marginInlineEnd: 0 }}>{row.routeMode || 'multi'}</Tag> },
+                      { title: 'Scheduler', width: 240, render: (_value: unknown, row: DataOpsRouterConfig) => routerSchedulerStatusTags(row) },
+                      { title: 'Updated', width: 170, render: (_value: unknown, row: DataOpsRouterConfig) => <Text ellipsis style={{ color: 'var(--app-text-subtle)' }}>{row.updatedAt || '-'}</Text> },
+                      { title: 'Configuration', width: 230, render: (_value: unknown, row: DataOpsRouterConfig) => <Space size={6}><Button size="small" type={row.id === selectedDataOpsPipelineStep.activeRouterConfigId ? 'primary' : 'default'} onClick={() => loadRouterConfig(row)}>Configure</Button><Button size="small" onClick={() => duplicateRouterConfig(row)}>Copy</Button><Button size="small" danger onClick={() => deleteRouterConfig(row.id)}>Delete</Button></Space> },
+                    ] as any[]}
+	                  />
+	                  <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, padding: 10, background: 'var(--app-bg)', display: 'grid', gap: 8 }}>
+	                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+	                      Selected router: {activeRouterConfig?.name || selectedDataOpsPipelineStep.activeRouterConfigId || 'current draft'} · routes: {activeRoutes.length} · targets can be Data Vault steps, main pipeline nodes, or external endpoints.
+	                    </Text>
+	                  </div>
+                  {dataOpsRouterConfigOpen ? (
+                    <Modal
+                      open={dataOpsRouterConfigOpen}
+                      onCancel={() => setDataOpsRouterConfigOpen(false)}
+                      title={`Query Result Router${activeRouterConfig?.name ? `: ${activeRouterConfig.name}` : ''}`}
+                      wrapClassName="data-ops-config-modal data-ops-mapper-modal"
+                      width="96vw"
+                      centered
+                      footer={[
+                        <Button key="save" onClick={() => saveCurrentRouterConfig()}>Save Router Row</Button>,
+                        <Button key="done" type="primary" onClick={() => {
+                          saveCurrentRouterConfig()
+                          setDataOpsRouterConfigOpen(false)
+                        }}>Done</Button>,
+                      ]}
+                      styles={{
+                        content: { background: 'var(--app-panel-bg)', border: '1px solid var(--app-border-strong)', height: '90vh', display: 'flex', flexDirection: 'column' },
+                        header: { background: 'var(--app-panel-bg)' },
+                        body: { background: 'var(--app-panel-bg)', flex: 1, overflowY: 'auto', minHeight: 0 },
+                      }}
+                    >
+                      <div className="data-ops-router-shell">
+                        <div className="data-ops-router-toolbar" style={{ display: 'grid', gridTemplateColumns: '2fr 160px 170px', gap: 10, alignItems: 'end' }}>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Query Result Source</Text>
+                              <Select size="small" showSearch allowClear optionFilterProp="label" value={routerRouteSourceSelectValue} onChange={(value) => patchRouter({ routeSource: String(value || '') })} placeholder={routerQuerySourceOptions.length > 0 ? 'select connected query result' : 'connect a Query Builder node'} options={routerQuerySourceOptions} notFoundContent="No connected Query Builder source" style={dataOpsControlStyle(dataOpsSectionColors.source, { width: '100%', marginTop: 5 })} />
+                            </div>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Route Mode</Text>
+                              <Select size="small" value={selectedDataOpsPipelineStep.routeMode || 'multi'} onChange={(value) => patchRouter({ routeMode: value as DataOpsPipelineStep['routeMode'] })} options={[{ value: 'single', label: 'Single' }, { value: 'multi', label: 'Multiple' }, { value: 'conditional', label: 'Conditional' }]} style={dataOpsControlStyle(dataOpsSectionColors.schedule, { width: '100%', marginTop: 5 })} />
+                            </div>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Default Payload</Text>
+                              <Select size="small" value={selectedDataOpsPipelineStep.payloadMode || 'all_rows'} onChange={(value) => patchRouter({ payloadMode: value as DataOpsPipelineStep['payloadMode'] })} options={[{ value: 'all_rows', label: 'All rows' }, { value: 'batch', label: 'Batch' }, { value: 'row_by_row', label: 'Row by row' }, { value: 'first_row', label: 'First row' }, { value: 'grouped', label: 'Grouped' }]} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%', marginTop: 5 })} />
+                            </div>
+                        </div>
+                        <div className="data-ops-router-layout">
+                          <div className="data-ops-router-main">
+                          <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                            <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Routing Endpoints</Text>
+	                            <Button size="small" onClick={addRouterRoute}>Add Route</Button>
+                          </Space>
+                          <Table
+                            size="small"
+                            rowKey="id"
+                            pagination={false}
+	                            scroll={{ x: 980, y: 260 }}
+	                            style={{ width: '100%', maxWidth: '100%' }}
+	                            dataSource={routeRows}
+	                            columns={[
+	                              { title: 'Use', width: 56, fixed: 'left', render: (_value: unknown, row: DataOpsRouterRouteRow) => <Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchRouterRoute(row.id, { enabled: checked })} /> },
+	                              { title: 'Route', width: 160, fixed: 'left', render: (_value: unknown, row: DataOpsRouterRouteRow) => <Input size="small" value={row.name || ''} onChange={(event) => patchRouterRoute(row.id, { name: event.target.value })} style={dataOpsInputStyle(dataOpsSectionColors.schedule)} /> },
+	                              { title: 'Match', width: 120, render: (_value: unknown, row: DataOpsRouterRouteRow) => <Select size="small" value={row.matchMode || 'all'} onChange={(value) => patchRouterRoute(row.id, { matchMode: value as DataOpsRouterRouteRow['matchMode'] })} options={[{ value: 'always', label: 'Always' }, { value: 'all', label: 'All' }, { value: 'any', label: 'Any' }, { value: 'default', label: 'Default' }]} style={dataOpsControlStyle(dataOpsSectionColors.where, { width: '100%' })} /> },
+	                              { title: 'Conditions', width: 120, render: (_value: unknown, row: DataOpsRouterRouteRow) => <Tag color={['always', 'default'].includes(String(row.matchMode || '')) ? 'default' : 'orange'} style={{ marginInlineEnd: 0 }}>{routeCriteria(row).length}</Tag> },
+	                              { title: 'Target Type', width: 160, render: (_value: unknown, row: DataOpsRouterRouteRow) => <Select size="small" value={row.targetType || 'data_ops_step'} onChange={(value) => patchRouterRoute(row.id, { targetType: value as DataOpsRouterRouteRow['targetType'], targetStepId: value === 'data_ops_step' ? dataOpsTargetStepOptions[0]?.value || '' : row.targetStepId, targetNodeId: value === 'main_pipeline_node' ? mainPipelineNodeOptions[0]?.value || '' : row.targetNodeId })} options={[{ value: 'data_ops_step', label: 'Data Vault step' }, { value: 'main_pipeline_node', label: 'Main pipeline node' }, { value: 'external', label: 'External endpoint' }]} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%' })} /> },
+                              { title: 'Endpoint', width: 260, render: (_value: unknown, row: DataOpsRouterRouteRow) => row.targetType === 'external'
+                                ? <Input size="small" value={row.endpoint || ''} onChange={(event) => patchRouterRoute(row.id, { endpoint: event.target.value })} placeholder="https://, queue, topic, webhook" style={dataOpsInputStyle(dataOpsSectionColors.output)} />
+                                : row.targetType === 'main_pipeline_node'
+                                  ? <Select size="small" showSearch optionFilterProp="label" value={row.targetNodeId || undefined} onChange={(value) => patchRouterRoute(row.id, { targetNodeId: String(value || '') })} placeholder="main pipeline node" options={mainPipelineNodeOptions} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%' })} />
+                                  : <Select size="small" showSearch optionFilterProp="label" value={row.targetStepId || undefined} onChange={(value) => patchRouterRoute(row.id, { targetStepId: String(value || '') })} placeholder="Data Vault step" options={dataOpsTargetStepOptions} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%' })} /> },
+                              { title: 'Payload', width: 130, render: (_value: unknown, row: DataOpsRouterRouteRow) => <Select size="small" value={row.payloadMode || selectedDataOpsPipelineStep.payloadMode || 'all_rows'} onChange={(value) => patchRouterRoute(row.id, { payloadMode: value as DataOpsRouterRouteRow['payloadMode'] })} options={[{ value: 'all_rows', label: 'All rows' }, { value: 'batch', label: 'Batch' }, { value: 'row_by_row', label: 'Row by row' }, { value: 'first_row', label: 'First row' }, { value: 'grouped', label: 'Grouped' }]} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%' })} /> },
+	                              { title: 'Configuration', width: 156, fixed: 'right', render: (_value: unknown, row: DataOpsRouterRouteRow) => <Space size={6}><Button size="small" onClick={() => setDataOpsRouterRouteConfigId(row.id)}>Configure</Button><Button size="small" danger onClick={() => deleteRouterRoute(row.id)}>Remove</Button></Space> },
+	                            ] as any[]}
+	                          />
+	                          {activeRouteConfigRow ? (
+	                            <Modal
+	                              open={Boolean(activeRouteConfigRow)}
+	                              onCancel={() => setDataOpsRouterRouteConfigId('')}
+	                              title={`Route Row Configuration: ${activeRouteConfigRow.name || activeRouteConfigRow.id}`}
+	                              wrapClassName="data-ops-config-modal"
+	                              width="78vw"
+	                              centered
+	                              footer={[
+	                                <Button key="done" type="primary" onClick={() => setDataOpsRouterRouteConfigId('')}>Done</Button>,
+	                              ]}
+	                              styles={{
+	                                content: { background: 'var(--app-panel-bg)', border: '1px solid var(--app-border-strong)' },
+	                                header: { background: 'var(--app-panel-bg)' },
+	                                body: { background: 'var(--app-panel-bg)' },
+	                              }}
+	                            >
+	                              <div style={{ display: 'grid', gap: 12 }}>
+	                                <div style={{ display: 'grid', gridTemplateColumns: '1fr 160px 160px 180px', gap: 10, alignItems: 'end' }}>
+	                                  <div>
+	                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Route Name</Text>
+	                                    <Input size="small" value={activeRouteConfigRow.name || ''} onChange={(event) => patchRouterRoute(activeRouteConfigRow.id, { name: event.target.value })} style={dataOpsInputStyle(dataOpsSectionColors.schedule, { marginTop: 5 })} />
+	                                  </div>
+	                                  <div>
+	                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Enabled</Text>
+	                                    <div style={{ marginTop: 8 }}><Switch size="small" checked={activeRouteConfigRow.enabled !== false} onChange={(checked) => patchRouterRoute(activeRouteConfigRow.id, { enabled: checked })} /></div>
+	                                  </div>
+	                                  <div>
+	                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Match Mode</Text>
+	                                    <Select size="small" value={activeRouteConfigRow.matchMode || 'all'} onChange={(value) => patchRouterRoute(activeRouteConfigRow.id, { matchMode: value as DataOpsRouterRouteRow['matchMode'] })} options={[{ value: 'always', label: 'Always' }, { value: 'all', label: 'All conditions' }, { value: 'any', label: 'Any condition' }, { value: 'default', label: 'Default / unmatched' }]} style={dataOpsControlStyle(dataOpsSectionColors.where, { width: '100%', marginTop: 5 })} />
+	                                  </div>
+	                                  <div>
+	                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Payload Mode</Text>
+	                                    <Select size="small" value={activeRouteConfigRow.payloadMode || selectedDataOpsPipelineStep.payloadMode || 'all_rows'} onChange={(value) => patchRouterRoute(activeRouteConfigRow.id, { payloadMode: value as DataOpsRouterRouteRow['payloadMode'] })} options={[{ value: 'all_rows', label: 'All rows' }, { value: 'batch', label: 'Batch' }, { value: 'row_by_row', label: 'Row by row' }, { value: 'first_row', label: 'First row' }, { value: 'grouped', label: 'Grouped' }]} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%', marginTop: 5 })} />
+	                                  </div>
+	                                </div>
+	                                <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 10 }}>
+	                                  <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+	                                    <div>
+	                                      <Text style={{ color: dataOpsSectionColors.where, fontWeight: 700 }}>Route-Level Conditions</Text>
+	                                      <br />
+	                                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+	                                        Add multiple row conditions. Match mode controls whether all or any conditions must pass.
+	                                      </Text>
+	                                    </div>
+	                                    <Button size="small" disabled={['always', 'default'].includes(String(activeRouteConfigRow.matchMode || ''))} onClick={() => patchRouterRoute(activeRouteConfigRow.id, { criteria: [...(activeRouteConfigRow.criteria || []), { id: dataOpsId('criterion'), field: '', operator: 'equals', value: '', enabled: true }] })}>Add Condition</Button>
+	                                  </Space>
+	                                  <Table
+	                                    size="small"
+	                                    rowKey="id"
+	                                    pagination={false}
+	                                    dataSource={activeRouteConfigRow.criteria || []}
+	                                    locale={{ emptyText: ['always', 'default'].includes(String(activeRouteConfigRow.matchMode || '')) ? 'Conditions are not used for this match mode.' : 'No route conditions configured.' }}
+	                                    columns={[
+	                                      { title: 'Use', width: 56, render: (_value: unknown, row: DataOpsRuleRow) => <Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchRouterRoute(activeRouteConfigRow.id, { criteria: (activeRouteConfigRow.criteria || []).map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} /> },
+	                                      { title: 'Field', render: (_value: unknown, row: DataOpsRuleRow) => <Select size="small" showSearch allowClear optionFilterProp="label" value={row.field || undefined} onChange={(value) => patchRouterRoute(activeRouteConfigRow.id, { criteria: (activeRouteConfigRow.criteria || []).map((item) => item.id === row.id ? { ...item, field: String(value || '') } : item) })} placeholder="field" options={routerFieldOptions} style={dataOpsControlStyle(dataOpsSectionColors.select, { width: '100%' })} /> },
+	                                      { title: 'Operator', width: 170, render: (_value: unknown, row: DataOpsRuleRow) => <Select size="small" value={row.operator || 'equals'} onChange={(value) => patchRouterRoute(activeRouteConfigRow.id, { criteria: (activeRouteConfigRow.criteria || []).map((item) => item.id === row.id ? { ...item, operator: String(value || 'equals') } : item) })} options={['equals', 'not_equals', 'greater_than', 'less_than', 'greater_or_equal', 'less_or_equal', 'contains', 'exists', 'empty'].map((value) => ({ value, label: value }))} style={dataOpsControlStyle(dataOpsSectionColors.where, { width: '100%' })} /> },
+	                                      { title: 'Value', render: (_value: unknown, row: DataOpsRuleRow) => <Input size="small" disabled={['exists', 'empty'].includes(String(row.operator || ''))} value={row.value || ''} onChange={(event) => patchRouterRoute(activeRouteConfigRow.id, { criteria: (activeRouteConfigRow.criteria || []).map((item) => item.id === row.id ? { ...item, value: event.target.value } : item) })} style={dataOpsInputStyle(dataOpsSectionColors.where)} /> },
+	                                      { title: '', width: 70, render: (_value: unknown, row: DataOpsRuleRow) => <Button size="small" danger onClick={() => patchRouterRoute(activeRouteConfigRow.id, { criteria: (activeRouteConfigRow.criteria || []).filter((item) => item.id !== row.id) })}>Remove</Button> },
+	                                    ] as any[]}
+	                                  />
+	                                </div>
+	                                <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 10 }}>
+	                                  <Text style={{ color: dataOpsSectionColors.output, fontWeight: 700 }}>Row-Level Target / Payload</Text>
+	                                  <div style={{ display: 'grid', gridTemplateColumns: '180px 1fr 180px', gap: 10, alignItems: 'end' }}>
+	                                    <div>
+	                                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Target Type</Text>
+	                                      <Select size="small" value={activeRouteConfigRow.targetType || 'data_ops_step'} onChange={(value) => patchRouterRoute(activeRouteConfigRow.id, { targetType: value as DataOpsRouterRouteRow['targetType'], targetStepId: value === 'data_ops_step' ? dataOpsTargetStepOptions[0]?.value || '' : activeRouteConfigRow.targetStepId, targetNodeId: value === 'main_pipeline_node' ? mainPipelineNodeOptions[0]?.value || '' : activeRouteConfigRow.targetNodeId })} options={[{ value: 'data_ops_step', label: 'Data Vault step' }, { value: 'main_pipeline_node', label: 'Main pipeline node' }, { value: 'external', label: 'External endpoint' }]} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%', marginTop: 5 })} />
+	                                    </div>
+	                                    <div>
+	                                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Routing Endpoint</Text>
+	                                      {activeRouteConfigRow.targetType === 'external'
+	                                        ? <Input size="small" value={activeRouteConfigRow.endpoint || ''} onChange={(event) => patchRouterRoute(activeRouteConfigRow.id, { endpoint: event.target.value })} placeholder="https://, queue, topic, webhook" style={dataOpsInputStyle(dataOpsSectionColors.output, { marginTop: 5 })} />
+	                                        : activeRouteConfigRow.targetType === 'main_pipeline_node'
+	                                          ? <Select size="small" showSearch optionFilterProp="label" value={activeRouteConfigRow.targetNodeId || undefined} onChange={(value) => patchRouterRoute(activeRouteConfigRow.id, { targetNodeId: String(value || '') })} placeholder="main pipeline node" options={mainPipelineNodeOptions} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%', marginTop: 5 })} />
+	                                          : <Select size="small" showSearch optionFilterProp="label" value={activeRouteConfigRow.targetStepId || undefined} onChange={(value) => patchRouterRoute(activeRouteConfigRow.id, { targetStepId: String(value || '') })} placeholder="Data Vault step" options={dataOpsTargetStepOptions} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%', marginTop: 5 })} />}
+	                                    </div>
+	                                    <div>
+	                                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Matched Rows</Text>
+	                                      <div style={{ marginTop: 7 }}>
+	                                        <Tag color="blue" style={{ marginInlineEnd: 0 }}>
+	                                          {routerSampleRows.length > 0 ? routerSampleRows.filter((row) => routeMatchesRow(row, activeRouteConfigRow)).length : 'preview unavailable'}
+	                                        </Tag>
+	                                      </div>
+	                                    </div>
+	                                  </div>
+	                                </div>
+	                              </div>
+	                            </Modal>
+	                          ) : null}
+	                          <div style={{ display: 'grid', gridTemplateColumns: '170px 120px 130px 150px 150px 1fr', gap: 10, alignItems: 'end' }}>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Processing Mode</Text>
+                              <Select size="small" value={selectedDataOpsPipelineStep.syncProcessingMode || 'batch'} onChange={(value) => patchRouter({ syncProcessingMode: value as DataOpsPipelineStep['syncProcessingMode'] })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} options={[{ value: 'batch', label: 'Batch' }, { value: 'incremental_batch', label: 'Incremental Batch' }, { value: 'cursor', label: 'Cursor' }, { value: 'row_by_row', label: 'Row by Row' }]} />
+                            </div>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Batch Size</Text>
+                              <InputNumber size="small" min={1} value={selectedDataOpsPipelineStep.syncBatchSize || 1000} onChange={(value) => patchRouter({ syncBatchSize: Math.max(1, Number(value || 1000)) })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} />
+                            </div>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Commit Every</Text>
+                              <InputNumber size="small" min={1} value={selectedDataOpsPipelineStep.syncCommitEvery || 5000} onChange={(value) => patchRouter({ syncCommitEvery: Math.max(1, Number(value || 5000)) })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} />
+                            </div>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Parallel</Text>
+                              <div style={{ marginTop: 8 }}><Switch size="small" checked={Boolean(selectedDataOpsPipelineStep.syncParallelEnabled)} onChange={(checked) => patchRouter({ syncParallelEnabled: checked })} /></div>
+                            </div>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Workers</Text>
+                              <InputNumber size="small" min={1} max={64} disabled={!selectedDataOpsPipelineStep.syncParallelEnabled} value={selectedDataOpsPipelineStep.syncParallelWorkers || 4} onChange={(value) => patchRouter({ syncParallelWorkers: Math.max(1, Number(value || 4)) })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} />
+                            </div>
+                            <div>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Error Policy</Text>
+                              <Select size="small" value={selectedDataOpsPipelineStep.syncErrorMode || 'stop'} onChange={(value) => patchRouter({ syncErrorMode: value as DataOpsPipelineStep['syncErrorMode'] })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} options={[{ value: 'stop', label: 'Stop on error' }, { value: 'skip', label: 'Skip bad rows' }, { value: 'reject', label: 'Write reject rows' }]} />
+                            </div>
+                          </div>
+	                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+	                            <Select size="small" showSearch allowClear optionFilterProp="label" value={selectedDataOpsPipelineStep.syncIncrementalField || undefined} onChange={(value) => patchRouter({ syncIncrementalField: String(value || '') })} placeholder="incremental watermark field" options={routerFieldOptions} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%' })} />
+	                            <Select size="small" showSearch allowClear optionFilterProp="label" value={selectedDataOpsPipelineStep.syncCursorField || undefined} onChange={(value) => patchRouter({ syncCursorField: String(value || '') })} placeholder="cursor/order field" options={routerFieldOptions} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%' })} />
+	                          </div>
+                          <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 10 }}>
+                            <Space style={{ width: '100%', justifyContent: 'space-between' }} align="start">
+                              <div>
+                                <Text style={{ color: 'var(--app-text)', fontWeight: 800, fontSize: 12 }}>Deploy / Scheduler</Text>
+                                <br />
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Stored on the active router configuration row.</Text>
+                              </div>
+                              {routerSchedulerStatusTags(routerScheduleStep)}
+                            </Space>
+                            <div style={{ display: 'grid', gridTemplateColumns: '160px 160px 190px 1fr', gap: 10, alignItems: 'end' }}>
+                              <Space style={{ justifyContent: 'space-between' }}>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Deploy router</Text>
+                                <Switch size="small" checked={Boolean(routerScheduleStep.deployEnabled)} onChange={(checked) => patchRouterScheduler({ deployEnabled: checked }, true)} />
+                              </Space>
+                              <Space style={{ justifyContent: 'space-between' }}>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Scheduler</Text>
+                                <Switch size="small" checked={Boolean(routerScheduleStep.scheduleEnabled)} onChange={(checked) => patchRouterScheduler({ scheduleEnabled: checked }, true)} />
+                              </Space>
+                              <div>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Schedule Type</Text>
+                                <Select size="small" value={routerScheduleStep.scheduleType || 'interval'} onChange={(value) => patchRouterScheduler({ scheduleType: value as DataOpsPipelineStep['scheduleType'] }, true)} options={[{ value: 'manual', label: 'Manual' }, { value: 'interval', label: 'Interval' }, { value: 'cron', label: 'Cron' }, { value: 'event', label: 'Event trigger' }]} style={dataOpsControlStyle(dataOpsSectionColors.schedule, { width: '100%', marginTop: 5 })} />
+                              </div>
+                              <Text ellipsis style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                                Deploy and Scheduler toggles register or disable the backend job for this router row.
+                              </Text>
+                            </div>
+                            <div style={{ display: 'grid', gridTemplateColumns: '150px 170px 1fr 150px 170px', gap: 10, alignItems: 'end' }}>
+                              <div>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Interval</Text>
+                                <InputNumber size="small" min={1} value={Number(routerScheduleStep.scheduleIntervalMinutes || 60)} onChange={(value) => patchRouterScheduler({ scheduleIntervalMinutes: Math.max(1, Number(value || 60)) })} onBlur={() => { void deployDataOpsRouterScheduler(routerScheduleStep) }} addonAfter="min" style={dataOpsControlStyle(dataOpsSectionColors.schedule, { width: '100%', marginTop: 5 })} />
+                              </div>
+                              <div>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Timezone</Text>
+                                <Input size="small" value={routerScheduleStep.scheduleTimezone || 'Asia/Kolkata'} onChange={(event) => patchRouterScheduler({ scheduleTimezone: event.target.value })} onBlur={() => { void deployDataOpsRouterScheduler(routerScheduleStep) }} placeholder="timezone" style={dataOpsInputStyle(dataOpsSectionColors.schedule, { marginTop: 5 })} />
+                              </div>
+                              <div>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Cron</Text>
+                                <Input size="small" value={routerScheduleStep.scheduleCron || '0 * * * *'} onChange={(event) => patchRouterScheduler({ scheduleCron: event.target.value })} onBlur={() => { void deployDataOpsRouterScheduler(routerScheduleStep) }} placeholder="cron expression" style={dataOpsInputStyle(dataOpsSectionColors.schedule, { marginTop: 5 })} />
+                              </div>
+                              <div>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Parallel Runs</Text>
+                                <InputNumber size="small" min={1} max={64} value={Number(routerScheduleStep.scheduleMaxParallelRuns || 1)} onChange={(value) => patchRouterScheduler({ scheduleMaxParallelRuns: Math.max(1, Number(value || 1)) })} onBlur={() => { void deployDataOpsRouterScheduler(routerScheduleStep) }} addonAfter="runs" style={dataOpsControlStyle(dataOpsSectionColors.schedule, { width: '100%', marginTop: 5 })} />
+                              </div>
+                              <div>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Missed Runs</Text>
+                                <Select size="small" value={routerScheduleStep.scheduleMisfirePolicy || 'skip'} onChange={(value) => patchRouterScheduler({ scheduleMisfirePolicy: value as DataOpsPipelineStep['scheduleMisfirePolicy'] }, true)} options={[{ value: 'skip', label: 'Skip missed' }, { value: 'run_once', label: 'Run once' }, { value: 'catch_up', label: 'Catch up' }]} style={dataOpsControlStyle(dataOpsSectionColors.schedule, { width: '100%', marginTop: 5 })} />
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+	                        <div className="data-ops-router-preview-side">
+                          <Collapse
+                            size="small"
+                            ghost
+                            defaultActiveKey={['route_preview']}
+                            items={[{
+                              key: 'route_preview',
+                              label: 'Route Preview',
+                              children: (
+                                <Table
+                                  size="small"
+                                  rowKey="key"
+                                  pagination={false}
+                                  dataSource={routePreviewRows}
+                                  locale={{ emptyText: <Text style={{ color: 'var(--app-text-subtle)' }}>No active route rows.</Text> }}
+                                  columns={[
+                                    { title: 'Route', dataIndex: 'name' },
+                                    { title: 'Target', dataIndex: 'target', render: (value: string) => <Text ellipsis style={{ color: dataOpsSectionColors.output }}>{value}</Text> },
+                                    { title: 'Match', dataIndex: 'mode', width: 80 },
+                                    { title: 'Rows', dataIndex: 'rows', width: 120 },
+                                  ] as any[]}
+                                />
+                              ),
+                            }, {
+                              key: 'payload',
+                              label: 'Payload Contract',
+                              children: (
+                                <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: 10, background: 'var(--app-bg)', display: 'grid', gap: 6 }}>
+                                  <Text style={{ color: dataOpsSectionColors.source }}>Source: {routerQuerySourceOptions.find((item) => item.value === selectedDataOpsPipelineStep.routeSource)?.label || selectedDataOpsPipelineStep.routeSource || 'upstream result'}</Text>
+                                  <Text style={{ color: dataOpsSectionColors.output }}>Payload: {selectedDataOpsPipelineStep.payloadMode || 'all_rows'}</Text>
+                                  <Text style={{ color: dataOpsSectionColors.schedule }}>Mode: {selectedDataOpsPipelineStep.routeMode || 'multi'}</Text>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Sample fields: {routerSourceFields.slice(0, 12).join(', ') || 'none loaded yet'}</Text>
+                                </div>
+                              ),
+                            }]}
+                          />
+	                        </div>
+	                      </div>
+                      </div>
+                    </Modal>
+                  ) : null}
+                </div>
+              )
+            })()
           ) : null}
           {selectedDataOpsPipelineStep.kind === 'map' ? (
             (() => {
@@ -33352,6 +36184,22 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               }
               const mapperConfigRows = Array.isArray(selectedDataOpsPipelineStep.mapperConfigs) ? selectedDataOpsPipelineStep.mapperConfigs : []
               const activeMapperConfig = mapperConfigRows.find((item) => item.id === selectedDataOpsPipelineStep.activeMapperConfigId)
+              const mapperScheduleStep: DataOpsPipelineStep = {
+                ...selectedDataOpsPipelineStep,
+                activeMapperConfigId: activeMapperConfig?.id || selectedDataOpsPipelineStep.activeMapperConfigId,
+                deployEnabled: activeMapperConfig ? Boolean(activeMapperConfig.deployEnabled) : Boolean(selectedDataOpsPipelineStep.deployEnabled),
+                scheduleEnabled: activeMapperConfig ? Boolean(activeMapperConfig.scheduleEnabled) : Boolean(selectedDataOpsPipelineStep.scheduleEnabled),
+                scheduleType: activeMapperConfig?.scheduleType || selectedDataOpsPipelineStep.scheduleType || 'interval',
+                scheduleIntervalMinutes: activeMapperConfig?.scheduleIntervalMinutes || selectedDataOpsPipelineStep.scheduleIntervalMinutes || 60,
+                scheduleCron: activeMapperConfig?.scheduleCron || selectedDataOpsPipelineStep.scheduleCron || '0 * * * *',
+                scheduleTimezone: activeMapperConfig?.scheduleTimezone || selectedDataOpsPipelineStep.scheduleTimezone || 'Asia/Kolkata',
+                scheduleMaxParallelRuns: activeMapperConfig?.scheduleMaxParallelRuns || selectedDataOpsPipelineStep.scheduleMaxParallelRuns || 1,
+                scheduleMisfirePolicy: activeMapperConfig?.scheduleMisfirePolicy || selectedDataOpsPipelineStep.scheduleMisfirePolicy || 'skip',
+                scheduleStatus: activeMapperConfig ? String(activeMapperConfig.scheduleStatus || '') : String(selectedDataOpsPipelineStep.scheduleStatus || ''),
+                scheduleBackendJobId: activeMapperConfig ? String(activeMapperConfig.scheduleBackendJobId || '') : String(selectedDataOpsPipelineStep.scheduleBackendJobId || ''),
+                scheduleNextRunAt: activeMapperConfig ? String(activeMapperConfig.scheduleNextRunAt || '') : String(selectedDataOpsPipelineStep.scheduleNextRunAt || ''),
+                scheduleLastRegisteredAt: activeMapperConfig ? String(activeMapperConfig.scheduleLastRegisteredAt || '') : String(selectedDataOpsPipelineStep.scheduleLastRegisteredAt || ''),
+              }
               const snapshotMapperConfig = (base?: Partial<DataOpsMapperConfig>): DataOpsMapperConfig => ({
                 id: String(base?.id || dataOpsId('mapper')),
                 name: String(base?.name || activeMapperConfig?.name || `Mapper ${mapperConfigRows.length + 1}`),
@@ -33542,7 +36390,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     ? mapperConfigRows.map((item) => item.id === activeConfigId ? { ...item, ...configPatch } : item)
                     : mapperConfigRows,
                 })
-                if (deploy) void deployDataOpsMapperScheduler(selectedDataOpsPipelineStep, patch as Record<string, unknown>)
+                if (deploy) void deployDataOpsMapperScheduler(mapperScheduleStep, patch as Record<string, unknown>)
               }
               const deleteMapperConfig = (configId: string) => {
                 const nextRows = mapperConfigRows.filter((item) => item.id !== configId)
@@ -33558,15 +36406,29 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 ...mapperActiveMappings.filter((row) => row.key).map((row) => String(row.target || '').trim()).filter(Boolean),
               ])
               const mapperNeedsKey = ['update', 'upsert', 'merge', 'delete', 'delete_insert'].includes(String(selectedDataOpsPipelineStep.writeMode || 'upsert'))
-              const mapperPanel = (title: string, extra: ReactNode, children: ReactNode) => (
-                <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, minWidth: 0 }}>
+              const mapperSchedulerStatusTags = (item: Partial<DataOpsPipelineStep & DataOpsMapperConfig>) => {
+                const status = String(item.scheduleStatus || (item.scheduleEnabled ? 'enabled' : 'disabled'))
+                return (
+                  <Space size={6} wrap>
+                    <Tag color={status === 'scheduled' ? 'green' : item.scheduleEnabled ? 'orange' : 'default'} style={{ marginInlineEnd: 0 }}>
+                      {status}
+                    </Tag>
+                    {item.scheduleNextRunAt ? <Tag color="blue" style={{ marginInlineEnd: 0 }}>next: {String(item.scheduleNextRunAt)}</Tag> : null}
+                  </Space>
+                )
+              }
+              const mapperPanel = (title: string, extra: ReactNode, children: ReactNode) => {
+                const color = dataOpsPanelColor(title)
+                return (
+                <div style={{ border: '1px solid var(--app-border)', borderLeft: `3px solid ${color}`, borderRadius: 8, background: 'var(--app-bg)', padding: 10, minWidth: 0 }}>
                   <Space style={{ width: '100%', justifyContent: 'space-between', marginBottom: 8 }} align="center">
-                    <Text style={{ color: 'var(--app-text)', fontWeight: 800, fontSize: 12 }}>{title}</Text>
+                    <Text style={{ color, fontWeight: 600, fontSize: 11, letterSpacing: 0 }}>{title}</Text>
                     {extra}
                   </Space>
                   {children}
                 </div>
-              )
+                )
+              }
               return (
                 <div style={{ display: 'grid', gap: 10 }}>
                   {mapperPanel(
@@ -33588,7 +36450,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         { title: 'Source', width: 190, render: (_value: unknown, row: DataOpsMapperConfig) => <Text ellipsis style={{ maxWidth: 180, color: 'var(--app-text-subtle)', fontSize: 11 }}>{row.lookupSource || '-'}</Text> },
                         { title: 'Target', width: 190, render: (_value: unknown, row: DataOpsMapperConfig) => <Text ellipsis style={{ maxWidth: 180, color: 'var(--app-text-subtle)', fontSize: 11 }}>{row.target || '-'}</Text> },
                         { title: 'Mappings', width: 86, render: (_value: unknown, row: DataOpsMapperConfig) => Number((row.mappingRows || []).filter((item) => item.enabled !== false).length).toLocaleString() },
-                        { title: 'Scheduler', width: 120, render: (_value: unknown, row: DataOpsMapperConfig) => <Tag color={String(row.scheduleStatus || '') === 'scheduled' ? 'green' : row.scheduleEnabled ? 'orange' : 'default'} style={{ marginInlineEnd: 0 }}>{String(row.scheduleStatus || (row.scheduleEnabled ? 'enabled' : 'disabled'))}</Tag> },
+                        { title: 'Scheduler', width: 240, render: (_value: unknown, row: DataOpsMapperConfig) => mapperSchedulerStatusTags(row) },
                         { title: 'Updated', width: 150, render: (_value: unknown, row: DataOpsMapperConfig) => <Text ellipsis style={{ maxWidth: 140, color: 'var(--app-text-subtle)', fontSize: 11 }}>{row.updatedAt || '-'}</Text> },
                         { title: 'Actions', width: 260, render: (_value: unknown, row: DataOpsMapperConfig) => (
                           <Space size={6} wrap>
@@ -33609,10 +36471,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   </div>
                   {dataOpsMapperConfigOpen ? (
                   <Modal
-                    open={dataOpsMapperConfigOpen}
-                    onCancel={() => setDataOpsMapperConfigOpen(false)}
-                    title={`Mapper Configuration${activeMapperConfig?.name ? `: ${activeMapperConfig.name}` : ''}`}
-                    width="96vw"
+	                    open={dataOpsMapperConfigOpen}
+	                    onCancel={() => setDataOpsMapperConfigOpen(false)}
+	                    title={`Mapper Configuration${activeMapperConfig?.name ? `: ${activeMapperConfig.name}` : ''}`}
+	                    wrapClassName="data-ops-config-modal"
+	                    width="96vw"
                     centered
                     footer={[
                       <Button key="save" onClick={saveCurrentMapperConfig}>Save Configuration</Button>,
@@ -33624,15 +36487,24 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       body: { background: 'var(--app-panel-bg)', flex: 1, overflowY: 'auto', minHeight: 0 },
                     }}
                   >
-                  <div onKeyDownCapture={stopDataOpsDeleteKeyPropagation} style={{ display: 'grid', gap: 10, minWidth: 0 }}>
-                  <div style={{ display: 'grid', gridTemplateColumns: '160px 180px 1fr', gap: 10, alignItems: 'end' }}>
+	                  <div onKeyDownCapture={stopDataOpsDeleteKeyPropagation} style={{ display: 'grid', gap: 10, minWidth: 0 }}>
+	                  <Space size={6} wrap>
+	                    {dataOpsLegendItems.map(([label, color]) => (
+	                      <Tag key={`data_ops_mapper_legend_${label}`} style={{ marginInlineEnd: 0, background: `${color}14`, border: `1px solid ${color}45`, color, fontSize: 10, fontWeight: 400 }}>
+	                        {label}
+	                      </Tag>
+	                    ))}
+	                  </Space>
+	                  <div className="data-ops-mapper-layout">
+	                  <div className="data-ops-mapper-main">
+	                  <div style={{ display: 'grid', gridTemplateColumns: '160px 180px 1fr', gap: 10, alignItems: 'end' }}>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Target Type</Text>
-                      <Select size="small" value={selectedDataOpsPipelineStep.targetMode || 'oracle'} onChange={(value) => patchMapper({ targetMode: value as DataOpsPipelineStep['targetMode'] })} style={{ width: '100%', marginTop: 5 }} options={[{ value: 'oracle', label: 'Oracle' }, { value: 'file', label: 'File' }, { value: 'api', label: 'API' }, { value: 'upstream', label: 'Upstream' }]} />
+                      <Select size="small" value={selectedDataOpsPipelineStep.targetMode || 'oracle'} onChange={(value) => patchMapper({ targetMode: value as DataOpsPipelineStep['targetMode'] })} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%', marginTop: 5 })} options={[{ value: 'oracle', label: 'Oracle' }, { value: 'file', label: 'File' }, { value: 'api', label: 'API' }, { value: 'upstream', label: 'Upstream' }]} />
                     </div>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Write Control</Text>
-                      <Select size="small" value={selectedDataOpsPipelineStep.writeMode || 'upsert'} onChange={(value) => patchMapper({ writeMode: value as DataOpsPipelineStep['writeMode'] })} style={{ width: '100%', marginTop: 5 }} options={[{ value: 'insert', label: 'Insert only' }, { value: 'update', label: 'Update only' }, { value: 'upsert', label: 'Upsert' }, { value: 'merge', label: 'Merge' }, { value: 'delete', label: 'Delete' }, { value: 'delete_insert', label: 'Delete + Insert' }, { value: 'truncate_insert', label: 'Truncate + Insert' }, { value: 'append', label: 'Append' }]} />
+                      <Select size="small" value={selectedDataOpsPipelineStep.writeMode || 'upsert'} onChange={(value) => patchMapper({ writeMode: value as DataOpsPipelineStep['writeMode'] })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} options={[{ value: 'insert', label: 'Insert only' }, { value: 'update', label: 'Update only' }, { value: 'upsert', label: 'Upsert' }, { value: 'merge', label: 'Merge' }, { value: 'delete', label: 'Delete' }, { value: 'delete_insert', label: 'Delete + Insert' }, { value: 'truncate_insert', label: 'Truncate + Insert' }, { value: 'append', label: 'Append' }]} />
                     </div>
                     <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: '7px 10px', minHeight: 47 }}>
                       <Space size={8} wrap>
@@ -33654,7 +36526,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         onChange={(value) => patchMapper({ lookupSource: String(value || '') })}
                         placeholder="Select source query"
                         options={mapperQuerySourceOptions}
-                        style={{ width: '100%', marginTop: 5 }}
+                        style={dataOpsControlStyle(dataOpsSectionColors.source, { width: '100%', marginTop: 5 })}
                       />
                     </div>
                     <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: '7px 10px', minHeight: 47 }}>
@@ -33670,11 +36542,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Destination / Target Table</Text>
-                      <Select size="small" showSearch allowClear optionFilterProp="label" value={selectedDataOpsPipelineStep.target || undefined} onChange={(value) => loadMapperTarget(String(value || ''))} onSearch={searchMapperTarget} placeholder="schema.table or endpoint" options={mapperObjectOptions} style={{ width: '100%', marginTop: 5 }} />
+                      <Select size="small" showSearch allowClear optionFilterProp="label" value={selectedDataOpsPipelineStep.target || undefined} onChange={(value) => loadMapperTarget(String(value || ''))} onSearch={searchMapperTarget} placeholder="schema.table or endpoint" options={mapperObjectOptions} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%', marginTop: 5 })} />
                     </div>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Key / Match Fields</Text>
-                      <Input size="small" value={selectedDataOpsPipelineStep.keyFields || ''} onChange={(event) => patchMapper({ keyFields: event.target.value })} placeholder="AGENT_CODE for upsert/merge" style={{ ...commonInputStyle, marginTop: 5 }} />
+                      <Input size="small" value={selectedDataOpsPipelineStep.keyFields || ''} onChange={(event) => patchMapper({ keyFields: event.target.value })} placeholder="AGENT_CODE for upsert/merge" style={dataOpsInputStyle(dataOpsSectionColors.output, { marginTop: 5 })} />
                     </div>
                   </div>
                   <Space style={{ width: '100%', justifyContent: 'space-between' }}>
@@ -33706,9 +36578,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     dataSource={selectedDataOpsPipelineStep.mappingRows || []}
                     columns={[
                       { title: 'Use', width: 58, render: (_value: unknown, row: DataOpsMapRow) => <Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchMapper({ mappingRows: (selectedDataOpsPipelineStep.mappingRows || []).map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} /> },
-                      { title: 'Source Field', render: (_value: unknown, row: DataOpsMapRow) => <Select size="small" showSearch allowClear optionFilterProp="label" value={row.source || undefined} onChange={(value) => patchMapper({ mappingRows: (selectedDataOpsPipelineStep.mappingRows || []).map((item) => item.id === row.id ? { ...item, source: String(value || '') } : item) })} placeholder="incoming field" options={mapperSourceOptions} style={{ width: '100%' }} /> },
-                      { title: 'Target Column', render: (_value: unknown, row: DataOpsMapRow) => <Select size="small" showSearch allowClear optionFilterProp="label" value={row.target || undefined} onChange={(value) => patchMapper({ mappingRows: (selectedDataOpsPipelineStep.mappingRows || []).map((item) => item.id === row.id ? { ...item, target: String(value || '') } : item) })} placeholder="target column" options={mapperTargetOptions} style={{ width: '100%' }} /> },
-                      { title: 'Default / Expression', render: (_value: unknown, row: DataOpsMapRow) => <Input size="small" value={row.defaultValue || ''} onChange={(event) => patchMapper({ mappingRows: (selectedDataOpsPipelineStep.mappingRows || []).map((item) => item.id === row.id ? { ...item, defaultValue: event.target.value } : item) })} placeholder="optional default or expression" /> },
+                      { title: 'Source Field', render: (_value: unknown, row: DataOpsMapRow) => <Select size="small" showSearch allowClear optionFilterProp="label" value={row.source || undefined} onChange={(value) => patchMapper({ mappingRows: (selectedDataOpsPipelineStep.mappingRows || []).map((item) => item.id === row.id ? { ...item, source: String(value || '') } : item) })} placeholder="incoming field" options={mapperSourceOptions} style={dataOpsControlStyle(dataOpsSectionColors.source, { width: '100%' })} /> },
+                      { title: 'Target Column', render: (_value: unknown, row: DataOpsMapRow) => <Select size="small" showSearch allowClear optionFilterProp="label" value={row.target || undefined} onChange={(value) => patchMapper({ mappingRows: (selectedDataOpsPipelineStep.mappingRows || []).map((item) => item.id === row.id ? { ...item, target: String(value || '') } : item) })} placeholder="target column" options={mapperTargetOptions} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%' })} /> },
+                      { title: 'Default / Expression', render: (_value: unknown, row: DataOpsMapRow) => <Input size="small" value={row.defaultValue || ''} onChange={(event) => patchMapper({ mappingRows: (selectedDataOpsPipelineStep.mappingRows || []).map((item) => item.id === row.id ? { ...item, defaultValue: event.target.value } : item) })} placeholder="optional default or expression" style={dataOpsInputStyle(dataOpsSectionColors.sql)} /> },
                       { title: 'Key', width: 58, render: (_value: unknown, row: DataOpsMapRow) => <Switch size="small" checked={Boolean(row.key)} onChange={(checked) => {
                         const existingKeys = String(selectedDataOpsPipelineStep.keyFields || '').split(',').map((item) => item.trim()).filter(Boolean)
                         const nextKeys = checked && row.target ? uniqueFieldNames([...existingKeys, row.target]) : existingKeys.filter((item) => item.toLowerCase() !== String(row.target || '').toLowerCase())
@@ -33720,15 +36592,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   <div style={{ display: 'grid', gridTemplateColumns: '170px 120px 130px 150px 150px 1fr', gap: 10, alignItems: 'end' }}>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Processing Mode</Text>
-                      <Select size="small" value={selectedDataOpsPipelineStep.syncProcessingMode || 'batch'} onChange={(value) => patchMapper({ syncProcessingMode: value as DataOpsPipelineStep['syncProcessingMode'] })} style={{ width: '100%', marginTop: 5 }} options={[{ value: 'batch', label: 'Batch' }, { value: 'incremental_batch', label: 'Incremental Batch' }, { value: 'cursor', label: 'Cursor' }, { value: 'row_by_row', label: 'Row by Row' }]} />
+                      <Select size="small" value={selectedDataOpsPipelineStep.syncProcessingMode || 'batch'} onChange={(value) => patchMapper({ syncProcessingMode: value as DataOpsPipelineStep['syncProcessingMode'] })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} options={[{ value: 'batch', label: 'Batch' }, { value: 'incremental_batch', label: 'Incremental Batch' }, { value: 'cursor', label: 'Cursor' }, { value: 'row_by_row', label: 'Row by Row' }]} />
                     </div>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Batch Size</Text>
-                      <InputNumber size="small" min={1} value={selectedDataOpsPipelineStep.syncBatchSize || 1000} onChange={(value) => patchMapper({ syncBatchSize: Math.max(1, Number(value || 1000)) })} style={{ width: '100%', marginTop: 5 }} />
+                      <InputNumber size="small" min={1} value={selectedDataOpsPipelineStep.syncBatchSize || 1000} onChange={(value) => patchMapper({ syncBatchSize: Math.max(1, Number(value || 1000)) })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} />
                     </div>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Commit Every</Text>
-                      <InputNumber size="small" min={1} value={selectedDataOpsPipelineStep.syncCommitEvery || 5000} onChange={(value) => patchMapper({ syncCommitEvery: Math.max(1, Number(value || 5000)) })} style={{ width: '100%', marginTop: 5 }} />
+                      <InputNumber size="small" min={1} value={selectedDataOpsPipelineStep.syncCommitEvery || 5000} onChange={(value) => patchMapper({ syncCommitEvery: Math.max(1, Number(value || 5000)) })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} />
                     </div>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Parallel</Text>
@@ -33736,18 +36608,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     </div>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Workers</Text>
-                      <InputNumber size="small" min={1} max={64} disabled={!selectedDataOpsPipelineStep.syncParallelEnabled} value={selectedDataOpsPipelineStep.syncParallelWorkers || 4} onChange={(value) => patchMapper({ syncParallelWorkers: Math.max(1, Number(value || 4)) })} style={{ width: '100%', marginTop: 5 }} />
+                      <InputNumber size="small" min={1} max={64} disabled={!selectedDataOpsPipelineStep.syncParallelEnabled} value={selectedDataOpsPipelineStep.syncParallelWorkers || 4} onChange={(value) => patchMapper({ syncParallelWorkers: Math.max(1, Number(value || 4)) })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} />
                     </div>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Error Policy</Text>
-                      <Select size="small" value={selectedDataOpsPipelineStep.syncErrorMode || 'stop'} onChange={(value) => patchMapper({ syncErrorMode: value as DataOpsPipelineStep['syncErrorMode'] })} style={{ width: '100%', marginTop: 5 }} options={[{ value: 'stop', label: 'Stop on error' }, { value: 'skip', label: 'Skip bad rows' }, { value: 'reject', label: 'Write reject rows' }]} />
+                      <Select size="small" value={selectedDataOpsPipelineStep.syncErrorMode || 'stop'} onChange={(value) => patchMapper({ syncErrorMode: value as DataOpsPipelineStep['syncErrorMode'] })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} options={[{ value: 'stop', label: 'Stop on error' }, { value: 'skip', label: 'Skip bad rows' }, { value: 'reject', label: 'Write reject rows' }]} />
                     </div>
                   </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
-                    <Input size="small" value={selectedDataOpsPipelineStep.syncIncrementalField || ''} onChange={(event) => patchMapper({ syncIncrementalField: event.target.value })} placeholder="incremental watermark field" />
-                    <Input size="small" value={selectedDataOpsPipelineStep.syncCursorField || ''} onChange={(event) => patchMapper({ syncCursorField: event.target.value })} placeholder="cursor/order field" />
-                    <Input size="small" value={selectedDataOpsPipelineStep.auditField || '_data_ops_audit'} onChange={(event) => patchMapper({ auditField: event.target.value })} placeholder="audit/status field" />
-                  </div>
+	                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+	                    <Select size="small" showSearch allowClear optionFilterProp="label" value={selectedDataOpsPipelineStep.syncIncrementalField || undefined} onChange={(value) => patchMapper({ syncIncrementalField: String(value || '') })} placeholder="incremental watermark field" options={mapperSourceOptions} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%' })} />
+	                    <Select size="small" showSearch allowClear optionFilterProp="label" value={selectedDataOpsPipelineStep.syncCursorField || undefined} onChange={(value) => patchMapper({ syncCursorField: String(value || '') })} placeholder="cursor/order field" options={mapperSourceOptions} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%' })} />
+	                    <Input size="small" value={selectedDataOpsPipelineStep.auditField || '_data_ops_audit'} onChange={(event) => patchMapper({ auditField: event.target.value })} placeholder="audit/status field" style={dataOpsInputStyle(dataOpsSectionColors.action)} />
+	                  </div>
                   <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 10 }}>
                     <Space style={{ width: '100%', justifyContent: 'space-between' }} align="start">
                       <div>
@@ -33756,75 +36628,74 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Stored on the active mapper configuration row.</Text>
                       </div>
                       <Space size={6} wrap>
-                        <Tag color={String(selectedDataOpsPipelineStep.scheduleStatus || '') === 'scheduled' ? 'green' : selectedDataOpsPipelineStep.scheduleEnabled ? 'orange' : 'default'} style={{ marginInlineEnd: 0 }}>
-                          {String(selectedDataOpsPipelineStep.scheduleStatus || (selectedDataOpsPipelineStep.scheduleEnabled ? 'enabled' : 'disabled'))}
+                        <Tag color={String(mapperScheduleStep.scheduleStatus || '') === 'scheduled' ? 'green' : mapperScheduleStep.scheduleEnabled ? 'orange' : 'default'} style={{ marginInlineEnd: 0 }}>
+                          {String(mapperScheduleStep.scheduleStatus || (mapperScheduleStep.scheduleEnabled ? 'enabled' : 'disabled'))}
                         </Tag>
-                        {selectedDataOpsPipelineStep.scheduleNextRunAt ? <Tag color="blue" style={{ marginInlineEnd: 0 }}>next: {String(selectedDataOpsPipelineStep.scheduleNextRunAt)}</Tag> : null}
+                        {mapperScheduleStep.scheduleNextRunAt ? <Tag color="blue" style={{ marginInlineEnd: 0 }}>next: {String(mapperScheduleStep.scheduleNextRunAt)}</Tag> : null}
                       </Space>
                     </Space>
                     <div style={{ display: 'grid', gridTemplateColumns: '160px 160px 190px 1fr', gap: 10, alignItems: 'end' }}>
                       <Space style={{ justifyContent: 'space-between' }}>
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Deploy sync</Text>
-                        <Switch size="small" checked={Boolean(selectedDataOpsPipelineStep.deployEnabled)} onChange={(checked) => patchMapperScheduler({ deployEnabled: checked }, true)} />
+                        <Switch size="small" checked={Boolean(mapperScheduleStep.deployEnabled)} onChange={(checked) => patchMapperScheduler({ deployEnabled: checked }, true)} />
                       </Space>
                       <Space style={{ justifyContent: 'space-between' }}>
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Scheduler</Text>
-                        <Switch size="small" checked={Boolean(selectedDataOpsPipelineStep.scheduleEnabled)} onChange={(checked) => patchMapperScheduler({ scheduleEnabled: checked }, true)} />
+                        <Switch size="small" checked={Boolean(mapperScheduleStep.scheduleEnabled)} onChange={(checked) => patchMapperScheduler({ scheduleEnabled: checked }, true)} />
                       </Space>
                       <div>
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Schedule Type</Text>
                         <Select
                           size="small"
-                          value={selectedDataOpsPipelineStep.scheduleType || 'interval'}
+                          value={mapperScheduleStep.scheduleType || 'interval'}
                           onChange={(value) => patchMapperScheduler({ scheduleType: value as DataOpsPipelineStep['scheduleType'] }, true)}
                           options={[{ value: 'manual', label: 'Manual' }, { value: 'interval', label: 'Interval' }, { value: 'cron', label: 'Cron' }, { value: 'event', label: 'Event trigger' }]}
-                          style={{ width: '100%', marginTop: 5 }}
+                          style={dataOpsControlStyle(dataOpsSectionColors.schedule, { width: '100%', marginTop: 5 })}
                         />
                       </div>
                       <Text ellipsis style={{ color: mapperSyncBuild.issue ? 'var(--app-warning)' : 'var(--app-text-subtle)', fontSize: 11 }}>
-                        {mapperSyncBuild.issue || (selectedDataOpsPipelineStep.scheduleLastRegisteredAt ? `Last registered: ${String(selectedDataOpsPipelineStep.scheduleLastRegisteredAt)}` : 'Save Scheduler registers or disables the backend job.')}
+                        {mapperSyncBuild.issue || (mapperScheduleStep.scheduleLastRegisteredAt ? `Last registered: ${String(mapperScheduleStep.scheduleLastRegisteredAt)}` : 'Deploy and Scheduler toggles register or disable the backend job.')}
                       </Text>
                     </div>
                     <div style={{ display: 'grid', gridTemplateColumns: '150px 170px 1fr 150px 170px', gap: 10, alignItems: 'end' }}>
                       <div>
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Interval</Text>
-                        <InputNumber size="small" min={1} value={Number(selectedDataOpsPipelineStep.scheduleIntervalMinutes || 60)} onChange={(value) => patchMapperScheduler({ scheduleIntervalMinutes: Math.max(1, Number(value || 60)) })} onBlur={() => { void deployDataOpsMapperScheduler(selectedDataOpsPipelineStep) }} addonAfter="min" style={{ width: '100%', marginTop: 5 }} />
+                        <InputNumber size="small" min={1} value={Number(mapperScheduleStep.scheduleIntervalMinutes || 60)} onChange={(value) => patchMapperScheduler({ scheduleIntervalMinutes: Math.max(1, Number(value || 60)) })} onBlur={() => { void deployDataOpsMapperScheduler(mapperScheduleStep) }} addonAfter="min" style={dataOpsControlStyle(dataOpsSectionColors.schedule, { width: '100%', marginTop: 5 })} />
                       </div>
                       <div>
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Timezone</Text>
-                        <Input size="small" value={selectedDataOpsPipelineStep.scheduleTimezone || 'Asia/Kolkata'} onChange={(event) => patchMapperScheduler({ scheduleTimezone: event.target.value })} onBlur={() => { void deployDataOpsMapperScheduler(selectedDataOpsPipelineStep) }} placeholder="timezone" style={{ marginTop: 5 }} />
+                        <Input size="small" value={mapperScheduleStep.scheduleTimezone || 'Asia/Kolkata'} onChange={(event) => patchMapperScheduler({ scheduleTimezone: event.target.value })} onBlur={() => { void deployDataOpsMapperScheduler(mapperScheduleStep) }} placeholder="timezone" style={dataOpsInputStyle(dataOpsSectionColors.schedule, { marginTop: 5 })} />
                       </div>
                       <div>
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Cron</Text>
-                        <Input size="small" value={selectedDataOpsPipelineStep.scheduleCron || '0 * * * *'} onChange={(event) => patchMapperScheduler({ scheduleCron: event.target.value })} onBlur={() => { void deployDataOpsMapperScheduler(selectedDataOpsPipelineStep) }} placeholder="cron expression" style={{ marginTop: 5 }} />
+                        <Input size="small" value={mapperScheduleStep.scheduleCron || '0 * * * *'} onChange={(event) => patchMapperScheduler({ scheduleCron: event.target.value })} onBlur={() => { void deployDataOpsMapperScheduler(mapperScheduleStep) }} placeholder="cron expression" style={dataOpsInputStyle(dataOpsSectionColors.schedule, { marginTop: 5 })} />
                       </div>
                       <div>
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Parallel Runs</Text>
-                        <InputNumber size="small" min={1} max={64} value={Number(selectedDataOpsPipelineStep.scheduleMaxParallelRuns || 1)} onChange={(value) => patchMapperScheduler({ scheduleMaxParallelRuns: Math.max(1, Number(value || 1)) })} onBlur={() => { void deployDataOpsMapperScheduler(selectedDataOpsPipelineStep) }} addonAfter="runs" style={{ width: '100%', marginTop: 5 }} />
+                        <InputNumber size="small" min={1} max={64} value={Number(mapperScheduleStep.scheduleMaxParallelRuns || 1)} onChange={(value) => patchMapperScheduler({ scheduleMaxParallelRuns: Math.max(1, Number(value || 1)) })} onBlur={() => { void deployDataOpsMapperScheduler(mapperScheduleStep) }} addonAfter="runs" style={dataOpsControlStyle(dataOpsSectionColors.schedule, { width: '100%', marginTop: 5 })} />
                       </div>
                       <div>
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Missed Runs</Text>
-                        <Select size="small" value={selectedDataOpsPipelineStep.scheduleMisfirePolicy || 'skip'} onChange={(value) => patchMapperScheduler({ scheduleMisfirePolicy: value as DataOpsPipelineStep['scheduleMisfirePolicy'] }, true)} options={[{ value: 'skip', label: 'Skip missed' }, { value: 'run_once', label: 'Run once' }, { value: 'catch_up', label: 'Catch up' }]} style={{ width: '100%', marginTop: 5 }} />
+                        <Select size="small" value={mapperScheduleStep.scheduleMisfirePolicy || 'skip'} onChange={(value) => patchMapperScheduler({ scheduleMisfirePolicy: value as DataOpsPipelineStep['scheduleMisfirePolicy'] }, true)} options={[{ value: 'skip', label: 'Skip missed' }, { value: 'run_once', label: 'Run once' }, { value: 'catch_up', label: 'Catch up' }]} style={dataOpsControlStyle(dataOpsSectionColors.schedule, { width: '100%', marginTop: 5 })} />
                       </div>
                     </div>
-                    <Space size={8} wrap>
-                      <Button size="small" onClick={() => { void deployDataOpsMapperScheduler(selectedDataOpsPipelineStep) }} disabled={Boolean(mapperSyncBuild.issue)}>
-                        Save Scheduler
-                      </Button>
-                      <Button size="small" onClick={saveCurrentMapperConfig}>
-                        Save Mapper Row
-                      </Button>
-                    </Space>
                   </div>
+                  </div>
+                  <div className="data-ops-mapper-sql-side">
                   <Collapse
                     size="small"
                     ghost
+                    defaultActiveKey={['sync_sql']}
                     items={[{
                       key: 'sync_sql',
                       label: 'Generated Sync SQL',
-                      children: <Input.TextArea rows={8} value={selectedDataOpsPipelineStep.expression || mapperSyncBuild.sql || mapperSyncBuild.issue} onChange={(event) => patchMapper({ expression: event.target.value })} style={{ ...commonInputStyle, fontFamily: 'monospace', fontSize: 12 }} />,
+                      children: (
+                        renderDataOpsSqlPreview(selectedDataOpsPipelineStep.expression || mapperSyncBuild.sql || mapperSyncBuild.issue, 300)
+                      ),
                     }]}
                   />
+                  </div>
+                  </div>
                   </div>
                   </Modal>
                   ) : null}
@@ -39370,7 +42241,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           <br />
           <Space size={6} wrap style={{ marginTop: 6 }}>
             <Tag style={{ background: '#0ea5e914', border: '1px solid #0ea5e930', color: '#0ea5e9' }}>
-              fields: {dataQueryFieldOptions.length}
+              fields: {dataQueryFieldOptionsForPicker.length}
             </Tag>
             <Tag style={{ background: '#22c55e14', border: '1px solid #22c55e30', color: '#22c55e' }}>
               {dataQueryPreviewSourceModeDraft === 'full' ? 'preview rows' : 'sample rows'}: {dataQueryPreviewRows.length}

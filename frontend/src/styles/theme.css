@@ -348,3 +348,436 @@ body {
 :root[data-app-theme='light'] .monaco-editor .opsfabric-expr-range-warning {
   background: rgba(245, 158, 11, 0.06) !important;
 }
+
+.react-flow__node.data-ops-flow-node-selected {
+  z-index: 30 !important;
+}
+
+.react-flow__node.data-ops-flow-node-selected .react-flow__handle {
+  background: #22d3ee !important;
+  border-color: #e0f2fe !important;
+  box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.24), 0 0 12px rgba(34, 211, 238, 0.5) !important;
+}
+
+.react-flow__node.data-ops-flow-node-configured:not(.data-ops-flow-node-selected) .react-flow__handle {
+  background: var(--data-ops-node-accent, #8b98aa) !important;
+  border-color: color-mix(in srgb, var(--data-ops-node-accent, #8b98aa) 72%, #ffffff 28%) !important;
+}
+
+.react-flow__node.data-ops-flow-node-processing {
+  animation: data-ops-processing-pulse 1.35s ease-in-out infinite;
+}
+
+.react-flow__edge.data-ops-flow-edge .react-flow__edge-path {
+  stroke-width: 1.4px;
+}
+
+.react-flow__edge.data-ops-flow-edge-configured .react-flow__edge-path {
+  opacity: 0.98;
+}
+
+.react-flow__edge.data-ops-flow-edge-selected {
+  z-index: 25 !important;
+}
+
+.react-flow__edge.data-ops-flow-edge-selected .react-flow__edge-path {
+  stroke: #22d3ee !important;
+  stroke-width: 2.4px !important;
+  filter: drop-shadow(0 0 6px rgba(34, 211, 238, 0.72));
+}
+
+.react-flow__edge.data-ops-flow-edge-processing .react-flow__edge-path {
+  stroke-width: 2px !important;
+  filter: drop-shadow(0 0 6px rgba(96, 165, 250, 0.7));
+}
+
+.react-flow__edge.data-ops-flow-edge-selected .react-flow__edge-text {
+  fill: #22d3ee !important;
+  font-weight: 800 !important;
+}
+
+.react-flow__edge.data-ops-flow-edge-selected .react-flow__edge-interaction,
+.react-flow__edge.data-ops-flow-edge .react-flow__edge-interaction {
+  stroke-width: 44px;
+}
+
+@keyframes data-ops-processing-pulse {
+  0%, 100% {
+    filter: brightness(1);
+  }
+  50% {
+    filter: brightness(1.18);
+  }
+}
+
+.data-ops-config-modal .ant-modal-title {
+  color: var(--app-text) !important;
+  font-size: 15px !important;
+  font-weight: 500 !important;
+  letter-spacing: 0 !important;
+}
+
+.data-ops-config-modal .ant-modal-body,
+.data-ops-config-modal .ant-typography,
+.data-ops-config-modal .ant-form-item-label > label {
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 0;
+}
+
+.data-ops-config-modal .ant-input,
+.data-ops-config-modal .ant-input-number,
+.data-ops-config-modal .ant-input-number-input,
+.data-ops-config-modal .ant-select,
+.data-ops-config-modal .ant-select-selection-item,
+.data-ops-config-modal .ant-select-selection-placeholder,
+.data-ops-config-modal .ant-btn,
+.data-ops-config-modal .ant-tag {
+  font-size: 13px !important;
+  font-weight: 400 !important;
+  letter-spacing: 0 !important;
+}
+
+.data-ops-config-modal .ant-input,
+.data-ops-config-modal .ant-input-number-input,
+.data-ops-config-modal textarea.ant-input,
+.data-ops-config-modal .ant-select-selector,
+.data-ops-config-modal .ant-select-selection-search-input,
+.data-ops-config-modal .ant-select-selection-item,
+.data-ops-config-modal .ant-select-selection-item-content,
+.data-ops-config-modal .ant-select-single .ant-select-selector .ant-select-selection-item,
+.data-ops-config-modal .ant-input-affix-wrapper input {
+  color: var(--data-ops-field-color, var(--app-text-muted)) !important;
+  -webkit-text-fill-color: var(--data-ops-field-color, var(--app-text-muted)) !important;
+  font-weight: 300 !important;
+}
+
+.data-ops-config-modal .ant-select-selection-placeholder,
+.data-ops-config-modal .ant-input::placeholder,
+.data-ops-config-modal textarea.ant-input::placeholder,
+.data-ops-config-modal .ant-input-affix-wrapper input::placeholder {
+  color: var(--app-text-faint) !important;
+  -webkit-text-fill-color: var(--app-text-faint) !important;
+  font-weight: 300 !important;
+}
+
+.data-ops-config-modal .ant-input-disabled,
+.data-ops-config-modal .ant-input[disabled],
+.data-ops-config-modal .ant-select-disabled .ant-select-selector,
+.data-ops-config-modal .ant-select-disabled .ant-select-selection-item {
+  color: var(--app-text-dim) !important;
+  -webkit-text-fill-color: var(--app-text-dim) !important;
+}
+
+.data-ops-config-modal .ant-select-multiple .ant-select-selection-item {
+  color: var(--data-ops-field-color, var(--app-text-muted)) !important;
+  background: color-mix(in srgb, var(--data-ops-field-color, #94a3b8) 10%, transparent) !important;
+  border: 1px solid color-mix(in srgb, var(--data-ops-field-color, #94a3b8) 28%, transparent) !important;
+  border-radius: 4px !important;
+  font-weight: 300 !important;
+}
+
+.data-ops-query-modal .ant-select-focused .ant-select-selector,
+.data-ops-query-modal .ant-input:focus,
+.data-ops-query-modal .ant-input-focused {
+  border-color: #60a5fa !important;
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.14) !important;
+}
+
+.ant-select-dropdown .ant-select-item-option-content {
+  color: var(--app-text-muted);
+  font-size: 13px;
+  font-weight: 300;
+  letter-spacing: 0;
+}
+
+.ant-select-dropdown .ant-select-item-option-selected .ant-select-item-option-content,
+.ant-select-dropdown .ant-select-item-option-active .ant-select-item-option-content {
+  color: var(--app-text) !important;
+}
+
+.data-ops-config-modal .ant-table {
+  font-size: 13px;
+  font-weight: 400;
+}
+
+.data-ops-config-modal .ant-table-thead > tr > th {
+  color: var(--app-text-subtle) !important;
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  background: var(--app-card-bg) !important;
+}
+
+.data-ops-config-modal .ant-table-tbody > tr > td {
+  font-size: 13px !important;
+  font-weight: 400 !important;
+}
+
+.data-ops-config-modal textarea.ant-input {
+  font-size: 13px !important;
+  font-weight: 300 !important;
+  line-height: 1.45;
+}
+
+.data-ops-query-builder-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 6fr) minmax(360px, 4fr);
+  gap: 10px;
+  align-items: start;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.data-ops-query-builder-main,
+.data-ops-mapper-main {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.data-ops-router-shell,
+.data-ops-router-main {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.data-ops-query-result-side,
+.data-ops-mapper-sql-side,
+.data-ops-router-preview-side {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  position: sticky;
+  top: 0;
+}
+
+.data-ops-query-result-side .ant-table-wrapper,
+.data-ops-query-result-side .ant-spin-nested-loading,
+.data-ops-query-result-side .ant-spin-container {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.data-ops-query-result-side .ant-table {
+  max-width: 100%;
+}
+
+.data-ops-query-result-side .ant-table-container {
+  overflow-x: auto;
+}
+
+.data-ops-query-result-side .data-ops-sql-preview,
+.data-ops-mapper-sql-side .data-ops-sql-preview {
+  max-height: calc(90vh - 245px) !important;
+}
+
+.data-ops-mapper-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 6fr) minmax(360px, 4fr);
+  gap: 10px;
+  align-items: start;
+  min-width: 0;
+}
+
+.data-ops-router-toolbar {
+  min-width: 0;
+}
+
+.data-ops-router-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 6fr) minmax(360px, 4fr);
+  gap: 12px;
+  align-items: start;
+  min-width: 0;
+}
+
+.data-ops-router-main {
+  overflow: hidden;
+}
+
+.data-ops-router-main .ant-table-wrapper {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.data-ops-router-preview-side {
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  background: var(--app-bg);
+  padding: 8px;
+}
+
+@media (max-width: 1280px) {
+  .data-ops-query-builder-layout,
+  .data-ops-mapper-layout,
+  .data-ops-router-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .data-ops-query-result-side,
+  .data-ops-mapper-sql-side,
+  .data-ops-router-preview-side {
+    position: static;
+  }
+}
+
+.data-ops-sql-preview {
+  margin: 0;
+  padding: 10px 12px;
+  color: var(--app-text-muted);
+  background: color-mix(in srgb, var(--app-bg) 92%, #020617);
+  border: 1px solid var(--app-border-strong);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  font-weight: 300;
+  line-height: 1.5;
+  letter-spacing: 0;
+  overflow: auto;
+  white-space: pre;
+}
+
+.data-ops-sql-editor-shell {
+  min-height: 160px;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--app-border-strong);
+  border-radius: 8px;
+  background: var(--app-bg);
+}
+
+.data-ops-sql-editor-shell:focus-within {
+  border-color: var(--app-accent, #3b82f6);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--app-accent, #3b82f6) 45%, transparent);
+}
+
+.data-ops-sql-editor-shell .monaco-editor,
+.data-ops-sql-editor-shell .monaco-editor-background,
+.data-ops-sql-editor-shell .monaco-editor .margin {
+  border-radius: 8px;
+}
+
+.data-ops-sql-keyword {
+  color: #93c5fd;
+  font-weight: 700;
+  background: rgba(96, 165, 250, 0.14);
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+.data-ops-sql-select {
+  color: #4ade80;
+  font-weight: 700;
+  background: rgba(34, 197, 94, 0.16);
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+.data-ops-sql-source {
+  color: #7dd3fc;
+  font-weight: 700;
+  background: rgba(56, 189, 248, 0.16);
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+.data-ops-sql-join {
+  color: #c4b5fd;
+  font-weight: 700;
+  background: rgba(167, 139, 250, 0.16);
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+.data-ops-sql-where {
+  color: #fbbf24;
+  font-weight: 700;
+  background: rgba(245, 158, 11, 0.18);
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+.data-ops-sql-group {
+  color: #2dd4bf;
+  font-weight: 700;
+  background: rgba(20, 184, 166, 0.16);
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+.data-ops-sql-having {
+  color: #f9a8d4;
+  font-weight: 700;
+  background: rgba(244, 114, 182, 0.16);
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+.data-ops-sql-order {
+  color: #a5b4fc;
+  font-weight: 700;
+  background: rgba(129, 140, 248, 0.16);
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+.data-ops-sql-action {
+  color: #93c5fd;
+  font-weight: 700;
+  background: rgba(96, 165, 250, 0.14);
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+.data-ops-sql-identifier {
+  color: #cbd5e1;
+  font-weight: 300;
+}
+
+.data-ops-sql-table {
+  color: #22d3ee;
+  font-weight: 700;
+  text-decoration: underline;
+  text-decoration-color: rgba(34, 211, 238, 0.85);
+  text-underline-offset: 3px;
+}
+
+.data-ops-sql-column {
+  color: #facc15;
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.data-ops-sql-function {
+  color: #ddd6fe;
+  font-weight: 700;
+  background: rgba(192, 132, 252, 0.16);
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+.data-ops-sql-string {
+  color: #bef264;
+  font-weight: 600;
+}
+
+.data-ops-sql-number {
+  color: #fdba74;
+  font-weight: 600;
+}
+
+.data-ops-sql-comment {
+  color: var(--app-text-dim);
+  font-style: italic;
+}
+
+.data-ops-sql-operator {
+  color: #f0abfc;
+  font-weight: 700;
+  background: rgba(240, 171, 252, 0.12);
+  border-radius: 3px;
+  padding: 0 1px;
+}

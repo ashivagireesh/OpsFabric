@@ -73,6 +73,7 @@ interface RREFeatureDictionaryEntry {
 
 interface RRESignalConfig {
   enabled: boolean
+  smartWordingEnabled: boolean
   feature: string
   severity: RRESeverity
   valueField: string
@@ -88,6 +89,8 @@ interface RRERule {
   id: string
   name: string
   enabled: boolean
+  smartWordingEnabled: boolean
+  smartWordingMaxChars: number
   priority: number
   rootGroup: RREConditionGroup
   templateId: string
@@ -251,6 +254,9 @@ function newGroup(seed?: Partial<RREConditionGroup>): RREConditionGroup {
 }
 
 const initialRules: RRERule[] = []
+const defaultRuleSmartWordingMaxChars = 180
+const minRuleSmartWordingMaxChars = 40
+const maxRuleSmartWordingMaxChars = 2000
 
 function normalizeCondition(raw: any): RRECondition {
   return newCondition({
@@ -289,6 +295,7 @@ function normalizeSignalConfig(raw: any): RRESignalConfig {
     : defaultSignalJsonFields
   return {
     enabled: raw?.enabled !== false,
+    smartWordingEnabled: Boolean(raw?.smartWordingEnabled || raw?.smart_wording_enabled || false),
     feature: String(raw?.feature || ''),
     severity: ['HIGH', 'MEDIUM', 'LOW'].includes(String(raw?.severity || '')) ? raw.severity : 'MEDIUM',
     valueField: String(raw?.valueField || raw?.value_field || ''),
@@ -299,6 +306,40 @@ function normalizeSignalConfig(raw: any): RRESignalConfig {
     recommendation: String(raw?.recommendation || ''),
     jsonFields,
   }
+}
+
+function normalizeRuleSmartWordingMaxChars(raw: unknown): number {
+  const value = Math.trunc(Number(raw))
+  if (!Number.isFinite(value)) return defaultRuleSmartWordingMaxChars
+  return Math.max(minRuleSmartWordingMaxChars, Math.min(maxRuleSmartWordingMaxChars, value))
+}
+
+function ruleSmartWordingMaxChars(rule: RRERule | undefined): number {
+  return normalizeRuleSmartWordingMaxChars(rule?.smartWordingMaxChars)
+}
+
+function compactRuleWording(text: string, maxChars = 240): string {
+  const limit = normalizeRuleSmartWordingMaxChars(maxChars)
+  const cleaned = String(text || '').replace(/\s+/g, ' ').trim()
+  if (cleaned.length <= limit) return cleaned
+  const meaningMatch = cleaned.match(/^(.*?\.)\s+This indicates\s+(.+?)\.?$/i)
+  if (meaningMatch) {
+    const summary = `${meaningMatch[1].trim()} Indicates ${meaningMatch[2].trim().replace(/\.$/, '')}.`
+    if (summary.length <= limit) return summary
+  }
+  const first = cleaned.split(/(?<=[.!?])\s+/)[0] || cleaned
+  if (first.length <= limit) return first
+  const suffix = '.'
+  const maxBodyLength = Math.max(1, limit - suffix.length)
+  const words = first.split(/\s+/).filter(Boolean)
+  let body = ''
+  for (const word of words) {
+    const next = body ? `${body} ${word}` : word
+    if (next.length > maxBodyLength) break
+    body = next
+  }
+  if (!body) body = first.slice(0, maxBodyLength).trimEnd()
+  return `${body}${suffix}`
 }
 
 function normalizeFeatureDictionary(raw: unknown): RREFeatureDictionaryEntry[] {
@@ -433,6 +474,8 @@ function normalizeRulesConfig(raw: unknown): RRERule[] {
     id: String(item?.id || `rule-${Date.now()}-${index}`),
     name: String(item?.name || `Rule ${index + 1}`),
     enabled: item?.enabled !== false,
+    smartWordingEnabled: Boolean(item?.smartWordingEnabled || item?.smart_wording_enabled || item?.signalConfig?.smartWordingEnabled || item?.signal_config?.smart_wording_enabled || false),
+    smartWordingMaxChars: normalizeRuleSmartWordingMaxChars(item?.smartWordingMaxChars ?? item?.smart_wording_max_chars ?? item?.smartWordingChars ?? item?.smart_wording_chars),
     priority: Number.isFinite(Number(item?.priority)) ? Number(item.priority) : index + 1,
     rootGroup: normalizeGroup(item?.rootGroup),
     templateId: String(item?.templateId || ''),
@@ -1219,16 +1262,19 @@ function renderTemplate(
   }
   const signal = buildNarrative(rule, output, dictionary)
   Object.assign(values, signal.placeholders)
+  const smartWordingMaxChars = ruleSmartWordingMaxChars(rule)
   rule.templateMappings.forEach((mapping) => {
     if (!mapping.placeholder) return
-    values[mapping.placeholder] = resolveMappedValue(output, mapping)
+    const mappedValue = resolveMappedValue(output, mapping)
+    values[mapping.placeholder] = rule.smartWordingEnabled ? compactRuleWording(mappedValue, smartWordingMaxChars) : mappedValue
   })
-  return template.body.replace(/\{\{\s*(=)?\s*([^{}]+?)\s*\}\}/g, (_match, isExpression: string, body: string) => {
+  const rendered = template.body.replace(/\{\{\s*(=)?\s*([^{}]+?)\s*\}\}/g, (_match, isExpression: string, body: string) => {
     const key = String(body || '').trim()
     if (!key) return ''
     if (isExpression) return evaluateTemplateMathExpression(key, output)
     return values[key] ?? formatScalar(readField(output, key))
   })
+  return rule.smartWordingEnabled ? compactRuleWording(rendered, smartWordingMaxChars) : rendered
 }
 
 function buildNarrative(rule: RRERule, output: Record<string, unknown>, dictionary: RREFeatureDictionaryEntry[]) {
@@ -1243,7 +1289,8 @@ function buildNarrative(rule: RRERule, output: Record<string, unknown>, dictiona
     ? cfg.impactValue
     : (cfg?.impactField ? formatScalar(readField(output, cfg.impactField)) : '')
   const defaultRecommendation = meta?.default_recommendation || ''
-  const recommendation = cfg?.recommendation || defaultRecommendation
+  let recommendation = cfg?.recommendation || defaultRecommendation
+  const smartWordingMaxChars = ruleSmartWordingMaxChars(rule)
   const risk = riskBand(readField(output, 'predictions.risk_score') ?? readField(output, 'risk_score') ?? readField(output, 'prediction_score'))
   const summary = risk ? `${rule.name} classified this record as ${risk} risk.` : `${rule.name} matched this record.`
   let observation = ''
@@ -1253,6 +1300,10 @@ function buildNarrative(rule: RRERule, output: Record<string, unknown>, dictiona
     observation = `${businessName.charAt(0).toUpperCase()}${businessName.slice(1)} is ${severityWord(severity)} abnormal, with observed value ${formatScalar(value)}.`
   }
   if (meta?.meaning) observation = `${observation} This indicates ${meta.meaning}.`
+  if (rule.smartWordingEnabled || cfg?.smartWordingEnabled) {
+    observation = compactRuleWording(observation, smartWordingMaxChars)
+    recommendation = compactRuleWording(recommendation, smartWordingMaxChars)
+  }
   const signalRecommendations = recommendation ? `- ${recommendation}` : ''
   const signalOutput = [
     summary,
@@ -1574,14 +1625,16 @@ function buildCumulativeClusterObservation(clusterName: string, signals: Array<R
   const classified = classifyClusterSignals(signals)
   if (classified.primary_driver) {
     const primary = signals.find((signal) => (signal.business_name || signal.feature) === classified.primary_driver) || signals[0]
+    const primaryRole = signalImpactRole(primary)
     const driverReason = primary
-      ? `${classified.primary_driver} is the primary impact driver because it crossed ${primary.threshold_type || 'configured'} criteria${primary.breach_percent ? ` by ${primary.breach_percent}%` : ''}`
+      ? `${classified.primary_driver} is the ${primaryRole === 'outcome' ? 'primary impacted outcome' : 'primary impact driver'} because it crossed ${primary.threshold_type || 'configured'} criteria${primary.breach_percent ? ` by ${primary.breach_percent}%` : ''}`
       : `${classified.primary_driver} is the primary impact driver`
     const evidenceText = signals.length
       ? ` Evidence: ${signals.map(clusterFactorSentence).join('; ')}.`
       : ''
-    const outcomeText = classified.impacted_outcomes.length
-      ? ` ${classified.impacted_outcomes.join(', ')} ${classified.impacted_outcomes.length === 1 ? 'is' : 'are'} impacted outcome${classified.impacted_outcomes.length === 1 ? '' : 's'}.`
+    const impactedOutcomes = classified.impacted_outcomes.filter((item) => item !== classified.primary_driver)
+    const outcomeText = impactedOutcomes.length
+      ? ` ${impactedOutcomes.join(', ')} ${impactedOutcomes.length === 1 ? 'is' : 'are'} impacted outcome${impactedOutcomes.length === 1 ? '' : 's'}.`
       : ''
     return `${scenario || clusterName}: ${driverReason}.${outcomeText}${evidenceText}`
   }
@@ -1598,18 +1651,24 @@ function buildCumulativeClusterObservation(clusterName: string, signals: Array<R
 function buildCumulativeClusterRecommendation(clusterName: string, signals: Array<Record<string, string>>, instruction = ''): string {
   const classified = classifyClusterSignals(signals)
   if (classified.primary_driver) {
+    const primary = signals.find((signal) => (signal.business_name || signal.feature) === classified.primary_driver) || signals[0]
+    const primaryRole = primary ? signalImpactRole(primary) : 'driver'
     const support = classified.secondary_drivers.length
       ? ` Supporting drivers: ${classified.secondary_drivers.join(', ')}.`
       : ''
-    const outcome = classified.impacted_outcomes.length
-      ? ` Check downstream impact on ${classified.impacted_outcomes.join(', ')}.`
+    const impactedOutcomes = classified.impacted_outcomes.filter((item) => item !== classified.primary_driver)
+    const outcome = impactedOutcomes.length
+      ? ` Check downstream impact on ${impactedOutcomes.join(', ')}.`
       : ''
     const absoluteEvidence = signals
       .slice(0, 3)
       .map(clusterFactorSentence)
       .join('; ')
     const evidence = absoluteEvidence ? ` Evidence to validate: ${absoluteEvidence}.` : ''
-    const base = `Prioritize ${classified.primary_driver}; validate source transactions and compare recent customer/entity behavior.${support}${outcome}${evidence}`
+    const action = primaryRole === 'outcome'
+      ? `Review ${classified.primary_driver} as the breached outcome`
+      : `Prioritize ${classified.primary_driver}`
+    const base = `${action}; validate source transactions and compare recent customer/entity behavior.${support}${outcome}${evidence}`
     return instruction ? `${instruction}. ${base}` : base
   }
   const critical = signals
@@ -1724,7 +1783,7 @@ function buildClusterRecommendationOutput(
   selectedFields: string[] = defaultClusterJsonFields,
   smartWordingEnabled = false,
 ): string {
-  const outputFields = selectedFields.length > 0 ? selectedFields : defaultClusterJsonFields
+  const outputFields = Array.from(new Set(['cluster', ...(selectedFields.length > 0 ? selectedFields : defaultClusterJsonFields)]))
   const signalByFeature = new Map(
     dictionary
       .map((entry) => buildConfiguredClusterSignal(entry, output))
@@ -2264,11 +2323,14 @@ export default function RREStudio(props: RREStudioProps) {
         id,
         name: 'New Rule',
         enabled: true,
+        smartWordingEnabled: false,
+        smartWordingMaxChars: defaultRuleSmartWordingMaxChars,
         priority: rules.length + 1,
         rootGroup: newGroup({ join: 'and', conditions: [newCondition({ field: predictionFields[0] || outputFields[0] || 'predictions.ensemble_prediction', operator: 'exists', value: '' })] }),
         templateId: templates[0]?.id || '',
         signalConfig: {
           enabled: true,
+          smartWordingEnabled: false,
           feature: predictionFields[0]?.replace(/^predictions\./, '') || outputFields[0] || '',
           severity: 'MEDIUM',
           valueField: predictionFields[0] || outputFields[0] || '',
@@ -2299,6 +2361,7 @@ export default function RREStudio(props: RREStudioProps) {
     const selectedTemplate = allTemplates.find((item) => item.id === ruleConfigDraft.templateId)
     const nextRule = {
       ...ruleConfigDraft,
+      smartWordingMaxChars: normalizeRuleSmartWordingMaxChars(ruleConfigDraft.smartWordingMaxChars),
       templateName: selectedTemplate?.name || ruleConfigDraft.templateName || '',
       templateBody: selectedTemplate?.body || ruleConfigDraft.templateBody || '',
       templateResponsibility: selectedTemplate?.responsibility || ruleConfigDraft.templateResponsibility || '',
@@ -3185,24 +3248,45 @@ predictions.risk_score,Risk Score,elevated model risk signal requiring operation
       >
         {ruleConfigDraft ? (
           <Space direction="vertical" size={12} style={{ width: '100%' }}>
-            <Space wrap>
-              <Switch
-                checked={ruleConfigDraft.enabled}
-                onChange={(enabled) => setRuleConfigDraft((current) => current ? { ...current, enabled } : current)}
-              />
-              <Input
-                value={ruleConfigDraft.name}
-                onChange={(event) => setRuleConfigDraft((current) => current ? { ...current, name: event.target.value } : current)}
-                placeholder="Rule name"
-                style={{ width: 260 }}
-              />
-              <Text style={{ color: 'var(--app-text-subtle)' }}>Priority</Text>
-              <InputNumber
-                min={1}
-                value={ruleConfigDraft.priority}
-                onChange={(priority) => setRuleConfigDraft((current) => current ? { ...current, priority: Number(priority || 1) } : current)}
-                style={{ width: 90 }}
-              />
+            <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap align="center">
+              <Space wrap align="center">
+                <Switch
+                  checked={ruleConfigDraft.enabled}
+                  onChange={(enabled) => setRuleConfigDraft((current) => current ? { ...current, enabled } : current)}
+                />
+                <Input
+                  value={ruleConfigDraft.name}
+                  onChange={(event) => setRuleConfigDraft((current) => current ? { ...current, name: event.target.value } : current)}
+                  placeholder="Rule name"
+                  style={{ width: 260 }}
+                />
+                <Text style={{ color: 'var(--app-text-subtle)' }}>Priority</Text>
+                <InputNumber
+                  min={1}
+                  value={ruleConfigDraft.priority}
+                  onChange={(priority) => setRuleConfigDraft((current) => current ? { ...current, priority: Number(priority || 1) } : current)}
+                  style={{ width: 90 }}
+                />
+              </Space>
+              <Space size={8} wrap align="center" style={{ justifyContent: 'flex-end' }}>
+                <Switch
+                  checked={Boolean(ruleConfigDraft.smartWordingEnabled)}
+                  onChange={(smartWordingEnabled) => setRuleConfigDraft((current) => current ? { ...current, smartWordingEnabled } : current)}
+                />
+                <Text style={{ color: 'var(--app-text)' }}>Smart wording</Text>
+                <Text style={{ color: 'var(--app-text-subtle)' }}>Max chars</Text>
+                <InputNumber
+                  min={minRuleSmartWordingMaxChars}
+                  max={maxRuleSmartWordingMaxChars}
+                  value={ruleSmartWordingMaxChars(ruleConfigDraft)}
+                  disabled={!ruleConfigDraft.smartWordingEnabled}
+                  onChange={(smartWordingMaxChars) => setRuleConfigDraft((current) => current ? {
+                    ...current,
+                    smartWordingMaxChars: normalizeRuleSmartWordingMaxChars(smartWordingMaxChars),
+                  } : current)}
+                  style={{ width: 110 }}
+                />
+              </Space>
             </Space>
 
             <RuleConditionGroupEditor
