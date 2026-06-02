@@ -577,6 +577,19 @@ const api = {
     }
   },
 
+  clearDataOpsRuntimeActivity: async () => {
+    try {
+      const r = await http.post('/api/runtime/monitor/data-ops-activity/clear')
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to clear Data Ops monitor logs')
+      throw new Error(message)
+    }
+  },
+
   testDataOpsConnection: async (connection: Record<string, unknown>) => {
     try {
       const r = await http.post('/api/data-ops/connection/test', { connection }, { timeout: 45000 })

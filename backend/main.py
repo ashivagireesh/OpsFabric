@@ -28,7 +28,7 @@ try:
     import msvcrt as _msvcrt  # type: ignore
 except Exception:  # pragma: no cover - non-Windows fallback
     _msvcrt = None
-from datetime import datetime, timedelta, date, time
+from datetime import datetime, timedelta, date, time, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
@@ -2893,6 +2893,16 @@ class DataOpsOracleSyncScheduleRequest(BaseModel):
     data_ops_node_id: Optional[str] = None
     mapper_step_id: Optional[str] = None
     mapper_config_id: Optional[str] = None
+    task_master_id: Optional[str] = None
+    task_master_name: Optional[str] = None
+    task_window_mode: Optional[str] = None
+    task_window_indicator: Optional[str] = None
+    task_monthly_run_day: Optional[int] = 1
+    task_lookback_count: Optional[int] = 1
+    task_lookback_unit: Optional[str] = "day"
+    task_duplicate_policy: Optional[str] = "skip_completed"
+    task_start_at: Optional[str] = None
+    task_end_at: Optional[str] = None
     enabled: bool = False
     deploy_enabled: bool = False
     schedule_type: str = "interval"
@@ -15148,7 +15158,7 @@ def _write_data_ops_schedule_activity_rows_unlocked(rows: List[Dict[str, Any]]) 
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{_os.getpid()}.tmp")
     tmp_path.write_text(
-        json.dumps(rows[:80], indent=2, ensure_ascii=False, sort_keys=True, default=str),
+        json.dumps(rows[:1000], indent=2, ensure_ascii=False, sort_keys=True, default=str),
         encoding="utf-8",
     )
     _os.replace(tmp_path, path)
@@ -15175,7 +15185,7 @@ def _record_data_ops_schedule_activity(job_id: str, status: str, message: str = 
     }
     with _data_ops_schedule_activity_lock:
         _data_ops_schedule_activity_rows.insert(0, row)
-        del _data_ops_schedule_activity_rows[80:]
+        del _data_ops_schedule_activity_rows[1000:]
     lock_path = _data_ops_schedule_activity_lock_path()
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "a+", encoding="utf-8") as lock_handle:
@@ -15269,7 +15279,7 @@ def _data_ops_schedule_monitor_rows(scheduler_jobs: List[Dict[str, Any]], checke
             row["status"] = "scheduled"
         elif activity_status in {"running", "success", "failed", "skipped"}:
             row["status"] = activity.get("status")
-        for key in ("execution_id", "duration_ms", "rows_processed"):
+        for key in ("execution_id", "duration_ms", "source_rows", "rows_processed", "destination_rows", "rejected_rows", "mismatch_rows"):
             if key in activity:
                 row[key] = activity.get(key)
     rows.sort(key=lambda item: str(item.get("next_run_at") or item.get("last_activity_at") or ""), reverse=False)
@@ -15296,7 +15306,7 @@ async def get_runtime_monitor(db: Session = Depends(get_db)):
         scheduler_jobs = []
     checked_at = datetime.utcnow().isoformat() + "Z"
     data_ops_schedules = _data_ops_schedule_monitor_rows(scheduler_jobs, checked_at)
-    data_ops_activity = _load_data_ops_schedule_activity_rows()[:25]
+    data_ops_activity = _load_data_ops_schedule_activity_rows()
     return {
         "ok": True,
         "pid": _os.getpid(),
@@ -15319,6 +15329,30 @@ async def get_runtime_monitor(db: Session = Depends(get_db)):
         "data_ops_schedules": data_ops_schedules,
         "data_ops_activity": data_ops_activity,
     }
+
+
+def _clear_runtime_monitor_data_ops_activity_rows() -> Dict[str, Any]:
+    with _data_ops_schedule_activity_lock:
+        _data_ops_schedule_activity_rows.clear()
+    lock_path = _data_ops_schedule_activity_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+        _lock_data_ops_schedule_registry(lock_handle)
+        try:
+            _write_data_ops_schedule_activity_rows_unlocked([])
+        finally:
+            _unlock_data_ops_schedule_registry(lock_handle)
+    return {"ok": True, "cleared": True}
+
+
+@app.post("/api/runtime/monitor/data-ops-activity/clear")
+async def clear_runtime_monitor_data_ops_activity_post():
+    return _clear_runtime_monitor_data_ops_activity_rows()
+
+
+@app.delete("/api/runtime/monitor/data-ops-activity")
+async def clear_runtime_monitor_data_ops_activity():
+    return _clear_runtime_monitor_data_ops_activity_rows()
 
 
 # ─── WEBSOCKET ────────────────────────────────────────────────────────────────
@@ -17258,7 +17292,22 @@ def _execute_data_ops_oracle_sql(config: Dict[str, Any], sql: str) -> Dict[str, 
     try:
         conn = _data_ops_oracle_connect(config)
         cur = conn.cursor()
-        cur.execute(raw_sql.rstrip().rstrip(";"))
+        bind_params = config.get("_data_ops_task_bind_params") if isinstance(config, dict) else {}
+        if not isinstance(bind_params, dict):
+            bind_params = {}
+        used_bind_names = {
+            str(match.group(1) or "").strip()
+            for match in re.finditer(r":([A-Za-z_][A-Za-z0-9_$#]*)", raw_sql)
+        }
+        execution_binds = {
+            str(key): value
+            for key, value in bind_params.items()
+            if str(key) in used_bind_names
+        }
+        if execution_binds:
+            cur.execute(raw_sql.rstrip().rstrip(";"), execution_binds)
+        else:
+            cur.execute(raw_sql.rstrip().rstrip(";"))
         rowcount = int(cur.rowcount or 0) if cur.rowcount is not None and cur.rowcount >= 0 else 0
         conn.commit()
         cur.close()
@@ -17291,11 +17340,109 @@ async def data_ops_oracle_execute(body: DataOpsOracleExecuteRequest):
         raise HTTPException(400, "SQL is required.")
     if not body.confirm:
         raise HTTPException(400, "Execution requires confirmation.")
+    config = dict(body.config or {})
+    manual_activity = bool(config.get("_data_ops_manual_activity"))
+    started_at = datetime.utcnow()
+    if config.get("_data_ops_task_bind_params"):
+        config["_data_ops_task_bind_params"] = _data_ops_runtime_task_bind_params(config, started_at)
+    job_id = str(config.get("_data_ops_manual_job_id") or f"data_ops_manual:{uuid.uuid4().hex}").strip()
+    pipeline_id = str(config.get("_data_ops_manual_pipeline_id") or config.get("_data_ops_pipeline_id") or "").strip()
+    data_ops_node_id = str(config.get("_data_ops_manual_data_ops_node_id") or config.get("_data_ops_node_id") or "").strip()
+    step_id = str(config.get("_data_ops_manual_step_id") or config.get("data_ops_mapper_step_id") or "").strip()
+    config_id = str(config.get("_data_ops_manual_config_id") or config.get("data_ops_active_mapper_config_id") or "").strip()
+    task_master_id = str(config.get("_data_ops_task_master_id") or "").strip()
+    task_master_name = str(config.get("_data_ops_task_master_name") or "").strip()
+    task_bind_params = config.get("_data_ops_task_bind_params") if isinstance(config.get("_data_ops_task_bind_params"), dict) else {}
+    business_window_key = str(task_bind_params.get("task_business_window_key") or "").strip()
+    force_retry = bool(config.get("_data_ops_force_retry"))
+    duplicate_policy = str(config.get("_data_ops_task_duplicate_policy") or task_bind_params.get("task_duplicate_policy") or "skip_completed").strip().lower()
+    if manual_activity and not force_retry and duplicate_policy != "allow_rerun" and _data_ops_completed_window_exists(pipeline_id, data_ops_node_id, task_master_id, config_id, business_window_key):
+        _record_data_ops_schedule_activity(
+            job_id,
+            "skipped",
+            f"Manual task sync skipped: already completed for {business_window_key}",
+            kind="mapper",
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_id=step_id,
+            config_id=config_id,
+            task_master_id=task_master_id,
+            task_master_name=task_master_name,
+            task_bind_params=task_bind_params,
+            business_window_key=business_window_key,
+            source_rows=0,
+            rows_processed=0,
+            destination_rows=0,
+            rejected_rows=0,
+            mismatch_rows=0,
+            last_run_started_at=started_at.isoformat() + "Z",
+            last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+        )
+        return {"ok": True, "operation": "SKIPPED", "rowcount": 0, "skipped": True, "business_window_key": business_window_key}
+    if manual_activity:
+        _record_data_ops_schedule_activity(
+            job_id,
+            "running",
+            "Manual task sync started",
+            kind="mapper",
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_id=step_id,
+            config_id=config_id,
+            task_master_id=task_master_id,
+            task_master_name=task_master_name,
+            task_bind_params=task_bind_params,
+            business_window_key=business_window_key,
+            last_run_started_at=started_at.isoformat() + "Z",
+        )
     try:
-        return _execute_data_ops_oracle_sql(body.config, sql)
+        result = _execute_data_ops_oracle_sql(config, sql)
+        if manual_activity:
+            rowcount = int(result.get("rowcount") or 0)
+            _record_data_ops_schedule_activity(
+                job_id,
+                "success",
+                f"Manual task sync completed: {rowcount} row(s)",
+                kind="mapper",
+                pipeline_id=pipeline_id,
+                data_ops_node_id=data_ops_node_id,
+                step_id=step_id,
+                config_id=config_id,
+                task_master_id=task_master_id,
+                task_master_name=task_master_name,
+                task_bind_params=task_bind_params,
+                business_window_key=business_window_key,
+                source_rows=rowcount,
+                rows_processed=rowcount,
+                destination_rows=rowcount,
+                rejected_rows=0,
+                mismatch_rows=0,
+                duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
+                last_run_started_at=started_at.isoformat() + "Z",
+                last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+            )
+        return result
     except HTTPException:
         raise
     except Exception as exc:
+        if manual_activity:
+            _record_data_ops_schedule_activity(
+                job_id,
+                "failed",
+                f"Manual task sync failed: {exc}",
+                kind="mapper",
+                pipeline_id=pipeline_id,
+                data_ops_node_id=data_ops_node_id,
+                step_id=step_id,
+                config_id=config_id,
+                task_master_id=task_master_id,
+                task_master_name=task_master_name,
+                task_bind_params=task_bind_params,
+                business_window_key=business_window_key,
+                duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
+                last_run_started_at=started_at.isoformat() + "Z",
+                last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+            )
         raise HTTPException(400, f"Oracle SQL execution failed: {exc}")
 
 
@@ -17317,6 +17464,168 @@ def _data_ops_mapper_sync_schedule_is_active(config: Dict[str, Any]) -> bool:
     return True
 
 
+def _data_ops_parse_date_text(value: Any) -> Optional[date]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw[:19].replace("Z", "+00:00")).date()
+    except Exception:
+        try:
+            return date.fromisoformat(raw[:10])
+        except Exception:
+            return None
+
+
+def _data_ops_runtime_task_bind_params(config: Dict[str, Any], run_at: datetime) -> Dict[str, Any]:
+    bind_params = config.get("_data_ops_task_bind_params") if isinstance(config, dict) else {}
+    if not isinstance(bind_params, dict):
+        bind_params = {}
+    binds: Dict[str, Any] = dict(bind_params)
+    mode = str(config.get("_data_ops_task_window_mode") or binds.get("task_window_mode") or "daily").strip().lower()
+    indicator = str(config.get("_data_ops_task_window_indicator") or binds.get("task_window_indicator") or "").strip().lower()
+    if not indicator:
+        indicator = "transaction_month" if mode == "monthly" else "transaction_day" if mode == "daily" else "transaction_range"
+    manual_window = bool(config.get("_data_ops_manual_window"))
+    run_date = run_at.date()
+    if manual_window and (binds.get("task_business_start_date") or binds.get("task_business_date")):
+        business_start = str(binds.get("task_business_start_date") or binds.get("task_business_date") or "").strip()
+        business_end = str(binds.get("task_business_end_date") or business_start).strip()
+    elif mode == "monthly":
+        this_month_start = date(run_date.year, run_date.month, 1)
+        previous_month_end = this_month_start - timedelta(days=1)
+        previous_month_start = date(previous_month_end.year, previous_month_end.month, 1)
+        business_start = previous_month_start.isoformat()
+        business_end = previous_month_end.isoformat()
+    elif mode == "daily":
+        business_day = run_date - timedelta(days=1)
+        business_start = business_day.isoformat()
+        business_end = business_start
+    elif mode == "previous_range":
+        count = max(1, int(config.get("_data_ops_task_lookback_count") or binds.get("task_lookback_count") or 1))
+        unit = str(config.get("_data_ops_task_lookback_unit") or binds.get("task_lookback_unit") or "day").strip().lower()
+        if unit == "month":
+            current_month_start = date(run_date.year, run_date.month, 1)
+            range_end = current_month_start - timedelta(days=1)
+            month_index = (range_end.year * 12 + range_end.month - 1) - count + 1
+            range_start = date(month_index // 12, month_index % 12 + 1, 1)
+            business_start = range_start.isoformat()
+            business_end = range_end.isoformat()
+        else:
+            range_end = run_date - timedelta(days=1)
+            range_start = range_end - timedelta(days=count - 1)
+            business_start = range_start.isoformat()
+            business_end = range_end.isoformat()
+    else:
+        business_start = str(binds.get("task_start_date") or binds.get("task_business_start_date") or "").strip()
+        business_end = str(binds.get("task_end_date") or binds.get("task_business_end_date") or business_start).strip()
+    business_month = business_start[:7] if business_start else ""
+    if business_start:
+        binds["task_business_date"] = business_start
+        binds["task_business_start_date"] = business_start
+        binds["task_business_month"] = business_month
+    if business_end:
+        binds["task_business_end_date"] = business_end
+    binds["task_window_mode"] = mode or "daily"
+    binds["task_window_indicator"] = indicator
+    if indicator == "transaction_month":
+        window_key = f"txn_month:{business_month}"
+        label = f"transaction - month {business_month}"
+    elif indicator == "transaction_day":
+        window_key = f"txn_day:{business_start}"
+        label = f"transaction - day {business_start}"
+    else:
+        window_key = f"range:{business_start}_to_{business_end or business_start}"
+        label = f"transaction - range {business_start} to {business_end or business_start}"
+    binds["task_business_window_key"] = window_key
+    binds["task_business_label"] = label
+    binds["txn_day"] = business_start
+    binds["txn_month"] = business_month
+    return binds
+
+
+def _data_ops_runtime_task_backlog_bind_windows(config: Dict[str, Any], run_at: datetime) -> List[Dict[str, Any]]:
+    mode = str(config.get("_data_ops_task_window_mode") or "").strip().lower()
+    if mode not in {"daily", "monthly"}:
+        return [_data_ops_runtime_task_bind_params(config, run_at)]
+    start_date = _data_ops_parse_date_text(config.get("_data_ops_task_start_at"))
+    expiry_date = _data_ops_parse_date_text(config.get("_data_ops_task_end_at"))
+    run_date = run_at.date()
+    windows: List[Dict[str, Any]] = []
+    if mode == "monthly":
+        previous_month_start = date(run_date.year, run_date.month, 1) - timedelta(days=1)
+        previous_month_start = date(previous_month_start.year, previous_month_start.month, 1)
+        cursor = date(start_date.year, start_date.month, 1) if start_date else previous_month_start
+        expiry_month = date(expiry_date.year, expiry_date.month, 1) if expiry_date else previous_month_start
+        last_month = expiry_month if expiry_month < previous_month_start else previous_month_start
+        while cursor <= last_month and len(windows) < 500:
+            next_month = date(cursor.year + (1 if cursor.month == 12 else 0), 1 if cursor.month == 12 else cursor.month + 1, 1)
+            month_end = next_month - timedelta(days=1)
+            window_config = dict(config)
+            task_binds = dict(config.get("_data_ops_task_bind_params") or {})
+            task_binds.update({
+                "task_start_date": cursor.isoformat(),
+                "task_end_date": month_end.isoformat(),
+                "task_business_date": cursor.isoformat(),
+                "task_business_start_date": cursor.isoformat(),
+                "task_business_end_date": month_end.isoformat(),
+                "task_business_month": cursor.isoformat()[:7],
+            })
+            window_config["_data_ops_task_bind_params"] = task_binds
+            window_config["_data_ops_manual_window"] = True
+            windows.append(_data_ops_runtime_task_bind_params(window_config, run_at))
+            cursor = next_month
+        return windows
+    yesterday = run_date - timedelta(days=1)
+    cursor = start_date or yesterday
+    last_day = expiry_date if expiry_date and expiry_date < yesterday else yesterday
+    while cursor <= last_day and len(windows) < 1000:
+        window_config = dict(config)
+        task_binds = dict(config.get("_data_ops_task_bind_params") or {})
+        task_binds.update({
+            "task_start_date": cursor.isoformat(),
+            "task_end_date": cursor.isoformat(),
+            "task_business_date": cursor.isoformat(),
+            "task_business_start_date": cursor.isoformat(),
+            "task_business_end_date": cursor.isoformat(),
+            "task_business_month": cursor.isoformat()[:7],
+        })
+        window_config["_data_ops_task_bind_params"] = task_binds
+        window_config["_data_ops_manual_window"] = True
+        windows.append(_data_ops_runtime_task_bind_params(window_config, run_at))
+        cursor = cursor + timedelta(days=1)
+    return windows
+
+
+def _data_ops_completed_window_exists(
+    pipeline_id: str,
+    data_ops_node_id: str,
+    task_master_id: str,
+    config_id: str,
+    business_window_key: str,
+) -> bool:
+    if not business_window_key:
+        return False
+    rows = _load_data_ops_schedule_activity_rows()
+    for row in rows:
+        if str(row.get("status") or "").strip().lower() != "success":
+            continue
+        binds = row.get("task_bind_params") if isinstance(row.get("task_bind_params"), dict) else {}
+        row_key = str(row.get("business_window_key") or binds.get("task_business_window_key") or "").strip()
+        if row_key != business_window_key:
+            continue
+        if pipeline_id and str(row.get("pipeline_id") or "") != pipeline_id:
+            continue
+        if data_ops_node_id and str(row.get("data_ops_node_id") or "") != data_ops_node_id:
+            continue
+        if task_master_id and str(row.get("task_master_id") or "") != task_master_id:
+            continue
+        if config_id and str(row.get("config_id") or "") != config_id:
+            continue
+        return True
+    return False
+
+
 async def _run_scheduled_data_ops_mapper_sync(
     job_id: str,
     config: Dict[str, Any],
@@ -17327,6 +17636,20 @@ async def _run_scheduled_data_ops_mapper_sync(
     mapper_config_id: str = "",
 ):
     started_at = datetime.utcnow()
+    runtime_config = dict(config or {})
+    task_master_id = str(runtime_config.get("_data_ops_task_master_id") or "")
+    task_master_name = str(runtime_config.get("_data_ops_task_master_name") or "")
+    duplicate_policy = str(runtime_config.get("_data_ops_task_duplicate_policy") or "skip_completed").strip().lower()
+    candidate_bind_windows = _data_ops_runtime_task_backlog_bind_windows(runtime_config, started_at)
+    runtime_bind_params = candidate_bind_windows[0] if candidate_bind_windows else _data_ops_runtime_task_bind_params(runtime_config, started_at)
+    for candidate in candidate_bind_windows:
+        candidate_key = str(candidate.get("task_business_window_key") or "").strip()
+        if duplicate_policy == "allow_rerun" or not _data_ops_completed_window_exists(pipeline_id, data_ops_node_id, task_master_id, mapper_config_id, candidate_key):
+            runtime_bind_params = candidate
+            break
+    runtime_config["_data_ops_task_bind_params"] = runtime_bind_params
+    business_window_key = str(runtime_bind_params.get("task_business_window_key") or "").strip()
+    duplicate_policy = str(runtime_config.get("_data_ops_task_duplicate_policy") or runtime_bind_params.get("task_duplicate_policy") or "skip_completed").strip().lower()
     _record_data_ops_schedule_activity(
         job_id,
         "running",
@@ -17336,9 +17659,13 @@ async def _run_scheduled_data_ops_mapper_sync(
         data_ops_node_id=data_ops_node_id,
         step_id=mapper_step_id,
         config_id=mapper_config_id,
+        task_master_id=task_master_id,
+        task_master_name=task_master_name,
+        task_bind_params=runtime_bind_params,
+        business_window_key=business_window_key,
         last_run_started_at=started_at.isoformat() + "Z",
     )
-    if not _data_ops_mapper_sync_schedule_is_active(config):
+    if not _data_ops_mapper_sync_schedule_is_active(runtime_config):
         try:
             scheduler.remove_job(job_id)
         except Exception:
@@ -17352,10 +17679,38 @@ async def _run_scheduled_data_ops_mapper_sync(
             data_ops_node_id=data_ops_node_id,
             step_id=mapper_step_id,
             config_id=mapper_config_id,
+            task_master_id=task_master_id,
+            task_master_name=task_master_name,
+            task_bind_params=runtime_bind_params,
+            business_window_key=business_window_key,
             last_run_started_at=started_at.isoformat() + "Z",
             last_run_finished_at=datetime.utcnow().isoformat() + "Z",
         )
         logger.debug(f"Removed inactive scheduled Data Ops mapper sync {job_id}")
+        return
+    if duplicate_policy != "allow_rerun" and _data_ops_completed_window_exists(pipeline_id, data_ops_node_id, task_master_id, mapper_config_id, business_window_key):
+        _record_data_ops_schedule_activity(
+            job_id,
+            "skipped",
+            f"Mapper sync skipped: already completed for {business_window_key}",
+            kind="mapper",
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_id=mapper_step_id,
+            config_id=mapper_config_id,
+            task_master_id=task_master_id,
+            task_master_name=task_master_name,
+            task_bind_params=runtime_bind_params,
+            business_window_key=business_window_key,
+            source_rows=0,
+            rows_processed=0,
+            destination_rows=0,
+            rejected_rows=0,
+            mismatch_rows=0,
+            last_run_started_at=started_at.isoformat() + "Z",
+            last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+        )
+        logger.info(f"Scheduled Data Ops mapper sync {job_id} skipped duplicate window {business_window_key}")
         return
     _persist_data_ops_schedule_next_run_at(
         pipeline_id=pipeline_id,
@@ -17368,7 +17723,7 @@ async def _run_scheduled_data_ops_mapper_sync(
         job_id=job_id,
     )
     try:
-        result = await asyncio.to_thread(_execute_data_ops_oracle_sql, config, sql)
+        result = await asyncio.to_thread(_execute_data_ops_oracle_sql, runtime_config, sql)
         _record_data_ops_schedule_activity(
             job_id,
             "success",
@@ -17378,7 +17733,15 @@ async def _run_scheduled_data_ops_mapper_sync(
             data_ops_node_id=data_ops_node_id,
             step_id=mapper_step_id,
             config_id=mapper_config_id,
+            task_master_id=task_master_id,
+            task_master_name=task_master_name,
+            task_bind_params=runtime_bind_params,
+            business_window_key=business_window_key,
+            source_rows=int(result.get("rowcount") or 0),
             rows_processed=int(result.get("rowcount") or 0),
+            destination_rows=int(result.get("rowcount") or 0),
+            rejected_rows=0,
+            mismatch_rows=0,
             duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
             last_run_started_at=started_at.isoformat() + "Z",
             last_run_finished_at=datetime.utcnow().isoformat() + "Z",
@@ -17394,6 +17757,10 @@ async def _run_scheduled_data_ops_mapper_sync(
             data_ops_node_id=data_ops_node_id,
             step_id=mapper_step_id,
             config_id=mapper_config_id,
+            task_master_id=task_master_id,
+            task_master_name=task_master_name,
+            task_bind_params=runtime_bind_params,
+            business_window_key=business_window_key,
             duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
             last_run_started_at=started_at.isoformat() + "Z",
             last_run_finished_at=datetime.utcnow().isoformat() + "Z",
@@ -17483,6 +17850,14 @@ async def data_ops_oracle_sync_schedule(body: DataOpsOracleSyncScheduleRequest):
         scheduled_config = dict(body.config or {})
         scheduled_config["_data_ops_mapper_scheduler_enabled"] = True
         scheduled_config["_data_ops_mapper_deploy_enabled"] = True
+        scheduled_config["_data_ops_task_window_mode"] = str(body.task_window_mode or "").strip()
+        scheduled_config["_data_ops_task_window_indicator"] = str(body.task_window_indicator or "").strip()
+        scheduled_config["_data_ops_task_monthly_run_day"] = int(body.task_monthly_run_day or 1)
+        scheduled_config["_data_ops_task_lookback_count"] = int(body.task_lookback_count or 1)
+        scheduled_config["_data_ops_task_lookback_unit"] = str(body.task_lookback_unit or "day").strip()
+        scheduled_config["_data_ops_task_duplicate_policy"] = str(body.task_duplicate_policy or "skip_completed").strip()
+        scheduled_config["_data_ops_task_start_at"] = str(body.task_start_at or "").strip()
+        scheduled_config["_data_ops_task_end_at"] = str(body.task_end_at or "").strip()
         schedule_record = {
             "kind": "mapper",
             "job_id": job_id,
@@ -17490,6 +17865,16 @@ async def data_ops_oracle_sync_schedule(body: DataOpsOracleSyncScheduleRequest):
             "data_ops_node_id": scope.get("data_ops_node_id") or "",
             "mapper_step_id": scope.get("mapper_step_id") or "",
             "mapper_config_id": scope.get("mapper_config_id") or "",
+            "task_master_id": str(body.task_master_id or "").strip(),
+            "task_master_name": str(body.task_master_name or "").strip(),
+            "task_window_mode": str(body.task_window_mode or "").strip(),
+            "task_window_indicator": str(body.task_window_indicator or "").strip(),
+            "task_monthly_run_day": int(body.task_monthly_run_day or 1),
+            "task_lookback_count": int(body.task_lookback_count or 1),
+            "task_lookback_unit": str(body.task_lookback_unit or "day").strip(),
+            "task_duplicate_policy": str(body.task_duplicate_policy or "skip_completed").strip(),
+            "task_start_at": str(body.task_start_at or "").strip(),
+            "task_end_at": str(body.task_end_at or "").strip(),
             "enabled": True,
             "deploy_enabled": True,
             "schedule_type": schedule_type,
@@ -17503,6 +17888,28 @@ async def data_ops_oracle_sync_schedule(body: DataOpsOracleSyncScheduleRequest):
         }
         _upsert_data_ops_schedule_registry_record(schedule_record)
         next_run_at = _ensure_data_ops_schedule_record_job(schedule_record, force=True)
+        task_bind_params = _data_ops_runtime_task_bind_params(scheduled_config, datetime.utcnow())
+        _record_data_ops_schedule_activity(
+            job_id,
+            "scheduled",
+            "Mapper sync window registered",
+            kind="mapper",
+            pipeline_id=schedule_record["pipeline_id"],
+            data_ops_node_id=schedule_record["data_ops_node_id"],
+            step_id=schedule_record["mapper_step_id"],
+            config_id=schedule_record["mapper_config_id"],
+            task_master_id=schedule_record["task_master_id"],
+            task_master_name=schedule_record["task_master_name"],
+            task_window_mode=schedule_record["task_window_mode"],
+            task_bind_params=task_bind_params,
+            business_window_key=str(task_bind_params.get("task_business_window_key") or ""),
+            next_run_at=next_run_at,
+            source_rows=0,
+            rows_processed=0,
+            destination_rows=0,
+            rejected_rows=0,
+            mismatch_rows=0,
+        )
     except Exception as exc:
         raise HTTPException(400, f"Failed to schedule mapper sync: {exc}")
     _persist_data_ops_schedule_next_run_at(
@@ -17876,11 +18283,35 @@ def _data_ops_schedule_record_fingerprint(record: Dict[str, Any]) -> str:
 def _data_ops_schedule_record_trigger(record: Dict[str, Any]) -> Tuple[Any, str]:
     schedule_type = str(record.get("schedule_type") or "interval").strip().lower()
     timezone_name = str(record.get("timezone") or "Asia/Kolkata").strip() or "Asia/Kolkata"
+    start_date = str(record.get("task_start_at") or "").strip() or None
+    end_date = str(record.get("task_end_at") or "").strip() or None
     if schedule_type == "cron":
         cron = _ensure_valid_cron_expr(record.get("cron") or "")
-        return CronTrigger.from_crontab(cron, timezone=timezone_name), cron
+        trigger = CronTrigger.from_crontab(cron, timezone=timezone_name)
+        if start_date:
+            try:
+                trigger.start_date = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+            except Exception:
+                pass
+        if end_date:
+            try:
+                trigger.end_date = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            except Exception:
+                pass
+        return trigger, cron
     interval_minutes = max(1, int(record.get("interval_minutes") or 60))
-    return IntervalTrigger(minutes=interval_minutes, timezone=timezone_name), f"every {interval_minutes} minute(s)"
+    trigger_kwargs: Dict[str, Any] = {"minutes": interval_minutes, "timezone": timezone_name}
+    if start_date:
+        try:
+            trigger_kwargs["start_date"] = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+        except Exception:
+            pass
+    if end_date:
+        try:
+            trigger_kwargs["end_date"] = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+        except Exception:
+            pass
+    return IntervalTrigger(**trigger_kwargs), f"every {interval_minutes} minute(s)"
 
 
 def _data_ops_schedule_record_enabled(record: Dict[str, Any]) -> bool:

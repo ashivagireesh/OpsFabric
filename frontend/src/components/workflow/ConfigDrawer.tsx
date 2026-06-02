@@ -175,7 +175,53 @@ type DataOpsRuleRow = {
   field?: string
   operator?: string
   value?: string
+  valueMode?: 'fixed' | 'bind'
+  bindParam?: string
   enabled?: boolean
+}
+
+type DataOpsBindParam = {
+  id: string
+  name: string
+  label?: string
+  dataType?: 'string' | 'number' | 'date' | 'boolean'
+  defaultValue?: string
+  required?: boolean
+  enabled?: boolean
+}
+
+type DataOpsQueryInputRow = {
+  id: string
+  param?: string
+  sourceMode?: 'default' | 'fixed' | 'field'
+  sourceField?: string
+  value?: string
+  enabled?: boolean
+}
+
+type DataOpsTaskMaster = {
+  id: string
+  name: string
+  description?: string
+  enabled?: boolean
+  windowMode?: 'daily' | 'monthly' | 'previous_range' | 'custom_range' | 'interval' | 'custom'
+  windowIndicator?: 'transaction_day' | 'transaction_month' | 'transaction_range'
+  startAt?: string
+  endAt?: string
+  frequency?: 'daily' | 'monthly' | 'hourly' | 'interval' | 'cron'
+  intervalMinutes?: number
+  runAtTime?: string
+  monthlyRunDay?: number
+  lookbackCount?: number
+  lookbackUnit?: 'day' | 'month' | 'hour' | 'minute'
+  executionMode?: 'task_driven' | 'subtask_driven' | 'hybrid'
+  duplicatePolicy?: 'skip_completed' | 'allow_rerun' | 'retry_only'
+  cron?: string
+  timezone?: string
+  retryPolicy?: 'mismatch' | 'failed' | 'rejected' | 'full'
+  status?: string
+  runOrder?: number
+  updatedAt?: string
 }
 
 type DataOpsJoinRow = {
@@ -261,6 +307,7 @@ type DataOpsQueryBuilderConfig = {
   groupByFields?: DataOpsFieldRow[]
   havingRules?: DataOpsRuleRow[]
   orderByRows?: DataOpsOrderRow[]
+  bindParameters?: DataOpsBindParam[]
   limitRows?: number
   updatedAt?: string
 }
@@ -272,6 +319,9 @@ type DataOpsMapperConfig = {
   targetMode?: DataOpsPipelineStep['targetMode']
   writeMode?: DataOpsPipelineStep['writeMode']
   lookupSource?: string
+  queryInputs?: DataOpsQueryInputRow[]
+  taskMasterId?: string
+  runOrder?: number
   target?: string
   keyFields?: string
   mappingRows?: DataOpsMapRow[]
@@ -321,6 +371,7 @@ type DataOpsRouterConfig = {
   name: string
   description?: string
   routeSource?: string
+  queryInputs?: DataOpsQueryInputRow[]
   routeMode?: 'single' | 'multi' | 'conditional'
   payloadMode?: DataOpsRouterRouteRow['payloadMode']
   routeRows?: DataOpsRouterRouteRow[]
@@ -410,12 +461,16 @@ type DataOpsPipelineStep = {
   groupByFields?: DataOpsFieldRow[]
   havingRules?: DataOpsRuleRow[]
   orderByRows?: DataOpsOrderRow[]
+  bindParameters?: DataOpsBindParam[]
   queryBuilders?: DataOpsQueryBuilderConfig[]
   activeQueryBuilderId?: string
   mapperConfigs?: DataOpsMapperConfig[]
   activeMapperConfigId?: string
+  taskMasters?: DataOpsTaskMaster[]
+  activeTaskMasterId?: string
   routerConfigs?: DataOpsRouterConfig[]
   activeRouterConfigId?: string
+  queryInputs?: DataOpsQueryInputRow[]
   limitRows?: number
   retry?: boolean
   checkpoint?: boolean
@@ -556,12 +611,98 @@ function normalizeDataOpsRuleRows(value: unknown): DataOpsRuleRow[] {
   return Array.isArray(value)
     ? value.map((item, idx) => {
       const row = item && typeof item === 'object' ? item as Record<string, unknown> : {}
+      const rawValueMode = String(row.valueMode || row.value_mode || '').toLowerCase()
+      const bindParam = String(row.bindParam || row.bind_param || '').replace(/^:/, '').trim()
       return {
         id: String(row.id || `rule_${idx + 1}`),
         field: String(row.field || ''),
         operator: String(row.operator || 'equals'),
         value: String(row.value || ''),
+        valueMode: rawValueMode === 'bind' || bindParam ? 'bind' : 'fixed',
+        bindParam,
         enabled: row.enabled !== false,
+      }
+    })
+    : []
+}
+
+function normalizeDataOpsBindParameters(value: unknown): DataOpsBindParam[] {
+  return Array.isArray(value)
+    ? value.map((item, idx) => {
+      const row = item && typeof item === 'object' ? item as Record<string, unknown> : {}
+      const rawName = String(row.name || row.param || row.key || '').replace(/^:/, '').trim()
+      const rawType = String(row.dataType || row.data_type || row.type || 'string').toLowerCase()
+      return {
+        id: String(row.id || `bind_${idx + 1}`),
+        name: rawName || `param_${idx + 1}`,
+        label: String(row.label || ''),
+        dataType: (['number', 'date', 'boolean'].includes(rawType) ? rawType : 'string') as DataOpsBindParam['dataType'],
+        defaultValue: String(row.defaultValue || row.default_value || ''),
+        required: Boolean(row.required),
+        enabled: row.enabled !== false,
+      }
+    })
+    : []
+}
+
+function normalizeDataOpsQueryInputs(value: unknown): DataOpsQueryInputRow[] {
+  return Array.isArray(value)
+    ? value.map((item, idx) => {
+      const row = item && typeof item === 'object' ? item as Record<string, unknown> : {}
+      const rawMode = String(row.sourceMode || row.source_mode || row.mode || 'default').toLowerCase()
+      return {
+        id: String(row.id || `query_input_${idx + 1}`),
+        param: String(row.param || row.name || row.bindParam || row.bind_param || '').replace(/^:/, '').trim(),
+        sourceMode: (['fixed', 'field'].includes(rawMode) ? rawMode : 'default') as DataOpsQueryInputRow['sourceMode'],
+        sourceField: String(row.sourceField || row.source_field || ''),
+        value: String(row.value || row.defaultValue || row.default_value || ''),
+        enabled: row.enabled !== false,
+      }
+    })
+    : []
+}
+
+function normalizeDataOpsTaskMasters(value: unknown): DataOpsTaskMaster[] {
+  return Array.isArray(value)
+    ? value.map((item, idx) => {
+      const row = item && typeof item === 'object' ? item as Record<string, unknown> : {}
+      const rawWindow = String(row.windowMode || row.window_mode || 'daily').toLowerCase()
+      const rawIndicator = String(row.windowIndicator || row.window_indicator || '').toLowerCase()
+      const rawFrequency = String(row.frequency || row.scheduleType || row.schedule_type || 'daily').toLowerCase()
+      const rawRetry = String(row.retryPolicy || row.retry_policy || 'mismatch').toLowerCase()
+      const rawLookbackUnit = String(row.lookbackUnit || row.lookback_unit || 'day').toLowerCase()
+      const rawExecutionMode = String(row.executionMode || row.execution_mode || 'subtask_driven').toLowerCase()
+      const rawDuplicatePolicy = String(row.duplicatePolicy || row.duplicate_policy || 'skip_completed').toLowerCase()
+      const normalizedWindow = (['monthly', 'previous_range', 'custom_range', 'interval', 'custom'].includes(rawWindow) ? rawWindow : 'daily') as DataOpsTaskMaster['windowMode']
+      return {
+        id: String(row.id || `task_master_${idx + 1}`),
+        name: String(row.name || row.label || `Task Master ${idx + 1}`),
+        description: String(row.description || ''),
+        enabled: row.enabled !== false,
+        windowMode: normalizedWindow,
+        windowIndicator: (['transaction_day', 'transaction_month', 'transaction_range'].includes(rawIndicator)
+          ? rawIndicator
+          : normalizedWindow === 'monthly'
+            ? 'transaction_month'
+            : normalizedWindow === 'daily'
+              ? 'transaction_day'
+              : 'transaction_range') as DataOpsTaskMaster['windowIndicator'],
+        startAt: String(row.startAt || row.start_at || ''),
+        endAt: String(row.endAt || row.end_at || ''),
+        frequency: (['monthly', 'hourly', 'interval', 'cron'].includes(rawFrequency) ? rawFrequency : 'daily') as DataOpsTaskMaster['frequency'],
+        intervalMinutes: Number.isFinite(Number(row.intervalMinutes || row.interval_minutes)) ? Math.max(1, Math.trunc(Number(row.intervalMinutes || row.interval_minutes))) : 60,
+        runAtTime: String(row.runAtTime || row.run_at_time || '00:00'),
+        monthlyRunDay: Number.isFinite(Number(row.monthlyRunDay || row.monthly_run_day)) ? Math.min(31, Math.max(1, Math.trunc(Number(row.monthlyRunDay || row.monthly_run_day)))) : 1,
+        lookbackCount: Number.isFinite(Number(row.lookbackCount || row.lookback_count)) ? Math.max(1, Math.trunc(Number(row.lookbackCount || row.lookback_count))) : 1,
+        lookbackUnit: (['month', 'hour', 'minute'].includes(rawLookbackUnit) ? rawLookbackUnit : 'day') as DataOpsTaskMaster['lookbackUnit'],
+        executionMode: (['task_driven', 'hybrid'].includes(rawExecutionMode) ? rawExecutionMode : 'subtask_driven') as DataOpsTaskMaster['executionMode'],
+        duplicatePolicy: (['allow_rerun', 'retry_only'].includes(rawDuplicatePolicy) ? rawDuplicatePolicy : 'skip_completed') as DataOpsTaskMaster['duplicatePolicy'],
+        cron: String(row.cron || '0 0 * * *'),
+        timezone: String(row.timezone || 'Asia/Kolkata'),
+        retryPolicy: (['failed', 'rejected', 'full'].includes(rawRetry) ? rawRetry : 'mismatch') as DataOpsTaskMaster['retryPolicy'],
+        status: String(row.status || ''),
+        runOrder: Number.isFinite(Number(row.runOrder || row.run_order)) ? Math.max(1, Math.trunc(Number(row.runOrder || row.run_order))) : idx + 1,
+        updatedAt: String(row.updatedAt || row.updated_at || ''),
       }
     })
     : []
@@ -693,6 +834,7 @@ function normalizeDataOpsQueryBuilderConfigs(value: unknown): DataOpsQueryBuilde
         groupByFields: normalizeDataOpsFieldRows(row.groupByFields || row.group_by_fields),
         havingRules: normalizeDataOpsRuleRows(row.havingRules || row.having_rules),
         orderByRows: normalizeDataOpsOrderRows(row.orderByRows || row.order_by_rows),
+        bindParameters: normalizeDataOpsBindParameters(row.bindParameters || row.bind_parameters || row.bindParams || row.bind_params),
         limitRows: Number.isFinite(Number(row.limitRows || row.limit_rows)) ? Number(row.limitRows || row.limit_rows) : undefined,
         updatedAt: String(row.updatedAt || row.updated_at || ''),
       }
@@ -711,6 +853,9 @@ function normalizeDataOpsMapperConfigs(value: unknown): DataOpsMapperConfig[] {
         targetMode: (['oracle', 'file', 'api', 'upstream'].includes(String(row.targetMode || row.target_mode || '')) ? String(row.targetMode || row.target_mode) : 'oracle') as DataOpsPipelineStep['targetMode'],
         writeMode: (['insert', 'update', 'upsert', 'merge', 'append', 'delete', 'delete_insert', 'truncate_insert'].includes(String(row.writeMode || row.write_mode || '')) ? String(row.writeMode || row.write_mode) : 'upsert') as DataOpsPipelineStep['writeMode'],
         lookupSource: String(row.lookupSource || row.lookup_source || ''),
+        queryInputs: normalizeDataOpsQueryInputs(row.queryInputs || row.query_inputs || row.bindInputs || row.bind_inputs),
+        taskMasterId: String(row.taskMasterId || row.task_master_id || ''),
+        runOrder: Number.isFinite(Number(row.runOrder || row.run_order)) ? Math.max(1, Math.trunc(Number(row.runOrder || row.run_order))) : idx + 1,
         target: String(row.target || ''),
         keyFields: String(row.keyFields || row.key_fields || ''),
         mappingRows: normalizeDataOpsMapRows(row.mappingRows || row.mapping_rows),
@@ -779,6 +924,7 @@ function normalizeDataOpsRouterConfigs(value: unknown): DataOpsRouterConfig[] {
         name: String(row.name || row.label || `Router ${idx + 1}`),
         description: String(row.description || ''),
         routeSource: String(row.routeSource || row.route_source || row.lookupSource || row.lookup_source || ''),
+        queryInputs: normalizeDataOpsQueryInputs(row.queryInputs || row.query_inputs || row.bindInputs || row.bind_inputs),
         routeMode: (['single', 'conditional'].includes(routeMode) ? routeMode : 'multi') as DataOpsRouterConfig['routeMode'],
         payloadMode: (['batch', 'row_by_row', 'first_row', 'grouped'].includes(payloadMode) ? payloadMode : 'all_rows') as DataOpsRouterConfig['payloadMode'],
         routeRows: normalizeDataOpsRouterRouteRows(row.routeRows || row.route_rows || row.routes),
@@ -909,12 +1055,16 @@ function normalizeDataOpsPipelineSteps(value: unknown, legacyText: unknown): Dat
       groupByFields: normalizeDataOpsFieldRows(item.groupByFields || item.group_by_fields),
       havingRules: normalizeDataOpsRuleRows(item.havingRules || item.having_rules),
       orderByRows: normalizeDataOpsOrderRows(item.orderByRows || item.order_by_rows),
+      bindParameters: normalizeDataOpsBindParameters(item.bindParameters || item.bind_parameters || item.bindParams || item.bind_params),
       queryBuilders: normalizeDataOpsQueryBuilderConfigs(item.queryBuilders || item.query_builders),
       activeQueryBuilderId: String(item.activeQueryBuilderId || item.active_query_builder_id || ''),
       mapperConfigs: normalizeDataOpsMapperConfigs(item.mapperConfigs || item.mapper_configs),
       activeMapperConfigId: String(item.activeMapperConfigId || item.active_mapper_config_id || ''),
+      taskMasters: normalizeDataOpsTaskMasters(item.taskMasters || item.task_masters),
+      activeTaskMasterId: String(item.activeTaskMasterId || item.active_task_master_id || ''),
       routerConfigs: normalizeDataOpsRouterConfigs(item.routerConfigs || item.router_configs),
       activeRouterConfigId: String(item.activeRouterConfigId || item.active_router_config_id || ''),
+      queryInputs: normalizeDataOpsQueryInputs(item.queryInputs || item.query_inputs || item.bindInputs || item.bind_inputs),
       limitRows: Number.isFinite(Number(item.limitRows || item.limit_rows)) ? Number(item.limitRows || item.limit_rows) : undefined,
       retry: Boolean(item.retry),
       checkpoint: item.checkpoint !== false,
@@ -9772,6 +9922,28 @@ function dataOpsActiveQuerySqlFromStep(step: DataOpsPipelineStep): string {
   return String(activeConfig?.query || activeConfig?.expression || step.query || step.expression || '').trim()
 }
 
+function dataOpsQueryBuilderSqlFromConfig(queryConfig: DataOpsQueryBuilderConfig): string {
+  const stored = String(queryConfig.query || queryConfig.expression || '').trim()
+  if (stored) return stored
+  return buildDataOpsQueryBuilderSql({
+    id: String(queryConfig.id || 'query'),
+    name: String(queryConfig.name || 'Query'),
+    kind: 'prepare',
+    position: { x: 0, y: 0 },
+    enabled: true,
+    operation: 'query_builder',
+    tables: queryConfig.tables || [],
+    selectFields: queryConfig.selectFields || [],
+    filterRules: queryConfig.filterRules || [],
+    joinKeys: queryConfig.joinKeys || [],
+    groupByFields: queryConfig.groupByFields || [],
+    havingRules: queryConfig.havingRules || [],
+    orderByRows: queryConfig.orderByRows || [],
+    bindParameters: queryConfig.bindParameters || [],
+    limitRows: queryConfig.limitRows,
+  })
+}
+
 function dataOpsSqlIdent(value: string): string {
   return String(value || '').trim()
 }
@@ -9779,9 +9951,16 @@ function dataOpsSqlIdent(value: string): string {
 function dataOpsSqlLiteral(value: string): string {
   const raw = String(value ?? '').trim()
   if (!raw) return "''"
+  if (/^:[A-Za-z_][\w$#]*$/.test(raw)) return raw
   if (/^-?\d+(\.\d+)?$/.test(raw)) return raw
   if (/^'.*'$/.test(raw)) return raw
   return `'${raw.replace(/'/g, "''")}'`
+}
+
+function dataOpsRuleValueSql(rule: Pick<DataOpsRuleRow, 'value' | 'valueMode' | 'bindParam'>): string {
+  const bindName = String(rule.bindParam || '').replace(/^:/, '').trim()
+  if (rule.valueMode === 'bind' && bindName) return `:${bindName}`
+  return String(rule.value || '')
 }
 
 function dataOpsSqlOperator(operator: string, value: string): string {
@@ -9899,11 +10078,11 @@ function buildDataOpsQueryBuilderSql(step: DataOpsPipelineStep): string {
   })()
   const whereSql = (step.filterRules || [])
     .filter((item) => item.enabled !== false && String(item.field || '').trim())
-    .map((item) => `${dataOpsSqlIdent(String(item.field || ''))} ${dataOpsSqlOperator(String(item.operator || 'equals'), String(item.value || ''))}`)
+    .map((item) => `${dataOpsSqlIdent(String(item.field || ''))} ${dataOpsSqlOperator(String(item.operator || 'equals'), dataOpsRuleValueSql(item))}`)
   const groupSql = selectedGroupRows.map((item) => dataOpsSqlIdent(String(item.field || '')))
   const havingSql = (step.havingRules || [])
     .filter((item) => item.enabled !== false && String(item.field || '').trim())
-    .map((item) => `${dataOpsSqlIdent(String(item.field || ''))} ${dataOpsSqlOperator(String(item.operator || 'greater_than'), String(item.value || ''))}`)
+    .map((item) => `${dataOpsSqlIdent(String(item.field || ''))} ${dataOpsSqlOperator(String(item.operator || 'greater_than'), dataOpsRuleValueSql(item))}`)
   const orderSql = selectedOrderRows.map((item) => `${dataOpsSqlIdent(String(item.field || ''))} ${String(item.direction || 'asc').toUpperCase()}`)
   return [
     `SELECT\n  ${selectSql}`,
@@ -9937,6 +10116,7 @@ function materializeDataOpsStepConfigsForSave(steps: DataOpsPipelineStep[]): Dat
         groupByFields: step.groupByFields || [],
         havingRules: step.havingRules || [],
         orderByRows: step.orderByRows || [],
+        bindParameters: step.bindParameters || [],
         limitRows: step.limitRows,
         updatedAt: now,
       }
@@ -9957,6 +10137,7 @@ function materializeDataOpsStepConfigsForSave(steps: DataOpsPipelineStep[]): Dat
         name: String(existing?.name || step.name || `Router ${rows.length + 1}`),
         description: String(existing?.description || ''),
         routeSource: step.routeSource || '',
+        queryInputs: step.queryInputs || [],
         routeMode: step.routeMode || 'multi',
         payloadMode: step.payloadMode || 'all_rows',
         routeRows: step.routeRows || [],
@@ -9999,6 +10180,9 @@ function materializeDataOpsStepConfigsForSave(steps: DataOpsPipelineStep[]): Dat
         targetMode: step.targetMode || 'oracle',
         writeMode: step.writeMode || 'upsert',
         lookupSource: step.lookupSource || '',
+        queryInputs: step.queryInputs || [],
+        taskMasterId: step.activeTaskMasterId || '',
+        runOrder: 1,
         target: step.target || '',
         keyFields: step.keyFields || '',
         mappingRows: step.mappingRows || [],
@@ -10029,6 +10213,7 @@ function materializeDataOpsStepConfigsForSave(steps: DataOpsPipelineStep[]): Dat
       return {
         ...step,
         activeMapperConfigId: targetId,
+        activeTaskMasterId: step.activeTaskMasterId || '',
         mapperConfigs: existing ? rows.map((item) => item.id === targetId ? nextConfig : item) : [...rows, nextConfig],
       }
     }
@@ -10040,6 +10225,276 @@ function dataOpsActiveQuerySqlFromConfig(cfg: Record<string, unknown>): string {
   const steps = normalizeDataOpsPipelineSteps(cfg.data_ops_pipeline_nodes, cfg.pipeline_steps)
   const prepareStep = steps.find((step) => step.enabled !== false && step.kind === 'prepare')
   return prepareStep ? dataOpsActiveQuerySqlFromStep(prepareStep) : ''
+}
+
+function dataOpsQueryBuilderFromRouteSource(steps: DataOpsPipelineStep[], routeSource: unknown): DataOpsQueryBuilderConfig | undefined {
+  const source = String(routeSource || '').trim()
+  if (!source) return undefined
+  if (source.startsWith('query:')) {
+    const [, sourceStepId, queryId] = source.split(':')
+    const sourceStep = steps.find((step) => step.id === sourceStepId && step.kind === 'prepare')
+    return (sourceStep?.queryBuilders || []).find((queryConfig) => String(queryConfig.id || '') === String(queryId || ''))
+  }
+  if (source.startsWith('step:')) {
+    const sourceStepId = source.slice('step:'.length)
+    const sourceStep = steps.find((step) => step.id === sourceStepId && step.kind === 'prepare')
+    if (!sourceStep) return undefined
+    const activeId = String(sourceStep.activeQueryBuilderId || '').trim()
+    return (sourceStep.queryBuilders || []).find((queryConfig) => String(queryConfig.id || '') === activeId)
+      || (sourceStep.queryBuilders || [])[0]
+  }
+  return undefined
+}
+
+function dataOpsBindParametersFromRouteSource(steps: DataOpsPipelineStep[], routeSource: unknown): DataOpsBindParam[] {
+  const source = String(routeSource || '').trim()
+  if (!source) return []
+  const queryConfig = dataOpsQueryBuilderFromRouteSource(steps, source)
+  if (queryConfig?.bindParameters?.length) return queryConfig.bindParameters
+  if (source.startsWith('step:')) {
+    const sourceStep = steps.find((step) => step.id === source.slice('step:'.length) && step.kind === 'prepare')
+    return sourceStep?.bindParameters || []
+  }
+  if (source.startsWith('query:')) {
+    const [, sourceStepId] = source.split(':')
+    const sourceStep = steps.find((step) => step.id === sourceStepId && step.kind === 'prepare')
+    return sourceStep?.bindParameters || []
+  }
+  return []
+}
+
+function dataOpsTaskMasterBusinessWindow(task?: DataOpsTaskMaster): Record<string, string> {
+  if (!task) return {}
+  const startRaw = String(task.startAt || '').trim()
+  const endRaw = String(task.endAt || '').trim()
+  const startDate = startRaw ? startRaw.slice(0, 10) : ''
+  const endDate = endRaw ? endRaw.slice(0, 10) : ''
+  const now = new Date()
+  const yesterday = new Date(now)
+  yesterday.setDate(now.getDate() - 1)
+  const previousMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0)
+  const previousMonthStart = new Date(previousMonthEnd.getFullYear(), previousMonthEnd.getMonth(), 1)
+  const dateText = (value: Date) => `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`
+  const mode = String(task.windowMode || 'daily')
+  const indicator = String(task.windowIndicator || (mode === 'monthly' ? 'transaction_month' : mode === 'daily' ? 'transaction_day' : 'transaction_range'))
+  const configuredMonthStart = startDate ? `${startDate.slice(0, 7)}-01` : ''
+  const configuredMonthEnd = startDate
+    ? dateText(new Date(Number(startDate.slice(0, 4)), Number(startDate.slice(5, 7)), 0))
+    : ''
+  let businessStart = ''
+  let businessEnd = ''
+  if (mode === 'monthly') {
+    businessStart = configuredMonthStart || dateText(previousMonthStart)
+    businessEnd = configuredMonthEnd || dateText(previousMonthEnd)
+  } else if (mode === 'daily') {
+    businessStart = startDate || dateText(yesterday)
+    businessEnd = businessStart
+  } else if (mode === 'previous_range') {
+    const count = Math.max(1, Number(task.lookbackCount || 1))
+    const unit = String(task.lookbackUnit || 'day')
+    const end = new Date(now)
+    if (unit === 'month') {
+      const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1)
+      const rangeEnd = new Date(currentMonthStart)
+      rangeEnd.setDate(0)
+      const rangeStart = new Date(rangeEnd.getFullYear(), rangeEnd.getMonth() - count + 1, 1)
+      businessStart = dateText(rangeStart)
+      businessEnd = dateText(rangeEnd)
+    } else {
+      end.setDate(now.getDate() - 1)
+      const start = new Date(end)
+      start.setDate(end.getDate() - count + 1)
+      businessStart = dateText(start)
+      businessEnd = dateText(end)
+    }
+  } else {
+    businessStart = startDate
+    businessEnd = endDate || startDate
+  }
+  const businessMonth = mode === 'monthly' ? businessStart.slice(0, 7) : businessStart ? businessStart.slice(0, 7) : ''
+  const windowKey = indicator === 'transaction_month'
+    ? `txn_month:${businessMonth}`
+    : indicator === 'transaction_day'
+      ? `txn_day:${businessStart}`
+      : `range:${businessStart}_to_${businessEnd || businessStart}`
+  return {
+    task_business_date: businessStart,
+    task_business_month: businessMonth,
+    task_business_start_date: businessStart,
+    task_business_end_date: businessEnd,
+    task_business_window_key: windowKey,
+    task_business_label: indicator === 'transaction_month'
+      ? `transaction - month ${businessMonth}`
+      : indicator === 'transaction_day'
+        ? `transaction - day ${businessStart}`
+        : `transaction - range ${businessStart} to ${businessEnd || businessStart}`,
+  }
+}
+
+function dataOpsTaskBacklogWindows(task?: DataOpsTaskMaster): DataOpsTaskMaster[] {
+  if (!task) return []
+  const mode = String(task.windowMode || 'daily')
+  if (!['daily', 'monthly'].includes(mode)) return [task]
+  const dateText = (value: Date) => `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`
+  const parseDate = (value: unknown) => {
+    const raw = String(value || '').slice(0, 10)
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null
+    const parsed = new Date(Number(raw.slice(0, 4)), Number(raw.slice(5, 7)) - 1, Number(raw.slice(8, 10)))
+    return Number.isNaN(parsed.getTime()) ? null : parsed
+  }
+  const now = new Date()
+  const start = parseDate(task.startAt)
+  const expiry = parseDate(task.endAt)
+  if (mode === 'monthly') {
+    const previousMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1)
+    const startMonth = start ? new Date(start.getFullYear(), start.getMonth(), 1) : previousMonth
+    const expiryMonth = expiry ? new Date(expiry.getFullYear(), expiry.getMonth(), 1) : previousMonth
+    const lastMonth = expiryMonth.getTime() < previousMonth.getTime() ? expiryMonth : previousMonth
+    const windows: DataOpsTaskMaster[] = []
+    const cursor = new Date(startMonth)
+    while (cursor.getTime() <= lastMonth.getTime() && windows.length < 500) {
+      const monthStart = new Date(cursor.getFullYear(), cursor.getMonth(), 1)
+      const monthEnd = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 0)
+      windows.push({
+        ...task,
+        windowMode: 'monthly',
+        windowIndicator: task.windowIndicator || 'transaction_month',
+        startAt: dateText(monthStart),
+        endAt: dateText(monthEnd),
+      })
+      cursor.setMonth(cursor.getMonth() + 1)
+    }
+    return windows
+  }
+  const yesterday = new Date(now)
+  yesterday.setDate(now.getDate() - 1)
+  const startDay = start || yesterday
+  const lastDay = expiry && expiry.getTime() < yesterday.getTime() ? expiry : yesterday
+  const windows: DataOpsTaskMaster[] = []
+  const cursor = new Date(startDay)
+  while (cursor.getTime() <= lastDay.getTime() && windows.length < 1000) {
+    const day = dateText(cursor)
+    windows.push({
+      ...task,
+      windowMode: 'daily',
+      windowIndicator: task.windowIndicator || 'transaction_day',
+      startAt: day,
+      endAt: day,
+    })
+    cursor.setDate(cursor.getDate() + 1)
+  }
+  return windows
+}
+
+function dataOpsTaskMasterBindParams(task?: DataOpsTaskMaster): Record<string, string> {
+  if (!task) return {}
+  const startRaw = String(task.startAt || '').trim()
+  const endRaw = String(task.endAt || '').trim()
+  const startDate = startRaw ? startRaw.slice(0, 10) : ''
+  const endDate = endRaw ? endRaw.slice(0, 10) : ''
+  const mode = String(task.windowMode || 'daily')
+  const indicator = String(task.windowIndicator || (mode === 'monthly' ? 'transaction_month' : mode === 'daily' ? 'transaction_day' : 'transaction_range'))
+  const businessWindow = dataOpsTaskMasterBusinessWindow(task)
+  return {
+    task_master_id: String(task.id || ''),
+    task_name: String(task.name || ''),
+    task_start_at: startRaw,
+    task_end_at: endRaw,
+    task_start_date: startDate,
+    task_end_date: endDate,
+    ...businessWindow,
+    txn_day: businessWindow.task_business_date || '',
+    txn_month: businessWindow.task_business_month || '',
+    task_run_time: String(task.runAtTime || '00:00'),
+    task_window_mode: mode,
+    task_window_indicator: indicator,
+    task_monthly_run_day: String(task.monthlyRunDay || 1),
+    task_lookback_count: String(task.lookbackCount || 1),
+    task_lookback_unit: String(task.lookbackUnit || 'day'),
+    task_duplicate_policy: String(task.duplicatePolicy || 'skip_completed'),
+  }
+}
+
+function dataOpsTaskMasterWindowLabel(task?: DataOpsTaskMaster): string {
+  if (!task) return 'No task selected'
+  const mode = String(task.windowMode || 'daily')
+  const start = String(task.startAt || '').trim()
+  const end = String(task.endAt || '').trim()
+  if (mode === 'monthly') return `${start.slice(0, 7) || 'previous month'}${end ? ` to ${end.slice(0, 7)}` : ''}`
+  if (mode === 'previous_range') return `previous ${Number(task.lookbackCount || 1)} ${task.lookbackUnit || 'day'}`
+  if (mode === 'interval' || mode === 'custom' || mode === 'custom_range') return `${start || 'start'} to ${end || 'open'}`
+  return start.slice(0, 10) || 'date not set'
+}
+
+function dataOpsTaskMasterScheduleSummary(task?: DataOpsTaskMaster): string {
+  if (!task) return 'No schedule'
+  const mode = String(task.windowMode || 'daily')
+  const runAt = String(task.runAtTime || '00:00')
+  if (mode === 'daily') return `Day · ${runAt}`
+  if (mode === 'monthly') return `Month · day ${Number(task.monthlyRunDay || 1)} at ${runAt}`
+  if (mode === 'previous_range') return `Previous ${Number(task.lookbackCount || 1)} ${task.lookbackUnit || 'day'}`
+  if (mode === 'interval') return `Every ${Number(task.intervalMinutes || 60)} min`
+  return `${mode} · ${dataOpsTaskMasterWindowLabel(task)}`
+}
+
+function dataOpsRouteSourcesForTarget(steps: DataOpsPipelineStep[], targetNodeId: string): string[] {
+  const target = String(targetNodeId || '').trim()
+  if (!target) return []
+  const routeSources: string[] = []
+  steps.forEach((step) => {
+    if (step.enabled === false || step.kind !== 'router') return
+    const routerConfigs = step.routerConfigs && step.routerConfigs.length > 0
+      ? step.routerConfigs
+      : [{
+        id: step.activeRouterConfigId || step.id,
+        name: step.name,
+        routeSource: step.routeSource,
+        routeRows: step.routeRows,
+      } as DataOpsRouterConfig]
+    routerConfigs.forEach((config) => {
+      const routes = Array.isArray(config.routeRows) ? config.routeRows : []
+      const targetsCurrentNode = routes.some((route) => (
+        route.enabled !== false
+        && String(route.targetType || '').trim() === 'main_pipeline_node'
+        && String(route.targetNodeId || '').trim() === target
+      ))
+      if (!targetsCurrentNode) return
+      const routeSource = String(config.routeSource || step.routeSource || '').trim()
+      if (routeSource) routeSources.push(routeSource)
+    })
+  })
+  return uniqueFieldNames(routeSources)
+}
+
+function dataOpsRoutedOutputFieldsFromConfig(cfg: Record<string, unknown>, targetNodeId: string): string[] {
+  const steps = normalizeDataOpsPipelineSteps(cfg.data_ops_pipeline_nodes, cfg.pipeline_steps)
+  const routedFields = dataOpsRouteSourcesForTarget(steps, targetNodeId).flatMap((routeSource) => (
+    dataOpsQueryBuilderOutputFields(dataOpsQueryBuilderFromRouteSource(steps, routeSource))
+  ))
+  return filterUserFacingFieldNames(uniqueFieldNames(routedFields))
+}
+
+function dataOpsRoutedQuerySqlFromConfig(cfg: Record<string, unknown>, targetNodeId: string): string {
+  const steps = normalizeDataOpsPipelineSteps(cfg.data_ops_pipeline_nodes, cfg.pipeline_steps)
+  for (const routeSource of dataOpsRouteSourcesForTarget(steps, targetNodeId)) {
+    const queryConfig = dataOpsQueryBuilderFromRouteSource(steps, routeSource)
+    if (queryConfig) return dataOpsQueryBuilderSqlFromConfig(queryConfig)
+  }
+  return ''
+}
+
+function dataOpsFieldsWithinConfiguredRoots(fields: string[], configuredFields: string[]): string[] {
+  const configured = uniqueFieldNames(configuredFields.map((field) => normalizeDataQueryPickerPath(field))).filter(Boolean)
+  if (configured.length <= 0) return uniqueFieldNames(fields)
+  const exact = new Set(configured.map((field) => field.toLowerCase()))
+  const roots = new Set(configured.map((field) => String(splitPathSegments(field)[0] || field).trim().toLowerCase()).filter(Boolean))
+  return uniqueFieldNames(fields.filter((field) => {
+    const path = normalizeDataQueryPickerPath(field)
+    if (!path) return false
+    const lower = path.toLowerCase()
+    const root = String(splitPathSegments(path)[0] || path).trim().toLowerCase()
+    return exact.has(lower) || roots.has(root)
+  }))
 }
 
 function extractDataOpsOutputFieldsFromConfig(cfg: Record<string, unknown>): string[] {
@@ -11288,6 +11743,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [dataOpsPipelineConfigOpen, setDataOpsPipelineConfigOpen] = useState(false)
   const [dataOpsQueryBuilderConfigOpen, setDataOpsQueryBuilderConfigOpen] = useState(false)
   const [dataOpsMapperConfigOpen, setDataOpsMapperConfigOpen] = useState(false)
+  const [dataOpsSubTaskMasterOpen, setDataOpsSubTaskMasterOpen] = useState(false)
+  const [dataOpsExpandedTaskMasterId, setDataOpsExpandedTaskMasterId] = useState('')
+  const [dataOpsMonitorClearedAt, setDataOpsMonitorClearedAt] = useState(0)
+  const [dataOpsMonitorWindowFilter, setDataOpsMonitorWindowFilter] = useState('')
+  const [dataOpsMonitorTaskFilter, setDataOpsMonitorTaskFilter] = useState('')
+  const [dataOpsMonitorSubTaskFilter, setDataOpsMonitorSubTaskFilter] = useState('')
   const [dataOpsRouterConfigOpen, setDataOpsRouterConfigOpen] = useState(false)
   const [dataOpsRouterRouteConfigId, setDataOpsRouterRouteConfigId] = useState('')
   const [dataOpsPipelineCanvasActive, setDataOpsPipelineCanvasActive] = useState(false)
@@ -16704,12 +17165,45 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         const kind = String(nodeTypeRaw || '').trim().toLowerCase()
         if (kind === 'lmdb_source') return 'lmdb'
         if (kind === 'oracle_source') return 'oracle'
+        if (kind === 'data_ops') return 'oracle'
         return normalizeProfileStorage(cfg.custom_profile_storage || cfg.profile_storage || 'lmdb')
+      }
+      const hasDataOpsOracleProfileTarget = (cfg: Record<string, unknown>): boolean => {
+        const hasTopLevelOracle = [
+          'oracle_host',
+          'oracle_user',
+          'oracle_password',
+          'oracle_service_name',
+          'oracle_sid',
+          'oracle_dsn',
+          'custom_profile_oracle_host',
+          'custom_profile_oracle_user',
+          'custom_profile_oracle_password',
+          'custom_profile_oracle_service_name',
+          'custom_profile_oracle_sid',
+          'custom_profile_oracle_dsn',
+        ].some((key) => String(cfg[key] || '').trim())
+        if (hasTopLevelOracle) return true
+        const steps = normalizeDataOpsPipelineSteps(cfg.data_ops_pipeline_nodes, cfg.pipeline_steps)
+        return steps.some((step) => {
+          const rawConnections = Array.isArray(step.connections) ? step.connections : []
+          return rawConnections.some((connection) => {
+            if (!connection || typeof connection !== 'object') return false
+            const item = connection as Record<string, unknown>
+            return String(item.type || '').trim().toLowerCase() === 'oracle'
+              && (
+                String(item.dsn || '').trim()
+                || String(item.host || '').trim()
+                || String(item.user || '').trim()
+              )
+          })
+        })
       }
       const isProfileCandidate = (nodeTypeRaw: string, cfg: Record<string, unknown>): boolean => {
         const kind = String(nodeTypeRaw || '').trim().toLowerCase()
         if (kind === 'lmdb_source') return selectedStorage === 'lmdb'
         if (kind === 'oracle_source') return selectedStorage === 'oracle'
+        if (kind === 'data_ops') return selectedStorage === 'oracle' && hasDataOpsOracleProfileTarget(cfg)
         if (kind !== 'map_transform' || !parseBoolLike(cfg.custom_profile_enabled, false)) return false
         return getCandidateStorage(kind, cfg) === selectedStorage
       }
@@ -16787,7 +17281,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           ? `${item.label} (LMDB source • ${item.source})`
           : item.nodeType === 'oracle_source'
             ? `${item.label} (Oracle profile table • ${item.source})`
-            : `${item.label} (${storageLabels[item.storage] || 'Profile'} profile • ${item.source})`,
+            : item.nodeType === 'data_ops'
+              ? `${item.label} (Data Ops Oracle profile • ${item.source})`
+              : `${item.label} (${storageLabels[item.storage] || 'Profile'} profile • ${item.source})`,
       }))
     },
     [dataQueryProfilePatchCandidateNodes]
@@ -16893,10 +17389,24 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         const sourceType = String(src.nodeType || '').trim().toLowerCase() || 'upstream'
         const sourceNode = nodes.find((node) => node.id === sourceId)
         const sourceDataOpsFields = sourceType === 'data_ops'
-          ? extractDataOpsOutputFieldsFromConfig(
-            (sourceNode?.data?.config && typeof sourceNode.data.config === 'object'
-              ? sourceNode.data.config
-              : {}) as Record<string, unknown>,
+          ? (
+            dataOpsRoutedOutputFieldsFromConfig(
+              (sourceNode?.data?.config && typeof sourceNode.data.config === 'object'
+                ? sourceNode.data.config
+                : {}) as Record<string, unknown>,
+              selectedNodeId,
+            ).length > 0
+              ? dataOpsRoutedOutputFieldsFromConfig(
+                (sourceNode?.data?.config && typeof sourceNode.data.config === 'object'
+                  ? sourceNode.data.config
+                  : {}) as Record<string, unknown>,
+                selectedNodeId,
+              )
+              : extractDataOpsOutputFieldsFromConfig(
+                (sourceNode?.data?.config && typeof sourceNode.data.config === 'object'
+                  ? sourceNode.data.config
+                  : {}) as Record<string, unknown>,
+              )
           )
           : []
         if (!sourceId) {
@@ -16909,8 +17419,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         }
         if (sourceType === 'data_ops') {
           const remoteSourceFields = dataQueryRemoteFieldHintsBySource[sourceId] || []
+          const scopedRemoteFields = sourceDataOpsFields.length > 0
+            ? dataOpsFieldsWithinConfiguredRoots(remoteSourceFields, sourceDataOpsFields)
+            : remoteSourceFields
           const fields = filterUserFacingFieldNames(uniqueFieldNames([
-            ...(remoteSourceFields.length > 0 ? remoteSourceFields : sourceDataOpsFields),
+            ...sourceDataOpsFields,
+            ...scopedRemoteFields,
           ].map((field) => normalizeDataQueryPickerPath(field)))).slice(0, DATA_QUERY_FIELD_TREE_FIELD_LIMIT)
           return {
             sourceId,
@@ -19652,12 +20166,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         let response: any = null
         const sourceNodeType = String(sourceNode.nodeType || '').trim().toLowerCase()
         const isDataOpsSource = sourceNodeType === 'data_ops'
+        const requestConfig: Record<string, unknown> = {
+          ...((sourceNode.config && typeof sourceNode.config === 'object'
+            ? sourceNode.config
+            : {}) as Record<string, unknown>),
+        }
         try {
-          const requestConfig: Record<string, unknown> = {
-            ...((sourceNode.config && typeof sourceNode.config === 'object'
-              ? sourceNode.config
-              : {}) as Record<string, unknown>),
-          }
           if (sourceNodeType === 'lmdb_source') {
             if (pipelineId) requestConfig._schema_pipeline_id = pipelineId
             if (upstreamProfileNodeIds.length > 0) {
@@ -19665,7 +20179,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             }
           }
           if (isDataOpsSource) {
-            const sql = dataOpsActiveQuerySqlFromConfig(requestConfig)
+            const sql = dataOpsRoutedQuerySqlFromConfig(requestConfig, String(selectedNodeId || '')) || dataOpsActiveQuerySqlFromConfig(requestConfig)
             if (!sql) continue
             response = await api.previewDataOpsOracleQuery(requestConfig, sql, 300)
           } else {
@@ -19687,6 +20201,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         }
         const sourceId = String(sourceNode.id || '').trim()
         const sourceFields = new Set<string>()
+        if (isDataOpsSource) {
+          const configuredDataOpsFields = dataOpsRoutedOutputFieldsFromConfig(requestConfig, String(selectedNodeId || ''))
+          const effectiveConfiguredFields = configuredDataOpsFields.length > 0
+            ? configuredDataOpsFields
+            : extractDataOpsOutputFieldsFromConfig(requestConfig)
+          effectiveConfiguredFields.forEach((name) => {
+            fieldSet.add(name)
+            sourceFields.add(name)
+          })
+        }
         const cols = parseFieldList(response?.columns)
         cols.forEach((name) => {
           fieldSet.add(name)
@@ -19708,14 +20232,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         const dataOpsOutputColumnSet = new Set(cols.map((name) => String(name || '').trim().toLowerCase()).filter(Boolean))
         const dataOpsJsonColumnSet = new Set(PRIORITY_JSON_FIELD_NAMES.map((name) => name.toLowerCase()))
         const discovered = isDataOpsSource
-          ? discoveredRaw.filter((name) => {
+          ? dataOpsFieldsWithinConfiguredRoots(discoveredRaw.filter((name) => {
             const path = String(name || '').trim()
             if (!path) return false
             const root = splitPathSegments(path)[0] || path
             const rootLower = String(root || '').trim().toLowerCase()
             return dataOpsOutputColumnSet.has(path.toLowerCase())
               || (dataOpsOutputColumnSet.has(rootLower) && dataOpsJsonColumnSet.has(rootLower) && path.includes('.'))
-          })
+          }), Array.from(sourceFields))
           : discoveredRaw
         discovered.forEach((name) => {
           fieldSet.add(name)
@@ -31031,6 +31555,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       activeQueryBuilderId: '',
       mapperConfigs: [],
       activeMapperConfigId: '',
+      taskMasters: [],
+      activeTaskMasterId: '',
       routerConfigs: [],
       activeRouterConfigId: '',
       limitRows: undefined,
@@ -31182,15 +31708,35 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       issue: '',
     }
   }, [dataOpsPipelineSteps])
-  const runDataOpsMapperSync = useCallback(async (step: DataOpsPipelineStep) => {
+  const runDataOpsMapperSync = useCallback(async (step: DataOpsPipelineStep, options: { forceRetry?: boolean } = {}) => {
     const { sql, issue } = buildDataOpsMapperSyncSql(step)
     if (issue) {
       notification.warning({ message: 'Mapper configuration issue', description: issue, placement: 'bottomRight' })
       return
     }
+    const activeMapperConfig = (step.mapperConfigs || []).find((item) => item.id === step.activeMapperConfigId)
+    const activeTask = (step.taskMasters || []).find((item) => item.id === (activeMapperConfig?.taskMasterId || step.activeTaskMasterId))
+      || (step.taskMasters || [])[0]
+    const taskBindParams = dataOpsTaskMasterBindParams(activeTask)
     setDataOpsSqlExecuting(true)
     try {
-      const response = await api.executeDataOpsOracleSql(nodeConfig, sql, true)
+      const response = await api.executeDataOpsOracleSql({
+        ...nodeConfig,
+        _data_ops_manual_activity: true,
+        _data_ops_manual_window: true,
+        _data_ops_force_retry: Boolean(options.forceRetry),
+        _data_ops_manual_job_id: `data_ops_manual:${selectedNodeId || 'node'}:${step.id}:${String(step.activeMapperConfigId || 'active')}:${Date.now()}`,
+        _data_ops_manual_pipeline_id: activePipelineId,
+        _data_ops_manual_data_ops_node_id: selectedNodeId || '',
+        _data_ops_manual_step_id: step.id,
+        _data_ops_manual_config_id: String(step.activeMapperConfigId || ''),
+        _data_ops_task_master_id: activeTask?.id || '',
+        _data_ops_task_master_name: activeTask?.name || '',
+        _data_ops_task_window_mode: activeTask?.windowMode || '',
+        _data_ops_task_window_indicator: activeTask?.windowIndicator || '',
+        _data_ops_task_duplicate_policy: activeTask?.duplicatePolicy || 'skip_completed',
+        _data_ops_task_bind_params: taskBindParams,
+      }, sql, true)
       const rowCount = Number(response?.rowcount ?? response?.rows_affected ?? 0)
       patchDataOpsPipelineStep(step.id, { expression: sql })
       if (selectedNodeId) {
@@ -31222,7 +31768,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     } finally {
       setDataOpsSqlExecuting(false)
     }
-  }, [buildDataOpsMapperSyncSql, nodeConfig, patchDataOpsPipelineStep, selectedNodeId, updateNodeConfig])
+  }, [activePipelineId, buildDataOpsMapperSyncSql, nodeConfig, patchDataOpsPipelineStep, selectedNodeId, updateNodeConfig])
   const deployDataOpsMapperScheduler = useCallback(async (step: DataOpsPipelineStep, schedulePatch: Record<string, unknown> = {}) => {
     if (!selectedNodeId) return
     const nextStep = { ...step, ...schedulePatch } as DataOpsPipelineStep
@@ -31231,6 +31777,22 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       data_ops_active_mapper_config_id: nextStep.activeMapperConfigId || '',
       data_ops_mapper_step_id: nextStep.id,
     }
+    const activeMapperConfig = (nextStep.mapperConfigs || []).find((item) => item.id === nextStep.activeMapperConfigId)
+    const activeTask = (nextStep.taskMasters || []).find((item) => item.id === (activeMapperConfig?.taskMasterId || nextStep.activeTaskMasterId))
+      || (nextStep.taskMasters || [])[0]
+    const taskBindParams = dataOpsTaskMasterBindParams(activeTask)
+    const taskRunTime = String(activeTask?.runAtTime || '').match(/^\d{2}:\d{2}$/) ? String(activeTask?.runAtTime) : ''
+    const taskRunHour = taskRunTime ? Number(taskRunTime.slice(0, 2)) : 0
+    const taskRunMinute = taskRunTime ? Number(taskRunTime.slice(3, 5)) : 0
+    const taskExecutionMode = String(activeTask?.executionMode || 'subtask_driven')
+    const useTaskDrivenSchedule = ['task_driven', 'hybrid'].includes(taskExecutionMode)
+    const taskDrivenScheduleType = useTaskDrivenSchedule && taskRunTime && ['daily', 'monthly'].includes(String(activeTask?.windowMode || 'daily')) ? 'cron' : String(nextStep.scheduleType || 'interval')
+    const taskMonthlyRunDay = Math.min(31, Math.max(1, Number(activeTask?.monthlyRunDay || 1)))
+    const taskDrivenCron = taskRunTime
+      ? String(activeTask?.windowMode || 'daily') === 'monthly'
+        ? `${taskRunMinute} ${taskRunHour} ${taskMonthlyRunDay} * *`
+        : `${taskRunMinute} ${taskRunHour} * * *`
+      : String(nextStep.scheduleCron || '0 * * * *')
     const { sql, issue } = buildDataOpsMapperSyncSql(nextStep)
     const deployEnabled = Boolean(nextStep.deployEnabled)
     const scheduleEnabled = Boolean(nextStep.scheduleEnabled)
@@ -31240,18 +31802,33 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     }
     try {
       const response = await api.scheduleDataOpsOracleSync({
-        config: nextConfig,
+        config: {
+          ...nextConfig,
+          _data_ops_task_master_id: activeTask?.id || '',
+          _data_ops_task_master_name: activeTask?.name || '',
+          _data_ops_task_bind_params: taskBindParams,
+        },
         sql,
         job_id: `${selectedNodeId}:${step.id}:${String(nextStep.activeMapperConfigId || 'active')}`,
         pipeline_id: activePipelineId,
         data_ops_node_id: selectedNodeId,
         mapper_step_id: step.id,
         mapper_config_id: String(nextStep.activeMapperConfigId || ''),
+        task_master_id: activeTask?.id || '',
+        task_master_name: activeTask?.name || '',
+        task_window_mode: activeTask?.windowMode || '',
+        task_window_indicator: activeTask?.windowIndicator || '',
+        task_monthly_run_day: activeTask?.monthlyRunDay || 1,
+        task_lookback_count: activeTask?.lookbackCount || 1,
+        task_lookback_unit: activeTask?.lookbackUnit || 'day',
+        task_duplicate_policy: activeTask?.duplicatePolicy || 'skip_completed',
+        task_start_at: activeTask?.startAt || '',
+        task_end_at: activeTask?.endAt || '',
         enabled: scheduleEnabled,
         deploy_enabled: deployEnabled,
-        schedule_type: String(nextStep.scheduleType || 'interval'),
+        schedule_type: taskDrivenScheduleType,
         interval_minutes: Number(nextStep.scheduleIntervalMinutes || 60),
-        cron: String(nextStep.scheduleCron || '0 * * * *'),
+        cron: taskDrivenCron,
         timezone: String(nextStep.scheduleTimezone || 'Asia/Kolkata'),
         max_instances: Number(nextStep.scheduleMaxParallelRuns || 1),
         misfire_policy: String(nextStep.scheduleMisfirePolicy || 'skip'),
@@ -31964,11 +32541,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 	    () => [
 	      dataOpsPipelineSteps.map((step) => `${step.id}:${step.kind}:${step.name}:${step.enabled}:${Math.round(step.position.x)}:${Math.round(step.position.y)}`).join('|'),
 	      dataOpsPipelineEdges.map((edge) => `${edge.id}:${edge.source}:${edge.target}`).join('|'),
-	      `selected-node:${dataOpsSelectedPipelineStepId || ''}`,
-	      `selected-edge:${dataOpsSelectedPipelineEdgeId || ''}`,
 	    ].join('::'),
-	    [dataOpsPipelineEdges, dataOpsPipelineSteps, dataOpsSelectedPipelineEdgeId, dataOpsSelectedPipelineStepId],
+	    [dataOpsPipelineEdges, dataOpsPipelineSteps],
 	  )
+  useEffect(() => {
+    if (!dataOpsFlowInstance || dataOpsNodeDragging) return
+    dataOpsFlowInstance.setNodes(dataOpsFlowNodes)
+    dataOpsFlowInstance.setEdges(dataOpsFlowEdges)
+  }, [dataOpsFlowEdges, dataOpsFlowInstance, dataOpsFlowNodes, dataOpsNodeDragging])
   const focusDataOpsPipelineView = useCallback((duration = 240) => {
     const instance = dataOpsFlowInstance
     if (!instance || dataOpsFlowNodes.length <= 0) return
@@ -34277,9 +34857,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       }}
       title={selectedDataOpsPipelineStep?.kind === 'prepare' ? 'Build Query' : selectedDataOpsPipelineStep ? `Configure ${selectedDataOpsPipelineStep.name}` : 'Configure Pipeline Step'}
       wrapClassName={selectedDataOpsPipelineStep?.kind === 'prepare' ? 'data-ops-config-modal data-ops-query-modal' : selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'map' || selectedDataOpsPipelineStep?.kind === 'router' ? 'data-ops-config-modal data-ops-mapper-modal' : 'data-ops-config-modal'}
-      width={selectedDataOpsPipelineStep?.kind === 'prepare' ? '100vw' : selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'map' || selectedDataOpsPipelineStep?.kind === 'router' ? '96vw' : 820}
-      centered={selectedDataOpsPipelineStep?.kind !== 'prepare'}
-      style={selectedDataOpsPipelineStep?.kind === 'prepare' ? { top: 0, maxWidth: '100vw', paddingBottom: 0 } : undefined}
+      width={selectedDataOpsPipelineStep?.kind === 'prepare' || selectedDataOpsPipelineStep?.kind === 'map' ? '100vw' : selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'router' ? '96vw' : 820}
+      centered={selectedDataOpsPipelineStep?.kind !== 'prepare' && selectedDataOpsPipelineStep?.kind !== 'map'}
+      style={selectedDataOpsPipelineStep?.kind === 'prepare' || selectedDataOpsPipelineStep?.kind === 'map' ? { top: 0, maxWidth: '100vw', paddingBottom: 0 } : undefined}
       footer={[
         ...(selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'prepare' || selectedDataOpsPipelineStep?.kind === 'map' || selectedDataOpsPipelineStep?.kind === 'router' ? [] : [
           <Button key="delete" danger disabled={!selectedDataOpsPipelineStep} onClick={() => selectedDataOpsPipelineStep && deleteDataOpsPipelineStep(selectedDataOpsPipelineStep.id)}>
@@ -34300,15 +34880,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         content: {
           background: 'var(--app-panel-bg)',
           border: '1px solid var(--app-border-strong)',
-          ...(selectedDataOpsPipelineStep?.kind === 'prepare' ? { height: '100vh', borderRadius: 0, display: 'flex', flexDirection: 'column' } : {}),
-          ...(selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'map' || selectedDataOpsPipelineStep?.kind === 'router' ? { height: '92vh', display: 'flex', flexDirection: 'column' } : {}),
+          ...(selectedDataOpsPipelineStep?.kind === 'prepare' || selectedDataOpsPipelineStep?.kind === 'map' ? { height: '100vh', borderRadius: 0, display: 'flex', flexDirection: 'column' } : {}),
+          ...(selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'router' ? { height: '92vh', display: 'flex', flexDirection: 'column' } : {}),
         },
         header: { background: 'var(--app-panel-bg)' },
         body: {
           background: 'var(--app-panel-bg)',
           overflowX: 'hidden',
-          ...(selectedDataOpsPipelineStep?.kind === 'prepare' ? { flex: 1, overflowY: 'auto', minHeight: 0 } : {}),
-          ...(selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'map' || selectedDataOpsPipelineStep?.kind === 'router' ? { flex: 1, overflowY: 'auto', minHeight: 0 } : {}),
+          ...(selectedDataOpsPipelineStep?.kind === 'prepare' || selectedDataOpsPipelineStep?.kind === 'map' ? { flex: 1, overflowY: 'auto', minHeight: 0 } : {}),
+          ...(selectedDataOpsPipelineStep?.kind === 'source' || selectedDataOpsPipelineStep?.kind === 'router' ? { flex: 1, overflowY: 'auto', minHeight: 0 } : {}),
         },
       }}
     >
@@ -34567,6 +35147,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             const sqlLiteral = (value: string) => {
               const raw = String(value ?? '').trim()
               if (!raw) return "''"
+              if (/^:[A-Za-z_][\w$#]*$/.test(raw)) return raw
               if (/^-?\d+(\.\d+)?$/.test(raw)) return raw
               if (/^'.*'$/.test(raw)) return raw
               return `'${raw.replace(/'/g, "''")}'`
@@ -34688,11 +35269,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             })()
             const whereSql = (step.filterRules || [])
               .filter((item) => item.enabled !== false && String(item.field || '').trim())
-              .map((item) => `${sqlIdent(String(item.field || ''))} ${sqlOperator(String(item.operator || 'equals'), String(item.value || ''))}`)
+              .map((item) => `${sqlIdent(String(item.field || ''))} ${sqlOperator(String(item.operator || 'equals'), dataOpsRuleValueSql(item))}`)
             const groupSql = selectedGroupRows.map((item) => sqlIdent(String(item.field || '')))
             const havingSql = (step.havingRules || [])
               .filter((item) => item.enabled !== false && String(item.field || '').trim())
-              .map((item) => `${sqlIdent(String(item.field || ''))} ${sqlOperator(String(item.operator || 'greater_than'), String(item.value || ''))}`)
+              .map((item) => `${sqlIdent(String(item.field || ''))} ${sqlOperator(String(item.operator || 'greater_than'), dataOpsRuleValueSql(item))}`)
             const orderSql = selectedOrderRows.map((item) => `${sqlIdent(String(item.field || ''))} ${String(item.direction || 'asc').toUpperCase()}`)
             const builtQuerySql = [
               `SELECT\n  ${selectSql}`,
@@ -34739,6 +35320,26 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             }
             const queryBuilderRows = step.queryBuilders || []
             const activeQueryBuilder = queryBuilderRows.find((item) => item.id === step.activeQueryBuilderId)
+            const bindParameters = step.bindParameters || []
+            const bindParameterOptions = bindParameters
+              .filter((item) => item.enabled !== false && String(item.name || '').trim())
+              .map((item) => ({ value: String(item.name || '').trim(), label: `:${String(item.name || '').trim()}${item.defaultValue ? ` = ${item.defaultValue}` : ''}` }))
+            const patchBindParameter = (bindId: string, patch: Partial<DataOpsBindParam>) => {
+              patchDataOpsPipelineStep(step.id, {
+                bindParameters: bindParameters.map((item) => item.id === bindId ? { ...item, ...patch } : item),
+              })
+            }
+            const patchRuleBindMode = (listName: 'filterRules' | 'havingRules', rowId: string, valueMode: DataOpsRuleRow['valueMode']) => {
+              const rows = listName === 'filterRules' ? step.filterRules || [] : step.havingRules || []
+              patchDataOpsPipelineStep(step.id, {
+                [listName]: rows.map((item) => item.id === rowId ? {
+                  ...item,
+                  valueMode,
+                  bindParam: valueMode === 'bind' ? String(item.bindParam || bindParameters[0]?.name || '').replace(/^:/, '').trim() : '',
+                  value: valueMode === 'bind' ? String(item.value || '') : String(item.value || '').replace(/^:/, ''),
+                } : item),
+              } as Partial<DataOpsPipelineStep>)
+            }
             const snapshotQueryBuilder = (base?: Partial<DataOpsQueryBuilderConfig>): DataOpsQueryBuilderConfig => ({
               id: String(base?.id || dataOpsId('query')),
               name: String(base?.name || activeQueryBuilder?.name || `Query ${queryBuilderRows.length + 1}`),
@@ -34752,6 +35353,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               groupByFields: step.groupByFields || [],
               havingRules: step.havingRules || [],
               orderByRows: step.orderByRows || [],
+              bindParameters: step.bindParameters || [],
               limitRows: step.limitRows,
               updatedAt: new Date().toISOString(),
             })
@@ -34785,6 +35387,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 groupByFields: config.groupByFields || [],
                 havingRules: config.havingRules || [],
                 orderByRows: config.orderByRows || [],
+                bindParameters: config.bindParameters || [],
                 limitRows: config.limitRows,
                 expression: config.expression || config.query || '',
                 query: config.query || config.expression || '',
@@ -34806,6 +35409,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 groupByFields: [],
                 havingRules: [],
                 orderByRows: [],
+                bindParameters: [],
                 limitRows: undefined,
                 updatedAt: new Date().toISOString(),
               }
@@ -34819,6 +35423,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 groupByFields: [],
                 havingRules: [],
                 orderByRows: [],
+                bindParameters: [],
                 limitRows: undefined,
                 expression: '',
                 query: '',
@@ -34941,6 +35546,23 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 </div>
                 <div className="data-ops-query-builder-layout">
                   <div className="data-ops-query-builder-main">
+                {compactPanel(
+                  'Bind Parameters',
+                  <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { bindParameters: [...bindParameters, { id: dataOpsId('bind'), name: `param_${bindParameters.length + 1}`, dataType: 'string', defaultValue: '', required: false, enabled: true }] })}>Add Bind</Button>,
+                  <div style={{ display: 'grid', gap: 8 }}>
+                    {bindParameters.length <= 0 ? <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Add bind parameters for WHERE/HAVING values. Mapper and Router can pass values, otherwise defaults are used.</Text> : null}
+                    {bindParameters.map((row) => (
+                      <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px minmax(130px, 1fr) 110px minmax(120px, 1fr) 86px 34px', gap: 8, alignItems: 'center' }}>
+                        <Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchBindParameter(row.id, { enabled: checked })} />
+                        <Input size="small" value={row.name || ''} onChange={(event) => patchBindParameter(row.id, { name: event.target.value.replace(/^:/, '').trim() })} placeholder="customer_account" style={dataOpsInputStyle(dataOpsSectionColors.where)} prefix=":" />
+                        <Select size="small" value={row.dataType || 'string'} onChange={(value) => patchBindParameter(row.id, { dataType: value as DataOpsBindParam['dataType'] })} options={[{ value: 'string', label: 'String' }, { value: 'number', label: 'Number' }, { value: 'date', label: 'Date' }, { value: 'boolean', label: 'Boolean' }]} style={dataOpsControlStyle(dataOpsSectionColors.where)} />
+                        <Input size="small" value={row.defaultValue || ''} onChange={(event) => patchBindParameter(row.id, { defaultValue: event.target.value })} placeholder="default value" style={dataOpsInputStyle(dataOpsSectionColors.where)} />
+                        <Switch size="small" checked={Boolean(row.required)} checkedChildren="req" unCheckedChildren="opt" onChange={(checked) => patchBindParameter(row.id, { required: checked })} />
+                        <Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { bindParameters: bindParameters.filter((item) => item.id !== row.id) })} />
+                      </div>
+                    ))}
+                  </div>
+                )}
                 {compactPanel(
                   '1. Pick Source Tables',
                   <Button size="small" icon={<PlusSquareOutlined />} disabled={connectionOptions.length <= 0} onClick={addTableFromPicker}>Add Source</Button>,
@@ -35113,11 +35735,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { filterRules: [...(step.filterRules || []), { id: dataOpsId('where'), field: '', operator: 'equals', value: '', enabled: true }] })}>Add Filter</Button>,
                     <div style={{ display: 'grid', gap: 8 }}>
                       {(step.filterRules || []).map((row) => (
-                        <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px 1.2fr 126px 1fr 34px', gap: 8, alignItems: 'center' }}>
+                        <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px 1.2fr 126px 86px 1fr 34px', gap: 8, alignItems: 'center' }}>
                           <Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchDataOpsPipelineStep(step.id, { filterRules: (step.filterRules || []).map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} />
 	                          {pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { filterRules: (step.filterRules || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'filter field', dataOpsSectionColors.where)}
 	                          <Select size="small" value={row.operator || 'equals'} onChange={(value) => patchDataOpsPipelineStep(step.id, { filterRules: (step.filterRules || []).map((item) => item.id === row.id ? { ...item, operator: value } : item) })} options={operatorOptions} style={dataOpsControlStyle(dataOpsSectionColors.where)} />
-	                          <Input size="small" value={row.value || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { filterRules: (step.filterRules || []).map((item) => item.id === row.id ? { ...item, value: event.target.value } : item) })} placeholder="value" style={dataOpsInputStyle(dataOpsSectionColors.where)} />
+                            <Select size="small" value={row.valueMode || 'fixed'} onChange={(value) => patchRuleBindMode('filterRules', row.id, value as DataOpsRuleRow['valueMode'])} options={[{ value: 'fixed', label: 'Fixed' }, { value: 'bind', label: 'Bind' }]} style={dataOpsControlStyle(dataOpsSectionColors.where)} />
+	                          {row.valueMode === 'bind' ? (
+                              <Select size="small" showSearch allowClear optionFilterProp="label" value={row.bindParam || undefined} onChange={(value) => patchDataOpsPipelineStep(step.id, { filterRules: (step.filterRules || []).map((item) => item.id === row.id ? { ...item, valueMode: 'bind', bindParam: String(value || ''), value: value ? `:${value}` : '' } : item) })} placeholder="bind parameter" options={bindParameterOptions} style={dataOpsControlStyle(dataOpsSectionColors.where)} />
+                            ) : (
+	                            <Input size="small" value={row.value || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { filterRules: (step.filterRules || []).map((item) => item.id === row.id ? { ...item, value: event.target.value, valueMode: 'fixed', bindParam: '' } : item) })} placeholder="value" style={dataOpsInputStyle(dataOpsSectionColors.where)} />
+                            )}
                           <Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { filterRules: (step.filterRules || []).filter((item) => item.id !== row.id) })} />
                         </div>
                       ))}
@@ -35126,7 +35753,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 10, alignItems: 'start' }}>
 	                  {compactPanel('5. Group By', <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { groupByFields: [...(step.groupByFields || []), { id: dataOpsId('group'), field: '', enabled: true }] })}>Add</Button>, <div style={{ display: 'grid', gap: 8 }}>{(step.groupByFields || []).map((row) => <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px 1fr 34px', gap: 8, alignItems: 'center' }}><Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchDataOpsPipelineStep(step.id, { groupByFields: (step.groupByFields || []).map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} />{pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { groupByFields: (step.groupByFields || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'group field', dataOpsSectionColors.group)}<Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { groupByFields: (step.groupByFields || []).filter((item) => item.id !== row.id) })} /></div>)}</div>)}
-	                  {compactPanel('Having', <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { havingRules: [...(step.havingRules || []), { id: dataOpsId('having'), field: '', operator: 'greater_than', value: '', enabled: true }] })}>Add</Button>, <div style={{ display: 'grid', gap: 8 }}>{(step.havingRules || []).map((row) => <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px 1fr 112px 86px 34px', gap: 8, alignItems: 'center' }}><Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} />{pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'metric', dataOpsSectionColors.having)}<Select size="small" value={row.operator || 'greater_than'} onChange={(value) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, operator: value } : item) })} options={compareOperatorOptions} style={dataOpsControlStyle(dataOpsSectionColors.having)} /><Input size="small" value={row.value || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, value: event.target.value } : item) })} style={dataOpsInputStyle(dataOpsSectionColors.having)} /><Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).filter((item) => item.id !== row.id) })} /></div>)}</div>)}
+	                  {compactPanel('Having', <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { havingRules: [...(step.havingRules || []), { id: dataOpsId('having'), field: '', operator: 'greater_than', value: '', valueMode: 'fixed', enabled: true }] })}>Add</Button>, <div style={{ display: 'grid', gap: 8 }}>{(step.havingRules || []).map((row) => <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px 1fr 112px 76px 1fr 34px', gap: 8, alignItems: 'center' }}><Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} />{pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'metric', dataOpsSectionColors.having)}<Select size="small" value={row.operator || 'greater_than'} onChange={(value) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, operator: value } : item) })} options={compareOperatorOptions} style={dataOpsControlStyle(dataOpsSectionColors.having)} /><Select size="small" value={row.valueMode || 'fixed'} onChange={(value) => patchRuleBindMode('havingRules', row.id, value as DataOpsRuleRow['valueMode'])} options={[{ value: 'fixed', label: 'Fixed' }, { value: 'bind', label: 'Bind' }]} style={dataOpsControlStyle(dataOpsSectionColors.having)} />{row.valueMode === 'bind' ? <Select size="small" showSearch allowClear optionFilterProp="label" value={row.bindParam || undefined} onChange={(value) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, valueMode: 'bind', bindParam: String(value || ''), value: value ? `:${value}` : '' } : item) })} placeholder="bind parameter" options={bindParameterOptions} style={dataOpsControlStyle(dataOpsSectionColors.having)} /> : <Input size="small" value={row.value || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, value: event.target.value, valueMode: 'fixed', bindParam: '' } : item) })} style={dataOpsInputStyle(dataOpsSectionColors.having)} />}<Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).filter((item) => item.id !== row.id) })} /></div>)}</div>)}
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 10, alignItems: 'start' }}>
 	                  {compactPanel('Order / Limit', <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { orderByRows: [...(step.orderByRows || []), { id: dataOpsId('order'), field: '', direction: 'asc', enabled: true }] })}>Add</Button>, <div style={{ display: 'grid', gap: 8 }}>{(step.orderByRows || []).map((row) => <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '1fr 74px 34px', gap: 8, alignItems: 'center' }}>{pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { orderByRows: (step.orderByRows || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'sort field', dataOpsSectionColors.order)}<Select size="small" value={row.direction || 'asc'} onChange={(value) => patchDataOpsPipelineStep(step.id, { orderByRows: (step.orderByRows || []).map((item) => item.id === row.id ? { ...item, direction: value as DataOpsOrderRow['direction'] } : item) })} options={[{ value: 'asc', label: 'Asc' }, { value: 'desc', label: 'Desc' }]} style={dataOpsControlStyle(dataOpsSectionColors.order)} /><Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { orderByRows: (step.orderByRows || []).filter((item) => item.id !== row.id) })} /></div>)}<Input size="small" type="number" min={0} value={step.limitRows} onChange={(event) => patchDataOpsPipelineStep(step.id, { limitRows: event.target.value ? Number(event.target.value) : undefined })} placeholder="limit rows" style={dataOpsInputStyle(dataOpsSectionColors.order)} /></div>)}
@@ -35340,6 +35967,25 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   return { value: node.id, label: `${label} (${type})` }
                 })
               const patchRouter = (patch: Partial<DataOpsPipelineStep>) => patchDataOpsPipelineStep(selectedDataOpsPipelineStep.id, patch)
+              const routerBindParameters = dataOpsBindParametersFromRouteSource(dataOpsPipelineSteps, selectedDataOpsPipelineStep.routeSource).filter((item) => item.enabled !== false)
+              const routerQueryInputs = selectedDataOpsPipelineStep.queryInputs || []
+              const routerQueryInputRows = routerBindParameters.map((param) => routerQueryInputs.find((item) => item.param === param.name) || {
+                id: dataOpsId('query_input'),
+                param: param.name,
+                sourceMode: 'default' as const,
+                value: '',
+                sourceField: '',
+                enabled: true,
+              })
+              const patchRouterQueryInput = (paramName: string, patch: Partial<DataOpsQueryInputRow>) => {
+                const existing = routerQueryInputs.find((item) => item.param === paramName)
+                const nextRow: DataOpsQueryInputRow = { id: existing?.id || dataOpsId('query_input'), param: paramName, sourceMode: 'default', sourceField: '', value: '', enabled: true, ...existing, ...patch }
+                patchRouter({
+                  queryInputs: existing
+                    ? routerQueryInputs.map((item) => item.param === paramName ? nextRow : item)
+                    : [...routerQueryInputs, nextRow],
+                })
+              }
               const routerConfigRows = Array.isArray(selectedDataOpsPipelineStep.routerConfigs) ? selectedDataOpsPipelineStep.routerConfigs : []
               const activeRouterConfig = routerConfigRows.find((item) => item.id === selectedDataOpsPipelineStep.activeRouterConfigId)
               const routerScheduleStep: DataOpsPipelineStep = {
@@ -35464,6 +36110,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 name: String(base?.name || activeRouterConfig?.name || `Router ${routerConfigRows.length + 1}`),
                 description: String(base?.description || ''),
                 routeSource: sourceStep.routeSource || '',
+                queryInputs: sourceStep.queryInputs || [],
                 routeMode: sourceStep.routeMode || 'multi',
                 payloadMode: sourceStep.payloadMode || 'all_rows',
                 routeRows: sourceStep.routeRows || [],
@@ -35519,6 +36166,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 patchRouter({
                   activeRouterConfigId: config.id,
                   routeSource: config.routeSource || '',
+                  queryInputs: config.queryInputs || [],
                   routeMode: config.routeMode || 'multi',
                   payloadMode: config.payloadMode || 'all_rows',
                   routeRows: config.routeRows || [],
@@ -35552,6 +36200,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   name: `Router ${routerConfigRows.length + 1}`,
                   description: '',
                   routeSource: routerQuerySourceOptions[0]?.value || '',
+                  queryInputs: [],
                   routeMode: 'multi',
                   payloadMode: 'all_rows',
                   routeRows: defaultRouteRows,
@@ -35843,6 +36492,30 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                               <Select size="small" value={selectedDataOpsPipelineStep.payloadMode || 'all_rows'} onChange={(value) => patchRouter({ payloadMode: value as DataOpsPipelineStep['payloadMode'] })} options={[{ value: 'all_rows', label: 'All rows' }, { value: 'batch', label: 'Batch' }, { value: 'row_by_row', label: 'Row by row' }, { value: 'first_row', label: 'First row' }, { value: 'grouped', label: 'Grouped' }]} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%', marginTop: 5 })} />
                             </div>
                         </div>
+                        {routerBindParameters.length > 0 ? (
+                          <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 8 }}>
+                            <Space style={{ justifyContent: 'space-between' }}>
+                              <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 12 }}>Query Inputs</Text>
+                              <Tag color="blue" style={{ marginInlineEnd: 0 }}>{routerBindParameters.length} bind</Tag>
+                            </Space>
+                            {routerQueryInputRows.map((row) => {
+                              const param = routerBindParameters.find((item) => item.name === row.param)
+                              return (
+                                <div key={row.param} style={{ display: 'grid', gridTemplateColumns: '42px 150px 110px minmax(180px, 1fr) 180px', gap: 8, alignItems: 'center' }}>
+                                  <Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchRouterQueryInput(String(row.param || ''), { enabled: checked })} />
+                                  <Text style={{ color: dataOpsSectionColors.where, fontWeight: 700 }}>:{row.param}</Text>
+                                  <Select size="small" value={row.sourceMode || 'default'} onChange={(value) => patchRouterQueryInput(String(row.param || ''), { sourceMode: value as DataOpsQueryInputRow['sourceMode'] })} options={[{ value: 'default', label: 'Default' }, { value: 'fixed', label: 'Fixed' }, { value: 'field', label: 'Field' }]} style={dataOpsControlStyle(dataOpsSectionColors.where)} />
+                                  {row.sourceMode === 'field' ? (
+                                    <Select size="small" showSearch allowClear optionFilterProp="label" value={row.sourceField || undefined} onChange={(value) => patchRouterQueryInput(String(row.param || ''), { sourceField: String(value || '') })} placeholder="router input field" options={routerFieldOptions} style={dataOpsControlStyle(dataOpsSectionColors.where)} />
+                                  ) : (
+                                    <Input size="small" disabled={row.sourceMode === 'default'} value={row.sourceMode === 'default' ? String(param?.defaultValue || '') : String(row.value || '')} onChange={(event) => patchRouterQueryInput(String(row.param || ''), { value: event.target.value })} placeholder="value/default" style={dataOpsInputStyle(dataOpsSectionColors.where)} />
+                                  )}
+                                  <Text ellipsis style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>default: {param?.defaultValue || '-'}</Text>
+                                </div>
+                              )
+                            })}
+                          </div>
+                        ) : null}
                         <div className="data-ops-router-layout">
                           <div className="data-ops-router-main">
                           <Space style={{ width: '100%', justifyContent: 'space-between' }}>
@@ -36150,6 +36823,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               ])
               const mapperSourceOptions = mapperSourceFields.map((value) => ({ value, label: value }))
               const mapperTargetOptions = mapperTargetColumns.map((value) => ({ value, label: value }))
+              const mapperKeyFieldOptions = uniqueFieldNames([
+                ...mapperTargetColumns,
+                ...(selectedDataOpsPipelineStep.mappingRows || []).map((item) => String(item.target || '').trim()).filter(Boolean),
+                ...String(selectedDataOpsPipelineStep.keyFields || '').split(',').map((item) => item.trim()).filter(Boolean),
+              ]).map((value) => ({ value, label: value }))
               const mapperDestinationObjectNames = uniqueFieldNames([
                 ...dataOpsCatalogObjects
                   .filter((item: any) => ['TABLE', 'VIEW', 'MATERIALIZED VIEW', 'SYNONYM'].includes(String(item.type || 'TABLE').toUpperCase()))
@@ -36168,6 +36846,25 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               ].filter(Boolean))
               const mapperObjectOptions = mapperDestinationObjectNames.map((value) => ({ value, label: value }))
               const patchMapper = (patch: Partial<DataOpsPipelineStep>) => patchDataOpsPipelineStep(selectedDataOpsPipelineStep.id, patch)
+              const mapperBindParameters = dataOpsBindParametersFromRouteSource(dataOpsPipelineSteps, selectedDataOpsPipelineStep.lookupSource).filter((item) => item.enabled !== false)
+              const mapperQueryInputs = selectedDataOpsPipelineStep.queryInputs || []
+              const mapperQueryInputRows = mapperBindParameters.map((param) => mapperQueryInputs.find((item) => item.param === param.name) || {
+                id: dataOpsId('query_input'),
+                param: param.name,
+                sourceMode: 'default' as const,
+                value: '',
+                sourceField: '',
+                enabled: true,
+              })
+              const patchMapperQueryInput = (paramName: string, patch: Partial<DataOpsQueryInputRow>) => {
+                const existing = mapperQueryInputs.find((item) => item.param === paramName)
+                const nextRow: DataOpsQueryInputRow = { id: existing?.id || dataOpsId('query_input'), param: paramName, sourceMode: 'default', sourceField: '', value: '', enabled: true, ...existing, ...patch }
+                patchMapper({
+                  queryInputs: existing
+                    ? mapperQueryInputs.map((item) => item.param === paramName ? nextRow : item)
+                    : [...mapperQueryInputs, nextRow],
+                })
+              }
               const searchMapperTarget = (value: string) => {
                 const search = String(value || '').trim()
                 patchMapper({ target: search })
@@ -36184,6 +36881,344 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               }
               const mapperConfigRows = Array.isArray(selectedDataOpsPipelineStep.mapperConfigs) ? selectedDataOpsPipelineStep.mapperConfigs : []
               const activeMapperConfig = mapperConfigRows.find((item) => item.id === selectedDataOpsPipelineStep.activeMapperConfigId)
+              const taskMasters = Array.isArray(selectedDataOpsPipelineStep.taskMasters) ? selectedDataOpsPipelineStep.taskMasters : []
+              const legacyTaskMasterId = 'default_task_master'
+              const hasLegacyMapperConfigs = taskMasters.length <= 0 && mapperConfigRows.length > 0
+              const legacyTaskMaster: DataOpsTaskMaster = {
+                id: legacyTaskMasterId,
+                name: 'Default Task Master',
+                description: 'Auto-created view for existing mapper configurations',
+                enabled: true,
+                windowMode: 'daily',
+                windowIndicator: 'transaction_day',
+                monthlyRunDay: 1,
+                lookbackCount: 1,
+                lookbackUnit: 'day',
+                executionMode: 'subtask_driven',
+                duplicatePolicy: 'skip_completed',
+                frequency: 'daily',
+                intervalMinutes: 60,
+                runAtTime: '00:00',
+                cron: '0 0 * * *',
+                timezone: 'Asia/Kolkata',
+                retryPolicy: 'mismatch',
+                status: 'active',
+                runOrder: 1,
+                updatedAt: '',
+              }
+              const displayTaskMasters = hasLegacyMapperConfigs ? [legacyTaskMaster] : taskMasters
+              const orderedTaskMasters = [...displayTaskMasters].sort((left, right) => Number(left.runOrder || 9999) - Number(right.runOrder || 9999))
+              const activeTaskMaster = orderedTaskMasters.find((item) => item.id === selectedDataOpsPipelineStep.activeTaskMasterId) || orderedTaskMasters[0]
+              const taskMasterOptions = orderedTaskMasters.map((item) => ({ value: item.id, label: `${item.name || item.id} · ${dataOpsTaskMasterWindowLabel(item)}` }))
+              const taskBindParams = dataOpsTaskMasterBindParams(activeTaskMaster)
+              const subTaskCountForTask = (taskId: string) => taskId === legacyTaskMasterId
+                ? mapperConfigRows.filter((item) => !item.taskMasterId || item.taskMasterId === legacyTaskMasterId).length
+                : mapperConfigRows.filter((item) => item.taskMasterId === taskId).length
+              const patchTaskMaster = (taskId: string, patch: Partial<DataOpsTaskMaster>) => patchMapper({
+                taskMasters: taskId === legacyTaskMasterId && hasLegacyMapperConfigs
+                  ? [{ ...legacyTaskMaster, ...patch, updatedAt: new Date().toISOString() }]
+                  : taskMasters.map((item) => item.id === taskId ? { ...item, ...patch, updatedAt: new Date().toISOString() } : item),
+                mapperConfigs: taskId === legacyTaskMasterId && hasLegacyMapperConfigs
+                  ? mapperConfigRows.map((item) => !item.taskMasterId ? { ...item, taskMasterId: legacyTaskMasterId } : item)
+                  : mapperConfigRows,
+              })
+              const moveTaskMasterOrder = (taskId: string, direction: -1 | 1) => {
+                const currentIndex = orderedTaskMasters.findIndex((item) => item.id === taskId)
+                const targetIndex = currentIndex + direction
+                if (currentIndex < 0 || targetIndex < 0 || targetIndex >= orderedTaskMasters.length) return
+                const reordered = [...orderedTaskMasters]
+                const [moved] = reordered.splice(currentIndex, 1)
+                reordered.splice(targetIndex, 0, moved)
+                const nextTaskMasters = reordered.map((item, index) => ({ ...item, runOrder: index + 1, updatedAt: new Date().toISOString() }))
+                patchMapper({
+                  taskMasters: nextTaskMasters,
+                  mapperConfigs: hasLegacyMapperConfigs
+                    ? mapperConfigRows.map((item) => !item.taskMasterId ? { ...item, taskMasterId: legacyTaskMasterId } : item)
+                    : mapperConfigRows,
+                })
+              }
+              const addTaskMaster = () => {
+                const today = new Date().toISOString().slice(0, 10)
+                const nextId = dataOpsId('task_master')
+                const nextTask: DataOpsTaskMaster = {
+                  id: nextId,
+                  name: `Task Master ${taskMasters.length + 1}`,
+                  description: '',
+                  enabled: true,
+                  windowMode: 'daily',
+                  windowIndicator: 'transaction_day',
+                  monthlyRunDay: 1,
+                  lookbackCount: 1,
+                  lookbackUnit: 'day',
+                  executionMode: 'subtask_driven',
+                  duplicatePolicy: 'skip_completed',
+                  startAt: today,
+                  endAt: today,
+                  frequency: 'daily',
+                  intervalMinutes: 60,
+                  runAtTime: '00:00',
+                  cron: '0 0 * * *',
+                  timezone: 'Asia/Kolkata',
+                  retryPolicy: 'mismatch',
+                  status: 'planned',
+                  runOrder: taskMasters.length + 1,
+                  updatedAt: new Date().toISOString(),
+                }
+                patchMapper({
+                  taskMasters: [...taskMasters, nextTask],
+                  activeTaskMasterId: nextId,
+                })
+              }
+              const duplicateTaskMaster = (task: DataOpsTaskMaster) => {
+                const nextId = dataOpsId('task_master')
+                patchMapper({
+                  taskMasters: [...taskMasters, { ...task, id: nextId, name: `${task.name || 'Task Master'} Copy`, runOrder: taskMasters.length + 1, updatedAt: new Date().toISOString() }],
+                  activeTaskMasterId: nextId,
+                })
+              }
+              const deleteTaskMaster = (taskId: string) => {
+                const nextRows = taskMasters.filter((item) => item.id !== taskId)
+                patchMapper({
+                  taskMasters: nextRows,
+                  activeTaskMasterId: selectedDataOpsPipelineStep.activeTaskMasterId === taskId ? String(nextRows[0]?.id || '') : selectedDataOpsPipelineStep.activeTaskMasterId,
+                  mapperConfigs: mapperConfigRows.map((item) => item.taskMasterId === taskId ? { ...item, taskMasterId: '' } : item),
+                })
+              }
+              const taskActivityRows = Array.isArray(dataOpsBackendMonitor?.data_ops_activity)
+                ? dataOpsBackendMonitor.data_ops_activity as Array<Record<string, unknown>>
+                : []
+              const rawTaskLogRows = taskActivityRows
+                .filter((row) => {
+                  const rowTime = Date.parse(String(row.at || row.last_run_started_at || row.last_activity_at || ''))
+                  if (dataOpsMonitorClearedAt > 0 && Number.isFinite(rowTime) && rowTime <= dataOpsMonitorClearedAt) return false
+                  if (String(row.kind || '') !== 'mapper') return false
+                  if (String(row.step_id || '') && String(row.step_id || '') !== selectedDataOpsPipelineStep.id) return false
+                  if (String(row.data_ops_node_id || '') && selectedNodeId && String(row.data_ops_node_id || '') !== selectedNodeId) return false
+                  return true
+                })
+              const taskLogRows = Array.from(rawTaskLogRows.reduce((acc, row) => {
+                const key = String(row.job_id || `${row.config_id || 'config'}:${row.last_run_started_at || row.at || ''}`)
+                const current = acc.get(key)
+                if (!current) {
+                  acc.set(key, { ...row })
+                  return acc
+                }
+                const currentTime = Date.parse(String(current.at || current.last_run_finished_at || current.last_run_started_at || ''))
+                const rowTime = Date.parse(String(row.at || row.last_run_finished_at || row.last_run_started_at || ''))
+                const newer = !Number.isFinite(currentTime) || (Number.isFinite(rowTime) && rowTime >= currentTime) ? row : current
+                const older = newer === row ? current : row
+                acc.set(key, {
+                  ...older,
+                  ...newer,
+                  last_run_started_at: older.last_run_started_at || newer.last_run_started_at || older.at || newer.at,
+                  last_run_finished_at: newer.last_run_finished_at || (String(newer.status || '').toLowerCase() === 'success' ? newer.at : older.last_run_finished_at),
+                  duration_ms: newer.duration_ms || older.duration_ms,
+                  source_rows: newer.source_rows ?? older.source_rows,
+                  rows_processed: newer.rows_processed ?? older.rows_processed,
+                  destination_rows: newer.destination_rows ?? older.destination_rows,
+                  rejected_rows: newer.rejected_rows ?? older.rejected_rows,
+                  mismatch_rows: newer.mismatch_rows ?? older.mismatch_rows,
+                })
+                return acc
+              }, new Map<string, Record<string, unknown>>()).values()).sort((a, b) => (
+                Date.parse(String(b.last_run_started_at || b.at || '')) - Date.parse(String(a.last_run_started_at || a.at || ''))
+              ))
+              const taskLogWindowValue = (row: Record<string, unknown>) => {
+                const binds = row.task_bind_params && typeof row.task_bind_params === 'object' ? row.task_bind_params as Record<string, unknown> : {}
+                if (binds.task_business_date || binds.task_business_month || binds.task_business_start_date) {
+                  const start = String(binds.task_business_start_date || binds.task_business_date || binds.task_business_month || '')
+                  const end = String(binds.task_business_end_date || '')
+                  return end && end !== start ? `${start} to ${end}` : start
+                }
+                const config = mapperConfigRows.find((item) => item.id === String(row.config_id || ''))
+                const task = orderedTaskMasters.find((item) => item.id === String(row.task_master_id || config?.taskMasterId || ''))
+                return task ? dataOpsTaskMasterWindowLabel(task) : String(row.task_window_mode || 'not set')
+              }
+              const taskLogSubTaskName = (row: Record<string, unknown>) => mapperConfigRows.find((item) => item.id === String(row.config_id || ''))?.name || String(row.config_id || '-')
+              const taskLogTaskName = (row: Record<string, unknown>) => {
+                const config = mapperConfigRows.find((item) => item.id === String(row.config_id || ''))
+                return String(row.task_master_name || orderedTaskMasters.find((item) => item.id === String(row.task_master_id || config?.taskMasterId || ''))?.name || (config ? 'Default Task Master' : '-'))
+              }
+              const taskLogWindowOptions = Array.from(new Set(taskLogRows.map(taskLogWindowValue))).filter(Boolean).map((value) => ({ value, label: value }))
+              const taskLogTaskOptions = Array.from(new Set(taskLogRows.map(taskLogTaskName))).filter(Boolean).map((value) => ({ value, label: value }))
+              const taskLogSubTaskOptions = Array.from(new Set(taskLogRows.map(taskLogSubTaskName))).filter(Boolean).map((value) => ({ value, label: value }))
+              const filteredTaskLogRows = taskLogRows.filter((row) => {
+                if (dataOpsMonitorWindowFilter && taskLogWindowValue(row) !== dataOpsMonitorWindowFilter) return false
+                if (dataOpsMonitorTaskFilter && taskLogTaskName(row) !== dataOpsMonitorTaskFilter) return false
+                if (dataOpsMonitorSubTaskFilter && taskLogSubTaskName(row) !== dataOpsMonitorSubTaskFilter) return false
+                return true
+              })
+              const taskRuntimeRowsForTask = (taskId: string) => {
+                const taskIds = taskId === legacyTaskMasterId ? new Set([legacyTaskMasterId, '']) : new Set([taskId])
+                return [
+                  ...dataOpsRuntimeSummary.activityRows,
+                  ...dataOpsRuntimeSummary.schedules,
+                ].filter((row) => {
+                  const rowTaskId = String(row.task_master_id || '')
+                  const isMapper = String(row.kind || '') === 'mapper' || String(row.job_id || '').startsWith('data_ops_oracle_sync:')
+                  const isCurrentStep = !String(row.step_id || '') || String(row.step_id || '') === selectedDataOpsPipelineStep.id
+                  return isMapper && isCurrentStep && taskIds.has(rowTaskId)
+                })
+              }
+              const taskLastRuntimeRow = (taskId: string) => taskRuntimeRowsForTask(taskId)
+                .filter((row) => row.last_run_started_at || row.at || row.last_activity_at)
+                .sort((a, b) => Date.parse(String(b.last_run_started_at || b.at || b.last_activity_at || '')) - Date.parse(String(a.last_run_started_at || a.at || a.last_activity_at || '')))[0]
+              const taskNextRunAt = (taskId: string) => taskRuntimeRowsForTask(taskId)
+                .map((row) => String(row.next_run_at || ''))
+                .filter(Boolean)
+                .sort((a, b) => Date.parse(a) - Date.parse(b))[0] || ''
+              const taskRuntimeStats = (taskId: string) => {
+                const latestRowsBySubTask = new Map<string, Record<string, unknown>>()
+                taskRuntimeRowsForTask(taskId)
+                  .filter((row) => row.source_rows || row.rows_processed || row.destination_rows || row.rejected_rows || row.mismatch_rows)
+                  .sort((a, b) => Date.parse(String(b.last_run_started_at || b.at || b.last_activity_at || '')) - Date.parse(String(a.last_run_started_at || a.at || a.last_activity_at || '')))
+                  .forEach((row) => {
+                    const key = String(row.config_id || row.job_id || '')
+                    if (key && !latestRowsBySubTask.has(key)) latestRowsBySubTask.set(key, row)
+                  })
+                return [...latestRowsBySubTask.values()].reduce<{ source: number; destination: number; rejected: number; mismatch: number }>((acc, row) => ({
+                  source: acc.source + Number(row.source_rows || 0),
+                  destination: acc.destination + Number(row.destination_rows || row.rows_processed || 0),
+                  rejected: acc.rejected + Number(row.rejected_rows || 0),
+                  mismatch: acc.mismatch + Number(row.mismatch_rows || 0),
+                }), { source: 0, destination: 0, rejected: 0, mismatch: 0 })
+              }
+              const taskRuntimeStatus = (taskId: string) => {
+                const rows = taskRuntimeRowsForTask(taskId)
+                const statuses = rows.map((row) => String(row.status || row.last_status || '').toLowerCase()).filter(Boolean)
+                if (statuses.includes('running')) return 'running'
+                if (statuses.some((status) => ['failed', 'error', 'failure'].includes(status))) return 'failed'
+                if (statuses.some((status) => ['scheduled', 'registered'].includes(status))) return 'scheduled'
+                if (statuses.some((status) => ['success', 'complete', 'completed'].includes(status))) return 'success'
+                return rows.length > 0 ? 'registered' : 'planned'
+              }
+              const retryMapperConfig = (configId: string) => {
+                const config = mapperConfigRows.find((item) => item.id === configId)
+                if (!config) {
+                  notification.warning({ message: 'Retry unavailable', description: 'Mapper configuration was not found for this log row.', placement: 'bottomRight' })
+                  return
+                }
+                void runDataOpsMapperSync({
+                  ...selectedDataOpsPipelineStep,
+                  activeMapperConfigId: config.id,
+                  activeTaskMasterId: config.taskMasterId || selectedDataOpsPipelineStep.activeTaskMasterId,
+                  targetMode: config.targetMode || selectedDataOpsPipelineStep.targetMode,
+                  writeMode: config.writeMode || selectedDataOpsPipelineStep.writeMode,
+                  lookupSource: config.lookupSource || selectedDataOpsPipelineStep.lookupSource,
+                  queryInputs: config.queryInputs || selectedDataOpsPipelineStep.queryInputs,
+                  target: config.target || selectedDataOpsPipelineStep.target,
+                  keyFields: config.keyFields || selectedDataOpsPipelineStep.keyFields,
+                  mappingRows: config.mappingRows || selectedDataOpsPipelineStep.mappingRows,
+                }, { forceRetry: true })
+              }
+              const refreshDataOpsMonitorOnce = async () => {
+                try {
+                  const response = await api.getRuntimeMonitor()
+                  setDataOpsBackendMonitor(response && typeof response === 'object' ? response : null)
+                } catch {
+                  setDataOpsBackendMonitor(null)
+                }
+              }
+              const clearTaskMonitorLogs = async () => {
+                const clearedAt = Date.now()
+                setDataOpsMonitorClearedAt(clearedAt)
+                setDataOpsBackendMonitor((current) => current ? { ...current, data_ops_activity: [] } : current)
+                setDataOpsMonitorWindowFilter('')
+                setDataOpsMonitorTaskFilter('')
+                setDataOpsMonitorSubTaskFilter('')
+                try {
+                  await api.clearDataOpsRuntimeActivity()
+                  notification.success({ message: 'Monitor logs cleared', placement: 'bottomRight', duration: 2 })
+                } catch (err: any) {
+                  notification.warning({ message: 'Monitor logs hidden locally', description: 'Restart the backend to enable permanent server-side clear logs.', placement: 'bottomRight' })
+                }
+              }
+              const runTaskMasterManually = async (task: DataOpsTaskMaster) => {
+                const subTasks = [...mapperConfigRows]
+                  .filter((item) => task.id === legacyTaskMasterId ? (!item.taskMasterId || item.taskMasterId === legacyTaskMasterId) : item.taskMasterId === task.id)
+                  .sort((left, right) => Number(left.runOrder || 9999) - Number(right.runOrder || 9999))
+                const incompleteSubTasks = subTasks.filter((item) => (
+                  !String(item.lookupSource || '').trim()
+                  || !String(item.target || '').trim()
+                  || !Array.isArray(item.mappingRows)
+                  || item.mappingRows.filter((row) => row.enabled !== false && String(row.target || '').trim() && (String(row.source || '').trim() || String(row.defaultValue || '').trim())).length <= 0
+                ))
+                if (subTasks.length <= 0) {
+                  notification.warning({ message: 'No sub tasks', description: 'Add sub tasks before running this Task Master.', placement: 'bottomRight' })
+                  return
+                }
+                if (incompleteSubTasks.length > 0) {
+                  notification.warning({
+                    message: 'Sub task configuration incomplete',
+                    description: `${incompleteSubTasks[0].name || 'Sub task'} needs source, target, and mapping rows before Task Master run.`,
+                    placement: 'bottomRight',
+                  })
+                  return
+                }
+                const backlogWindows = dataOpsTaskBacklogWindows(task)
+                if (backlogWindows.length <= 0) {
+                  notification.info({ message: 'No completed window to run', description: 'The current day/month is still ongoing or the loop dates are outside the completed range.', placement: 'bottomRight' })
+                  return
+                }
+                setDataOpsSqlExecuting(true)
+                let completed = 0
+                let affected = 0
+                try {
+                  for (const windowTask of backlogWindows) {
+                    const taskBindParamsForRun = dataOpsTaskMasterBindParams(windowTask)
+                    for (const config of subTasks) {
+                      const stepForConfig: DataOpsPipelineStep = {
+                        ...selectedDataOpsPipelineStep,
+                        activeMapperConfigId: config.id,
+                        activeTaskMasterId: task.id,
+                        targetMode: config.targetMode || 'oracle',
+                        writeMode: config.writeMode || 'upsert',
+                        lookupSource: config.lookupSource || '',
+                        queryInputs: config.queryInputs || [],
+                        target: config.target || '',
+                        keyFields: config.keyFields || '',
+                        mappingRows: config.mappingRows || [],
+                      }
+                      const { sql, issue } = buildDataOpsMapperSyncSql(stepForConfig)
+                      if (issue) throw new Error(`${config.name || 'Sub task'}: ${issue}`)
+                      const response = await api.executeDataOpsOracleSql({
+                        ...nodeConfig,
+                        _data_ops_manual_activity: true,
+                        _data_ops_manual_window: true,
+                        _data_ops_force_retry: false,
+                        _data_ops_manual_job_id: `data_ops_manual:${selectedNodeId || 'node'}:${selectedDataOpsPipelineStep.id}:${config.id}:${taskBindParamsForRun.task_business_window_key || Date.now()}`,
+                        _data_ops_manual_pipeline_id: activePipelineId,
+                        _data_ops_manual_data_ops_node_id: selectedNodeId || '',
+                        _data_ops_manual_step_id: selectedDataOpsPipelineStep.id,
+                        _data_ops_manual_config_id: config.id,
+                        _data_ops_task_master_id: task.id,
+                        _data_ops_task_master_name: task.name || '',
+                        _data_ops_task_window_mode: windowTask.windowMode || task.windowMode || '',
+                        _data_ops_task_window_indicator: windowTask.windowIndicator || '',
+                        _data_ops_task_duplicate_policy: task.duplicatePolicy || 'skip_completed',
+                        _data_ops_task_bind_params: taskBindParamsForRun,
+                      }, sql, true)
+                      completed += 1
+                      affected += Number(response?.rowcount ?? response?.rows_affected ?? 0)
+                    }
+                  }
+                  notification.success({
+                    message: 'Task Master run completed',
+                    description: `${backlogWindows.length.toLocaleString()} window(s), ${completed.toLocaleString()} sub task run(s), ${affected.toLocaleString()} destination row(s).`,
+                    placement: 'bottomRight',
+                  })
+                  void refreshDataOpsMonitorOnce()
+                } catch (err: any) {
+                  notification.error({
+                    message: 'Task Master run failed',
+                    description: String(err?.message || 'Manual Task Master run failed'),
+                    placement: 'bottomRight',
+                  })
+                  void refreshDataOpsMonitorOnce()
+                } finally {
+                  setDataOpsSqlExecuting(false)
+                }
+              }
               const mapperScheduleStep: DataOpsPipelineStep = {
                 ...selectedDataOpsPipelineStep,
                 activeMapperConfigId: activeMapperConfig?.id || selectedDataOpsPipelineStep.activeMapperConfigId,
@@ -36207,6 +37242,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 targetMode: selectedDataOpsPipelineStep.targetMode || 'oracle',
                 writeMode: selectedDataOpsPipelineStep.writeMode || 'upsert',
                 lookupSource: selectedDataOpsPipelineStep.lookupSource || '',
+                queryInputs: selectedDataOpsPipelineStep.queryInputs || [],
+                taskMasterId: selectedDataOpsPipelineStep.activeTaskMasterId || activeMapperConfig?.taskMasterId || '',
+                runOrder: activeMapperConfig?.runOrder || mapperConfigRows.length + 1,
                 target: selectedDataOpsPipelineStep.target || '',
                 keyFields: selectedDataOpsPipelineStep.keyFields || '',
                 mappingRows: selectedDataOpsPipelineStep.mappingRows || [],
@@ -36257,6 +37295,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   targetMode: config.targetMode || 'oracle',
                   writeMode: config.writeMode || 'upsert',
                   lookupSource: config.lookupSource || '',
+                  queryInputs: config.queryInputs || [],
+                  activeTaskMasterId: config.taskMasterId || selectedDataOpsPipelineStep.activeTaskMasterId || '',
                   target: config.target || '',
                   keyFields: config.keyFields || '',
                   mappingRows: config.mappingRows || [],
@@ -36294,6 +37334,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   targetMode: 'oracle',
                   writeMode: 'upsert',
                   lookupSource: '',
+                  queryInputs: [],
+                  taskMasterId: selectedDataOpsPipelineStep.activeTaskMasterId || '',
+                  runOrder: mapperConfigRows.length + 1,
                   target: '',
                   keyFields: '',
                   mappingRows: [],
@@ -36327,6 +37370,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   targetMode: 'oracle',
                   writeMode: 'upsert',
                   lookupSource: '',
+                  queryInputs: [],
+                  activeTaskMasterId: selectedDataOpsPipelineStep.activeTaskMasterId || '',
                   target: '',
                   keyFields: '',
                   mappingRows: [],
@@ -36399,6 +37444,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   activeMapperConfigId: selectedDataOpsPipelineStep.activeMapperConfigId === configId ? String(nextRows[0]?.id || '') : selectedDataOpsPipelineStep.activeMapperConfigId,
                 })
               }
+              const manageTaskMaster = (task: DataOpsTaskMaster) => {
+                patchMapper({ activeTaskMasterId: task.id })
+                setDataOpsSubTaskMasterOpen(true)
+              }
               const mapperSyncBuild = buildDataOpsMapperSyncSql(selectedDataOpsPipelineStep)
               const mapperActiveMappings = (selectedDataOpsPipelineStep.mappingRows || []).filter((row) => row.enabled !== false && row.source && row.target)
               const mapperKeyFields = uniqueFieldNames([
@@ -36429,46 +37478,299 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 </div>
                 )
               }
+              const visibleMapperConfigRows = activeTaskMaster
+                ? mapperConfigRows.filter((item) => activeTaskMaster.id === legacyTaskMasterId ? (!item.taskMasterId || item.taskMasterId === legacyTaskMasterId) : item.taskMasterId === activeTaskMaster.id)
+                : mapperConfigRows
+              const orderedVisibleMapperConfigRows = [...visibleMapperConfigRows].sort((left, right) => Number(left.runOrder || 9999) - Number(right.runOrder || 9999))
+              const moveSubTaskOrder = (configId: string, direction: -1 | 1) => {
+                const currentIndex = orderedVisibleMapperConfigRows.findIndex((item) => item.id === configId)
+                const targetIndex = currentIndex + direction
+                if (currentIndex < 0 || targetIndex < 0 || targetIndex >= orderedVisibleMapperConfigRows.length) return
+                const reordered = [...orderedVisibleMapperConfigRows]
+                const [moved] = reordered.splice(currentIndex, 1)
+                reordered.splice(targetIndex, 0, moved)
+                const nextById = new Map(reordered.map((item, index) => [item.id, { ...item, runOrder: index + 1, taskMasterId: item.taskMasterId || activeTaskMaster?.id || '' }]))
+                patchMapper({
+                  mapperConfigs: mapperConfigRows.map((item) => nextById.get(item.id) || item),
+                })
+              }
               return (
                 <div style={{ display: 'grid', gap: 10 }}>
+                  <Tabs
+                    size="small"
+                    items={[
+                      {
+                        key: 'task_manager',
+                        label: 'Task Manager',
+                        children: (
+                          <div style={{ display: 'grid', gap: 10 }}>
                   {mapperPanel(
-                    'Mapper Configurations',
+                    'Task Master',
+                    <Button size="small" type="primary" onClick={addTaskMaster}>Add Task</Button>,
+                    <div style={{ display: 'grid', gap: 10 }}>
+                      <Table
+                        size="small"
+                        rowKey="id"
+                        pagination={false}
+                        dataSource={orderedTaskMasters}
+                        locale={{ emptyText: 'No task masters yet. Add a task to define date/month/interval processing windows.' }}
+                        columns={[
+                          { title: '#', width: 44, render: (_value: unknown, _row: DataOpsTaskMaster, index: number) => <Text style={{ color: 'var(--app-text-subtle)', fontWeight: 700 }}>{index + 1}</Text> },
+                          { title: 'Order', width: 82, render: (_value: unknown, row: DataOpsTaskMaster, index: number) => <Space size={4}><Button size="small" icon={<ArrowUpOutlined />} disabled={index === 0} onClick={() => moveTaskMasterOrder(row.id, -1)} /><Button size="small" icon={<ArrowDownOutlined />} disabled={index >= orderedTaskMasters.length - 1} onClick={() => moveTaskMasterOrder(row.id, 1)} /></Space> },
+                          { title: 'Use', width: 56, render: (_value: unknown, row: DataOpsTaskMaster) => <Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchTaskMaster(row.id, { enabled: checked })} /> },
+                          { title: 'Task', width: 300, render: (_value: unknown, row: DataOpsTaskMaster) => <Input size="small" value={row.name || ''} onChange={(event) => patchTaskMaster(row.id, { name: event.target.value })} placeholder="daily customer sync" /> },
+                          { title: 'Definition', width: 290, render: (_value: unknown, row: DataOpsTaskMaster) => <Text ellipsis style={{ maxWidth: 280, color: 'var(--app-text)' }}>{dataOpsTaskMasterScheduleSummary(row)}</Text> },
+                          { title: 'Last Run', width: 145, render: (_value: unknown, row: DataOpsTaskMaster) => {
+                            const runtime = taskLastRuntimeRow(row.id)
+                            return <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{dataOpsTimestampText(runtime?.last_run_started_at || runtime?.at || runtime?.last_activity_at || '') || 'not run'}</Text>
+                          } },
+                          { title: 'Next Period', width: 145, render: (_value: unknown, row: DataOpsTaskMaster) => {
+                            const nextRun = taskNextRunAt(row.id)
+                            return <Text style={{ color: nextRun ? '#f59e0b' : 'var(--app-text-subtle)', fontSize: 11, fontWeight: 700 }}>{nextRun ? dataOpsCountdownText(nextRun, dataOpsRuntimeTick) || dataOpsTimestampText(nextRun) : 'not registered'}</Text>
+                          } },
+                          { title: 'Stats', width: 190, render: (_value: unknown, row: DataOpsTaskMaster) => {
+                            const stats = taskRuntimeStats(row.id)
+                            return <Space size={4} wrap><Tag color="blue" style={{ marginInlineEnd: 0 }}>src {stats.source.toLocaleString()}</Tag><Tag color="green" style={{ marginInlineEnd: 0 }}>dest {stats.destination.toLocaleString()}</Tag><Tag color={stats.rejected ? 'red' : 'default'} style={{ marginInlineEnd: 0 }}>rej {stats.rejected.toLocaleString()}</Tag></Space>
+                          } },
+                          { title: 'State', width: 92, render: (_value: unknown, row: DataOpsTaskMaster) => {
+                            const status = row.enabled === false ? 'disabled' : taskRuntimeStatus(row.id)
+                            return <Tag color={dataOpsStatusColor(status)} style={{ marginInlineEnd: 0 }}>{status}</Tag>
+                          } },
+                          { title: 'Actions', width: 280, render: (_value: unknown, row: DataOpsTaskMaster) => (
+                            <Space size={6} onClick={(event) => event.stopPropagation()}>
+                              <Button size="small" type="primary" onClick={(event) => { event.stopPropagation(); manageTaskMaster(row) }}>Manage</Button>
+                              <Popconfirm title="Run this Task Master now?" description="Only this task's assigned subtasks run, sequentially in configured order." okText="Run" cancelText="Cancel" onConfirm={() => { void runTaskMasterManually(row) }}>
+                                <Button size="small" loading={dataOpsSqlExecuting} disabled={subTaskCountForTask(row.id) <= 0}>Run</Button>
+                              </Popconfirm>
+                              <Button size="small" onClick={(event) => { event.stopPropagation(); duplicateTaskMaster(row) }}>Copy</Button>
+                              <Button size="small" danger onClick={(event) => { event.stopPropagation(); deleteTaskMaster(row.id) }}>Delete</Button>
+                            </Space>
+                          ) },
+                        ] as any[]}
+                        scroll={{ x: 1660 }}
+                        expandable={{
+                          expandedRowKeys: dataOpsExpandedTaskMasterId ? [dataOpsExpandedTaskMasterId] : [],
+                          onExpand: (expanded, row) => {
+                            const id = String((row as DataOpsTaskMaster).id || '')
+                            setDataOpsExpandedTaskMasterId(expanded ? id : '')
+                            if (expanded && id) patchMapper({ activeTaskMasterId: id })
+                          },
+                          expandedRowRender: (row: DataOpsTaskMaster) => (
+                            <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 8 }}>
+                              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8, alignItems: 'end' }}>
+                                <div>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Window Definition</Text>
+                                  <Select size="small" value={row.windowMode || 'daily'} onChange={(value) => {
+                                    const nextMode = value as DataOpsTaskMaster['windowMode']
+                                    patchTaskMaster(row.id, {
+                                      windowMode: nextMode,
+                                      windowIndicator: nextMode === 'monthly' ? 'transaction_month' : nextMode === 'daily' ? 'transaction_day' : 'transaction_range',
+                                    })
+                                  }} options={[
+                                    { value: 'daily', label: 'Day' },
+                                    { value: 'monthly', label: 'Month' },
+                                    { value: 'previous_range', label: 'Previous Range' },
+                                    { value: 'custom_range', label: 'Custom Range' },
+                                  ]} style={{ width: '100%', marginTop: 4 }} />
+                                </div>
+                                <div>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Transaction Indicator</Text>
+                                  <Select size="small" value={row.windowIndicator || (row.windowMode === 'monthly' ? 'transaction_month' : row.windowMode === 'daily' ? 'transaction_day' : 'transaction_range')} onChange={(value) => patchTaskMaster(row.id, { windowIndicator: value as DataOpsTaskMaster['windowIndicator'] })} options={[
+                                    { value: 'transaction_day', label: 'transaction - day' },
+                                    { value: 'transaction_month', label: 'transaction - month' },
+                                    { value: 'transaction_range', label: 'transaction - range' },
+                                  ]} style={{ width: '100%', marginTop: 4 }} />
+                                </div>
+                                <div>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Loop Start</Text>
+                                  <Input size="small" type="date" value={row.startAt || ''} onChange={(event) => patchTaskMaster(row.id, { startAt: event.target.value })} style={{ marginTop: 4 }} />
+                                </div>
+                                <div>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Expiry Date</Text>
+                                  <Input size="small" type="date" value={row.endAt || ''} onChange={(event) => patchTaskMaster(row.id, { endAt: event.target.value })} style={{ marginTop: 4 }} />
+                                </div>
+                                <div>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Run Time</Text>
+                                  <Input size="small" type="time" value={row.runAtTime || '00:00'} onChange={(event) => patchTaskMaster(row.id, { runAtTime: event.target.value })} style={{ marginTop: 4 }} />
+                                </div>
+                                <div>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Monthly Run Day</Text>
+                                  <InputNumber size="small" min={1} max={31} value={row.monthlyRunDay || 1} onChange={(value) => patchTaskMaster(row.id, { monthlyRunDay: Number(value || 1) })} addonAfter="day" style={{ width: '100%', marginTop: 4 }} disabled={row.windowMode !== 'monthly'} />
+                                </div>
+                                <div>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Lookback Count</Text>
+                                  <InputNumber size="small" min={1} value={row.lookbackCount || 1} onChange={(value) => patchTaskMaster(row.id, { lookbackCount: Number(value || 1) })} style={{ width: '100%', marginTop: 4 }} disabled={row.windowMode !== 'previous_range'} />
+                                </div>
+                                <div>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Lookback Unit</Text>
+                                  <Select size="small" value={row.lookbackUnit || 'day'} onChange={(value) => patchTaskMaster(row.id, { lookbackUnit: value as DataOpsTaskMaster['lookbackUnit'] })} options={[{ value: 'day', label: 'day' }, { value: 'month', label: 'month' }]} style={{ width: '100%', marginTop: 4 }} disabled={row.windowMode !== 'previous_range'} />
+                                </div>
+                                <div>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Interval</Text>
+                                  <InputNumber size="small" min={1} value={row.intervalMinutes || 60} onChange={(value) => patchTaskMaster(row.id, { intervalMinutes: Number(value || 60) })} addonAfter="min" style={{ width: '100%', marginTop: 4 }} />
+                                </div>
+                                <div>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Retry</Text>
+                                  <Select size="small" value={row.retryPolicy || 'mismatch'} onChange={(value) => patchTaskMaster(row.id, { retryPolicy: value as DataOpsTaskMaster['retryPolicy'] })} options={[{ value: 'mismatch', label: 'Mismatch' }, { value: 'failed', label: 'Failed' }, { value: 'rejected', label: 'Rejected' }, { value: 'full', label: 'Full rerun' }]} style={{ width: '100%', marginTop: 4 }} />
+                                </div>
+                                <div>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Duplicate Window</Text>
+                                  <Select size="small" value={row.duplicatePolicy || 'skip_completed'} onChange={(value) => patchTaskMaster(row.id, { duplicatePolicy: value as DataOpsTaskMaster['duplicatePolicy'] })} options={[{ value: 'skip_completed', label: 'Skip completed' }, { value: 'retry_only', label: 'Retry only' }, { value: 'allow_rerun', label: 'Allow rerun' }]} style={{ width: '100%', marginTop: 4 }} />
+                                </div>
+                                <div>
+                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Execution Mode</Text>
+                                  <Select size="small" value={row.executionMode || 'subtask_driven'} onChange={(value) => patchTaskMaster(row.id, { executionMode: value as DataOpsTaskMaster['executionMode'] })} options={[{ value: 'subtask_driven', label: 'Sub task scheduler' }, { value: 'task_driven', label: 'Task scheduler' }, { value: 'hybrid', label: 'Hybrid' }]} style={{ width: '100%', marginTop: 4 }} />
+                                </div>
+                              </div>
+                              <Space size={6} wrap>
+                                <Tag color="blue" style={{ marginInlineEnd: 0 }}>window: {dataOpsTaskMasterWindowLabel(row)}</Tag>
+                                <Tag color="purple" style={{ marginInlineEnd: 0 }}>sub tasks: {subTaskCountForTask(row.id)}</Tag>
+                                <Tag color="gold" style={{ marginInlineEnd: 0 }}>backlog windows: {dataOpsTaskBacklogWindows(row).length}</Tag>
+                                <Tag color="cyan" style={{ marginInlineEnd: 0 }}>{dataOpsTaskMasterScheduleSummary(row)}</Tag>
+                                <Tag color="geekblue" style={{ marginInlineEnd: 0 }}>{dataOpsTaskMasterBusinessWindow(row).task_business_window_key || 'window key pending'}</Tag>
+                              </Space>
+                            </div>
+                          ),
+                          rowExpandable: () => true,
+                        }}
+                        onRow={(row) => ({
+                          onClick: (event) => {
+                            const target = event.target as HTMLElement | null
+                            if (target?.closest('button,input,textarea,select,.ant-select,.ant-switch,.ant-picker,.ant-input-number')) return
+                            const id = String((row as DataOpsTaskMaster).id || '')
+                            patchMapper({ activeTaskMasterId: id })
+                            setDataOpsExpandedTaskMasterId((current) => current === id ? '' : id)
+                          },
+                        })}
+                      />
+                    </div>
+                  )}
+                          </div>
+                        ),
+                      },
+                      {
+                        key: 'monitor_log',
+                        label: `Monitor Log (${taskLogRows.length})`,
+                        children: (
+                          <div style={{ display: 'grid', gap: 10 }}>
+                  {mapperPanel(
+                    'Task / Sub Task Logs',
                     <Space size={6}>
-                      <Button size="small" onClick={saveCurrentMapperConfig}>Save Current</Button>
-                      <Button size="small" disabled={!selectedDataOpsPipelineStep.activeMapperConfigId && mapperConfigRows.length <= 0} onClick={() => setDataOpsMapperConfigOpen(true)}>Configure Current</Button>
-                      <Button size="small" type="primary" onClick={addMapperConfig}>Add Mapper</Button>
+                      <Tag color={filteredTaskLogRows.length > 0 ? 'cyan' : 'default'} style={{ marginInlineEnd: 0 }}>{filteredTaskLogRows.length} shown</Tag>
+                      <Popconfirm title="Clear monitor logs?" description="This clears Data Ops backend activity log rows." okText="Clear" cancelText="Cancel" onConfirm={() => { void clearTaskMonitorLogs() }}>
+                        <Button size="small" danger>Clear Logs</Button>
+                      </Popconfirm>
                     </Space>,
+                    <div style={{ display: 'grid', gap: 10 }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'minmax(160px, 220px) minmax(160px, 220px) minmax(160px, 240px) 90px', gap: 8 }}>
+                      <Select size="small" allowClear placeholder="Filter window" value={dataOpsMonitorWindowFilter || undefined} onChange={(value) => setDataOpsMonitorWindowFilter(String(value || ''))} options={taskLogWindowOptions} />
+                      <Select size="small" allowClear placeholder="Filter task" value={dataOpsMonitorTaskFilter || undefined} onChange={(value) => setDataOpsMonitorTaskFilter(String(value || ''))} options={taskLogTaskOptions} />
+                      <Select size="small" allowClear placeholder="Filter sub task" value={dataOpsMonitorSubTaskFilter || undefined} onChange={(value) => setDataOpsMonitorSubTaskFilter(String(value || ''))} options={taskLogSubTaskOptions} />
+                      <Button size="small" onClick={() => { setDataOpsMonitorWindowFilter(''); setDataOpsMonitorTaskFilter(''); setDataOpsMonitorSubTaskFilter('') }}>Clear</Button>
+                    </div>
                     <Table
                       size="small"
-                      rowKey="id"
+                      rowKey={(row: any, index) => `${String(row.job_id || row.config_id || 'log')}_${index}`}
                       pagination={false}
-                      dataSource={mapperConfigRows}
-                      locale={{ emptyText: 'No saved mapper configurations yet. Click Save Current or Add Mapper.' }}
+                      dataSource={filteredTaskLogRows}
+                      locale={{ emptyText: 'No task/sub-task backend logs for the selected filters.' }}
                       columns={[
-                        { title: 'Active', width: 70, render: (_value: unknown, row: DataOpsMapperConfig) => <Tag color={row.id === selectedDataOpsPipelineStep.activeMapperConfigId ? 'green' : 'default'} style={{ marginInlineEnd: 0 }}>{row.id === selectedDataOpsPipelineStep.activeMapperConfigId ? 'active' : 'saved'}</Tag> },
-                        { title: 'Mapper Name', render: (_value: unknown, row: DataOpsMapperConfig) => <Input size="small" value={row.name || ''} onChange={(event) => updateMapperConfig(row.id, { name: event.target.value })} placeholder="mapper name" /> },
-                        { title: 'Source', width: 190, render: (_value: unknown, row: DataOpsMapperConfig) => <Text ellipsis style={{ maxWidth: 180, color: 'var(--app-text-subtle)', fontSize: 11 }}>{row.lookupSource || '-'}</Text> },
-                        { title: 'Target', width: 190, render: (_value: unknown, row: DataOpsMapperConfig) => <Text ellipsis style={{ maxWidth: 180, color: 'var(--app-text-subtle)', fontSize: 11 }}>{row.target || '-'}</Text> },
-                        { title: 'Mappings', width: 86, render: (_value: unknown, row: DataOpsMapperConfig) => Number((row.mappingRows || []).filter((item) => item.enabled !== false).length).toLocaleString() },
-                        { title: 'Scheduler', width: 240, render: (_value: unknown, row: DataOpsMapperConfig) => mapperSchedulerStatusTags(row) },
-                        { title: 'Updated', width: 150, render: (_value: unknown, row: DataOpsMapperConfig) => <Text ellipsis style={{ maxWidth: 140, color: 'var(--app-text-subtle)', fontSize: 11 }}>{row.updatedAt || '-'}</Text> },
-                        { title: 'Actions', width: 260, render: (_value: unknown, row: DataOpsMapperConfig) => (
-                          <Space size={6} wrap>
-                            <Button size="small" type="primary" onClick={() => loadMapperConfig(row)}>Configure</Button>
-                            <Button size="small" onClick={() => duplicateMapperConfig(row)}>Duplicate</Button>
-                            <Button size="small" danger onClick={() => deleteMapperConfig(row.id)}>Remove</Button>
-                          </Space>
-                        ) },
+                        { title: 'Task', width: 180, render: (_value: unknown, row: Record<string, unknown>) => <Text ellipsis style={{ maxWidth: 170, color: 'var(--app-text)', fontWeight: 700 }}>{taskLogTaskName(row)}</Text> },
+                        { title: 'Sub Task', width: 190, render: (_value: unknown, row: Record<string, unknown>) => <Text ellipsis style={{ maxWidth: 180 }}>{taskLogSubTaskName(row)}</Text> },
+                        { title: 'Window', width: 190, render: (_value: unknown, row: Record<string, unknown>) => <Text ellipsis style={{ maxWidth: 180, color: 'var(--app-text-subtle)' }}>{taskLogWindowValue(row)}</Text> },
+                        { title: 'Status', width: 96, render: (_value: unknown, row: Record<string, unknown>) => <Tag color={dataOpsStatusColor(row.status)} style={{ marginInlineEnd: 0 }}>{String(row.status || 'idle')}</Tag> },
+                        { title: 'Started', width: 145, render: (_value: unknown, row: Record<string, unknown>) => <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{dataOpsTimestampText(row.last_run_started_at || row.at || '') || '-'}</Text> },
+                        { title: 'Finished', width: 145, render: (_value: unknown, row: Record<string, unknown>) => <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{dataOpsTimestampText(row.last_run_finished_at || '') || '-'}</Text> },
+                        { title: 'Duration', width: 90, render: (_value: unknown, row: Record<string, unknown>) => Number(row.duration_ms || 0) > 0 ? `${Number(row.duration_ms || 0).toLocaleString()} ms` : '-' },
+                        { title: 'Source Count', width: 112, render: (_value: unknown, row: Record<string, unknown>) => Number(row.source_rows || row.rows_source || 0).toLocaleString() },
+                        { title: 'Destination Sync', width: 130, render: (_value: unknown, row: Record<string, unknown>) => Number(row.destination_rows || row.rows_processed || 0).toLocaleString() },
+                        { title: 'Rejected', width: 86, render: (_value: unknown, row: Record<string, unknown>) => Number(row.rejected_rows || 0).toLocaleString() },
+                        { title: 'Mismatch', width: 92, render: (_value: unknown, row: Record<string, unknown>) => {
+                          const mismatch = Number(row.mismatch_rows || 0)
+                          return <Text style={{ color: mismatch ? '#f59e0b' : 'var(--app-text-subtle)', fontWeight: 700 }}>{mismatch.toLocaleString()}</Text>
+                        } },
+                        { title: 'Retry', width: 92, render: (_value: unknown, row: Record<string, unknown>) => {
+                          const status = String(row.status || '').toLowerCase()
+                          const mismatch = Number(row.mismatch_rows || 0)
+                          return <Button size="small" disabled={!['failed', 'error', 'success'].includes(status) && mismatch <= 0} onClick={() => retryMapperConfig(String(row.config_id || ''))}>Retry</Button>
+                        } },
                       ] as any[]}
+                      scroll={{ x: 1400, y: 220 }}
                     />
+                    </div>
                   )}
-                  <div style={{ border: '1px dashed var(--app-border-strong)', borderRadius: 8, background: 'var(--app-bg)', padding: 18, textAlign: 'center' }}>
-                    <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Mapper configuration opens separately</Text>
-                    <br />
-                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
-                      Use Configure on a row, Configure Current, or Add Mapper to edit mappings and sync settings.
-                    </Text>
-                  </div>
+                          </div>
+                        ),
+                      },
+                    ]}
+                  />
+                  {dataOpsSubTaskMasterOpen ? (
+                    <Modal
+                      open={dataOpsSubTaskMasterOpen}
+                      onCancel={() => setDataOpsSubTaskMasterOpen(false)}
+                      title={`Sub Task Master${activeTaskMaster?.name ? `: ${activeTaskMaster.name}` : ''}`}
+                      wrapClassName="data-ops-config-modal"
+                      width="100vw"
+                      style={{ top: 0, maxWidth: '100vw', paddingBottom: 0 }}
+                      footer={[
+                        <Button key="close" type="primary" onClick={() => setDataOpsSubTaskMasterOpen(false)}>Done</Button>,
+                      ]}
+                      styles={{
+                        content: { background: 'var(--app-panel-bg)', border: '1px solid var(--app-border-strong)', borderRadius: 0, height: '100vh', display: 'flex', flexDirection: 'column' },
+                        header: { background: 'var(--app-panel-bg)' },
+                        body: { background: 'var(--app-panel-bg)', flex: 1, overflowY: 'auto', minHeight: 0 },
+                      }}
+                    >
+                      <div style={{ display: 'grid', gap: 10 }}>
+                        {activeTaskMaster ? (
+                          <div style={{ display: 'grid', gap: 8 }}>
+                            <Space size={6} wrap>
+                              <Tag color="blue" style={{ marginInlineEnd: 0 }}>task: {activeTaskMaster.name}</Tag>
+                              <Tag color="cyan" style={{ marginInlineEnd: 0 }}>window: {dataOpsTaskMasterWindowLabel(activeTaskMaster)}</Tag>
+                              <Tag color="purple" style={{ marginInlineEnd: 0 }}>sub tasks: {visibleMapperConfigRows.length}</Tag>
+                            </Space>
+                            <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10 }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, fontWeight: 700 }}>Bind Parameters</Text>
+                              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+                                {Object.entries(taskBindParams).filter(([, value]) => value).map(([key, value]) => (
+                                  <Tag key={key} color="cyan" style={{ marginInlineEnd: 0 }}>:{key}={value}</Tag>
+                                ))}
+                              </div>
+                            </div>
+                          </div>
+                        ) : null}
+                        {mapperPanel(
+                          'Sub Task Master',
+                          <Button size="small" type="primary" disabled={!activeTaskMaster} onClick={addMapperConfig}>Add Sub Task</Button>,
+                          <Table
+                            size="small"
+                            rowKey="id"
+                            pagination={false}
+                            dataSource={orderedVisibleMapperConfigRows}
+                            locale={{ emptyText: 'No sub tasks for this Task Master yet. Click Add Sub Task.' }}
+                            columns={[
+                              { title: '#', width: 44, render: (_value: unknown, _row: DataOpsMapperConfig, index: number) => <Text style={{ color: 'var(--app-text-subtle)', fontWeight: 700 }}>{index + 1}</Text> },
+                              { title: 'Order', width: 82, render: (_value: unknown, row: DataOpsMapperConfig, index: number) => <Space size={4}><Button size="small" icon={<ArrowUpOutlined />} disabled={index === 0} onClick={() => moveSubTaskOrder(row.id, -1)} /><Button size="small" icon={<ArrowDownOutlined />} disabled={index >= orderedVisibleMapperConfigRows.length - 1} onClick={() => moveSubTaskOrder(row.id, 1)} /></Space> },
+                              { title: 'Active', width: 70, render: (_value: unknown, row: DataOpsMapperConfig) => <Tag color={row.id === selectedDataOpsPipelineStep.activeMapperConfigId ? 'green' : 'default'} style={{ marginInlineEnd: 0 }}>{row.id === selectedDataOpsPipelineStep.activeMapperConfigId ? 'active' : 'saved'}</Tag> },
+                              { title: 'Sub Task', render: (_value: unknown, row: DataOpsMapperConfig) => <Input size="small" value={row.name || ''} onChange={(event) => updateMapperConfig(row.id, { name: event.target.value })} placeholder="sub task name" /> },
+                              { title: 'Source', width: 190, render: (_value: unknown, row: DataOpsMapperConfig) => <Text ellipsis style={{ maxWidth: 180, color: 'var(--app-text-subtle)', fontSize: 11 }}>{row.lookupSource || '-'}</Text> },
+                              { title: 'Target', width: 190, render: (_value: unknown, row: DataOpsMapperConfig) => <Text ellipsis style={{ maxWidth: 180, color: 'var(--app-text-subtle)', fontSize: 11 }}>{row.target || '-'}</Text> },
+                              { title: 'Mappings', width: 86, render: (_value: unknown, row: DataOpsMapperConfig) => Number((row.mappingRows || []).filter((item) => item.enabled !== false).length).toLocaleString() },
+                              { title: 'Scheduler', width: 240, render: (_value: unknown, row: DataOpsMapperConfig) => mapperSchedulerStatusTags(row) },
+                              { title: 'Updated', width: 150, render: (_value: unknown, row: DataOpsMapperConfig) => <Text ellipsis style={{ maxWidth: 140, color: 'var(--app-text-subtle)', fontSize: 11 }}>{row.updatedAt || '-'}</Text> },
+                              { title: 'Actions', width: 260, render: (_value: unknown, row: DataOpsMapperConfig) => (
+                                <Space size={6} wrap>
+                                  <Button size="small" type="primary" onClick={() => loadMapperConfig(row)}>Configure</Button>
+                                  <Button size="small" onClick={() => duplicateMapperConfig(row)}>Duplicate</Button>
+                                  <Button size="small" danger onClick={() => deleteMapperConfig(row.id)}>Remove</Button>
+                                </Space>
+                              ) },
+                            ] as any[]}
+                          />
+                        )}
+                      </div>
+                    </Modal>
+                  ) : null}
                   {dataOpsMapperConfigOpen ? (
                   <Modal
 	                    open={dataOpsMapperConfigOpen}
@@ -36514,7 +37816,21 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       <div><Text style={{ color: mapperSyncBuild.issue ? 'var(--app-warning)' : 'var(--app-text-subtle)', fontSize: 11 }}>{mapperSyncBuild.issue || 'Mappings can be prepared and executed against the Oracle target.'}</Text></div>
                     </div>
                   </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 1fr) minmax(220px, 0.7fr)', gap: 10, alignItems: 'end' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'minmax(220px, .8fr) minmax(260px, 1fr) minmax(220px, 0.7fr)', gap: 10, alignItems: 'end' }}>
+                    <div>
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Parent Task Master</Text>
+                      <Select
+                        size="small"
+                        showSearch
+                        allowClear
+                        optionFilterProp="label"
+                        value={selectedDataOpsPipelineStep.activeTaskMasterId || undefined}
+                        onChange={(value) => patchMapper({ activeTaskMasterId: String(value || '') })}
+                        placeholder="Select parent task"
+                        options={taskMasterOptions}
+                        style={dataOpsControlStyle(dataOpsSectionColors.schedule, { width: '100%', marginTop: 5 })}
+                      />
+                    </div>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Query Builder Source</Text>
                       <Select
@@ -36539,6 +37855,30 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       </Text>
                     </div>
                   </div>
+                  {mapperBindParameters.length > 0 ? (
+                    <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 8 }}>
+                      <Space style={{ justifyContent: 'space-between' }}>
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 12 }}>Query Inputs</Text>
+                        <Tag color="blue" style={{ marginInlineEnd: 0 }}>{mapperBindParameters.length} bind</Tag>
+                      </Space>
+                      {mapperQueryInputRows.map((row) => {
+                        const param = mapperBindParameters.find((item) => item.name === row.param)
+                        return (
+                          <div key={row.param} style={{ display: 'grid', gridTemplateColumns: '42px 150px 110px minmax(180px, 1fr) 180px', gap: 8, alignItems: 'center' }}>
+                            <Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchMapperQueryInput(String(row.param || ''), { enabled: checked })} />
+                            <Text style={{ color: dataOpsSectionColors.where, fontWeight: 700 }}>:{row.param}</Text>
+                            <Select size="small" value={row.sourceMode || 'default'} onChange={(value) => patchMapperQueryInput(String(row.param || ''), { sourceMode: value as DataOpsQueryInputRow['sourceMode'] })} options={[{ value: 'default', label: 'Default' }, { value: 'fixed', label: 'Fixed' }, { value: 'field', label: 'Field' }]} style={dataOpsControlStyle(dataOpsSectionColors.where)} />
+                            {row.sourceMode === 'field' ? (
+                              <Select size="small" showSearch allowClear optionFilterProp="label" value={row.sourceField || undefined} onChange={(value) => patchMapperQueryInput(String(row.param || ''), { sourceField: String(value || '') })} placeholder="mapper input field" options={mapperSourceOptions} style={dataOpsControlStyle(dataOpsSectionColors.where)} />
+                            ) : (
+                              <Input size="small" disabled={row.sourceMode === 'default'} value={row.sourceMode === 'default' ? String(param?.defaultValue || '') : String(row.value || '')} onChange={(event) => patchMapperQueryInput(String(row.param || ''), { value: event.target.value })} placeholder="value/default" style={dataOpsInputStyle(dataOpsSectionColors.where)} />
+                            )}
+                            <Text ellipsis style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>default: {param?.defaultValue || '-'}</Text>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  ) : null}
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Destination / Target Table</Text>
@@ -36546,7 +37886,28 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     </div>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Key / Match Fields</Text>
-                      <Input size="small" value={selectedDataOpsPipelineStep.keyFields || ''} onChange={(event) => patchMapper({ keyFields: event.target.value })} placeholder="AGENT_CODE for upsert/merge" style={dataOpsInputStyle(dataOpsSectionColors.output, { marginTop: 5 })} />
+                      <Select
+                        size="small"
+                        mode="tags"
+                        showSearch
+                        allowClear
+                        optionFilterProp="label"
+                        value={String(selectedDataOpsPipelineStep.keyFields || '').split(',').map((item) => item.trim()).filter(Boolean)}
+                        onChange={(values) => {
+                          const nextKeys = uniqueFieldNames((values || []).map((item) => String(item || '').trim()).filter(Boolean))
+                          const keySet = new Set(nextKeys.map((item) => item.toLowerCase()))
+                          patchMapper({
+                            keyFields: nextKeys.join(', '),
+                            mappingRows: (selectedDataOpsPipelineStep.mappingRows || []).map((item) => ({
+                              ...item,
+                              key: keySet.has(String(item.target || '').trim().toLowerCase()),
+                            })),
+                          })
+                        }}
+                        placeholder="Select target key columns"
+                        options={mapperKeyFieldOptions}
+                        style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%', marginTop: 5 })}
+                      />
                     </div>
                   </div>
                   <Space style={{ width: '100%', justifyContent: 'space-between' }}>

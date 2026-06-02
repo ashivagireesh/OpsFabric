@@ -10553,15 +10553,19 @@ END;"""
             }
 
         def _data_ops_query_sql_from_config(route_source_override: str = "") -> str:
+            sql, _, _ = _data_ops_query_config_for_source(route_source_override)
+            return sql
+
+        def _data_ops_query_config_for_source(route_source_override: str = "") -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
             steps_by_id = {
                 str(step.get("id") or ""): step
                 for step in raw_steps
                 if isinstance(step, dict) and str(step.get("id") or "")
             }
 
-            def _step_query(step: Optional[Dict[str, Any]], query_id: str = "") -> str:
+            def _step_query(step: Optional[Dict[str, Any]], query_id: str = "") -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
                 if not isinstance(step, dict):
-                    return ""
+                    return "", {}, {}
                 query_rows = step.get("queryBuilders") or step.get("query_builders") or []
                 if isinstance(query_rows, list):
                     selected_id = query_id or str(step.get("activeQueryBuilderId") or step.get("active_query_builder_id") or "").strip()
@@ -10574,8 +10578,8 @@ END;"""
                     for item in candidates:
                         sql = str(item.get("query") or item.get("expression") or "").strip()
                         if sql:
-                            return sql
-                return str(step.get("query") or step.get("expression") or "").strip()
+                            return sql, item, step
+                return str(step.get("query") or step.get("expression") or "").strip(), {}, step
 
             route_source = str(route_source_override or "").strip()
             for step in raw_steps:
@@ -10594,10 +10598,63 @@ END;"""
 
             for step in raw_steps:
                 if isinstance(step, dict) and _kind(step) == "prepare":
-                    sql = _step_query(step)
+                    sql, query_config, source_step = _step_query(step)
                     if sql:
-                        return sql
-            return ""
+                        return sql, query_config, source_step
+            return "", {}, {}
+
+        def _data_ops_query_bind_params(sql: str, route_source_override: str = "") -> Dict[str, Any]:
+            used_names = {
+                str(match.group(1) or "").strip()
+                for match in re.finditer(r":([A-Za-z_][A-Za-z0-9_$#]*)", str(sql or ""))
+            }
+            if not used_names:
+                return {}
+            _, query_config, source_step = _data_ops_query_config_for_source(route_source_override)
+            bind_rows = []
+            if isinstance(query_config, dict):
+                bind_rows.extend(query_config.get("bindParameters") or query_config.get("bind_parameters") or query_config.get("bindParams") or [])
+            if isinstance(source_step, dict):
+                bind_rows.extend(source_step.get("bindParameters") or source_step.get("bind_parameters") or source_step.get("bindParams") or [])
+
+            params: Dict[str, Any] = {}
+            for row in bind_rows:
+                if not isinstance(row, dict) or row.get("enabled") is False:
+                    continue
+                name = str(row.get("name") or row.get("param") or row.get("key") or "").strip().lstrip(":")
+                if not name or name not in used_names:
+                    continue
+                if row.get("defaultValue") is not None or row.get("default_value") is not None:
+                    params[name] = row.get("defaultValue") if row.get("defaultValue") is not None else row.get("default_value")
+
+            route_source = str(route_source_override or "").strip()
+            for step in raw_steps:
+                if not isinstance(step, dict):
+                    continue
+                step_source = str(
+                    step.get("lookupSource")
+                    or step.get("lookup_source")
+                    or step.get("routeSource")
+                    or step.get("route_source")
+                    or ""
+                ).strip()
+                if route_source and step_source != route_source:
+                    continue
+                for item in step.get("queryInputs") or step.get("query_inputs") or step.get("bindInputs") or []:
+                    if not isinstance(item, dict) or item.get("enabled") is False:
+                        continue
+                    name = str(item.get("param") or item.get("name") or item.get("bindParam") or item.get("bind_param") or "").strip().lstrip(":")
+                    if not name or name not in used_names:
+                        continue
+                    mode = str(item.get("sourceMode") or item.get("source_mode") or "default").strip().lower()
+                    if mode == "fixed":
+                        params[name] = item.get("value", "")
+                    elif mode == "field":
+                        # Saved query execution is set-level. A downstream row field cannot be
+                        # resolved before the query runs, so keep the bind default for this mode.
+                        params.setdefault(name, item.get("value", ""))
+
+            return {name: value for name, value in params.items() if name in used_names}
 
         def _oracle_query_value(value: Any) -> Any:
             if hasattr(value, "read"):
@@ -10647,10 +10704,11 @@ END;"""
                     try:
                         batch_size = _query_result_row_limit()
                         total_limit = _query_result_total_limit()
+                        bind_params = _data_ops_query_bind_params(sql, route_source_override)
                         cursor.arraysize = max(1, min(batch_size, 5000))
                         cursor.execute(
                             f"SELECT * FROM ({sql}) WHERE ROWNUM <= :limit",
-                            {"limit": total_limit},
+                            {**bind_params, "limit": total_limit},
                         )
                         columns = [str(desc[0] or "") for desc in (cursor.description or [])]
                         fetched = []
@@ -13034,40 +13092,80 @@ END;"""
 
     def _profile_query_oracle_profile_cfg_from_source_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
         cfg = dict(config or {})
+
+        def _first_non_empty(*keys: str) -> Any:
+            for key in keys:
+                value = cfg.get(key)
+                if value is not None and str(value).strip() != "":
+                    return value
+            return ""
+
+        if not (
+            _first_non_empty(
+                "custom_profile_oracle_dsn",
+                "oracle_dsn",
+                "dsn",
+                "custom_profile_oracle_host",
+                "oracle_host",
+                "host",
+            )
+            and _first_non_empty("custom_profile_oracle_user", "oracle_user", "user")
+            and _first_non_empty("custom_profile_oracle_password", "oracle_password", "password")
+        ):
+            raw_steps = cfg.get("data_ops_pipeline_nodes") or cfg.get("pipeline_steps")
+            if isinstance(raw_steps, list):
+                for step in raw_steps:
+                    if not isinstance(step, dict):
+                        continue
+                    raw_connections = step.get("connections")
+                    if not isinstance(raw_connections, list):
+                        continue
+                    for connection in raw_connections:
+                        if not isinstance(connection, dict):
+                            continue
+                        if str(connection.get("type") or "").strip().lower() != "oracle":
+                            continue
+                        if (
+                            str(connection.get("dsn") or "").strip()
+                            or str(connection.get("host") or "").strip()
+                            or str(connection.get("user") or "").strip()
+                        ):
+                            merged_cfg = dict(cfg)
+                            for key, value in connection.items():
+                                if value is not None and str(value).strip() != "":
+                                    merged_cfg[key] = value
+                            cfg = merged_cfg
+                            break
+                    if _first_non_empty("dsn", "host", "user", "password"):
+                        break
+
         return {
-            "custom_profile_oracle_host": cfg.get("custom_profile_oracle_host") or cfg.get("host"),
-            "custom_profile_oracle_port": cfg.get("custom_profile_oracle_port") or cfg.get("port"),
+            "custom_profile_oracle_host": _first_non_empty("custom_profile_oracle_host", "oracle_host", "host"),
+            "custom_profile_oracle_port": _first_non_empty("custom_profile_oracle_port", "oracle_port", "port"),
             "custom_profile_oracle_service_name": (
-                cfg.get("custom_profile_oracle_service_name")
-                or cfg.get("service_name")
+                _first_non_empty("custom_profile_oracle_service_name", "oracle_service_name", "service_name", "service")
             ),
-            "custom_profile_oracle_sid": cfg.get("custom_profile_oracle_sid") or cfg.get("sid"),
-            "custom_profile_oracle_user": cfg.get("custom_profile_oracle_user") or cfg.get("user"),
+            "custom_profile_oracle_sid": _first_non_empty("custom_profile_oracle_sid", "oracle_sid", "sid"),
+            "custom_profile_oracle_user": _first_non_empty("custom_profile_oracle_user", "oracle_user", "user"),
             "custom_profile_oracle_password": (
-                cfg.get("custom_profile_oracle_password")
-                or cfg.get("password")
+                _first_non_empty("custom_profile_oracle_password", "oracle_password", "password")
             ),
-            "custom_profile_oracle_dsn": cfg.get("custom_profile_oracle_dsn") or cfg.get("dsn"),
+            "custom_profile_oracle_dsn": _first_non_empty("custom_profile_oracle_dsn", "oracle_dsn", "dsn"),
             "custom_profile_oracle_table": self._profile_query_extract_oracle_source_table(cfg),
             "custom_profile_oracle_write_strategy": (
-                cfg.get("custom_profile_oracle_write_strategy")
-                or cfg.get("write_strategy")
+                _first_non_empty("custom_profile_oracle_write_strategy", "oracle_write_strategy", "write_strategy")
             ),
             "custom_profile_oracle_parallel_workers": (
-                cfg.get("custom_profile_oracle_parallel_workers")
-                or cfg.get("parallel_workers")
+                _first_non_empty("custom_profile_oracle_parallel_workers", "oracle_parallel_workers", "parallel_workers")
             ),
             "custom_profile_oracle_parallel_min_tokens": (
-                cfg.get("custom_profile_oracle_parallel_min_tokens")
-                or cfg.get("parallel_min_tokens")
+                _first_non_empty("custom_profile_oracle_parallel_min_tokens", "oracle_parallel_min_tokens", "parallel_min_tokens")
             ),
             "custom_profile_oracle_merge_batch_size": (
-                cfg.get("custom_profile_oracle_merge_batch_size")
-                or cfg.get("merge_batch_size")
+                _first_non_empty("custom_profile_oracle_merge_batch_size", "oracle_merge_batch_size", "merge_batch_size")
             ),
             "custom_profile_oracle_parallel_force": (
-                cfg.get("custom_profile_oracle_parallel_force")
-                or cfg.get("parallel_force")
+                _first_non_empty("custom_profile_oracle_parallel_force", "oracle_parallel_force", "parallel_force")
             ),
         }
 
@@ -14205,6 +14303,52 @@ END;"""
             if callable(warn_cb) and (skipped_missing_key > 0 or skipped_invalid_patch > 0):
                 warn_cb(
                     "Profile Query Oracle patch completed with skips: "
+                    f"updated={updated_count}, missing_key={skipped_missing_key}, invalid_patch={skipped_invalid_patch}."
+                )
+            return
+
+        if target_node_type == "data_ops" and storage == "oracle":
+            data_ops_patch_cfg = dict(safe_cfg)
+            if (
+                "profile_patch_oracle_full_document_fallback" not in data_ops_patch_cfg
+                and "profile_patch_oracle_fallback" not in data_ops_patch_cfg
+            ):
+                data_ops_patch_cfg["profile_patch_oracle_full_document_fallback"] = False
+            data_ops_patch_cfg.setdefault("profile_patch_oracle_allow_any_pipeline_id", True)
+            data_ops_patch_cfg.setdefault("profile_patch_oracle_allow_any_node_id", True)
+            updated_count, skipped_missing_key, skipped_invalid_patch = self._apply_profile_query_patch_updates_oracle_source(
+                source_rows,
+                data_ops_patch_cfg,
+                target_node_config,
+                pipeline_id=pipeline_id,
+                target_node_id=target_node_id,
+                warn_cb=warn_cb,
+            )
+            if (
+                updated_count <= 0
+                and patch_stage == "post"
+                and isinstance(pre_rows, list)
+                and len(pre_rows) > 0
+                and pre_rows is not source_rows
+            ):
+                updated_count, skipped_missing_key, skipped_invalid_patch = self._apply_profile_query_patch_updates_oracle_source(
+                    pre_rows,
+                    data_ops_patch_cfg,
+                    target_node_config,
+                    pipeline_id=pipeline_id,
+                    target_node_id=target_node_id,
+                    warn_cb=warn_cb,
+                )
+            if updated_count <= 0:
+                if callable(warn_cb):
+                    warn_cb(
+                        "Profile Query Data Ops Oracle patch skipped: "
+                        f"updated=0, missing_key={skipped_missing_key}, invalid_patch={skipped_invalid_patch}."
+                    )
+                return
+            if callable(warn_cb) and (skipped_missing_key > 0 or skipped_invalid_patch > 0):
+                warn_cb(
+                    "Profile Query Data Ops Oracle patch completed with skips: "
                     f"updated={updated_count}, missing_key={skipped_missing_key}, invalid_patch={skipped_invalid_patch}."
                 )
             return
