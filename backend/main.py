@@ -35,6 +35,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from contextlib import asynccontextmanager
 from email.message import EmailMessage
 from email.utils import make_msgid
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -45,6 +46,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy.orm import Session, load_only
+from sqlalchemy.orm.attributes import flag_modified
 from loguru import logger
 try:
     import lmdb as _lmdb  # type: ignore
@@ -381,6 +383,7 @@ threadsafe_ws_manager = ThreadSafeWebSocketProxy()
 
 SCHEDULE_JOB_PREFIX = "pipeline_schedule:"
 DATA_OPS_SYNC_JOB_PREFIX = "data_ops_mapper_sync:"
+DATA_OPS_TASK_MASTER_JOB_PREFIX = "data_ops_task_master:"
 DATA_OPS_ROUTER_JOB_PREFIX = "data_ops_router:"
 DATA_OPS_SCHEDULE_REGISTRY_SYNC_JOB_ID = "data_ops_schedule_registry_sync"
 SCHEDULE_PRESET_TO_CRON = {
@@ -420,6 +423,7 @@ def _env_bool(name: str, default: bool) -> bool:
     return bool(default)
 
 
+PIPELINE_GATEWAY_MAX_ROWS = _env_int("PIPELINE_GATEWAY_MAX_ROWS", 500000, 1000, 2000000)
 _EXECUTION_HISTORY_MAX_ROWS = _env_int("EXECUTION_HISTORY_MAX_ROWS", 2000, 10, 50000)
 _EXECUTION_HISTORY_MAX_LOG_ENTRIES = _env_int("EXECUTION_HISTORY_MAX_LOG_ENTRIES", 500, 20, 10000)
 _EXECUTION_HISTORY_LOG_MESSAGE_MAX_CHARS = _env_int("EXECUTION_HISTORY_LOG_MESSAGE_MAX_CHARS", 800, 120, 10000)
@@ -1626,6 +1630,49 @@ def _persist_execution_terminal_status_only(execution_id: str, payload: Dict[str
     return False
 
 
+def _append_execution_error_log_and_fail(execution_id: str, message: str) -> bool:
+    """Last-resort worker crash persistence so UI polling cannot remain running forever."""
+    execution_id_norm = str(execution_id or "").strip()
+    if not execution_id_norm:
+        return False
+
+    crash_log = {
+        "nodeId": "__system__",
+        "nodeLabel": "System",
+        "timestamp": datetime.utcnow().isoformat(),
+        "status": "error",
+        "message": f"✗ {message}",
+        "rows": 0,
+    }
+    recovery_db = SessionLocal()
+    try:
+        execution = recovery_db.query(models.Execution).filter(
+            models.Execution.id == execution_id_norm
+        ).first()
+        if execution is None:
+            return False
+        status_norm = str(execution.status or "").strip().lower()
+        if status_norm in {"success", "failed", "cancelled"}:
+            return True
+        existing_logs = execution.logs if isinstance(execution.logs, list) else []
+        execution.logs = _compact_execution_logs_for_history([*existing_logs, crash_log])
+        flag_modified(execution, "logs")
+        execution.status = "failed"
+        execution.finished_at = execution.finished_at or datetime.utcnow()
+        if not execution.error_message:
+            execution.error_message = message
+        recovery_db.commit()
+        return True
+    except Exception as persist_exc:
+        recovery_db.rollback()
+        logger.error(
+            f"Failed to persist worker crash for execution {execution_id_norm}: {persist_exc}"
+        )
+        return False
+    finally:
+        recovery_db.close()
+
+
 def _compact_node_result_for_history(value: Any, max_rows: int) -> Any:
     """
     Keep execution history lightweight by truncating very large in-memory node outputs.
@@ -2337,9 +2384,19 @@ def _start_pipeline_execution(
                     )
                 )
             except Exception as exc:
-                logger.error(
-                    f"Execution worker crashed for {execution_id}: {exc}"
+                logger.exception(f"Execution worker crashed for {execution_id}: {exc}")
+                _append_execution_error_log_and_fail(
+                    execution_id,
+                    f"Execution worker crashed before completion: {exc}",
                 )
+                execution_abort_events.pop(execution_id, None)
+                execution_abort_requested_at.pop(execution_id, None)
+                execution_workers.pop(execution_id, None)
+                with _execution_pipeline_overrides_lock:
+                    execution_pipeline_overrides.pop(str(execution_id or "").strip(), None)
+                _clear_execution_runtime_node_enabled(execution_id)
+                with _execution_log_flush_lock:
+                    _execution_log_flush_state.pop(execution_id, None)
 
         worker = threading.Thread(
             target=_worker_runner,
@@ -2885,6 +2942,19 @@ class DataOpsOracleQueryPreviewRequest(BaseModel):
     limit: int = 100
 
 
+class DataOpsCheckpointResetRequest(BaseModel):
+    pipeline_id: Optional[str] = None
+    data_ops_node_id: Optional[str] = None
+    task_master_id: Optional[str] = None
+    mapper_step_id: Optional[str] = None
+    mapper_config_id: Optional[str] = None
+
+
+class DataOpsCheckpointUpdateRequest(DataOpsCheckpointResetRequest):
+    last_source_id: Optional[Any] = None
+    last_transaction_time: Optional[Any] = None
+
+
 class DataOpsOracleSyncScheduleRequest(BaseModel):
     config: dict = {}
     sql: str = ""
@@ -2893,6 +2963,42 @@ class DataOpsOracleSyncScheduleRequest(BaseModel):
     data_ops_node_id: Optional[str] = None
     mapper_step_id: Optional[str] = None
     mapper_config_id: Optional[str] = None
+    task_master_id: Optional[str] = None
+    task_master_name: Optional[str] = None
+    task_window_mode: Optional[str] = None
+    task_window_indicator: Optional[str] = None
+    task_monthly_run_day: Optional[int] = 1
+    task_lookback_count: Optional[int] = 1
+    task_lookback_unit: Optional[str] = "day"
+    task_duplicate_policy: Optional[str] = "skip_completed"
+    task_start_at: Optional[str] = None
+    task_end_at: Optional[str] = None
+    enabled: bool = False
+    deploy_enabled: bool = False
+    schedule_type: str = "interval"
+    interval_minutes: int = 60
+    cron: Optional[str] = None
+    timezone: Optional[str] = None
+    max_instances: int = 1
+    misfire_policy: str = "skip"
+
+
+class DataOpsTaskMasterSubTaskScheduleSpec(BaseModel):
+    config: dict = {}
+    sql: str = ""
+    mapper_config_id: str
+    mapper_config_name: Optional[str] = None
+    enabled: bool = True
+    run_order: int = 1
+
+
+class DataOpsTaskMasterScheduleRequest(BaseModel):
+    config: dict = {}
+    sub_tasks: List[DataOpsTaskMasterSubTaskScheduleSpec] = []
+    job_id: str
+    pipeline_id: Optional[str] = None
+    data_ops_node_id: Optional[str] = None
+    mapper_step_id: Optional[str] = None
     task_master_id: Optional[str] = None
     task_master_name: Optional[str] = None
     task_window_mode: Optional[str] = None
@@ -14170,9 +14276,10 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
                         "message": f"✗ {cancel_message}",
                         "rows": 0,
                     }
-                    merged_logs = logs if isinstance(logs, list) else []
+                    merged_logs = list(logs) if isinstance(logs, list) else []
                     merged_logs.append(stale_log)
                     execution.logs = merged_logs
+                    flag_modified(execution, "logs")
                 db.commit()
                 return
 
@@ -14192,6 +14299,7 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
                     "rows": 0,
                 }
                 execution.logs = [cancel_log]
+                flag_modified(execution, "logs")
                 if not execution.error_message:
                     execution.error_message = cancel_message
                 db.commit()
@@ -14211,6 +14319,7 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
                 "rows": 0,
             }
             execution.logs = [stale_log]
+            flag_modified(execution, "logs")
             db.commit()
             return
 
@@ -14293,9 +14402,10 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
                     "message": f"✗ {stale_message}",
                     "rows": 0,
                 }
-                merged_logs = logs if isinstance(logs, list) else []
+                merged_logs = list(logs) if isinstance(logs, list) else []
                 merged_logs.append(stale_log)
                 execution.logs = merged_logs
+                flag_modified(execution, "logs")
                 db.commit()
                 return
 
@@ -14327,9 +14437,10 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
                         "message": f"✗ {cancel_message}",
                         "rows": 0,
                     }
-                    merged_logs = logs if isinstance(logs, list) else []
+                    merged_logs = list(logs) if isinstance(logs, list) else []
                     merged_logs.append(stale_log)
                     execution.logs = merged_logs
+                    flag_modified(execution, "logs")
                 db.commit()
                 return
             stale_message = "Execution auto-finalized as failed: worker thread is not active."
@@ -14345,9 +14456,10 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
                 "message": f"✗ {stale_message}",
                 "rows": 0,
             }
-            merged_logs = logs if isinstance(logs, list) else []
+            merged_logs = list(logs) if isinstance(logs, list) else []
             merged_logs.append(stale_log)
             execution.logs = merged_logs
+            flag_modified(execution, "logs")
             db.commit()
             return
 
@@ -14371,9 +14483,10 @@ def _try_finalize_stale_running_execution(execution: models.Execution, db: Sessi
                     "message": f"✗ {cancel_message}",
                     "rows": 0,
                 }
-                merged_logs = logs if isinstance(logs, list) else []
+                merged_logs = list(logs) if isinstance(logs, list) else []
                 merged_logs.append(stale_log)
                 execution.logs = merged_logs
+                flag_modified(execution, "logs")
             db.commit()
             return
 
@@ -15139,6 +15252,99 @@ def _data_ops_schedule_activity_lock_path() -> Path:
     return _BACKEND_DIR / "state" / "data_ops_schedule_activity.lock"
 
 
+def _data_ops_stop_signals_path() -> Path:
+    return _BACKEND_DIR / "state" / "data_ops_stop_signals.json"
+
+
+def _data_ops_stop_signals_lock_path() -> Path:
+    return _BACKEND_DIR / "state" / "data_ops_stop_signals.lock"
+
+
+def _load_data_ops_stop_signals_unlocked() -> List[Dict[str, Any]]:
+    path = _data_ops_stop_signals_path()
+    try:
+        if not path.exists():
+            return []
+        parsed = json.loads(path.read_text(encoding="utf-8") or "[]")
+        return [row for row in parsed if isinstance(row, dict)] if isinstance(parsed, list) else []
+    except Exception as exc:
+        logger.warning(f"Failed loading Data Ops stop signals: {exc}")
+        return []
+
+
+def _write_data_ops_stop_signals_unlocked(rows: List[Dict[str, Any]]) -> None:
+    path = _data_ops_stop_signals_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{_os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(rows[-500:], indent=2, ensure_ascii=False, sort_keys=True, default=str), encoding="utf-8")
+    _os.replace(tmp_path, path)
+
+
+def _data_ops_stop_scope_matches(signal: Dict[str, Any], scope: Dict[str, Any]) -> bool:
+    if str(signal.get("job_id") or "").strip() and str(signal.get("job_id") or "").strip() == str(scope.get("job_id") or "").strip():
+        return True
+    scoped_keys = ["pipeline_id", "data_ops_node_id", "mapper_step_id", "mapper_config_id", "router_step_id", "router_config_id", "task_master_id"]
+    matched = False
+    for key in scoped_keys:
+        signal_value = str(signal.get(key) or "").strip()
+        if not signal_value:
+            continue
+        matched = True
+        if signal_value != str(scope.get(key) or "").strip():
+            return False
+    return matched
+
+
+def _request_data_ops_stop_signal(scope: Dict[str, Any]) -> Dict[str, Any]:
+    signal = {
+        "requested_at": datetime.utcnow().isoformat() + "Z",
+        "job_id": str(scope.get("job_id") or "").strip(),
+        "pipeline_id": str(scope.get("pipeline_id") or "").strip(),
+        "data_ops_node_id": str(scope.get("data_ops_node_id") or "").strip(),
+        "mapper_step_id": str(scope.get("mapper_step_id") or "").strip(),
+        "mapper_config_id": str(scope.get("mapper_config_id") or "").strip(),
+        "router_step_id": str(scope.get("router_step_id") or "").strip(),
+        "router_config_id": str(scope.get("router_config_id") or "").strip(),
+        "task_master_id": str(scope.get("task_master_id") or "").strip(),
+    }
+    lock_path = _data_ops_stop_signals_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+        _lock_data_ops_schedule_registry(lock_handle)
+        try:
+            rows = _load_data_ops_stop_signals_unlocked()
+            rows.append(signal)
+            _write_data_ops_stop_signals_unlocked(rows)
+        finally:
+            _unlock_data_ops_schedule_registry(lock_handle)
+    return signal
+
+
+def _clear_data_ops_stop_signals_for_scope(scope: Dict[str, Any]) -> None:
+    lock_path = _data_ops_stop_signals_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+        _lock_data_ops_schedule_registry(lock_handle)
+        try:
+            rows = _load_data_ops_stop_signals_unlocked()
+            kept = [row for row in rows if not _data_ops_stop_scope_matches(row, scope)]
+            if len(kept) != len(rows):
+                _write_data_ops_stop_signals_unlocked(kept)
+        finally:
+            _unlock_data_ops_schedule_registry(lock_handle)
+
+
+def _data_ops_stop_requested(scope: Dict[str, Any]) -> bool:
+    lock_path = _data_ops_stop_signals_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+        _lock_data_ops_schedule_registry(lock_handle)
+        try:
+            return any(_data_ops_stop_scope_matches(row, scope) for row in _load_data_ops_stop_signals_unlocked())
+        finally:
+            _unlock_data_ops_schedule_registry(lock_handle)
+
+
 def _load_data_ops_schedule_activity_rows_unlocked() -> List[Dict[str, Any]]:
     path = _data_ops_schedule_activity_path()
     try:
@@ -15198,6 +15404,559 @@ def _record_data_ops_schedule_activity(job_id: str, status: str, message: str = 
             _unlock_data_ops_schedule_registry(lock_handle)
 
 
+def _sync_data_ops_activity_checkpoint_binds(
+    checkpoint_key: str,
+    last_source_id: Any,
+    last_transaction_time: Any,
+) -> Dict[str, Any]:
+    normalized_key = str(checkpoint_key or "").strip()
+    if not normalized_key:
+        return {"activity_rows_updated": 0}
+    mutable_statuses = {"queued", "running", "scheduled", "stopping"}
+    updated_count = 0
+    reconciled_at = datetime.utcnow().isoformat() + "Z"
+
+    def reconcile_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+        changed = 0
+        next_rows: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            next_row = dict(row)
+            bind_params = next_row.get("task_bind_params") if isinstance(next_row.get("task_bind_params"), dict) else {}
+            row_checkpoint_key = str(bind_params.get("checkpoint_key") or next_row.get("checkpoint_key") or "").strip()
+            row_status = str(next_row.get("status") or "").strip().lower()
+            if row_checkpoint_key == normalized_key and row_status in mutable_statuses:
+                next_binds = dict(bind_params)
+                next_binds["checkpoint_last_source_id"] = last_source_id
+                next_binds["checkpoint_last_transaction_time"] = last_transaction_time
+                next_binds["checkpoint_key"] = normalized_key
+                next_row["task_bind_params"] = next_binds
+                next_row["checkpoint_cursor_reconciled_at"] = reconciled_at
+                changed += 1
+            next_rows.append(next_row)
+        return next_rows, changed
+
+    with _data_ops_schedule_activity_lock:
+        next_memory_rows, memory_updated = reconcile_rows(_data_ops_schedule_activity_rows)
+        if memory_updated:
+            _data_ops_schedule_activity_rows[:] = next_memory_rows
+    updated_count = max(updated_count, memory_updated)
+
+    lock_path = _data_ops_schedule_activity_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+        _lock_data_ops_schedule_registry(lock_handle)
+        try:
+            rows = _load_data_ops_schedule_activity_rows_unlocked()
+            next_rows, file_updated = reconcile_rows(rows)
+            if file_updated:
+                _write_data_ops_schedule_activity_rows_unlocked(next_rows)
+            updated_count = max(updated_count, file_updated)
+        finally:
+            _unlock_data_ops_schedule_registry(lock_handle)
+    return {"activity_rows_updated": updated_count}
+
+
+def _data_ops_checkpoint_path() -> Path:
+    return _BACKEND_DIR / "state" / "data_ops_checkpoints.json"
+
+
+def _data_ops_checkpoint_lock_path() -> Path:
+    return _BACKEND_DIR / "state" / "data_ops_checkpoints.lock"
+
+
+def _data_ops_checkpoint_key(
+    pipeline_id: str,
+    data_ops_node_id: str,
+    task_master_id: str,
+    mapper_step_id: str,
+    mapper_config_id: str,
+    business_window_key: str,
+) -> str:
+    # Incremental cursors are mapper-level state. The business window is stored
+    # on the checkpoint record for audit, but it must not split the cursor key.
+    parts = [
+        str(pipeline_id or "").strip(),
+        str(data_ops_node_id or "").strip(),
+        str(task_master_id or "").strip(),
+        str(mapper_step_id or "").strip(),
+        str(mapper_config_id or "").strip(),
+        "incremental_cursor",
+    ]
+    return "::".join(part.replace("::", "__") for part in parts)
+
+
+def _data_ops_checkpoint_identity_complete(
+    pipeline_id: str,
+    data_ops_node_id: str,
+    task_master_id: str,
+    mapper_step_id: str,
+    mapper_config_id: str,
+) -> bool:
+    return all(
+        str(value or "").strip()
+        for value in (pipeline_id, data_ops_node_id, task_master_id, mapper_step_id, mapper_config_id)
+    )
+
+
+def _data_ops_legacy_checkpoint_prefix(
+    pipeline_id: str,
+    data_ops_node_id: str,
+    task_master_id: str,
+    mapper_step_id: str,
+    mapper_config_id: str,
+) -> str:
+    parts = [
+        str(pipeline_id or "").strip(),
+        str(data_ops_node_id or "").strip(),
+        str(task_master_id or "").strip(),
+        str(mapper_step_id or "").strip(),
+        str(mapper_config_id or "").strip(),
+    ]
+    return "::".join(part.replace("::", "__") for part in parts) + "::"
+
+
+def _load_data_ops_checkpoints_unlocked() -> Dict[str, Dict[str, Any]]:
+    path = _data_ops_checkpoint_path()
+    try:
+        if not path.exists():
+            return {}
+        parsed = json.loads(path.read_text(encoding="utf-8") or "{}")
+        if not isinstance(parsed, dict):
+            return {}
+        return {
+            str(key): value
+            for key, value in parsed.items()
+            if str(key).strip() and isinstance(value, dict)
+        }
+    except Exception as exc:
+        logger.warning(f"Failed loading Data Ops checkpoints: {exc}")
+        return {}
+
+
+def _write_data_ops_checkpoints_unlocked(rows: Dict[str, Dict[str, Any]]) -> None:
+    path = _data_ops_checkpoint_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{_os.getpid()}.tmp")
+    tmp_path.write_text(
+        json.dumps(rows, indent=2, ensure_ascii=False, sort_keys=True, default=str),
+        encoding="utf-8",
+    )
+    _os.replace(tmp_path, path)
+
+
+def _load_data_ops_checkpoint_record(key: str) -> Dict[str, Any]:
+    normalized = str(key or "").strip()
+    if not normalized:
+        return {}
+    lock_path = _data_ops_checkpoint_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+        _lock_data_ops_schedule_registry(lock_handle)
+        try:
+            return dict(_load_data_ops_checkpoints_unlocked().get(normalized) or {})
+        finally:
+            _unlock_data_ops_schedule_registry(lock_handle)
+
+
+def _load_latest_data_ops_checkpoint_record_by_prefix(prefix: str) -> Dict[str, Any]:
+    normalized_prefix = str(prefix or "").strip()
+    if not normalized_prefix:
+        return {}
+    lock_path = _data_ops_checkpoint_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+        _lock_data_ops_schedule_registry(lock_handle)
+        try:
+            rows = _load_data_ops_checkpoints_unlocked()
+            matches = [
+                dict(value)
+                for key, value in rows.items()
+                if str(key).startswith(normalized_prefix)
+                and not str(key).endswith("::incremental_cursor")
+                and isinstance(value, dict)
+            ]
+            if not matches:
+                return {}
+            matches.sort(
+                key=lambda item: (
+                    bool(item.get("last_source_id") not in (None, "") or item.get("last_transaction_time") not in (None, "")),
+                    str(item.get("updated_at") or ""),
+                ),
+                reverse=True,
+            )
+            return dict(matches[0])
+        finally:
+            _unlock_data_ops_schedule_registry(lock_handle)
+
+
+def _upsert_data_ops_checkpoint_record(key: str, record: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = str(key or "").strip()
+    if not normalized:
+        return {}
+    lock_path = _data_ops_checkpoint_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+        _lock_data_ops_schedule_registry(lock_handle)
+        try:
+            rows = _load_data_ops_checkpoints_unlocked()
+            rows[normalized] = {
+                **dict(record or {}),
+                "checkpoint_key": normalized,
+                "updated_at": datetime.utcnow().isoformat() + "Z",
+            }
+            _write_data_ops_checkpoints_unlocked(rows)
+            return dict(rows[normalized])
+        finally:
+            _unlock_data_ops_schedule_registry(lock_handle)
+
+
+def _delete_data_ops_checkpoint_records_for_mapper(
+    pipeline_id: str,
+    data_ops_node_id: str,
+    task_master_id: str,
+    mapper_step_id: str,
+    mapper_config_id: str,
+) -> Dict[str, Any]:
+    checkpoint_key = _data_ops_checkpoint_key(
+        pipeline_id,
+        data_ops_node_id,
+        task_master_id,
+        mapper_step_id,
+        mapper_config_id,
+        "",
+    )
+    legacy_prefix = _data_ops_legacy_checkpoint_prefix(
+        pipeline_id,
+        data_ops_node_id,
+        task_master_id,
+        mapper_step_id,
+        mapper_config_id,
+    )
+    lock_path = _data_ops_checkpoint_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+        _lock_data_ops_schedule_registry(lock_handle)
+        try:
+            rows = _load_data_ops_checkpoints_unlocked()
+            removed_keys = [
+                key
+                for key in list(rows.keys())
+                if str(key) == checkpoint_key or str(key).startswith(legacy_prefix)
+            ]
+            for key in removed_keys:
+                rows.pop(key, None)
+            if removed_keys:
+                _write_data_ops_checkpoints_unlocked(rows)
+            return {
+                "checkpoint_key": checkpoint_key,
+                "legacy_prefix": legacy_prefix,
+                "removed": len(removed_keys),
+                "removed_keys": removed_keys,
+            }
+        finally:
+            _unlock_data_ops_schedule_registry(lock_handle)
+
+
+def _load_data_ops_checkpoint_record_for_mapper(
+    pipeline_id: str,
+    data_ops_node_id: str,
+    task_master_id: str,
+    mapper_step_id: str,
+    mapper_config_id: str,
+) -> Dict[str, Any]:
+    checkpoint_key = _data_ops_checkpoint_key(
+        pipeline_id,
+        data_ops_node_id,
+        task_master_id,
+        mapper_step_id,
+        mapper_config_id,
+        "",
+    )
+    record = _load_data_ops_checkpoint_record(checkpoint_key)
+    source = "stable" if record else ""
+    if not record:
+        record = _load_latest_data_ops_checkpoint_record_by_prefix(
+            _data_ops_legacy_checkpoint_prefix(
+                pipeline_id,
+                data_ops_node_id,
+                task_master_id,
+                mapper_step_id,
+                mapper_config_id,
+            )
+        )
+        source = "legacy" if record else ""
+    return {
+        "checkpoint_key": checkpoint_key,
+        "source": source,
+        "record": dict(record or {}),
+        "last_source_id": record.get("last_source_id") if isinstance(record, dict) else None,
+        "last_transaction_time": record.get("last_transaction_time") if isinstance(record, dict) else None,
+        "updated_at": record.get("updated_at") if isinstance(record, dict) else None,
+        "business_window_key": record.get("business_window_key") if isinstance(record, dict) else "",
+    }
+
+
+def _update_data_ops_checkpoint_record_for_mapper(
+    pipeline_id: str,
+    data_ops_node_id: str,
+    task_master_id: str,
+    mapper_step_id: str,
+    mapper_config_id: str,
+    last_source_id: Any,
+    last_transaction_time: Any,
+) -> Dict[str, Any]:
+    loaded = _load_data_ops_checkpoint_record_for_mapper(
+        pipeline_id,
+        data_ops_node_id,
+        task_master_id,
+        mapper_step_id,
+        mapper_config_id,
+    )
+    checkpoint_key = str(loaded.get("checkpoint_key") or "").strip()
+    record = {
+        **dict(loaded.get("record") or {}),
+        "pipeline_id": str(pipeline_id or ""),
+        "data_ops_node_id": str(data_ops_node_id or ""),
+        "task_master_id": str(task_master_id or ""),
+        "mapper_step_id": str(mapper_step_id or ""),
+        "mapper_config_id": str(mapper_config_id or ""),
+        "last_source_id": None if str(last_source_id or "").strip() == "" else _to_json_safe_value(last_source_id),
+        "last_transaction_time": None if str(last_transaction_time or "").strip() == "" else _to_json_safe_value(last_transaction_time),
+        "manual_override": True,
+    }
+    updated = _upsert_data_ops_checkpoint_record(checkpoint_key, record)
+    return {
+        "checkpoint_key": checkpoint_key,
+        "source": "stable",
+        "record": updated,
+        "last_source_id": updated.get("last_source_id"),
+        "last_transaction_time": updated.get("last_transaction_time"),
+        "updated_at": updated.get("updated_at"),
+        "business_window_key": updated.get("business_window_key") or "",
+    }
+
+
+def _data_ops_oracle_identifier(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("Oracle field name is required.")
+    return ".".join(
+        part.upper() if re.match(r"^[A-Za-z][A-Za-z0-9_$#]*$", part) else f'"{part.replace(chr(34), chr(34) + chr(34))}"'
+        for part in raw.split(".")
+        if part.strip()
+    )
+
+
+def _infer_data_ops_checkpoint_id_field(sql: Any) -> str:
+    text = str(sql or "")
+    if not text:
+        return ""
+    patterns = [
+        r"\b([A-Za-z][A-Za-z0-9_$#]*(?:\.[A-Za-z][A-Za-z0-9_$#]*)?)\s*>\s*:checkpoint_last_source_id\b",
+        r"\b([A-Za-z][A-Za-z0-9_$#]*(?:\.[A-Za-z][A-Za-z0-9_$#]*)?)\s*>=\s*:checkpoint_last_source_id\b",
+        r":checkpoint_last_source_id\b\s*<\s*([A-Za-z][A-Za-z0-9_$#]*(?:\.[A-Za-z][A-Za-z0-9_$#]*)?)",
+        r":checkpoint_last_source_id\b\s*<=\s*([A-Za-z][A-Za-z0-9_$#]*(?:\.[A-Za-z][A-Za-z0-9_$#]*)?)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            raw = str(match.group(1) or "").strip()
+            return raw.split(".")[-1].strip()
+    return ""
+
+
+def _extract_data_ops_checkpoint_source_sql(sql: Any) -> str:
+    text = str(sql or "").strip().rstrip(";")
+    if not text:
+        return ""
+    match = re.search(
+        r"(SELECT\s+\*\s+FROM\s+\(\s*SELECT\b.*?\)\s+batch_src\s+WHERE\s+ROWNUM\s*<=\s*\d+)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match:
+        return str(match.group(1) or "").strip()
+    return ""
+
+
+def _attach_data_ops_checkpoint_context(
+    runtime_config: Dict[str, Any],
+    pipeline_id: str,
+    data_ops_node_id: str,
+    task_master_id: str,
+    mapper_step_id: str,
+    mapper_config_id: str,
+    business_window_key: str,
+) -> Dict[str, Any]:
+    if runtime_config.get("_data_ops_checkpoint_enabled") is False:
+        return {}
+    if not _data_ops_checkpoint_identity_complete(
+        pipeline_id,
+        data_ops_node_id,
+        task_master_id,
+        mapper_step_id,
+        mapper_config_id,
+    ):
+        runtime_config["_data_ops_checkpoint_enabled"] = False
+        return {}
+    checkpoint_key = _data_ops_checkpoint_key(
+        pipeline_id,
+        data_ops_node_id,
+        task_master_id,
+        mapper_step_id,
+        mapper_config_id,
+        business_window_key,
+    )
+    previous = _load_data_ops_checkpoint_record(checkpoint_key)
+    if not previous:
+        previous = _load_latest_data_ops_checkpoint_record_by_prefix(
+            _data_ops_legacy_checkpoint_prefix(
+                pipeline_id,
+                data_ops_node_id,
+                task_master_id,
+                mapper_step_id,
+                mapper_config_id,
+            )
+        )
+    bind_params = runtime_config.get("_data_ops_task_bind_params") if isinstance(runtime_config.get("_data_ops_task_bind_params"), dict) else {}
+    bind_params = dict(bind_params or {})
+    bind_params["checkpoint_last_source_id"] = previous.get("last_source_id")
+    bind_params["checkpoint_last_transaction_time"] = previous.get("last_transaction_time")
+    bind_params["checkpoint_key"] = checkpoint_key
+    runtime_config["_data_ops_task_bind_params"] = bind_params
+    runtime_config["_data_ops_checkpoint_key"] = checkpoint_key
+    runtime_config["_data_ops_checkpoint_previous"] = previous
+    return previous
+
+
+def _probe_data_ops_checkpoint_from_source(config: Dict[str, Any]) -> Dict[str, Any]:
+    if config.get("_data_ops_checkpoint_enabled") is False:
+        return {}
+    source_sql = _strip_sql_terminator(config.get("_data_ops_checkpoint_source_sql"))
+    executable_sql = config.get("_data_ops_checkpoint_executable_sql")
+    source_keyword = _data_ops_first_sql_keyword(source_sql) if source_sql else ""
+    if not source_sql or source_keyword != "select":
+        extracted_source_sql = _extract_data_ops_checkpoint_source_sql(executable_sql or source_sql)
+        if extracted_source_sql:
+            source_sql = extracted_source_sql
+            config["_data_ops_checkpoint_source_sql"] = source_sql
+    id_field = str(config.get("_data_ops_checkpoint_id_field") or "").strip()
+    time_field = str(config.get("_data_ops_checkpoint_time_field") or "").strip()
+    if not id_field:
+        id_field = _infer_data_ops_checkpoint_id_field(source_sql) or _infer_data_ops_checkpoint_id_field(config.get("_data_ops_checkpoint_executable_sql"))
+        if id_field:
+            config["_data_ops_checkpoint_id_field"] = id_field
+    if not source_sql or (not id_field and not time_field):
+        return {}
+    select_parts: List[str] = []
+    order_parts: List[str] = []
+    if id_field:
+        id_expr = f"src.{_data_ops_oracle_identifier(id_field)}"
+        select_parts.append(f"{id_expr} AS checkpoint_source_id")
+        order_parts.append(f"{id_expr} DESC NULLS LAST")
+    if time_field:
+        time_expr = f"src.{_data_ops_oracle_identifier(time_field)}"
+        select_parts.append(f"{time_expr} AS checkpoint_transaction_time")
+        order_parts.insert(0, f"{time_expr} DESC NULLS LAST")
+    probe_sql = (
+        "SELECT * FROM (\n"
+        f"  SELECT {', '.join(select_parts)}\n"
+        f"  FROM (\n{source_sql}\n  ) src\n"
+        f"  ORDER BY {', '.join(order_parts)}\n"
+        ") WHERE ROWNUM <= 1"
+    )
+    conn = None
+    try:
+        conn = _data_ops_oracle_connect(config)
+        cur = conn.cursor()
+        bind_params = config.get("_data_ops_task_bind_params") if isinstance(config, dict) else {}
+        if not isinstance(bind_params, dict):
+            bind_params = {}
+        used_bind_names = {
+            str(match.group(1) or "").strip()
+            for match in re.finditer(r":([A-Za-z_][A-Za-z0-9_$#]*)", probe_sql)
+        }
+        execution_binds = {
+            str(key): value
+            for key, value in bind_params.items()
+            if str(key) in used_bind_names
+        }
+        if execution_binds:
+            cur.execute(probe_sql, execution_binds)
+        else:
+            cur.execute(probe_sql)
+        columns = [str(desc[0] or "").lower() for desc in (cur.description or [])]
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return {}
+        values = {columns[idx]: _to_json_safe_value(value) for idx, value in enumerate(row) if idx < len(columns)}
+        return {
+            "last_source_id": values.get("checkpoint_source_id"),
+            "last_transaction_time": values.get("checkpoint_transaction_time"),
+        }
+    except Exception as exc:
+        logger.warning(f"Failed probing Data Ops checkpoint source: {exc}")
+        return {}
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _save_data_ops_checkpoint_after_success(
+    runtime_config: Dict[str, Any],
+    pipeline_id: str,
+    data_ops_node_id: str,
+    task_master_id: str,
+    mapper_step_id: str,
+    mapper_config_id: str,
+    business_window_key: str,
+    rowcount: int,
+    run_id: str,
+) -> Dict[str, Any]:
+    checkpoint_key = str(runtime_config.get("_data_ops_checkpoint_key") or "").strip() or _data_ops_checkpoint_key(
+        pipeline_id,
+        data_ops_node_id,
+        task_master_id,
+        mapper_step_id,
+        mapper_config_id,
+        business_window_key,
+    )
+    if runtime_config.get("_data_ops_checkpoint_enabled") is False or not checkpoint_key:
+        return {}
+    if not _data_ops_checkpoint_identity_complete(
+        pipeline_id,
+        data_ops_node_id,
+        task_master_id,
+        mapper_step_id,
+        mapper_config_id,
+    ):
+        return dict(runtime_config.get("_data_ops_checkpoint_previous") or {})
+    probe = _probe_data_ops_checkpoint_from_source(runtime_config)
+    if not probe and int(rowcount or 0) <= 0:
+        return dict(runtime_config.get("_data_ops_checkpoint_previous") or {})
+    record = {
+        **dict(runtime_config.get("_data_ops_checkpoint_previous") or {}),
+        **{key: value for key, value in probe.items() if value not in (None, "")},
+        "pipeline_id": str(pipeline_id or ""),
+        "data_ops_node_id": str(data_ops_node_id or ""),
+        "task_master_id": str(task_master_id or ""),
+        "mapper_step_id": str(mapper_step_id or ""),
+        "mapper_config_id": str(mapper_config_id or ""),
+        "business_window_key": str(business_window_key or ""),
+        "id_field": str(runtime_config.get("_data_ops_checkpoint_id_field") or ""),
+        "transaction_time_field": str(runtime_config.get("_data_ops_checkpoint_time_field") or ""),
+        "last_success_run_id": str(run_id or ""),
+        "last_rowcount": int(rowcount or 0),
+    }
+    return _upsert_data_ops_checkpoint_record(checkpoint_key, record)
+
+
 def _parse_data_ops_job_id(job_id: str) -> Dict[str, str]:
     if job_id.startswith(DATA_OPS_ROUTER_JOB_PREFIX):
         raw = job_id[len(DATA_OPS_ROUTER_JOB_PREFIX):]
@@ -15208,6 +15967,17 @@ def _parse_data_ops_job_id(job_id: str) -> Dict[str, str]:
             "data_ops_node_id": parts[1] if len(parts) > 1 else "",
             "step_id": parts[2] if len(parts) > 2 else "",
             "config_id": parts[3] if len(parts) > 3 else "",
+        }
+    if job_id.startswith(DATA_OPS_TASK_MASTER_JOB_PREFIX):
+        raw = job_id[len(DATA_OPS_TASK_MASTER_JOB_PREFIX):]
+        parts = raw.split(":")
+        return {
+            "kind": "task_master",
+            "pipeline_id": parts[0] if len(parts) > 2 else "",
+            "data_ops_node_id": parts[0] if len(parts) > 0 else "",
+            "step_id": parts[1] if len(parts) > 1 else "",
+            "config_id": "",
+            "task_master_id": parts[2] if len(parts) > 2 else "",
         }
     if job_id.startswith(DATA_OPS_SYNC_JOB_PREFIX):
         raw = job_id[len(DATA_OPS_SYNC_JOB_PREFIX):]
@@ -15229,11 +15999,13 @@ def _data_ops_schedule_monitor_rows(scheduler_jobs: List[Dict[str, Any]], checke
         registry = {}
     data_ops_jobs = [
         job for job in scheduler_jobs
-        if str(job.get("id", "")).startswith((DATA_OPS_SYNC_JOB_PREFIX, DATA_OPS_ROUTER_JOB_PREFIX))
+        if str(job.get("id", "")).startswith((DATA_OPS_SYNC_JOB_PREFIX, DATA_OPS_TASK_MASTER_JOB_PREFIX, DATA_OPS_ROUTER_JOB_PREFIX))
     ]
     rows: List[Dict[str, Any]] = []
+    seen_job_ids: set[str] = set()
     for job in data_ops_jobs:
         job_id = str(job.get("id") or "")
+        seen_job_ids.add(job_id)
         record = registry.get(job_id) if isinstance(registry.get(job_id), dict) else {}
         parsed = _parse_data_ops_job_id(job_id)
         row = {
@@ -15245,12 +16017,42 @@ def _data_ops_schedule_monitor_rows(scheduler_jobs: List[Dict[str, Any]], checke
             "status": "scheduled",
             "next_run_at": job.get("next_run_at") or record.get("next_run_at"),
             "schedule_type": record.get("schedule_type") or "interval",
-            "interval_minutes": record.get("interval_minutes"),
+            "interval_minutes": record.get("interval_minutes") if str(record.get("schedule_type") or "").strip().lower() != "cron" else None,
             "cron": record.get("cron"),
             "timezone": record.get("timezone") or "Asia/Kolkata",
             "last_checked_at": checked_at,
         }
         rows.append(row)
+    if isinstance(registry, dict):
+        for job_id, raw_record in registry.items():
+            if job_id in seen_job_ids or not isinstance(raw_record, dict):
+                continue
+            record = dict(raw_record)
+            if not _data_ops_schedule_record_enabled(record):
+                continue
+            parsed = _parse_data_ops_job_id(str(job_id))
+            next_run_at = record.get("next_run_at")
+            if not next_run_at:
+                try:
+                    trigger, _schedule_text = _data_ops_schedule_record_trigger(record)
+                    next_run_at = _scheduler_job_next_run_at(None, trigger)
+                except Exception:
+                    next_run_at = None
+            rows.append({
+                **parsed,
+                **record,
+                "job_id": str(job_id),
+                "name": str(record.get("name") or record.get("task_master_name") or record.get("mapper_config_name") or parsed.get("kind") or "Data Ops job"),
+                "kind": str(record.get("kind") or parsed.get("kind") or "scheduler"),
+                "status": "scheduled",
+                "next_run_at": next_run_at,
+                "schedule_type": record.get("schedule_type") or "interval",
+                "interval_minutes": record.get("interval_minutes") if str(record.get("schedule_type") or "").strip().lower() != "cron" else None,
+                "cron": record.get("cron"),
+                "timezone": record.get("timezone") or "Asia/Kolkata",
+                "last_checked_at": checked_at,
+                "registry_only": True,
+            })
     recent_activity = _load_data_ops_schedule_activity_rows()
     latest_by_job: Dict[str, Dict[str, Any]] = {}
     for row in recent_activity:
@@ -15275,9 +16077,14 @@ def _data_ops_schedule_monitor_rows(scheduler_jobs: List[Dict[str, Any]], checke
             activity_age_seconds = max(0.0, (checked_dt - activity_dt).total_seconds())
         except Exception:
             pass
-        if activity_status == "running" and activity_age_seconds > 20:
+        has_next_run = bool(row.get("next_run_at"))
+        if activity_status == "running" and activity_age_seconds <= 20:
+            row["status"] = activity.get("status")
+        elif activity_status in {"failed", "error", "failure"}:
+            row["status"] = activity.get("status")
+        elif has_next_run:
             row["status"] = "scheduled"
-        elif activity_status in {"running", "success", "failed", "skipped"}:
+        elif activity_status in {"success", "skipped", "running"}:
             row["status"] = activity.get("status")
         for key in ("execution_id", "duration_ms", "source_rows", "rows_processed", "destination_rows", "rejected_rows", "mismatch_rows"):
             if key in activity:
@@ -15353,6 +16160,24 @@ async def clear_runtime_monitor_data_ops_activity_post():
 @app.delete("/api/runtime/monitor/data-ops-activity")
 async def clear_runtime_monitor_data_ops_activity():
     return _clear_runtime_monitor_data_ops_activity_rows()
+
+
+@app.post("/api/data-ops/oracle/stop")
+async def data_ops_oracle_stop(body: Dict[str, Any]):
+    signal = _request_data_ops_stop_signal(body or {})
+    job_id = str(signal.get("job_id") or "").strip()
+    _record_data_ops_schedule_activity(
+        job_id or f"data_ops_stop:{uuid.uuid4().hex}",
+        "stopping",
+        "Stop requested for Data Ops continuous run",
+        kind="mapper",
+        pipeline_id=signal.get("pipeline_id"),
+        data_ops_node_id=signal.get("data_ops_node_id"),
+        step_id=signal.get("mapper_step_id"),
+        config_id=signal.get("mapper_config_id"),
+        task_master_id=signal.get("task_master_id"),
+    )
+    return {"ok": True, "stop_requested": True, "signal": signal}
 
 
 # ─── WEBSOCKET ────────────────────────────────────────────────────────────────
@@ -17252,7 +18077,22 @@ async def data_ops_oracle_query_preview(body: DataOpsOracleQueryPreviewRequest):
     try:
         conn = _data_ops_oracle_connect(body.config)
         cur = conn.cursor()
-        cur.execute(f"SELECT * FROM ({sql}) WHERE ROWNUM <= :limit", {"limit": limit})
+        bind_params = body.config.get("_data_ops_task_bind_params") if isinstance(body.config, dict) else {}
+        if not isinstance(bind_params, dict):
+            bind_params = {}
+        execution_binds: Dict[str, Any] = {"limit": limit}
+        missing_binds: List[str] = []
+        for name in _data_ops_sql_bind_names(sql):
+            if str(name).lower() == "limit":
+                continue
+            found, value = _data_ops_resolve_bind_param_value(name, bind_params)
+            if found:
+                execution_binds[name] = _data_ops_oracle_bind_value(name, value)
+            else:
+                missing_binds.append(name)
+        if missing_binds:
+            raise ValueError(f"Missing bind value(s): {', '.join(f':{name}' for name in missing_binds)}")
+        cur.execute(f"SELECT * FROM ({sql}) WHERE ROWNUM <= :limit", execution_binds)
         columns = [str(desc[0] or "") for desc in (cur.description or [])]
         rows = [
             {columns[idx]: _data_ops_oracle_value(value) for idx, value in enumerate(record)}
@@ -17281,6 +18121,102 @@ async def data_ops_oracle_query_preview(body: DataOpsOracleQueryPreviewRequest):
                 pass
 
 
+@app.post("/api/data-ops/checkpoint/reset")
+async def data_ops_checkpoint_reset(body: DataOpsCheckpointResetRequest):
+    pipeline_id = str(body.pipeline_id or "").strip()
+    data_ops_node_id = str(body.data_ops_node_id or "").strip()
+    task_master_id = str(body.task_master_id or "").strip()
+    mapper_step_id = str(body.mapper_step_id or "").strip()
+    mapper_config_id = str(body.mapper_config_id or "").strip()
+    missing = [
+        label
+        for label, value in (
+            ("pipeline_id", pipeline_id),
+            ("data_ops_node_id", data_ops_node_id),
+            ("task_master_id", task_master_id),
+            ("mapper_step_id", mapper_step_id),
+            ("mapper_config_id", mapper_config_id),
+        )
+        if not value
+    ]
+    if missing:
+        raise HTTPException(400, f"Missing checkpoint reset field(s): {', '.join(missing)}")
+    result = _delete_data_ops_checkpoint_records_for_mapper(
+        pipeline_id,
+        data_ops_node_id,
+        task_master_id,
+        mapper_step_id,
+        mapper_config_id,
+    )
+    activity_result = _sync_data_ops_activity_checkpoint_binds(
+        str(result.get("checkpoint_key") or ""),
+        None,
+        None,
+    )
+    return {"ok": True, **result, **activity_result}
+
+
+def _data_ops_checkpoint_request_identity(body: DataOpsCheckpointResetRequest) -> Tuple[str, str, str, str, str]:
+    pipeline_id = str(body.pipeline_id or "").strip()
+    data_ops_node_id = str(body.data_ops_node_id or "").strip()
+    task_master_id = str(body.task_master_id or "").strip()
+    mapper_step_id = str(body.mapper_step_id or "").strip()
+    mapper_config_id = str(body.mapper_config_id or "").strip()
+    missing = [
+        label
+        for label, value in (
+            ("pipeline_id", pipeline_id),
+            ("data_ops_node_id", data_ops_node_id),
+            ("task_master_id", task_master_id),
+            ("mapper_step_id", mapper_step_id),
+            ("mapper_config_id", mapper_config_id),
+        )
+        if not value
+    ]
+    if missing:
+        raise HTTPException(400, f"Missing checkpoint field(s): {', '.join(missing)}")
+    return pipeline_id, data_ops_node_id, task_master_id, mapper_step_id, mapper_config_id
+
+
+@app.post("/api/data-ops/checkpoint/get")
+async def data_ops_checkpoint_get(body: DataOpsCheckpointResetRequest):
+    pipeline_id, data_ops_node_id, task_master_id, mapper_step_id, mapper_config_id = _data_ops_checkpoint_request_identity(body)
+    return {
+        "ok": True,
+        **_load_data_ops_checkpoint_record_for_mapper(
+            pipeline_id,
+            data_ops_node_id,
+            task_master_id,
+            mapper_step_id,
+            mapper_config_id,
+        ),
+    }
+
+
+@app.post("/api/data-ops/checkpoint/update")
+async def data_ops_checkpoint_update(body: DataOpsCheckpointUpdateRequest):
+    pipeline_id, data_ops_node_id, task_master_id, mapper_step_id, mapper_config_id = _data_ops_checkpoint_request_identity(body)
+    result = _update_data_ops_checkpoint_record_for_mapper(
+        pipeline_id,
+        data_ops_node_id,
+        task_master_id,
+        mapper_step_id,
+        mapper_config_id,
+        body.last_source_id,
+        body.last_transaction_time,
+    )
+    activity_result = _sync_data_ops_activity_checkpoint_binds(
+        str(result.get("checkpoint_key") or ""),
+        result.get("last_source_id"),
+        result.get("last_transaction_time"),
+    )
+    return {
+        "ok": True,
+        **result,
+        **activity_result,
+    }
+
+
 def _execute_data_ops_oracle_sql(config: Dict[str, Any], sql: str) -> Dict[str, Any]:
     raw_sql = str(sql or "").strip()
     if not raw_sql:
@@ -17295,15 +18231,17 @@ def _execute_data_ops_oracle_sql(config: Dict[str, Any], sql: str) -> Dict[str, 
         bind_params = config.get("_data_ops_task_bind_params") if isinstance(config, dict) else {}
         if not isinstance(bind_params, dict):
             bind_params = {}
-        used_bind_names = {
-            str(match.group(1) or "").strip()
-            for match in re.finditer(r":([A-Za-z_][A-Za-z0-9_$#]*)", raw_sql)
-        }
-        execution_binds = {
-            str(key): value
-            for key, value in bind_params.items()
-            if str(key) in used_bind_names
-        }
+        used_bind_names = set(_data_ops_sql_bind_names(raw_sql))
+        execution_binds: Dict[str, Any] = {}
+        missing_binds: List[str] = []
+        for name in used_bind_names:
+            found, value = _data_ops_resolve_bind_param_value(name, bind_params)
+            if found:
+                execution_binds[name] = _data_ops_oracle_bind_value(name, value)
+            else:
+                missing_binds.append(name)
+        if missing_binds:
+            raise ValueError(f"Missing bind value(s): {', '.join(f':{name}' for name in missing_binds)}")
         if execution_binds:
             cur.execute(raw_sql.rstrip().rstrip(";"), execution_binds)
         else:
@@ -17333,6 +18271,243 @@ def _execute_data_ops_oracle_sql(config: Dict[str, Any], sql: str) -> Dict[str, 
                 pass
 
 
+def _data_ops_checkpoint_cursor_tuple(record: Dict[str, Any]) -> Tuple[str, str]:
+    if not isinstance(record, dict):
+        return "", ""
+    return (
+        "" if record.get("last_source_id") is None else str(record.get("last_source_id")),
+        "" if record.get("last_transaction_time") is None else str(record.get("last_transaction_time")),
+    )
+
+
+def _set_data_ops_checkpoint_binds(runtime_config: Dict[str, Any], checkpoint_record: Dict[str, Any]) -> None:
+    bind_params = runtime_config.get("_data_ops_task_bind_params") if isinstance(runtime_config.get("_data_ops_task_bind_params"), dict) else {}
+    bind_params = dict(bind_params or {})
+    bind_params["checkpoint_last_source_id"] = checkpoint_record.get("last_source_id") if isinstance(checkpoint_record, dict) else None
+    bind_params["checkpoint_last_transaction_time"] = checkpoint_record.get("last_transaction_time") if isinstance(checkpoint_record, dict) else None
+    if runtime_config.get("_data_ops_checkpoint_key"):
+        bind_params["checkpoint_key"] = runtime_config.get("_data_ops_checkpoint_key")
+    runtime_config["_data_ops_task_bind_params"] = bind_params
+
+
+def _execute_data_ops_mapper_sql_with_checkpoint(
+    runtime_config: Dict[str, Any],
+    sql: str,
+    pipeline_id: str,
+    data_ops_node_id: str,
+    task_master_id: str,
+    mapper_step_id: str,
+    mapper_config_id: str,
+    business_window_key: str,
+    run_id: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    runtime_config["_data_ops_checkpoint_executable_sql"] = str(sql or "")
+    if not str(runtime_config.get("_data_ops_checkpoint_source_sql") or "").strip():
+        extracted_source_sql = _extract_data_ops_checkpoint_source_sql(sql)
+        if extracted_source_sql:
+            runtime_config["_data_ops_checkpoint_source_sql"] = extracted_source_sql
+    if not str(runtime_config.get("_data_ops_checkpoint_id_field") or "").strip():
+        inferred_id_field = _infer_data_ops_checkpoint_id_field(runtime_config.get("_data_ops_checkpoint_source_sql")) or _infer_data_ops_checkpoint_id_field(sql)
+        if inferred_id_field:
+            runtime_config["_data_ops_checkpoint_id_field"] = inferred_id_field
+    mode = str(runtime_config.get("_data_ops_sync_processing_mode") or runtime_config.get("syncProcessingMode") or runtime_config.get("sync_processing_mode") or "batch").strip().lower()
+    raw_max_batches = (
+        runtime_config.get("_data_ops_sync_max_batches")
+        if runtime_config.get("_data_ops_sync_max_batches") not in (None, "")
+        else runtime_config.get("syncMaxBatches")
+        if runtime_config.get("syncMaxBatches") not in (None, "")
+        else runtime_config.get("sync_max_batches")
+        if runtime_config.get("sync_max_batches") not in (None, "")
+        else 100
+    )
+    try:
+        parsed_max_batches = int(raw_max_batches)
+    except Exception:
+        parsed_max_batches = 100
+    unlimited_batches = parsed_max_batches <= 0
+    max_batches = None if unlimited_batches else max(1, min(parsed_max_batches, 10000))
+    try:
+        loop_gap_seconds = float(
+            runtime_config.get("_data_ops_sync_loop_gap_seconds")
+            or runtime_config.get("syncLoopGapSeconds")
+            or runtime_config.get("sync_loop_gap_seconds")
+            or runtime_config.get("_data_ops_sync_empty_poll_seconds")
+            or runtime_config.get("syncEmptyPollSeconds")
+            or 5
+        )
+    except Exception:
+        loop_gap_seconds = 5.0
+    loop_gap_seconds = max(1.0, min(loop_gap_seconds, 3600.0))
+    if (
+        mode != "incremental_batch_loop"
+        and (unlimited_batches or int(max_batches or 0) > 1)
+        and runtime_config.get("_data_ops_checkpoint_enabled") is not False
+        and re.search(r":checkpoint_last_source_id\b", str(sql or ""), flags=re.IGNORECASE)
+        and re.search(r"\bROWNUM\s*<=\s*\d+", str(sql or ""), flags=re.IGNORECASE)
+    ):
+        mode = "incremental_batch_loop"
+    if mode != "incremental_batch_loop":
+        result = _execute_data_ops_oracle_sql(runtime_config, sql)
+        rowcount = int(result.get("rowcount") or 0)
+        checkpoint_record = _save_data_ops_checkpoint_after_success(
+            runtime_config,
+            pipeline_id,
+            data_ops_node_id,
+            task_master_id,
+            mapper_step_id,
+            mapper_config_id,
+            business_window_key,
+            rowcount,
+            run_id,
+        )
+        return result, checkpoint_record
+
+    checkpoint_enabled = runtime_config.get("_data_ops_checkpoint_enabled") is not False
+    cursor_configured = bool(str(runtime_config.get("_data_ops_checkpoint_id_field") or "").strip() or str(runtime_config.get("_data_ops_checkpoint_time_field") or "").strip())
+    if checkpoint_enabled and not cursor_configured:
+        raise ValueError("Incremental batch loop requires a checkpoint ID or transaction time field; none could be configured or inferred.")
+    total_rowcount = 0
+    batches = 0
+    empty_polls = 0
+    stopped_reason = "running"
+    last_result: Dict[str, Any] = {}
+    checkpoint_record = dict(runtime_config.get("_data_ops_checkpoint_previous") or {})
+    last_cursor = _data_ops_checkpoint_cursor_tuple(checkpoint_record)
+    progress_callback = runtime_config.get("_data_ops_progress_callback")
+    stop_scope = {
+        "job_id": run_id,
+        "pipeline_id": pipeline_id,
+        "data_ops_node_id": data_ops_node_id,
+        "mapper_step_id": mapper_step_id,
+        "mapper_config_id": mapper_config_id,
+        "task_master_id": task_master_id,
+    }
+    def _sleep_until_next_loop() -> bool:
+        slept = 0.0
+        while slept < loop_gap_seconds:
+            if _data_ops_stop_requested(stop_scope):
+                return True
+            step_sleep = min(1.0, loop_gap_seconds - slept)
+            _time.sleep(step_sleep)
+            slept += step_sleep
+        return _data_ops_stop_requested(stop_scope)
+
+    batch_index = 0
+    while unlimited_batches or batch_index < int(max_batches or 0):
+        if _data_ops_stop_requested(stop_scope):
+            stopped_reason = "stopped"
+            break
+        checkpoint_key = str(runtime_config.get("_data_ops_checkpoint_key") or "").strip()
+        if checkpoint_enabled and checkpoint_key:
+            live_checkpoint_record = _load_data_ops_checkpoint_record(checkpoint_key)
+            live_cursor = _data_ops_checkpoint_cursor_tuple(live_checkpoint_record)
+            if live_cursor != _data_ops_checkpoint_cursor_tuple(checkpoint_record):
+                checkpoint_record = dict(live_checkpoint_record or {})
+                last_cursor = live_cursor
+                runtime_config["_data_ops_checkpoint_previous"] = checkpoint_record
+                _set_data_ops_checkpoint_binds(runtime_config, checkpoint_record)
+        result = _execute_data_ops_oracle_sql(runtime_config, sql)
+        last_result = result
+        rowcount = int(result.get("rowcount") or 0)
+        batch_index += 1
+        batches += 1
+        if rowcount <= 0:
+            empty_polls += 1
+            if unlimited_batches:
+                if _sleep_until_next_loop():
+                    stopped_reason = "stopped"
+                    break
+                continue
+            stopped_reason = "no_rows"
+            break
+        total_rowcount += rowcount
+        checkpoint_record = _save_data_ops_checkpoint_after_success(
+            runtime_config,
+            pipeline_id,
+            data_ops_node_id,
+            task_master_id,
+            mapper_step_id,
+            mapper_config_id,
+            business_window_key,
+            rowcount,
+            f"{run_id}:batch:{batch_index}",
+        )
+        next_cursor = _data_ops_checkpoint_cursor_tuple(checkpoint_record)
+        if checkpoint_enabled and cursor_configured and next_cursor == last_cursor:
+            raise ValueError("Incremental batch loop stopped because checkpoint cursor did not advance after processing rows.")
+        last_cursor = next_cursor
+        runtime_config["_data_ops_checkpoint_previous"] = checkpoint_record
+        _set_data_ops_checkpoint_binds(runtime_config, checkpoint_record)
+        if callable(progress_callback):
+            try:
+                progress_callback({
+                    "rowcount": total_rowcount,
+                    "batch_rowcount": rowcount,
+                    "batches": batches,
+                    "checkpoint": checkpoint_record,
+                    "processing_mode": mode,
+                })
+            except Exception as exc:
+                logger.debug(f"Data Ops progress callback failed: {exc}")
+        if unlimited_batches or batch_index < int(max_batches or 0):
+            if _sleep_until_next_loop():
+                stopped_reason = "stopped"
+                break
+    if stopped_reason == "running":
+        stopped_reason = "max_batches"
+    return {
+        **last_result,
+        "ok": True,
+        "operation": last_result.get("operation") or _data_ops_first_sql_keyword(sql),
+        "rowcount": total_rowcount,
+        "batches": batches,
+        "empty_polls": empty_polls,
+        "max_batches": 0 if unlimited_batches else max_batches,
+        "unlimited_batches": unlimited_batches,
+        "empty_poll_seconds": loop_gap_seconds,
+        "loop_gap_seconds": loop_gap_seconds,
+        "stopped_reason": stopped_reason,
+        "processing_mode": mode,
+    }, checkpoint_record
+
+
+def _data_ops_sql_bind_names(sql: str) -> List[str]:
+    seen: set[str] = set()
+    names: List[str] = []
+    for match in re.finditer(r":([A-Za-z_][A-Za-z0-9_$#]*)", str(sql or "")):
+        name = str(match.group(1) or "").strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _data_ops_execution_diagnostics(config: Dict[str, Any], sql: str, error: Any = None) -> Dict[str, Any]:
+    raw_sql = str(sql or "").strip()
+    bind_params = config.get("_data_ops_task_bind_params") if isinstance(config, dict) else {}
+    if not isinstance(bind_params, dict):
+        bind_params = {}
+    bind_names = _data_ops_sql_bind_names(raw_sql)
+    provided_binds = {str(key): _to_json_safe_value(value) for key, value in bind_params.items()}
+    execution_binds: Dict[str, Any] = {}
+    missing_binds: List[str] = []
+    for name in bind_names:
+        found, value = _data_ops_resolve_bind_param_value(name, bind_params)
+        if found:
+            execution_binds[name] = _to_json_safe_value(_data_ops_oracle_bind_value(name, value))
+        else:
+            missing_binds.append(name)
+    return {
+        "sql": raw_sql,
+        "parsed_sql": raw_sql,
+        "bind_names": bind_names,
+        "provided_binds": provided_binds,
+        "execution_binds": execution_binds,
+        "missing_binds": missing_binds,
+        "error_detail": str(error or ""),
+    }
+
+
 @app.post("/api/data-ops/oracle/execute")
 async def data_ops_oracle_execute(body: DataOpsOracleExecuteRequest):
     sql = str(body.sql or "").strip()
@@ -17354,6 +18529,25 @@ async def data_ops_oracle_execute(body: DataOpsOracleExecuteRequest):
     task_master_name = str(config.get("_data_ops_task_master_name") or "").strip()
     task_bind_params = config.get("_data_ops_task_bind_params") if isinstance(config.get("_data_ops_task_bind_params"), dict) else {}
     business_window_key = str(task_bind_params.get("task_business_window_key") or "").strip()
+    stop_scope = {
+        "job_id": job_id,
+        "pipeline_id": pipeline_id,
+        "data_ops_node_id": data_ops_node_id,
+        "mapper_step_id": step_id,
+        "mapper_config_id": config_id,
+        "task_master_id": task_master_id,
+    }
+    _clear_data_ops_stop_signals_for_scope(stop_scope)
+    previous_checkpoint = _attach_data_ops_checkpoint_context(
+        config,
+        pipeline_id,
+        data_ops_node_id,
+        task_master_id,
+        step_id,
+        config_id,
+        business_window_key,
+    )
+    task_bind_params = config.get("_data_ops_task_bind_params") if isinstance(config.get("_data_ops_task_bind_params"), dict) else {}
     force_retry = bool(config.get("_data_ops_force_retry"))
     duplicate_policy = str(config.get("_data_ops_task_duplicate_policy") or task_bind_params.get("task_duplicate_policy") or "skip_completed").strip().lower()
     if manual_activity and not force_retry and duplicate_policy != "allow_rerun" and _data_ops_completed_window_exists(pipeline_id, data_ops_node_id, task_master_id, config_id, business_window_key):
@@ -17395,14 +18589,53 @@ async def data_ops_oracle_execute(body: DataOpsOracleExecuteRequest):
             business_window_key=business_window_key,
             last_run_started_at=started_at.isoformat() + "Z",
         )
+        def _manual_progress_callback(progress: Dict[str, Any]) -> None:
+            rowcount = int(progress.get("rowcount") or 0)
+            batches = int(progress.get("batches") or 0)
+            _record_data_ops_schedule_activity(
+                job_id,
+                "running",
+                f"Manual task sync running: {rowcount} row(s) across {batches} batch(es)",
+                kind="mapper",
+                pipeline_id=pipeline_id,
+                data_ops_node_id=data_ops_node_id,
+                step_id=step_id,
+                config_id=config_id,
+                task_master_id=task_master_id,
+                task_master_name=task_master_name,
+                task_bind_params=config.get("_data_ops_task_bind_params") if isinstance(config.get("_data_ops_task_bind_params"), dict) else task_bind_params,
+                business_window_key=business_window_key,
+                source_rows=rowcount,
+                rows_processed=rowcount,
+                destination_rows=rowcount,
+                rejected_rows=0,
+                mismatch_rows=0,
+                batches=batches,
+                checkpoint=progress.get("checkpoint"),
+                duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
+                last_run_started_at=started_at.isoformat() + "Z",
+            )
+        config["_data_ops_progress_callback"] = _manual_progress_callback
     try:
-        result = _execute_data_ops_oracle_sql(config, sql)
+        result, checkpoint_record = _execute_data_ops_mapper_sql_with_checkpoint(
+            config,
+            sql,
+            pipeline_id,
+            data_ops_node_id,
+            task_master_id,
+            step_id,
+            config_id,
+            business_window_key,
+            job_id,
+        )
         if manual_activity:
             rowcount = int(result.get("rowcount") or 0)
+            diagnostics = _data_ops_execution_diagnostics(config, sql)
+            batch_suffix = f" across {int(result.get('batches') or 1)} batch(es)" if result.get("processing_mode") == "incremental_batch_loop" else ""
             _record_data_ops_schedule_activity(
                 job_id,
                 "success",
-                f"Manual task sync completed: {rowcount} row(s)",
+                f"Manual task sync completed: {rowcount} row(s){batch_suffix}",
                 kind="mapper",
                 pipeline_id=pipeline_id,
                 data_ops_node_id=data_ops_node_id,
@@ -17417,6 +18650,13 @@ async def data_ops_oracle_execute(body: DataOpsOracleExecuteRequest):
                 destination_rows=rowcount,
                 rejected_rows=0,
                 mismatch_rows=0,
+                checkpoint=checkpoint_record or previous_checkpoint,
+                sql=diagnostics.get("sql"),
+                parsed_sql=diagnostics.get("parsed_sql"),
+                bind_names=diagnostics.get("bind_names"),
+                provided_binds=diagnostics.get("provided_binds"),
+                execution_binds=diagnostics.get("execution_binds"),
+                missing_binds=diagnostics.get("missing_binds"),
                 duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
                 last_run_started_at=started_at.isoformat() + "Z",
                 last_run_finished_at=datetime.utcnow().isoformat() + "Z",
@@ -17426,6 +18666,7 @@ async def data_ops_oracle_execute(body: DataOpsOracleExecuteRequest):
         raise
     except Exception as exc:
         if manual_activity:
+            diagnostics = _data_ops_execution_diagnostics(config, sql, exc)
             _record_data_ops_schedule_activity(
                 job_id,
                 "failed",
@@ -17439,6 +18680,18 @@ async def data_ops_oracle_execute(body: DataOpsOracleExecuteRequest):
                 task_master_name=task_master_name,
                 task_bind_params=task_bind_params,
                 business_window_key=business_window_key,
+                source_rows=0,
+                rows_processed=0,
+                destination_rows=0,
+                rejected_rows=0,
+                mismatch_rows=0,
+                sql=diagnostics.get("sql"),
+                parsed_sql=diagnostics.get("parsed_sql"),
+                bind_names=diagnostics.get("bind_names"),
+                provided_binds=diagnostics.get("provided_binds"),
+                execution_binds=diagnostics.get("execution_binds"),
+                missing_binds=diagnostics.get("missing_binds"),
+                error_detail=diagnostics.get("error_detail"),
                 duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
                 last_run_started_at=started_at.isoformat() + "Z",
                 last_run_finished_at=datetime.utcnow().isoformat() + "Z",
@@ -17477,6 +18730,71 @@ def _data_ops_parse_date_text(value: Any) -> Optional[date]:
             return None
 
 
+def _data_ops_oracle_bind_value(key: str, value: Any) -> Any:
+    raw = str(value or "").strip()
+    if not raw:
+        return value
+    key_lower = str(key or "").strip().lower()
+    date_like_key = (
+        key_lower.endswith("_date")
+        or key_lower.endswith("date")
+        or "transaction_time" in key_lower
+        or key_lower in {"txn_day", "txn_date"}
+    )
+    if not date_like_key:
+        return value
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
+        parsed_date = _data_ops_parse_date_text(raw)
+        return parsed_date or value
+    if re.match(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}", raw):
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            return value
+    return value
+
+
+def _data_ops_normalize_bind_ref(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    without_colon = raw[1:].strip() if raw.startswith(":") else raw
+    match = re.match(r"^([A-Za-z_][A-Za-z0-9_$#]*)\b", without_colon)
+    if raw.startswith(":") and match:
+        return str(match.group(1) or "").strip()
+    return without_colon
+
+
+def _data_ops_resolve_bind_param_value(bind_name: str, bind_params: Dict[str, Any]) -> Tuple[bool, Any]:
+    name = str(bind_name or "").lstrip(":").strip()
+    if not name:
+        return False, None
+    if name in bind_params:
+        return True, bind_params.get(name)
+    lowered = name.lower()
+    for key, value in bind_params.items():
+        if str(key).lower() == lowered:
+            return True, value
+    compact = re.sub(r"[^a-z0-9]+", "", lowered)
+    for key, value in bind_params.items():
+        if re.sub(r"[^a-z0-9]+", "", str(key).lower()) == compact:
+            return True, value
+    alias_candidates: List[str] = []
+    if lowered in {"txn_date", "txndate", "transaction_date", "business_date"} or (lowered.endswith("_date") and "txn" in lowered):
+        alias_candidates.extend(["txn_day", "task_business_date", "task_business_start_date"])
+    if lowered in {"txn_month", "txnmonth", "transaction_month", "business_month"} or lowered.endswith("_month"):
+        alias_candidates.extend(["txn_month", "task_business_month"])
+    if lowered in {"checkpoint_last_source_id", "checkpoint_last_transaction_time", "checkpoint_key"}:
+        return True, None
+    for candidate in alias_candidates:
+        if candidate in bind_params:
+            return True, bind_params.get(candidate)
+        for key, value in bind_params.items():
+            if str(key).lower() == candidate.lower():
+                return True, value
+    return False, None
+
+
 def _data_ops_runtime_task_bind_params(config: Dict[str, Any], run_at: datetime) -> Dict[str, Any]:
     bind_params = config.get("_data_ops_task_bind_params") if isinstance(config, dict) else {}
     if not isinstance(bind_params, dict):
@@ -17487,7 +18805,16 @@ def _data_ops_runtime_task_bind_params(config: Dict[str, Any], run_at: datetime)
     if not indicator:
         indicator = "transaction_month" if mode == "monthly" else "transaction_day" if mode == "daily" else "transaction_range"
     manual_window = bool(config.get("_data_ops_manual_window"))
-    run_date = run_at.date()
+    timezone_name = str(config.get("_data_ops_task_timezone") or config.get("timezone") or binds.get("task_timezone") or "Asia/Kolkata").strip() or "Asia/Kolkata"
+    try:
+        task_tz = ZoneInfo(timezone_name)
+    except Exception:
+        task_tz = timezone.utc
+    if run_at.tzinfo is None:
+        local_run_at = run_at.replace(tzinfo=timezone.utc).astimezone(task_tz)
+    else:
+        local_run_at = run_at.astimezone(task_tz)
+    run_date = local_run_at.date()
     if manual_window and (binds.get("task_business_start_date") or binds.get("task_business_date")):
         business_start = str(binds.get("task_business_start_date") or binds.get("task_business_date") or "").strip()
         business_end = str(binds.get("task_business_end_date") or business_start).strip()
@@ -17501,10 +18828,24 @@ def _data_ops_runtime_task_bind_params(config: Dict[str, Any], run_at: datetime)
         business_day = run_date - timedelta(days=1)
         business_start = business_day.isoformat()
         business_end = business_start
-    elif mode == "previous_range":
+    elif mode in {"previous_range", "previous_interval"}:
         count = max(1, int(config.get("_data_ops_task_lookback_count") or binds.get("task_lookback_count") or 1))
         unit = str(config.get("_data_ops_task_lookback_unit") or binds.get("task_lookback_unit") or "day").strip().lower()
-        if unit == "month":
+        if unit == "minute":
+            boundary = local_run_at.replace(second=0, microsecond=0)
+            boundary = boundary.replace(minute=(boundary.minute // count) * count)
+            range_start_dt = boundary - timedelta(minutes=count)
+            range_end_dt = boundary - timedelta(seconds=1)
+            business_start = range_start_dt.strftime("%Y-%m-%d %H:%M:%S")
+            business_end = range_end_dt.strftime("%Y-%m-%d %H:%M:%S")
+        elif unit == "hour":
+            boundary = local_run_at.replace(minute=0, second=0, microsecond=0)
+            boundary = boundary.replace(hour=(boundary.hour // count) * count)
+            range_start_dt = boundary - timedelta(hours=count)
+            range_end_dt = boundary - timedelta(seconds=1)
+            business_start = range_start_dt.strftime("%Y-%m-%d %H:%M:%S")
+            business_end = range_end_dt.strftime("%Y-%m-%d %H:%M:%S")
+        elif unit == "month":
             current_month_start = date(run_date.year, run_date.month, 1)
             range_end = current_month_start - timedelta(days=1)
             month_index = (range_end.year * 12 + range_end.month - 1) - count + 1
@@ -17535,12 +18876,30 @@ def _data_ops_runtime_task_bind_params(config: Dict[str, Any], run_at: datetime)
         window_key = f"txn_day:{business_start}"
         label = f"transaction - day {business_start}"
     else:
-        window_key = f"range:{business_start}_to_{business_end or business_start}"
+        window_key = f"range:{business_start}_to_{business_end or business_start}".replace(" ", "_")
         label = f"transaction - range {business_start} to {business_end or business_start}"
     binds["task_business_window_key"] = window_key
     binds["task_business_label"] = label
     binds["txn_day"] = business_start
     binds["txn_month"] = business_month
+    binds["task_timezone"] = timezone_name
+    query_inputs = config.get("_data_ops_query_inputs") if isinstance(config, dict) else []
+    if isinstance(query_inputs, list):
+        for item in query_inputs:
+            row = item if isinstance(item, dict) else {}
+            if row.get("enabled") is False:
+                continue
+            param = str(row.get("param") or row.get("name") or "").lstrip(":").strip()
+            if not param:
+                continue
+            mode = str(row.get("sourceMode") or row.get("source_mode") or "default").strip().lower()
+            if mode == "fixed":
+                binds[param] = row.get("value")
+            elif mode == "field":
+                source_field = _data_ops_normalize_bind_ref(row.get("sourceField") or row.get("source_field") or "")
+                matched_key = next((key for key in binds.keys() if str(key) == source_field or str(key).lower() == source_field.lower()), "")
+                if matched_key:
+                    binds[param] = binds.get(matched_key)
     return binds
 
 
@@ -17649,6 +19008,16 @@ async def _run_scheduled_data_ops_mapper_sync(
             break
     runtime_config["_data_ops_task_bind_params"] = runtime_bind_params
     business_window_key = str(runtime_bind_params.get("task_business_window_key") or "").strip()
+    previous_checkpoint = _attach_data_ops_checkpoint_context(
+        runtime_config,
+        pipeline_id,
+        data_ops_node_id,
+        task_master_id,
+        mapper_step_id,
+        mapper_config_id,
+        business_window_key,
+    )
+    runtime_bind_params = runtime_config.get("_data_ops_task_bind_params") if isinstance(runtime_config.get("_data_ops_task_bind_params"), dict) else runtime_bind_params
     duplicate_policy = str(runtime_config.get("_data_ops_task_duplicate_policy") or runtime_bind_params.get("task_duplicate_policy") or "skip_completed").strip().lower()
     _record_data_ops_schedule_activity(
         job_id,
@@ -17722,12 +19091,53 @@ async def _run_scheduled_data_ops_mapper_sync(
         active_config_key="activeMapperConfigId",
         job_id=job_id,
     )
+    def _scheduled_mapper_progress_callback(progress: Dict[str, Any]) -> None:
+        rowcount = int(progress.get("rowcount") or 0)
+        batches = int(progress.get("batches") or 0)
+        _record_data_ops_schedule_activity(
+            job_id,
+            "running",
+            f"Mapper sync running: {rowcount} row(s) across {batches} batch(es)",
+            kind="mapper",
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_id=mapper_step_id,
+            config_id=mapper_config_id,
+            task_master_id=task_master_id,
+            task_master_name=task_master_name,
+            task_bind_params=runtime_config.get("_data_ops_task_bind_params") if isinstance(runtime_config.get("_data_ops_task_bind_params"), dict) else runtime_bind_params,
+            business_window_key=business_window_key,
+            source_rows=rowcount,
+            rows_processed=rowcount,
+            destination_rows=rowcount,
+            rejected_rows=0,
+            mismatch_rows=0,
+            batches=batches,
+            checkpoint=progress.get("checkpoint"),
+            duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
+            last_run_started_at=started_at.isoformat() + "Z",
+        )
+    runtime_config["_data_ops_progress_callback"] = _scheduled_mapper_progress_callback
     try:
-        result = await asyncio.to_thread(_execute_data_ops_oracle_sql, runtime_config, sql)
+        result, checkpoint_record = await asyncio.to_thread(
+            _execute_data_ops_mapper_sql_with_checkpoint,
+            runtime_config,
+            sql,
+            pipeline_id,
+            data_ops_node_id,
+            task_master_id,
+            mapper_step_id,
+            mapper_config_id,
+            business_window_key,
+            job_id,
+        )
+        rowcount = int(result.get("rowcount") or 0)
+        diagnostics = _data_ops_execution_diagnostics(runtime_config, sql)
+        batch_suffix = f" across {int(result.get('batches') or 1)} batch(es)" if result.get("processing_mode") == "incremental_batch_loop" else ""
         _record_data_ops_schedule_activity(
             job_id,
             "success",
-            f"Mapper sync completed: {result.get('rowcount', 0)} row(s)",
+            f"Mapper sync completed: {rowcount} row(s){batch_suffix}",
             kind="mapper",
             pipeline_id=pipeline_id,
             data_ops_node_id=data_ops_node_id,
@@ -17737,17 +19147,25 @@ async def _run_scheduled_data_ops_mapper_sync(
             task_master_name=task_master_name,
             task_bind_params=runtime_bind_params,
             business_window_key=business_window_key,
-            source_rows=int(result.get("rowcount") or 0),
-            rows_processed=int(result.get("rowcount") or 0),
-            destination_rows=int(result.get("rowcount") or 0),
+            source_rows=rowcount,
+            rows_processed=rowcount,
+            destination_rows=rowcount,
             rejected_rows=0,
             mismatch_rows=0,
+            checkpoint=checkpoint_record or previous_checkpoint,
+            sql=diagnostics.get("sql"),
+            parsed_sql=diagnostics.get("parsed_sql"),
+            bind_names=diagnostics.get("bind_names"),
+            provided_binds=diagnostics.get("provided_binds"),
+            execution_binds=diagnostics.get("execution_binds"),
+            missing_binds=diagnostics.get("missing_binds"),
             duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
             last_run_started_at=started_at.isoformat() + "Z",
             last_run_finished_at=datetime.utcnow().isoformat() + "Z",
         )
-        logger.info(f"Scheduled Data Ops mapper sync {job_id} completed: {result.get('rowcount', 0)} row(s)")
+        logger.info(f"Scheduled Data Ops mapper sync {job_id} completed: {rowcount} row(s)")
     except Exception as exc:
+        diagnostics = _data_ops_execution_diagnostics(runtime_config, sql, exc)
         _record_data_ops_schedule_activity(
             job_id,
             "failed",
@@ -17761,6 +19179,18 @@ async def _run_scheduled_data_ops_mapper_sync(
             task_master_name=task_master_name,
             task_bind_params=runtime_bind_params,
             business_window_key=business_window_key,
+            source_rows=0,
+            rows_processed=0,
+            destination_rows=0,
+            rejected_rows=0,
+            mismatch_rows=0,
+            sql=diagnostics.get("sql"),
+            parsed_sql=diagnostics.get("parsed_sql"),
+            bind_names=diagnostics.get("bind_names"),
+            provided_binds=diagnostics.get("provided_binds"),
+            execution_binds=diagnostics.get("execution_binds"),
+            missing_binds=diagnostics.get("missing_binds"),
+            error_detail=diagnostics.get("error_detail"),
             duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
             last_run_started_at=started_at.isoformat() + "Z",
             last_run_finished_at=datetime.utcnow().isoformat() + "Z",
@@ -17777,6 +19207,386 @@ async def _run_scheduled_data_ops_mapper_sync(
             active_config_key="activeMapperConfigId",
             job_id=job_id,
         )
+
+
+def _data_ops_enabled_mapper_config_ids(
+    pipeline_id: str,
+    data_ops_node_id: str = "",
+    mapper_step_id: str = "",
+    task_master_id: str = "",
+) -> Optional[set[str]]:
+    pipeline_id = str(pipeline_id or "").strip()
+    if not pipeline_id:
+        return None
+    db = SessionLocal()
+    try:
+        pipeline = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
+        if not pipeline or not isinstance(pipeline.nodes, list):
+            return None
+        enabled_ids: set[str] = set()
+        matched_scope = False
+        for node in pipeline.nodes:
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("id") or "").strip()
+            if data_ops_node_id and node_id != data_ops_node_id:
+                continue
+            data = node.get("data") if isinstance(node.get("data"), dict) else {}
+            cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
+            steps = cfg.get("data_ops_pipeline_nodes") if isinstance(cfg.get("data_ops_pipeline_nodes"), list) else []
+            for step in steps:
+                if not isinstance(step, dict) or _data_ops_step_kind_for_scheduler(step) != "map":
+                    continue
+                step_id = str(step.get("id") or "").strip()
+                if mapper_step_id and step_id != mapper_step_id:
+                    continue
+                matched_scope = True
+                configs = step.get("mapperConfigs") or step.get("mapper_configs") or []
+                if not isinstance(configs, list):
+                    continue
+                for config in configs:
+                    if not isinstance(config, dict):
+                        continue
+                    config_id = str(config.get("id") or "").strip()
+                    if not config_id or config.get("enabled") is False:
+                        continue
+                    if task_master_id and str(config.get("taskMasterId") or config.get("task_master_id") or "").strip() != task_master_id:
+                        continue
+                    enabled_ids.add(config_id)
+        return enabled_ids if matched_scope else None
+    except Exception as exc:
+        logger.warning(f"Failed checking current Data Ops mapper enabled state for pipeline {pipeline_id}: {exc}")
+        return None
+    finally:
+        db.close()
+
+
+async def _run_scheduled_data_ops_task_master(
+    job_id: str,
+    config: Dict[str, Any],
+    sub_tasks: List[Dict[str, Any]],
+    pipeline_id: str = "",
+    data_ops_node_id: str = "",
+    mapper_step_id: str = "",
+    task_master_id: str = "",
+):
+    started_at = datetime.utcnow()
+    task_config = dict(config or {})
+    task_master_id = str(task_master_id or task_config.get("_data_ops_task_master_id") or "")
+    task_master_name = str(task_config.get("_data_ops_task_master_name") or "")
+    duplicate_policy = str(task_config.get("_data_ops_task_duplicate_policy") or "skip_completed").strip().lower()
+    current_enabled_mapper_ids = _data_ops_enabled_mapper_config_ids(
+        pipeline_id,
+        data_ops_node_id,
+        mapper_step_id,
+        task_master_id,
+    )
+    ordered_sub_tasks = sorted(
+        [
+            item for item in sub_tasks
+            if isinstance(item, dict)
+            and item.get("enabled") is not False
+            and (
+                current_enabled_mapper_ids is None
+                or str(item.get("mapper_config_id") or item.get("config_id") or "").strip() in current_enabled_mapper_ids
+            )
+        ],
+        key=lambda item: int(item.get("run_order") or item.get("runOrder") or 9999),
+    )
+    _record_data_ops_schedule_activity(
+        job_id,
+        "running",
+        "Task Master started",
+        kind="task_master",
+        pipeline_id=pipeline_id,
+        data_ops_node_id=data_ops_node_id,
+        step_id=mapper_step_id,
+        task_master_id=task_master_id,
+        task_master_name=task_master_name,
+        last_run_started_at=started_at.isoformat() + "Z",
+    )
+    if not _data_ops_mapper_sync_schedule_is_active(task_config):
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
+        _record_data_ops_schedule_activity(
+            job_id,
+            "skipped",
+            "Task Master scheduler is inactive",
+            kind="task_master",
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_id=mapper_step_id,
+            task_master_id=task_master_id,
+            task_master_name=task_master_name,
+            last_run_started_at=started_at.isoformat() + "Z",
+            last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+        )
+        return
+    if not ordered_sub_tasks:
+        _record_data_ops_schedule_activity(
+            job_id,
+            "skipped",
+            "Task Master has no subtasks",
+            kind="task_master",
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_id=mapper_step_id,
+            task_master_id=task_master_id,
+            task_master_name=task_master_name,
+            last_run_started_at=started_at.isoformat() + "Z",
+            last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+        )
+        return
+    windows = _data_ops_runtime_task_backlog_bind_windows(task_config, started_at)
+    completed = 0
+    skipped = 0
+    affected = 0
+    active_subtask_context: Dict[str, Any] = {}
+    try:
+        for runtime_bind_params in windows:
+            business_window_key = str(runtime_bind_params.get("task_business_window_key") or "").strip()
+            for sub_task in ordered_sub_tasks:
+                mapper_config_id = str(sub_task.get("mapper_config_id") or sub_task.get("config_id") or "").strip()
+                mapper_config_name = str(sub_task.get("mapper_config_name") or mapper_config_id or "Sub Task").strip()
+                sub_job_id = f"{job_id}:{mapper_config_id}:{business_window_key or completed + skipped + 1}"
+                if duplicate_policy != "allow_rerun" and _data_ops_completed_window_exists(
+                    pipeline_id,
+                    data_ops_node_id,
+                    task_master_id,
+                    mapper_config_id,
+                    business_window_key,
+                ):
+                    skipped += 1
+                    _record_data_ops_schedule_activity(
+                        sub_job_id,
+                        "skipped",
+                        f"{mapper_config_name} skipped: already completed for {business_window_key}",
+                        kind="mapper",
+                        pipeline_id=pipeline_id,
+                        data_ops_node_id=data_ops_node_id,
+                        step_id=mapper_step_id,
+                        config_id=mapper_config_id,
+                        task_master_id=task_master_id,
+                        task_master_name=task_master_name,
+                        task_bind_params=runtime_bind_params,
+                        business_window_key=business_window_key,
+                        last_run_started_at=datetime.utcnow().isoformat() + "Z",
+                        last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+                    )
+                    continue
+                runtime_config = dict(sub_task.get("config") or {})
+                runtime_config.update({
+                    "_data_ops_mapper_scheduler_enabled": True,
+                    "_data_ops_mapper_deploy_enabled": True,
+                    "_data_ops_task_master_id": task_master_id,
+                    "_data_ops_task_master_name": task_master_name,
+                    "_data_ops_task_bind_params": runtime_bind_params,
+                    "_data_ops_task_duplicate_policy": duplicate_policy,
+                    "_data_ops_task_window_mode": task_config.get("_data_ops_task_window_mode") or runtime_bind_params.get("task_window_mode") or "",
+                    "_data_ops_task_window_indicator": task_config.get("_data_ops_task_window_indicator") or runtime_bind_params.get("task_window_indicator") or "",
+                })
+                previous_checkpoint = _attach_data_ops_checkpoint_context(
+                    runtime_config,
+                    pipeline_id,
+                    data_ops_node_id,
+                    task_master_id,
+                    mapper_step_id,
+                    mapper_config_id,
+                    business_window_key,
+                )
+                runtime_bind_params = runtime_config.get("_data_ops_task_bind_params") if isinstance(runtime_config.get("_data_ops_task_bind_params"), dict) else runtime_bind_params
+                sub_started_at = datetime.utcnow()
+                active_subtask_context = {
+                    "job_id": sub_job_id,
+                    "mapper_config_id": mapper_config_id,
+                    "mapper_config_name": mapper_config_name,
+                    "runtime_config": runtime_config,
+                    "runtime_bind_params": runtime_bind_params,
+                    "business_window_key": business_window_key,
+                    "started_at": sub_started_at,
+                    "sql": str(sub_task.get("sql") or ""),
+                }
+                _record_data_ops_schedule_activity(
+                    sub_job_id,
+                    "running",
+                    f"{mapper_config_name} started",
+                    kind="mapper",
+                    pipeline_id=pipeline_id,
+                    data_ops_node_id=data_ops_node_id,
+                    step_id=mapper_step_id,
+                    config_id=mapper_config_id,
+                    task_master_id=task_master_id,
+                    task_master_name=task_master_name,
+                    task_bind_params=runtime_bind_params,
+                    business_window_key=business_window_key,
+                    last_run_started_at=sub_started_at.isoformat() + "Z",
+                )
+                def _task_master_subtask_progress_callback(progress: Dict[str, Any]) -> None:
+                    rowcount = int(progress.get("rowcount") or 0)
+                    batches = int(progress.get("batches") or 0)
+                    _record_data_ops_schedule_activity(
+                        sub_job_id,
+                        "running",
+                        f"{mapper_config_name} running: {rowcount} row(s) across {batches} batch(es)",
+                        kind="mapper",
+                        pipeline_id=pipeline_id,
+                        data_ops_node_id=data_ops_node_id,
+                        step_id=mapper_step_id,
+                        config_id=mapper_config_id,
+                        task_master_id=task_master_id,
+                        task_master_name=task_master_name,
+                        task_bind_params=runtime_config.get("_data_ops_task_bind_params") if isinstance(runtime_config.get("_data_ops_task_bind_params"), dict) else runtime_bind_params,
+                        business_window_key=business_window_key,
+                        source_rows=rowcount,
+                        rows_processed=rowcount,
+                        destination_rows=rowcount,
+                        rejected_rows=0,
+                        mismatch_rows=0,
+                        batches=batches,
+                        checkpoint=progress.get("checkpoint"),
+                        duration_ms=int((datetime.utcnow() - sub_started_at).total_seconds() * 1000),
+                        last_run_started_at=sub_started_at.isoformat() + "Z",
+                    )
+                runtime_config["_data_ops_progress_callback"] = _task_master_subtask_progress_callback
+                result, checkpoint_record = await asyncio.to_thread(
+                    _execute_data_ops_mapper_sql_with_checkpoint,
+                    runtime_config,
+                    str(sub_task.get("sql") or ""),
+                    pipeline_id,
+                    data_ops_node_id,
+                    task_master_id,
+                    mapper_step_id,
+                    mapper_config_id,
+                    business_window_key,
+                    sub_job_id,
+                )
+                active_subtask_context = {}
+                rowcount = int(result.get("rowcount") or 0)
+                diagnostics = _data_ops_execution_diagnostics(runtime_config, str(sub_task.get("sql") or ""))
+                affected += rowcount
+                completed += 1
+                batch_suffix = f" across {int(result.get('batches') or 1)} batch(es)" if result.get("processing_mode") == "incremental_batch_loop" else ""
+                _record_data_ops_schedule_activity(
+                    sub_job_id,
+                    "success",
+                    f"{mapper_config_name} completed: {rowcount} row(s){batch_suffix}",
+                    kind="mapper",
+                    pipeline_id=pipeline_id,
+                    data_ops_node_id=data_ops_node_id,
+                    step_id=mapper_step_id,
+                    config_id=mapper_config_id,
+                    task_master_id=task_master_id,
+                    task_master_name=task_master_name,
+                    task_bind_params=runtime_bind_params,
+                    business_window_key=business_window_key,
+                    source_rows=rowcount,
+                    rows_processed=rowcount,
+                    destination_rows=rowcount,
+                    rejected_rows=0,
+                    mismatch_rows=0,
+                    checkpoint=checkpoint_record or previous_checkpoint,
+                    sql=diagnostics.get("sql"),
+                    parsed_sql=diagnostics.get("parsed_sql"),
+                    bind_names=diagnostics.get("bind_names"),
+                    provided_binds=diagnostics.get("provided_binds"),
+                    execution_binds=diagnostics.get("execution_binds"),
+                    missing_binds=diagnostics.get("missing_binds"),
+                    duration_ms=int((datetime.utcnow() - sub_started_at).total_seconds() * 1000),
+                    last_run_started_at=sub_started_at.isoformat() + "Z",
+                    last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+                )
+        _record_data_ops_schedule_activity(
+            job_id,
+            "success",
+            f"Task Master completed: {completed} subtask run(s), {skipped} skipped, {affected} row(s)",
+            kind="task_master",
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_id=mapper_step_id,
+            task_master_id=task_master_id,
+            task_master_name=task_master_name,
+            duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
+            source_rows=affected,
+            rows_processed=affected,
+            destination_rows=affected,
+            rejected_rows=0,
+            mismatch_rows=0,
+            last_run_started_at=started_at.isoformat() + "Z",
+            last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+        )
+    except Exception as exc:
+        if active_subtask_context:
+            diagnostics = _data_ops_execution_diagnostics(
+                active_subtask_context.get("runtime_config") if isinstance(active_subtask_context.get("runtime_config"), dict) else {},
+                str(active_subtask_context.get("sql") or ""),
+                exc,
+            )
+            sub_started_at = active_subtask_context.get("started_at")
+            if not isinstance(sub_started_at, datetime):
+                sub_started_at = started_at
+            _record_data_ops_schedule_activity(
+                str(active_subtask_context.get("job_id") or job_id),
+                "failed",
+                f"{active_subtask_context.get('mapper_config_name') or 'Sub task'} failed: {exc}",
+                kind="mapper",
+                pipeline_id=pipeline_id,
+                data_ops_node_id=data_ops_node_id,
+                step_id=mapper_step_id,
+                config_id=str(active_subtask_context.get("mapper_config_id") or ""),
+                task_master_id=task_master_id,
+                task_master_name=task_master_name,
+                task_bind_params=active_subtask_context.get("runtime_bind_params") if isinstance(active_subtask_context.get("runtime_bind_params"), dict) else {},
+                business_window_key=str(active_subtask_context.get("business_window_key") or ""),
+                source_rows=0,
+                rows_processed=0,
+                destination_rows=0,
+                rejected_rows=0,
+                mismatch_rows=0,
+                sql=diagnostics.get("sql"),
+                parsed_sql=diagnostics.get("parsed_sql"),
+                bind_names=diagnostics.get("bind_names"),
+                provided_binds=diagnostics.get("provided_binds"),
+                execution_binds=diagnostics.get("execution_binds"),
+                missing_binds=diagnostics.get("missing_binds"),
+                error_detail=diagnostics.get("error_detail"),
+                duration_ms=int((datetime.utcnow() - sub_started_at).total_seconds() * 1000),
+                last_run_started_at=sub_started_at.isoformat() + "Z",
+                last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+            )
+        _record_data_ops_schedule_activity(
+            job_id,
+            "failed",
+            f"Task Master failed after {completed} subtask run(s): {exc}",
+            kind="task_master",
+            pipeline_id=pipeline_id,
+            data_ops_node_id=data_ops_node_id,
+            step_id=mapper_step_id,
+            task_master_id=task_master_id,
+            task_master_name=task_master_name,
+            error_detail=str(exc),
+            source_rows=affected,
+            rows_processed=affected,
+            destination_rows=affected,
+            rejected_rows=0,
+            mismatch_rows=0,
+            duration_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
+            last_run_started_at=started_at.isoformat() + "Z",
+            last_run_finished_at=datetime.utcnow().isoformat() + "Z",
+        )
+        logger.error(f"Scheduled Data Ops Task Master {job_id} failed: {exc}")
+    finally:
+        try:
+            record = _load_data_ops_schedule_registry().get(job_id) or {}
+            if isinstance(record, dict) and record:
+                next_run_at = _scheduler_job_next_run_at(scheduler.get_job(job_id))
+                if not next_run_at:
+                    trigger, _schedule_text = _data_ops_schedule_record_trigger(record)
+                    next_run_at = _scheduler_job_next_run_at(None, trigger)
+                _persist_data_ops_schedule_record_next_run(record, job_id, next_run_at)
+        except Exception as exc:
+            logger.warning(f"Failed updating Task Master next run for {job_id}: {exc}")
 
 
 def _remove_data_ops_mapper_sync_jobs(raw_job_id: str, remove_pipeline_jobs: bool = False) -> int:
@@ -17796,6 +19606,149 @@ def _remove_data_ops_mapper_sync_jobs(raw_job_id: str, remove_pipeline_jobs: boo
             seen.add(job.id)
             removed += 1
     return removed
+
+
+def _remove_data_ops_task_master_jobs(raw_job_id: str) -> int:
+    job_id = f"{DATA_OPS_TASK_MASTER_JOB_PREFIX}{raw_job_id}"
+    removed = 0
+    for job in list(scheduler.get_jobs()):
+        if job.id == job_id or job.id.startswith(job_id):
+            scheduler.remove_job(job.id)
+            removed += 1
+    _data_ops_schedule_job_fingerprints.pop(job_id, None)
+    return removed
+
+
+@app.post("/api/data-ops/task-master/schedule")
+async def data_ops_task_master_schedule(body: DataOpsTaskMasterScheduleRequest):
+    raw_job_id = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(body.job_id or "").strip())
+    if not raw_job_id:
+        raise HTTPException(400, "job_id is required.")
+    job_id = f"{DATA_OPS_TASK_MASTER_JOB_PREFIX}{raw_job_id}"
+    registry_prefixes = [job_id]
+    if not body.enabled or not body.deploy_enabled:
+        removed = _remove_data_ops_task_master_jobs(raw_job_id)
+        registry_removed = _remove_data_ops_schedule_registry_records(registry_prefixes)
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "enabled": False,
+            "next_run_at": None,
+            "removed_jobs": removed + registry_removed,
+            "message": f"Data Ops Task Master scheduler disabled. Removed {removed + registry_removed} backend job(s).",
+        }
+    schedule_type = str(body.schedule_type or "interval").strip().lower()
+    if schedule_type in {"manual", "event"}:
+        removed = _remove_data_ops_task_master_jobs(raw_job_id)
+        registry_removed = _remove_data_ops_schedule_registry_records(registry_prefixes)
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "enabled": False,
+            "next_run_at": None,
+            "removed_jobs": removed + registry_removed,
+            "message": f"Schedule type '{schedule_type}' does not create a time-based backend job.",
+        }
+    sub_tasks: List[Dict[str, Any]] = []
+    for item in body.sub_tasks or []:
+        sql = str(item.sql or "").strip()
+        if not sql:
+            raise HTTPException(400, f"SQL is required for sub task {item.mapper_config_name or item.mapper_config_id}.")
+        if not _data_ops_sql_allowed_for_execute(sql):
+            raise HTTPException(400, f"Only executable mapper sync SQL can be scheduled for sub task {item.mapper_config_name or item.mapper_config_id}.")
+        sub_tasks.append({
+            "config": dict(item.config or {}),
+            "sql": sql,
+            "mapper_config_id": str(item.mapper_config_id or "").strip(),
+            "mapper_config_name": str(item.mapper_config_name or item.mapper_config_id or "").strip(),
+            "enabled": bool(item.enabled),
+            "run_order": int(item.run_order or 1),
+        })
+    if not sub_tasks:
+        raise HTTPException(400, "At least one sub task is required to schedule a Task Master.")
+    timezone_name = str(body.timezone or "Asia/Kolkata").strip() or "Asia/Kolkata"
+    try:
+        if schedule_type == "cron":
+            schedule_text = _ensure_valid_cron_expr(body.cron or "")
+        else:
+            interval_minutes = max(1, int(body.interval_minutes or 60))
+            schedule_text = f"every {interval_minutes} minute(s)"
+        scheduled_config = dict(body.config or {})
+        scheduled_config["_data_ops_mapper_scheduler_enabled"] = True
+        scheduled_config["_data_ops_mapper_deploy_enabled"] = True
+        scheduled_config["_data_ops_task_master_id"] = str(body.task_master_id or "").strip()
+        scheduled_config["_data_ops_task_master_name"] = str(body.task_master_name or "").strip()
+        scheduled_config["_data_ops_task_window_mode"] = str(body.task_window_mode or "").strip()
+        scheduled_config["_data_ops_task_window_indicator"] = str(body.task_window_indicator or "").strip()
+        scheduled_config["_data_ops_task_monthly_run_day"] = int(body.task_monthly_run_day or 1)
+        scheduled_config["_data_ops_task_lookback_count"] = int(body.task_lookback_count or 1)
+        scheduled_config["_data_ops_task_lookback_unit"] = str(body.task_lookback_unit or "day").strip()
+        scheduled_config["_data_ops_task_duplicate_policy"] = str(body.task_duplicate_policy or "skip_completed").strip()
+        scheduled_config["_data_ops_task_start_at"] = str(body.task_start_at or "").strip()
+        scheduled_config["_data_ops_task_end_at"] = str(body.task_end_at or "").strip()
+        scheduled_config["_data_ops_task_timezone"] = timezone_name
+        schedule_record = {
+            "kind": "task_master",
+            "job_id": job_id,
+            "pipeline_id": str(body.pipeline_id or "").strip(),
+            "data_ops_node_id": str(body.data_ops_node_id or "").strip(),
+            "mapper_step_id": str(body.mapper_step_id or "").strip(),
+            "task_master_id": str(body.task_master_id or "").strip(),
+            "task_master_name": str(body.task_master_name or "").strip(),
+            "task_window_mode": str(body.task_window_mode or "").strip(),
+            "task_window_indicator": str(body.task_window_indicator or "").strip(),
+            "task_monthly_run_day": int(body.task_monthly_run_day or 1),
+            "task_lookback_count": int(body.task_lookback_count or 1),
+            "task_lookback_unit": str(body.task_lookback_unit or "day").strip(),
+            "task_duplicate_policy": str(body.task_duplicate_policy or "skip_completed").strip(),
+            "task_start_at": str(body.task_start_at or "").strip(),
+            "task_end_at": str(body.task_end_at or "").strip(),
+            "enabled": True,
+            "deploy_enabled": True,
+            "schedule_type": schedule_type,
+            "interval_minutes": int(body.interval_minutes or 60) if schedule_type != "cron" else None,
+            "cron": body.cron or "0 * * * *",
+            "timezone": timezone_name,
+            "max_instances": max(1, int(body.max_instances or 1)),
+            "misfire_policy": str(body.misfire_policy or "skip"),
+            "config": scheduled_config,
+            "sub_tasks": sub_tasks,
+        }
+        _upsert_data_ops_schedule_registry_record(schedule_record)
+        next_run_at = _ensure_data_ops_schedule_record_job(schedule_record, force=True)
+        task_bind_params = _data_ops_runtime_task_bind_params(scheduled_config, datetime.utcnow())
+        _record_data_ops_schedule_activity(
+            job_id,
+            "scheduled",
+            "Task Master window registered",
+            kind="task_master",
+            pipeline_id=schedule_record["pipeline_id"],
+            data_ops_node_id=schedule_record["data_ops_node_id"],
+            step_id=schedule_record["mapper_step_id"],
+            task_master_id=schedule_record["task_master_id"],
+            task_master_name=schedule_record["task_master_name"],
+            task_window_mode=schedule_record["task_window_mode"],
+            task_bind_params=task_bind_params,
+            business_window_key=str(task_bind_params.get("task_business_window_key") or ""),
+            next_run_at=next_run_at,
+            source_rows=0,
+            rows_processed=0,
+            destination_rows=0,
+            rejected_rows=0,
+            mismatch_rows=0,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"Failed to schedule Task Master: {exc}")
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "enabled": True,
+        "schedule": schedule_text,
+        "next_run_at": next_run_at,
+        "message": "Data Ops Task Master scheduler registered.",
+    }
 
 
 @app.post("/api/data-ops/oracle/sync-schedule")
@@ -17959,7 +19912,8 @@ def _data_ops_router_schedule_is_active(pipeline_id: str, job_id: str) -> bool:
                     if candidate_job_id != job_id:
                         continue
                     return (
-                        bool(candidate.get("deployEnabled") or candidate.get("deploy_enabled"))
+                        candidate.get("enabled", True) is not False
+                        and bool(candidate.get("deployEnabled") or candidate.get("deploy_enabled"))
                         and bool(candidate.get("scheduleEnabled") or candidate.get("schedule_enabled"))
                         and str(candidate.get("scheduleStatus") or candidate.get("schedule_status") or "").strip().lower() != "disabled"
                     )
@@ -18275,6 +20229,7 @@ def _data_ops_schedule_record_fingerprint(record: Dict[str, Any]) -> str:
         "max_instances": int(record.get("max_instances") or 1),
         "misfire_policy": record.get("misfire_policy"),
         "sql_sha256": hashlib.sha256(str(record.get("sql") or "").encode("utf-8")).hexdigest(),
+        "sub_tasks_sha256": hashlib.sha256(json.dumps(record.get("sub_tasks") or [], sort_keys=True, default=str).encode("utf-8")).hexdigest(),
         "config_sha256": hashlib.sha256(json.dumps(record.get("config") or {}, sort_keys=True, default=str).encode("utf-8")).hexdigest(),
     }
     return hashlib.sha256(json.dumps(compact, sort_keys=True, default=str).encode("utf-8")).hexdigest()
@@ -18283,34 +20238,49 @@ def _data_ops_schedule_record_fingerprint(record: Dict[str, Any]) -> str:
 def _data_ops_schedule_record_trigger(record: Dict[str, Any]) -> Tuple[Any, str]:
     schedule_type = str(record.get("schedule_type") or "interval").strip().lower()
     timezone_name = str(record.get("timezone") or "Asia/Kolkata").strip() or "Asia/Kolkata"
-    start_date = str(record.get("task_start_at") or "").strip() or None
-    end_date = str(record.get("task_end_at") or "").strip() or None
+    kind = str(record.get("kind") or "").strip().lower()
+    # Task Master start/end are business-window bounds, not scheduler active bounds.
+    start_date = None if kind == "task_master" else str(record.get("task_start_at") or "").strip() or None
+    end_date = None if kind == "task_master" else str(record.get("task_end_at") or "").strip() or None
+    try:
+        schedule_tz = ZoneInfo(timezone_name)
+    except Exception:
+        schedule_tz = timezone.utc
+
+    def _schedule_bound(value: Optional[str], is_end: bool = False) -> Optional[datetime]:
+        if not value:
+            return None
+        raw = str(value).replace("Z", "+00:00")
+        try:
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+                parsed_date = date.fromisoformat(raw)
+                parsed = datetime.combine(parsed_date, time.max if is_end else time.min)
+            else:
+                parsed = datetime.fromisoformat(raw)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=schedule_tz)
+            return parsed
+        except Exception:
+            return None
+
     if schedule_type == "cron":
         cron = _ensure_valid_cron_expr(record.get("cron") or "")
         trigger = CronTrigger.from_crontab(cron, timezone=timezone_name)
-        if start_date:
-            try:
-                trigger.start_date = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
-            except Exception:
-                pass
-        if end_date:
-            try:
-                trigger.end_date = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-            except Exception:
-                pass
+        parsed_start = _schedule_bound(start_date)
+        parsed_end = _schedule_bound(end_date, is_end=True)
+        if parsed_start:
+            trigger.start_date = parsed_start
+        if parsed_end:
+            trigger.end_date = parsed_end
         return trigger, cron
     interval_minutes = max(1, int(record.get("interval_minutes") or 60))
     trigger_kwargs: Dict[str, Any] = {"minutes": interval_minutes, "timezone": timezone_name}
-    if start_date:
-        try:
-            trigger_kwargs["start_date"] = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
-        except Exception:
-            pass
-    if end_date:
-        try:
-            trigger_kwargs["end_date"] = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-        except Exception:
-            pass
+    parsed_start = _schedule_bound(start_date)
+    parsed_end = _schedule_bound(end_date, is_end=True)
+    if parsed_start:
+        trigger_kwargs["start_date"] = parsed_start
+    if parsed_end:
+        trigger_kwargs["end_date"] = parsed_end
     return IntervalTrigger(**trigger_kwargs), f"every {interval_minutes} minute(s)"
 
 
@@ -18321,6 +20291,18 @@ def _data_ops_schedule_record_enabled(record: Dict[str, Any]) -> bool:
 
 
 def _persist_data_ops_schedule_record_next_run(record: Dict[str, Any], job_id: str, next_run_at: Optional[str]) -> None:
+    if next_run_at is not None:
+        def _mutator(registry: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+            existing = registry.get(job_id)
+            if isinstance(existing, dict):
+                existing["next_run_at"] = next_run_at
+                existing["updated_at"] = datetime.utcnow().isoformat() + "Z"
+            return registry
+
+        try:
+            _mutate_data_ops_schedule_registry(_mutator)
+        except Exception:
+            pass
     kind = str(record.get("kind") or "").strip().lower()
     if kind == "mapper":
         _persist_data_ops_schedule_next_run_at(
@@ -18331,6 +20313,18 @@ def _persist_data_ops_schedule_record_next_run(record: Dict[str, Any], job_id: s
             config_id=str(record.get("mapper_config_id") or "").strip(),
             config_collection_key="mapperConfigs",
             active_config_key="activeMapperConfigId",
+            job_id=job_id,
+            next_run_at=next_run_at,
+        )
+    elif kind == "task_master":
+        _persist_data_ops_schedule_next_run_at(
+            pipeline_id=str(record.get("pipeline_id") or "").strip(),
+            data_ops_node_id=str(record.get("data_ops_node_id") or "").strip(),
+            step_kind="map",
+            step_id=str(record.get("mapper_step_id") or "").strip(),
+            config_id=str(record.get("task_master_id") or "").strip(),
+            config_collection_key="taskMasters",
+            active_config_key="activeTaskMasterId",
             job_id=job_id,
             next_run_at=next_run_at,
         )
@@ -18391,6 +20385,27 @@ def _ensure_data_ops_schedule_record_job(record: Dict[str, Any], force: bool = F
             max_instances=max_instances,
             coalesce=coalesce,
         )
+    elif kind == "task_master":
+        scheduled_config = dict(record.get("config") or {})
+        scheduled_config["_data_ops_mapper_scheduler_enabled"] = True
+        scheduled_config["_data_ops_mapper_deploy_enabled"] = True
+        scheduler.add_job(
+            _run_scheduled_data_ops_task_master,
+            trigger=trigger,
+            args=[
+                job_id,
+                scheduled_config,
+                list(record.get("sub_tasks") or []),
+                str(record.get("pipeline_id") or "").strip(),
+                str(record.get("data_ops_node_id") or "").strip(),
+                str(record.get("mapper_step_id") or "").strip(),
+                str(record.get("task_master_id") or "").strip(),
+            ],
+            id=job_id,
+            replace_existing=True,
+            max_instances=max_instances,
+            coalesce=coalesce,
+        )
     elif kind == "router":
         scheduler.add_job(
             _run_scheduled_data_ops_router,
@@ -18425,6 +20440,8 @@ def _router_schedule_record_from_config(
     step_id = str(step.get("id") or "").strip()
     config_id = str(config.get("id") or "").strip()
     if not pipeline_id or not data_ops_node_id or not step_id or not config_id:
+        return None
+    if step.get("enabled", True) is False or config.get("enabled", True) is False:
         return None
     deploy_enabled = bool(config.get("deployEnabled") or config.get("deploy_enabled"))
     schedule_enabled = bool(config.get("scheduleEnabled") or config.get("schedule_enabled"))
@@ -18502,7 +20519,7 @@ def _sync_data_ops_registered_schedule_jobs() -> None:
     desired.update(_collect_data_ops_router_schedule_records_from_db())
 
     for job in list(scheduler.get_jobs()):
-        if not (job.id.startswith(DATA_OPS_SYNC_JOB_PREFIX) or job.id.startswith(DATA_OPS_ROUTER_JOB_PREFIX)):
+        if not (job.id.startswith(DATA_OPS_SYNC_JOB_PREFIX) or job.id.startswith(DATA_OPS_TASK_MASTER_JOB_PREFIX) or job.id.startswith(DATA_OPS_ROUTER_JOB_PREFIX)):
             continue
         if job.id not in desired:
             scheduler.remove_job(job.id)
@@ -18599,23 +20616,24 @@ def _build_data_ops_router_schedule_pipeline_override(
                 item for item in (step.get("routerConfigs") or step.get("router_configs") or [])
                 if isinstance(item, dict)
             ] if isinstance(step.get("routerConfigs") or step.get("router_configs") or [], list) else []
+            enabled_configs = [item for item in configs if item.get("enabled", True) is not False]
             matching_config = None
             if router_config_id:
                 matching_config = next(
                     (
-                        item for item in configs
+                        item for item in enabled_configs
                         if str(item.get("id") or "").strip() == router_config_id
                     ),
                     None,
                 )
                 if configs and matching_config is None:
                     continue
-            elif configs:
+            elif enabled_configs:
                 active_config_id = str(step.get("activeRouterConfigId") or step.get("active_router_config_id") or "").strip()
                 matching_config = next(
-                    (item for item in configs if str(item.get("id") or "").strip() == active_config_id),
+                    (item for item in enabled_configs if str(item.get("id") or "").strip() == active_config_id),
                     None,
-                ) or configs[0]
+                ) or enabled_configs[0]
             selected_node = node
             selected_step = step
             selected_config = matching_config
@@ -27397,7 +29415,7 @@ def _gateway_route_values_from_node(
 
     response_mapping = _gateway_json_or_default(cfg.get("response_mapping"))
     try:
-        response_mapping["limit"] = max(1, min(int(cfg.get("response_limit") or response_mapping.get("limit") or 1000), 50000))
+        response_mapping["limit"] = max(1, min(int(cfg.get("response_limit") or response_mapping.get("limit") or 1000), PIPELINE_GATEWAY_MAX_ROWS))
     except Exception:
         response_mapping["limit"] = 1000
     output_fields = _gateway_split_csv(cfg.get("output_fields") or response_mapping.get("output_fields"))
@@ -29139,7 +31157,7 @@ async def _gateway_execute_route_source(
     input_specs = _gateway_input_specs(route)
     raw_limit = query_params.get("limit") or response_mapping.get("limit") or 1000
     try:
-        max_rows = max(1, min(int(raw_limit), 50000))
+        max_rows = max(1, min(int(raw_limit), PIPELINE_GATEWAY_MAX_ROWS))
     except Exception:
         max_rows = 1000
 

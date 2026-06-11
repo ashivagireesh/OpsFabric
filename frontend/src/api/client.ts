@@ -4,6 +4,7 @@ const envApiBase = String(import.meta.env.VITE_API_BASE_URL || '').trim()
 const BASE = envApiBase || (import.meta.env.DEV ? 'http://localhost:8001' : '')
 const http = axios.create({ baseURL: BASE, timeout: 30000 })
 const H2O_LONG_TIMEOUT_MS = 10 * 60 * 1000
+const DATA_OPS_EXECUTE_TIMEOUT_MS = 15 * 60 * 1000
 
 // ─── In-memory store for offline pipeline creation ──────────────────────────
 const localPipelineStore: Record<string, any> = {}
@@ -523,17 +524,31 @@ const api = {
 
   executeDataOpsOracleSql: async (config: Record<string, unknown>, sql: string, confirm = true) => {
     try {
+      const continuousRun = Number(config?._data_ops_sync_max_batches ?? config?.syncMaxBatches ?? config?.sync_max_batches) <= 0
       const r = await http.post('/api/data-ops/oracle/execute', {
         config,
         sql,
         confirm,
-      })
+      }, { timeout: continuousRun ? 0 : DATA_OPS_EXECUTE_TIMEOUT_MS })
       return r.data
     } catch (err: any) {
       const detail = err?.response?.data?.detail
       const message = typeof detail === 'string'
         ? detail
         : String(err?.message || 'Failed to execute Oracle SQL')
+      throw new Error(message)
+    }
+  },
+
+  stopDataOpsOracleRun: async (payload: Record<string, unknown>) => {
+    try {
+      const r = await http.post('/api/data-ops/oracle/stop', payload)
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to stop Data Ops run')
       throw new Error(message)
     }
   },
@@ -547,6 +562,58 @@ const api = {
       const message = typeof detail === 'string'
         ? detail
         : String(err?.message || 'Failed to schedule Oracle sync')
+      throw new Error(message)
+    }
+  },
+
+  scheduleDataOpsTaskMaster: async (payload: Record<string, unknown>) => {
+    try {
+      const r = await http.post('/api/data-ops/task-master/schedule', payload)
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to schedule Task Master')
+      throw new Error(message)
+    }
+  },
+
+  resetDataOpsCheckpoint: async (payload: Record<string, unknown>) => {
+    try {
+      const r = await http.post('/api/data-ops/checkpoint/reset', payload)
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to reset checkpoint cursor')
+      throw new Error(message)
+    }
+  },
+
+  getDataOpsCheckpoint: async (payload: Record<string, unknown>) => {
+    try {
+      const r = await http.post('/api/data-ops/checkpoint/get', payload)
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to load checkpoint cursor')
+      throw new Error(message)
+    }
+  },
+
+  updateDataOpsCheckpoint: async (payload: Record<string, unknown>) => {
+    try {
+      const r = await http.post('/api/data-ops/checkpoint/update', payload)
+      return r.data
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      const message = typeof detail === 'string'
+        ? detail
+        : String(err?.message || 'Failed to update checkpoint cursor')
       throw new Error(message)
     }
   },

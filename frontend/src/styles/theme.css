@@ -553,6 +553,189 @@ body {
   top: 0;
 }
 
+.data-ops-action-stack {
+  width: 100%;
+}
+
+.data-ops-action-stack .ant-btn {
+  width: 100%;
+  justify-content: center;
+}
+
+.data-ops-vertical-config,
+.data-ops-mapper-setup-grid {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)) !important;
+  padding: 10px;
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--app-bg) 92%, var(--app-card-bg));
+  align-items: start !important;
+  min-width: 0;
+}
+
+.data-ops-mapper-primary-config {
+  grid-template-columns: minmax(130px, 0.8fr) minmax(150px, 0.9fr) minmax(220px, 1.3fr) !important;
+  border-left: 3px solid var(--data-ops-output-color, #22c55e);
+}
+
+.data-ops-mapper-source-config {
+  grid-template-columns: minmax(180px, 0.85fr) minmax(230px, 1.15fr) minmax(220px, 0.8fr) !important;
+  border-left: 3px solid var(--data-ops-source-color, #38bdf8);
+}
+
+.data-ops-target-key-config {
+  grid-template-columns: repeat(2, minmax(220px, 1fr)) !important;
+  border-left: 3px solid var(--data-ops-output-color, #22c55e);
+}
+
+.data-ops-mapper-bind-config {
+  grid-template-columns: 1fr !important;
+  border-left: 3px solid var(--data-ops-filter-color, #f59e0b) !important;
+  align-content: start;
+  gap: 10px !important;
+}
+
+.data-ops-mapper-setup-grid > div,
+.data-ops-parameter-card > div {
+  min-width: 0;
+}
+
+.data-ops-mapper-top-config-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(360px, 1fr));
+  gap: 10px;
+  align-items: start;
+  min-width: 0;
+}
+
+.data-ops-mapper-top-config-grid .data-ops-mapper-setup-grid {
+  height: 100%;
+}
+
+.data-ops-mapper-bind-config > .ant-space {
+  align-items: center;
+  margin-bottom: 2px;
+  width: 100%;
+  justify-content: space-between !important;
+}
+
+.data-ops-mapper-bind-row {
+  grid-template-columns: 38px minmax(130px, 0.8fr) minmax(110px, 0.65fr) minmax(180px, 1.2fr) !important;
+  row-gap: 4px !important;
+  align-items: end !important;
+}
+
+.data-ops-mapper-bind-row > .ant-typography:last-child {
+  grid-column: 2 / -1;
+  grid-row: 2;
+  min-width: 0;
+}
+
+.data-ops-mapper-bind-row .ant-select,
+.data-ops-mapper-bind-row .ant-input {
+  width: 100% !important;
+}
+
+.data-ops-parameter-panel-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.64fr) minmax(280px, 0.9fr) minmax(340px, 1.08fr);
+  gap: 10px;
+  align-items: start;
+  min-width: 0;
+}
+
+.data-ops-parameter-card {
+  min-width: 0;
+  max-width: 100%;
+  border: 1px solid var(--app-border) !important;
+  border-radius: 8px !important;
+  background: color-mix(in srgb, var(--app-bg) 94%, var(--app-card-bg)) !important;
+  padding: 10px !important;
+  align-content: start;
+}
+
+.data-ops-batch-card {
+  grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  align-items: start !important;
+  align-content: start;
+}
+
+.data-ops-batch-card > div {
+  min-height: 54px;
+}
+
+.data-ops-batch-card > div:nth-child(4) {
+  grid-row: 2;
+  grid-column: 2;
+}
+
+.data-ops-batch-card > div:nth-child(3) {
+  grid-row: 2;
+  grid-column: 1;
+}
+
+.data-ops-batch-card > div:nth-child(7) {
+  grid-column: 1 / -1;
+}
+
+.data-ops-checkpoint-card {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)) !important;
+  align-content: start;
+}
+
+.data-ops-checkpoint-card .ant-collapse-content-box {
+  padding: 8px 0 0 !important;
+}
+
+.data-ops-checkpoint-card .ant-collapse-content-box > div,
+.data-ops-checkpoint-card .ant-collapse-content-box > div > div {
+  grid-template-columns: 1fr !important;
+}
+
+.data-ops-checkpoint-card .ant-collapse-content-box .ant-space {
+  justify-content: flex-start !important;
+  flex-wrap: wrap;
+}
+
+.data-ops-scheduler-card {
+  border-left: 3px solid var(--data-ops-schedule-color, #f97316) !important;
+  align-content: start;
+}
+
+.data-ops-scheduler-card > div[style*="grid-template-columns"] {
+  grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)) !important;
+}
+
+.data-ops-scheduler-card > div[style*="grid-template-columns"] > .ant-typography {
+  align-self: center;
+  min-width: 0;
+}
+
+.data-ops-task-master-expanded {
+  grid-template-columns: minmax(360px, 0.82fr) minmax(460px, 1.18fr) !important;
+  align-items: start;
+}
+
+.data-ops-task-window-card {
+  grid-template-columns: repeat(2, minmax(150px, 1fr)) !important;
+}
+
+.data-ops-task-scheduler-card {
+  min-height: 0 !important;
+}
+
+.data-ops-task-scheduler-card > .ant-space:first-child {
+  align-items: flex-start !important;
+}
+
+.data-ops-task-scheduler-card > div[style*="grid-template-columns"] {
+  grid-template-columns: repeat(3, minmax(130px, 1fr)) !important;
+}
+
+.data-ops-task-master-expanded > .ant-space {
+  grid-column: 1 / -1;
+}
+
 .data-ops-query-result-side .ant-table-wrapper,
 .data-ops-query-result-side .ant-spin-nested-loading,
 .data-ops-query-result-side .ant-spin-container {
@@ -576,8 +759,8 @@ body {
 
 .data-ops-mapper-layout {
   display: grid;
-  grid-template-columns: minmax(0, 6fr) minmax(360px, 4fr);
-  gap: 10px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
   align-items: start;
   min-width: 0;
 }
@@ -588,7 +771,7 @@ body {
 
 .data-ops-router-layout {
   display: grid;
-  grid-template-columns: minmax(0, 6fr) minmax(360px, 4fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   align-items: start;
   min-width: 0;
@@ -604,10 +787,24 @@ body {
 }
 
 .data-ops-router-preview-side {
+  display: none;
   border: 1px solid var(--app-border);
   border-radius: 8px;
   background: var(--app-bg);
   padding: 8px;
+}
+
+.data-ops-mapper-sql-side {
+  display: none;
+}
+
+@media (max-width: 1480px) {
+  .data-ops-mapper-primary-config,
+  .data-ops-mapper-source-config,
+  .data-ops-target-key-config,
+  .data-ops-parameter-panel-grid {
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)) !important;
+  }
 }
 
 @media (max-width: 1280px) {
@@ -780,4 +977,67 @@ body {
   background: rgba(240, 171, 252, 0.12);
   border-radius: 3px;
   padding: 0 1px;
+}
+
+.data-ops-monitor-table-shell {
+  width: 100%;
+  max-width: calc(100vw - 92px);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.data-ops-monitor-table-shell .ant-table-wrapper,
+.data-ops-monitor-table-shell .ant-spin-nested-loading,
+.data-ops-monitor-table-shell .ant-spin-container,
+.data-ops-monitor-table-shell .ant-table,
+.data-ops-monitor-log-table,
+.data-ops-monitor-log-table .ant-table-container,
+.data-ops-monitor-log-table .ant-table-content {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.data-ops-monitor-log-table .ant-table-container,
+.data-ops-monitor-log-table .ant-table-content,
+.data-ops-monitor-log-table .ant-table-body {
+  overflow-x: auto !important;
+}
+
+.data-ops-monitor-log-table .ant-table-cell-fix-left,
+.data-ops-monitor-log-table .ant-table-cell-fix-left-first,
+.data-ops-monitor-log-table .ant-table-cell-fix-left-last,
+.data-ops-monitor-log-table .ant-table-cell-fix-right,
+.data-ops-monitor-log-table .ant-table-cell-fix-right-first,
+.data-ops-monitor-log-table .ant-table-cell-fix-right-last {
+  background: var(--app-card-bg) !important;
+  z-index: 3;
+}
+
+.data-ops-monitor-log-table .ant-table-cell-fix-left-last::after {
+  box-shadow: 8px 0 12px rgba(0, 0, 0, 0.28);
+}
+
+.data-ops-monitor-log-expanded {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  background: var(--app-panel-bg);
+  border: 1px solid var(--app-border);
+  border-radius: 6px;
+}
+
+.data-ops-monitor-log-detail {
+  margin: 0;
+  max-height: 520px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--app-text);
+  background: var(--app-card-bg);
+  border: 1px solid var(--app-border);
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 11px;
+  line-height: 1.45;
 }

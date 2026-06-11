@@ -190,6 +190,26 @@ type DataOpsBindParam = {
   enabled?: boolean
 }
 
+const DATA_OPS_CHECKPOINT_BIND_PRESETS: Array<Omit<DataOpsBindParam, 'id'>> = [
+  { name: 'checkpoint_last_source_id', label: 'Last processed source id', dataType: 'string', defaultValue: '', required: false, enabled: true },
+  { name: 'checkpoint_last_transaction_time', label: 'Last processed transaction time', dataType: 'string', defaultValue: '', required: false, enabled: true },
+  { name: 'checkpoint_key', label: 'Checkpoint key', dataType: 'string', defaultValue: '', required: false, enabled: true },
+]
+
+const DATA_OPS_TASK_MASTER_BIND_PRESETS: Array<Omit<DataOpsBindParam, 'id'>> = [
+  { name: 'task_business_date', label: 'Task business date', dataType: 'date', defaultValue: '', required: false, enabled: true },
+  { name: 'task_business_start_date', label: 'Task business start date', dataType: 'date', defaultValue: '', required: false, enabled: true },
+  { name: 'task_business_end_date', label: 'Task business end date', dataType: 'date', defaultValue: '', required: false, enabled: true },
+  { name: 'task_business_month', label: 'Task business month', dataType: 'string', defaultValue: '', required: false, enabled: true },
+  { name: 'task_business_window_key', label: 'Task business window key', dataType: 'string', defaultValue: '', required: false, enabled: true },
+  { name: 'txn_day', label: 'Transaction day shortcut', dataType: 'date', defaultValue: '', required: false, enabled: true },
+  { name: 'txn_month', label: 'Transaction month shortcut', dataType: 'string', defaultValue: '', required: false, enabled: true },
+  { name: 'task_start_date', label: 'Task configured start date', dataType: 'date', defaultValue: '', required: false, enabled: true },
+  { name: 'task_end_date', label: 'Task configured end date', dataType: 'date', defaultValue: '', required: false, enabled: true },
+  { name: 'task_window_mode', label: 'Task window mode', dataType: 'string', defaultValue: '', required: false, enabled: true },
+  { name: 'task_window_indicator', label: 'Task window indicator', dataType: 'string', defaultValue: '', required: false, enabled: true },
+]
+
 type DataOpsQueryInputRow = {
   id: string
   param?: string
@@ -204,7 +224,7 @@ type DataOpsTaskMaster = {
   name: string
   description?: string
   enabled?: boolean
-  windowMode?: 'daily' | 'monthly' | 'previous_range' | 'custom_range' | 'interval' | 'custom'
+  windowMode?: 'daily' | 'monthly' | 'previous_range' | 'previous_interval' | 'custom_range' | 'interval' | 'custom'
   windowIndicator?: 'transaction_day' | 'transaction_month' | 'transaction_range'
   startAt?: string
   endAt?: string
@@ -219,6 +239,18 @@ type DataOpsTaskMaster = {
   cron?: string
   timezone?: string
   retryPolicy?: 'mismatch' | 'failed' | 'rejected' | 'full'
+  deployEnabled?: boolean
+  scheduleEnabled?: boolean
+  scheduleType?: 'manual' | 'interval' | 'cron' | 'event'
+  scheduleIntervalMinutes?: number
+  scheduleCron?: string
+  scheduleTimezone?: string
+  scheduleMaxParallelRuns?: number
+  scheduleMisfirePolicy?: 'skip' | 'run_once' | 'catch_up'
+  scheduleStatus?: string
+  scheduleBackendJobId?: string
+  scheduleNextRunAt?: string
+  scheduleLastRegisteredAt?: string
   status?: string
   runOrder?: number
   updatedAt?: string
@@ -316,6 +348,7 @@ type DataOpsMapperConfig = {
   id: string
   name: string
   description?: string
+  enabled?: boolean
   targetMode?: DataOpsPipelineStep['targetMode']
   writeMode?: DataOpsPipelineStep['writeMode']
   lookupSource?: string
@@ -328,10 +361,15 @@ type DataOpsMapperConfig = {
   syncProcessingMode?: DataOpsPipelineStep['syncProcessingMode']
   syncBatchSize?: number
   syncCommitEvery?: number
+  syncMaxBatches?: number
+  syncLoopGapSeconds?: number
   syncParallelEnabled?: boolean
   syncParallelWorkers?: number
   syncIncrementalField?: string
   syncCursorField?: string
+  checkpointEnabled?: boolean
+  checkpointIdField?: string
+  checkpointTimeField?: string
   syncErrorMode?: DataOpsPipelineStep['syncErrorMode']
   auditField?: string
   expression?: string
@@ -369,6 +407,7 @@ type DataOpsRouterRouteRow = {
 type DataOpsRouterConfig = {
   id: string
   name: string
+  enabled?: boolean
   description?: string
   routeSource?: string
   queryInputs?: DataOpsQueryInputRow[]
@@ -378,10 +417,16 @@ type DataOpsRouterConfig = {
   syncProcessingMode?: DataOpsPipelineStep['syncProcessingMode']
   syncBatchSize?: number
   syncCommitEvery?: number
+  syncMaxBatches?: number
+  syncLoopGapSeconds?: number
   syncParallelEnabled?: boolean
   syncParallelWorkers?: number
   syncIncrementalField?: string
   syncCursorField?: string
+  checkpointEnabled?: boolean
+  checkpointIdField?: string
+  checkpointTimeField?: string
+  auditField?: string
   syncErrorMode?: DataOpsPipelineStep['syncErrorMode']
   deployEnabled?: boolean
   scheduleEnabled?: boolean
@@ -425,13 +470,18 @@ type DataOpsPipelineStep = {
   keyFields?: string
   auditField?: string
   metrics?: string
-  syncProcessingMode?: 'batch' | 'incremental_batch' | 'cursor' | 'row_by_row'
+  syncProcessingMode?: 'batch' | 'incremental_batch' | 'incremental_batch_loop' | 'cursor' | 'row_by_row'
   syncBatchSize?: number
   syncCommitEvery?: number
+  syncMaxBatches?: number
+  syncLoopGapSeconds?: number
   syncParallelEnabled?: boolean
   syncParallelWorkers?: number
   syncIncrementalField?: string
   syncCursorField?: string
+  checkpointEnabled?: boolean
+  checkpointIdField?: string
+  checkpointTimeField?: string
   syncErrorMode?: 'stop' | 'skip' | 'reject'
   deployEnabled?: boolean
   scheduleEnabled?: boolean
@@ -673,7 +723,7 @@ function normalizeDataOpsTaskMasters(value: unknown): DataOpsTaskMaster[] {
       const rawLookbackUnit = String(row.lookbackUnit || row.lookback_unit || 'day').toLowerCase()
       const rawExecutionMode = String(row.executionMode || row.execution_mode || 'subtask_driven').toLowerCase()
       const rawDuplicatePolicy = String(row.duplicatePolicy || row.duplicate_policy || 'skip_completed').toLowerCase()
-      const normalizedWindow = (['monthly', 'previous_range', 'custom_range', 'interval', 'custom'].includes(rawWindow) ? rawWindow : 'daily') as DataOpsTaskMaster['windowMode']
+      const normalizedWindow = (rawWindow === 'interval' ? 'previous_interval' : ['monthly', 'previous_range', 'previous_interval', 'custom_range', 'custom'].includes(rawWindow) ? rawWindow : 'daily') as DataOpsTaskMaster['windowMode']
       return {
         id: String(row.id || `task_master_${idx + 1}`),
         name: String(row.name || row.label || `Task Master ${idx + 1}`),
@@ -700,6 +750,18 @@ function normalizeDataOpsTaskMasters(value: unknown): DataOpsTaskMaster[] {
         cron: String(row.cron || '0 0 * * *'),
         timezone: String(row.timezone || 'Asia/Kolkata'),
         retryPolicy: (['failed', 'rejected', 'full'].includes(rawRetry) ? rawRetry : 'mismatch') as DataOpsTaskMaster['retryPolicy'],
+        deployEnabled: Boolean(row.deployEnabled || row.deploy_enabled),
+        scheduleEnabled: Boolean(row.scheduleEnabled || row.schedule_enabled),
+        scheduleType: (String(row.scheduleType || row.schedule_type || '') === 'interval' ? 'interval' : 'cron') as DataOpsTaskMaster['scheduleType'],
+        scheduleIntervalMinutes: Number.isFinite(Number(row.scheduleIntervalMinutes || row.schedule_interval_minutes)) ? Math.max(1, Math.trunc(Number(row.scheduleIntervalMinutes || row.schedule_interval_minutes))) : 15,
+        scheduleCron: String(row.scheduleCron || row.schedule_cron || row.cron || '0 0 * * *'),
+        scheduleTimezone: String(row.scheduleTimezone || row.schedule_timezone || row.timezone || 'Asia/Kolkata'),
+        scheduleMaxParallelRuns: Number.isFinite(Number(row.scheduleMaxParallelRuns || row.schedule_max_parallel_runs)) ? Math.max(1, Math.trunc(Number(row.scheduleMaxParallelRuns || row.schedule_max_parallel_runs))) : 1,
+        scheduleMisfirePolicy: (['run_once', 'catch_up'].includes(String(row.scheduleMisfirePolicy || row.schedule_misfire_policy || '')) ? String(row.scheduleMisfirePolicy || row.schedule_misfire_policy) : 'skip') as DataOpsTaskMaster['scheduleMisfirePolicy'],
+        scheduleStatus: String(row.scheduleStatus || row.schedule_status || ''),
+        scheduleBackendJobId: String(row.scheduleBackendJobId || row.schedule_backend_job_id || ''),
+        scheduleNextRunAt: String(row.scheduleNextRunAt || row.schedule_next_run_at || ''),
+        scheduleLastRegisteredAt: String(row.scheduleLastRegisteredAt || row.schedule_last_registered_at || ''),
         status: String(row.status || ''),
         runOrder: Number.isFinite(Number(row.runOrder || row.run_order)) ? Math.max(1, Math.trunc(Number(row.runOrder || row.run_order))) : idx + 1,
         updatedAt: String(row.updatedAt || row.updated_at || ''),
@@ -846,10 +908,15 @@ function normalizeDataOpsMapperConfigs(value: unknown): DataOpsMapperConfig[] {
   return Array.isArray(value)
     ? value.map((item, idx) => {
       const row = item && typeof item === 'object' ? item as Record<string, unknown> : {}
+      const rawSyncMaxBatches = row.syncMaxBatches ?? row.sync_max_batches
+      const rawSyncLoopGapSeconds = row.syncLoopGapSeconds ?? row.sync_loop_gap_seconds ?? row.syncEmptyPollSeconds ?? row.sync_empty_poll_seconds
+      const rawScheduleBackendJobId = String(row.scheduleBackendJobId || row.schedule_backend_job_id || '')
+      const staleTaskMasterSchedule = rawScheduleBackendJobId.startsWith('data_ops_task_master:')
       return {
         id: String(row.id || `mapper_config_${idx + 1}`),
         name: String(row.name || row.label || `Mapper ${idx + 1}`),
         description: String(row.description || ''),
+        enabled: row.enabled !== false,
         targetMode: (['oracle', 'file', 'api', 'upstream'].includes(String(row.targetMode || row.target_mode || '')) ? String(row.targetMode || row.target_mode) : 'oracle') as DataOpsPipelineStep['targetMode'],
         writeMode: (['insert', 'update', 'upsert', 'merge', 'append', 'delete', 'delete_insert', 'truncate_insert'].includes(String(row.writeMode || row.write_mode || '')) ? String(row.writeMode || row.write_mode) : 'upsert') as DataOpsPipelineStep['writeMode'],
         lookupSource: String(row.lookupSource || row.lookup_source || ''),
@@ -859,27 +926,32 @@ function normalizeDataOpsMapperConfigs(value: unknown): DataOpsMapperConfig[] {
         target: String(row.target || ''),
         keyFields: String(row.keyFields || row.key_fields || ''),
         mappingRows: normalizeDataOpsMapRows(row.mappingRows || row.mapping_rows),
-        syncProcessingMode: (['batch', 'incremental_batch', 'cursor', 'row_by_row'].includes(String(row.syncProcessingMode || row.sync_processing_mode || '')) ? String(row.syncProcessingMode || row.sync_processing_mode) : 'batch') as DataOpsPipelineStep['syncProcessingMode'],
+        syncProcessingMode: (['batch', 'incremental_batch', 'incremental_batch_loop', 'cursor', 'row_by_row'].includes(String(row.syncProcessingMode || row.sync_processing_mode || '')) ? String(row.syncProcessingMode || row.sync_processing_mode) : 'batch') as DataOpsPipelineStep['syncProcessingMode'],
         syncBatchSize: Number.isFinite(Number(row.syncBatchSize || row.sync_batch_size)) ? Math.max(1, Math.trunc(Number(row.syncBatchSize || row.sync_batch_size))) : 1000,
         syncCommitEvery: Number.isFinite(Number(row.syncCommitEvery || row.sync_commit_every)) ? Math.max(1, Math.trunc(Number(row.syncCommitEvery || row.sync_commit_every))) : 5000,
+        syncMaxBatches: Number.isFinite(Number(rawSyncMaxBatches)) ? Math.max(0, Math.trunc(Number(rawSyncMaxBatches))) : 100,
+        syncLoopGapSeconds: Number.isFinite(Number(rawSyncLoopGapSeconds)) ? Math.max(1, Math.trunc(Number(rawSyncLoopGapSeconds))) : 5,
         syncParallelEnabled: Boolean(row.syncParallelEnabled || row.sync_parallel_enabled),
         syncParallelWorkers: Number.isFinite(Number(row.syncParallelWorkers || row.sync_parallel_workers)) ? Math.max(1, Math.trunc(Number(row.syncParallelWorkers || row.sync_parallel_workers))) : 4,
         syncIncrementalField: String(row.syncIncrementalField || row.sync_incremental_field || ''),
         syncCursorField: String(row.syncCursorField || row.sync_cursor_field || ''),
+        checkpointEnabled: row.checkpointEnabled !== false && row.checkpoint_enabled !== false,
+        checkpointIdField: String(row.checkpointIdField || row.checkpoint_id_field || row.syncCursorField || row.sync_cursor_field || ''),
+        checkpointTimeField: String(row.checkpointTimeField || row.checkpoint_time_field || row.syncIncrementalField || row.sync_incremental_field || ''),
         syncErrorMode: (['skip', 'reject'].includes(String(row.syncErrorMode || row.sync_error_mode || '')) ? String(row.syncErrorMode || row.sync_error_mode) : 'stop') as DataOpsPipelineStep['syncErrorMode'],
         auditField: String(row.auditField || row.audit_field || '_data_ops_audit'),
         expression: String(row.expression || row.sql || ''),
-        deployEnabled: Boolean(row.deployEnabled || row.deploy_enabled),
-        scheduleEnabled: Boolean(row.scheduleEnabled || row.schedule_enabled),
+        deployEnabled: staleTaskMasterSchedule ? false : Boolean(row.deployEnabled || row.deploy_enabled),
+        scheduleEnabled: staleTaskMasterSchedule ? false : Boolean(row.scheduleEnabled || row.schedule_enabled),
         scheduleType: (['manual', 'cron', 'event'].includes(String(row.scheduleType || row.schedule_type || '')) ? String(row.scheduleType || row.schedule_type) : 'interval') as DataOpsMapperConfig['scheduleType'],
         scheduleIntervalMinutes: Number.isFinite(Number(row.scheduleIntervalMinutes || row.schedule_interval_minutes)) ? Math.max(1, Math.trunc(Number(row.scheduleIntervalMinutes || row.schedule_interval_minutes))) : 60,
         scheduleCron: String(row.scheduleCron || row.schedule_cron || '0 * * * *'),
         scheduleTimezone: String(row.scheduleTimezone || row.schedule_timezone || 'Asia/Kolkata'),
         scheduleMaxParallelRuns: Number.isFinite(Number(row.scheduleMaxParallelRuns || row.schedule_max_parallel_runs)) ? Math.max(1, Math.trunc(Number(row.scheduleMaxParallelRuns || row.schedule_max_parallel_runs))) : 1,
         scheduleMisfirePolicy: (['run_once', 'catch_up'].includes(String(row.scheduleMisfirePolicy || row.schedule_misfire_policy || '')) ? String(row.scheduleMisfirePolicy || row.schedule_misfire_policy) : 'skip') as DataOpsMapperConfig['scheduleMisfirePolicy'],
-        scheduleStatus: String(row.scheduleStatus || row.schedule_status || ''),
-        scheduleBackendJobId: String(row.scheduleBackendJobId || row.schedule_backend_job_id || ''),
-        scheduleNextRunAt: String(row.scheduleNextRunAt || row.schedule_next_run_at || ''),
+        scheduleStatus: staleTaskMasterSchedule ? 'planned' : String(row.scheduleStatus || row.schedule_status || ''),
+        scheduleBackendJobId: staleTaskMasterSchedule ? '' : rawScheduleBackendJobId,
+        scheduleNextRunAt: staleTaskMasterSchedule ? '' : String(row.scheduleNextRunAt || row.schedule_next_run_at || ''),
         scheduleLastRegisteredAt: String(row.scheduleLastRegisteredAt || row.schedule_last_registered_at || ''),
         updatedAt: String(row.updatedAt || row.updated_at || ''),
       }
@@ -917,24 +989,33 @@ function normalizeDataOpsRouterConfigs(value: unknown): DataOpsRouterConfig[] {
   return Array.isArray(value)
     ? value.map((item, idx) => {
       const row = item && typeof item === 'object' ? item as Record<string, unknown> : {}
+      const rawSyncMaxBatches = row.syncMaxBatches ?? row.sync_max_batches
+      const rawSyncLoopGapSeconds = row.syncLoopGapSeconds ?? row.sync_loop_gap_seconds ?? row.syncEmptyPollSeconds ?? row.sync_empty_poll_seconds
       const routeMode = String(row.routeMode || row.route_mode || 'multi')
       const payloadMode = String(row.payloadMode || row.payload_mode || 'all_rows')
       return {
         id: String(row.id || `router_config_${idx + 1}`),
         name: String(row.name || row.label || `Router ${idx + 1}`),
+        enabled: row.enabled !== false,
         description: String(row.description || ''),
         routeSource: String(row.routeSource || row.route_source || row.lookupSource || row.lookup_source || ''),
         queryInputs: normalizeDataOpsQueryInputs(row.queryInputs || row.query_inputs || row.bindInputs || row.bind_inputs),
         routeMode: (['single', 'conditional'].includes(routeMode) ? routeMode : 'multi') as DataOpsRouterConfig['routeMode'],
         payloadMode: (['batch', 'row_by_row', 'first_row', 'grouped'].includes(payloadMode) ? payloadMode : 'all_rows') as DataOpsRouterConfig['payloadMode'],
         routeRows: normalizeDataOpsRouterRouteRows(row.routeRows || row.route_rows || row.routes),
-        syncProcessingMode: (['incremental_batch', 'cursor', 'row_by_row'].includes(String(row.syncProcessingMode || row.sync_processing_mode || '')) ? String(row.syncProcessingMode || row.sync_processing_mode) : 'batch') as DataOpsPipelineStep['syncProcessingMode'],
+        syncProcessingMode: (['incremental_batch', 'incremental_batch_loop', 'cursor', 'row_by_row'].includes(String(row.syncProcessingMode || row.sync_processing_mode || '')) ? String(row.syncProcessingMode || row.sync_processing_mode) : 'batch') as DataOpsPipelineStep['syncProcessingMode'],
         syncBatchSize: Number.isFinite(Number(row.syncBatchSize || row.sync_batch_size)) ? Math.max(1, Math.trunc(Number(row.syncBatchSize || row.sync_batch_size))) : 1000,
         syncCommitEvery: Number.isFinite(Number(row.syncCommitEvery || row.sync_commit_every)) ? Math.max(1, Math.trunc(Number(row.syncCommitEvery || row.sync_commit_every))) : 5000,
+        syncMaxBatches: Number.isFinite(Number(rawSyncMaxBatches)) ? Math.max(0, Math.trunc(Number(rawSyncMaxBatches))) : 100,
+        syncLoopGapSeconds: Number.isFinite(Number(rawSyncLoopGapSeconds)) ? Math.max(1, Math.trunc(Number(rawSyncLoopGapSeconds))) : 5,
         syncParallelEnabled: Boolean(row.syncParallelEnabled || row.sync_parallel_enabled),
         syncParallelWorkers: Number.isFinite(Number(row.syncParallelWorkers || row.sync_parallel_workers)) ? Math.max(1, Math.trunc(Number(row.syncParallelWorkers || row.sync_parallel_workers))) : 4,
         syncIncrementalField: String(row.syncIncrementalField || row.sync_incremental_field || ''),
         syncCursorField: String(row.syncCursorField || row.sync_cursor_field || ''),
+        checkpointEnabled: row.checkpointEnabled !== false && row.checkpoint_enabled !== false,
+        checkpointIdField: String(row.checkpointIdField || row.checkpoint_id_field || row.syncCursorField || row.sync_cursor_field || ''),
+        checkpointTimeField: String(row.checkpointTimeField || row.checkpoint_time_field || row.syncIncrementalField || row.sync_incremental_field || ''),
+        auditField: String(row.auditField || row.audit_field || '_data_ops_audit'),
         syncErrorMode: (['skip', 'reject'].includes(String(row.syncErrorMode || row.sync_error_mode || '')) ? String(row.syncErrorMode || row.sync_error_mode) : 'stop') as DataOpsPipelineStep['syncErrorMode'],
         deployEnabled: Boolean(row.deployEnabled || row.deploy_enabled),
         scheduleEnabled: Boolean(row.scheduleEnabled || row.schedule_enabled),
@@ -984,16 +1065,22 @@ function normalizeDataOpsPipelineSteps(value: unknown, legacyText: unknown): Dat
   const supportedRows = rawRows.filter((row) => !isUnsupportedDataOpsStep(row))
   const structured = supportedRows.map((row, idx) => {
     const item = row && typeof row === 'object' ? row as Record<string, unknown> : {}
+    const rawSyncMaxBatches = item.syncMaxBatches ?? item.sync_max_batches
+    const rawSyncLoopGapSeconds = item.syncLoopGapSeconds ?? item.sync_loop_gap_seconds ?? item.syncEmptyPollSeconds ?? item.sync_empty_poll_seconds
     const name = String(item.name || item.label || `Step ${idx + 1}`).trim()
     const kind = normalizeDataOpsStepKind(item.kind, name)
     const rawPosition = item.position && typeof item.position === 'object' ? item.position as Record<string, unknown> : {}
+    const routerConfigs = normalizeDataOpsRouterConfigs(item.routerConfigs || item.router_configs)
+    const enabled = kind === 'router' && routerConfigs.length > 0
+      ? routerConfigs.some((config) => config.enabled !== false)
+      : item.enabled !== false
     const x = Number(rawPosition.x)
     const y = Number(rawPosition.y)
     return {
       id: String(item.id || `data_ops_step_${idx + 1}`).trim() || `data_ops_step_${idx + 1}`,
       name: canonicalDataOpsStepName(kind, name || `Step ${idx + 1}`),
       kind,
-      enabled: item.enabled !== false,
+      enabled,
       position: {
         x: Number.isFinite(x) ? x : 80 + idx * 230,
         y: Number.isFinite(y) ? y : idx % 2 === 0 ? 90 : 230,
@@ -1019,13 +1106,18 @@ function normalizeDataOpsPipelineSteps(value: unknown, legacyText: unknown): Dat
       keyFields: String(item.keyFields || item.key_fields || ''),
       auditField: String(item.auditField || item.audit_field || '_data_ops_audit'),
       metrics: String(item.metrics || 'row_count,error_count,duplicate_count'),
-      syncProcessingMode: (['batch', 'incremental_batch', 'cursor', 'row_by_row'].includes(String(item.syncProcessingMode || item.sync_processing_mode || '')) ? String(item.syncProcessingMode || item.sync_processing_mode) : 'batch') as DataOpsPipelineStep['syncProcessingMode'],
+      syncProcessingMode: (['batch', 'incremental_batch', 'incremental_batch_loop', 'cursor', 'row_by_row'].includes(String(item.syncProcessingMode || item.sync_processing_mode || '')) ? String(item.syncProcessingMode || item.sync_processing_mode) : 'batch') as DataOpsPipelineStep['syncProcessingMode'],
       syncBatchSize: Number.isFinite(Number(item.syncBatchSize || item.sync_batch_size)) ? Math.max(1, Math.trunc(Number(item.syncBatchSize || item.sync_batch_size))) : 1000,
       syncCommitEvery: Number.isFinite(Number(item.syncCommitEvery || item.sync_commit_every)) ? Math.max(1, Math.trunc(Number(item.syncCommitEvery || item.sync_commit_every))) : 5000,
+      syncMaxBatches: Number.isFinite(Number(rawSyncMaxBatches)) ? Math.max(0, Math.trunc(Number(rawSyncMaxBatches))) : 100,
+      syncLoopGapSeconds: Number.isFinite(Number(rawSyncLoopGapSeconds)) ? Math.max(1, Math.trunc(Number(rawSyncLoopGapSeconds))) : 5,
       syncParallelEnabled: Boolean(item.syncParallelEnabled || item.sync_parallel_enabled),
       syncParallelWorkers: Number.isFinite(Number(item.syncParallelWorkers || item.sync_parallel_workers)) ? Math.max(1, Math.trunc(Number(item.syncParallelWorkers || item.sync_parallel_workers))) : 4,
       syncIncrementalField: String(item.syncIncrementalField || item.sync_incremental_field || ''),
       syncCursorField: String(item.syncCursorField || item.sync_cursor_field || ''),
+      checkpointEnabled: item.checkpointEnabled !== false && item.checkpoint_enabled !== false,
+      checkpointIdField: String(item.checkpointIdField || item.checkpoint_id_field || item.syncCursorField || item.sync_cursor_field || ''),
+      checkpointTimeField: String(item.checkpointTimeField || item.checkpoint_time_field || item.syncIncrementalField || item.sync_incremental_field || ''),
       syncErrorMode: (['skip', 'reject'].includes(String(item.syncErrorMode || item.sync_error_mode || '')) ? String(item.syncErrorMode || item.sync_error_mode) : 'stop') as DataOpsPipelineStep['syncErrorMode'],
       deployEnabled: Boolean(item.deployEnabled || item.deploy_enabled || item.data_ops_pipeline_deploy_enabled),
       scheduleEnabled: Boolean(item.scheduleEnabled || item.schedule_enabled || item.data_ops_schedule_enabled),
@@ -1062,7 +1154,7 @@ function normalizeDataOpsPipelineSteps(value: unknown, legacyText: unknown): Dat
       activeMapperConfigId: String(item.activeMapperConfigId || item.active_mapper_config_id || ''),
       taskMasters: normalizeDataOpsTaskMasters(item.taskMasters || item.task_masters),
       activeTaskMasterId: String(item.activeTaskMasterId || item.active_task_master_id || ''),
-      routerConfigs: normalizeDataOpsRouterConfigs(item.routerConfigs || item.router_configs),
+      routerConfigs,
       activeRouterConfigId: String(item.activeRouterConfigId || item.active_router_config_id || ''),
       queryInputs: normalizeDataOpsQueryInputs(item.queryInputs || item.query_inputs || item.bindInputs || item.bind_inputs),
       limitRows: Number.isFinite(Number(item.limitRows || item.limit_rows)) ? Number(item.limitRows || item.limit_rows) : undefined,
@@ -1109,10 +1201,15 @@ function normalizeDataOpsPipelineSteps(value: unknown, legacyText: unknown): Dat
     syncProcessingMode: 'batch',
     syncBatchSize: 1000,
     syncCommitEvery: 5000,
+    syncMaxBatches: 100,
+    syncLoopGapSeconds: 5,
     syncParallelEnabled: false,
     syncParallelWorkers: 4,
     syncIncrementalField: '',
     syncCursorField: '',
+    checkpointEnabled: true,
+    checkpointIdField: '',
+    checkpointTimeField: '',
     syncErrorMode: 'stop',
     selectFields: [],
     filterRules: [],
@@ -9862,7 +9959,7 @@ function dataOpsFieldOutputNames(fieldRow: Partial<DataOpsFieldRow> | Record<str
     const safeLeaf = leaf.replace(/\W+/g, '_').replace(/^_+|_+$/g, '') || 'value'
     names.push(`${aggregate}_${safeLeaf}`)
   } else if (rawField) {
-    const leaf = rawField.split('.').pop()?.trim()
+    const leaf = rawField.startsWith(':') ? rawField.replace(/^:/, '').trim() : rawField.split('.').pop()?.trim()
     if (leaf) names.push(leaf)
   }
   if (includeSourcePath && rawField) {
@@ -9976,6 +10073,26 @@ function dataOpsSqlOperator(operator: string, value: string): string {
   return `= ${dataOpsSqlLiteral(value)}`
 }
 
+function dataOpsRuleBindName(rule: Pick<DataOpsRuleRow, 'valueMode' | 'bindParam'>): string {
+  return String(rule.bindParam || '').replace(/^:/, '').trim()
+}
+
+function dataOpsIsCheckpointBindName(name: string): boolean {
+  const normalized = String(name || '').replace(/^:/, '').trim().toLowerCase()
+  return DATA_OPS_CHECKPOINT_BIND_PRESETS.some((item) => String(item.name || '').toLowerCase() === normalized)
+}
+
+function dataOpsRuleConditionSql(rule: DataOpsRuleRow, defaultOperator = 'equals'): string {
+  const field = dataOpsSqlIdent(String(rule.field || ''))
+  const operatorSql = dataOpsSqlOperator(String(rule.operator || defaultOperator), dataOpsRuleValueSql(rule))
+  const condition = `${field} ${operatorSql}`
+  const bindName = dataOpsRuleBindName(rule)
+  if (rule.valueMode === 'bind' && dataOpsIsCheckpointBindName(bindName) && !['exists', 'empty'].includes(String(rule.operator || defaultOperator))) {
+    return `(:${bindName} IS NULL OR ${condition})`
+  }
+  return condition
+}
+
 function dataOpsSqlCaseResultByMode(mode: string | undefined, value: string): string {
   const raw = String(value ?? '').trim()
   if (!raw) return "''"
@@ -10078,11 +10195,11 @@ function buildDataOpsQueryBuilderSql(step: DataOpsPipelineStep): string {
   })()
   const whereSql = (step.filterRules || [])
     .filter((item) => item.enabled !== false && String(item.field || '').trim())
-    .map((item) => `${dataOpsSqlIdent(String(item.field || ''))} ${dataOpsSqlOperator(String(item.operator || 'equals'), dataOpsRuleValueSql(item))}`)
+    .map((item) => dataOpsRuleConditionSql(item, 'equals'))
   const groupSql = selectedGroupRows.map((item) => dataOpsSqlIdent(String(item.field || '')))
   const havingSql = (step.havingRules || [])
     .filter((item) => item.enabled !== false && String(item.field || '').trim())
-    .map((item) => `${dataOpsSqlIdent(String(item.field || ''))} ${dataOpsSqlOperator(String(item.operator || 'greater_than'), dataOpsRuleValueSql(item))}`)
+    .map((item) => dataOpsRuleConditionSql(item, 'greater_than'))
   const orderSql = selectedOrderRows.map((item) => `${dataOpsSqlIdent(String(item.field || ''))} ${String(item.direction || 'asc').toUpperCase()}`)
   return [
     `SELECT\n  ${selectSql}`,
@@ -10144,10 +10261,16 @@ function materializeDataOpsStepConfigsForSave(steps: DataOpsPipelineStep[]): Dat
         syncProcessingMode: step.syncProcessingMode || 'batch',
         syncBatchSize: step.syncBatchSize || 1000,
         syncCommitEvery: step.syncCommitEvery || 5000,
+        syncMaxBatches: step.syncMaxBatches ?? 100,
+        syncLoopGapSeconds: step.syncLoopGapSeconds ?? 5,
         syncParallelEnabled: Boolean(step.syncParallelEnabled),
         syncParallelWorkers: step.syncParallelWorkers || 4,
         syncIncrementalField: step.syncIncrementalField || '',
         syncCursorField: step.syncCursorField || '',
+        checkpointEnabled: step.checkpoint !== false && step.checkpointEnabled !== false,
+        checkpointIdField: step.checkpointIdField || step.syncCursorField || '',
+        checkpointTimeField: step.checkpointTimeField || step.syncIncrementalField || '',
+        auditField: step.auditField || '_data_ops_audit',
         syncErrorMode: step.syncErrorMode || 'stop',
         deployEnabled: Boolean(step.deployEnabled),
         scheduleEnabled: Boolean(step.scheduleEnabled),
@@ -10173,10 +10296,19 @@ function materializeDataOpsStepConfigsForSave(steps: DataOpsPipelineStep[]): Dat
       const rows = step.mapperConfigs || []
       const targetId = String(step.activeMapperConfigId || rows[0]?.id || dataOpsId('mapper'))
       const existing = rows.find((item) => item.id === targetId)
+      if (existing) {
+        return {
+          ...step,
+          activeMapperConfigId: targetId,
+          activeTaskMasterId: step.activeTaskMasterId || existing.taskMasterId || '',
+          mapperConfigs: rows,
+        }
+      }
       const nextConfig: DataOpsMapperConfig = {
         id: targetId,
-        name: String(existing?.name || step.name || `Mapper ${rows.length + 1}`),
-        description: String(existing?.description || ''),
+        name: String(step.name || `Mapper ${rows.length + 1}`),
+        description: '',
+        enabled: true,
         targetMode: step.targetMode || 'oracle',
         writeMode: step.writeMode || 'upsert',
         lookupSource: step.lookupSource || '',
@@ -10189,10 +10321,15 @@ function materializeDataOpsStepConfigsForSave(steps: DataOpsPipelineStep[]): Dat
         syncProcessingMode: step.syncProcessingMode || 'batch',
         syncBatchSize: step.syncBatchSize || 1000,
         syncCommitEvery: step.syncCommitEvery || 5000,
+        syncMaxBatches: step.syncMaxBatches ?? 100,
+        syncLoopGapSeconds: step.syncLoopGapSeconds ?? 5,
         syncParallelEnabled: Boolean(step.syncParallelEnabled),
         syncParallelWorkers: step.syncParallelWorkers || 4,
         syncIncrementalField: step.syncIncrementalField || '',
         syncCursorField: step.syncCursorField || '',
+        checkpointEnabled: step.checkpoint !== false && step.checkpointEnabled !== false,
+        checkpointIdField: step.checkpointIdField || step.syncCursorField || '',
+        checkpointTimeField: step.checkpointTimeField || step.syncIncrementalField || '',
         syncErrorMode: step.syncErrorMode || 'stop',
         auditField: step.auditField || '_data_ops_audit',
         expression: step.expression || '',
@@ -10214,7 +10351,7 @@ function materializeDataOpsStepConfigsForSave(steps: DataOpsPipelineStep[]): Dat
         ...step,
         activeMapperConfigId: targetId,
         activeTaskMasterId: step.activeTaskMasterId || '',
-        mapperConfigs: existing ? rows.map((item) => item.id === targetId ? nextConfig : item) : [...rows, nextConfig],
+        mapperConfigs: [...rows, nextConfig],
       }
     }
     return step
@@ -10275,6 +10412,7 @@ function dataOpsTaskMasterBusinessWindow(task?: DataOpsTaskMaster): Record<strin
   const previousMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0)
   const previousMonthStart = new Date(previousMonthEnd.getFullYear(), previousMonthEnd.getMonth(), 1)
   const dateText = (value: Date) => `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`
+  const dateTimeText = (value: Date) => `${dateText(value)} ${String(value.getHours()).padStart(2, '0')}:${String(value.getMinutes()).padStart(2, '0')}:${String(value.getSeconds()).padStart(2, '0')}`
   const mode = String(task.windowMode || 'daily')
   const indicator = String(task.windowIndicator || (mode === 'monthly' ? 'transaction_month' : mode === 'daily' ? 'transaction_day' : 'transaction_range'))
   const configuredMonthStart = startDate ? `${startDate.slice(0, 7)}-01` : ''
@@ -10289,11 +10427,29 @@ function dataOpsTaskMasterBusinessWindow(task?: DataOpsTaskMaster): Record<strin
   } else if (mode === 'daily') {
     businessStart = startDate || dateText(yesterday)
     businessEnd = businessStart
-  } else if (mode === 'previous_range') {
+  } else if (mode === 'previous_range' || mode === 'previous_interval') {
     const count = Math.max(1, Number(task.lookbackCount || 1))
     const unit = String(task.lookbackUnit || 'day')
     const end = new Date(now)
-    if (unit === 'month') {
+    if (unit === 'minute') {
+      const boundary = new Date(now)
+      boundary.setSeconds(0, 0)
+      boundary.setMinutes(Math.floor(boundary.getMinutes() / count) * count)
+      const rangeStart = new Date(boundary)
+      rangeStart.setMinutes(boundary.getMinutes() - count)
+      const rangeEnd = new Date(boundary.getTime() - 1000)
+      businessStart = dateTimeText(rangeStart)
+      businessEnd = dateTimeText(rangeEnd)
+    } else if (unit === 'hour') {
+      const boundary = new Date(now)
+      boundary.setMinutes(0, 0, 0)
+      boundary.setHours(Math.floor(boundary.getHours() / count) * count)
+      const rangeStart = new Date(boundary)
+      rangeStart.setHours(boundary.getHours() - count)
+      const rangeEnd = new Date(boundary.getTime() - 1000)
+      businessStart = dateTimeText(rangeStart)
+      businessEnd = dateTimeText(rangeEnd)
+    } else if (unit === 'month') {
       const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1)
       const rangeEnd = new Date(currentMonthStart)
       rangeEnd.setDate(0)
@@ -10316,7 +10472,7 @@ function dataOpsTaskMasterBusinessWindow(task?: DataOpsTaskMaster): Record<strin
     ? `txn_month:${businessMonth}`
     : indicator === 'transaction_day'
       ? `txn_day:${businessStart}`
-      : `range:${businessStart}_to_${businessEnd || businessStart}`
+      : `range:${businessStart}_to_${businessEnd || businessStart}`.replace(/\s+/g, '_')
   return {
     task_business_date: businessStart,
     task_business_month: businessMonth,
@@ -10415,14 +10571,49 @@ function dataOpsTaskMasterBindParams(task?: DataOpsTaskMaster): Record<string, s
   }
 }
 
+function dataOpsNormalizeBindRef(value: unknown): string {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  const withoutColon = raw.replace(/^:/, '').trim()
+  const taskBindMatch = withoutColon.match(/^([A-Za-z_][A-Za-z0-9_$#]*)\b/)
+  return raw.startsWith(':') && taskBindMatch ? taskBindMatch[1] : withoutColon
+}
+
+function dataOpsApplyQueryInputBinds(baseBinds: Record<string, unknown>, queryInputs?: DataOpsQueryInputRow[], bindDefs?: DataOpsBindParam[]): Record<string, unknown> {
+  const nextBinds: Record<string, unknown> = { ...(baseBinds || {}) }
+  const defaultsByParam = new Map((bindDefs || []).map((item) => [String(item.name || '').replace(/^:/, '').trim(), item.defaultValue || '']))
+  ;(queryInputs || []).forEach((row) => {
+    if (row.enabled === false) return
+    const param = String(row.param || '').replace(/^:/, '').trim()
+    if (!param) return
+    const mode = String(row.sourceMode || 'default')
+    if (mode === 'fixed') {
+      nextBinds[param] = String(row.value || '')
+      return
+    }
+    if (mode === 'field') {
+      const sourceField = dataOpsNormalizeBindRef(row.sourceField)
+      const matchedKey = Object.keys(nextBinds).find((key) => key === sourceField || key.toLowerCase() === sourceField.toLowerCase())
+      if (matchedKey) {
+        nextBinds[param] = nextBinds[matchedKey]
+      }
+      return
+    }
+    if (!Object.prototype.hasOwnProperty.call(nextBinds, param) && defaultsByParam.has(param)) {
+      nextBinds[param] = defaultsByParam.get(param) || ''
+    }
+  })
+  return nextBinds
+}
+
 function dataOpsTaskMasterWindowLabel(task?: DataOpsTaskMaster): string {
   if (!task) return 'No task selected'
   const mode = String(task.windowMode || 'daily')
   const start = String(task.startAt || '').trim()
   const end = String(task.endAt || '').trim()
   if (mode === 'monthly') return `${start.slice(0, 7) || 'previous month'}${end ? ` to ${end.slice(0, 7)}` : ''}`
-  if (mode === 'previous_range') return `previous ${Number(task.lookbackCount || 1)} ${task.lookbackUnit || 'day'}`
-  if (mode === 'interval' || mode === 'custom' || mode === 'custom_range') return `${start || 'start'} to ${end || 'open'}`
+  if (mode === 'previous_range' || mode === 'previous_interval') return `previous ${Number(task.lookbackCount || 1)} ${task.lookbackUnit || 'day'}`
+  if (mode === 'custom' || mode === 'custom_range') return `${start || 'start'} to ${end || 'open'}`
   return start.slice(0, 10) || 'date not set'
 }
 
@@ -10430,10 +10621,16 @@ function dataOpsTaskMasterScheduleSummary(task?: DataOpsTaskMaster): string {
   if (!task) return 'No schedule'
   const mode = String(task.windowMode || 'daily')
   const runAt = String(task.runAtTime || '00:00')
+  if (task.scheduleType === 'interval') {
+    const intervalText = `every ${Number(task.scheduleIntervalMinutes || 15)} min`
+    if (mode === 'daily') return `Day window · ${intervalText}`
+    if (mode === 'monthly') return `Month window · ${intervalText}`
+    if (mode === 'previous_range' || mode === 'previous_interval') return `Previous ${Number(task.lookbackCount || 1)} ${task.lookbackUnit || 'day'} · ${intervalText}`
+    return `${dataOpsTaskMasterWindowLabel(task)} · ${intervalText}`
+  }
   if (mode === 'daily') return `Day · ${runAt}`
   if (mode === 'monthly') return `Month · day ${Number(task.monthlyRunDay || 1)} at ${runAt}`
-  if (mode === 'previous_range') return `Previous ${Number(task.lookbackCount || 1)} ${task.lookbackUnit || 'day'}`
-  if (mode === 'interval') return `Every ${Number(task.intervalMinutes || 60)} min`
+  if (mode === 'previous_range' || mode === 'previous_interval') return `Previous ${Number(task.lookbackCount || 1)} ${task.lookbackUnit || 'day'}`
   return `${mode} · ${dataOpsTaskMasterWindowLabel(task)}`
 }
 
@@ -10452,6 +10649,7 @@ function dataOpsRouteSourcesForTarget(steps: DataOpsPipelineStep[], targetNodeId
         routeRows: step.routeRows,
       } as DataOpsRouterConfig]
     routerConfigs.forEach((config) => {
+      if (config.enabled === false) return
       const routes = Array.isArray(config.routeRows) ? config.routeRows : []
       const targetsCurrentNode = routes.some((route) => (
         route.enabled !== false
@@ -11731,7 +11929,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [dataOpsQueryResultLoading, setDataOpsQueryResultLoading] = useState(false)
   const [dataOpsQueryResult, setDataOpsQueryResult] = useState<Record<string, any> | null>(null)
   const [dataOpsQueryError, setDataOpsQueryError] = useState<string | null>(null)
+  const [dataOpsQueryWriterSelectedSql, setDataOpsQueryWriterSelectedSql] = useState('')
   const [dataOpsSqlExecuting, setDataOpsSqlExecuting] = useState(false)
+  const [dataOpsObjectSqlExecuting, setDataOpsObjectSqlExecuting] = useState(false)
+  const [dataOpsActiveRunScope, setDataOpsActiveRunScope] = useState<Record<string, unknown> | null>(null)
   const [dataOpsLastExecution, setDataOpsLastExecution] = useState<Record<string, any> | null>(null)
   const [dataOpsStudioActiveTab, setDataOpsStudioActiveTab] = useState<'dashboard' | 'objects' | 'pipeline'>('pipeline')
   const [dataOpsSelectedObject, setDataOpsSelectedObject] = useState<{ schema: string; name: string; type: string } | null>(null)
@@ -11743,19 +11944,27 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const [dataOpsPipelineConfigOpen, setDataOpsPipelineConfigOpen] = useState(false)
   const [dataOpsQueryBuilderConfigOpen, setDataOpsQueryBuilderConfigOpen] = useState(false)
   const [dataOpsMapperConfigOpen, setDataOpsMapperConfigOpen] = useState(false)
+  const [dataOpsMapperSqlDrawerOpen, setDataOpsMapperSqlDrawerOpen] = useState(false)
   const [dataOpsSubTaskMasterOpen, setDataOpsSubTaskMasterOpen] = useState(false)
   const [dataOpsExpandedTaskMasterId, setDataOpsExpandedTaskMasterId] = useState('')
   const [dataOpsMonitorClearedAt, setDataOpsMonitorClearedAt] = useState(0)
   const [dataOpsMonitorWindowFilter, setDataOpsMonitorWindowFilter] = useState('')
   const [dataOpsMonitorTaskFilter, setDataOpsMonitorTaskFilter] = useState('')
   const [dataOpsMonitorSubTaskFilter, setDataOpsMonitorSubTaskFilter] = useState('')
+  const [dataOpsMonitorDrillTabs, setDataOpsMonitorDrillTabs] = useState<Array<{ key: string; level: 'subtask' | 'window'; task: string; subTask?: string; label: string }>>([])
+  const [dataOpsMonitorActiveDrillTab, setDataOpsMonitorActiveDrillTab] = useState('task_summary')
+  const [dataOpsCheckpointCursor, setDataOpsCheckpointCursor] = useState<Record<string, any> | null>(null)
+  const [dataOpsCheckpointDraft, setDataOpsCheckpointDraft] = useState({ lastSourceId: '', lastTransactionTime: '' })
+  const [dataOpsCheckpointLoading, setDataOpsCheckpointLoading] = useState(false)
   const [dataOpsRouterConfigOpen, setDataOpsRouterConfigOpen] = useState(false)
+  const [dataOpsRouterPreviewDrawerOpen, setDataOpsRouterPreviewDrawerOpen] = useState(false)
   const [dataOpsRouterRouteConfigId, setDataOpsRouterRouteConfigId] = useState('')
   const [dataOpsPipelineCanvasActive, setDataOpsPipelineCanvasActive] = useState(false)
   const [dataOpsNodeDragging, setDataOpsNodeDragging] = useState(false)
   const [dataOpsFlowInstance, setDataOpsFlowInstance] = useState<ReactFlowInstance | null>(null)
   const [dataOpsFlowViewport, setDataOpsFlowViewport] = useState({ x: 0, y: 0, zoom: 1 })
   const dataOpsPipelineFitKeyRef = useRef('')
+  const dataOpsQueryWriterEditorRef = useRef<any | null>(null)
   const [dataOpsRuntimeTick, setDataOpsRuntimeTick] = useState(() => Date.now())
   const [dataOpsBackendMonitor, setDataOpsBackendMonitor] = useState<Record<string, any> | null>(null)
   const [dataOpsConnectionTestingById, setDataOpsConnectionTestingById] = useState<Record<string, boolean>>({})
@@ -30782,7 +30991,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   }
   const executeDataOpsInlineSql = async (sql: string, label = 'Oracle operation') => {
     if (!selectedNodeId) return
-    setDataOpsSqlExecuting(true)
+    setDataOpsObjectSqlExecuting(true)
     try {
       const response = await api.executeDataOpsOracleSql(nodeConfig, sql, true)
       setDataOpsLastExecution(response)
@@ -30803,7 +31012,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       })
       throw err
     } finally {
-      setDataOpsSqlExecuting(false)
+      setDataOpsObjectSqlExecuting(false)
     }
   }
   const prepareDataOpsInlineSql = (sql: string, label = 'Inline operation') => {
@@ -31096,7 +31305,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   }
   const applyDataOpsObjectOperation = async () => {
     if (!validateDataOpsObjectSql()) return
-    setDataOpsSqlExecuting(true)
+    setDataOpsObjectSqlExecuting(true)
     try {
       const response = await api.executeDataOpsOracleSql(nodeConfig, dataOpsObjectSql, true)
       setDataOpsLastExecution(response)
@@ -31113,18 +31322,95 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         placement: 'bottomRight',
       })
     } finally {
-      setDataOpsSqlExecuting(false)
+      setDataOpsObjectSqlExecuting(false)
     }
   }
-  const dataOpsQueryWriterSql = String(nodeConfig.data_ops_query_writer_sql || '')
   const dataOpsDefaultQueryWriterSql = `SELECT *\nFROM ${dataOpsDataTargetSchema}.${dataOpsDataTargetName || dataOpsSelectedObjectName || 'YOUR_TABLE'}`
+  const dataOpsQueryWriterTabs = useMemo(() => {
+    const rawTabs = Array.isArray(nodeConfig.data_ops_query_writer_tabs) ? nodeConfig.data_ops_query_writer_tabs : []
+    const tabs = rawTabs
+      .map((item: any, index: number) => ({
+        id: String(item?.id || `query_${index + 1}`),
+        title: String(item?.title || `Query ${index + 1}`),
+        sql: String(item?.sql ?? ''),
+      }))
+      .filter((item) => item.id)
+    if (tabs.length > 0) return tabs
+    return [{
+      id: 'query_1',
+      title: 'Query 1',
+      sql: String(nodeConfig.data_ops_query_writer_sql || dataOpsDefaultQueryWriterSql),
+    }]
+  }, [dataOpsDefaultQueryWriterSql, nodeConfig.data_ops_query_writer_sql, nodeConfig.data_ops_query_writer_tabs])
+  const dataOpsActiveQueryWriterTabId = String(nodeConfig.data_ops_query_writer_active_tab_id || dataOpsQueryWriterTabs[0]?.id || 'query_1')
+  const dataOpsActiveQueryWriterTab = dataOpsQueryWriterTabs.find((item) => item.id === dataOpsActiveQueryWriterTabId) || dataOpsQueryWriterTabs[0]
+  const dataOpsQueryWriterSql = String(dataOpsActiveQueryWriterTab?.sql || dataOpsDefaultQueryWriterSql)
+  const updateDataOpsQueryWriterTabs = (tabs: Array<{ id: string; title: string; sql: string }>, activeTabId: string) => {
+    if (!selectedNodeId) return
+    const safeTabs = tabs.length > 0 ? tabs : [{ id: 'query_1', title: 'Query 1', sql: dataOpsDefaultQueryWriterSql }]
+    const safeActiveTabId = safeTabs.some((item) => item.id === activeTabId) ? activeTabId : safeTabs[0].id
+    const activeSql = String(safeTabs.find((item) => item.id === safeActiveTabId)?.sql || '')
+    updateNodeConfig(selectedNodeId, {
+      data_ops_query_writer_tabs: safeTabs,
+      data_ops_query_writer_active_tab_id: safeActiveTabId,
+      data_ops_query_writer_sql: activeSql,
+    })
+  }
+  const setDataOpsActiveQueryWriterTab = (tabId: string) => {
+    if (!selectedNodeId) return
+    setDataOpsQueryWriterSelectedSql('')
+    const activeSql = String(dataOpsQueryWriterTabs.find((item) => item.id === tabId)?.sql || dataOpsQueryWriterTabs[0]?.sql || '')
+    updateNodeConfig(selectedNodeId, {
+      data_ops_query_writer_active_tab_id: tabId,
+      data_ops_query_writer_sql: activeSql,
+    })
+  }
+  const patchDataOpsActiveQueryWriterSql = (sql: string) => {
+    const nextTabs = dataOpsQueryWriterTabs.map((item) => (
+      item.id === dataOpsActiveQueryWriterTab?.id ? { ...item, sql } : item
+    ))
+    updateDataOpsQueryWriterTabs(nextTabs, dataOpsActiveQueryWriterTab?.id || dataOpsActiveQueryWriterTabId)
+  }
+  const addDataOpsQueryWriterTab = (sql = '') => {
+    const nextIndex = dataOpsQueryWriterTabs.length + 1
+    const tabId = dataOpsId('query')
+    updateDataOpsQueryWriterTabs([
+      ...dataOpsQueryWriterTabs,
+      { id: tabId, title: `Query ${nextIndex}`, sql },
+    ], tabId)
+    setDataOpsQueryWriterSelectedSql('')
+    setDataOpsQueryResult(null)
+    setDataOpsQueryError(null)
+  }
+  const closeDataOpsQueryWriterTab = (tabId: string) => {
+    const closingIndex = Math.max(0, dataOpsQueryWriterTabs.findIndex((item) => item.id === tabId))
+    const nextTabs = dataOpsQueryWriterTabs.filter((item) => item.id !== tabId)
+    const nextActive = tabId === dataOpsActiveQueryWriterTabId
+      ? (nextTabs[Math.max(0, closingIndex - 1)]?.id || nextTabs[0]?.id || 'query_1')
+      : dataOpsActiveQueryWriterTabId
+    updateDataOpsQueryWriterTabs(nextTabs, nextActive)
+    setDataOpsQueryWriterSelectedSql('')
+    setDataOpsQueryResult(null)
+    setDataOpsQueryError(null)
+  }
+  const closeAllDataOpsQueryWriterTabs = () => {
+    updateDataOpsQueryWriterTabs([{ id: 'query_1', title: 'Query 1', sql: dataOpsDefaultQueryWriterSql }], 'query_1')
+    setDataOpsQueryWriterSelectedSql('')
+    setDataOpsQueryResult(null)
+    setDataOpsQueryError(null)
+  }
+  const dataOpsRunnableQueryWriterSql = () => {
+    const selectedSql = String(dataOpsQueryWriterSelectedSql || '').trim()
+    if (selectedSql) return selectedSql
+    return String(dataOpsQueryWriterSql || dataOpsDefaultQueryWriterSql).trim()
+  }
   const dataOpsQueryFirstKeyword = (sql: string) => (String(sql || '')
     .replace(/\/\*[\s\S]*?\*\//g, ' ')
     .replace(/^\s*--.*$/gm, ' ')
     .trim()
     .match(/^([A-Za-z]+)/)?.[1] || '').toUpperCase()
   const previewDataOpsQueryWriterSql = async () => {
-    const sql = String(dataOpsQueryWriterSql || dataOpsDefaultQueryWriterSql).trim()
+    const sql = dataOpsRunnableQueryWriterSql()
     if (!sql) {
       notification.warning({ message: 'No query to preview', placement: 'bottomRight' })
       return
@@ -31153,7 +31439,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     }
   }
   const executeDataOpsQueryWriterSql = async () => {
-    const sql = String(dataOpsQueryWriterSql || dataOpsDefaultQueryWriterSql).trim()
+    const sql = dataOpsRunnableQueryWriterSql()
     const first = dataOpsQueryFirstKeyword(sql)
     if (['SELECT', 'WITH'].includes(first)) {
       await previewDataOpsQueryWriterSql()
@@ -31495,6 +31781,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   }, [applyDataOpsPipelineSnapshot, dataOpsPipelineSnapshot])
   const stopDataOpsDeleteKeyPropagation = useCallback((event: KeyboardEvent) => {
     if (event.key !== 'Backspace' && event.key !== 'Delete') return
+    const target = event.target as HTMLElement | null
+    if (target?.closest('input, textarea, [contenteditable="true"], .monaco-editor, .view-lines, .inputarea')) return
     event.stopPropagation()
   }, [])
   const addDataOpsPipelineStep = useCallback((name: string, kind: DataOpsPipelineStepKind, position?: { x: number; y: number }) => {
@@ -31530,10 +31818,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       syncProcessingMode: 'batch',
       syncBatchSize: 1000,
       syncCommitEvery: 5000,
+      syncMaxBatches: 100,
+      syncLoopGapSeconds: 5,
       syncParallelEnabled: false,
       syncParallelWorkers: 4,
       syncIncrementalField: '',
       syncCursorField: '',
+      checkpointEnabled: true,
+      checkpointIdField: '',
+      checkpointTimeField: '',
       syncErrorMode: 'stop',
       selectFields: [],
       filterRules: [],
@@ -31571,6 +31864,59 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const nextSteps = dataOpsPipelineSteps.map((step) => step.id === stepId ? { ...step, ...patch } : step)
     persistDataOpsPipeline(nextSteps, dataOpsPipelineEdges, recordHistory)
   }, [dataOpsPipelineEdges, dataOpsPipelineSteps, persistDataOpsPipeline])
+  useEffect(() => {
+    if (!dataOpsMapperConfigOpen || !selectedDataOpsPipelineStep || selectedDataOpsPipelineStep.kind !== 'map') return
+    const config = (selectedDataOpsPipelineStep.mapperConfigs || []).find((item) => item.id === selectedDataOpsPipelineStep.activeMapperConfigId)
+    if (!config) return
+    const nextPatch: Partial<DataOpsPipelineStep> = {
+      activeMapperConfigId: config.id,
+      activeTaskMasterId: config.taskMasterId || selectedDataOpsPipelineStep.activeTaskMasterId || '',
+      targetMode: config.targetMode || 'oracle',
+      writeMode: config.writeMode || 'upsert',
+      lookupSource: config.lookupSource || '',
+      queryInputs: config.queryInputs || [],
+      target: config.target || '',
+      keyFields: config.keyFields || '',
+      mappingRows: config.mappingRows || [],
+      syncProcessingMode: config.syncProcessingMode || 'batch',
+      syncBatchSize: config.syncBatchSize || 1000,
+      syncCommitEvery: config.syncCommitEvery || 5000,
+      syncMaxBatches: config.syncMaxBatches ?? 100,
+      syncLoopGapSeconds: config.syncLoopGapSeconds ?? 5,
+      syncParallelEnabled: Boolean(config.syncParallelEnabled),
+      syncParallelWorkers: config.syncParallelWorkers || 4,
+      syncIncrementalField: config.syncIncrementalField || '',
+      syncCursorField: config.syncCursorField || '',
+      checkpoint: config.checkpointEnabled !== false,
+      checkpointEnabled: config.checkpointEnabled !== false,
+      checkpointIdField: config.checkpointIdField || config.syncCursorField || '',
+      checkpointTimeField: config.checkpointTimeField || config.syncIncrementalField || '',
+      syncErrorMode: config.syncErrorMode || 'stop',
+      auditField: config.auditField || '_data_ops_audit',
+      expression: config.expression || '',
+      deployEnabled: Boolean(config.deployEnabled),
+      scheduleEnabled: Boolean(config.scheduleEnabled),
+      scheduleType: config.scheduleType || 'interval',
+      scheduleIntervalMinutes: config.scheduleIntervalMinutes || 60,
+      scheduleCron: config.scheduleCron || '0 * * * *',
+      scheduleTimezone: config.scheduleTimezone || 'Asia/Kolkata',
+      scheduleMaxParallelRuns: config.scheduleMaxParallelRuns || 1,
+      scheduleMisfirePolicy: config.scheduleMisfirePolicy || 'skip',
+      scheduleStatus: config.scheduleStatus || '',
+      scheduleBackendJobId: config.scheduleBackendJobId || '',
+      scheduleNextRunAt: config.scheduleNextRunAt || '',
+      scheduleLastRegisteredAt: config.scheduleLastRegisteredAt || '',
+    }
+    const differs = (Object.keys(nextPatch) as Array<keyof DataOpsPipelineStep>).some((key) => {
+      const currentValue = selectedDataOpsPipelineStep[key]
+      const nextValue = nextPatch[key]
+      if (Array.isArray(currentValue) || Array.isArray(nextValue)) {
+        return JSON.stringify(currentValue || []) !== JSON.stringify(nextValue || [])
+      }
+      return currentValue !== nextValue
+    })
+    if (differs) patchDataOpsPipelineStep(selectedDataOpsPipelineStep.id, nextPatch, false)
+  }, [dataOpsMapperConfigOpen, patchDataOpsPipelineStep, selectedDataOpsPipelineStep])
   const patchDataOpsStepNameDirect = useCallback((stepId: string, value: string, persist = false) => {
     if (!selectedNodeId) return
     const storeState = useWorkflowStore.getState()
@@ -31628,7 +31974,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       })
     }, 150)
   }, [dataOpsStepNameDraft, patchDataOpsStepNameDirect])
-  const buildDataOpsMapperSyncSql = useCallback((step: DataOpsPipelineStep): { sql: string; issue: string } => {
+  const buildDataOpsMapperSyncSql = useCallback((step: DataOpsPipelineStep): { sql: string; issue: string; sourceSql?: string } => {
     const target = String(step.target || '').trim()
     const writeMode = String(step.writeMode || 'upsert')
     const activeMappings = (step.mappingRows || [])
@@ -31655,6 +32001,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       return String(sourceQueryStep?.query || sourceQueryStep?.expression || '').trim().replace(/;\s*$/, '')
     }
     const sourceSql = resolveMapperSourceSql()
+    const syncMode = String(step.syncProcessingMode || 'batch')
+    const syncBatchSize = Math.max(1, Math.trunc(Number(step.syncBatchSize || 1000)))
+    const batchLimitedSourceSql = ['incremental_batch', 'incremental_batch_loop'].includes(syncMode)
+      ? `SELECT * FROM (\n${sourceSql}\n) batch_src WHERE ROWNUM <= ${syncBatchSize}`
+      : sourceSql
     const keyTargets = uniqueFieldNames([
       ...String(step.keyFields || '').split(',').map((item) => item.trim()).filter(Boolean),
       ...activeMappings.filter((row) => row.key).map((row) => String(row.target || '').trim()).filter(Boolean),
@@ -31671,28 +32022,28 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       return `src.${oracleIdent(String(row.source || '').trim())}`
     }
     const targetName = oracleIdent(target)
-    if (!target) return { sql: '', issue: 'Select the destination target table.' }
-    if (!sourceSql) return { sql: '', issue: 'Save SQL from the previous Query Builder step before running sync.' }
-    if (activeMappings.length <= 0) return { sql: '', issue: 'Add at least one active source-to-target mapping.' }
-    if (needsKey && keyTargets.length <= 0) return { sql: '', issue: 'Upsert, merge, update, and delete need Key / Match Fields. Use AGENT_CODE for this target.' }
+    if (!target) return { sql: '', issue: 'Select the destination target table.', sourceSql }
+    if (!sourceSql) return { sql: '', issue: 'Save SQL from the previous Query Builder step before running sync.', sourceSql }
+    if (activeMappings.length <= 0) return { sql: '', issue: 'Add at least one active source-to-target mapping.', sourceSql }
+    if (needsKey && keyTargets.length <= 0) return { sql: '', issue: 'Upsert, merge, update, and delete need Key / Match Fields. Use AGENT_CODE for this target.', sourceSql }
     const selectList = activeMappings.map((row) => `  ${sourceExpr(row)} AS ${oracleIdent(String(row.target || '').trim())}`).join(',\n')
     const targetColumns = activeMappings.map((row) => oracleIdent(String(row.target || '').trim()))
-    const sourceSubquery = `SELECT\n${selectList}\nFROM (\n${sourceSql}\n) src`
+    const sourceSubquery = `SELECT\n${selectList}\nFROM (\n${batchLimitedSourceSql}\n) src`
     const insertSql = `INSERT INTO ${targetName} (${targetColumns.join(', ')})\nSELECT ${targetColumns.map((column) => `src.${column}`).join(', ')}\nFROM (\n${sourceSubquery}\n) src`
     if (['insert', 'append'].includes(writeMode)) {
-      return { sql: insertSql, issue: '' }
+      return { sql: insertSql, issue: '', sourceSql: batchLimitedSourceSql }
     }
     if (writeMode === 'truncate_insert') {
-      return { sql: `BEGIN\n  EXECUTE IMMEDIATE 'TRUNCATE TABLE ${targetName.replace(/'/g, "''")}';\n  ${insertSql.replace(/\n/g, '\n  ')};\nEND;`, issue: '' }
+      return { sql: `BEGIN\n  EXECUTE IMMEDIATE 'TRUNCATE TABLE ${targetName.replace(/'/g, "''")}';\n  ${insertSql.replace(/\n/g, '\n  ')};\nEND;`, issue: '', sourceSql: batchLimitedSourceSql }
     }
     const keySet = new Set(keyTargets.map((item) => item.toUpperCase()))
     const onClause = keyTargets.map((field) => `tgt.${oracleIdent(field)} = src.${oracleIdent(field)}`).join(' AND ')
     const updateColumns = targetColumns.filter((column) => !keySet.has(column.replace(/"/g, '').toUpperCase()))
     if (writeMode === 'delete') {
-      return { sql: `DELETE FROM ${targetName} tgt\nWHERE EXISTS (\n  SELECT 1\n  FROM (\n${sourceSubquery}\n  ) src\n  WHERE ${onClause}\n)`, issue: '' }
+      return { sql: `DELETE FROM ${targetName} tgt\nWHERE EXISTS (\n  SELECT 1\n  FROM (\n${sourceSubquery}\n  ) src\n  WHERE ${onClause}\n)`, issue: '', sourceSql: batchLimitedSourceSql }
     }
     if (writeMode === 'delete_insert') {
-      return { sql: `BEGIN\n  DELETE FROM ${targetName} tgt\n  WHERE EXISTS (\n    SELECT 1\n    FROM (\n${sourceSubquery.replace(/\n/g, '\n      ')}\n    ) src\n    WHERE ${onClause}\n  );\n  ${insertSql.replace(/\n/g, '\n  ')};\nEND;`, issue: '' }
+      return { sql: `BEGIN\n  DELETE FROM ${targetName} tgt\n  WHERE EXISTS (\n    SELECT 1\n    FROM (\n${sourceSubquery.replace(/\n/g, '\n      ')}\n    ) src\n    WHERE ${onClause}\n  );\n  ${insertSql.replace(/\n/g, '\n  ')};\nEND;`, issue: '', sourceSql: batchLimitedSourceSql }
     }
     const matchedSql = updateColumns.length > 0
       ? `\nWHEN MATCHED THEN UPDATE SET\n${updateColumns.map((column) => `  tgt.${column} = src.${column}`).join(',\n')}`
@@ -31701,15 +32052,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       ? ''
       : `\nWHEN NOT MATCHED THEN INSERT (${targetColumns.join(', ')})\nVALUES (${targetColumns.map((column) => `src.${column}`).join(', ')})`
     if (writeMode === 'update' && updateColumns.length <= 0) {
-      return { sql: '', issue: 'Update mode needs at least one non-key target column to update.' }
+      return { sql: '', issue: 'Update mode needs at least one non-key target column to update.', sourceSql }
     }
     return {
       sql: `MERGE INTO ${targetName} tgt\nUSING (\n${sourceSubquery}\n) src\nON (${onClause})${matchedSql}${notMatchedSql}`,
       issue: '',
+      sourceSql: batchLimitedSourceSql,
     }
   }, [dataOpsPipelineSteps])
-  const runDataOpsMapperSync = useCallback(async (step: DataOpsPipelineStep, options: { forceRetry?: boolean } = {}) => {
-    const { sql, issue } = buildDataOpsMapperSyncSql(step)
+  const runDataOpsMapperSync = useCallback(async (step: DataOpsPipelineStep, options: { forceRetry?: boolean; taskBindParams?: Record<string, unknown> } = {}) => {
+    const { sql, issue, sourceSql } = buildDataOpsMapperSyncSql(step)
     if (issue) {
       notification.warning({ message: 'Mapper configuration issue', description: issue, placement: 'bottomRight' })
       return
@@ -31717,15 +32069,27 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const activeMapperConfig = (step.mapperConfigs || []).find((item) => item.id === step.activeMapperConfigId)
     const activeTask = (step.taskMasters || []).find((item) => item.id === (activeMapperConfig?.taskMasterId || step.activeTaskMasterId))
       || (step.taskMasters || [])[0]
-    const taskBindParams = dataOpsTaskMasterBindParams(activeTask)
+    const activeQueryInputs = step.queryInputs || activeMapperConfig?.queryInputs || []
+    const baseTaskBindParams = options.taskBindParams && Object.keys(options.taskBindParams).length > 0 ? options.taskBindParams : dataOpsTaskMasterBindParams(activeTask)
+    const taskBindParams = dataOpsApplyQueryInputBinds(baseTaskBindParams, activeQueryInputs, dataOpsBindParametersFromRouteSource(dataOpsPipelineSteps, step.lookupSource))
+    const manualJobId = `data_ops_manual:${selectedNodeId || 'node'}:${step.id}:${String(step.activeMapperConfigId || 'active')}:${taskBindParams.task_business_window_key || 'window'}:${Date.now()}`
+    const runScope = {
+      job_id: manualJobId,
+      pipeline_id: activePipelineId,
+      data_ops_node_id: selectedNodeId || '',
+      mapper_step_id: step.id,
+      mapper_config_id: String(step.activeMapperConfigId || ''),
+      task_master_id: activeTask?.id || '',
+    }
+    setDataOpsActiveRunScope(runScope)
     setDataOpsSqlExecuting(true)
     try {
       const response = await api.executeDataOpsOracleSql({
         ...nodeConfig,
         _data_ops_manual_activity: true,
         _data_ops_manual_window: true,
-        _data_ops_force_retry: Boolean(options.forceRetry),
-        _data_ops_manual_job_id: `data_ops_manual:${selectedNodeId || 'node'}:${step.id}:${String(step.activeMapperConfigId || 'active')}:${Date.now()}`,
+        _data_ops_force_retry: options.forceRetry !== false,
+        _data_ops_manual_job_id: manualJobId,
         _data_ops_manual_pipeline_id: activePipelineId,
         _data_ops_manual_data_ops_node_id: selectedNodeId || '',
         _data_ops_manual_step_id: step.id,
@@ -31736,6 +32100,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         _data_ops_task_window_indicator: activeTask?.windowIndicator || '',
         _data_ops_task_duplicate_policy: activeTask?.duplicatePolicy || 'skip_completed',
         _data_ops_task_bind_params: taskBindParams,
+        _data_ops_query_inputs: activeQueryInputs,
+        _data_ops_sync_processing_mode: step.syncProcessingMode || activeMapperConfig?.syncProcessingMode || 'batch',
+        _data_ops_sync_batch_size: step.syncBatchSize || activeMapperConfig?.syncBatchSize || 1000,
+        _data_ops_sync_commit_every: step.syncCommitEvery || activeMapperConfig?.syncCommitEvery || 5000,
+        _data_ops_sync_max_batches: step.syncMaxBatches ?? activeMapperConfig?.syncMaxBatches ?? 100,
+        _data_ops_sync_loop_gap_seconds: step.syncLoopGapSeconds ?? activeMapperConfig?.syncLoopGapSeconds ?? 5,
+        _data_ops_checkpoint_enabled: activeMapperConfig?.checkpointEnabled !== false && step.checkpoint !== false,
+        _data_ops_checkpoint_id_field: step.checkpointIdField || step.syncCursorField || activeMapperConfig?.checkpointIdField || activeMapperConfig?.syncCursorField || '',
+        _data_ops_checkpoint_time_field: step.checkpointTimeField || step.syncIncrementalField || activeMapperConfig?.checkpointTimeField || activeMapperConfig?.syncIncrementalField || '',
+        _data_ops_checkpoint_source_sql: sourceSql || '',
       }, sql, true)
       const rowCount = Number(response?.rowcount ?? response?.rows_affected ?? 0)
       patchDataOpsPipelineStep(step.id, { expression: sql })
@@ -31756,9 +32130,29 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       }
       notification.success({
         message: 'Data sync completed',
-        description: `${rowCount.toLocaleString()} row(s) affected in ${step.target}.`,
+        description: `${rowCount.toLocaleString()} row(s) affected in ${step.target}.${response?.processing_mode === 'incremental_batch_loop' ? ` ${Number(response?.batches || 0).toLocaleString()} batch(es), stopped: ${String(response?.stopped_reason || 'complete')}.` : ''}`,
         placement: 'bottomRight',
       })
+      const mapperConfigId = String(step.activeMapperConfigId || activeMapperConfig?.id || '').trim()
+      const taskMasterId = String(activeTask?.id || activeMapperConfig?.taskMasterId || step.activeTaskMasterId || '').trim()
+      if (activePipelineId && selectedNodeId && step.id && mapperConfigId && taskMasterId) {
+        try {
+          const checkpointResponse = await api.getDataOpsCheckpoint({
+            pipeline_id: activePipelineId,
+            data_ops_node_id: selectedNodeId,
+            task_master_id: taskMasterId,
+            mapper_step_id: step.id,
+            mapper_config_id: mapperConfigId,
+          })
+          setDataOpsCheckpointCursor(checkpointResponse || null)
+          setDataOpsCheckpointDraft({
+            lastSourceId: checkpointResponse?.last_source_id == null ? '' : String(checkpointResponse.last_source_id),
+            lastTransactionTime: checkpointResponse?.last_transaction_time == null ? '' : String(checkpointResponse.last_transaction_time),
+          })
+        } catch {
+          // The sync has already succeeded; leave the visible cursor unchanged if refresh fails.
+        }
+      }
     } catch (err: any) {
       notification.error({
         message: 'Data sync failed',
@@ -31767,8 +32161,169 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       })
     } finally {
       setDataOpsSqlExecuting(false)
+      setDataOpsActiveRunScope(null)
     }
   }, [activePipelineId, buildDataOpsMapperSyncSql, nodeConfig, patchDataOpsPipelineStep, selectedNodeId, updateNodeConfig])
+  const dataOpsMapperCheckpointPayload = useCallback((step: DataOpsPipelineStep | null | undefined) => {
+    if (!step) return null
+    const activeMapperConfig = step.kind === 'map'
+      ? (step.mapperConfigs || []).find((item) => item.id === step.activeMapperConfigId)
+      : undefined
+    const activeRouterConfig = step.kind === 'router'
+      ? (step.routerConfigs || []).find((item) => item.id === step.activeRouterConfigId)
+      : undefined
+    const activeTask = step.kind === 'map'
+      ? ((step.taskMasters || []).find((item) => item.id === (activeMapperConfig?.taskMasterId || step.activeTaskMasterId))
+        || (step.taskMasters || [])[0])
+      : undefined
+    const mapperConfigId = String(
+      step.kind === 'router'
+        ? (step.activeRouterConfigId || activeRouterConfig?.id || '')
+        : (step.activeMapperConfigId || activeMapperConfig?.id || '')
+    ).trim()
+    const taskMasterId = String(
+      step.kind === 'router'
+        ? 'router'
+        : (activeTask?.id || activeMapperConfig?.taskMasterId || step.activeTaskMasterId || '')
+    ).trim()
+    if (!activePipelineId || !selectedNodeId || !step.id || !mapperConfigId || !taskMasterId) {
+      return null
+    }
+    return {
+      pipeline_id: activePipelineId,
+      data_ops_node_id: selectedNodeId,
+      task_master_id: taskMasterId,
+      mapper_step_id: step.id,
+      mapper_config_id: mapperConfigId,
+    }
+  }, [activePipelineId, selectedNodeId])
+  const loadDataOpsMapperCheckpoint = useCallback(async (step: DataOpsPipelineStep | null | undefined, options: { silent?: boolean } = {}) => {
+    const payload = dataOpsMapperCheckpointPayload(step)
+    if (!payload) {
+      setDataOpsCheckpointCursor(null)
+      setDataOpsCheckpointDraft({ lastSourceId: '', lastTransactionTime: '' })
+      return
+    }
+    setDataOpsCheckpointLoading(true)
+    try {
+      const response = await api.getDataOpsCheckpoint(payload)
+      setDataOpsCheckpointCursor(response || null)
+      setDataOpsCheckpointDraft({
+        lastSourceId: response?.last_source_id == null ? '' : String(response.last_source_id),
+        lastTransactionTime: response?.last_transaction_time == null ? '' : String(response.last_transaction_time),
+      })
+    } catch (err: any) {
+      setDataOpsCheckpointCursor(null)
+      setDataOpsCheckpointDraft({ lastSourceId: '', lastTransactionTime: '' })
+      if (!options.silent) {
+        notification.error({
+          message: 'Checkpoint load failed',
+          description: String(err?.message || 'Failed to load checkpoint cursor'),
+          placement: 'bottomRight',
+        })
+      }
+    } finally {
+      setDataOpsCheckpointLoading(false)
+    }
+  }, [dataOpsMapperCheckpointPayload])
+  const saveDataOpsMapperCheckpoint = useCallback(async (step: DataOpsPipelineStep) => {
+    const payload = dataOpsMapperCheckpointPayload(step)
+    if (!payload) {
+      notification.warning({
+        message: 'Checkpoint save not ready',
+        description: 'Save/select the pipeline, task master, and mapper configuration before editing the cursor.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    setDataOpsCheckpointLoading(true)
+    try {
+      const response = await api.updateDataOpsCheckpoint({
+        ...payload,
+        last_source_id: dataOpsCheckpointDraft.lastSourceId,
+        last_transaction_time: dataOpsCheckpointDraft.lastTransactionTime,
+      })
+      setDataOpsCheckpointCursor(response || null)
+      setDataOpsCheckpointDraft({
+        lastSourceId: response?.last_source_id == null ? '' : String(response.last_source_id),
+        lastTransactionTime: response?.last_transaction_time == null ? '' : String(response.last_transaction_time),
+      })
+      notification.success({ message: 'Checkpoint cursor saved', placement: 'bottomRight' })
+    } catch (err: any) {
+      notification.error({
+        message: 'Checkpoint save failed',
+        description: String(err?.message || 'Failed to update checkpoint cursor'),
+        placement: 'bottomRight',
+      })
+    } finally {
+      setDataOpsCheckpointLoading(false)
+    }
+  }, [dataOpsCheckpointDraft.lastSourceId, dataOpsCheckpointDraft.lastTransactionTime, dataOpsMapperCheckpointPayload])
+  useEffect(() => {
+    if (!dataOpsPipelineConfigOpen || !['map', 'router'].includes(String(selectedDataOpsPipelineStep?.kind || ''))) return
+    void loadDataOpsMapperCheckpoint(selectedDataOpsPipelineStep, { silent: true })
+  }, [
+    dataOpsPipelineConfigOpen,
+    loadDataOpsMapperCheckpoint,
+    selectedDataOpsPipelineStep?.activeMapperConfigId,
+    selectedDataOpsPipelineStep?.activeRouterConfigId,
+    selectedDataOpsPipelineStep?.activeTaskMasterId,
+    selectedDataOpsPipelineStep?.id,
+    selectedDataOpsPipelineStep?.kind,
+  ])
+  const resetDataOpsMapperCheckpoint = useCallback(async (step: DataOpsPipelineStep) => {
+    const payload = dataOpsMapperCheckpointPayload(step)
+    if (!payload) {
+      notification.warning({
+        message: 'Checkpoint reset not ready',
+        description: 'Save/select the pipeline, task master, and mapper configuration before resetting the cursor.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    setDataOpsSqlExecuting(true)
+    try {
+      const response = await api.resetDataOpsCheckpoint(payload)
+      setDataOpsCheckpointCursor(null)
+      setDataOpsCheckpointDraft({ lastSourceId: '', lastTransactionTime: '' })
+      notification.success({
+        message: 'Checkpoint cursor reset',
+        description: `${Number(response?.removed || 0)} checkpoint record(s) cleared.`,
+        placement: 'bottomRight',
+      })
+    } catch (err: any) {
+      notification.error({
+        message: 'Checkpoint reset failed',
+        description: String(err?.message || 'Failed to reset checkpoint cursor'),
+        placement: 'bottomRight',
+      })
+    } finally {
+      setDataOpsSqlExecuting(false)
+    }
+  }, [dataOpsMapperCheckpointPayload])
+  const stopDataOpsActiveRun = useCallback(async () => {
+    const scope = dataOpsActiveRunScope || {
+      pipeline_id: activePipelineId,
+      data_ops_node_id: selectedNodeId || '',
+      mapper_step_id: selectedDataOpsPipelineStep?.id || '',
+      mapper_config_id: selectedDataOpsPipelineStep?.activeMapperConfigId || '',
+      task_master_id: selectedDataOpsPipelineStep?.activeTaskMasterId || '',
+    }
+    try {
+      await api.stopDataOpsOracleRun(scope)
+      notification.info({
+        message: 'Stop requested',
+        description: 'The continuous loop will stop after the current batch or poll wait.',
+        placement: 'bottomRight',
+      })
+    } catch (err: any) {
+      notification.error({
+        message: 'Stop request failed',
+        description: String(err?.message || 'Failed to stop Data Ops run'),
+        placement: 'bottomRight',
+      })
+    }
+  }, [activePipelineId, dataOpsActiveRunScope, selectedDataOpsPipelineStep?.activeMapperConfigId, selectedDataOpsPipelineStep?.activeTaskMasterId, selectedDataOpsPipelineStep?.id, selectedNodeId])
   const deployDataOpsMapperScheduler = useCallback(async (step: DataOpsPipelineStep, schedulePatch: Record<string, unknown> = {}) => {
     if (!selectedNodeId) return
     const nextStep = { ...step, ...schedulePatch } as DataOpsPipelineStep
@@ -31780,7 +32335,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     const activeMapperConfig = (nextStep.mapperConfigs || []).find((item) => item.id === nextStep.activeMapperConfigId)
     const activeTask = (nextStep.taskMasters || []).find((item) => item.id === (activeMapperConfig?.taskMasterId || nextStep.activeTaskMasterId))
       || (nextStep.taskMasters || [])[0]
-    const taskBindParams = dataOpsTaskMasterBindParams(activeTask)
+    const activeQueryInputs = nextStep.queryInputs || activeMapperConfig?.queryInputs || []
+    const taskBindParams = dataOpsApplyQueryInputBinds(dataOpsTaskMasterBindParams(activeTask), activeQueryInputs, dataOpsBindParametersFromRouteSource(dataOpsPipelineSteps, nextStep.lookupSource))
     const taskRunTime = String(activeTask?.runAtTime || '').match(/^\d{2}:\d{2}$/) ? String(activeTask?.runAtTime) : ''
     const taskRunHour = taskRunTime ? Number(taskRunTime.slice(0, 2)) : 0
     const taskRunMinute = taskRunTime ? Number(taskRunTime.slice(3, 5)) : 0
@@ -31793,7 +32349,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         ? `${taskRunMinute} ${taskRunHour} ${taskMonthlyRunDay} * *`
         : `${taskRunMinute} ${taskRunHour} * * *`
       : String(nextStep.scheduleCron || '0 * * * *')
-    const { sql, issue } = buildDataOpsMapperSyncSql(nextStep)
+    const { sql, issue, sourceSql } = buildDataOpsMapperSyncSql(nextStep)
     const deployEnabled = Boolean(nextStep.deployEnabled)
     const scheduleEnabled = Boolean(nextStep.scheduleEnabled)
     if ((deployEnabled || scheduleEnabled) && issue) {
@@ -31807,6 +32363,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
           _data_ops_task_master_id: activeTask?.id || '',
           _data_ops_task_master_name: activeTask?.name || '',
           _data_ops_task_bind_params: taskBindParams,
+          _data_ops_query_inputs: activeQueryInputs,
+          _data_ops_sync_processing_mode: nextStep.syncProcessingMode || activeMapperConfig?.syncProcessingMode || 'batch',
+          _data_ops_sync_batch_size: nextStep.syncBatchSize || activeMapperConfig?.syncBatchSize || 1000,
+          _data_ops_sync_commit_every: nextStep.syncCommitEvery || activeMapperConfig?.syncCommitEvery || 5000,
+          _data_ops_sync_max_batches: nextStep.syncMaxBatches ?? activeMapperConfig?.syncMaxBatches ?? 100,
+          _data_ops_sync_loop_gap_seconds: nextStep.syncLoopGapSeconds ?? activeMapperConfig?.syncLoopGapSeconds ?? 5,
+          _data_ops_checkpoint_enabled: activeMapperConfig?.checkpointEnabled !== false && nextStep.checkpoint !== false,
+          _data_ops_checkpoint_id_field: nextStep.checkpointIdField || nextStep.syncCursorField || activeMapperConfig?.checkpointIdField || activeMapperConfig?.syncCursorField || '',
+          _data_ops_checkpoint_time_field: nextStep.checkpointTimeField || nextStep.syncIncrementalField || activeMapperConfig?.checkpointTimeField || activeMapperConfig?.syncIncrementalField || '',
+          _data_ops_checkpoint_source_sql: sourceSql || '',
         },
         sql,
         job_id: `${selectedNodeId}:${step.id}:${String(nextStep.activeMapperConfigId || 'active')}`,
@@ -31916,6 +32482,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       }
       const activeConfigId = activeRouterConfigId
       const schedulerConfigPatch: Partial<DataOpsRouterConfig> = {
+        ...(Object.prototype.hasOwnProperty.call(schedulePatch, 'enabled') ? { enabled: Boolean(schedulePatch.enabled) } : {}),
         deployEnabled: Boolean(nextStep.deployEnabled),
         scheduleEnabled: Boolean(nextStep.scheduleEnabled),
         scheduleType: nextStep.scheduleType || 'interval',
@@ -32143,6 +32710,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         || tagName === 'select'
         || target.isContentEditable
         || Boolean(target.closest('[contenteditable="true"]'))
+        || Boolean(target.closest('.monaco-editor, .view-lines, .inputarea'))
       )
     }
     const isInPipelineCanvas = (target: EventTarget | null): boolean => (
@@ -32155,7 +32723,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       const editable = isEditableTarget(event.target)
       const canvasTarget = isInPipelineCanvas(event.target)
       if (editable) {
-        event.stopImmediatePropagation()
         return
       }
       if (canvasTarget || dataOpsPipelineCanvasActive) {
@@ -34273,7 +34840,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           key: 'query_writer',
                           label: 'Query Writer',
                           children: (
-                            <div style={{ height: 'calc(100vh - 236px)', minHeight: 0, display: 'grid', gridTemplateRows: 'auto minmax(160px, 0.72fr) minmax(160px, 1fr)', gap: 10, overflow: 'hidden' }}>
+                            <div style={{ height: 'calc(100vh - 236px)', minHeight: 0, display: 'grid', gridTemplateRows: 'auto auto minmax(160px, 0.72fr) minmax(160px, 1fr)', gap: 10, overflow: 'hidden' }}>
                               <Space style={{ width: '100%', justifyContent: 'space-between' }} align="center" wrap>
                                 <Space direction="vertical" size={2}>
                                   <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>SQL Query Writer</Text>
@@ -34285,36 +34852,88 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                   <Button
                                     size="small"
                                     disabled={!dataOpsDataTargetName && !dataOpsSelectedObjectName}
-                                    onClick={() => selectedNodeId && updateNodeConfig(selectedNodeId, { data_ops_query_writer_sql: dataOpsDefaultQueryWriterSql })}
+                                    onClick={() => patchDataOpsActiveQueryWriterSql(dataOpsDefaultQueryWriterSql)}
                                   >
                                     Query Selected Object
                                   </Button>
+                                  <Button size="small" danger disabled={dataOpsQueryWriterTabs.length <= 1 && dataOpsQueryWriterSql === dataOpsDefaultQueryWriterSql} onClick={closeAllDataOpsQueryWriterTabs}>
+                                    Close All
+                                  </Button>
                                   <Button size="small" loading={dataOpsQueryResultLoading} onClick={() => { void previewDataOpsQueryWriterSql() }}>
-                                    Preview Query
+                                    {dataOpsQueryWriterSelectedSql.trim() ? 'Preview Selection' : 'Preview Query'}
                                   </Button>
                                   <Popconfirm
                                     title="Execute SQL?"
-                                    description="SELECT/WITH statements will preview only. DML, DDL, and PL/SQL statements will run against Oracle."
+                                    description={dataOpsQueryWriterSelectedSql.trim() ? 'Only the selected SQL text from the active tab will run.' : 'SELECT/WITH statements will preview only. DML, DDL, and PL/SQL statements will run against Oracle.'}
                                     okText="Run SQL"
-                                    okButtonProps={{ danger: !['SELECT', 'WITH'].includes(dataOpsQueryFirstKeyword(dataOpsQueryWriterSql || dataOpsDefaultQueryWriterSql)), loading: dataOpsSqlExecuting || dataOpsQueryResultLoading }}
+                                    okButtonProps={{ danger: !['SELECT', 'WITH'].includes(dataOpsQueryFirstKeyword(dataOpsRunnableQueryWriterSql())), loading: dataOpsObjectSqlExecuting || dataOpsQueryResultLoading }}
                                     onConfirm={() => { void executeDataOpsQueryWriterSql() }}
                                   >
-                                    <Button size="small" type="primary" loading={dataOpsSqlExecuting || dataOpsQueryResultLoading}>Run SQL</Button>
+                                    <Button size="small" type="primary" loading={dataOpsObjectSqlExecuting || dataOpsQueryResultLoading}>
+                                      {dataOpsQueryWriterSelectedSql.trim() ? 'Run Selection' : 'Run SQL'}
+                                    </Button>
                                   </Popconfirm>
                                 </Space>
                               </Space>
+                              <Tabs
+                                size="small"
+                                type="card"
+                                activeKey={dataOpsActiveQueryWriterTab?.id}
+                                onChange={setDataOpsActiveQueryWriterTab}
+                                style={{ minWidth: 0 }}
+                                tabBarExtraContent={{
+                                  right: (
+                                    <Tooltip title="New query tab">
+                                      <Button
+                                        size="small"
+                                        icon={<PlusSquareOutlined />}
+                                        onClick={() => addDataOpsQueryWriterTab(dataOpsDefaultQueryWriterSql)}
+                                      />
+                                    </Tooltip>
+                                  ),
+                                }}
+                                items={dataOpsQueryWriterTabs.map((tab) => ({
+                                  key: tab.id,
+                                  label: (
+                                    <Space size={6}>
+                                      <Text style={{ color: tab.id === dataOpsActiveQueryWriterTab?.id ? 'var(--app-text)' : 'var(--app-text-subtle)', maxWidth: 140 }} ellipsis>
+                                        {tab.title}
+                                      </Text>
+                                      <CloseOutlined
+                                        style={{ fontSize: 10, color: 'var(--app-text-subtle)' }}
+                                        onClick={(event) => {
+                                          event.stopPropagation()
+                                          closeDataOpsQueryWriterTab(tab.id)
+                                        }}
+                                      />
+                                    </Space>
+                                  ),
+                                  children: null,
+                                }))}
+                              />
                               <div className="data-ops-sql-editor-shell">
                                 <Editor
+                                  key={dataOpsActiveQueryWriterTab?.id}
                                   height="100%"
                                   language={DATA_OPS_SQL_LANGUAGE_ID}
-                                  value={dataOpsQueryWriterSql || dataOpsDefaultQueryWriterSql}
+                                  value={dataOpsQueryWriterSql}
                                   beforeMount={(monaco) => ensureDataOpsSqlLanguage(monaco)}
                                   onMount={(editor, monaco) => {
+                                    dataOpsQueryWriterEditorRef.current = editor
                                     ensureDataOpsSqlLanguage(monaco)
                                     const model = editor.getModel?.()
                                     if (model) {
                                       monaco.editor.setModelLanguage(model, DATA_OPS_SQL_LANGUAGE_ID)
                                     }
+                                    const syncSelectedSql = () => {
+                                      const selection = editor.getSelection?.()
+                                      const selected = selection && !selection.isEmpty?.()
+                                        ? String(editor.getModel?.()?.getValueInRange?.(selection) || '')
+                                        : ''
+                                      setDataOpsQueryWriterSelectedSql(selected.trim() ? selected : '')
+                                    }
+                                    editor.onDidChangeCursorSelection?.(syncSelectedSql)
+                                    editor.onDidBlurEditorText?.(syncSelectedSql)
                                     editor.onDidChangeCursorPosition?.(() => {
                                       const action = editor.getAction?.('editor.action.triggerSuggest')
                                       const position = editor.getPosition?.()
@@ -34328,7 +34947,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                     })
                                     editor.focus?.()
                                   }}
-                                  onChange={(value) => selectedNodeId && updateNodeConfig(selectedNodeId, { data_ops_query_writer_sql: value || '' })}
+                                  onChange={(value) => patchDataOpsActiveQueryWriterSql(value || '')}
                                   theme={customEditorThemeId}
                                   options={{
                                     fontFamily: customEditorFontFamily,
@@ -34487,10 +35106,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                   title="Execute SQL script?"
                                   description="This runs the current script text against the configured Oracle connection."
                                   okText="Execute Script"
-                                  okButtonProps={{ danger: true, loading: dataOpsSqlExecuting }}
+                                  okButtonProps={{ danger: true, loading: dataOpsObjectSqlExecuting }}
                                   onConfirm={() => { void applyDataOpsObjectOperation() }}
                                 >
-                                  <Button size="small" danger loading={dataOpsSqlExecuting}>Execute Script</Button>
+                                  <Button size="small" danger loading={dataOpsObjectSqlExecuting}>Execute Script</Button>
                                 </Popconfirm>
                               </Space>
                             </Space>
@@ -34528,10 +35147,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         title="Execute SQL script?"
                         description="Action tabs execute through controls. This button runs the optional SQL script text."
                         okText="Execute Script"
-                        okButtonProps={{ danger: true, loading: dataOpsSqlExecuting }}
+                        okButtonProps={{ danger: true, loading: dataOpsObjectSqlExecuting }}
                         onConfirm={() => { void applyDataOpsObjectOperation() }}
                       >
-                        <Button block danger loading={dataOpsSqlExecuting}>Execute SQL Script</Button>
+                        <Button block danger loading={dataOpsObjectSqlExecuting}>Execute SQL Script</Button>
                       </Popconfirm>
                       {dataOpsLastExecution ? (
                         <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
@@ -35269,11 +35888,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             })()
             const whereSql = (step.filterRules || [])
               .filter((item) => item.enabled !== false && String(item.field || '').trim())
-              .map((item) => `${sqlIdent(String(item.field || ''))} ${sqlOperator(String(item.operator || 'equals'), dataOpsRuleValueSql(item))}`)
+              .map((item) => dataOpsRuleConditionSql(item, 'equals'))
             const groupSql = selectedGroupRows.map((item) => sqlIdent(String(item.field || '')))
             const havingSql = (step.havingRules || [])
               .filter((item) => item.enabled !== false && String(item.field || '').trim())
-              .map((item) => `${sqlIdent(String(item.field || ''))} ${sqlOperator(String(item.operator || 'greater_than'), dataOpsRuleValueSql(item))}`)
+              .map((item) => dataOpsRuleConditionSql(item, 'greater_than'))
             const orderSql = selectedOrderRows.map((item) => `${sqlIdent(String(item.field || ''))} ${String(item.direction || 'asc').toUpperCase()}`)
             const builtQuerySql = [
               `SELECT\n  ${selectSql}`,
@@ -35321,9 +35940,43 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             const queryBuilderRows = step.queryBuilders || []
             const activeQueryBuilder = queryBuilderRows.find((item) => item.id === step.activeQueryBuilderId)
             const bindParameters = step.bindParameters || []
-            const bindParameterOptions = bindParameters
+            const configuredBindNames = new Set(bindParameters.map((item) => String(item.name || '').replace(/^:/, '').trim().toLowerCase()).filter(Boolean))
+            const checkpointWhereBindOptions = DATA_OPS_CHECKPOINT_BIND_PRESETS
+              .filter((item) => !configuredBindNames.has(String(item.name || '').toLowerCase()))
+              .map((item) => ({ value: item.name, label: `:${item.name} - ${item.label || 'checkpoint'}` }))
+            const bindParameterOptions = [
+              ...bindParameters
               .filter((item) => item.enabled !== false && String(item.name || '').trim())
-              .map((item) => ({ value: String(item.name || '').trim(), label: `:${String(item.name || '').trim()}${item.defaultValue ? ` = ${item.defaultValue}` : ''}` }))
+              .map((item) => ({ value: String(item.name || '').trim(), label: `:${String(item.name || '').trim()}${item.defaultValue ? ` = ${item.defaultValue}` : item.label ? ` - ${item.label}` : ''}` })),
+              ...checkpointWhereBindOptions,
+            ]
+            const selectBindParameterOptions = bindParameters
+              .filter((item) => item.enabled !== false && String(item.name || '').trim())
+              .map((item) => ({ value: `:${String(item.name || '').replace(/^:/, '').trim()}`, label: `:${String(item.name || '').replace(/^:/, '').trim()}${item.defaultValue ? ` = ${item.defaultValue}` : item.label ? ` - ${item.label}` : ''}` }))
+            const selectFieldOptions = [
+              {
+                label: 'Source Fields',
+                options: fieldOptions,
+              },
+              {
+                label: 'Bind Parameters',
+                options: selectBindParameterOptions,
+              },
+            ].filter((group) => group.options.length > 0)
+            const queryBuilderPreviewBindParams = {
+              ...DATA_OPS_CHECKPOINT_BIND_PRESETS.reduce<Record<string, unknown>>((acc, item) => {
+                const name = String(item.name || '').replace(/^:/, '').trim()
+                if (name) acc[name] = item.defaultValue ? item.defaultValue : null
+                return acc
+              }, {}),
+              ...bindParameters.reduce<Record<string, unknown>>((acc, item) => {
+                if (item.enabled === false) return acc
+                const name = String(item.name || '').replace(/^:/, '').trim()
+                if (!name) return acc
+                acc[name] = item.defaultValue !== undefined && item.defaultValue !== '' ? item.defaultValue : null
+                return acc
+              }, {}),
+            }
             const patchBindParameter = (bindId: string, patch: Partial<DataOpsBindParam>) => {
               patchDataOpsPipelineStep(step.id, {
                 bindParameters: bindParameters.map((item) => item.id === bindId ? { ...item, ...patch } : item),
@@ -35335,7 +35988,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 [listName]: rows.map((item) => item.id === rowId ? {
                   ...item,
                   valueMode,
-                  bindParam: valueMode === 'bind' ? String(item.bindParam || bindParameters[0]?.name || '').replace(/^:/, '').trim() : '',
+                  bindParam: valueMode === 'bind' ? String(item.bindParam || bindParameterOptions[0]?.value || '').replace(/^:/, '').trim() : '',
                   value: valueMode === 'bind' ? String(item.value || '') : String(item.value || '').replace(/^:/, ''),
                 } : item),
               } as Partial<DataOpsPipelineStep>)
@@ -35548,7 +36201,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   <div className="data-ops-query-builder-main">
                 {compactPanel(
                   'Bind Parameters',
-                  <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { bindParameters: [...bindParameters, { id: dataOpsId('bind'), name: `param_${bindParameters.length + 1}`, dataType: 'string', defaultValue: '', required: false, enabled: true }] })}>Add Bind</Button>,
+                  <Space size={6}>
+                    <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { bindParameters: [...bindParameters, { id: dataOpsId('bind'), name: `param_${bindParameters.length + 1}`, dataType: 'string', defaultValue: '', required: false, enabled: true }] })}>Add Bind</Button>
+                  </Space>,
                   <div style={{ display: 'grid', gap: 8 }}>
                     {bindParameters.length <= 0 ? <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Add bind parameters for WHERE/HAVING values. Mapper and Router can pass values, otherwise defaults are used.</Text> : null}
                     {bindParameters.map((row) => (
@@ -35630,8 +36285,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       maxTagCount="responsive"
                       value={selectFields.map((item) => item.field).filter(Boolean) as string[]}
                       onChange={(values) => syncSelectedFields(values.map((item) => String(item)))}
-	                      placeholder="Pick fields from selected tables"
-	                      options={fieldOptions}
+	                      placeholder="Pick source fields or bind parameters"
+	                      options={selectFieldOptions as any}
 	                      style={dataOpsControlStyle(dataOpsSectionColors.select)}
 	                    />
                     {selectFields.length > 0 ? (
@@ -35675,7 +36330,22 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                     />
                                   </div>
                                 )
-	                              : pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'source field', dataOpsSectionColors.select)}
+	                              : (
+                                  <Select
+                                    size="small"
+                                    showSearch
+                                    allowClear
+                                    optionFilterProp="label"
+                                    value={row.field || undefined}
+                                    onChange={(value) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, field: String(value || '') } : item) })}
+                                    onSearch={(value) => {
+                                      if (value && !fieldNames.includes(value)) patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, field: value } : item) })
+                                    }}
+                                    placeholder="source field or bind"
+                                    options={selectFieldOptions as any}
+                                    style={dataOpsControlStyle(dataOpsSectionColors.select, { width: '100%' })}
+                                  />
+                                )}
 	                            <Select size="small" value={row.aggregate || ''} onChange={(value) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, aggregate: String(value || '') } : item) })} options={aggregateOptions} style={dataOpsControlStyle(dataOpsSectionColors.select)} />
 	                            <Input size="small" value={row.alias || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, alias: event.target.value } : item) })} placeholder="output alias" style={dataOpsInputStyle(dataOpsSectionColors.select)} />
                             <Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.filter((item) => item.id !== row.id) })} />
@@ -35756,7 +36426,32 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 	                  {compactPanel('Having', <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { havingRules: [...(step.havingRules || []), { id: dataOpsId('having'), field: '', operator: 'greater_than', value: '', valueMode: 'fixed', enabled: true }] })}>Add</Button>, <div style={{ display: 'grid', gap: 8 }}>{(step.havingRules || []).map((row) => <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px 1fr 112px 76px 1fr 34px', gap: 8, alignItems: 'center' }}><Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} />{pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'metric', dataOpsSectionColors.having)}<Select size="small" value={row.operator || 'greater_than'} onChange={(value) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, operator: value } : item) })} options={compareOperatorOptions} style={dataOpsControlStyle(dataOpsSectionColors.having)} /><Select size="small" value={row.valueMode || 'fixed'} onChange={(value) => patchRuleBindMode('havingRules', row.id, value as DataOpsRuleRow['valueMode'])} options={[{ value: 'fixed', label: 'Fixed' }, { value: 'bind', label: 'Bind' }]} style={dataOpsControlStyle(dataOpsSectionColors.having)} />{row.valueMode === 'bind' ? <Select size="small" showSearch allowClear optionFilterProp="label" value={row.bindParam || undefined} onChange={(value) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, valueMode: 'bind', bindParam: String(value || ''), value: value ? `:${value}` : '' } : item) })} placeholder="bind parameter" options={bindParameterOptions} style={dataOpsControlStyle(dataOpsSectionColors.having)} /> : <Input size="small" value={row.value || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, value: event.target.value, valueMode: 'fixed', bindParam: '' } : item) })} style={dataOpsInputStyle(dataOpsSectionColors.having)} />}<Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).filter((item) => item.id !== row.id) })} /></div>)}</div>)}
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 10, alignItems: 'start' }}>
-	                  {compactPanel('Order / Limit', <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { orderByRows: [...(step.orderByRows || []), { id: dataOpsId('order'), field: '', direction: 'asc', enabled: true }] })}>Add</Button>, <div style={{ display: 'grid', gap: 8 }}>{(step.orderByRows || []).map((row) => <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '1fr 74px 34px', gap: 8, alignItems: 'center' }}>{pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { orderByRows: (step.orderByRows || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'sort field', dataOpsSectionColors.order)}<Select size="small" value={row.direction || 'asc'} onChange={(value) => patchDataOpsPipelineStep(step.id, { orderByRows: (step.orderByRows || []).map((item) => item.id === row.id ? { ...item, direction: value as DataOpsOrderRow['direction'] } : item) })} options={[{ value: 'asc', label: 'Asc' }, { value: 'desc', label: 'Desc' }]} style={dataOpsControlStyle(dataOpsSectionColors.order)} /><Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { orderByRows: (step.orderByRows || []).filter((item) => item.id !== row.id) })} /></div>)}<Input size="small" type="number" min={0} value={step.limitRows} onChange={(event) => patchDataOpsPipelineStep(step.id, { limitRows: event.target.value ? Number(event.target.value) : undefined })} placeholder="limit rows" style={dataOpsInputStyle(dataOpsSectionColors.order)} /></div>)}
+	                  {compactPanel(
+                      '6. Order By / Limit',
+                      <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { orderByRows: [...(step.orderByRows || []), { id: dataOpsId('order'), field: '', direction: 'asc', enabled: true }] })}>Add Sort</Button>,
+                      <div style={{ display: 'grid', gap: 10 }}>
+                        <div style={{ display: 'grid', gap: 6 }}>
+                          <Text style={{ color: dataOpsSectionColors.order, fontSize: 11, fontWeight: 700 }}>Order By</Text>
+                          {(step.orderByRows || []).length <= 0 ? (
+                            <div style={{ border: '1px dashed var(--app-border)', borderRadius: 6, padding: '8px 10px', color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                              Add a sort field to generate ORDER BY.
+                            </div>
+                          ) : null}
+                          {(step.orderByRows || []).map((row) => (
+                            <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px minmax(0, 1fr) 90px 34px', gap: 8, alignItems: 'center' }}>
+                              <Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchDataOpsPipelineStep(step.id, { orderByRows: (step.orderByRows || []).map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} />
+                              {pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { orderByRows: (step.orderByRows || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'sort field', dataOpsSectionColors.order)}
+                              <Select size="small" value={row.direction || 'asc'} onChange={(value) => patchDataOpsPipelineStep(step.id, { orderByRows: (step.orderByRows || []).map((item) => item.id === row.id ? { ...item, direction: value as DataOpsOrderRow['direction'] } : item) })} options={[{ value: 'asc', label: 'Asc' }, { value: 'desc', label: 'Desc' }]} style={dataOpsControlStyle(dataOpsSectionColors.order)} />
+                              <Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { orderByRows: (step.orderByRows || []).filter((item) => item.id !== row.id) })} />
+                            </div>
+                          ))}
+                        </div>
+                        <div style={{ display: 'grid', gap: 6 }}>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, fontWeight: 700 }}>Limit Rows</Text>
+                          <Input size="small" type="number" min={0} value={step.limitRows} onChange={(event) => patchDataOpsPipelineStep(step.id, { limitRows: event.target.value ? Number(event.target.value) : undefined })} placeholder="limit rows" style={dataOpsInputStyle(dataOpsSectionColors.order)} />
+                        </div>
+                      </div>,
+                    )}
                 </div>
                   </div>
                   <div className="data-ops-query-result-side">
@@ -35788,7 +36483,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                 setDataOpsObjectDataLoading(true)
                                 setDataOpsObjectDataError(null)
                                 try {
-                                  const response = await api.previewDataOpsOracleQuery(nodeConfig, builtQuerySql, Number(step.limitRows || 100))
+                                  const response = await api.previewDataOpsOracleQuery({
+                                    ...nodeConfig,
+                                    _data_ops_task_bind_params: queryBuilderPreviewBindParams,
+                                  }, builtQuerySql, Number(step.limitRows || 100))
                                   setDataOpsObjectData(response)
                                   notification.success({ message: 'Query preview loaded', description: `${Number(response?.row_count || 0).toLocaleString()} row(s) returned.`, placement: 'bottomRight', duration: 2 })
                                 } catch (err: any) {
@@ -35905,13 +36603,53 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   ...configs.map((config) => ({
                     value: `query:${queryStep.id}:${config.id}`,
                     label: `${queryStep.name || 'Query Builder'} - ${config.name || 'Query'}`,
-                  })),
-                ]
-              })
-              const routerQuerySourceOptionValues = new Set(routerQuerySourceOptions.map((item) => String(item.value || '')))
-              const routerRouteSourceSelectValue = routerQuerySourceOptionValues.has(String(selectedDataOpsPipelineStep.routeSource || ''))
-                ? selectedDataOpsPipelineStep.routeSource
-                : undefined
+	                  })),
+	                ]
+	              })
+              const routerConfigRows = Array.isArray(selectedDataOpsPipelineStep.routerConfigs) ? selectedDataOpsPipelineStep.routerConfigs : []
+              const activeRouterConfig = routerConfigRows.find((item) => item.id === selectedDataOpsPipelineStep.activeRouterConfigId)
+              const routerEditorStep: DataOpsPipelineStep = activeRouterConfig
+                ? {
+                    ...selectedDataOpsPipelineStep,
+                    activeRouterConfigId: activeRouterConfig.id,
+                    routeSource: activeRouterConfig.routeSource || '',
+                    queryInputs: activeRouterConfig.queryInputs || [],
+                    routeMode: activeRouterConfig.routeMode || 'multi',
+                    payloadMode: activeRouterConfig.payloadMode || 'all_rows',
+                    routeRows: activeRouterConfig.routeRows || [],
+                    syncProcessingMode: activeRouterConfig.syncProcessingMode || 'batch',
+                    syncBatchSize: activeRouterConfig.syncBatchSize || 1000,
+                    syncCommitEvery: activeRouterConfig.syncCommitEvery || 5000,
+                    syncMaxBatches: activeRouterConfig.syncMaxBatches ?? 100,
+                    syncLoopGapSeconds: activeRouterConfig.syncLoopGapSeconds ?? 5,
+                    syncParallelEnabled: Boolean(activeRouterConfig.syncParallelEnabled),
+                    syncParallelWorkers: activeRouterConfig.syncParallelWorkers || 4,
+                    syncIncrementalField: activeRouterConfig.syncIncrementalField || '',
+                    syncCursorField: activeRouterConfig.syncCursorField || '',
+                    checkpoint: activeRouterConfig.checkpointEnabled !== false,
+                    checkpointEnabled: activeRouterConfig.checkpointEnabled !== false,
+                    checkpointIdField: activeRouterConfig.checkpointIdField || activeRouterConfig.syncCursorField || '',
+                    checkpointTimeField: activeRouterConfig.checkpointTimeField || activeRouterConfig.syncIncrementalField || '',
+                    auditField: activeRouterConfig.auditField || '_data_ops_audit',
+                    syncErrorMode: activeRouterConfig.syncErrorMode || 'stop',
+                    deployEnabled: Boolean(activeRouterConfig.deployEnabled),
+                    scheduleEnabled: Boolean(activeRouterConfig.scheduleEnabled),
+                    scheduleType: activeRouterConfig.scheduleType || 'interval',
+                    scheduleIntervalMinutes: activeRouterConfig.scheduleIntervalMinutes || 60,
+                    scheduleCron: activeRouterConfig.scheduleCron || '0 * * * *',
+                    scheduleTimezone: activeRouterConfig.scheduleTimezone || 'Asia/Kolkata',
+                    scheduleMaxParallelRuns: activeRouterConfig.scheduleMaxParallelRuns || 1,
+                    scheduleMisfirePolicy: activeRouterConfig.scheduleMisfirePolicy || 'skip',
+                    scheduleStatus: activeRouterConfig.scheduleStatus || '',
+                    scheduleBackendJobId: activeRouterConfig.scheduleBackendJobId || '',
+                    scheduleNextRunAt: activeRouterConfig.scheduleNextRunAt || '',
+                    scheduleLastRegisteredAt: activeRouterConfig.scheduleLastRegisteredAt || '',
+                  }
+                : selectedDataOpsPipelineStep
+	              const routerQuerySourceOptionValues = new Set(routerQuerySourceOptions.map((item) => String(item.value || '')))
+	              const routerRouteSourceSelectValue = routerQuerySourceOptionValues.has(String(routerEditorStep.routeSource || ''))
+	                ? routerEditorStep.routeSource
+	                : undefined
               const routerFieldLabel = (field: DataOpsFieldRow) => {
                 const alias = String(field.alias || '').trim()
                 if (alias) return alias
@@ -35925,7 +36663,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 .filter((field) => field.enabled !== false)
                 .map(routerFieldLabel)
                 .filter(Boolean))
-              const routerSelectedSourceValue = String(selectedDataOpsPipelineStep.routeSource || '')
+	              const routerSelectedSourceValue = String(routerEditorStep.routeSource || '')
               const routerSelectedSourceFields = (() => {
                 if (routerSelectedSourceValue.startsWith('query:')) {
                   const [, sourceStepId, queryId] = routerSelectedSourceValue.split(':')
@@ -35966,9 +36704,51 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   const type = String(nodeData.type || node.type || 'node')
                   return { value: node.id, label: `${label} (${type})` }
                 })
-              const patchRouter = (patch: Partial<DataOpsPipelineStep>) => patchDataOpsPipelineStep(selectedDataOpsPipelineStep.id, patch)
-              const routerBindParameters = dataOpsBindParametersFromRouteSource(dataOpsPipelineSteps, selectedDataOpsPipelineStep.routeSource).filter((item) => item.enabled !== false)
-              const routerQueryInputs = selectedDataOpsPipelineStep.queryInputs || []
+              const patchRouter = (patch: Partial<DataOpsPipelineStep>) => {
+                const activeConfigId = String(patch.activeRouterConfigId || selectedDataOpsPipelineStep.activeRouterConfigId || '').trim()
+                const mirrorKeys = new Set([
+                  'routeSource',
+                  'queryInputs',
+                  'routeMode',
+                  'payloadMode',
+                  'routeRows',
+                  'syncProcessingMode',
+                  'syncBatchSize',
+                  'syncCommitEvery',
+                  'syncMaxBatches',
+                  'syncLoopGapSeconds',
+                  'syncParallelEnabled',
+                  'syncParallelWorkers',
+                  'syncIncrementalField',
+                  'syncCursorField',
+                  'checkpointEnabled',
+                  'checkpointIdField',
+                  'checkpointTimeField',
+                  'auditField',
+                  'syncErrorMode',
+                ])
+                const mirroredPatch = Object.fromEntries(
+                  Object.entries(patch).filter(([key]) => mirrorKeys.has(key))
+                ) as Partial<DataOpsRouterConfig>
+                const shouldMirror = activeConfigId && Object.keys(mirroredPatch).length > 0
+                patchDataOpsPipelineStep(selectedDataOpsPipelineStep.id, {
+                  ...patch,
+                  ...(shouldMirror ? {
+                    routerConfigs: routerConfigRows.map((config) => (
+                      config.id === activeConfigId
+                        ? {
+                            ...config,
+                            ...mirroredPatch,
+                            checkpointEnabled: patch.checkpointEnabled ?? patch.checkpoint ?? mirroredPatch.checkpointEnabled ?? config.checkpointEnabled,
+                            updatedAt: new Date().toISOString(),
+                          }
+                        : config
+                    )),
+                  } : {}),
+                })
+              }
+              const routerBindParameters = dataOpsBindParametersFromRouteSource(dataOpsPipelineSteps, routerEditorStep.routeSource).filter((item) => item.enabled !== false)
+              const routerQueryInputs = routerEditorStep.queryInputs || []
               const routerQueryInputRows = routerBindParameters.map((param) => routerQueryInputs.find((item) => item.param === param.name) || {
                 id: dataOpsId('query_input'),
                 param: param.name,
@@ -35986,8 +36766,6 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     : [...routerQueryInputs, nextRow],
                 })
               }
-              const routerConfigRows = Array.isArray(selectedDataOpsPipelineStep.routerConfigs) ? selectedDataOpsPipelineStep.routerConfigs : []
-              const activeRouterConfig = routerConfigRows.find((item) => item.id === selectedDataOpsPipelineStep.activeRouterConfigId)
               const routerScheduleStep: DataOpsPipelineStep = {
                 ...selectedDataOpsPipelineStep,
                 activeRouterConfigId: activeRouterConfig?.id || selectedDataOpsPipelineStep.activeRouterConfigId,
@@ -36018,7 +36796,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   enabled: true,
                 },
               ]
-              const buildDataOpsRouterEdgesForConfigs = (configs: Array<{ id?: string; name?: string; routeRows?: DataOpsRouterRouteRow[] }>, baseEdges: Edge[] = dataOpsPipelineEdges) => {
+              const buildDataOpsRouterEdgesForConfigs = (configs: Array<{ id?: string; name?: string; enabled?: boolean; routeRows?: DataOpsRouterRouteRow[] }>, baseEdges: Edge[] = dataOpsPipelineEdges) => {
                 const sourceStepId = String(selectedDataOpsPipelineStep.id || '')
                 const managedPrefix = `data_ops_route_${sourceStepId}_`
                 const nextEdges = baseEdges.filter((edge) => {
@@ -36026,7 +36804,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   const edgeData = edge.data && typeof edge.data === 'object' ? edge.data as Record<string, unknown> : {}
                   return !(edgeId.startsWith(managedPrefix) || (edgeData.dataOpsRouterManaged === true && String(edge.source || '') === sourceStepId))
                 })
-                configs.forEach((config, configIndex) => {
+                configs.filter((config) => config.enabled !== false).forEach((config, configIndex) => {
                   const scope = String(config.id || config.name || `router_${configIndex + 1}`).replace(/[^A-Za-z0-9_.:-]+/g, '_')
                   ;(config.routeRows || [])
                     .filter((route) => route.enabled !== false && route.targetType === 'data_ops_step' && route.targetStepId && route.targetStepId !== sourceStepId)
@@ -36060,7 +36838,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               }
               const buildDataOpsRouterEdges = (routes: DataOpsRouterRouteRow[], baseEdges: Edge[] = dataOpsPipelineEdges) =>
                 buildDataOpsRouterEdgesForConfigs([{ id: selectedDataOpsPipelineStep.activeRouterConfigId || 'current', routeRows: routes }], baseEdges)
-              const syncMainPipelineRouterEdgesForConfigs = (configs: Array<{ id?: string; name?: string; routeRows?: DataOpsRouterRouteRow[] }>) => {
+              const syncMainPipelineRouterEdgesForConfigs = (configs: Array<{ id?: string; name?: string; enabled?: boolean; routeRows?: DataOpsRouterRouteRow[] }>) => {
                 const sourceNodeId = String(selectedNodeId || '')
                 if (!sourceNodeId) return
                 const state = useWorkflowStore.getState()
@@ -36069,7 +36847,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   const edgeData = edge.data && typeof edge.data === 'object' ? edge.data as Record<string, unknown> : {}
                   return !(String(edge.source || '') === sourceNodeId && edgeData.dataOpsRouterManaged === true)
                 })
-                configs.forEach((config, configIndex) => {
+                configs.filter((config) => config.enabled !== false).forEach((config, configIndex) => {
                   const scope = String(config.id || config.name || `router_${configIndex + 1}`).replace(/[^A-Za-z0-9_.:-]+/g, '_')
                   ;(config.routeRows || [])
                     .filter((route) => route.enabled !== false && route.targetType === 'main_pipeline_node' && route.targetNodeId && route.targetNodeId !== sourceNodeId)
@@ -36106,9 +36884,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               const syncMainPipelineRouterEdges = (routes: DataOpsRouterRouteRow[]) =>
                 syncMainPipelineRouterEdgesForConfigs([{ id: selectedDataOpsPipelineStep.activeRouterConfigId || 'current', routeRows: routes }])
               const snapshotRouterConfig = (base?: Partial<DataOpsRouterConfig>, sourceStep: DataOpsPipelineStep = selectedDataOpsPipelineStep): DataOpsRouterConfig => ({
-                id: String(base?.id || dataOpsId('router')),
-                name: String(base?.name || activeRouterConfig?.name || `Router ${routerConfigRows.length + 1}`),
-                description: String(base?.description || ''),
+                  id: String(base?.id || dataOpsId('router')),
+                  name: String(base?.name || activeRouterConfig?.name || `Router ${routerConfigRows.length + 1}`),
+                  enabled: base?.enabled !== false,
+                  description: String(base?.description || ''),
                 routeSource: sourceStep.routeSource || '',
                 queryInputs: sourceStep.queryInputs || [],
                 routeMode: sourceStep.routeMode || 'multi',
@@ -36117,11 +36896,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 syncProcessingMode: sourceStep.syncProcessingMode || 'batch',
                 syncBatchSize: sourceStep.syncBatchSize || 1000,
                 syncCommitEvery: sourceStep.syncCommitEvery || 5000,
+                syncMaxBatches: sourceStep.syncMaxBatches ?? 100,
+                syncLoopGapSeconds: sourceStep.syncLoopGapSeconds ?? 5,
                 syncParallelEnabled: Boolean(sourceStep.syncParallelEnabled),
-                syncParallelWorkers: sourceStep.syncParallelWorkers || 4,
-                syncIncrementalField: sourceStep.syncIncrementalField || '',
-                syncCursorField: sourceStep.syncCursorField || '',
-                syncErrorMode: sourceStep.syncErrorMode || 'stop',
+	                syncParallelWorkers: sourceStep.syncParallelWorkers || 4,
+	                syncIncrementalField: sourceStep.syncIncrementalField || '',
+	                syncCursorField: sourceStep.syncCursorField || '',
+	                checkpointEnabled: sourceStep.checkpoint !== false && sourceStep.checkpointEnabled !== false,
+	                checkpointIdField: sourceStep.checkpointIdField || sourceStep.syncCursorField || '',
+	                checkpointTimeField: sourceStep.checkpointTimeField || sourceStep.syncIncrementalField || '',
+	                auditField: sourceStep.auditField || '_data_ops_audit',
+	                syncErrorMode: sourceStep.syncErrorMode || 'stop',
                 deployEnabled: Boolean(sourceStep.deployEnabled),
                 scheduleEnabled: Boolean(sourceStep.scheduleEnabled),
                 scheduleType: sourceStep.scheduleType || 'interval',
@@ -36144,12 +36929,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 const nextConfig = snapshotRouterConfig({
                   id: targetId,
                   name: existing?.name || activeRouterConfig?.name || `Router ${routerConfigRows.length + 1}`,
+                  enabled: existing?.enabled !== false,
                   description: existing?.description || '',
                 }, sourceStep)
                 const nextRouterConfigs = existing
                   ? sourceRows.map((item) => item.id === targetId ? nextConfig : item)
                   : [...sourceRows, nextConfig]
-                const nextStep = { ...sourceStep, routerConfigs: nextRouterConfigs, activeRouterConfigId: targetId }
+                const nextStep = { ...sourceStep, enabled: nextRouterConfigs.some((item) => item.enabled !== false), routerConfigs: nextRouterConfigs, activeRouterConfigId: targetId }
                 const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id
                   ? nextStep
                   : step)
@@ -36173,11 +36959,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   syncProcessingMode: config.syncProcessingMode || 'batch',
                   syncBatchSize: config.syncBatchSize || 1000,
                   syncCommitEvery: config.syncCommitEvery || 5000,
+                  syncMaxBatches: config.syncMaxBatches ?? 100,
+                  syncLoopGapSeconds: config.syncLoopGapSeconds ?? 5,
                   syncParallelEnabled: Boolean(config.syncParallelEnabled),
-                  syncParallelWorkers: config.syncParallelWorkers || 4,
-                  syncIncrementalField: config.syncIncrementalField || '',
-                  syncCursorField: config.syncCursorField || '',
-                  syncErrorMode: config.syncErrorMode || 'stop',
+	                  syncParallelWorkers: config.syncParallelWorkers || 4,
+	                  syncIncrementalField: config.syncIncrementalField || '',
+	                  syncCursorField: config.syncCursorField || '',
+	                  checkpoint: config.checkpointEnabled !== false,
+	                  checkpointEnabled: config.checkpointEnabled !== false,
+	                  checkpointIdField: config.checkpointIdField || config.syncCursorField || '',
+	                  checkpointTimeField: config.checkpointTimeField || config.syncIncrementalField || '',
+	                  auditField: config.auditField || '_data_ops_audit',
+	                  syncErrorMode: config.syncErrorMode || 'stop',
                   deployEnabled: Boolean(config.deployEnabled),
                   scheduleEnabled: Boolean(config.scheduleEnabled),
                   scheduleType: config.scheduleType || 'interval',
@@ -36198,6 +36991,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 const nextConfig: DataOpsRouterConfig = {
                   id: nextId,
                   name: `Router ${routerConfigRows.length + 1}`,
+                  enabled: true,
                   description: '',
                   routeSource: routerQuerySourceOptions[0]?.value || '',
                   queryInputs: [],
@@ -36207,11 +37001,17 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   syncProcessingMode: 'batch',
                   syncBatchSize: 1000,
                   syncCommitEvery: 5000,
+                  syncMaxBatches: 100,
+                  syncLoopGapSeconds: 5,
                   syncParallelEnabled: false,
-                  syncParallelWorkers: 4,
-                  syncIncrementalField: '',
-                  syncCursorField: '',
-                  syncErrorMode: 'stop',
+	                  syncParallelWorkers: 4,
+	                  syncIncrementalField: '',
+	                  syncCursorField: '',
+	                  checkpointEnabled: true,
+	                  checkpointIdField: '',
+	                  checkpointTimeField: '',
+	                  auditField: '_data_ops_audit',
+	                  syncErrorMode: 'stop',
                   deployEnabled: false,
                   scheduleEnabled: false,
                   scheduleType: 'interval',
@@ -36227,6 +37027,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   updatedAt: new Date().toISOString(),
                 }
                 const nextPatch: Partial<DataOpsPipelineStep> = {
+                  enabled: true,
                   routerConfigs: [...routerConfigRows, nextConfig],
                   activeRouterConfigId: nextId,
                   routeSource: nextConfig.routeSource,
@@ -36236,11 +37037,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   syncProcessingMode: 'batch',
                   syncBatchSize: 1000,
                   syncCommitEvery: 5000,
+                  syncMaxBatches: 100,
+                  syncLoopGapSeconds: 5,
                   syncParallelEnabled: false,
-                  syncParallelWorkers: 4,
-                  syncIncrementalField: '',
-                  syncCursorField: '',
-                  syncErrorMode: 'stop',
+	                  syncParallelWorkers: 4,
+	                  syncIncrementalField: '',
+	                  syncCursorField: '',
+	                  checkpoint: true,
+	                  checkpointEnabled: true,
+	                  checkpointIdField: '',
+	                  checkpointTimeField: '',
+	                  auditField: '_data_ops_audit',
+	                  syncErrorMode: 'stop',
                   deployEnabled: false,
                   scheduleEnabled: false,
                   scheduleType: 'interval',
@@ -36264,14 +37072,41 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               const duplicateRouterConfig = (config: DataOpsRouterConfig) => {
                 const nextId = dataOpsId('router')
                 patchRouter({
-                  routerConfigs: [...routerConfigRows, { ...config, id: nextId, name: `${config.name || 'Router'} Copy`, updatedAt: new Date().toISOString() }],
+                  routerConfigs: [...routerConfigRows, { ...config, id: nextId, name: `${config.name || 'Router'} Copy`, enabled: config.enabled !== false, updatedAt: new Date().toISOString() }],
                   activeRouterConfigId: nextId,
                 })
               }
               const updateRouterConfig = (configId: string, patch: Partial<DataOpsRouterConfig>) => {
+                const nextRouterConfigs = routerConfigRows.map((item) => item.id === configId ? { ...item, ...patch, updatedAt: new Date().toISOString() } : item)
                 patchRouter({
-                  routerConfigs: routerConfigRows.map((item) => item.id === configId ? { ...item, ...patch, updatedAt: new Date().toISOString() } : item),
+                  enabled: nextRouterConfigs.some((item) => item.enabled !== false),
+                  routerConfigs: nextRouterConfigs,
                 })
+                const nextDataOpsEdges = buildDataOpsRouterEdgesForConfigs(nextRouterConfigs)
+                syncMainPipelineRouterEdgesForConfigs(nextRouterConfigs)
+                persistDataOpsPipeline(
+                  dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, enabled: nextRouterConfigs.some((item) => item.enabled !== false), routerConfigs: nextRouterConfigs } : step),
+                  nextDataOpsEdges,
+                )
+              }
+              const toggleRouterConfig = (config: DataOpsRouterConfig, enabled: boolean) => {
+                const patch: Partial<DataOpsRouterConfig> = { enabled }
+                if (!enabled) {
+                  patch.deployEnabled = false
+                  patch.scheduleEnabled = false
+                  patch.scheduleStatus = 'disabled'
+                  patch.scheduleNextRunAt = ''
+                }
+                updateRouterConfig(config.id, patch)
+                if (!enabled && (config.deployEnabled || config.scheduleEnabled || config.scheduleBackendJobId)) {
+                  void deployDataOpsRouterScheduler({ ...routerScheduleStep, activeRouterConfigId: config.id }, {
+                    enabled: false,
+                    deployEnabled: false,
+                    scheduleEnabled: false,
+                    scheduleStatus: 'disabled',
+                    scheduleBackendJobId: config.scheduleBackendJobId || routerScheduleStep.scheduleBackendJobId,
+                  })
+                }
               }
               const deleteRouterConfig = (configId: string) => {
                 const nextRows = routerConfigRows.filter((item) => item.id !== configId)
@@ -36305,7 +37140,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 })
                 if (deploy) void deployDataOpsRouterScheduler(routerScheduleStep, patch as Record<string, unknown>)
               }
-              const routeRows = selectedDataOpsPipelineStep.routeRows || []
+              const routeRows = routerEditorStep.routeRows || []
               const activeRoutes = routeRows.filter((row) => row.enabled !== false)
               const activeRouteConfigRow = routeRows.find((row) => row.id === dataOpsRouterRouteConfigId) || null
               const routerSampleRows = (dataOpsQueryResultRows.length > 0 ? dataOpsQueryResultRows : dataOpsObjectDataRows) as Array<Record<string, unknown>>
@@ -36364,15 +37199,19 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   name: route.name || route.id,
                   target: getRouteTargetLabel(route),
                   mode: route.matchMode || 'all',
-                  payload: route.payloadMode || selectedDataOpsPipelineStep.payloadMode || 'all_rows',
+                  payload: route.payloadMode || routerEditorStep.payloadMode || 'all_rows',
                   rows: routerSampleRows.length > 0 ? matched : 'preview unavailable',
                 }
               })
               const patchRouterRoute = (routeId: string, patch: Partial<DataOpsRouterRouteRow>) => {
                 const nextRouteRows = routeRows.map((item) => item.id === routeId ? { ...item, ...patch } : item)
-                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, routeRows: nextRouteRows } : step)
-                const nextDataOpsEdges = buildDataOpsRouterEdges(nextRouteRows)
-                syncMainPipelineRouterEdges(nextRouteRows)
+                const activeConfigId = String(routerEditorStep.activeRouterConfigId || selectedDataOpsPipelineStep.activeRouterConfigId || '').trim()
+                const nextRouterConfigs = activeConfigId
+                  ? routerConfigRows.map((config) => config.id === activeConfigId ? { ...config, routeRows: nextRouteRows, updatedAt: new Date().toISOString() } : config)
+                  : routerConfigRows
+                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, routeRows: nextRouteRows, routerConfigs: nextRouterConfigs } : step)
+                const nextDataOpsEdges = buildDataOpsRouterEdgesForConfigs(nextRouterConfigs.length > 0 ? nextRouterConfigs : [{ id: activeConfigId || 'current', routeRows: nextRouteRows }])
+                syncMainPipelineRouterEdgesForConfigs(nextRouterConfigs.length > 0 ? nextRouterConfigs : [{ id: activeConfigId || 'current', routeRows: nextRouteRows }])
                 persistDataOpsPipeline(nextSteps, nextDataOpsEdges)
               }
               const addRouterRoute = () => {
@@ -36388,21 +37227,29 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   targetStepId: dataOpsTargetStepOptions[0]?.value || '',
                   targetNodeId: '',
                   endpoint: '',
-                  payloadMode: selectedDataOpsPipelineStep.payloadMode || 'all_rows',
+                  payloadMode: routerEditorStep.payloadMode || 'all_rows',
                   enabled: true,
                 }
                 const nextRouteRows = [...routeRows, nextRoute]
-                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, routeRows: nextRouteRows } : step)
-                const nextDataOpsEdges = buildDataOpsRouterEdges(nextRouteRows)
-                syncMainPipelineRouterEdges(nextRouteRows)
+                const activeConfigId = String(routerEditorStep.activeRouterConfigId || selectedDataOpsPipelineStep.activeRouterConfigId || '').trim()
+                const nextRouterConfigs = activeConfigId
+                  ? routerConfigRows.map((config) => config.id === activeConfigId ? { ...config, routeRows: nextRouteRows, updatedAt: new Date().toISOString() } : config)
+                  : routerConfigRows
+                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, routeRows: nextRouteRows, routerConfigs: nextRouterConfigs } : step)
+                const nextDataOpsEdges = buildDataOpsRouterEdgesForConfigs(nextRouterConfigs.length > 0 ? nextRouterConfigs : [{ id: activeConfigId || 'current', routeRows: nextRouteRows }])
+                syncMainPipelineRouterEdgesForConfigs(nextRouterConfigs.length > 0 ? nextRouterConfigs : [{ id: activeConfigId || 'current', routeRows: nextRouteRows }])
                 persistDataOpsPipeline(nextSteps, nextDataOpsEdges)
                 setDataOpsRouterRouteConfigId(nextRoute.id)
               }
               const deleteRouterRoute = (routeId: string) => {
                 const nextRouteRows = routeRows.filter((item) => item.id !== routeId)
-                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, routeRows: nextRouteRows } : step)
-                const nextDataOpsEdges = buildDataOpsRouterEdges(nextRouteRows)
-                syncMainPipelineRouterEdges(nextRouteRows)
+                const activeConfigId = String(routerEditorStep.activeRouterConfigId || selectedDataOpsPipelineStep.activeRouterConfigId || '').trim()
+                const nextRouterConfigs = activeConfigId
+                  ? routerConfigRows.map((config) => config.id === activeConfigId ? { ...config, routeRows: nextRouteRows, updatedAt: new Date().toISOString() } : config)
+                  : routerConfigRows
+                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, routeRows: nextRouteRows, routerConfigs: nextRouterConfigs } : step)
+                const nextDataOpsEdges = buildDataOpsRouterEdgesForConfigs(nextRouterConfigs.length > 0 ? nextRouterConfigs : [{ id: activeConfigId || 'current', routeRows: nextRouteRows }])
+                syncMainPipelineRouterEdgesForConfigs(nextRouterConfigs.length > 0 ? nextRouterConfigs : [{ id: activeConfigId || 'current', routeRows: nextRouteRows }])
                 persistDataOpsPipeline(nextSteps, nextDataOpsEdges)
                 if (dataOpsRouterRouteConfigId === routeId) setDataOpsRouterRouteConfigId('')
               }
@@ -36442,6 +37289,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     }}
                     columns={[
                       { title: 'State', width: 86, render: (_value: unknown, row: DataOpsRouterConfig) => <Tag color={row.id === selectedDataOpsPipelineStep.activeRouterConfigId ? 'green' : 'default'} style={{ marginInlineEnd: 0 }}>{row.id === selectedDataOpsPipelineStep.activeRouterConfigId ? 'selected' : 'saved'}</Tag> },
+                      { title: 'Use', width: 72, render: (_value: unknown, row: DataOpsRouterConfig) => <Switch size="small" checked={row.enabled !== false} onChange={(checked) => toggleRouterConfig(row, checked)} /> },
                       { title: 'Router Name', render: (_value: unknown, row: DataOpsRouterConfig) => <Input size="small" value={row.name || ''} onChange={(event) => updateRouterConfig(row.id, { name: event.target.value })} style={dataOpsInputStyle(dataOpsSectionColors.schedule)} /> },
                       { title: 'Source Query', width: 260, render: (_value: unknown, row: DataOpsRouterConfig) => <Text ellipsis style={{ color: dataOpsSectionColors.source }}>{routerQuerySourceOptions.find((item) => item.value === row.routeSource)?.label || row.routeSource || 'upstream result'}</Text> },
                       { title: 'Routes', width: 92, render: (_value: unknown, row: DataOpsRouterConfig) => <Tag color="orange" style={{ marginInlineEnd: 0 }}>{(row.routeRows || []).filter((item) => item.enabled !== false).length}</Tag> },
@@ -36485,11 +37333,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                             </div>
                             <div>
                               <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Route Mode</Text>
-                              <Select size="small" value={selectedDataOpsPipelineStep.routeMode || 'multi'} onChange={(value) => patchRouter({ routeMode: value as DataOpsPipelineStep['routeMode'] })} options={[{ value: 'single', label: 'Single' }, { value: 'multi', label: 'Multiple' }, { value: 'conditional', label: 'Conditional' }]} style={dataOpsControlStyle(dataOpsSectionColors.schedule, { width: '100%', marginTop: 5 })} />
+                              <Select size="small" value={routerEditorStep.routeMode || 'multi'} onChange={(value) => patchRouter({ routeMode: value as DataOpsPipelineStep['routeMode'] })} options={[{ value: 'single', label: 'Single' }, { value: 'multi', label: 'Multiple' }, { value: 'conditional', label: 'Conditional' }]} style={dataOpsControlStyle(dataOpsSectionColors.schedule, { width: '100%', marginTop: 5 })} />
                             </div>
                             <div>
                               <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Default Payload</Text>
-                              <Select size="small" value={selectedDataOpsPipelineStep.payloadMode || 'all_rows'} onChange={(value) => patchRouter({ payloadMode: value as DataOpsPipelineStep['payloadMode'] })} options={[{ value: 'all_rows', label: 'All rows' }, { value: 'batch', label: 'Batch' }, { value: 'row_by_row', label: 'Row by row' }, { value: 'first_row', label: 'First row' }, { value: 'grouped', label: 'Grouped' }]} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%', marginTop: 5 })} />
+                              <Select size="small" value={routerEditorStep.payloadMode || 'all_rows'} onChange={(value) => patchRouter({ payloadMode: value as DataOpsPipelineStep['payloadMode'] })} options={[{ value: 'all_rows', label: 'All rows' }, { value: 'batch', label: 'Batch' }, { value: 'row_by_row', label: 'Row by row' }, { value: 'first_row', label: 'First row' }, { value: 'grouped', label: 'Grouped' }]} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%', marginTop: 5 })} />
                             </div>
                         </div>
                         {routerBindParameters.length > 0 ? (
@@ -36520,7 +37368,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           <div className="data-ops-router-main">
                           <Space style={{ width: '100%', justifyContent: 'space-between' }}>
                             <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Routing Endpoints</Text>
-	                            <Button size="small" onClick={addRouterRoute}>Add Route</Button>
+	                            <Space size={6}>
+	                              <Button size="small" onClick={() => setDataOpsRouterPreviewDrawerOpen(true)}>Preview / Contract</Button>
+	                              <Button size="small" onClick={addRouterRoute}>Add Route</Button>
+	                            </Space>
                           </Space>
                           <Table
                             size="small"
@@ -36634,37 +37485,160 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 	                              </div>
 	                            </Modal>
 	                          ) : null}
-	                          <div style={{ display: 'grid', gridTemplateColumns: '170px 120px 130px 150px 150px 1fr', gap: 10, alignItems: 'end' }}>
-                            <div>
-                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Processing Mode</Text>
-                              <Select size="small" value={selectedDataOpsPipelineStep.syncProcessingMode || 'batch'} onChange={(value) => patchRouter({ syncProcessingMode: value as DataOpsPipelineStep['syncProcessingMode'] })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} options={[{ value: 'batch', label: 'Batch' }, { value: 'incremental_batch', label: 'Incremental Batch' }, { value: 'cursor', label: 'Cursor' }, { value: 'row_by_row', label: 'Row by Row' }]} />
+	                            <div className="data-ops-parameter-panel-grid">
+		                          <div className="data-ops-parameter-card data-ops-batch-card" style={{ display: 'grid', gridTemplateColumns: '190px 110px 120px 120px 110px 110px 1fr', gap: 10, alignItems: 'end' }}>
+	                            <div>
+	                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Processing Mode</Text>
+	                              <Select size="small" value={routerEditorStep.syncProcessingMode || 'batch'} onChange={(value) => patchRouter({ syncProcessingMode: value as DataOpsPipelineStep['syncProcessingMode'] })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} options={[{ value: 'batch', label: 'Batch' }, { value: 'incremental_batch', label: 'Incremental Batch' }, { value: 'incremental_batch_loop', label: 'Incremental Batch Loop' }, { value: 'cursor', label: 'Cursor' }, { value: 'row_by_row', label: 'Row by Row' }]} />
+	                            </div>
+	                            <div>
+	                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Batch Size</Text>
+	                              <InputNumber size="small" min={1} value={routerEditorStep.syncBatchSize || 1000} onChange={(value) => patchRouter({ syncBatchSize: Math.max(1, Number(value || 1000)) })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} />
                             </div>
                             <div>
-                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Batch Size</Text>
-                              <InputNumber size="small" min={1} value={selectedDataOpsPipelineStep.syncBatchSize || 1000} onChange={(value) => patchRouter({ syncBatchSize: Math.max(1, Number(value || 1000)) })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} />
-                            </div>
-                            <div>
-                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Commit Every</Text>
-                              <InputNumber size="small" min={1} value={selectedDataOpsPipelineStep.syncCommitEvery || 5000} onChange={(value) => patchRouter({ syncCommitEvery: Math.max(1, Number(value || 5000)) })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} />
-                            </div>
-                            <div>
-                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Parallel</Text>
-                              <div style={{ marginTop: 8 }}><Switch size="small" checked={Boolean(selectedDataOpsPipelineStep.syncParallelEnabled)} onChange={(checked) => patchRouter({ syncParallelEnabled: checked })} /></div>
-                            </div>
+	                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Commit Every</Text>
+	                              <InputNumber size="small" min={1} value={routerEditorStep.syncCommitEvery || 5000} onChange={(value) => patchRouter({ syncCommitEvery: Math.max(1, Number(value || 5000)) })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} />
+	                            </div>
+	                            <div>
+	                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Max Batches</Text>
+	                              <InputNumber size="small" min={0} max={10000} value={routerEditorStep.syncMaxBatches ?? 100} onChange={(value) => {
+	                                const nextValue = Number(value ?? 100)
+	                                patchRouter({ syncMaxBatches: Number.isFinite(nextValue) ? Math.max(0, Math.trunc(nextValue)) : 100 })
+	                              }} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} />
+	                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10 }}>0 = keep polling until stopped</Text>
+	                            </div>
+	                            {routerEditorStep.syncProcessingMode === 'incremental_batch_loop' ? (
+	                              <div>
+	                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Loop Gap Seconds</Text>
+	                                <InputNumber
+	                                  size="small"
+	                                  min={1}
+	                                  max={3600}
+	                                  value={routerEditorStep.syncLoopGapSeconds ?? 5}
+	                                  onChange={(value) => {
+	                                    const nextValue = Number(value ?? 5)
+	                                    patchRouter({ syncLoopGapSeconds: Number.isFinite(nextValue) ? Math.max(1, Math.trunc(nextValue)) : 5 })
+	                                  }}
+	                                  style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })}
+	                                />
+	                              </div>
+	                            ) : null}
+	                            <div>
+	                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Parallel</Text>
+	                              <div style={{ marginTop: 8 }}><Switch size="small" checked={Boolean(routerEditorStep.syncParallelEnabled)} onChange={(checked) => patchRouter({ syncParallelEnabled: checked })} /></div>
+	                            </div>
                             <div>
                               <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Workers</Text>
-                              <InputNumber size="small" min={1} max={64} disabled={!selectedDataOpsPipelineStep.syncParallelEnabled} value={selectedDataOpsPipelineStep.syncParallelWorkers || 4} onChange={(value) => patchRouter({ syncParallelWorkers: Math.max(1, Number(value || 4)) })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} />
+                              <InputNumber size="small" min={1} max={64} disabled={!routerEditorStep.syncParallelEnabled} value={routerEditorStep.syncParallelWorkers || 4} onChange={(value) => patchRouter({ syncParallelWorkers: Math.max(1, Number(value || 4)) })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} />
                             </div>
                             <div>
                               <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Error Policy</Text>
-                              <Select size="small" value={selectedDataOpsPipelineStep.syncErrorMode || 'stop'} onChange={(value) => patchRouter({ syncErrorMode: value as DataOpsPipelineStep['syncErrorMode'] })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} options={[{ value: 'stop', label: 'Stop on error' }, { value: 'skip', label: 'Skip bad rows' }, { value: 'reject', label: 'Write reject rows' }]} />
-                            </div>
-                          </div>
-	                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-	                            <Select size="small" showSearch allowClear optionFilterProp="label" value={selectedDataOpsPipelineStep.syncIncrementalField || undefined} onChange={(value) => patchRouter({ syncIncrementalField: String(value || '') })} placeholder="incremental watermark field" options={routerFieldOptions} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%' })} />
-	                            <Select size="small" showSearch allowClear optionFilterProp="label" value={selectedDataOpsPipelineStep.syncCursorField || undefined} onChange={(value) => patchRouter({ syncCursorField: String(value || '') })} placeholder="cursor/order field" options={routerFieldOptions} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%' })} />
+	                              <Select size="small" value={routerEditorStep.syncErrorMode || 'stop'} onChange={(value) => patchRouter({ syncErrorMode: value as DataOpsPipelineStep['syncErrorMode'] })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} options={[{ value: 'stop', label: 'Stop on error' }, { value: 'skip', label: 'Skip bad rows' }, { value: 'reject', label: 'Write reject rows' }]} />
+	                            </div>
 	                          </div>
-                          <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 10 }}>
+		                          <Collapse
+		                            className="data-ops-parameter-card data-ops-checkpoint-card"
+		                            size="small"
+		                            ghost
+		                            items={[{
+		                              key: 'checkpoint_cursor',
+		                              label: 'Checkpoint / Incremental Cursor',
+		                              children: (
+		                                <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 10 }}>
+		                                  <div style={{ display: 'grid', gridTemplateColumns: '110px minmax(0, 1fr) minmax(0, 1fr) minmax(0, 0.9fr)', gap: 10, alignItems: 'end' }}>
+		                                    <div style={{ minWidth: 0 }}>
+		                                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', lineHeight: '16px' }}>State</Text>
+		                                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, height: 30, marginTop: 4 }}>
+		                                        <Switch size="small" checked={routerEditorStep.checkpoint !== false && routerEditorStep.checkpointEnabled !== false} onChange={(checked) => patchRouter({ checkpoint: checked, checkpointEnabled: checked })} />
+		                                        <Text style={{ color: 'var(--app-text)', fontSize: 12 }}>{routerEditorStep.checkpoint !== false && routerEditorStep.checkpointEnabled !== false ? 'Enabled' : 'Disabled'}</Text>
+		                                      </div>
+		                                    </div>
+		                                    <div style={{ minWidth: 0 }}>
+		                                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', lineHeight: '16px' }}>ID Field</Text>
+		                                      <Select
+		                                        size="small"
+		                                        showSearch
+		                                        allowClear
+		                                        optionFilterProp="label"
+		                                        value={routerEditorStep.checkpointIdField || routerEditorStep.syncCursorField || undefined}
+		                                        onChange={(value) => patchRouter({ checkpointIdField: String(value || ''), syncCursorField: String(value || '') })}
+		                                        placeholder="source id / cursor id"
+		                                        options={routerFieldOptions}
+		                                        style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 4 })}
+		                                      />
+		                                    </div>
+		                                    <div style={{ minWidth: 0 }}>
+		                                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', lineHeight: '16px' }}>Transaction Time Field</Text>
+		                                      <Select
+		                                        size="small"
+		                                        showSearch
+		                                        allowClear
+		                                        optionFilterProp="label"
+		                                        value={routerEditorStep.checkpointTimeField || routerEditorStep.syncIncrementalField || undefined}
+		                                        onChange={(value) => patchRouter({ checkpointTimeField: String(value || ''), syncIncrementalField: String(value || '') })}
+		                                        placeholder="source transaction timestamp"
+		                                        options={routerFieldOptions}
+		                                        style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 4 })}
+		                                      />
+		                                    </div>
+		                                    <div style={{ minWidth: 0 }}>
+		                                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', lineHeight: '16px' }}>Audit Field</Text>
+		                                      <Input size="small" value={routerEditorStep.auditField || '_data_ops_audit'} onChange={(event) => patchRouter({ auditField: event.target.value })} placeholder="audit/status field" style={dataOpsInputStyle(dataOpsSectionColors.action, { marginTop: 4 })} />
+		                                    </div>
+		                                  </div>
+		                                  <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr) 312px', gap: 10, alignItems: 'end', borderTop: '1px solid var(--app-border)', paddingTop: 10 }}>
+		                                    <div style={{ minWidth: 0 }}>
+		                                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', lineHeight: '16px', marginBottom: 4 }}>Stored Source ID Cursor</Text>
+		                                      <Input
+		                                        size="small"
+		                                        value={dataOpsCheckpointDraft.lastSourceId}
+		                                        onChange={(event) => setDataOpsCheckpointDraft((current) => ({ ...current, lastSourceId: event.target.value }))}
+		                                        placeholder="not stored"
+		                                        style={dataOpsInputStyle(dataOpsSectionColors.action)}
+		                                      />
+		                                    </div>
+		                                    <div style={{ minWidth: 0 }}>
+		                                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', lineHeight: '16px', marginBottom: 4 }}>Stored Transaction Time Cursor</Text>
+		                                      <Input
+		                                        size="small"
+		                                        value={dataOpsCheckpointDraft.lastTransactionTime}
+		                                        onChange={(event) => setDataOpsCheckpointDraft((current) => ({ ...current, lastTransactionTime: event.target.value }))}
+		                                        placeholder="not stored"
+		                                        style={dataOpsInputStyle(dataOpsSectionColors.action)}
+		                                      />
+		                                    </div>
+		                                    <Space size={6} style={{ justifyContent: 'flex-end', alignSelf: 'end' }}>
+		                                      <Button size="small" loading={dataOpsCheckpointLoading} onClick={() => { void loadDataOpsMapperCheckpoint(routerEditorStep) }}>
+		                                        Refresh
+		                                      </Button>
+		                                      <Button size="small" type="primary" loading={dataOpsCheckpointLoading} onClick={() => { void saveDataOpsMapperCheckpoint(routerEditorStep) }}>
+		                                        Save Cursor
+		                                      </Button>
+		                                      <Popconfirm
+		                                        title="Reset checkpoint cursor?"
+		                                        description="Next run will start without the saved incremental cursor for this router."
+		                                        okText="Reset"
+		                                        cancelText="Cancel"
+		                                        okButtonProps={{ danger: true }}
+		                                        onConfirm={() => { void resetDataOpsMapperCheckpoint(routerEditorStep) }}
+		                                      >
+		                                        <Button size="small" danger loading={dataOpsCheckpointLoading} disabled={routerEditorStep.checkpoint === false || routerEditorStep.checkpointEnabled === false}>
+		                                          Reset Cursor
+		                                        </Button>
+		                                      </Popconfirm>
+		                                    </Space>
+		                                  </div>
+		                                  {(dataOpsCheckpointCursor?.source || dataOpsCheckpointCursor?.updated_at) ? (
+		                                    <Space size={6} wrap>
+		                                      {dataOpsCheckpointCursor?.source ? <Tag color={dataOpsCheckpointCursor.source === 'legacy' ? 'orange' : 'blue'} style={{ marginInlineEnd: 0 }}>cursor: {String(dataOpsCheckpointCursor.source)}</Tag> : null}
+		                                      {dataOpsCheckpointCursor?.updated_at ? <Tag color="default" style={{ marginInlineEnd: 0 }}>updated: {String(dataOpsCheckpointCursor.updated_at).slice(0, 19)}</Tag> : null}
+		                                    </Space>
+		                                  ) : null}
+		                                </div>
+		                              ),
+		                            }]}
+		                          />
+                          <div className="data-ops-parameter-card data-ops-scheduler-card" style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 10 }}>
                             <Space style={{ width: '100%', justifyContent: 'space-between' }} align="start">
                               <div>
                                 <Text style={{ color: 'var(--app-text)', fontWeight: 800, fontSize: 12 }}>Deploy / Scheduler</Text>
@@ -36713,6 +37687,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                               </div>
                             </div>
                           </div>
+                            </div>
                         </div>
 	                        <div className="data-ops-router-preview-side">
                           <Collapse
@@ -36723,9 +37698,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                               key: 'route_preview',
                               label: 'Route Preview',
                               children: (
-                                <Table
-                                  size="small"
-                                  rowKey="key"
+	                            <Table
+	                              className="data-ops-monitor-log-table"
+	                              size="small"
+	                              tableLayout="fixed"
+	                              rowKey="key"
                                   pagination={false}
                                   dataSource={routePreviewRows}
                                   locale={{ emptyText: <Text style={{ color: 'var(--app-text-subtle)' }}>No active route rows.</Text> }}
@@ -36752,6 +37729,38 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           />
 	                        </div>
 	                      </div>
+                        <Drawer
+                          title="Route Preview / Payload Contract"
+                          placement="right"
+                          width={720}
+                          open={dataOpsRouterPreviewDrawerOpen}
+                          onClose={() => setDataOpsRouterPreviewDrawerOpen(false)}
+                          styles={{ body: { background: 'var(--app-panel-bg)' }, header: { background: 'var(--app-panel-bg)' } }}
+                        >
+                          <div style={{ display: 'grid', gap: 12 }}>
+                            <Table
+                              className="data-ops-monitor-log-table"
+                              size="small"
+                              tableLayout="fixed"
+                              rowKey="key"
+                              pagination={false}
+                              dataSource={routePreviewRows}
+                              locale={{ emptyText: <Text style={{ color: 'var(--app-text-subtle)' }}>No active route rows.</Text> }}
+                              columns={[
+                                { title: 'Route', dataIndex: 'name' },
+                                { title: 'Target', dataIndex: 'target', render: (value: string) => <Text ellipsis style={{ color: dataOpsSectionColors.output }}>{value}</Text> },
+                                { title: 'Match', dataIndex: 'mode', width: 90 },
+                                { title: 'Rows', dataIndex: 'rows', width: 130 },
+                              ] as any[]}
+                            />
+                            <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: 10, background: 'var(--app-bg)', display: 'grid', gap: 6 }}>
+                              <Text style={{ color: dataOpsSectionColors.source }}>Source: {routerQuerySourceOptions.find((item) => item.value === selectedDataOpsPipelineStep.routeSource)?.label || selectedDataOpsPipelineStep.routeSource || 'upstream result'}</Text>
+                              <Text style={{ color: dataOpsSectionColors.output }}>Payload: {selectedDataOpsPipelineStep.payloadMode || 'all_rows'}</Text>
+                              <Text style={{ color: dataOpsSectionColors.schedule }}>Mode: {selectedDataOpsPipelineStep.routeMode || 'multi'}</Text>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Sample fields: {routerSourceFields.slice(0, 12).join(', ') || 'none loaded yet'}</Text>
+                            </div>
+                          </div>
+                        </Drawer>
                       </div>
                     </Modal>
                   ) : null}
@@ -36822,6 +37831,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 ...(selectedDataOpsPipelineStep.mappingRows || []).map((item) => String(item.target || '').trim()).filter(Boolean),
               ])
               const mapperSourceOptions = mapperSourceFields.map((value) => ({ value, label: value }))
+              const mapperBindValueOptions = [
+                {
+                  label: 'Task Master Bind Values',
+                  options: DATA_OPS_TASK_MASTER_BIND_PRESETS.map((item) => ({ value: item.name, label: `:${item.name} - ${item.label || 'task master'}` })),
+                },
+                {
+                  label: 'Source Fields',
+                  options: mapperSourceOptions,
+                },
+              ]
               const mapperTargetOptions = mapperTargetColumns.map((value) => ({ value, label: value }))
               const mapperKeyFieldOptions = uniqueFieldNames([
                 ...mapperTargetColumns,
@@ -36845,7 +37864,51 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 dataOpsDataTargetName,
               ].filter(Boolean))
               const mapperObjectOptions = mapperDestinationObjectNames.map((value) => ({ value, label: value }))
-              const patchMapper = (patch: Partial<DataOpsPipelineStep>) => patchDataOpsPipelineStep(selectedDataOpsPipelineStep.id, patch)
+              const patchMapper = (patch: Partial<DataOpsPipelineStep>) => {
+                const activeConfigId = String(selectedDataOpsPipelineStep.activeMapperConfigId || '').trim()
+                const mirrorKeys = new Set([
+                  'targetMode',
+                  'writeMode',
+                  'lookupSource',
+                  'queryInputs',
+                  'target',
+                  'keyFields',
+                  'mappingRows',
+                  'syncProcessingMode',
+                  'syncBatchSize',
+                  'syncCommitEvery',
+                  'syncMaxBatches',
+                  'syncParallelEnabled',
+                  'syncParallelWorkers',
+                  'syncIncrementalField',
+                  'syncCursorField',
+                  'checkpointEnabled',
+                  'checkpointIdField',
+                  'checkpointTimeField',
+                  'syncErrorMode',
+                  'auditField',
+                  'expression',
+                ])
+                const mirroredPatch = Object.fromEntries(
+                  Object.entries(patch).filter(([key]) => mirrorKeys.has(key))
+                ) as Partial<DataOpsMapperConfig>
+                const shouldMirror = activeConfigId && Object.keys(mirroredPatch).length > 0
+                patchDataOpsPipelineStep(selectedDataOpsPipelineStep.id, {
+                  ...patch,
+                  ...(shouldMirror ? {
+                    mapperConfigs: (selectedDataOpsPipelineStep.mapperConfigs || []).map((config) => (
+                      config.id === activeConfigId
+                        ? {
+                            ...config,
+                            ...mirroredPatch,
+                            checkpointEnabled: patch.checkpointEnabled ?? patch.checkpoint ?? mirroredPatch.checkpointEnabled ?? config.checkpointEnabled,
+                            updatedAt: new Date().toISOString(),
+                          }
+                        : config
+                    )),
+                  } : {}),
+                })
+              }
               const mapperBindParameters = dataOpsBindParametersFromRouteSource(dataOpsPipelineSteps, selectedDataOpsPipelineStep.lookupSource).filter((item) => item.enabled !== false)
               const mapperQueryInputs = selectedDataOpsPipelineStep.queryInputs || []
               const mapperQueryInputRows = mapperBindParameters.map((param) => mapperQueryInputs.find((item) => item.param === param.name) || {
@@ -36881,6 +37944,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               }
               const mapperConfigRows = Array.isArray(selectedDataOpsPipelineStep.mapperConfigs) ? selectedDataOpsPipelineStep.mapperConfigs : []
               const activeMapperConfig = mapperConfigRows.find((item) => item.id === selectedDataOpsPipelineStep.activeMapperConfigId)
+              const effectiveMapperQueryInputs = (config?: DataOpsMapperConfig) => (
+                config && config.id === selectedDataOpsPipelineStep.activeMapperConfigId
+                  ? (selectedDataOpsPipelineStep.queryInputs || config.queryInputs || [])
+                  : (config?.queryInputs || [])
+              )
               const taskMasters = Array.isArray(selectedDataOpsPipelineStep.taskMasters) ? selectedDataOpsPipelineStep.taskMasters : []
               const legacyTaskMasterId = 'default_task_master'
               const hasLegacyMapperConfigs = taskMasters.length <= 0 && mapperConfigRows.length > 0
@@ -36902,6 +37970,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 cron: '0 0 * * *',
                 timezone: 'Asia/Kolkata',
                 retryPolicy: 'mismatch',
+                deployEnabled: false,
+                scheduleEnabled: false,
+                scheduleType: 'cron',
+                scheduleIntervalMinutes: 15,
+                scheduleCron: '0 0 * * *',
+                scheduleTimezone: 'Asia/Kolkata',
+                scheduleMaxParallelRuns: 1,
+                scheduleMisfirePolicy: 'skip',
+                scheduleStatus: '',
+                scheduleBackendJobId: '',
+                scheduleNextRunAt: '',
+                scheduleLastRegisteredAt: '',
                 status: 'active',
                 runOrder: 1,
                 updatedAt: '',
@@ -36914,6 +37994,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               const subTaskCountForTask = (taskId: string) => taskId === legacyTaskMasterId
                 ? mapperConfigRows.filter((item) => !item.taskMasterId || item.taskMasterId === legacyTaskMasterId).length
                 : mapperConfigRows.filter((item) => item.taskMasterId === taskId).length
+              const enabledSubTaskCountForTask = (taskId: string) => taskId === legacyTaskMasterId
+                ? mapperConfigRows.filter((item) => item.enabled !== false && (!item.taskMasterId || item.taskMasterId === legacyTaskMasterId)).length
+                : mapperConfigRows.filter((item) => item.enabled !== false && item.taskMasterId === taskId).length
               const patchTaskMaster = (taskId: string, patch: Partial<DataOpsTaskMaster>) => patchMapper({
                 taskMasters: taskId === legacyTaskMasterId && hasLegacyMapperConfigs
                   ? [{ ...legacyTaskMaster, ...patch, updatedAt: new Date().toISOString() }]
@@ -36960,6 +38043,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   cron: '0 0 * * *',
                   timezone: 'Asia/Kolkata',
                   retryPolicy: 'mismatch',
+                  deployEnabled: false,
+                  scheduleEnabled: false,
+                  scheduleType: 'cron',
+                  scheduleIntervalMinutes: 15,
+                  scheduleCron: '0 0 * * *',
+                  scheduleTimezone: 'Asia/Kolkata',
+                  scheduleMaxParallelRuns: 1,
+                  scheduleMisfirePolicy: 'skip',
+                  scheduleStatus: '',
+                  scheduleBackendJobId: '',
+                  scheduleNextRunAt: '',
+                  scheduleLastRegisteredAt: '',
                   status: 'planned',
                   runOrder: taskMasters.length + 1,
                   updatedAt: new Date().toISOString(),
@@ -37048,6 +38143,330 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 if (dataOpsMonitorSubTaskFilter && taskLogSubTaskName(row) !== dataOpsMonitorSubTaskFilter) return false
                 return true
               })
+              const taskLogNumber = (row: Record<string, unknown>, keys: string[]) => keys.reduce((value, key) => value || Number(row[key] || 0), 0)
+              const taskLogGroupedRows = Array.from(filteredTaskLogRows.reduce((acc, row) => {
+                const task = taskLogTaskName(row)
+                const subTask = taskLogSubTaskName(row)
+                const window = taskLogWindowValue(row)
+                const key = `${task}::${subTask}::${window}`
+                const current = acc.get(key) || {
+                  key,
+                  task,
+                  subTask,
+                  window,
+                  rows: [] as Record<string, unknown>[],
+                  runs: 0,
+                  sourceRows: 0,
+                  destinationRows: 0,
+                  rejectedRows: 0,
+                  mismatchRows: 0,
+                  durationMs: 0,
+                  startedAt: '',
+                  finishedAt: '',
+                  status: 'idle',
+                }
+                current.rows.push(row)
+                current.runs += 1
+                current.sourceRows += taskLogNumber(row, ['source_rows', 'rows_source'])
+                current.destinationRows += taskLogNumber(row, ['destination_rows', 'rows_processed'])
+                current.rejectedRows += taskLogNumber(row, ['rejected_rows'])
+                current.mismatchRows += taskLogNumber(row, ['mismatch_rows'])
+                current.durationMs += Number(row.duration_ms || 0)
+                const startedAt = String(row.last_run_started_at || row.at || '')
+                const finishedAt = String(row.last_run_finished_at || '')
+                if (!current.startedAt || Date.parse(startedAt) > Date.parse(current.startedAt)) current.startedAt = startedAt
+                if (!current.finishedAt || Date.parse(finishedAt) > Date.parse(current.finishedAt)) current.finishedAt = finishedAt
+                const status = String(row.status || '').toLowerCase()
+                if (['failed', 'error', 'failure'].includes(status)) current.status = status
+                else if (status === 'running' && !['failed', 'error', 'failure'].includes(current.status)) current.status = status
+                else if (status === 'success' && !['failed', 'error', 'failure', 'running'].includes(current.status)) current.status = status
+                acc.set(key, current)
+                return acc
+              }, new Map<string, {
+                key: string
+                task: string
+                subTask: string
+                window: string
+                rows: Record<string, unknown>[]
+                runs: number
+                sourceRows: number
+                destinationRows: number
+                rejectedRows: number
+                mismatchRows: number
+                durationMs: number
+                startedAt: string
+                finishedAt: string
+                status: string
+              }>()).values()).sort((a, b) => Date.parse(b.startedAt || '') - Date.parse(a.startedAt || ''))
+              const taskLogStatusRank = (value: unknown) => {
+                const status = String(value || '').toLowerCase()
+                if (['failed', 'error', 'failure'].includes(status)) return 5
+                if (status === 'running') return 4
+                if (status === 'success') return 3
+                if (status === 'skipped') return 2
+                if (['scheduled', 'registered'].includes(status)) return 1
+                return 0
+              }
+              const taskLogSummaryStatus = (current: string, incoming: unknown) => taskLogStatusRank(incoming) > taskLogStatusRank(current) ? String(incoming || 'idle').toLowerCase() : current
+              const taskLogRawRows = filteredTaskLogRows.map((row, index) => ({
+                ...row,
+                key: String(row.job_id || `${row.config_id || 'log'}:${row.last_run_started_at || row.at || index}`),
+                task: taskLogTaskName(row),
+                subTask: taskLogSubTaskName(row),
+                window: taskLogWindowValue(row),
+                startedAt: String(row.last_run_started_at || row.at || ''),
+                finishedAt: String(row.last_run_finished_at || ''),
+                durationMs: Number(row.duration_ms || 0),
+                sourceRows: taskLogNumber(row, ['source_rows', 'rows_source']),
+                destinationRows: taskLogNumber(row, ['destination_rows', 'rows_processed']),
+                rejectedRows: taskLogNumber(row, ['rejected_rows']),
+                mismatchRows: taskLogNumber(row, ['mismatch_rows']),
+	                status: String(row.status || 'idle').toLowerCase(),
+	                message: String(row.message || ''),
+	                configId: String(row.config_id || ''),
+	              }))
+              const buildTaskLogAggregateRows = (mode: 'task' | 'subtask' | 'window', sourceRows: any[] = taskLogRawRows) => Array.from(sourceRows.reduce((acc, row: any) => {
+                const key = mode === 'task' ? row.task : mode === 'subtask' ? `${row.task}::${row.subTask}` : `${row.task}::${row.subTask}::${row.window}`
+	                const current = acc.get(key) || {
+	                  key,
+	                  task: row.task,
+	                  subTask: mode === 'task' ? '' : row.subTask,
+	                  window: mode === 'window' ? row.window : '',
+	                  rows: [] as any[],
+	                  subTasks: new Set<string>(),
+	                  windows: new Set<string>(),
+                  runs: 0,
+                  sourceRows: 0,
+                  destinationRows: 0,
+                  rejectedRows: 0,
+                  mismatchRows: 0,
+                  durationMs: 0,
+                  startedAt: '',
+                  finishedAt: '',
+                  status: 'idle',
+	                }
+	                current.rows.push(row)
+	                current.subTasks.add(row.subTask)
+                current.windows.add(row.window)
+                current.runs += 1
+                current.sourceRows += Number(row.sourceRows || 0)
+                current.destinationRows += Number(row.destinationRows || 0)
+                current.rejectedRows += Number(row.rejectedRows || 0)
+                current.mismatchRows += Number(row.mismatchRows || 0)
+                current.durationMs += Number(row.durationMs || 0)
+                if (!current.startedAt || Date.parse(row.startedAt || '') > Date.parse(current.startedAt || '')) current.startedAt = row.startedAt
+                if (!current.finishedAt || Date.parse(row.finishedAt || '') > Date.parse(current.finishedAt || '')) current.finishedAt = row.finishedAt
+                current.status = taskLogSummaryStatus(current.status, row.status)
+                acc.set(key, current)
+                return acc
+              }, new Map<string, any>()).values()).map((row: any) => ({
+	                ...row,
+	                rows: row.rows || [],
+	                subTaskCount: row.subTasks.size,
+                windowCount: row.windows.size,
+              })).sort((a, b) => Date.parse(b.startedAt || '') - Date.parse(a.startedAt || ''))
+              const taskLogTaskSummaryRows = buildTaskLogAggregateRows('task')
+              const taskLogSubTaskSummaryRows = buildTaskLogAggregateRows('subtask')
+              const taskLogWindowSummaryRows = buildTaskLogAggregateRows('window')
+              const taskLogStatusOptions = Array.from(new Set(taskLogRawRows.map((row: any) => String(row.status || 'idle')))).filter(Boolean).map((value) => ({ value, text: value }))
+              const taskLogColumnFilters = {
+                task: taskLogTaskOptions.map((item) => ({ text: item.label, value: item.value })),
+                subTask: taskLogSubTaskOptions.map((item) => ({ text: item.label, value: item.value })),
+                window: taskLogWindowOptions.map((item) => ({ text: item.label, value: item.value })),
+                status: taskLogStatusOptions,
+              }
+              const taskLogStringFilter = (key: string) => (value: boolean | string | number, row: any) => String(row[key] || '') === String(value)
+	              const taskLogTextColumn = (title: string, key: 'task' | 'subTask' | 'window', width: number, fixed?: 'left') => ({
+                title,
+                dataIndex: key,
+                key,
+                width,
+                fixed,
+                filters: taskLogColumnFilters[key],
+                onFilter: taskLogStringFilter(key),
+                sorter: (a: any, b: any) => String(a[key] || '').localeCompare(String(b[key] || '')),
+	                render: (value: unknown) => <Text ellipsis style={{ maxWidth: width - 18, color: key === 'window' ? 'var(--app-text-subtle)' : 'var(--app-text)', fontWeight: key === 'task' ? 700 : 500 }}>{String(value || '-')}</Text>,
+	              })
+	              const taskLogRowTime = (row: any) => Date.parse(String(row?.finishedAt || row?.last_run_finished_at || row?.startedAt || row?.last_run_started_at || row?.at || ''))
+	              const taskLogHasDiagnostics = (row: any) => Boolean(row?.parsed_sql || row?.sql || row?.error_detail || row?.missing_binds || row?.bind_names || row?.execution_binds || row?.provided_binds)
+	              const taskLogLatestRow = (row: any) => {
+	                const rows = Array.isArray(row?.rows) && row.rows.length > 0 ? row.rows : [row]
+	                const sorted = [...rows].sort((a: any, b: any) => taskLogRowTime(b) - taskLogRowTime(a))
+	                return sorted[0] || row
+	              }
+	              const taskLogRetryColumn = { title: 'Retry', key: 'retry', width: 88, fixed: 'left', render: (_value: unknown, row: any) => {
+	                const latest = taskLogLatestRow(row)
+	                const configId = String(latest?.configId || latest?.config_id || '')
+	                return <Button size="small" disabled={!configId} onClick={(event) => { event.stopPropagation(); retryMapperConfig(configId, latest) }}>Retry</Button>
+	              } }
+	              const taskLogDetailValue = (value: unknown) => {
+	                if (value === null || value === undefined || value === '') return ''
+	                if (Array.isArray(value) || typeof value === 'object') {
+	                  try {
+	                    return JSON.stringify(value, null, 2)
+	                  } catch {
+	                    return String(value)
+	                  }
+	                }
+	                return String(value)
+	              }
+	              const taskLogDetailBlock = (label: string, value: unknown) => {
+	                const text = taskLogDetailValue(value)
+	                if (!text) return null
+	                return (
+	                  <div style={{ display: 'grid', gap: 4, minWidth: 0 }}>
+	                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, fontWeight: 700 }}>{label}</Text>
+	                    <pre className="data-ops-monitor-log-detail">{text}</pre>
+	                  </div>
+	                )
+	              }
+	              const taskLogBindNamesFromSql = (sql: string) => {
+	                const names: string[] = []
+	                const seen = new Set<string>()
+	                String(sql || '').replace(/:([A-Za-z_][A-Za-z0-9_$#]*)/g, (_match, name: string) => {
+	                  const key = String(name || '').trim()
+	                  if (key && !seen.has(key)) {
+	                    seen.add(key)
+	                    names.push(key)
+	                  }
+	                  return ''
+	                })
+	                return names
+	              }
+	              const taskLogBindValueMap = (latest: any) => ({
+	                ...(latest?.task_bind_params && typeof latest.task_bind_params === 'object' ? latest.task_bind_params : {}),
+	                ...(latest?.provided_binds && typeof latest.provided_binds === 'object' ? latest.provided_binds : {}),
+	                ...(latest?.execution_binds && typeof latest.execution_binds === 'object' ? latest.execution_binds : {}),
+	              } as Record<string, unknown>)
+	              const taskLogResolveBindValue = (name: string, bindValues: Record<string, unknown>) => {
+	                const raw = String(name || '').replace(/^:/, '').trim()
+	                const directKey = Object.keys(bindValues).find((key) => key === raw || key.toLowerCase() === raw.toLowerCase())
+	                if (directKey) return { found: true, value: bindValues[directKey] }
+	                const lowered = raw.toLowerCase()
+	                const aliases = lowered === 'txn_date' || lowered === 'txndate' || (lowered.endsWith('_date') && lowered.includes('txn'))
+	                  ? ['txn_day', 'task_business_date', 'task_business_start_date']
+	                  : lowered.endsWith('_month') ? ['txn_month', 'task_business_month'] : []
+	                for (const alias of aliases) {
+	                  const aliasKey = Object.keys(bindValues).find((key) => key.toLowerCase() === alias)
+	                  if (aliasKey) return { found: true, value: bindValues[aliasKey] }
+	                }
+	                return { found: false, value: '' }
+	              }
+	              const taskLogSqlLiteral = (value: unknown) => {
+	                if (value === null || value === undefined || value === '') return 'NULL'
+	                if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+	                const raw = String(value)
+	                if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return `DATE '${raw}'`
+	                if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/.test(raw)) return `TIMESTAMP '${raw.replace('T', ' ').replace(/Z$/, '')}'`
+	                return `'${raw.replace(/'/g, "''")}'`
+	              }
+	              const taskLogSqlWithBindPreview = (sql: string, bindValues: Record<string, unknown>, bindNames: string[]) => {
+	                const bindSet = new Set(bindNames)
+	                return String(sql || '').replace(/:([A-Za-z_][A-Za-z0-9_$#]*)/g, (match, name: string) => {
+	                  const key = String(name || '').trim()
+	                  if (!bindSet.has(key)) bindSet.add(key)
+	                  const resolved = taskLogResolveBindValue(key, bindValues)
+	                  return resolved.found
+	                    ? taskLogSqlLiteral(resolved.value)
+	                    : `/* MISSING ${match} */ ${match}`
+	                })
+	              }
+	              const taskLogExpandedRowRender = (row: any) => {
+	                const latest = taskLogLatestRow(row)
+	                const missingBinds = Array.isArray(latest?.missing_binds) ? latest.missing_binds : []
+	                const configId = String(latest?.configId || latest?.config_id || row?.configId || row?.config_id || '')
+	                const config = mapperConfigRows.find((item) => item.id === configId)
+	                const fallbackSql = config ? buildDataOpsMapperSyncSql({
+	                  ...selectedDataOpsPipelineStep,
+	                  activeMapperConfigId: config.id,
+	                  activeTaskMasterId: config.taskMasterId || selectedDataOpsPipelineStep.activeTaskMasterId,
+	                  targetMode: config.targetMode || selectedDataOpsPipelineStep.targetMode,
+	                  writeMode: config.writeMode || selectedDataOpsPipelineStep.writeMode,
+	                  lookupSource: config.lookupSource || selectedDataOpsPipelineStep.lookupSource,
+	                  queryInputs: effectiveMapperQueryInputs(config),
+	                  target: config.target || selectedDataOpsPipelineStep.target,
+	                  keyFields: config.keyFields || selectedDataOpsPipelineStep.keyFields,
+	                  mappingRows: config.mappingRows || selectedDataOpsPipelineStep.mappingRows,
+	                }).sql : ''
+	                const completeSql = String(latest?.parsed_sql || latest?.sql || fallbackSql || '')
+	                const bindValues = taskLogBindValueMap(latest)
+	                const bindNames = Array.isArray(latest?.bind_names) && latest.bind_names.length > 0 ? latest.bind_names.map((item: unknown) => String(item)) : taskLogBindNamesFromSql(completeSql)
+	                const bindMappingRows = bindNames.map((name: string) => ({
+	                  key: name,
+	                  placeholder: `:${name}`,
+	                  value: taskLogResolveBindValue(name, bindValues).value,
+	                  status: taskLogResolveBindValue(name, bindValues).found ? 'resolved' : 'missing',
+	                }))
+	                const sqlWithBindPreview = taskLogSqlWithBindPreview(completeSql, bindValues, bindNames)
+	                return (
+	                  <div className="data-ops-monitor-log-expanded">
+	                    <Space size={6} wrap>
+	                      <Tag color={['failed', 'error', 'failure'].includes(String(latest?.status || row.status || '').toLowerCase()) ? 'red' : 'blue'} style={{ marginInlineEnd: 0 }}>{String(latest?.status || row.status || 'idle')}</Tag>
+	                      {missingBinds.length > 0 ? <Tag color="volcano" style={{ marginInlineEnd: 0 }}>missing: {missingBinds.map((item: unknown) => `:${String(item)}`).join(', ')}</Tag> : null}
+	                      {Array.isArray(latest?.bind_names) ? <Tag color="cyan" style={{ marginInlineEnd: 0 }}>binds: {latest.bind_names.length}</Tag> : null}
+	                    </Space>
+	                    {taskLogDetailBlock('Error', latest?.error_detail || latest?.message)}
+	                    {taskLogDetailBlock('SQL With Bind Values Preview', sqlWithBindPreview)}
+	                    {bindMappingRows.length > 0 ? (
+	                      <Table
+	                        size="small"
+	                        rowKey="key"
+	                        pagination={false}
+	                        dataSource={bindMappingRows}
+	                        columns={[
+	                          { title: 'Placeholder', dataIndex: 'placeholder', key: 'placeholder', width: 180, render: (value: unknown) => <Text code>{String(value || '')}</Text> },
+	                          { title: 'Resolved Value', dataIndex: 'value', key: 'value', render: (_value: unknown, bindRow: any) => bindRow.status === 'missing' ? <Tag color="volcano">missing</Tag> : <Text code>{taskLogDetailValue(bindRow.value)}</Text> },
+	                          { title: 'Status', dataIndex: 'status', key: 'status', width: 120, render: (value: unknown) => <Tag color={String(value) === 'missing' ? 'red' : 'green'}>{String(value)}</Tag> },
+	                        ] as any[]}
+	                      />
+	                    ) : null}
+	                    <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 10 }}>
+	                      {taskLogDetailBlock('Bind Placeholders', latest?.bind_names)}
+	                      {taskLogDetailBlock('Execution Binds', latest?.execution_binds)}
+	                    </div>
+	                    {taskLogDetailBlock('Provided Bind Params', latest?.provided_binds || latest?.task_bind_params)}
+	                  </div>
+	                )
+	              }
+	              const taskLogExpandable = {
+	                expandedRowRender: taskLogExpandedRowRender,
+	                rowExpandable: (row: any) => {
+	                  const latest = taskLogLatestRow(row)
+	                  return Boolean(latest?.sql || latest?.parsed_sql || latest?.error_detail || latest?.message || latest?.task_bind_params)
+	                },
+	              }
+	              const taskLogMetricColumns = [
+	                { title: 'Runs', dataIndex: 'runs', key: 'runs', width: 78, align: 'right', sorter: (a: any, b: any) => Number(a.runs || 0) - Number(b.runs || 0), render: (value: unknown) => Number(value || 0).toLocaleString() },
+	                { title: 'Status', dataIndex: 'status', key: 'status', width: 96, filters: taskLogColumnFilters.status, onFilter: taskLogStringFilter('status'), sorter: (a: any, b: any) => taskLogStatusRank(a.status) - taskLogStatusRank(b.status), render: (value: unknown) => <Tag color={dataOpsStatusColor(value)} style={{ marginInlineEnd: 0 }}>{String(value || 'idle')}</Tag> },
+	                { title: 'Message', key: 'message', width: 320, render: (_value: unknown, row: any) => <Text ellipsis style={{ maxWidth: 300, color: ['failed', 'error', 'failure'].includes(String(row.status || '').toLowerCase()) ? 'var(--app-danger)' : 'var(--app-text-subtle)', fontSize: 11 }}>{String(taskLogLatestRow(row)?.message || '-')}</Text> },
+	                { title: 'Latest Started', dataIndex: 'startedAt', key: 'startedAt', width: 152, sorter: (a: any, b: any) => Date.parse(String(a.startedAt || '')) - Date.parse(String(b.startedAt || '')), render: (value: unknown) => <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{dataOpsTimestampText(value || '') || '-'}</Text> },
+                { title: 'Latest Finished', dataIndex: 'finishedAt', key: 'finishedAt', width: 152, sorter: (a: any, b: any) => Date.parse(String(a.finishedAt || '')) - Date.parse(String(b.finishedAt || '')), render: (value: unknown) => <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{dataOpsTimestampText(value || '') || '-'}</Text> },
+                { title: 'Total Duration', dataIndex: 'durationMs', key: 'durationMs', width: 118, align: 'right', sorter: (a: any, b: any) => Number(a.durationMs || 0) - Number(b.durationMs || 0), render: (value: unknown) => Number(value || 0) > 0 ? `${Number(value || 0).toLocaleString()} ms` : '-' },
+                { title: 'Avg Duration', key: 'avgDurationMs', width: 112, align: 'right', sorter: (a: any, b: any) => (Number(a.durationMs || 0) / Math.max(1, Number(a.runs || 1))) - (Number(b.durationMs || 0) / Math.max(1, Number(b.runs || 1))), render: (_value: unknown, row: any) => Number(row.durationMs || 0) > 0 ? `${Math.round(Number(row.durationMs || 0) / Math.max(1, Number(row.runs || 1))).toLocaleString()} ms` : '-' },
+                { title: 'Source Count', dataIndex: 'sourceRows', key: 'sourceRows', width: 122, align: 'right', sorter: (a: any, b: any) => Number(a.sourceRows || 0) - Number(b.sourceRows || 0), render: (value: unknown) => Number(value || 0).toLocaleString() },
+                { title: 'Destination Sync', dataIndex: 'destinationRows', key: 'destinationRows', width: 142, align: 'right', sorter: (a: any, b: any) => Number(a.destinationRows || 0) - Number(b.destinationRows || 0), render: (value: unknown) => Number(value || 0).toLocaleString() },
+	                { title: 'Rejected', dataIndex: 'rejectedRows', key: 'rejectedRows', width: 92, align: 'right', sorter: (a: any, b: any) => Number(a.rejectedRows || 0) - Number(b.rejectedRows || 0), render: (value: unknown) => Number(value || 0).toLocaleString() },
+	                { title: 'Mismatch', dataIndex: 'mismatchRows', key: 'mismatchRows', width: 98, align: 'right', sorter: (a: any, b: any) => Number(a.mismatchRows || 0) - Number(b.mismatchRows || 0), render: (value: unknown) => <Text style={{ color: Number(value || 0) ? '#f59e0b' : 'var(--app-text-subtle)', fontWeight: 700 }}>{Number(value || 0).toLocaleString()}</Text> },
+	              ]
+              const taskLogTablePagination = (label: string) => ({ pageSize: 10, showSizeChanger: true, pageSizeOptions: [10, 25, 50, 100], showTotal: (total: number, range: [number, number]) => `${range[0]}-${range[1]} of ${total} ${label}` })
+              const openDataOpsMonitorDrillTab = (tab: { key: string; level: 'subtask' | 'window'; task: string; subTask?: string; label: string }) => {
+                setDataOpsMonitorDrillTabs((current) => current.some((item) => item.key === tab.key) ? current : [...current, tab])
+                setDataOpsMonitorActiveDrillTab(tab.key)
+              }
+              const closeDataOpsMonitorDrillTab = (targetKey: string) => {
+                setDataOpsMonitorDrillTabs((current) => {
+                  const next = current.filter((item) => item.key !== targetKey)
+                  if (dataOpsMonitorActiveDrillTab === targetKey) setDataOpsMonitorActiveDrillTab(next[next.length - 1]?.key || 'task_summary')
+                  return next
+                })
+              }
+              const closeAllDataOpsMonitorDrillTabs = () => {
+                setDataOpsMonitorDrillTabs([])
+                setDataOpsMonitorActiveDrillTab('task_summary')
+              }
+              const taskLogDrillRows = (tab: { level: 'subtask' | 'window'; task: string; subTask?: string }) => taskLogRawRows.filter((row: any) => (
+                row.task === tab.task && (tab.level === 'subtask' || row.subTask === tab.subTask)
+              ))
               const taskRuntimeRowsForTask = (taskId: string) => {
                 const taskIds = taskId === legacyTaskMasterId ? new Set([legacyTaskMasterId, '']) : new Set([taskId])
                 return [
@@ -37055,18 +38474,51 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   ...dataOpsRuntimeSummary.schedules,
                 ].filter((row) => {
                   const rowTaskId = String(row.task_master_id || '')
-                  const isMapper = String(row.kind || '') === 'mapper' || String(row.job_id || '').startsWith('data_ops_oracle_sync:')
+                  const kind = String(row.kind || '')
+                  const isMapper = kind === 'mapper' || kind === 'task_master' || String(row.job_id || '').startsWith('data_ops_oracle_sync:')
                   const isCurrentStep = !String(row.step_id || '') || String(row.step_id || '') === selectedDataOpsPipelineStep.id
                   return isMapper && isCurrentStep && taskIds.has(rowTaskId)
+                })
+              }
+              const taskScheduleRowsForTask = (taskId: string) => {
+                const taskIds = taskId === legacyTaskMasterId ? new Set([legacyTaskMasterId, '']) : new Set([taskId])
+                return dataOpsRuntimeSummary.schedules.filter((row) => {
+                  const rowTaskId = String(row.task_master_id || '')
+                  const kind = String(row.kind || '')
+                  const isCurrentStep = !String(row.step_id || '') || String(row.step_id || '') === selectedDataOpsPipelineStep.id
+                  return kind === 'task_master' && isCurrentStep && taskIds.has(rowTaskId)
                 })
               }
               const taskLastRuntimeRow = (taskId: string) => taskRuntimeRowsForTask(taskId)
                 .filter((row) => row.last_run_started_at || row.at || row.last_activity_at)
                 .sort((a, b) => Date.parse(String(b.last_run_started_at || b.at || b.last_activity_at || '')) - Date.parse(String(a.last_run_started_at || a.at || a.last_activity_at || '')))[0]
-              const taskNextRunAt = (taskId: string) => taskRuntimeRowsForTask(taskId)
+              const taskRuntimeProgressText = (row?: Record<string, unknown>) => {
+                if (!row) return ''
+                const status = String(row.status || row.last_status || '').toLowerCase()
+                const rows = Number(row.rows_processed || row.destination_rows || row.source_rows || 0)
+                const checkpoint = row.checkpoint && typeof row.checkpoint === 'object' ? row.checkpoint as Record<string, unknown> : {}
+                const batches = Number(row.batches || 0)
+                const cursor = String(checkpoint.last_source_id || '')
+                const parts = [
+                  status === 'running' ? 'running' : '',
+                  rows > 0 ? `${rows.toLocaleString()} rows` : '',
+                  batches > 0 ? `${batches.toLocaleString()} batch(es)` : '',
+                  cursor ? `cursor ${cursor}` : '',
+                ].filter(Boolean)
+                return parts.join(' · ')
+              }
+              const taskNextRunAt = (taskId: string) => taskScheduleRowsForTask(taskId)
                 .map((row) => String(row.next_run_at || ''))
                 .filter(Boolean)
                 .sort((a, b) => Date.parse(a) - Date.parse(b))[0] || ''
+              const effectiveTaskNextRunAt = (task: DataOpsTaskMaster) => taskNextRunAt(task.id) || String(task.scheduleNextRunAt || '')
+              const taskNextRunDisplay = (value: unknown) => {
+                const raw = String(value || '').trim()
+                if (!raw) return ''
+                const timestamp = dataOpsTimestampText(raw)
+                const countdown = dataOpsCountdownText(raw, dataOpsRuntimeTick)
+                return countdown ? `${timestamp} (${countdown})` : timestamp
+              }
               const taskRuntimeStats = (taskId: string) => {
                 const latestRowsBySubTask = new Map<string, Record<string, unknown>>()
                 taskRuntimeRowsForTask(taskId)
@@ -37092,12 +38544,23 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 if (statuses.some((status) => ['success', 'complete', 'completed'].includes(status))) return 'success'
                 return rows.length > 0 ? 'registered' : 'planned'
               }
-              const retryMapperConfig = (configId: string) => {
+              const activeDataOpsRunValue = (key: string) => String((dataOpsActiveRunScope as Record<string, unknown> | null)?.[key] || '')
+              const isTaskMasterRunActive = (taskId: string) => (
+                dataOpsSqlExecuting
+                && activeDataOpsRunValue('task_master_id') === String(taskId || '')
+                && !activeDataOpsRunValue('mapper_config_id')
+              )
+              const isMapperConfigRunActive = (configId: string) => (
+                dataOpsSqlExecuting
+                && activeDataOpsRunValue('mapper_config_id') === String(configId || '')
+              )
+              const retryMapperConfig = (configId: string, logRow?: any) => {
                 const config = mapperConfigRows.find((item) => item.id === configId)
                 if (!config) {
                   notification.warning({ message: 'Retry unavailable', description: 'Mapper configuration was not found for this log row.', placement: 'bottomRight' })
                   return
                 }
+                const taskBindParams = logRow?.task_bind_params && typeof logRow.task_bind_params === 'object' ? logRow.task_bind_params as Record<string, unknown> : undefined
                 void runDataOpsMapperSync({
                   ...selectedDataOpsPipelineStep,
                   activeMapperConfigId: config.id,
@@ -37105,11 +38568,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   targetMode: config.targetMode || selectedDataOpsPipelineStep.targetMode,
                   writeMode: config.writeMode || selectedDataOpsPipelineStep.writeMode,
                   lookupSource: config.lookupSource || selectedDataOpsPipelineStep.lookupSource,
-                  queryInputs: config.queryInputs || selectedDataOpsPipelineStep.queryInputs,
+                  queryInputs: effectiveMapperQueryInputs(config),
                   target: config.target || selectedDataOpsPipelineStep.target,
                   keyFields: config.keyFields || selectedDataOpsPipelineStep.keyFields,
                   mappingRows: config.mappingRows || selectedDataOpsPipelineStep.mappingRows,
-                }, { forceRetry: true })
+                }, { forceRetry: true, taskBindParams })
               }
               const refreshDataOpsMonitorOnce = async () => {
                 try {
@@ -37126,6 +38589,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 setDataOpsMonitorWindowFilter('')
                 setDataOpsMonitorTaskFilter('')
                 setDataOpsMonitorSubTaskFilter('')
+                closeAllDataOpsMonitorDrillTabs()
                 try {
                   await api.clearDataOpsRuntimeActivity()
                   notification.success({ message: 'Monitor logs cleared', placement: 'bottomRight', duration: 2 })
@@ -37134,8 +38598,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 }
               }
               const runTaskMasterManually = async (task: DataOpsTaskMaster) => {
+                if (task.enabled === false) {
+                  notification.warning({ message: 'Task disabled', description: 'Enable this Task Master before running it.', placement: 'bottomRight' })
+                  return
+                }
                 const subTasks = [...mapperConfigRows]
                   .filter((item) => task.id === legacyTaskMasterId ? (!item.taskMasterId || item.taskMasterId === legacyTaskMasterId) : item.taskMasterId === task.id)
+                  .filter((item) => item.enabled !== false)
                   .sort((left, right) => Number(left.runOrder || 9999) - Number(right.runOrder || 9999))
                 const incompleteSubTasks = subTasks.filter((item) => (
                   !String(item.lookupSource || '').trim()
@@ -37144,7 +38613,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   || item.mappingRows.filter((row) => row.enabled !== false && String(row.target || '').trim() && (String(row.source || '').trim() || String(row.defaultValue || '').trim())).length <= 0
                 ))
                 if (subTasks.length <= 0) {
-                  notification.warning({ message: 'No sub tasks', description: 'Add sub tasks before running this Task Master.', placement: 'bottomRight' })
+                  notification.warning({ message: 'No enabled sub tasks', description: 'Enable at least one sub task before running this Task Master.', placement: 'bottomRight' })
                   return
                 }
                 if (incompleteSubTasks.length > 0) {
@@ -37160,28 +38629,49 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   notification.info({ message: 'No completed window to run', description: 'The current day/month is still ongoing or the loop dates are outside the completed range.', placement: 'bottomRight' })
                   return
                 }
+                setDataOpsActiveRunScope({
+                  pipeline_id: activePipelineId,
+                  data_ops_node_id: selectedNodeId || '',
+                  mapper_step_id: selectedDataOpsPipelineStep.id,
+                  task_master_id: task.id,
+                })
                 setDataOpsSqlExecuting(true)
                 let completed = 0
                 let affected = 0
                 try {
                   for (const windowTask of backlogWindows) {
-                    const taskBindParamsForRun = dataOpsTaskMasterBindParams(windowTask)
-                    for (const config of subTasks) {
-                      const stepForConfig: DataOpsPipelineStep = {
+	                    const baseTaskBindParamsForRun = dataOpsTaskMasterBindParams(windowTask)
+	                    for (const config of subTasks) {
+	                      const stepForConfig: DataOpsPipelineStep = {
                         ...selectedDataOpsPipelineStep,
                         activeMapperConfigId: config.id,
                         activeTaskMasterId: task.id,
                         targetMode: config.targetMode || 'oracle',
                         writeMode: config.writeMode || 'upsert',
                         lookupSource: config.lookupSource || '',
-                        queryInputs: config.queryInputs || [],
+                        queryInputs: effectiveMapperQueryInputs(config),
                         target: config.target || '',
                         keyFields: config.keyFields || '',
-                        mappingRows: config.mappingRows || [],
-                      }
-                      const { sql, issue } = buildDataOpsMapperSyncSql(stepForConfig)
-                      if (issue) throw new Error(`${config.name || 'Sub task'}: ${issue}`)
-                      const response = await api.executeDataOpsOracleSql({
+	                        mappingRows: config.mappingRows || [],
+                        syncProcessingMode: config.syncProcessingMode || 'batch',
+                        syncBatchSize: config.syncBatchSize || 1000,
+                        syncCommitEvery: config.syncCommitEvery || 5000,
+                        syncMaxBatches: config.syncMaxBatches ?? 100,
+                        syncLoopGapSeconds: config.syncLoopGapSeconds ?? 5,
+                        syncParallelEnabled: Boolean(config.syncParallelEnabled),
+                        syncParallelWorkers: config.syncParallelWorkers || 4,
+                        syncIncrementalField: config.syncIncrementalField || '',
+                        syncCursorField: config.syncCursorField || '',
+                        checkpoint: config.checkpointEnabled !== false,
+                        checkpointEnabled: config.checkpointEnabled !== false,
+                        checkpointIdField: config.checkpointIdField || config.syncCursorField || '',
+                        checkpointTimeField: config.checkpointTimeField || config.syncIncrementalField || '',
+	                      }
+	                      const { sql, issue, sourceSql } = buildDataOpsMapperSyncSql(stepForConfig)
+	                      if (issue) throw new Error(`${config.name || 'Sub task'}: ${issue}`)
+	                      const queryInputsForRun = effectiveMapperQueryInputs(config)
+	                      const taskBindParamsForRun = dataOpsApplyQueryInputBinds(baseTaskBindParamsForRun, queryInputsForRun, dataOpsBindParametersFromRouteSource(dataOpsPipelineSteps, config.lookupSource || ''))
+	                      const response = await api.executeDataOpsOracleSql({
                         ...nodeConfig,
                         _data_ops_manual_activity: true,
                         _data_ops_manual_window: true,
@@ -37194,10 +38684,20 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         _data_ops_task_master_id: task.id,
                         _data_ops_task_master_name: task.name || '',
                         _data_ops_task_window_mode: windowTask.windowMode || task.windowMode || '',
-                        _data_ops_task_window_indicator: windowTask.windowIndicator || '',
-                        _data_ops_task_duplicate_policy: task.duplicatePolicy || 'skip_completed',
-                        _data_ops_task_bind_params: taskBindParamsForRun,
-                      }, sql, true)
+	                        _data_ops_task_window_indicator: windowTask.windowIndicator || '',
+	                        _data_ops_task_duplicate_policy: task.duplicatePolicy || 'skip_completed',
+	                        _data_ops_task_bind_params: taskBindParamsForRun,
+	                        _data_ops_query_inputs: queryInputsForRun,
+                        _data_ops_sync_processing_mode: config.syncProcessingMode || 'batch',
+                        _data_ops_sync_batch_size: config.syncBatchSize || 1000,
+                        _data_ops_sync_commit_every: config.syncCommitEvery || 5000,
+                        _data_ops_sync_max_batches: config.syncMaxBatches ?? 100,
+                        _data_ops_sync_loop_gap_seconds: config.syncLoopGapSeconds ?? 5,
+                        _data_ops_checkpoint_enabled: config.checkpointEnabled !== false,
+                        _data_ops_checkpoint_id_field: config.checkpointIdField || config.syncCursorField || '',
+                        _data_ops_checkpoint_time_field: config.checkpointTimeField || config.syncIncrementalField || '',
+                        _data_ops_checkpoint_source_sql: sourceSql || '',
+	                      }, sql, true)
                       completed += 1
                       affected += Number(response?.rowcount ?? response?.rows_affected ?? 0)
                     }
@@ -37215,6 +38715,178 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     placement: 'bottomRight',
                   })
                   void refreshDataOpsMonitorOnce()
+                } finally {
+                  setDataOpsSqlExecuting(false)
+                  setDataOpsActiveRunScope(null)
+                }
+              }
+              const deployTaskMasterScheduler = async (task: DataOpsTaskMaster, schedulePatch: Partial<DataOpsTaskMaster> = {}) => {
+                if (!activePipelineId || !selectedNodeId) {
+                  notification.warning({ message: 'Scheduler not ready', description: 'Save the pipeline before registering a Task Master schedule.', placement: 'bottomRight' })
+                  return
+                }
+                const nextTask = { ...task, ...schedulePatch } as DataOpsTaskMaster
+                if (nextTask.enabled === false && Boolean(schedulePatch.scheduleEnabled || nextTask.scheduleEnabled || schedulePatch.deployEnabled || nextTask.deployEnabled)) {
+                  notification.warning({ message: 'Task disabled', description: 'Enable this Task Master before deploying its scheduler.', placement: 'bottomRight' })
+                  return
+                }
+                const subTasks = [...mapperConfigRows]
+                  .filter((item) => nextTask.id === legacyTaskMasterId ? (!item.taskMasterId || item.taskMasterId === legacyTaskMasterId) : item.taskMasterId === nextTask.id)
+                  .filter((item) => item.enabled !== false)
+                  .sort((left, right) => Number(left.runOrder || 9999) - Number(right.runOrder || 9999))
+                if (subTasks.length <= 0) {
+                  notification.warning({ message: 'No enabled sub tasks', description: 'Enable at least one sub task before registering this Task Master schedule.', placement: 'bottomRight' })
+                  return
+                }
+                const deployEnabled = Boolean(nextTask.deployEnabled)
+                const scheduleEnabled = Boolean(nextTask.scheduleEnabled)
+                const taskRunTime = String(nextTask.runAtTime || '').match(/^\d{2}:\d{2}$/) ? String(nextTask.runAtTime) : ''
+                const taskRunHour = taskRunTime ? Number(taskRunTime.slice(0, 2)) : 0
+                const taskRunMinute = taskRunTime ? Number(taskRunTime.slice(3, 5)) : 0
+                const taskMonthlyRunDay = Math.min(31, Math.max(1, Number(nextTask.monthlyRunDay || 1)))
+                const scheduleType = (String(nextTask.scheduleType || 'cron') === 'interval' ? 'interval' : 'cron') as DataOpsTaskMaster['scheduleType']
+                const scheduleIntervalMinutes = Math.max(1, Math.trunc(Number(nextTask.scheduleIntervalMinutes || 15)))
+                const defaultTaskCron = taskRunTime
+                  ? String(nextTask.windowMode || 'daily') === 'monthly'
+                    ? `${taskRunMinute} ${taskRunHour} ${taskMonthlyRunDay} * *`
+                    : `${taskRunMinute} ${taskRunHour} * * *`
+                  : String(nextTask.scheduleCron || nextTask.cron || '0 0 * * *')
+	                const taskBindParams = dataOpsTaskMasterBindParams(nextTask)
+                const registeredAt = new Date().toISOString()
+                setDataOpsSqlExecuting(true)
+                try {
+                  const scheduleSubTasks = subTasks.map((config) => {
+                    const stepForConfig: DataOpsPipelineStep = {
+                      ...selectedDataOpsPipelineStep,
+                      activeMapperConfigId: config.id,
+                      activeTaskMasterId: nextTask.id,
+                      targetMode: config.targetMode || 'oracle',
+                      writeMode: config.writeMode || 'upsert',
+                      lookupSource: config.lookupSource || '',
+                      queryInputs: effectiveMapperQueryInputs(config),
+                      target: config.target || '',
+                      keyFields: config.keyFields || '',
+                      mappingRows: config.mappingRows || [],
+                      syncProcessingMode: config.syncProcessingMode || 'batch',
+                      syncBatchSize: config.syncBatchSize || 1000,
+                      syncCommitEvery: config.syncCommitEvery || 5000,
+                      syncMaxBatches: config.syncMaxBatches ?? 100,
+                      syncLoopGapSeconds: config.syncLoopGapSeconds ?? 5,
+                      syncIncrementalField: config.syncIncrementalField || '',
+                      syncCursorField: config.syncCursorField || '',
+                      checkpointEnabled: config.checkpointEnabled !== false,
+                      checkpointIdField: config.checkpointIdField || config.syncCursorField || '',
+                      checkpointTimeField: config.checkpointTimeField || config.syncIncrementalField || '',
+                    }
+                    const built = buildDataOpsMapperSyncSql(stepForConfig)
+	                    if (deployEnabled && scheduleEnabled && built.issue) throw new Error(`${config.name || 'Sub task'}: ${built.issue}`)
+	                    const queryInputsForSchedule = effectiveMapperQueryInputs(config)
+	                    const subTaskBindParams = dataOpsApplyQueryInputBinds(taskBindParams, queryInputsForSchedule, dataOpsBindParametersFromRouteSource(dataOpsPipelineSteps, config.lookupSource || ''))
+	                    return {
+                      config: {
+                        ...nodeConfig,
+                        data_ops_active_mapper_config_id: config.id,
+                        data_ops_mapper_step_id: selectedDataOpsPipelineStep.id,
+	                        _data_ops_task_master_id: nextTask.id,
+	                        _data_ops_task_master_name: nextTask.name || '',
+	                        _data_ops_task_bind_params: subTaskBindParams,
+	                        _data_ops_query_inputs: queryInputsForSchedule,
+                        _data_ops_sync_processing_mode: config.syncProcessingMode || 'batch',
+                        _data_ops_sync_batch_size: config.syncBatchSize || 1000,
+                        _data_ops_sync_commit_every: config.syncCommitEvery || 5000,
+                        _data_ops_sync_max_batches: config.syncMaxBatches ?? 100,
+                        _data_ops_sync_loop_gap_seconds: config.syncLoopGapSeconds ?? 5,
+                        _data_ops_checkpoint_enabled: config.checkpointEnabled !== false && selectedDataOpsPipelineStep.checkpoint !== false,
+                        _data_ops_checkpoint_id_field: config.checkpointIdField || config.syncCursorField || '',
+                        _data_ops_checkpoint_time_field: config.checkpointTimeField || config.syncIncrementalField || '',
+                        _data_ops_checkpoint_source_sql: built.sourceSql || '',
+                      },
+                      sql: built.sql,
+                      mapper_config_id: config.id,
+                      mapper_config_name: config.name || config.id,
+                      enabled: config.enabled !== false,
+                      run_order: Number(config.runOrder || 9999),
+                    }
+                  })
+                  const response = await api.scheduleDataOpsTaskMaster({
+                    config: {
+                      ...nodeConfig,
+                      _data_ops_task_master_id: nextTask.id,
+                      _data_ops_task_master_name: nextTask.name || '',
+                      _data_ops_task_bind_params: taskBindParams,
+                    },
+                    sub_tasks: scheduleSubTasks,
+                    job_id: `${selectedNodeId}:${selectedDataOpsPipelineStep.id}:${nextTask.id}`,
+                    pipeline_id: activePipelineId,
+                    data_ops_node_id: selectedNodeId,
+                    mapper_step_id: selectedDataOpsPipelineStep.id,
+                    task_master_id: nextTask.id,
+                    task_master_name: nextTask.name || '',
+                    task_window_mode: nextTask.windowMode || '',
+                    task_window_indicator: nextTask.windowIndicator || '',
+                    task_monthly_run_day: nextTask.monthlyRunDay || 1,
+                    task_lookback_count: nextTask.lookbackCount || 1,
+                    task_lookback_unit: nextTask.lookbackUnit || 'day',
+                    task_duplicate_policy: nextTask.duplicatePolicy || 'skip_completed',
+                    task_start_at: nextTask.startAt || '',
+                    task_end_at: nextTask.endAt || '',
+                    enabled: scheduleEnabled,
+                    deploy_enabled: deployEnabled,
+                    schedule_type: scheduleType,
+                    interval_minutes: scheduleIntervalMinutes,
+                    cron: defaultTaskCron,
+                    timezone: String(nextTask.scheduleTimezone || nextTask.timezone || 'Asia/Kolkata'),
+                    max_instances: Number(nextTask.scheduleMaxParallelRuns || 1),
+                    misfire_policy: String(nextTask.scheduleMisfirePolicy || 'skip'),
+                  })
+                  const taskSchedulerPatch: Partial<DataOpsTaskMaster> = {
+                    ...schedulePatch,
+                    deployEnabled,
+                    scheduleEnabled,
+                    scheduleType,
+                    scheduleIntervalMinutes,
+                    scheduleCron: defaultTaskCron,
+                    scheduleTimezone: String(nextTask.scheduleTimezone || nextTask.timezone || 'Asia/Kolkata'),
+                    scheduleMaxParallelRuns: Number(nextTask.scheduleMaxParallelRuns || 1),
+                    scheduleMisfirePolicy: nextTask.scheduleMisfirePolicy || 'skip',
+                    scheduleBackendJobId: String(response?.job_id || ''),
+                    scheduleNextRunAt: response?.enabled ? String(response?.next_run_at || '') : '',
+                    scheduleStatus: response?.enabled ? 'scheduled' : 'disabled',
+                    scheduleLastRegisteredAt: registeredAt,
+                    status: response?.enabled ? 'scheduled' : 'planned',
+                  }
+                  patchMapper({
+                    taskMasters: taskMasters.map((item) => item.id === nextTask.id ? { ...item, ...taskSchedulerPatch, updatedAt: registeredAt } : item),
+                    mapperConfigs: mapperConfigRows.map((item) => {
+                      const backendJobId = String(item.scheduleBackendJobId || '')
+                      if (!subTasks.some((config) => config.id === item.id) || !backendJobId.startsWith('data_ops_task_master:')) return item
+                      return {
+                        ...item,
+                        deployEnabled: false,
+                        scheduleEnabled: false,
+                        scheduleBackendJobId: '',
+                        scheduleNextRunAt: '',
+                        scheduleStatus: 'planned',
+                        updatedAt: registeredAt,
+                      }
+                    }),
+                  })
+                  notification.success({
+                    message: response?.enabled ? 'Task Master scheduler enabled' : 'Task Master scheduler disabled',
+                    description: response?.enabled
+                      ? `${subTasks.length.toLocaleString()} sub task(s) will run sequentially${response?.next_run_at ? `; next: ${String(response.next_run_at)}` : ''}.`
+                      : String(response?.message || 'Task Master scheduler disabled.'),
+                    placement: 'bottomRight',
+                    duration: 3,
+                  })
+                  persistPipelineAfterConfigUpdate('Task Master scheduler saved permanently')
+                  void refreshDataOpsMonitorOnce()
+                } catch (err: any) {
+                  notification.error({
+                    message: 'Task Master scheduler failed',
+                    description: String(err?.message || 'Failed to register Task Master scheduler'),
+                    placement: 'bottomRight',
+                  })
                 } finally {
                   setDataOpsSqlExecuting(false)
                 }
@@ -37239,22 +38911,28 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 id: String(base?.id || dataOpsId('mapper')),
                 name: String(base?.name || activeMapperConfig?.name || `Mapper ${mapperConfigRows.length + 1}`),
                 description: String(base?.description || ''),
+                enabled: base?.enabled ?? activeMapperConfig?.enabled ?? true,
                 targetMode: selectedDataOpsPipelineStep.targetMode || 'oracle',
                 writeMode: selectedDataOpsPipelineStep.writeMode || 'upsert',
                 lookupSource: selectedDataOpsPipelineStep.lookupSource || '',
                 queryInputs: selectedDataOpsPipelineStep.queryInputs || [],
-                taskMasterId: selectedDataOpsPipelineStep.activeTaskMasterId || activeMapperConfig?.taskMasterId || '',
-                runOrder: activeMapperConfig?.runOrder || mapperConfigRows.length + 1,
+                taskMasterId: selectedDataOpsPipelineStep.activeTaskMasterId || base?.taskMasterId || activeMapperConfig?.taskMasterId || '',
+                runOrder: base?.runOrder || activeMapperConfig?.runOrder || mapperConfigRows.length + 1,
                 target: selectedDataOpsPipelineStep.target || '',
                 keyFields: selectedDataOpsPipelineStep.keyFields || '',
                 mappingRows: selectedDataOpsPipelineStep.mappingRows || [],
                 syncProcessingMode: selectedDataOpsPipelineStep.syncProcessingMode || 'batch',
                 syncBatchSize: selectedDataOpsPipelineStep.syncBatchSize || 1000,
                 syncCommitEvery: selectedDataOpsPipelineStep.syncCommitEvery || 5000,
+                syncMaxBatches: selectedDataOpsPipelineStep.syncMaxBatches ?? 100,
+                syncLoopGapSeconds: selectedDataOpsPipelineStep.syncLoopGapSeconds ?? 5,
                 syncParallelEnabled: Boolean(selectedDataOpsPipelineStep.syncParallelEnabled),
                 syncParallelWorkers: selectedDataOpsPipelineStep.syncParallelWorkers || 4,
                 syncIncrementalField: selectedDataOpsPipelineStep.syncIncrementalField || '',
                 syncCursorField: selectedDataOpsPipelineStep.syncCursorField || '',
+                checkpointEnabled: selectedDataOpsPipelineStep.checkpoint !== false && selectedDataOpsPipelineStep.checkpointEnabled !== false,
+                checkpointIdField: selectedDataOpsPipelineStep.checkpointIdField || selectedDataOpsPipelineStep.syncCursorField || '',
+                checkpointTimeField: selectedDataOpsPipelineStep.checkpointTimeField || selectedDataOpsPipelineStep.syncIncrementalField || '',
                 syncErrorMode: selectedDataOpsPipelineStep.syncErrorMode || 'stop',
                 auditField: selectedDataOpsPipelineStep.auditField || '_data_ops_audit',
                 expression: selectedDataOpsPipelineStep.expression || '',
@@ -37279,6 +38957,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   id: targetId,
                   name: existing?.name || activeMapperConfig?.name || `Mapper ${mapperConfigRows.length + 1}`,
                   description: existing?.description || '',
+                  enabled: existing?.enabled ?? activeMapperConfig?.enabled ?? true,
+                  taskMasterId: existing?.taskMasterId || activeMapperConfig?.taskMasterId || '',
+                  runOrder: existing?.runOrder || activeMapperConfig?.runOrder || mapperConfigRows.length + 1,
                 })
                 patchMapper({
                   mapperConfigs: existing
@@ -37295,7 +38976,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   targetMode: config.targetMode || 'oracle',
                   writeMode: config.writeMode || 'upsert',
                   lookupSource: config.lookupSource || '',
-                  queryInputs: config.queryInputs || [],
+                  queryInputs: effectiveMapperQueryInputs(config),
                   activeTaskMasterId: config.taskMasterId || selectedDataOpsPipelineStep.activeTaskMasterId || '',
                   target: config.target || '',
                   keyFields: config.keyFields || '',
@@ -37303,10 +38984,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   syncProcessingMode: config.syncProcessingMode || 'batch',
                   syncBatchSize: config.syncBatchSize || 1000,
                   syncCommitEvery: config.syncCommitEvery || 5000,
+                  syncMaxBatches: config.syncMaxBatches ?? 100,
+                  syncLoopGapSeconds: config.syncLoopGapSeconds ?? 5,
                   syncParallelEnabled: Boolean(config.syncParallelEnabled),
                   syncParallelWorkers: config.syncParallelWorkers || 4,
                   syncIncrementalField: config.syncIncrementalField || '',
                   syncCursorField: config.syncCursorField || '',
+                  checkpointEnabled: config.checkpointEnabled !== false,
+                  checkpointIdField: config.checkpointIdField || config.syncCursorField || '',
+                  checkpointTimeField: config.checkpointTimeField || config.syncIncrementalField || '',
                   syncErrorMode: config.syncErrorMode || 'stop',
                   auditField: config.auditField || '_data_ops_audit',
                   expression: config.expression || '',
@@ -37331,6 +39017,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   id: nextId,
                   name: `Mapper ${mapperConfigRows.length + 1}`,
                   description: '',
+                  enabled: true,
                   targetMode: 'oracle',
                   writeMode: 'upsert',
                   lookupSource: '',
@@ -37343,10 +39030,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   syncProcessingMode: 'batch',
                   syncBatchSize: 1000,
                   syncCommitEvery: 5000,
+                  syncMaxBatches: 100,
+                  syncLoopGapSeconds: 5,
                   syncParallelEnabled: false,
                   syncParallelWorkers: 4,
                   syncIncrementalField: '',
                   syncCursorField: '',
+                  checkpointEnabled: true,
+                  checkpointIdField: '',
+                  checkpointTimeField: '',
                   syncErrorMode: 'stop',
                   auditField: '_data_ops_audit',
                   expression: '',
@@ -37378,9 +39070,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   syncProcessingMode: 'batch',
                   syncBatchSize: 1000,
                   syncCommitEvery: 5000,
+                  syncMaxBatches: 100,
+                  syncLoopGapSeconds: 5,
                   syncParallelEnabled: false,
                   syncParallelWorkers: 4,
                   syncIncrementalField: '',
+                  checkpointEnabled: true,
+                  checkpointIdField: '',
+                  checkpointTimeField: '',
                   syncCursorField: '',
                   syncErrorMode: 'stop',
                   auditField: '_data_ops_audit',
@@ -37408,9 +39105,35 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 })
               }
               const updateMapperConfig = (configId: string, patch: Partial<DataOpsMapperConfig>) => {
+                const existingConfig = mapperConfigRows.find((item) => item.id === configId)
+                const nextRows = mapperConfigRows.map((item) => item.id === configId ? { ...item, ...patch, updatedAt: new Date().toISOString() } : item)
                 patchMapper({
-                  mapperConfigs: mapperConfigRows.map((item) => item.id === configId ? { ...item, ...patch, updatedAt: new Date().toISOString() } : item),
+                  mapperConfigs: nextRows,
                 })
+                if (Object.prototype.hasOwnProperty.call(patch, 'enabled')) {
+                  persistPipelineAfterConfigUpdate('Sub task state saved permanently')
+                  if (patch.enabled === false) {
+                    void api.stopDataOpsOracleRun({
+                      pipeline_id: activePipelineId,
+                      data_ops_node_id: selectedNodeId || '',
+                      mapper_step_id: selectedDataOpsPipelineStep.id,
+                      mapper_config_id: configId,
+                      task_master_id: existingConfig?.taskMasterId || selectedDataOpsPipelineStep.activeTaskMasterId || '',
+                    }).then(() => {
+                      notification.info({
+                        message: 'Sub task disabled',
+                        description: 'Any active loop for this sub task will stop after the current batch or poll wait.',
+                        placement: 'bottomRight',
+                      })
+                    }).catch((err: any) => {
+                      notification.warning({
+                        message: 'Sub task disabled',
+                        description: `State was saved, but stop request failed: ${String(err?.message || err)}`,
+                        placement: 'bottomRight',
+                      })
+                    })
+                  }
+                }
               }
               const patchMapperScheduler = (patch: Partial<DataOpsPipelineStep>, deploy = false) => {
                 const activeConfigId = String(selectedDataOpsPipelineStep.activeMapperConfigId || '')
@@ -37449,6 +39172,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 setDataOpsSubTaskMasterOpen(true)
               }
               const mapperSyncBuild = buildDataOpsMapperSyncSql(selectedDataOpsPipelineStep)
+              const activeMapperConfigRunActive = isMapperConfigRunActive(String(selectedDataOpsPipelineStep.activeMapperConfigId || activeMapperConfig?.id || ''))
               const mapperActiveMappings = (selectedDataOpsPipelineStep.mappingRows || []).filter((row) => row.enabled !== false && row.source && row.target)
               const mapperKeyFields = uniqueFieldNames([
                 ...String(selectedDataOpsPipelineStep.keyFields || '').split(',').map((item) => item.trim()).filter(Boolean),
@@ -37522,30 +39246,41 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                           { title: 'Definition', width: 290, render: (_value: unknown, row: DataOpsTaskMaster) => <Text ellipsis style={{ maxWidth: 280, color: 'var(--app-text)' }}>{dataOpsTaskMasterScheduleSummary(row)}</Text> },
                           { title: 'Last Run', width: 145, render: (_value: unknown, row: DataOpsTaskMaster) => {
                             const runtime = taskLastRuntimeRow(row.id)
-                            return <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{dataOpsTimestampText(runtime?.last_run_started_at || runtime?.at || runtime?.last_activity_at || '') || 'not run'}</Text>
+                            const progressText = taskRuntimeProgressText(runtime)
+                            return (
+                              <div style={{ display: 'grid', gap: 2, minWidth: 0 }}>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{dataOpsTimestampText(runtime?.last_run_started_at || runtime?.at || runtime?.last_activity_at || '') || 'not run'}</Text>
+                                {progressText ? <Text ellipsis style={{ color: String(runtime?.status || '').toLowerCase() === 'running' ? '#60a5fa' : 'var(--app-text-subtle)', fontSize: 10, maxWidth: 136 }}>{progressText}</Text> : null}
+                              </div>
+                            )
                           } },
-                          { title: 'Next Period', width: 145, render: (_value: unknown, row: DataOpsTaskMaster) => {
-                            const nextRun = taskNextRunAt(row.id)
-                            return <Text style={{ color: nextRun ? '#f59e0b' : 'var(--app-text-subtle)', fontSize: 11, fontWeight: 700 }}>{nextRun ? dataOpsCountdownText(nextRun, dataOpsRuntimeTick) || dataOpsTimestampText(nextRun) : 'not registered'}</Text>
+                          { title: 'Next Run', width: 230, render: (_value: unknown, row: DataOpsTaskMaster) => {
+                            const nextRun = effectiveTaskNextRunAt(row)
+                            const enabledPending = !nextRun && Boolean(row.deployEnabled && row.scheduleEnabled)
+                            return <Text style={{ color: nextRun || enabledPending ? '#f59e0b' : 'var(--app-text-subtle)', fontSize: 11, fontWeight: 700 }}>{nextRun ? taskNextRunDisplay(nextRun) : enabledPending ? 'next run pending' : 'not deployed'}</Text>
                           } },
                           { title: 'Stats', width: 190, render: (_value: unknown, row: DataOpsTaskMaster) => {
                             const stats = taskRuntimeStats(row.id)
-                            return <Space size={4} wrap><Tag color="blue" style={{ marginInlineEnd: 0 }}>src {stats.source.toLocaleString()}</Tag><Tag color="green" style={{ marginInlineEnd: 0 }}>dest {stats.destination.toLocaleString()}</Tag><Tag color={stats.rejected ? 'red' : 'default'} style={{ marginInlineEnd: 0 }}>rej {stats.rejected.toLocaleString()}</Tag></Space>
+                            return <Space size={4} wrap><Tag color="blue" style={{ marginInlineEnd: 0 }}>src {stats.source.toLocaleString()}</Tag><Tag color="green" style={{ marginInlineEnd: 0 }}>dest {stats.destination.toLocaleString()}</Tag><Tag color="purple" style={{ marginInlineEnd: 0 }}>on {enabledSubTaskCountForTask(row.id)}/{subTaskCountForTask(row.id)}</Tag><Tag color={stats.rejected ? 'red' : 'default'} style={{ marginInlineEnd: 0 }}>rej {stats.rejected.toLocaleString()}</Tag></Space>
                           } },
                           { title: 'State', width: 92, render: (_value: unknown, row: DataOpsTaskMaster) => {
-                            const status = row.enabled === false ? 'disabled' : taskRuntimeStatus(row.id)
+                            const status = row.enabled === false ? 'disabled' : (row.scheduleStatus || taskRuntimeStatus(row.id))
                             return <Tag color={dataOpsStatusColor(status)} style={{ marginInlineEnd: 0 }}>{status}</Tag>
                           } },
-                          { title: 'Actions', width: 280, render: (_value: unknown, row: DataOpsTaskMaster) => (
-                            <Space size={6} onClick={(event) => event.stopPropagation()}>
-                              <Button size="small" type="primary" onClick={(event) => { event.stopPropagation(); manageTaskMaster(row) }}>Manage</Button>
-                              <Popconfirm title="Run this Task Master now?" description="Only this task's assigned subtasks run, sequentially in configured order." okText="Run" cancelText="Cancel" onConfirm={() => { void runTaskMasterManually(row) }}>
-                                <Button size="small" loading={dataOpsSqlExecuting} disabled={subTaskCountForTask(row.id) <= 0}>Run</Button>
-                              </Popconfirm>
-                              <Button size="small" onClick={(event) => { event.stopPropagation(); duplicateTaskMaster(row) }}>Copy</Button>
-                              <Button size="small" danger onClick={(event) => { event.stopPropagation(); deleteTaskMaster(row.id) }}>Delete</Button>
-                            </Space>
-                          ) },
+                          { title: 'Actions', width: 290, render: (_value: unknown, row: DataOpsTaskMaster) => {
+                            const rowRunActive = isTaskMasterRunActive(row.id)
+                            return (
+                              <Space size={6} onClick={(event) => event.stopPropagation()}>
+                                <Button size="small" type="primary" onClick={(event) => { event.stopPropagation(); manageTaskMaster(row) }}>Manage</Button>
+                                <Popconfirm title="Run this Task Master now?" description="Only this task's assigned subtasks run, sequentially in configured order." okText="Run" cancelText="Cancel" onConfirm={() => { void runTaskMasterManually(row) }}>
+                                  <Button size="small" loading={rowRunActive} disabled={row.enabled === false || enabledSubTaskCountForTask(row.id) <= 0}>Run</Button>
+                                </Popconfirm>
+                                {rowRunActive ? <Button size="small" danger onClick={() => { void stopDataOpsActiveRun() }}>Stop</Button> : null}
+                                <Button size="small" onClick={(event) => { event.stopPropagation(); duplicateTaskMaster(row) }}>Copy</Button>
+                                <Button size="small" danger onClick={(event) => { event.stopPropagation(); deleteTaskMaster(row.id) }}>Delete</Button>
+                              </Space>
+                            )
+                          } },
                         ] as any[]}
                         scroll={{ x: 1660 }}
                         expandable={{
@@ -37556,8 +39291,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                             if (expanded && id) patchMapper({ activeTaskMasterId: id })
                           },
                           expandedRowRender: (row: DataOpsTaskMaster) => (
-                            <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 8 }}>
-                              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8, alignItems: 'end' }}>
+                            <div className="data-ops-task-master-expanded" style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 8 }}>
+                              <div className="data-ops-parameter-card data-ops-task-window-card" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8, alignItems: 'end' }}>
                                 <div>
                                   <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Window Definition</Text>
                                   <Select size="small" value={row.windowMode || 'daily'} onChange={(value) => {
@@ -37565,20 +39300,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                     patchTaskMaster(row.id, {
                                       windowMode: nextMode,
                                       windowIndicator: nextMode === 'monthly' ? 'transaction_month' : nextMode === 'daily' ? 'transaction_day' : 'transaction_range',
+                                      lookbackUnit: nextMode === 'previous_interval' || nextMode === 'previous_range' ? (row.lookbackUnit || 'minute') : row.lookbackUnit,
                                     })
                                   }} options={[
                                     { value: 'daily', label: 'Day' },
                                     { value: 'monthly', label: 'Month' },
-                                    { value: 'previous_range', label: 'Previous Range' },
+                                    { value: 'previous_interval', label: 'Previous Interval' },
                                     { value: 'custom_range', label: 'Custom Range' },
-                                  ]} style={{ width: '100%', marginTop: 4 }} />
-                                </div>
-                                <div>
-                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Transaction Indicator</Text>
-                                  <Select size="small" value={row.windowIndicator || (row.windowMode === 'monthly' ? 'transaction_month' : row.windowMode === 'daily' ? 'transaction_day' : 'transaction_range')} onChange={(value) => patchTaskMaster(row.id, { windowIndicator: value as DataOpsTaskMaster['windowIndicator'] })} options={[
-                                    { value: 'transaction_day', label: 'transaction - day' },
-                                    { value: 'transaction_month', label: 'transaction - month' },
-                                    { value: 'transaction_range', label: 'transaction - range' },
                                   ]} style={{ width: '100%', marginTop: 4 }} />
                                 </div>
                                 <div>
@@ -37589,25 +39317,25 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                   <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Expiry Date</Text>
                                   <Input size="small" type="date" value={row.endAt || ''} onChange={(event) => patchTaskMaster(row.id, { endAt: event.target.value })} style={{ marginTop: 4 }} />
                                 </div>
-                                <div>
-                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Run Time</Text>
-                                  <Input size="small" type="time" value={row.runAtTime || '00:00'} onChange={(event) => patchTaskMaster(row.id, { runAtTime: event.target.value })} style={{ marginTop: 4 }} />
-                                </div>
-                                <div>
-                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Monthly Run Day</Text>
-                                  <InputNumber size="small" min={1} max={31} value={row.monthlyRunDay || 1} onChange={(value) => patchTaskMaster(row.id, { monthlyRunDay: Number(value || 1) })} addonAfter="day" style={{ width: '100%', marginTop: 4 }} disabled={row.windowMode !== 'monthly'} />
-                                </div>
+                                {row.scheduleType !== 'interval' && (
+                                  <>
+                                    <div>
+                                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Run Time</Text>
+                                      <Input size="small" type="time" value={row.runAtTime || '00:00'} onChange={(event) => patchTaskMaster(row.id, { runAtTime: event.target.value })} style={{ marginTop: 4 }} />
+                                    </div>
+                                    <div>
+                                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Monthly Run Day</Text>
+                                      <InputNumber size="small" min={1} max={31} value={row.monthlyRunDay || 1} onChange={(value) => patchTaskMaster(row.id, { monthlyRunDay: Number(value || 1) })} addonAfter="day" style={{ width: '100%', marginTop: 4 }} disabled={row.windowMode !== 'monthly'} />
+                                    </div>
+                                  </>
+                                )}
                                 <div>
                                   <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Lookback Count</Text>
-                                  <InputNumber size="small" min={1} value={row.lookbackCount || 1} onChange={(value) => patchTaskMaster(row.id, { lookbackCount: Number(value || 1) })} style={{ width: '100%', marginTop: 4 }} disabled={row.windowMode !== 'previous_range'} />
+                                  <InputNumber size="small" min={1} value={row.lookbackCount || 1} onChange={(value) => patchTaskMaster(row.id, { lookbackCount: Number(value || 1) })} style={{ width: '100%', marginTop: 4 }} disabled={!['previous_range', 'previous_interval'].includes(String(row.windowMode || ''))} />
                                 </div>
                                 <div>
                                   <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Lookback Unit</Text>
-                                  <Select size="small" value={row.lookbackUnit || 'day'} onChange={(value) => patchTaskMaster(row.id, { lookbackUnit: value as DataOpsTaskMaster['lookbackUnit'] })} options={[{ value: 'day', label: 'day' }, { value: 'month', label: 'month' }]} style={{ width: '100%', marginTop: 4 }} disabled={row.windowMode !== 'previous_range'} />
-                                </div>
-                                <div>
-                                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Interval</Text>
-                                  <InputNumber size="small" min={1} value={row.intervalMinutes || 60} onChange={(value) => patchTaskMaster(row.id, { intervalMinutes: Number(value || 60) })} addonAfter="min" style={{ width: '100%', marginTop: 4 }} />
+                                  <Select size="small" value={row.lookbackUnit || 'minute'} onChange={(value) => patchTaskMaster(row.id, { lookbackUnit: value as DataOpsTaskMaster['lookbackUnit'] })} options={[{ value: 'minute', label: 'minute' }, { value: 'hour', label: 'hour' }, { value: 'day', label: 'day' }, { value: 'month', label: 'month' }]} style={{ width: '100%', marginTop: 4 }} disabled={!['previous_range', 'previous_interval'].includes(String(row.windowMode || ''))} />
                                 </div>
                                 <div>
                                   <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Retry</Text>
@@ -37622,9 +39350,89 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                   <Select size="small" value={row.executionMode || 'subtask_driven'} onChange={(value) => patchTaskMaster(row.id, { executionMode: value as DataOpsTaskMaster['executionMode'] })} options={[{ value: 'subtask_driven', label: 'Sub task scheduler' }, { value: 'task_driven', label: 'Task scheduler' }, { value: 'hybrid', label: 'Hybrid' }]} style={{ width: '100%', marginTop: 4 }} />
                                 </div>
                               </div>
+                              <div className="data-ops-parameter-card data-ops-scheduler-card data-ops-task-scheduler-card" style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-panel-bg)', padding: 10, display: 'grid', gap: 10 }}>
+                                <Space style={{ width: '100%', justifyContent: 'space-between' }} align="start">
+                                  <div>
+                                    <Text style={{ color: 'var(--app-text)', fontWeight: 800, fontSize: 12 }}>Task Scheduler</Text>
+                                    <br />
+                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Assigned subtasks run in configured order for the completed window.</Text>
+                                  </div>
+                                  <Space size={6} wrap>
+                                    <Tag color={String(row.scheduleStatus || '') === 'scheduled' ? 'green' : row.scheduleEnabled ? 'orange' : 'default'} style={{ marginInlineEnd: 0 }}>
+                                      {String(row.scheduleStatus || (row.scheduleEnabled ? 'enabled' : 'disabled'))}
+                                    </Tag>
+                                    <Tag color={effectiveTaskNextRunAt(row) ? 'blue' : row.scheduleEnabled && row.deployEnabled ? 'gold' : 'default'} style={{ marginInlineEnd: 0 }}>
+                                      {effectiveTaskNextRunAt(row) ? `next run: ${taskNextRunDisplay(effectiveTaskNextRunAt(row))}` : row.scheduleEnabled && row.deployEnabled ? 'next run pending' : 'not deployed'}
+                                    </Tag>
+                                  </Space>
+                                </Space>
+                                <div style={{ display: 'grid', gridTemplateColumns: '150px 150px 180px minmax(220px, 1fr) 150px 170px', gap: 10, alignItems: 'end' }}>
+                                  <Space style={{ justifyContent: 'space-between' }}>
+                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Deploy task</Text>
+                                    <Switch
+                                      size="small"
+                                      checked={Boolean(row.deployEnabled)}
+                                      onChange={(checked) => {
+                                        void deployTaskMasterScheduler(row, {
+                                          deployEnabled: checked,
+                                          scheduleEnabled: checked ? Boolean(row.scheduleEnabled) : false,
+                                        })
+                                      }}
+                                    />
+                                  </Space>
+                                  <Space style={{ justifyContent: 'space-between' }}>
+                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Scheduler</Text>
+                                    <Switch
+                                      size="small"
+                                      checked={Boolean(row.scheduleEnabled)}
+                                      onChange={(checked) => {
+                                        void deployTaskMasterScheduler(row, {
+                                          deployEnabled: checked ? true : Boolean(row.deployEnabled),
+                                          scheduleEnabled: checked,
+                                        })
+                                      }}
+                                    />
+                                  </Space>
+                                  <div>
+                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Scheduler Mode</Text>
+                                    <Select size="small" value={row.scheduleType || 'cron'} onChange={(value) => {
+                                      const nextType = value as DataOpsTaskMaster['scheduleType']
+                                      patchTaskMaster(row.id, { scheduleType: nextType, scheduleIntervalMinutes: row.scheduleIntervalMinutes || 15 })
+                                      if (row.deployEnabled && row.scheduleEnabled) {
+                                        void deployTaskMasterScheduler(row, { scheduleType: nextType, scheduleIntervalMinutes: row.scheduleIntervalMinutes || 15 })
+                                      }
+                                    }} options={[{ value: 'cron', label: 'Run at time' }, { value: 'interval', label: 'Run every interval' }]} style={{ width: '100%', marginTop: 4 }} />
+                                  </div>
+                                  <div>
+                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{row.scheduleType === 'interval' ? 'Run Every' : 'Generated Cron'}</Text>
+                                    {row.scheduleType === 'interval' ? (
+                                      <InputNumber size="small" min={1} value={Number(row.scheduleIntervalMinutes || 15)} onChange={(value) => patchTaskMaster(row.id, { scheduleIntervalMinutes: Math.max(1, Number(value || 15)) })} onBlur={() => { if (row.deployEnabled && row.scheduleEnabled) void deployTaskMasterScheduler(row) }} addonAfter="min" style={{ width: '100%', marginTop: 4 }} />
+                                    ) : (
+                                      <Input size="small" value={String(row.runAtTime || '').match(/^\d{2}:\d{2}$/) ? row.windowMode === 'monthly' ? `${Number(String(row.runAtTime).slice(3, 5))} ${Number(String(row.runAtTime).slice(0, 2))} ${Math.min(31, Math.max(1, Number(row.monthlyRunDay || 1)))} * *` : `${Number(String(row.runAtTime).slice(3, 5))} ${Number(String(row.runAtTime).slice(0, 2))} * * *` : (row.scheduleCron || row.cron || '0 0 * * *')} disabled style={{ marginTop: 4 }} />
+                                    )}
+                                  </div>
+                                  <div>
+                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Timezone</Text>
+                                    <Input size="small" value={row.scheduleTimezone || row.timezone || 'Asia/Kolkata'} onChange={(event) => patchTaskMaster(row.id, { scheduleTimezone: event.target.value, timezone: event.target.value })} style={{ marginTop: 4 }} />
+                                  </div>
+                                  <div>
+                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Parallel Runs</Text>
+                                    <InputNumber size="small" min={1} max={64} value={row.scheduleMaxParallelRuns || 1} onChange={(value) => patchTaskMaster(row.id, { scheduleMaxParallelRuns: Number(value || 1) })} addonAfter="runs" style={{ width: '100%', marginTop: 4 }} />
+                                  </div>
+                                </div>
+                                <div style={{ display: 'grid', gridTemplateColumns: '170px 1fr', gap: 10, alignItems: 'end' }}>
+                                  <div>
+                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Missed Runs</Text>
+                                    <Select size="small" value={row.scheduleMisfirePolicy || 'skip'} onChange={(value) => patchTaskMaster(row.id, { scheduleMisfirePolicy: value as DataOpsTaskMaster['scheduleMisfirePolicy'] })} options={[{ value: 'skip', label: 'Skip missed' }, { value: 'run_once', label: 'Run once' }, { value: 'catch_up', label: 'Catch up' }]} style={{ width: '100%', marginTop: 4 }} />
+                                  </div>
+                                  <Text ellipsis style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                                    {row.scheduleLastRegisteredAt ? `Last registered: ${row.scheduleLastRegisteredAt}` : 'Enable Deploy task and Scheduler to register the Task Master job.'}
+                                  </Text>
+                                </div>
+                              </div>
                               <Space size={6} wrap>
                                 <Tag color="blue" style={{ marginInlineEnd: 0 }}>window: {dataOpsTaskMasterWindowLabel(row)}</Tag>
-                                <Tag color="purple" style={{ marginInlineEnd: 0 }}>sub tasks: {subTaskCountForTask(row.id)}</Tag>
+                              <Tag color="purple" style={{ marginInlineEnd: 0 }}>sub tasks: {enabledSubTaskCountForTask(row.id)}/{subTaskCountForTask(row.id)}</Tag>
                                 <Tag color="gold" style={{ marginInlineEnd: 0 }}>backlog windows: {dataOpsTaskBacklogWindows(row).length}</Tag>
                                 <Tag color="cyan" style={{ marginInlineEnd: 0 }}>{dataOpsTaskMasterScheduleSummary(row)}</Tag>
                                 <Tag color="geekblue" style={{ marginInlineEnd: 0 }}>{dataOpsTaskMasterBusinessWindow(row).task_business_window_key || 'window key pending'}</Tag>
@@ -37660,6 +39468,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       <Popconfirm title="Clear monitor logs?" description="This clears Data Ops backend activity log rows." okText="Clear" cancelText="Cancel" onConfirm={() => { void clearTaskMonitorLogs() }}>
                         <Button size="small" danger>Clear Logs</Button>
                       </Popconfirm>
+                      <Button size="small" disabled={dataOpsMonitorDrillTabs.length <= 0} onClick={closeAllDataOpsMonitorDrillTabs}>Close All Tabs</Button>
                     </Space>,
                     <div style={{ display: 'grid', gap: 10 }}>
                     <div style={{ display: 'grid', gridTemplateColumns: 'minmax(160px, 220px) minmax(160px, 220px) minmax(160px, 240px) 90px', gap: 8 }}>
@@ -37668,34 +39477,104 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       <Select size="small" allowClear placeholder="Filter sub task" value={dataOpsMonitorSubTaskFilter || undefined} onChange={(value) => setDataOpsMonitorSubTaskFilter(String(value || ''))} options={taskLogSubTaskOptions} />
                       <Button size="small" onClick={() => { setDataOpsMonitorWindowFilter(''); setDataOpsMonitorTaskFilter(''); setDataOpsMonitorSubTaskFilter('') }}>Clear</Button>
                     </div>
-                    <Table
+                    <Tabs
                       size="small"
-                      rowKey={(row: any, index) => `${String(row.job_id || row.config_id || 'log')}_${index}`}
-                      pagination={false}
-                      dataSource={filteredTaskLogRows}
-                      locale={{ emptyText: 'No task/sub-task backend logs for the selected filters.' }}
-                      columns={[
-                        { title: 'Task', width: 180, render: (_value: unknown, row: Record<string, unknown>) => <Text ellipsis style={{ maxWidth: 170, color: 'var(--app-text)', fontWeight: 700 }}>{taskLogTaskName(row)}</Text> },
-                        { title: 'Sub Task', width: 190, render: (_value: unknown, row: Record<string, unknown>) => <Text ellipsis style={{ maxWidth: 180 }}>{taskLogSubTaskName(row)}</Text> },
-                        { title: 'Window', width: 190, render: (_value: unknown, row: Record<string, unknown>) => <Text ellipsis style={{ maxWidth: 180, color: 'var(--app-text-subtle)' }}>{taskLogWindowValue(row)}</Text> },
-                        { title: 'Status', width: 96, render: (_value: unknown, row: Record<string, unknown>) => <Tag color={dataOpsStatusColor(row.status)} style={{ marginInlineEnd: 0 }}>{String(row.status || 'idle')}</Tag> },
-                        { title: 'Started', width: 145, render: (_value: unknown, row: Record<string, unknown>) => <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{dataOpsTimestampText(row.last_run_started_at || row.at || '') || '-'}</Text> },
-                        { title: 'Finished', width: 145, render: (_value: unknown, row: Record<string, unknown>) => <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>{dataOpsTimestampText(row.last_run_finished_at || '') || '-'}</Text> },
-                        { title: 'Duration', width: 90, render: (_value: unknown, row: Record<string, unknown>) => Number(row.duration_ms || 0) > 0 ? `${Number(row.duration_ms || 0).toLocaleString()} ms` : '-' },
-                        { title: 'Source Count', width: 112, render: (_value: unknown, row: Record<string, unknown>) => Number(row.source_rows || row.rows_source || 0).toLocaleString() },
-                        { title: 'Destination Sync', width: 130, render: (_value: unknown, row: Record<string, unknown>) => Number(row.destination_rows || row.rows_processed || 0).toLocaleString() },
-                        { title: 'Rejected', width: 86, render: (_value: unknown, row: Record<string, unknown>) => Number(row.rejected_rows || 0).toLocaleString() },
-                        { title: 'Mismatch', width: 92, render: (_value: unknown, row: Record<string, unknown>) => {
-                          const mismatch = Number(row.mismatch_rows || 0)
-                          return <Text style={{ color: mismatch ? '#f59e0b' : 'var(--app-text-subtle)', fontWeight: 700 }}>{mismatch.toLocaleString()}</Text>
-                        } },
-                        { title: 'Retry', width: 92, render: (_value: unknown, row: Record<string, unknown>) => {
-                          const status = String(row.status || '').toLowerCase()
-                          const mismatch = Number(row.mismatch_rows || 0)
-                          return <Button size="small" disabled={!['failed', 'error', 'success'].includes(status) && mismatch <= 0} onClick={() => retryMapperConfig(String(row.config_id || ''))}>Retry</Button>
-                        } },
-                      ] as any[]}
-                      scroll={{ x: 1400, y: 220 }}
+                      type="editable-card"
+                      hideAdd
+                      activeKey={dataOpsMonitorActiveDrillTab}
+                      onChange={setDataOpsMonitorActiveDrillTab}
+                      onEdit={(targetKey, action) => {
+                        if (action === 'remove') closeDataOpsMonitorDrillTab(String(targetKey))
+                      }}
+                      items={[
+                        {
+                          key: 'task_summary',
+                          label: `Task Summary (${taskLogTaskSummaryRows.length})`,
+                          closable: false,
+                          children: (
+                            <div className="data-ops-monitor-table-shell">
+                              <Table
+                                className="data-ops-monitor-log-table"
+                                size="small"
+                                tableLayout="fixed"
+                                sticky
+                                rowKey="key"
+                                pagination={taskLogTablePagination('tasks')}
+                                expandable={taskLogExpandable}
+                                dataSource={taskLogTaskSummaryRows}
+                                locale={{ emptyText: 'No task summary rows for the selected filters.' }}
+                                columns={[
+                                  taskLogTextColumn('Task', 'task', 240, 'left'),
+                                  taskLogRetryColumn,
+                                  { title: 'Sub Tasks', dataIndex: 'subTaskCount', key: 'subTaskCount', width: 100, align: 'right', sorter: (a: any, b: any) => Number(a.subTaskCount || 0) - Number(b.subTaskCount || 0), render: (value: unknown) => Number(value || 0).toLocaleString() },
+                                  { title: 'Windows', dataIndex: 'windowCount', key: 'windowCount', width: 96, align: 'right', sorter: (a: any, b: any) => Number(a.windowCount || 0) - Number(b.windowCount || 0), render: (value: unknown) => Number(value || 0).toLocaleString() },
+                                  ...taskLogMetricColumns,
+                                ] as any[]}
+                                scroll={{ x: 2240, y: 'calc(100vh - 500px)' }}
+                                onRow={(row: any) => ({
+                                  onClick: () => openDataOpsMonitorDrillTab({
+                                    key: `subtask:${row.task}`,
+                                    level: 'subtask',
+                                    task: String(row.task || ''),
+                                    label: `Sub Tasks: ${String(row.task || '-')}`,
+                                  }),
+                                  style: { cursor: 'pointer' },
+                                })}
+                              />
+                            </div>
+                          ),
+                        },
+                        ...dataOpsMonitorDrillTabs.map((tab) => {
+                          const drillRows = taskLogDrillRows(tab)
+                          const tableRows = tab.level === 'subtask'
+                            ? buildTaskLogAggregateRows('subtask', drillRows)
+                            : buildTaskLogAggregateRows('window', drillRows)
+                          return {
+                            key: tab.key,
+                            label: tab.label,
+                            closable: true,
+                            children: (
+	                            <div className="data-ops-monitor-table-shell">
+	                              <Table
+	                                className="data-ops-monitor-log-table"
+	                                size="small"
+	                                tableLayout="fixed"
+	                                sticky
+	                                rowKey="key"
+                                pagination={taskLogTablePagination(tab.level === 'subtask' ? 'sub tasks' : 'windows')}
+                                expandable={taskLogExpandable}
+                                dataSource={tableRows}
+                                locale={{ emptyText: 'No drill rows for the selected filters.' }}
+                                columns={tab.level === 'subtask' ? [
+                                  taskLogTextColumn('Task', 'task', 220, 'left'),
+                                  taskLogTextColumn('Sub Task', 'subTask', 220, 'left'),
+                                  taskLogRetryColumn,
+                                  { title: 'Windows', dataIndex: 'windowCount', key: 'windowCount', width: 96, align: 'right', sorter: (a: any, b: any) => Number(a.windowCount || 0) - Number(b.windowCount || 0), render: (value: unknown) => Number(value || 0).toLocaleString() },
+                                  ...taskLogMetricColumns,
+                                ] as any[] : [
+                                  taskLogTextColumn('Task', 'task', 210, 'left'),
+                                  taskLogTextColumn('Sub Task', 'subTask', 210, 'left'),
+                                  taskLogTextColumn('Window', 'window', 210, 'left'),
+                                  taskLogRetryColumn,
+                                  ...taskLogMetricColumns,
+                                ] as any[]}
+	                                scroll={{ x: tab.level === 'subtask' ? 2320 : 2520, y: 'calc(100vh - 500px)' }}
+                                onRow={(row: any) => tab.level === 'subtask' ? ({
+                                  onClick: () => openDataOpsMonitorDrillTab({
+                                    key: `window:${row.task}:${row.subTask}`,
+                                    level: 'window',
+                                    task: String(row.task || ''),
+                                    subTask: String(row.subTask || ''),
+                                    label: `Windows: ${String(row.subTask || '-')}`,
+                                  }),
+                                  style: { cursor: 'pointer' },
+                                }) : {}}
+                              />
+	                            </div>
+                            ),
+                          }
+                        }),
+                      ]}
                     />
                     </div>
                   )}
@@ -37729,14 +39608,34 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                               <Tag color="cyan" style={{ marginInlineEnd: 0 }}>window: {dataOpsTaskMasterWindowLabel(activeTaskMaster)}</Tag>
                               <Tag color="purple" style={{ marginInlineEnd: 0 }}>sub tasks: {visibleMapperConfigRows.length}</Tag>
                             </Space>
-                            <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10 }}>
-                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, fontWeight: 700 }}>Bind Parameters</Text>
-                              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
-                                {Object.entries(taskBindParams).filter(([, value]) => value).map(([key, value]) => (
-                                  <Tag key={key} color="cyan" style={{ marginInlineEnd: 0 }}>:{key}={value}</Tag>
-                                ))}
-                              </div>
-                            </div>
+                            <Collapse
+                              size="small"
+                              bordered
+                              defaultActiveKey={[]}
+                              style={{ background: 'var(--app-bg)', borderColor: 'var(--app-border)' }}
+                              items={[{
+                                key: 'bind_params',
+                                label: (
+                                  <Space size={6}>
+                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, fontWeight: 700 }}>Bind Parameters</Text>
+                                    <Tag color="cyan" style={{ marginInlineEnd: 0 }}>{Object.entries(taskBindParams).filter(([, value]) => value).length}</Tag>
+                                  </Space>
+                                ),
+                                children: (
+                                  <Table
+                                    size="small"
+                                    rowKey="key"
+                                    pagination={false}
+                                    dataSource={Object.entries(taskBindParams).filter(([, value]) => value).map(([key, value]) => ({ key, value }))}
+                                    locale={{ emptyText: 'No bind parameter values for this task window.' }}
+                                    columns={[
+                                      { title: 'Parameter', width: 260, render: (_value: unknown, row: { key: string; value: unknown }) => <Text code style={{ color: 'var(--app-text)' }}>:{row.key}</Text> },
+                                      { title: 'Value', render: (_value: unknown, row: { key: string; value: unknown }) => <Text ellipsis style={{ maxWidth: 720, color: 'var(--app-text-subtle)' }}>{String(row.value || '-')}</Text> },
+                                    ] as any[]}
+                                  />
+                                ),
+                              }]}
+                            />
                           </div>
                         ) : null}
                         {mapperPanel(
@@ -37751,7 +39650,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                             columns={[
                               { title: '#', width: 44, render: (_value: unknown, _row: DataOpsMapperConfig, index: number) => <Text style={{ color: 'var(--app-text-subtle)', fontWeight: 700 }}>{index + 1}</Text> },
                               { title: 'Order', width: 82, render: (_value: unknown, row: DataOpsMapperConfig, index: number) => <Space size={4}><Button size="small" icon={<ArrowUpOutlined />} disabled={index === 0} onClick={() => moveSubTaskOrder(row.id, -1)} /><Button size="small" icon={<ArrowDownOutlined />} disabled={index >= orderedVisibleMapperConfigRows.length - 1} onClick={() => moveSubTaskOrder(row.id, 1)} /></Space> },
-                              { title: 'Active', width: 70, render: (_value: unknown, row: DataOpsMapperConfig) => <Tag color={row.id === selectedDataOpsPipelineStep.activeMapperConfigId ? 'green' : 'default'} style={{ marginInlineEnd: 0 }}>{row.id === selectedDataOpsPipelineStep.activeMapperConfigId ? 'active' : 'saved'}</Tag> },
+                              { title: 'Use', width: 76, render: (_value: unknown, row: DataOpsMapperConfig) => <Switch size="small" checked={row.enabled !== false} onChange={(checked) => updateMapperConfig(row.id, { enabled: checked })} /> },
+                              { title: 'State', width: 86, render: (_value: unknown, row: DataOpsMapperConfig) => <Tag color={row.enabled === false ? 'default' : row.id === selectedDataOpsPipelineStep.activeMapperConfigId ? 'green' : 'blue'} style={{ marginInlineEnd: 0 }}>{row.enabled === false ? 'disabled' : row.id === selectedDataOpsPipelineStep.activeMapperConfigId ? 'active' : 'enabled'}</Tag> },
                               { title: 'Sub Task', render: (_value: unknown, row: DataOpsMapperConfig) => <Input size="small" value={row.name || ''} onChange={(event) => updateMapperConfig(row.id, { name: event.target.value })} placeholder="sub task name" /> },
                               { title: 'Source', width: 190, render: (_value: unknown, row: DataOpsMapperConfig) => <Text ellipsis style={{ maxWidth: 180, color: 'var(--app-text-subtle)', fontSize: 11 }}>{row.lookupSource || '-'}</Text> },
                               { title: 'Target', width: 190, render: (_value: unknown, row: DataOpsMapperConfig) => <Text ellipsis style={{ maxWidth: 180, color: 'var(--app-text-subtle)', fontSize: 11 }}>{row.target || '-'}</Text> },
@@ -37799,7 +39699,8 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
 	                  </Space>
 	                  <div className="data-ops-mapper-layout">
 	                  <div className="data-ops-mapper-main">
-	                  <div style={{ display: 'grid', gridTemplateColumns: '160px 180px 1fr', gap: 10, alignItems: 'end' }}>
+	                  <div className="data-ops-mapper-top-config-grid">
+	                  <div className="data-ops-mapper-setup-grid data-ops-mapper-primary-config" style={{ display: 'grid', gridTemplateColumns: '160px 180px 1fr', gap: 10, alignItems: 'end' }}>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Target Type</Text>
                       <Select size="small" value={selectedDataOpsPipelineStep.targetMode || 'oracle'} onChange={(value) => patchMapper({ targetMode: value as DataOpsPipelineStep['targetMode'] })} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%', marginTop: 5 })} options={[{ value: 'oracle', label: 'Oracle' }, { value: 'file', label: 'File' }, { value: 'api', label: 'API' }, { value: 'upstream', label: 'Upstream' }]} />
@@ -37816,7 +39717,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       <div><Text style={{ color: mapperSyncBuild.issue ? 'var(--app-warning)' : 'var(--app-text-subtle)', fontSize: 11 }}>{mapperSyncBuild.issue || 'Mappings can be prepared and executed against the Oracle target.'}</Text></div>
                     </div>
                   </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'minmax(220px, .8fr) minmax(260px, 1fr) minmax(220px, 0.7fr)', gap: 10, alignItems: 'end' }}>
+                  <div className="data-ops-mapper-setup-grid data-ops-mapper-source-config" style={{ display: 'grid', gridTemplateColumns: 'minmax(220px, .8fr) minmax(260px, 1fr) minmax(220px, 0.7fr)', gap: 10, alignItems: 'end' }}>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Parent Task Master</Text>
                       <Select
@@ -37845,18 +39746,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                         style={dataOpsControlStyle(dataOpsSectionColors.source, { width: '100%', marginTop: 5 })}
                       />
                     </div>
-                    <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: '7px 10px', minHeight: 47 }}>
-                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
-                        Source fields: {mapperSourceFields.length > 0 ? mapperSourceFields.length.toLocaleString() : 'none loaded'}
-                      </Text>
-                      <br />
-                      <Text ellipsis style={{ color: 'var(--app-text)', fontSize: 11, maxWidth: 420 }}>
-                        {mapperSourceFields.slice(0, 8).join(', ') || 'Select or save a Query Builder configuration first.'}
-                      </Text>
-                    </div>
                   </div>
                   {mapperBindParameters.length > 0 ? (
-                    <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 8 }}>
+                    <div className="data-ops-mapper-setup-grid data-ops-mapper-bind-config" style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 8 }}>
                       <Space style={{ justifyContent: 'space-between' }}>
                         <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 12 }}>Query Inputs</Text>
                         <Tag color="blue" style={{ marginInlineEnd: 0 }}>{mapperBindParameters.length} bind</Tag>
@@ -37864,12 +39756,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       {mapperQueryInputRows.map((row) => {
                         const param = mapperBindParameters.find((item) => item.name === row.param)
                         return (
-                          <div key={row.param} style={{ display: 'grid', gridTemplateColumns: '42px 150px 110px minmax(180px, 1fr) 180px', gap: 8, alignItems: 'center' }}>
+                          <div className="data-ops-mapper-bind-row" key={row.param} style={{ display: 'grid', gridTemplateColumns: '42px 150px 110px minmax(180px, 1fr) 180px', gap: 8, alignItems: 'center' }}>
                             <Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchMapperQueryInput(String(row.param || ''), { enabled: checked })} />
                             <Text style={{ color: dataOpsSectionColors.where, fontWeight: 700 }}>:{row.param}</Text>
                             <Select size="small" value={row.sourceMode || 'default'} onChange={(value) => patchMapperQueryInput(String(row.param || ''), { sourceMode: value as DataOpsQueryInputRow['sourceMode'] })} options={[{ value: 'default', label: 'Default' }, { value: 'fixed', label: 'Fixed' }, { value: 'field', label: 'Field' }]} style={dataOpsControlStyle(dataOpsSectionColors.where)} />
                             {row.sourceMode === 'field' ? (
-                              <Select size="small" showSearch allowClear optionFilterProp="label" value={row.sourceField || undefined} onChange={(value) => patchMapperQueryInput(String(row.param || ''), { sourceField: String(value || '') })} placeholder="mapper input field" options={mapperSourceOptions} style={dataOpsControlStyle(dataOpsSectionColors.where)} />
+                              <Select size="small" showSearch allowClear optionFilterProp="label" value={row.sourceField || undefined} onChange={(value) => patchMapperQueryInput(String(row.param || ''), { sourceField: String(value || '') })} placeholder="bind value or source field" options={mapperBindValueOptions as any} style={dataOpsControlStyle(dataOpsSectionColors.where)} />
                             ) : (
                               <Input size="small" disabled={row.sourceMode === 'default'} value={row.sourceMode === 'default' ? String(param?.defaultValue || '') : String(row.value || '')} onChange={(event) => patchMapperQueryInput(String(row.param || ''), { value: event.target.value })} placeholder="value/default" style={dataOpsInputStyle(dataOpsSectionColors.where)} />
                             )}
@@ -37879,7 +39771,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       })}
                     </div>
                   ) : null}
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                  <div className="data-ops-mapper-setup-grid data-ops-target-key-config" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Destination / Target Table</Text>
                       <Select size="small" showSearch allowClear optionFilterProp="label" value={selectedDataOpsPipelineStep.target || undefined} onChange={(value) => loadMapperTarget(String(value || ''))} onSearch={searchMapperTarget} placeholder="schema.table or endpoint" options={mapperObjectOptions} style={dataOpsControlStyle(dataOpsSectionColors.output, { width: '100%', marginTop: 5 })} />
@@ -37910,20 +39802,23 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       />
                     </div>
                   </div>
+                  </div>
                   <Space style={{ width: '100%', justifyContent: 'space-between' }}>
                     <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Source To Target Mapping</Text>
                     <Space size={6}>
                       <Button size="small" onClick={() => patchMapper({ expression: mapperSyncBuild.sql })} disabled={!mapperSyncBuild.sql}>Prepare Sync SQL</Button>
+                      <Button size="small" onClick={() => setDataOpsMapperSqlDrawerOpen(true)}>View Sync SQL</Button>
                       <Popconfirm
                         title="Run data sync?"
                         description={mapperSyncBuild.issue || `Execute mapper SQL against ${selectedDataOpsPipelineStep.target || 'target table'} now.`}
                         okText="Run Sync"
                         cancelText="Cancel"
-                        okButtonProps={{ loading: dataOpsSqlExecuting, danger: ['delete', 'delete_insert', 'truncate_insert'].includes(String(selectedDataOpsPipelineStep.writeMode || '')) }}
+                        okButtonProps={{ loading: activeMapperConfigRunActive, danger: ['delete', 'delete_insert', 'truncate_insert'].includes(String(selectedDataOpsPipelineStep.writeMode || '')) }}
                         onConfirm={() => { void runDataOpsMapperSync(selectedDataOpsPipelineStep) }}
                       >
-                        <Button size="small" type="primary" loading={dataOpsSqlExecuting} disabled={Boolean(mapperSyncBuild.issue)}>Run Sync</Button>
+                        <Button size="small" type="primary" loading={activeMapperConfigRunActive} disabled={Boolean(mapperSyncBuild.issue)}>Run Sync</Button>
                       </Popconfirm>
+                      {activeMapperConfigRunActive ? <Button size="small" danger onClick={() => { void stopDataOpsActiveRun() }}>Stop</Button> : null}
                       <Button size="small" disabled={mapperSourceFields.length <= 0 || mapperTargetColumns.length <= 0} onClick={() => patchMapper({ mappingRows: mapperTargetColumns.slice(0, 20).map((target) => {
                         const matched = mapperSourceFields.find((source) => source.toLowerCase() === target.toLowerCase()) || ''
                         return { id: dataOpsId('map'), source: matched, target, defaultValue: '', key: selectedDataOpsPipelineStep.keyFields?.split(',').map((item) => item.trim().toLowerCase()).includes(target.toLowerCase()), enabled: true }
@@ -37950,10 +39845,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       { title: '', width: 70, render: (_value: unknown, row: DataOpsMapRow) => <Button size="small" danger onClick={() => patchMapper({ mappingRows: (selectedDataOpsPipelineStep.mappingRows || []).filter((item) => item.id !== row.id) })}>Remove</Button> },
                     ] as any[]}
                   />
-                  <div style={{ display: 'grid', gridTemplateColumns: '170px 120px 130px 150px 150px 1fr', gap: 10, alignItems: 'end' }}>
+                  <div className="data-ops-parameter-panel-grid">
+                  <div className="data-ops-parameter-card data-ops-batch-card" style={{ display: 'grid', gridTemplateColumns: '190px 110px 120px 120px 110px 110px 1fr', gap: 10, alignItems: 'end' }}>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Processing Mode</Text>
-                      <Select size="small" value={selectedDataOpsPipelineStep.syncProcessingMode || 'batch'} onChange={(value) => patchMapper({ syncProcessingMode: value as DataOpsPipelineStep['syncProcessingMode'] })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} options={[{ value: 'batch', label: 'Batch' }, { value: 'incremental_batch', label: 'Incremental Batch' }, { value: 'cursor', label: 'Cursor' }, { value: 'row_by_row', label: 'Row by Row' }]} />
+                      <Select size="small" value={selectedDataOpsPipelineStep.syncProcessingMode || 'batch'} onChange={(value) => patchMapper({ syncProcessingMode: value as DataOpsPipelineStep['syncProcessingMode'] })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} options={[{ value: 'batch', label: 'Batch' }, { value: 'incremental_batch', label: 'Incremental Batch' }, { value: 'incremental_batch_loop', label: 'Incremental Batch Loop' }, { value: 'cursor', label: 'Cursor' }, { value: 'row_by_row', label: 'Row by Row' }]} />
                     </div>
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Batch Size</Text>
@@ -37963,6 +39859,30 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Commit Every</Text>
                       <InputNumber size="small" min={1} value={selectedDataOpsPipelineStep.syncCommitEvery || 5000} onChange={(value) => patchMapper({ syncCommitEvery: Math.max(1, Number(value || 5000)) })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} />
                     </div>
+                    <div>
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Max Batches</Text>
+                      <InputNumber size="small" min={0} max={10000} value={selectedDataOpsPipelineStep.syncMaxBatches ?? 100} onChange={(value) => {
+                        const nextValue = Number(value ?? 100)
+                        patchMapper({ syncMaxBatches: Number.isFinite(nextValue) ? Math.max(0, Math.trunc(nextValue)) : 100 })
+                      }} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} />
+                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 10 }}>0 = keep polling until stopped</Text>
+                    </div>
+                    {selectedDataOpsPipelineStep.syncProcessingMode === 'incremental_batch_loop' ? (
+                      <div>
+                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Loop Gap Seconds</Text>
+                        <InputNumber
+                          size="small"
+                          min={1}
+                          max={3600}
+                          value={selectedDataOpsPipelineStep.syncLoopGapSeconds ?? 5}
+                          onChange={(value) => {
+                            const nextValue = Number(value ?? 5)
+                            patchMapper({ syncLoopGapSeconds: Number.isFinite(nextValue) ? Math.max(1, Math.trunc(nextValue)) : 5 })
+                          }}
+                          style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })}
+                        />
+                      </div>
+                    ) : null}
                     <div>
                       <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Parallel</Text>
                       <div style={{ marginTop: 8 }}><Switch size="small" checked={Boolean(selectedDataOpsPipelineStep.syncParallelEnabled)} onChange={(checked) => patchMapper({ syncParallelEnabled: checked })} /></div>
@@ -37976,12 +39896,109 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       <Select size="small" value={selectedDataOpsPipelineStep.syncErrorMode || 'stop'} onChange={(value) => patchMapper({ syncErrorMode: value as DataOpsPipelineStep['syncErrorMode'] })} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 5 })} options={[{ value: 'stop', label: 'Stop on error' }, { value: 'skip', label: 'Skip bad rows' }, { value: 'reject', label: 'Write reject rows' }]} />
                     </div>
                   </div>
-	                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
-	                    <Select size="small" showSearch allowClear optionFilterProp="label" value={selectedDataOpsPipelineStep.syncIncrementalField || undefined} onChange={(value) => patchMapper({ syncIncrementalField: String(value || '') })} placeholder="incremental watermark field" options={mapperSourceOptions} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%' })} />
-	                    <Select size="small" showSearch allowClear optionFilterProp="label" value={selectedDataOpsPipelineStep.syncCursorField || undefined} onChange={(value) => patchMapper({ syncCursorField: String(value || '') })} placeholder="cursor/order field" options={mapperSourceOptions} style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%' })} />
-	                    <Input size="small" value={selectedDataOpsPipelineStep.auditField || '_data_ops_audit'} onChange={(event) => patchMapper({ auditField: event.target.value })} placeholder="audit/status field" style={dataOpsInputStyle(dataOpsSectionColors.action)} />
-	                  </div>
-                  <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 10 }}>
+                  <Collapse
+                    className="data-ops-parameter-card data-ops-checkpoint-card"
+                    size="small"
+                    ghost
+                    items={[{
+                      key: 'checkpoint_cursor',
+                      label: 'Checkpoint / Incremental Cursor',
+                      children: (
+                        <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 10 }}>
+                          <div style={{ display: 'grid', gridTemplateColumns: '110px minmax(0, 1fr) minmax(0, 1fr) minmax(0, 0.9fr)', gap: 10, alignItems: 'end' }}>
+                            <div style={{ minWidth: 0 }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', lineHeight: '16px' }}>State</Text>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 8, height: 30, marginTop: 4 }}>
+                                <Switch size="small" checked={selectedDataOpsPipelineStep.checkpoint !== false && selectedDataOpsPipelineStep.checkpointEnabled !== false} onChange={(checked) => patchMapper({ checkpoint: checked, checkpointEnabled: checked })} />
+                                <Text style={{ color: 'var(--app-text)', fontSize: 12 }}>{selectedDataOpsPipelineStep.checkpoint !== false && selectedDataOpsPipelineStep.checkpointEnabled !== false ? 'Enabled' : 'Disabled'}</Text>
+                              </div>
+                            </div>
+                            <div style={{ minWidth: 0 }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', lineHeight: '16px' }}>ID Field</Text>
+                              <Select
+                                size="small"
+                                showSearch
+                                allowClear
+                                optionFilterProp="label"
+                                value={selectedDataOpsPipelineStep.checkpointIdField || selectedDataOpsPipelineStep.syncCursorField || undefined}
+                                onChange={(value) => patchMapper({ checkpointIdField: String(value || ''), syncCursorField: String(value || '') })}
+                                placeholder="source id / cursor id"
+                                options={mapperSourceOptions}
+                                style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 4 })}
+                              />
+                            </div>
+                            <div style={{ minWidth: 0 }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', lineHeight: '16px' }}>Transaction Time Field</Text>
+                              <Select
+                                size="small"
+                                showSearch
+                                allowClear
+                                optionFilterProp="label"
+                                value={selectedDataOpsPipelineStep.checkpointTimeField || selectedDataOpsPipelineStep.syncIncrementalField || undefined}
+                                onChange={(value) => patchMapper({ checkpointTimeField: String(value || ''), syncIncrementalField: String(value || '') })}
+                                placeholder="source transaction timestamp"
+                                options={mapperSourceOptions}
+                                style={dataOpsControlStyle(dataOpsSectionColors.action, { width: '100%', marginTop: 4 })}
+                              />
+                            </div>
+                            <div style={{ minWidth: 0 }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', lineHeight: '16px' }}>Audit Field</Text>
+                              <Input size="small" value={selectedDataOpsPipelineStep.auditField || '_data_ops_audit'} onChange={(event) => patchMapper({ auditField: event.target.value })} placeholder="audit/status field" style={dataOpsInputStyle(dataOpsSectionColors.action, { marginTop: 4 })} />
+                            </div>
+                          </div>
+                          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr) 312px', gap: 10, alignItems: 'end', borderTop: '1px solid var(--app-border)', paddingTop: 10 }}>
+                            <div style={{ minWidth: 0 }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', lineHeight: '16px', marginBottom: 4 }}>Stored Source ID Cursor</Text>
+                              <Input
+                                size="small"
+                                value={dataOpsCheckpointDraft.lastSourceId}
+                                onChange={(event) => setDataOpsCheckpointDraft((current) => ({ ...current, lastSourceId: event.target.value }))}
+                                placeholder="not stored"
+                                style={dataOpsInputStyle(dataOpsSectionColors.action)}
+                              />
+                            </div>
+                            <div style={{ minWidth: 0 }}>
+                              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11, display: 'block', lineHeight: '16px', marginBottom: 4 }}>Stored Transaction Time Cursor</Text>
+                              <Input
+                                size="small"
+                                value={dataOpsCheckpointDraft.lastTransactionTime}
+                                onChange={(event) => setDataOpsCheckpointDraft((current) => ({ ...current, lastTransactionTime: event.target.value }))}
+                                placeholder="not stored"
+                                style={dataOpsInputStyle(dataOpsSectionColors.action)}
+                              />
+                            </div>
+                            <Space size={6} style={{ justifyContent: 'flex-end', alignSelf: 'end' }}>
+                              <Button size="small" loading={dataOpsCheckpointLoading} onClick={() => { void loadDataOpsMapperCheckpoint(selectedDataOpsPipelineStep) }}>
+                                Refresh
+                              </Button>
+                              <Button size="small" type="primary" loading={dataOpsCheckpointLoading} onClick={() => { void saveDataOpsMapperCheckpoint(selectedDataOpsPipelineStep) }}>
+                                Save Cursor
+                              </Button>
+                              <Popconfirm
+                                title="Reset checkpoint cursor?"
+                                description="Next run will start without the saved incremental cursor for this mapper."
+                                okText="Reset"
+                                cancelText="Cancel"
+                                okButtonProps={{ danger: true }}
+                                onConfirm={() => { void resetDataOpsMapperCheckpoint(selectedDataOpsPipelineStep) }}
+                              >
+                                <Button size="small" danger loading={dataOpsCheckpointLoading} disabled={selectedDataOpsPipelineStep.checkpoint === false || selectedDataOpsPipelineStep.checkpointEnabled === false}>
+                                  Reset Cursor
+                                </Button>
+                              </Popconfirm>
+                            </Space>
+                          </div>
+                          {(dataOpsCheckpointCursor?.source || dataOpsCheckpointCursor?.updated_at) ? (
+                            <Space size={6} wrap>
+                              {dataOpsCheckpointCursor?.source ? <Tag color={dataOpsCheckpointCursor.source === 'legacy' ? 'orange' : 'blue'} style={{ marginInlineEnd: 0 }}>cursor: {String(dataOpsCheckpointCursor.source)}</Tag> : null}
+                              {dataOpsCheckpointCursor?.updated_at ? <Tag color="default" style={{ marginInlineEnd: 0 }}>updated: {String(dataOpsCheckpointCursor.updated_at).slice(0, 19)}</Tag> : null}
+                            </Space>
+                          ) : null}
+                        </div>
+                      ),
+                    }]}
+                  />
+                  <div className="data-ops-parameter-card data-ops-scheduler-card" style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 10 }}>
                     <Space style={{ width: '100%', justifyContent: 'space-between' }} align="start">
                       <div>
                         <Text style={{ color: 'var(--app-text)', fontWeight: 800, fontSize: 12 }}>Deploy / Scheduler</Text>
@@ -38042,6 +40059,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     </div>
                   </div>
                   </div>
+                  </div>
                   <div className="data-ops-mapper-sql-side">
                   <Collapse
                     size="small"
@@ -38056,6 +40074,16 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     }]}
                   />
                   </div>
+                  <Drawer
+                    title="Generated Sync SQL"
+                    placement="right"
+                    width={760}
+                    open={dataOpsMapperSqlDrawerOpen}
+                    onClose={() => setDataOpsMapperSqlDrawerOpen(false)}
+                    styles={{ body: { background: 'var(--app-panel-bg)' }, header: { background: 'var(--app-panel-bg)' } }}
+                  >
+                    {renderDataOpsSqlPreview(selectedDataOpsPipelineStep.expression || mapperSyncBuild.sql || mapperSyncBuild.issue, 300)}
+                  </Drawer>
                   </div>
                   </div>
                   </Modal>
@@ -38388,7 +40416,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       footer={[
         <Button key="cancel" onClick={() => setDataOpsActionOpen(false)}>Cancel</Button>,
         <Button key="preview" onClick={previewDataOpsActionScript}>Preview SQL Script</Button>,
-        <Button key="execute" type="primary" danger={/DROP|TRUNCATE/.test(dataOpsActionValue('operation', 'CREATE'))} loading={dataOpsSqlExecuting} onClick={() => { void executeDataOpsActionConfig() }}>
+        <Button key="execute" type="primary" danger={/DROP|TRUNCATE/.test(dataOpsActionValue('operation', 'CREATE'))} loading={dataOpsObjectSqlExecuting} onClick={() => { void executeDataOpsActionConfig() }}>
           Execute Action
         </Button>,
       ]}

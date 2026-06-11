@@ -31,6 +31,22 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 from loguru import logger
 
+
+def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
+    try:
+        parsed = int(str(os.getenv(name, str(default))).strip() or str(default))
+    except Exception:
+        parsed = int(default)
+    return max(min_value, min(parsed, max_value))
+
+
+DATA_OPS_QUERY_MAX_ROWS = _env_int(
+    "DATA_OPS_QUERY_MAX_ROWS",
+    _env_int("PIPELINE_GATEWAY_MAX_ROWS", 500000, 1000, 2000000),
+    1000,
+    2000000,
+)
+
 _BUSINESS_MAIL_EXECUTOR = ThreadPoolExecutor(
     max_workers=max(1, min(int(os.getenv("BUSINESS_MAIL_ASYNC_WORKERS", "8") or "8"), 32))
 )
@@ -5449,7 +5465,7 @@ END;"""
             limit = int((config or {}).get("limit", default) or default)
         except Exception:
             limit = default
-        return max(1, min(limit, 50000))
+        return max(1, min(limit, DATA_OPS_QUERY_MAX_ROWS))
 
     def _apply_oracle_source_limit(self, query: str, limit: int) -> str:
         q = str(query or "").strip().rstrip(";")
@@ -5457,7 +5473,7 @@ END;"""
             return q
         if self._oracle_query_has_row_limiter(q):
             return q
-        safe_limit = max(1, min(int(limit or 1000), 50000))
+        safe_limit = max(1, min(int(limit or 1000), DATA_OPS_QUERY_MAX_ROWS))
         return f"SELECT * FROM ({q}) src_q WHERE ROWNUM <= {safe_limit}"
 
     def _normalize_profile_query_mode(self, value: Any) -> str:
@@ -10402,7 +10418,7 @@ END;"""
             for candidate in row_count_candidates:
                 row_count = _positive_row_count(candidate)
                 if row_count is not None:
-                    return max(1, min(row_count, 50000))
+                    return max(1, min(row_count, DATA_OPS_QUERY_MAX_ROWS))
             return 1000
 
         def _query_result_total_limit() -> int:
@@ -10440,8 +10456,8 @@ END;"""
             for candidate in row_count_candidates:
                 row_count = _positive_row_count(candidate)
                 if row_count is not None:
-                    return max(1, min(row_count, 50000))
-            return 50000
+                    return max(1, min(row_count, DATA_OPS_QUERY_MAX_ROWS))
+            return DATA_OPS_QUERY_MAX_ROWS
 
         def _data_ops_saved_oracle_config(route_source_override: str = "") -> Dict[str, Any]:
             connections: List[Dict[str, Any]] = []
@@ -10610,6 +10626,7 @@ END;"""
             }
             if not used_names:
                 return {}
+            used_name_by_lower = {name.lower(): name for name in used_names}
             _, query_config, source_step = _data_ops_query_config_for_source(route_source_override)
             bind_rows = []
             if isinstance(query_config, dict):
@@ -10653,6 +10670,75 @@ END;"""
                         # Saved query execution is set-level. A downstream row field cannot be
                         # resolved before the query runs, so keep the bind default for this mode.
                         params.setdefault(name, item.get("value", ""))
+
+            checkpoint_bind_names = {
+                "checkpoint_last_source_id",
+                "checkpoint_last_transaction_time",
+                "checkpoint_key",
+            }
+
+            def _router_checkpoint_record() -> Dict[str, Any]:
+                if not isinstance(execution_context, dict):
+                    return {}
+                pipeline_key = str(execution_context.get("pipeline_id") or "").strip()
+                node_key = str(execution_context.get("node_id") or "").strip()
+                if not pipeline_key or not node_key:
+                    return {}
+                route_source = str(route_source_override or "").strip()
+                if not route_source:
+                    return {}
+                for router_step in raw_steps:
+                    if not isinstance(router_step, dict) or _kind(router_step) != "router":
+                        continue
+                    step_id = str(router_step.get("id") or "").strip()
+                    for router_config in router_step.get("routerConfigs") or router_step.get("router_configs") or []:
+                        if not isinstance(router_config, dict):
+                            continue
+                        if str(router_config.get("routeSource") or router_config.get("route_source") or "").strip() != route_source:
+                            continue
+                        config_id = str(router_config.get("id") or "").strip()
+                        if not step_id or not config_id:
+                            return {}
+                        checkpoint_key = f"{pipeline_key}::{node_key}::router::{step_id}::{config_id}::incremental_cursor"
+                        try:
+                            path = Path(__file__).resolve().parent / "state" / "data_ops_checkpoints.json"
+                            if not path.exists():
+                                return {"checkpoint_key": checkpoint_key}
+                            payload = json.loads(path.read_text(encoding="utf-8"))
+                            record = payload.get(checkpoint_key) if isinstance(payload, dict) else None
+                            if not isinstance(record, dict):
+                                return {"checkpoint_key": checkpoint_key}
+                            return {**record, "checkpoint_key": checkpoint_key}
+                        except Exception:
+                            return {"checkpoint_key": checkpoint_key}
+                return {}
+
+            missing_checkpoint_names = {
+                lower_name
+                for lower_name in checkpoint_bind_names
+                if lower_name in used_name_by_lower and used_name_by_lower[lower_name] not in params
+            }
+            if missing_checkpoint_names:
+                checkpoint_record = _router_checkpoint_record()
+                checkpoint_values = {
+                    "checkpoint_last_source_id": (
+                        checkpoint_record.get("last_source_id")
+                        if isinstance(checkpoint_record, dict)
+                        else None
+                    ),
+                    "checkpoint_last_transaction_time": (
+                        checkpoint_record.get("last_transaction_time")
+                        if isinstance(checkpoint_record, dict)
+                        else None
+                    ),
+                    "checkpoint_key": (
+                        checkpoint_record.get("checkpoint_key")
+                        if isinstance(checkpoint_record, dict)
+                        else ""
+                    ),
+                }
+                for lower_name in missing_checkpoint_names:
+                    params[used_name_by_lower[lower_name]] = checkpoint_values.get(lower_name)
 
             return {name: value for name, value in params.items() if name in used_names}
 
@@ -11092,14 +11178,313 @@ END;"""
                         "criteria_mode": "any" if match_mode == "any" else "all",
                     } if criteria else {}
 
-                def _rows_for_router_config(router_config: Dict[str, Any]) -> List[Any]:
+                def _rows_for_router_config(router_config: Dict[str, Any]) -> Tuple[List[Any], bool]:
                     route_source = str(router_config.get("routeSource") or router_config.get("route_source") or "").strip()
                     if not route_source:
-                        return rows
+                        return rows, False
                     if route_source not in query_rows_by_source:
                         query_rows_by_source[route_source] = _try_fetch_data_ops_query_rows(route_source)
                     fetched_rows, fetched = query_rows_by_source[route_source]
-                    return fetched_rows if fetched else rows
+                    return (fetched_rows, True) if fetched else (rows, False)
+
+                def _router_checkpoint_value(value: Any) -> Any:
+                    return self._json_safe_value(value)
+
+                def _router_checkpoint_sort_key(value: Any) -> Tuple[int, Any]:
+                    if value is None:
+                        return (0, "")
+                    if isinstance(value, bool):
+                        return (1, int(value))
+                    if isinstance(value, (int, float)) and not (isinstance(value, float) and math.isnan(value)):
+                        return (2, float(value))
+                    if isinstance(value, (datetime, date, time)):
+                        return (3, value.isoformat())
+                    text = str(value).strip()
+                    if not text:
+                        return (0, "")
+                    try:
+                        return (2, float(text.replace(",", "")))
+                    except Exception:
+                        pass
+                    try:
+                        return (3, datetime.fromisoformat(text.replace("Z", "+00:00")).isoformat())
+                    except Exception:
+                        return (1, text)
+
+                def _max_router_row_field(config_rows: List[Any], field_name: str) -> Tuple[Any, bool]:
+                    field = str(field_name or "").strip()
+                    if not field:
+                        return None, False
+                    best_value: Any = None
+                    best_key: Tuple[int, Any] = (0, "")
+                    found = False
+                    for row in config_rows:
+                        value, ok = self._extract_row_value_by_path(row, field)
+                        if not ok or value in (None, ""):
+                            continue
+                        value_key = _router_checkpoint_sort_key(value)
+                        if not found or value_key > best_key:
+                            best_value = value
+                            best_key = value_key
+                            found = True
+                    return best_value, found
+
+                def _save_router_checkpoint_after_success(
+                    router_config: Dict[str, Any],
+                    config_id: str,
+                    config_rows: List[Any],
+                ) -> None:
+                    if not config_rows:
+                        return
+                    if not self._parse_bool_like(router_config.get("checkpointEnabled", router_config.get("checkpoint_enabled", False)), False):
+                        return
+                    if not isinstance(execution_context, dict):
+                        return
+                    pipeline_key = str(execution_context.get("pipeline_id") or "").strip()
+                    node_key = str(execution_context.get("node_id") or "").strip()
+                    step_id = str(step.get("id") or "").strip()
+                    if not pipeline_key or not node_key or not step_id or not config_id:
+                        return
+
+                    source_field = str(
+                        router_config.get("checkpointIdField")
+                        or router_config.get("checkpoint_id_field")
+                        or router_config.get("syncCursorField")
+                        or router_config.get("sync_cursor_field")
+                        or ""
+                    ).strip()
+                    time_field = str(
+                        router_config.get("checkpointTimeField")
+                        or router_config.get("checkpoint_time_field")
+                        or router_config.get("syncIncrementalField")
+                        or router_config.get("sync_incremental_field")
+                        or ""
+                    ).strip()
+                    last_source_id, has_source_id = _max_router_row_field(config_rows, source_field)
+                    last_transaction_time, has_transaction_time = _max_router_row_field(config_rows, time_field)
+                    if not has_source_id and not has_transaction_time:
+                        return
+
+                    checkpoint_key = f"{pipeline_key}::{node_key}::router::{step_id}::{config_id}::incremental_cursor"
+                    path = Path(__file__).resolve().parent / "state" / "data_ops_checkpoints.json"
+                    lock_path = path.with_suffix(".lock")
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    lock_handle = None
+                    try:
+                        lock_handle = open(lock_path, "a+", encoding="utf-8")
+                        try:
+                            import fcntl  # type: ignore
+                            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                        except Exception:
+                            pass
+                        try:
+                            payload = json.loads(path.read_text(encoding="utf-8") or "{}") if path.exists() else {}
+                        except Exception:
+                            payload = {}
+                        if not isinstance(payload, dict):
+                            payload = {}
+                        existing = payload.get(checkpoint_key)
+                        if not isinstance(existing, dict):
+                            existing = {}
+                        next_record = {
+                            **existing,
+                            "checkpoint_key": checkpoint_key,
+                            "pipeline_id": pipeline_key,
+                            "data_ops_node_id": node_key,
+                            "task_master_id": "router",
+                            "mapper_step_id": step_id,
+                            "mapper_config_id": config_id,
+                            "router_step_id": step_id,
+                            "router_config_id": config_id,
+                            "business_window_key": str(execution_context.get("window_key") or ""),
+                            "rowcount": len(config_rows),
+                            "manual_override": False,
+                            "source": "data_ops_router_run",
+                            "updated_at": datetime.utcnow().isoformat() + "Z",
+                        }
+                        if has_source_id:
+                            next_record["last_source_id"] = _router_checkpoint_value(last_source_id)
+                        if has_transaction_time:
+                            next_record["last_transaction_time"] = _router_checkpoint_value(last_transaction_time)
+                        payload[checkpoint_key] = next_record
+                        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+                        tmp_path.write_text(
+                            json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True, default=str),
+                            encoding="utf-8",
+                        )
+                        os.replace(tmp_path, path)
+                    except Exception as exc:
+                        execution_context.setdefault("data_ops_warnings", []).append({
+                            "message": f"Router checkpoint cursor save failed for {config_name}: {exc}",
+                        })
+                    finally:
+                        if lock_handle is not None:
+                            try:
+                                import fcntl  # type: ignore
+                                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                            except Exception:
+                                pass
+                            try:
+                                lock_handle.close()
+                            except Exception:
+                                pass
+
+                def _router_int(value: Any, default: int, min_value: int, max_value: int) -> int:
+                    try:
+                        parsed = int(float(str(value if value is not None else default).strip() or str(default)))
+                    except Exception:
+                        parsed = int(default)
+                    return max(min_value, min(parsed, max_value))
+
+                def _router_loop_gap_seconds(router_config: Dict[str, Any]) -> int:
+                    return _router_int(
+                        router_config.get("syncLoopGapSeconds")
+                        or router_config.get("sync_loop_gap_seconds")
+                        or router_config.get("_data_ops_sync_loop_gap_seconds")
+                        or router_config.get("syncEmptyPollSeconds")
+                        or router_config.get("sync_empty_poll_seconds")
+                        or 5,
+                        5,
+                        1,
+                        3600,
+                    )
+
+                def _router_max_batches(router_config: Dict[str, Any]) -> int:
+                    return _router_int(
+                        router_config.get("syncMaxBatches")
+                        if router_config.get("syncMaxBatches") is not None
+                        else router_config.get("sync_max_batches"),
+                        100,
+                        0,
+                        10000,
+                    )
+
+                def _router_processing_mode(router_config: Dict[str, Any]) -> str:
+                    mode = str(
+                        router_config.get("syncProcessingMode")
+                        or router_config.get("sync_processing_mode")
+                        or router_config.get("_data_ops_sync_processing_mode")
+                        or "batch"
+                    ).strip().lower()
+                    return mode if mode in {"batch", "incremental_batch", "incremental_batch_loop", "cursor", "row_by_row"} else "batch"
+
+                def _router_stop_requested(config_id: str = "") -> bool:
+                    if not isinstance(execution_context, dict):
+                        return False
+                    stop_path = Path(__file__).resolve().parent / "state" / "data_ops_stop_signals.json"
+                    if not stop_path.exists():
+                        return False
+                    scope = {
+                        "job_id": str(execution_context.get("job_id") or execution_context.get("run_id") or "").strip(),
+                        "pipeline_id": str(execution_context.get("pipeline_id") or "").strip(),
+                        "data_ops_node_id": str(execution_context.get("data_ops_node_id") or execution_context.get("node_id") or "").strip(),
+                        "mapper_step_id": str(step.get("id") or "").strip(),
+                        "mapper_config_id": str(config_id or "").strip(),
+                        "router_step_id": str(step.get("id") or "").strip(),
+                        "router_config_id": str(config_id or "").strip(),
+                        "task_master_id": str(execution_context.get("task_master_id") or "").strip(),
+                    }
+                    try:
+                        signals = json.loads(stop_path.read_text(encoding="utf-8") or "[]")
+                    except Exception:
+                        return False
+                    if not isinstance(signals, list):
+                        return False
+                    for signal in signals:
+                        if not isinstance(signal, dict):
+                            continue
+                        signal_job = str(signal.get("job_id") or "").strip()
+                        if signal_job and signal_job == scope["job_id"]:
+                            return True
+                        matched = False
+                        mismatch = False
+                        for key in ("pipeline_id", "data_ops_node_id", "mapper_step_id", "mapper_config_id", "router_step_id", "router_config_id", "task_master_id"):
+                            signal_value = str(signal.get(key) or "").strip()
+                            if not signal_value:
+                                continue
+                            matched = True
+                            if signal_value != scope.get(key, ""):
+                                mismatch = True
+                                break
+                        if matched and not mismatch:
+                            return True
+                    return False
+
+                def _sleep_router_loop_gap(config_id: str, seconds: int) -> bool:
+                    slept = 0.0
+                    gap = max(1, int(seconds or 1))
+                    while slept < gap:
+                        if _router_stop_requested(config_id):
+                            return True
+                        step_sleep = min(1.0, gap - slept)
+                        pytime.sleep(step_sleep)
+                        slept += step_sleep
+                    return _router_stop_requested(config_id)
+
+                def _collect_rows_for_router_config(router_config: Dict[str, Any], config_id: str) -> Tuple[List[Any], bool, Dict[str, Any]]:
+                    mode = _router_processing_mode(router_config)
+                    if mode != "incremental_batch_loop":
+                        config_rows, config_rows_from_query = _rows_for_router_config(router_config)
+                        if config_rows_from_query:
+                            _save_router_checkpoint_after_success(router_config, config_id, config_rows)
+                        return config_rows, config_rows_from_query, {
+                            "processing_mode": mode,
+                            "batches": 1 if config_rows else 0,
+                            "loop_gap_seconds": 0,
+                            "stopped_reason": "complete",
+                        }
+
+                    route_source = str(router_config.get("routeSource") or router_config.get("route_source") or "").strip()
+                    max_batches = _router_max_batches(router_config)
+                    unlimited_batches = max_batches <= 0
+                    loop_gap_seconds = _router_loop_gap_seconds(router_config)
+                    combined_rows: List[Any] = []
+                    batches = 0
+                    empty_polls = 0
+                    stopped_reason = "running"
+                    batch_index = 0
+                    while unlimited_batches or batch_index < max_batches:
+                        if _router_stop_requested(config_id):
+                            stopped_reason = "stopped"
+                            break
+                        if route_source:
+                            query_rows_by_source.pop(route_source, None)
+                        config_rows, config_rows_from_query = _rows_for_router_config(router_config)
+                        batch_index += 1
+                        batches += 1
+                        if not config_rows_from_query:
+                            combined_rows.extend(config_rows)
+                            stopped_reason = "complete"
+                            break
+                        if not config_rows:
+                            empty_polls += 1
+                            if unlimited_batches:
+                                if _sleep_router_loop_gap(config_id, loop_gap_seconds):
+                                    stopped_reason = "stopped"
+                                    break
+                                continue
+                            stopped_reason = "no_rows"
+                            break
+                        combined_rows.extend(config_rows)
+                        if config_rows_from_query:
+                            _save_router_checkpoint_after_success(router_config, config_id, config_rows)
+                        if unlimited_batches or batch_index < max_batches:
+                            if _sleep_router_loop_gap(config_id, loop_gap_seconds):
+                                stopped_reason = "stopped"
+                                break
+                    if stopped_reason == "running":
+                        stopped_reason = "max_batches"
+                    return combined_rows, True, {
+                        "processing_mode": mode,
+                        "batches": batches,
+                        "empty_polls": empty_polls,
+                        "max_batches": 0 if unlimited_batches else max_batches,
+                        "unlimited_batches": unlimited_batches,
+                        "loop_gap_seconds": loop_gap_seconds,
+                        "stopped_reason": stopped_reason,
+                    }
 
                 for config_index, router_config in enumerate(runtime_configs):
                     config_id = str(router_config.get("id") or step.get("id") or f"router_{config_index + 1}").strip() or f"router_{config_index + 1}"
@@ -11115,7 +11500,7 @@ END;"""
                     if default_payload_mode not in {"all_rows", "batch", "row_by_row", "first_row", "grouped"}:
                         default_payload_mode = "all_rows"
 
-                    config_rows = _rows_for_router_config(router_config)
+                    config_rows, config_rows_from_query, config_loop_meta = _collect_rows_for_router_config(router_config, config_id)
                     config_matched_indices: set[int] = set()
                     config_row_handles_by_index: Dict[int, List[str]] = {}
                     default_routes: List[Dict[str, Any]] = []
@@ -11159,6 +11544,7 @@ END;"""
                             "match_mode": match_mode,
                             "payload_mode": str(route.get("payloadMode") or route.get("payload_mode") or default_payload_mode),
                             "row_count": len(bundle_rows),
+                            "loop": config_loop_meta,
                             **_route_target(route),
                         })
                         if route_mode == "single" and bundle_rows:
@@ -11187,6 +11573,7 @@ END;"""
                             "match_mode": "default",
                             "payload_mode": str(route.get("payloadMode") or route.get("payload_mode") or default_payload_mode),
                             "row_count": len(bundle_rows),
+                            "loop": config_loop_meta,
                             **_route_target(route),
                         })
 

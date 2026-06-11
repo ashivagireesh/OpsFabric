@@ -2621,6 +2621,9 @@ export default function PipelineEditor() {
                   { value: 5000, label: '5,000' },
                   { value: 10000, label: '10,000' },
                   { value: 50000, label: '50,000' },
+                  { value: 100000, label: '100,000' },
+                  { value: 250000, label: '250,000' },
+                  { value: 500000, label: '500,000' },
                 ]}
                 dropdownStyle={{ background: 'var(--app-card-bg)' }}
               />
