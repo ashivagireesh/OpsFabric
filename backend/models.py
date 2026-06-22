@@ -271,3 +271,61 @@ class ApiGatewayLog(Base):
     request_meta = Column(JSON, default={})
     response_meta = Column(JSON, default={})
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class RuleIntelligencePack(Base):
+    __tablename__ = "rule_intelligence_packs"
+
+    id = Column(String, primary_key=True, index=True)
+    name = Column(String, nullable=False, index=True)
+    description = Column(Text, nullable=True)
+    status = Column(String, default="draft", index=True)
+    owner = Column(String, default="admin")
+    source = Column(String, default="studio")
+    tags = Column(JSON, default=[])
+    current_version_id = Column(String, nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+    versions = relationship("RuleIntelligencePackVersion", back_populates="pack", cascade="all, delete-orphan")
+    events = relationship("RuleIntelligenceApprovalEvent", back_populates="pack", cascade="all, delete-orphan")
+
+
+class RuleIntelligencePackVersion(Base):
+    __tablename__ = "rule_intelligence_pack_versions"
+
+    id = Column(String, primary_key=True, index=True)
+    rule_pack_id = Column(String, ForeignKey("rule_intelligence_packs.id"), nullable=False, index=True)
+    version_number = Column(Integer, default=1)
+    version_label = Column(String, default="v1")
+    status = Column(String, default="draft", index=True)
+    config = Column(JSON, default={})
+    validation = Column(JSON, default={})
+    notes = Column(Text, nullable=True)
+    created_by = Column(String, default="admin")
+    submitted_by = Column(String, nullable=True)
+    approved_by = Column(String, nullable=True)
+    rejected_by = Column(String, nullable=True)
+    activated_by = Column(String, nullable=True)
+    submitted_at = Column(DateTime(timezone=True), nullable=True)
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    rejected_at = Column(DateTime(timezone=True), nullable=True)
+    activated_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+    pack = relationship("RuleIntelligencePack", back_populates="versions")
+    events = relationship("RuleIntelligenceApprovalEvent", back_populates="version", cascade="all, delete-orphan")
+
+
+class RuleIntelligenceApprovalEvent(Base):
+    __tablename__ = "rule_intelligence_approval_events"
+
+    id = Column(String, primary_key=True, index=True)
+    rule_pack_id = Column(String, ForeignKey("rule_intelligence_packs.id"), nullable=False, index=True)
+    version_id = Column(String, ForeignKey("rule_intelligence_pack_versions.id"), nullable=True, index=True)
+    action = Column(String, nullable=False, index=True)
+    actor = Column(String, default="admin")
+    comment = Column(Text, nullable=True)
+    detail = Column(JSON, default={})
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    pack = relationship("RuleIntelligencePack", back_populates="events")
+    version = relationship("RuleIntelligencePackVersion", back_populates="events")

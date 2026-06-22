@@ -20,6 +20,8 @@ import pickle
 import smtplib
 import ssl
 import sqlite3 as _sqlite3
+import csv as _csv
+import zipfile as _zipfile
 try:
     import fcntl as _fcntl  # type: ignore
 except Exception:  # pragma: no cover - Windows fallback
@@ -30,6 +32,7 @@ except Exception:  # pragma: no cover - non-Windows fallback
     _msvcrt = None
 from datetime import datetime, timedelta, date, time, timezone
 from decimal import Decimal
+from io import BytesIO
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 from contextlib import asynccontextmanager
@@ -195,6 +198,8 @@ def _resolve_backend_source_file_path(raw_path: str) -> str:
     if raw_file_path.startswith("__local__://"):
         relative_path = raw_file_path.replace("__local__://", "", 1).strip().lstrip("/")
         output_name = _os.path.basename(relative_path)
+        if relative_path:
+            candidates.append(_BACKEND_DIR / relative_path)
         if output_name:
             candidates.append(_BACKEND_DIR / "outputs" / output_name)
     else:
@@ -3228,6 +3233,53 @@ class CustomFieldValidationRequest(BaseModel):
     validation_source: str = "lmdb"  # lmdb|rocksdb (rows mode deprecated)
     lmdb_config: Dict[str, Any] = Field(default_factory=dict)
     rocksdb_config: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RuleIntelligencePreviewRequest(BaseModel):
+    config: Dict[str, Any] = Field(default_factory=dict)
+    rows: List[Dict[str, Any]] = Field(default_factory=list)
+    max_rows: int = 100
+    output_max_rows: int = 1000
+    use_upstream: bool = False
+    pipeline_id: Optional[str] = None
+    node_id: Optional[str] = None
+
+
+class RuleIntelligenceUpstreamSampleRequest(BaseModel):
+    pipeline_id: Optional[str] = None
+    node_id: Optional[str] = None
+    max_rows: int = 1000
+
+
+class RuleIntelligenceValidateRequest(BaseModel):
+    config: Dict[str, Any] = Field(default_factory=dict)
+    rows: List[Dict[str, Any]] = Field(default_factory=list)
+    max_rows: int = 100
+
+
+class RuleIntelligencePackCreateRequest(BaseModel):
+    name: str
+    description: Optional[str] = ""
+    tags: List[str] = Field(default_factory=list)
+    owner: str = "admin"
+    source: str = "studio"
+    config: Dict[str, Any] = Field(default_factory=dict)
+    notes: Optional[str] = ""
+
+
+class RuleIntelligenceVersionCreateRequest(BaseModel):
+    config: Dict[str, Any] = Field(default_factory=dict)
+    version_label: Optional[str] = None
+    notes: Optional[str] = ""
+    created_by: str = "admin"
+    validate: bool = True
+    rows: List[Dict[str, Any]] = Field(default_factory=list)
+    max_rows: int = 100
+
+
+class RuleIntelligenceLifecycleRequest(BaseModel):
+    actor: str = "admin"
+    comment: Optional[str] = ""
 
 
 class DevChatProviderProfile(BaseModel):
@@ -19261,6 +19313,244 @@ def _data_ops_enabled_mapper_config_ids(
         db.close()
 
 
+def _data_ops_oracle_ident(value: Any) -> str:
+    parts: List[str] = []
+    for part in str(value or "").split("."):
+        raw = part.strip()
+        if not raw:
+            continue
+        if re.match(r"^[A-Za-z][A-Za-z0-9_$#]*$", raw):
+            parts.append(raw.upper())
+        else:
+            parts.append(f"\"{raw.replace(chr(34), chr(34) + chr(34))}\"")
+    return ".".join(parts)
+
+
+def _data_ops_lookup_query_sql_from_steps(
+    steps: List[Dict[str, Any]],
+    lookup_source: str,
+    mapper_step_id: str = "",
+) -> str:
+    steps_by_id = {
+        str(step.get("id") or "").strip(): step
+        for step in steps
+        if isinstance(step, dict) and str(step.get("id") or "").strip()
+    }
+
+    def _step_query(step: Optional[Dict[str, Any]], query_id: str = "") -> str:
+        if not isinstance(step, dict):
+            return ""
+        query_rows = step.get("queryBuilders") or step.get("query_builders") or []
+        if isinstance(query_rows, list):
+            selected_id = query_id or str(step.get("activeQueryBuilderId") or step.get("active_query_builder_id") or "").strip()
+            candidates = [
+                item for item in query_rows
+                if isinstance(item, dict) and (not selected_id or str(item.get("id") or "").strip() == selected_id)
+            ]
+            if not candidates and query_rows:
+                candidates = [item for item in query_rows if isinstance(item, dict)]
+            for item in candidates:
+                sql = str(item.get("query") or item.get("expression") or "").strip()
+                if sql:
+                    return _strip_sql_terminator(sql)
+        return _strip_sql_terminator(step.get("query") or step.get("expression") or "")
+
+    source = str(lookup_source or "").strip()
+    if source.startswith("query:"):
+        parts = source.split(":")
+        if len(parts) >= 3:
+            return _step_query(steps_by_id.get(parts[1]), parts[2])
+    if source.startswith("step:"):
+        return _step_query(steps_by_id.get(source[len("step:"):]))
+
+    mapper_index = next(
+        (idx for idx, step in enumerate(steps) if isinstance(step, dict) and str(step.get("id") or "").strip() == mapper_step_id),
+        len(steps),
+    )
+    for step in reversed(steps[:mapper_index]):
+        if not isinstance(step, dict) or _data_ops_step_kind_for_scheduler(step) != "prepare":
+            continue
+        sql = _step_query(step)
+        if sql:
+            return sql
+    return ""
+
+
+def _data_ops_build_mapper_sql_from_config(
+    mapper_step: Dict[str, Any],
+    mapper_config: Dict[str, Any],
+    source_sql: str,
+) -> Tuple[str, str]:
+    target = str(mapper_config.get("target") or mapper_step.get("target") or "").strip()
+    source_sql = _strip_sql_terminator(source_sql)
+    if not target or not source_sql:
+        return "", source_sql
+    write_mode = str(mapper_config.get("writeMode") or mapper_config.get("write_mode") or mapper_step.get("writeMode") or "upsert").strip().lower()
+    mapping_rows = mapper_config.get("mappingRows") or mapper_config.get("mapping_rows") or mapper_step.get("mappingRows") or []
+    if not isinstance(mapping_rows, list):
+        mapping_rows = []
+    active_mappings = [
+        row for row in mapping_rows
+        if isinstance(row, dict)
+        and row.get("enabled") is not False
+        and str(row.get("target") or "").strip()
+        and (str(row.get("source") or "").strip() or str(row.get("defaultValue") or row.get("default_value") or "").strip())
+    ]
+    if not active_mappings:
+        return "", source_sql
+
+    sync_mode = str(mapper_config.get("syncProcessingMode") or mapper_config.get("sync_processing_mode") or mapper_step.get("syncProcessingMode") or "batch").strip()
+    try:
+        sync_batch_size = max(1, int(float(mapper_config.get("syncBatchSize") or mapper_config.get("sync_batch_size") or mapper_step.get("syncBatchSize") or 1000)))
+    except Exception:
+        sync_batch_size = 1000
+    batch_source_sql = source_sql
+    if sync_mode in {"incremental_batch", "incremental_batch_loop"}:
+        batch_source_sql = f"SELECT * FROM (\n{source_sql}\n) batch_src WHERE ROWNUM <= {sync_batch_size}"
+
+    def _source_expr(row: Dict[str, Any]) -> str:
+        explicit = str(row.get("defaultValue") or row.get("default_value") or "").strip()
+        if explicit:
+            return explicit
+        return f"src.{_data_ops_oracle_ident(row.get('source') or '')}"
+
+    target_name = _data_ops_oracle_ident(target)
+    target_columns = [_data_ops_oracle_ident(row.get("target") or "") for row in active_mappings]
+    select_list = ",\n".join(
+        f"  {_source_expr(row)} AS {_data_ops_oracle_ident(row.get('target') or '')}"
+        for row in active_mappings
+    )
+    source_subquery = f"SELECT\n{select_list}\nFROM (\n{batch_source_sql}\n) src"
+    insert_sql = (
+        f"INSERT INTO {target_name} ({', '.join(target_columns)})\n"
+        f"SELECT {', '.join(f'src.{column}' for column in target_columns)}\n"
+        f"FROM (\n{source_subquery}\n) src"
+    )
+    if write_mode in {"insert", "append"}:
+        return insert_sql, batch_source_sql
+    if write_mode == "truncate_insert":
+        escaped_target = target_name.replace("'", "''")
+        return f"BEGIN\n  EXECUTE IMMEDIATE 'TRUNCATE TABLE {escaped_target}';\n  {insert_sql.replace(chr(10), chr(10) + '  ')};\nEND;", batch_source_sql
+
+    key_text = str(mapper_config.get("keyFields") or mapper_config.get("key_fields") or mapper_step.get("keyFields") or "").strip()
+    key_targets = [item.strip() for item in re.split(r"[,\n]", key_text) if item.strip()]
+    for row in active_mappings:
+        if row.get("key") and str(row.get("target") or "").strip():
+            key_targets.append(str(row.get("target") or "").strip())
+    key_targets = list(dict.fromkeys(key_targets))
+    if write_mode in {"update", "upsert", "merge", "delete", "delete_insert"} and not key_targets:
+        return "", batch_source_sql
+    key_set = {_data_ops_oracle_ident(item).replace('"', "").upper() for item in key_targets}
+    on_clause = " AND ".join(f"tgt.{_data_ops_oracle_ident(field)} = src.{_data_ops_oracle_ident(field)}" for field in key_targets)
+    update_columns = [column for column in target_columns if column.replace('"', "").upper() not in key_set]
+    if write_mode == "delete":
+        return (
+            f"DELETE FROM {target_name} tgt\nWHERE EXISTS (\n  SELECT 1\n  FROM (\n{source_subquery}\n  ) src\n  WHERE {on_clause}\n)",
+            batch_source_sql,
+        )
+    if write_mode == "delete_insert":
+        indented_source = source_subquery.replace(chr(10), chr(10) + "      ")
+        indented_insert = insert_sql.replace(chr(10), chr(10) + "  ")
+        return (
+            f"BEGIN\n  DELETE FROM {target_name} tgt\n  WHERE EXISTS (\n    SELECT 1\n    FROM (\n{indented_source}\n    ) src\n    WHERE {on_clause}\n  );\n  {indented_insert};\nEND;",
+            batch_source_sql,
+        )
+    update_set = ",\n".join(f"  tgt.{column} = src.{column}" for column in update_columns)
+    matched_sql = f"\nWHEN MATCHED THEN UPDATE SET\n{update_set}" if update_set else ""
+    not_matched_sql = "" if write_mode == "update" else (
+        f"\nWHEN NOT MATCHED THEN INSERT ({', '.join(target_columns)})\n"
+        f"VALUES ({', '.join(f'src.{column}' for column in target_columns)})"
+    )
+    return f"MERGE INTO {target_name} tgt\nUSING (\n{source_subquery}\n) src\nON ({on_clause}){matched_sql}{not_matched_sql}", batch_source_sql
+
+
+def _data_ops_latest_task_master_subtask(
+    pipeline_id: str,
+    data_ops_node_id: str,
+    mapper_step_id: str,
+    task_master_id: str,
+    sub_task: Dict[str, Any],
+) -> Dict[str, Any]:
+    mapper_config_id = str(sub_task.get("mapper_config_id") or sub_task.get("config_id") or "").strip()
+    if not pipeline_id or not mapper_config_id:
+        return sub_task
+    db = SessionLocal()
+    try:
+        pipeline = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
+        if not pipeline or not isinstance(pipeline.nodes, list):
+            return sub_task
+        for node in pipeline.nodes:
+            if not isinstance(node, dict):
+                continue
+            if data_ops_node_id and str(node.get("id") or "").strip() != data_ops_node_id:
+                continue
+            data = node.get("data") if isinstance(node.get("data"), dict) else {}
+            cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
+            steps = cfg.get("data_ops_pipeline_nodes") if isinstance(cfg.get("data_ops_pipeline_nodes"), list) else []
+            clean_steps = [item for item in steps if isinstance(item, dict)]
+            for step in clean_steps:
+                if _data_ops_step_kind_for_scheduler(step) != "map":
+                    continue
+                if mapper_step_id and str(step.get("id") or "").strip() != mapper_step_id:
+                    continue
+                configs = step.get("mapperConfigs") or step.get("mapper_configs") or []
+                if not isinstance(configs, list):
+                    continue
+                mapper_config = next(
+                    (
+                        item for item in configs
+                        if isinstance(item, dict)
+                        and str(item.get("id") or "").strip() == mapper_config_id
+                        and item.get("enabled") is not False
+                        and (
+                            not task_master_id
+                            or str(item.get("taskMasterId") or item.get("task_master_id") or "").strip() == task_master_id
+                        )
+                    ),
+                    None,
+                )
+                if not isinstance(mapper_config, dict):
+                    continue
+                source_sql = _data_ops_lookup_query_sql_from_steps(
+                    clean_steps,
+                    str(mapper_config.get("lookupSource") or mapper_config.get("lookup_source") or step.get("lookupSource") or ""),
+                    str(step.get("id") or ""),
+                )
+                sql, checkpoint_source_sql = _data_ops_build_mapper_sql_from_config(step, mapper_config, source_sql)
+                if not sql:
+                    return sub_task
+                next_sub_task = copy.deepcopy(sub_task)
+                next_config = dict(next_sub_task.get("config") or {})
+                next_config.update(cfg)
+                next_config.update({
+                    "data_ops_active_mapper_config_id": mapper_config_id,
+                    "data_ops_mapper_step_id": str(step.get("id") or ""),
+                    "_data_ops_sync_processing_mode": mapper_config.get("syncProcessingMode") or mapper_config.get("sync_processing_mode") or "batch",
+                    "_data_ops_sync_batch_size": mapper_config.get("syncBatchSize") or mapper_config.get("sync_batch_size") or 1000,
+                    "_data_ops_sync_commit_every": mapper_config.get("syncCommitEvery") or mapper_config.get("sync_commit_every") or 5000,
+                    "_data_ops_sync_max_batches": mapper_config.get("syncMaxBatches") if mapper_config.get("syncMaxBatches") is not None else mapper_config.get("sync_max_batches", 100),
+                    "_data_ops_sync_loop_gap_seconds": mapper_config.get("syncLoopGapSeconds") if mapper_config.get("syncLoopGapSeconds") is not None else mapper_config.get("sync_loop_gap_seconds", 5),
+                    "_data_ops_checkpoint_enabled": mapper_config.get("checkpointEnabled", mapper_config.get("checkpoint_enabled", True)) is not False,
+                    "_data_ops_checkpoint_id_field": mapper_config.get("checkpointIdField") or mapper_config.get("checkpoint_id_field") or mapper_config.get("syncCursorField") or mapper_config.get("sync_cursor_field") or "",
+                    "_data_ops_checkpoint_time_field": mapper_config.get("checkpointTimeField") or mapper_config.get("checkpoint_time_field") or mapper_config.get("syncIncrementalField") or mapper_config.get("sync_incremental_field") or "",
+                    "_data_ops_checkpoint_source_sql": checkpoint_source_sql,
+                })
+                next_sub_task["config"] = next_config
+                next_sub_task["sql"] = sql
+                next_sub_task["mapper_config_name"] = str(mapper_config.get("name") or next_sub_task.get("mapper_config_name") or mapper_config_id)
+                try:
+                    next_sub_task["run_order"] = int(mapper_config.get("runOrder") or mapper_config.get("run_order") or next_sub_task.get("run_order") or 9999)
+                except Exception:
+                    next_sub_task["run_order"] = next_sub_task.get("run_order") or 9999
+                return next_sub_task
+        return sub_task
+    except Exception as exc:
+        logger.warning(f"Failed resolving latest Data Ops mapper sub task {mapper_config_id}: {exc}")
+        return sub_task
+    finally:
+        db.close()
+
+
 async def _run_scheduled_data_ops_task_master(
     job_id: str,
     config: Dict[str, Any],
@@ -19348,6 +19638,13 @@ async def _run_scheduled_data_ops_task_master(
         for runtime_bind_params in windows:
             business_window_key = str(runtime_bind_params.get("task_business_window_key") or "").strip()
             for sub_task in ordered_sub_tasks:
+                sub_task = _data_ops_latest_task_master_subtask(
+                    pipeline_id,
+                    data_ops_node_id,
+                    mapper_step_id,
+                    task_master_id,
+                    sub_task,
+                )
                 mapper_config_id = str(sub_task.get("mapper_config_id") or sub_task.get("config_id") or "").strip()
                 mapper_config_name = str(sub_task.get("mapper_config_name") or mapper_config_id or "Sub Task").strip()
                 sub_job_id = f"{job_id}:{mapper_config_id}:{business_window_key or completed + skipped + 1}"
@@ -22123,6 +22420,1253 @@ async def validate_custom_fields(body: CustomFieldValidationRequest):
         "warnings": warnings,
         "sample_input": _json_safe_value(normalized_rows[:10]),
         "sample_output": _json_safe_value((result_rows or [])[:20] if isinstance(result_rows, list) else []),
+    }
+
+
+def _rule_intelligence_parse_section(config: Dict[str, Any], key: str, fallback: Any) -> Any:
+    value = config.get(key)
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return fallback
+        try:
+            return json.loads(text)
+        except Exception:
+            return fallback
+    return value
+
+
+def _rule_intelligence_validate_config(config: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    errors: List[str] = []
+    warnings: List[str] = []
+    input_fields = _rule_intelligence_parse_section(config, "input_fields", [])
+    mapping = _rule_intelligence_parse_section(config, "field_mapping", {})
+    rules = _rule_intelligence_parse_section(config, "rules", [])
+    targets = _rule_intelligence_parse_section(config, "targets", [])
+    anomalies = _rule_intelligence_parse_section(config, "anomalies", [])
+    output_layout = _rule_intelligence_parse_section(config, "output_layout", {})
+
+    if not isinstance(input_fields, list):
+        errors.append("input_fields must be a JSON array.")
+        input_fields = []
+    if not isinstance(mapping, dict):
+        errors.append("field_mapping must be a JSON object.")
+        mapping = {}
+    if not isinstance(rules, list):
+        errors.append("rules must be a JSON array.")
+        rules = []
+    if not isinstance(targets, list):
+        errors.append("targets must be a JSON array.")
+        targets = []
+    if not isinstance(anomalies, list):
+        errors.append("anomalies must be a JSON array.")
+        anomalies = []
+    if not isinstance(output_layout, dict):
+        errors.append("output_layout must be a JSON object.")
+        output_layout = {}
+
+    seen_input_fields: set = set()
+    for idx, field in enumerate(input_fields):
+        if not isinstance(field, dict):
+            errors.append(f"Input field #{idx + 1}: item must be an object.")
+            continue
+        field_id = str(field.get("id") or field.get("name") or "").strip()
+        if not field_id:
+            errors.append(f"Input field #{idx + 1}: id is required.")
+            continue
+        if field_id in seen_input_fields:
+            errors.append(f"Input field '{field_id}': duplicate id.")
+        seen_input_fields.add(field_id)
+        if bool(field.get("required", False)) and not str(mapping.get(field_id) or field.get("mapped_field") or "").strip():
+            errors.append(f"Input field '{field_id}': required field is not mapped to an upstream field.")
+
+    if not input_fields:
+        for key in ["entity_field", "amount_field", "date_field"]:
+            if not str(mapping.get(key) or "").strip():
+                warnings.append(f"field_mapping.{key} is empty; runtime default will be used.")
+
+    enabled_rules = 0
+    seen_rule_names: set = set()
+    for idx, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            errors.append(f"Rule #{idx + 1}: item must be an object.")
+            continue
+        if rule.get("enabled", True) is False:
+            continue
+        enabled_rules += 1
+        name = str(rule.get("name") or rule.get("id") or "").strip()
+        if not name:
+            errors.append(f"Rule #{idx + 1}: name or id is required.")
+        elif name.lower() in seen_rule_names:
+            warnings.append(f"Rule '{name}' appears more than once.")
+        else:
+            seen_rule_names.add(name.lower())
+        calculation = rule.get("calculation") if isinstance(rule.get("calculation"), dict) else {}
+        method = str(calculation.get("method") or rule.get("calculation_type") or "percentage").strip().lower()
+        if method not in {"percentage", "percent", "rate", "flat", "fixed", "fixed_amount", "formula", "expression", "slab", "slabs", "tier"}:
+            errors.append(f"Rule '{name or idx + 1}': unsupported calculation method '{method}'.")
+        if method in {"formula", "expression"} and not str(calculation.get("expression") or rule.get("expression") or "").strip():
+            errors.append(f"Rule '{name or idx + 1}': formula expression is required.")
+        cap = rule.get("cap") if isinstance(rule.get("cap"), dict) else {}
+        if cap and cap.get("enabled") is not False and cap.get("amount", cap.get("max_amount")) is None:
+            warnings.append(f"Rule '{name or idx + 1}': cap is enabled without amount/max_amount.")
+    if enabled_rules == 0:
+        warnings.append("No enabled calculation rules configured.")
+
+    for idx, target in enumerate(targets):
+        if not isinstance(target, dict):
+            errors.append(f"Target #{idx + 1}: item must be an object.")
+            continue
+        if target.get("enabled", True) is False:
+            continue
+        if target.get("target_value", target.get("target", target.get("value"))) is None:
+            errors.append(f"Target #{idx + 1}: target_value is required.")
+
+    for idx, anomaly in enumerate(anomalies):
+        if not isinstance(anomaly, dict):
+            errors.append(f"Anomaly #{idx + 1}: item must be an object.")
+            continue
+        if anomaly.get("enabled", True) is False:
+            continue
+        if anomaly.get("value", anomaly.get("threshold", anomaly.get("threshold_value"))) is None:
+            errors.append(f"Anomaly #{idx + 1}: threshold/value is required.")
+
+    mode = str(output_layout.get("mode") or output_layout.get("output_mode") or "pivot").strip().lower()
+    if mode not in {"ledger", "summary", "pivot", "settlement", "settlement_summary", "settlement_report", "ledger_and_pivot", "all"}:
+        errors.append(f"output_layout.mode '{mode}' is not supported.")
+
+    return errors, warnings
+
+
+def _rule_intelligence_node_type(node: Any) -> str:
+    if not isinstance(node, dict):
+        return ""
+    data = node.get("data") if isinstance(node.get("data"), dict) else {}
+    definition = data.get("definition") if isinstance(data.get("definition"), dict) else {}
+    return str(
+        data.get("nodeType")
+        or definition.get("type")
+        or node.get("nodeType")
+        or node.get("type")
+        or ""
+    ).strip().lower()
+
+
+def _rule_intelligence_node_config(node: Any) -> Dict[str, Any]:
+    if not isinstance(node, dict):
+        return {}
+    data = node.get("data") if isinstance(node.get("data"), dict) else {}
+    config = data.get("config") if isinstance(data.get("config"), dict) else node.get("config")
+    return dict(config) if isinstance(config, dict) else {}
+
+
+def _rule_intelligence_read_tabular_file_sample(file_path: Any, max_rows: int) -> List[Dict[str, Any]]:
+    path = _resolve_backend_source_file_path(str(file_path or "").strip())
+    if not path or not _os.path.isfile(path):
+        return []
+    limit = max(1, min(int(max_rows or 1000), 10000))
+    suffix = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    try:
+        import pandas as pd
+        if suffix == "csv":
+            df = pd.read_csv(path, nrows=limit)
+            return df.fillna("").to_dict(orient="records")
+        if suffix in {"xlsx", "xls"}:
+            df = pd.read_excel(path, nrows=limit)
+            return df.fillna("").to_dict(orient="records")
+        if suffix == "parquet":
+            df = pd.read_parquet(path)
+            return df.head(limit).fillna("").to_dict(orient="records")
+        if suffix == "json":
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if isinstance(payload, list):
+                return [row for row in payload if isinstance(row, dict)][:limit]
+            if isinstance(payload, dict):
+                for key in ("rows", "records", "items", "data", "result", "output"):
+                    nested = payload.get(key)
+                    if isinstance(nested, list):
+                        return [row for row in nested if isinstance(row, dict)][:limit]
+                return [payload]
+    except Exception:
+        return []
+    return []
+
+
+def _rule_intelligence_direct_source_ids(pipeline: Any, node_id: str) -> List[str]:
+    edges = pipeline.edges if isinstance(getattr(pipeline, "edges", None), list) else []
+    out: List[str] = []
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if str(edge.get("target") or "").strip() != node_id:
+            continue
+        source = str(edge.get("source") or "").strip()
+        if source and source not in out:
+            out.append(source)
+    return out
+
+
+def _rule_intelligence_candidate_file_paths(pipeline: Any, node_id: str, source_ids: List[str]) -> List[str]:
+    nodes = pipeline.nodes if isinstance(getattr(pipeline, "nodes", None), list) else []
+    edges = pipeline.edges if isinstance(getattr(pipeline, "edges", None), list) else []
+    node_by_id = {
+        str(node.get("id") or "").strip(): node
+        for node in nodes
+        if isinstance(node, dict) and str(node.get("id") or "").strip()
+    }
+    candidate_node_ids: List[str] = []
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        source = str(edge.get("source") or "").strip()
+        target = str(edge.get("target") or "").strip()
+        if source in source_ids and target and target != node_id and target not in candidate_node_ids:
+            candidate_node_ids.append(target)
+
+    for source_id in source_ids:
+        source_node = node_by_id.get(source_id)
+        source_config = _rule_intelligence_node_config(source_node)
+        for step in source_config.get("data_ops_pipeline_nodes") or []:
+            if not isinstance(step, dict):
+                continue
+            route_rows = step.get("routeRows")
+            if not isinstance(route_rows, list):
+                continue
+            for route in route_rows:
+                if not isinstance(route, dict):
+                    continue
+                target = str(route.get("targetNodeId") or route.get("target_node_id") or "").strip()
+                if target and target != node_id and target not in candidate_node_ids:
+                    candidate_node_ids.append(target)
+        for router in source_config.get("routerConfigs") or []:
+            if not isinstance(router, dict):
+                continue
+            for route in router.get("routeRows") or []:
+                if not isinstance(route, dict):
+                    continue
+                target = str(route.get("targetNodeId") or route.get("target_node_id") or "").strip()
+                if target and target != node_id and target not in candidate_node_ids:
+                    candidate_node_ids.append(target)
+
+    paths: List[str] = []
+    for candidate_id in candidate_node_ids:
+        candidate_node = node_by_id.get(candidate_id)
+        candidate_type = _rule_intelligence_node_type(candidate_node)
+        candidate_config = _rule_intelligence_node_config(candidate_node)
+        file_path = str(candidate_config.get("file_path") or candidate_config.get("path") or "").strip()
+        if not file_path:
+            continue
+        if (
+            candidate_type.endswith("_destination")
+            or candidate_type in {"csv_destination", "json_destination", "excel_destination", "parquet_destination"}
+            or candidate_type in {"csv_source", "json_source", "excel_source", "parquet_source"}
+        ):
+            if file_path not in paths:
+                    paths.append(file_path)
+    return paths
+
+
+def _rule_intelligence_data_ops_bind_defaults(query_config: Dict[str, Any], step: Dict[str, Any], sql: str) -> Dict[str, Any]:
+    used_names = set(_data_ops_sql_bind_names(sql))
+    params: Dict[str, Any] = {}
+    bind_rows: List[Any] = []
+    for source in (query_config, step):
+        rows = (
+            source.get("bindParameters")
+            or source.get("bind_parameters")
+            or source.get("bindParams")
+            or []
+        ) if isinstance(source, dict) else []
+        if isinstance(rows, list):
+            bind_rows.extend(rows)
+    for row in bind_rows:
+        if not isinstance(row, dict) or row.get("enabled") is False:
+            continue
+        name = str(row.get("name") or row.get("param") or row.get("key") or "").strip().lstrip(":")
+        if not name or (used_names and name not in used_names):
+            continue
+        if row.get("defaultValue") is not None:
+            params[name] = row.get("defaultValue")
+        elif row.get("default_value") is not None:
+            params[name] = row.get("default_value")
+        elif row.get("value") is not None:
+            params[name] = row.get("value")
+    return params
+
+
+def _rule_intelligence_data_ops_oracle_config(config: Dict[str, Any], step: Dict[str, Any], query_config: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(config or {})
+    connection_name = ""
+    tables = query_config.get("tables") if isinstance(query_config, dict) else None
+    if not isinstance(tables, list):
+        tables = step.get("tables") if isinstance(step, dict) else None
+    if isinstance(tables, list):
+        for table_row in tables:
+            if isinstance(table_row, dict) and str(table_row.get("connection") or "").strip():
+                connection_name = str(table_row.get("connection") or "").strip()
+                break
+    connection_rows: List[Any] = []
+    for source in (step, config):
+        rows = source.get("connections") if isinstance(source, dict) else None
+        if isinstance(rows, list):
+            connection_rows.extend(rows)
+    selected_connection: Optional[Dict[str, Any]] = None
+    for row in connection_rows:
+        if not isinstance(row, dict):
+            continue
+        if connection_name and str(row.get("name") or "").strip() == connection_name:
+            selected_connection = row
+            break
+        if selected_connection is None and str(row.get("type") or "").strip().lower() == "oracle":
+            selected_connection = row
+    if selected_connection:
+        merged.update({
+            key: value
+            for key, value in selected_connection.items()
+            if value is not None and str(value).strip() != ""
+        })
+        if selected_connection.get("service") and not merged.get("oracle_service_name"):
+            merged["oracle_service_name"] = selected_connection.get("service")
+    return merged
+
+
+def _rule_intelligence_data_ops_active_query(step: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    query_rows = step.get("queryBuilders") or step.get("query_builders") or []
+    active_id = str(step.get("activeQueryBuilderId") or step.get("active_query_builder_id") or "").strip()
+    if isinstance(query_rows, list) and query_rows:
+        candidates = [
+            row for row in query_rows
+            if isinstance(row, dict) and (not active_id or str(row.get("id") or "").strip() == active_id)
+        ]
+        if not candidates:
+            candidates = [row for row in query_rows if isinstance(row, dict)]
+        for row in candidates:
+            sql = _strip_sql_terminator(row.get("query") or row.get("expression") or "")
+            if sql:
+                return sql, row
+    return _strip_sql_terminator(step.get("query") or step.get("expression") or ""), {}
+
+
+def _rule_intelligence_load_data_ops_upstream_rows(
+    pipeline: Any,
+    source_ids: List[str],
+    max_rows: int,
+) -> Dict[str, Any]:
+    safe_max_rows = max(1, min(int(max_rows or 1000), 250000))
+    nodes = pipeline.nodes if isinstance(getattr(pipeline, "nodes", None), list) else []
+    node_by_id = {
+        str(node.get("id") or "").strip(): node
+        for node in nodes
+        if isinstance(node, dict) and str(node.get("id") or "").strip()
+    }
+    for source_id in source_ids:
+        source_node = node_by_id.get(source_id)
+        if _rule_intelligence_node_type(source_node) != "data_ops":
+            continue
+        config = _rule_intelligence_node_config(source_node)
+        steps = config.get("data_ops_pipeline_nodes") if isinstance(config.get("data_ops_pipeline_nodes"), list) else []
+        prepare_steps = [
+            step for step in steps
+            if isinstance(step, dict)
+            and step.get("enabled", True) is not False
+            and str(step.get("kind") or step.get("type") or "").strip().lower() in {"prepare", "query", "query_builder"}
+        ]
+        for step in reversed(prepare_steps):
+            sql, query_config = _rule_intelligence_data_ops_active_query(step)
+            if not sql:
+                continue
+            if _data_ops_first_sql_keyword(sql) not in {"SELECT", "WITH"} or ";" in sql:
+                continue
+            conn = None
+            cur = None
+            try:
+                oracle_config = _rule_intelligence_data_ops_oracle_config(config, step, query_config)
+                bind_params = _rule_intelligence_data_ops_bind_defaults(query_config, step, sql)
+                execution_binds: Dict[str, Any] = {"limit": safe_max_rows}
+                missing_binds: List[str] = []
+                for name in _data_ops_sql_bind_names(sql):
+                    if str(name).lower() == "limit":
+                        continue
+                    found, value = _data_ops_resolve_bind_param_value(name, bind_params)
+                    if found:
+                        execution_binds[name] = _data_ops_oracle_bind_value(name, value)
+                    else:
+                        missing_binds.append(name)
+                if missing_binds:
+                    return {
+                        "ok": False,
+                        "rows": [],
+                        "source": "data_ops_live_query",
+                        "source_node_id": source_id,
+                        "message": f"Missing bind value(s): {', '.join(f':{name}' for name in missing_binds)}",
+                    }
+                conn = _data_ops_oracle_connect(oracle_config)
+                cur = conn.cursor()
+                cur.arraysize = min(5000, max(100, safe_max_rows))
+                cur.execute(f"SELECT * FROM ({sql}) WHERE ROWNUM <= :limit", execution_binds)
+                columns = [str(desc[0] or "") for desc in (cur.description or [])]
+                rows: List[Dict[str, Any]] = []
+                while len(rows) < safe_max_rows:
+                    chunk = cur.fetchmany(min(5000, safe_max_rows - len(rows)))
+                    if not chunk:
+                        break
+                    for record in chunk:
+                        rows.append({
+                            columns[idx]: _data_ops_oracle_value(value)
+                            for idx, value in enumerate(record)
+                        })
+                if rows:
+                    return {
+                        "ok": True,
+                        "rows": _json_safe_value(rows),
+                        "source": "data_ops_live_query",
+                        "source_node_id": source_id,
+                        "row_count": len(rows),
+                        "row_limit": safe_max_rows,
+                    }
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "rows": [],
+                    "source": "data_ops_live_query",
+                    "source_node_id": source_id,
+                    "message": f"Data Ops live preview failed: {exc}",
+                }
+            finally:
+                if cur:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+    return {"ok": False, "rows": [], "source": "none", "message": "No live Data Ops SELECT query found."}
+
+
+def _rule_intelligence_load_upstream_sample(
+    db: Session,
+    pipeline_id: str,
+    node_id: str,
+    max_rows: int,
+    prefer_live: bool = False,
+) -> Dict[str, Any]:
+    safe_max_rows = max(1, min(int(max_rows or 1000), 250000))
+    pipeline = db.query(models.Pipeline).filter(models.Pipeline.id == pipeline_id).first()
+    if not pipeline:
+        return {"ok": False, "rows": [], "source": "none", "message": "Pipeline not found."}
+    source_ids = _rule_intelligence_direct_source_ids(pipeline, node_id)
+    if not source_ids:
+        return {"ok": False, "rows": [], "source": "none", "message": "Rule Intelligence node has no direct upstream source."}
+
+    if prefer_live:
+        live_rows = _rule_intelligence_load_data_ops_upstream_rows(pipeline, source_ids, safe_max_rows)
+        if live_rows.get("ok") or live_rows.get("source") == "data_ops_live_query":
+            return live_rows
+
+    exec_row = db.query(models.Execution).filter(
+        models.Execution.pipeline_id == pipeline_id,
+        models.Execution.status == "success",
+    ).order_by(models.Execution.started_at.desc()).first()
+    if exec_row and exec_row.node_results:
+        for source_id in source_ids:
+            rows = _extract_rows_from_pipeline_execution(exec_row.node_results, source_id, strict_preferred=True)
+            rows = [row for row in rows if isinstance(row, dict)][:safe_max_rows]
+            if rows:
+                return {
+                    "ok": True,
+                    "rows": _json_safe_value(rows),
+                    "source": "latest_execution",
+                    "source_node_id": source_id,
+                    "row_count": len(rows),
+                }
+
+    file_paths = _rule_intelligence_candidate_file_paths(pipeline, node_id, source_ids)
+    for file_path in file_paths:
+        rows = _rule_intelligence_read_tabular_file_sample(file_path, safe_max_rows)
+        if rows:
+            return {
+                "ok": True,
+                "rows": _json_safe_value(rows),
+                "source": "connected_file_output",
+                "file_path": file_path,
+                "row_count": len(rows),
+            }
+
+    live_rows = _rule_intelligence_load_data_ops_upstream_rows(pipeline, source_ids, safe_max_rows)
+    if live_rows.get("ok") or live_rows.get("source") == "data_ops_live_query":
+        return live_rows
+
+    return {
+        "ok": False,
+        "rows": [],
+        "source": "none",
+        "source_node_ids": source_ids,
+        "message": "No upstream sample rows found in latest execution or connected output files.",
+    }
+
+
+@app.post("/api/rule-intelligence/upstream-sample")
+async def rule_intelligence_upstream_sample(body: RuleIntelligenceUpstreamSampleRequest, db: Session = Depends(get_db)):
+    pipeline_id = str(body.pipeline_id or "").strip()
+    node_id = str(body.node_id or "").strip()
+    if not pipeline_id or not node_id:
+        return {
+            "ok": False,
+            "rows": [],
+            "source": "none",
+            "message": "pipeline_id and node_id are required.",
+        }
+    result = _rule_intelligence_load_upstream_sample(db, pipeline_id, node_id, body.max_rows)
+    rows = result.get("rows") if isinstance(result.get("rows"), list) else []
+    columns: List[str] = []
+    seen: set[str] = set()
+    for row in rows[:50]:
+        if not isinstance(row, dict):
+            continue
+        for key in row.keys():
+            text = str(key or "").strip()
+            if text and text not in seen:
+                seen.add(text)
+                columns.append(text)
+    result["columns"] = columns
+    result["row_count"] = int(result.get("row_count") or len(rows))
+    return result
+
+
+RULE_INTELLIGENCE_DEFAULT_CLUSTER_NAMES: Dict[str, str] = {
+    "eligibility": "Eligibility",
+    "commission": "Commission Calculation",
+    "target_activity": "BC Activity Targets",
+    "target_service": "Service Targets",
+    "target_amount": "Amount Targets",
+    "target_commission": "Commission Targets",
+    "target_quality": "Quality Targets",
+    "target_compliance": "Compliance Targets",
+    "anomaly_transaction": "Transaction Risk",
+    "anomaly_agent": "Agent Behavior",
+    "anomaly_commission": "Commission Control",
+    "anomaly_data_quality": "Data Quality",
+    "anomaly_eligibility": "Eligibility Control",
+    "output": "Output Formatting",
+}
+
+
+def _rule_intelligence_cluster_names(config: Dict[str, Any]) -> Dict[str, str]:
+    clusters = _rule_intelligence_parse_section(config, "clusters", [])
+    out: Dict[str, str] = dict(RULE_INTELLIGENCE_DEFAULT_CLUSTER_NAMES)
+    if not isinstance(clusters, list):
+        return out
+    for cluster in clusters:
+        if not isinstance(cluster, dict):
+            continue
+        cluster_id = str(cluster.get("id") or cluster.get("key") or "").strip()
+        if not cluster_id:
+            continue
+        out[cluster_id] = str(cluster.get("name") or cluster_id).strip() or cluster_id
+    return out
+
+
+def _rule_intelligence_monitoring_sections(
+    config: Dict[str, Any],
+    input_rows: List[Dict[str, Any]],
+    max_rows: int,
+) -> Dict[str, Any]:
+    mapping = etl_engine._rule_engine_mapping(config or {})
+    output_layout = etl_engine._rule_engine_json_value((config or {}).get("output_layout"), {})
+    output_layout = output_layout if isinstance(output_layout, dict) else {}
+    output_layout.setdefault("mode", "pivot")
+    output_layout.setdefault("row_fields", ["entity", "period"])
+    output_layout.setdefault("period_grain", "month")
+    targets = etl_engine._rule_engine_list((config or {}).get("targets"))
+    anomalies = etl_engine._rule_engine_list((config or {}).get("anomalies"))
+    cluster_names = _rule_intelligence_cluster_names(config or {})
+
+    def _enrich(row: Dict[str, Any], fallback_cluster_id: str) -> Dict[str, Any]:
+        out = dict(row or {})
+        cluster_id = str(out.get("cluster_id") or fallback_cluster_id).strip() or fallback_cluster_id
+        out["cluster_id"] = cluster_id
+        out["cluster_name"] = cluster_names.get(cluster_id, cluster_id)
+        return out
+
+    target_rows = [
+        _enrich(row, "target_activity")
+        for row in etl_engine._rule_engine_target_rows(input_rows, targets, mapping, output_layout)
+    ]
+    anomaly_rows = [
+        _enrich(row, "anomaly_transaction")
+        for row in etl_engine._rule_engine_anomaly_rows(input_rows, anomalies, mapping, output_layout)
+    ]
+    return {
+        "target_rows": len(target_rows),
+        "anomaly_rows": len(anomaly_rows),
+        "target_output": _json_safe_value(target_rows[:max_rows]),
+        "anomaly_output": _json_safe_value(anomaly_rows[:max_rows]),
+    }
+
+
+@app.post("/api/rule-intelligence/preview")
+async def preview_rule_intelligence(body: RuleIntelligencePreviewRequest, db: Session = Depends(get_db)):
+    config = body.config if isinstance(body.config, dict) else {}
+    max_rows = max(1, min(int(body.max_rows or 100), 250000))
+    output_max_rows = max(1, min(int(body.output_max_rows or 1000), 5000))
+    upstream_source = ""
+    if body.use_upstream and str(body.pipeline_id or "").strip() and str(body.node_id or "").strip():
+        upstream_result = _rule_intelligence_load_upstream_sample(
+            db,
+            str(body.pipeline_id or "").strip(),
+            str(body.node_id or "").strip(),
+            max_rows,
+            prefer_live=True,
+        )
+        upstream_rows = upstream_result.get("rows") if isinstance(upstream_result, dict) else []
+        input_rows = etl_engine._rule_engine_extract_rows_from_payload(upstream_rows if isinstance(upstream_rows, list) else [])
+        upstream_source = str(upstream_result.get("source") or "") if isinstance(upstream_result, dict) else ""
+        if not input_rows and isinstance(upstream_result, dict) and upstream_result.get("message"):
+            return {
+                "ok": False,
+                "input_rows": 0,
+                "output_rows": 0,
+                "errors": [str(upstream_result.get("message") or "No upstream rows found.")],
+                "warnings": [],
+                "sample_input": [],
+                "sample_output": [],
+                "source": upstream_source,
+            }
+    else:
+        input_rows = etl_engine._rule_engine_extract_rows_from_payload(body.rows if isinstance(body.rows, list) else [])
+    input_rows = input_rows[:max_rows]
+    if not input_rows:
+        return {
+            "ok": False,
+            "input_rows": 0,
+            "output_rows": 0,
+            "errors": ["No sample rows provided for Rule Intelligence preview."],
+            "warnings": [],
+            "sample_input": [],
+            "sample_output": [],
+            "source": upstream_source,
+        }
+    errors, warnings = _rule_intelligence_validate_config(config)
+    if errors:
+        return {
+            "ok": False,
+            "input_rows": len(input_rows),
+            "output_rows": 0,
+            "errors": errors,
+                "warnings": warnings,
+                "sample_input": _json_safe_value(input_rows[:10]),
+                "sample_output": [],
+                "source": upstream_source,
+            }
+    transform_warnings: List[str] = []
+    try:
+        result_rows = etl_engine._transform_rule_intelligence(
+            input_rows,
+            config,
+            execution_context={
+                "node_id": "__rule_intelligence_preview__",
+                "node_warnings": transform_warnings,
+            },
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "input_rows": len(input_rows),
+            "output_rows": 0,
+            "errors": [f"{exc.__class__.__name__}: {exc}"],
+            "warnings": warnings + transform_warnings[:200],
+            "sample_input": _json_safe_value(input_rows[:10]),
+            "sample_output": [],
+            "source": upstream_source,
+        }
+    return {
+        "ok": True,
+        "input_rows": len(input_rows),
+        "output_rows": len(result_rows),
+        "calculation_rows": len(result_rows),
+        "errors": [],
+        "warnings": warnings + transform_warnings[:200],
+        "sample_input": _json_safe_value(input_rows[:10]),
+        "sample_output": _json_safe_value(result_rows[:output_max_rows]),
+        "calculation_output": _json_safe_value(result_rows[:output_max_rows]),
+        "source": upstream_source,
+        "preview_row_limit": max_rows,
+        "output_row_limit": output_max_rows,
+        **_rule_intelligence_monitoring_sections(config, input_rows, output_max_rows),
+    }
+
+
+@app.post("/api/rule-intelligence/validate")
+async def validate_rule_intelligence(body: RuleIntelligenceValidateRequest):
+    config = body.config if isinstance(body.config, dict) else {}
+    max_rows = max(1, min(int(body.max_rows or 100), 1000))
+    input_rows = etl_engine._rule_engine_extract_rows_from_payload(body.rows if isinstance(body.rows, list) else [])
+    input_rows = input_rows[:max_rows]
+    errors, warnings = _rule_intelligence_validate_config(config)
+    preview_rows: List[Dict[str, Any]] = []
+    if not errors and input_rows:
+        transform_warnings: List[str] = []
+        try:
+            preview_rows = etl_engine._transform_rule_intelligence(
+                input_rows,
+                config,
+                execution_context={
+                    "node_id": "__rule_intelligence_validate__",
+                    "node_warnings": transform_warnings,
+                },
+            )
+            warnings.extend(transform_warnings[:200])
+        except Exception as exc:
+            errors.append(f"{exc.__class__.__name__}: {exc}")
+    elif not input_rows:
+        warnings.append("No sample rows supplied; validation checked configuration only.")
+    return {
+        "ok": len(errors) == 0,
+        "input_rows": len(input_rows),
+        "output_rows": len(preview_rows),
+        "calculation_rows": len(preview_rows),
+        "errors": errors,
+        "warnings": warnings,
+        "sample_input": _json_safe_value(input_rows[:10]),
+        "sample_output": _json_safe_value(preview_rows[:max_rows]),
+        "calculation_output": _json_safe_value(preview_rows[:max_rows]),
+        **(_rule_intelligence_monitoring_sections(config, input_rows, max_rows) if input_rows else {
+            "target_rows": 0,
+            "anomaly_rows": 0,
+            "target_output": [],
+            "anomaly_output": [],
+        }),
+    }
+
+
+def _rule_pack_config_from_body(config: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = config if isinstance(config, dict) else {}
+    return {
+        "rule_pack": _rule_intelligence_parse_section(cfg, "rule_pack", {}),
+        "input_fields": _rule_intelligence_parse_section(cfg, "input_fields", []),
+        "field_mapping": _rule_intelligence_parse_section(cfg, "field_mapping", {}),
+        "clusters": _rule_intelligence_parse_section(cfg, "clusters", []),
+        "rules": _rule_intelligence_parse_section(cfg, "rules", []),
+        "targets": _rule_intelligence_parse_section(cfg, "targets", []),
+        "anomalies": _rule_intelligence_parse_section(cfg, "anomalies", []),
+        "output_layout": _rule_intelligence_parse_section(cfg, "output_layout", {}),
+    }
+
+
+def _rule_pack_datetime(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return value.isoformat()
+    except Exception:
+        return str(value)
+
+
+def _serialize_rule_pack_version(version: Any) -> Dict[str, Any]:
+    return {
+        "id": version.id,
+        "rule_pack_id": version.rule_pack_id,
+        "version_number": version.version_number,
+        "version_label": version.version_label,
+        "status": version.status,
+        "config": _json_safe_value(version.config or {}),
+        "validation": _json_safe_value(version.validation or {}),
+        "notes": version.notes,
+        "created_by": version.created_by,
+        "submitted_by": version.submitted_by,
+        "approved_by": version.approved_by,
+        "rejected_by": version.rejected_by,
+        "activated_by": version.activated_by,
+        "created_at": _rule_pack_datetime(version.created_at),
+        "updated_at": _rule_pack_datetime(version.updated_at),
+        "submitted_at": _rule_pack_datetime(version.submitted_at),
+        "approved_at": _rule_pack_datetime(version.approved_at),
+        "rejected_at": _rule_pack_datetime(version.rejected_at),
+        "activated_at": _rule_pack_datetime(version.activated_at),
+    }
+
+
+def _serialize_rule_pack(pack: Any, include_versions: bool = False, include_events: bool = False) -> Dict[str, Any]:
+    versions = sorted(list(getattr(pack, "versions", []) or []), key=lambda item: int(item.version_number or 0), reverse=True)
+    current = next((version for version in versions if str(version.id) == str(pack.current_version_id or "")), None)
+    if current is None and versions:
+        current = versions[0]
+    out = {
+        "id": pack.id,
+        "name": pack.name,
+        "description": pack.description,
+        "status": pack.status,
+        "owner": pack.owner,
+        "source": pack.source,
+        "tags": pack.tags or [],
+        "current_version_id": pack.current_version_id,
+        "version_count": len(versions),
+        "current_version": _serialize_rule_pack_version(current) if current is not None else None,
+        "created_at": _rule_pack_datetime(pack.created_at),
+        "updated_at": _rule_pack_datetime(pack.updated_at),
+    }
+    if include_versions:
+        out["versions"] = [_serialize_rule_pack_version(version) for version in versions]
+    if include_events:
+        events = sorted(list(getattr(pack, "events", []) or []), key=lambda item: str(item.created_at or ""), reverse=True)
+        out["events"] = [{
+            "id": event.id,
+            "rule_pack_id": event.rule_pack_id,
+            "version_id": event.version_id,
+            "action": event.action,
+            "actor": event.actor,
+            "comment": event.comment,
+            "detail": _json_safe_value(event.detail or {}),
+            "created_at": _rule_pack_datetime(event.created_at),
+        } for event in events]
+    return out
+
+
+def _rule_pack_add_event(
+    db: Session,
+    pack_id: str,
+    version_id: Optional[str],
+    action: str,
+    actor: str,
+    comment: Optional[str] = "",
+    detail: Optional[Dict[str, Any]] = None,
+) -> None:
+    db.add(models.RuleIntelligenceApprovalEvent(
+        id=str(uuid.uuid4()),
+        rule_pack_id=pack_id,
+        version_id=version_id,
+        action=action,
+        actor=str(actor or "admin"),
+        comment=comment or "",
+        detail=detail or {},
+    ))
+
+
+def _validate_rule_pack_config_for_version(config: Dict[str, Any], rows: List[Dict[str, Any]], max_rows: int) -> Dict[str, Any]:
+    errors, warnings = _rule_intelligence_validate_config(config)
+    preview_rows: List[Dict[str, Any]] = []
+    if not errors and rows:
+        transform_warnings: List[str] = []
+        try:
+            preview_rows = etl_engine._transform_rule_intelligence(
+                rows[:max(1, min(max_rows, 1000))],
+                config,
+                execution_context={
+                    "node_id": "__rule_intelligence_version_validation__",
+                    "node_warnings": transform_warnings,
+                },
+            )
+            warnings.extend(transform_warnings[:100])
+        except Exception as exc:
+            errors.append(f"{exc.__class__.__name__}: {exc}")
+    return {
+        "ok": len(errors) == 0,
+        "errors": errors,
+        "warnings": warnings,
+        "preview_rows": len(preview_rows),
+        "validated_at": datetime.utcnow().isoformat(),
+    }
+
+
+@app.get("/api/rule-intelligence/rule-packs")
+async def list_rule_intelligence_packs(
+    search: Optional[str] = None,
+    status: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    query = db.query(models.RuleIntelligencePack)
+    if search:
+        like = f"%{str(search).strip()}%"
+        query = query.filter(models.RuleIntelligencePack.name.ilike(like))
+    if status:
+        query = query.filter(models.RuleIntelligencePack.status == str(status).strip())
+    rows = query.order_by(models.RuleIntelligencePack.updated_at.desc()).all()
+    return [_serialize_rule_pack(row) for row in rows]
+
+
+@app.post("/api/rule-intelligence/rule-packs", status_code=201)
+async def create_rule_intelligence_pack(body: RuleIntelligencePackCreateRequest, db: Session = Depends(get_db)):
+    name = str(body.name or "").strip()
+    if not name:
+        raise HTTPException(400, "Rule pack name is required.")
+    pack_id = str(uuid.uuid4())
+    config = _rule_pack_config_from_body(body.config)
+    validation = _validate_rule_pack_config_for_version(config, [], 0)
+    version_id = str(uuid.uuid4())
+    pack = models.RuleIntelligencePack(
+        id=pack_id,
+        name=name,
+        description=body.description or "",
+        status="draft",
+        owner=body.owner or "admin",
+        source=body.source or "studio",
+        tags=body.tags or [],
+        current_version_id=version_id,
+    )
+    version = models.RuleIntelligencePackVersion(
+        id=version_id,
+        rule_pack_id=pack_id,
+        version_number=1,
+        version_label="v1",
+        status="draft",
+        config=config,
+        validation=validation,
+        notes=body.notes or "",
+        created_by=body.owner or "admin",
+    )
+    db.add(pack)
+    db.add(version)
+    _rule_pack_add_event(db, pack_id, version_id, "created", body.owner or "admin", body.notes or "", {"source": body.source or "studio"})
+    db.commit()
+    db.refresh(pack)
+    return _serialize_rule_pack(pack, include_versions=True, include_events=True)
+
+
+@app.get("/api/rule-intelligence/rule-packs/{pack_id}")
+async def get_rule_intelligence_pack(pack_id: str, db: Session = Depends(get_db)):
+    pack = db.query(models.RuleIntelligencePack).filter(models.RuleIntelligencePack.id == pack_id).first()
+    if not pack:
+        raise HTTPException(404, "Rule pack not found.")
+    return _serialize_rule_pack(pack, include_versions=True, include_events=True)
+
+
+@app.post("/api/rule-intelligence/rule-packs/{pack_id}/versions", status_code=201)
+async def create_rule_intelligence_pack_version(
+    pack_id: str,
+    body: RuleIntelligenceVersionCreateRequest,
+    db: Session = Depends(get_db),
+):
+    pack = db.query(models.RuleIntelligencePack).filter(models.RuleIntelligencePack.id == pack_id).first()
+    if not pack:
+        raise HTTPException(404, "Rule pack not found.")
+    latest = db.query(models.RuleIntelligencePackVersion).filter(
+        models.RuleIntelligencePackVersion.rule_pack_id == pack_id
+    ).order_by(models.RuleIntelligencePackVersion.version_number.desc()).first()
+    version_number = int((latest.version_number if latest else 0) or 0) + 1
+    version_label = str(body.version_label or f"v{version_number}").strip() or f"v{version_number}"
+    config = _rule_pack_config_from_body(body.config)
+    validation = _validate_rule_pack_config_for_version(
+        config,
+        [row for row in (body.rows or []) if isinstance(row, dict)],
+        max(1, min(int(body.max_rows or 100), 1000)),
+    ) if body.validate else {"ok": True, "errors": [], "warnings": ["Validation skipped."], "validated_at": datetime.utcnow().isoformat()}
+    version = models.RuleIntelligencePackVersion(
+        id=str(uuid.uuid4()),
+        rule_pack_id=pack_id,
+        version_number=version_number,
+        version_label=version_label,
+        status="draft",
+        config=config,
+        validation=validation,
+        notes=body.notes or "",
+        created_by=body.created_by or "admin",
+    )
+    pack.status = "draft"
+    db.add(version)
+    _rule_pack_add_event(db, pack_id, version.id, "version_created", body.created_by or "admin", body.notes or "", {"version_label": version_label})
+    db.commit()
+    db.refresh(version)
+    return _serialize_rule_pack_version(version)
+
+
+@app.post("/api/rule-intelligence/rule-packs/{pack_id}/versions/{version_id}/{action}")
+async def update_rule_intelligence_pack_version_lifecycle(
+    pack_id: str,
+    version_id: str,
+    action: str,
+    body: RuleIntelligenceLifecycleRequest,
+    db: Session = Depends(get_db),
+):
+    action_name = str(action or "").strip().lower()
+    if action_name not in {"submit", "approve", "reject", "activate", "retire"}:
+        raise HTTPException(400, "Unsupported rule-pack lifecycle action.")
+    pack = db.query(models.RuleIntelligencePack).filter(models.RuleIntelligencePack.id == pack_id).first()
+    if not pack:
+        raise HTTPException(404, "Rule pack not found.")
+    version = db.query(models.RuleIntelligencePackVersion).filter(
+        models.RuleIntelligencePackVersion.rule_pack_id == pack_id,
+        models.RuleIntelligencePackVersion.id == version_id,
+    ).first()
+    if not version:
+        raise HTTPException(404, "Rule pack version not found.")
+    now = datetime.utcnow()
+    actor = body.actor or "admin"
+    if action_name == "submit":
+        if version.status not in {"draft", "rejected"}:
+            raise HTTPException(400, "Only draft or rejected versions can be submitted.")
+        version.status = "submitted"
+        version.submitted_by = actor
+        version.submitted_at = now
+        pack.status = "submitted"
+    elif action_name == "approve":
+        if version.status not in {"submitted", "draft"}:
+            raise HTTPException(400, "Only submitted or draft versions can be approved.")
+        validation = version.validation or {}
+        if validation and validation.get("ok") is False:
+            raise HTTPException(400, "Version validation has errors. Fix validation before approval.")
+        version.status = "approved"
+        version.approved_by = actor
+        version.approved_at = now
+        pack.status = "approved"
+    elif action_name == "reject":
+        if version.status not in {"submitted", "approved", "draft"}:
+            raise HTTPException(400, "This version cannot be rejected from its current status.")
+        version.status = "rejected"
+        version.rejected_by = actor
+        version.rejected_at = now
+        pack.status = "rejected"
+    elif action_name == "activate":
+        if version.status not in {"approved", "active"}:
+            raise HTTPException(400, "Only approved versions can be activated.")
+        active_versions = db.query(models.RuleIntelligencePackVersion).filter(
+            models.RuleIntelligencePackVersion.rule_pack_id == pack_id,
+            models.RuleIntelligencePackVersion.status == "active",
+        ).all()
+        for active_version in active_versions:
+            if active_version.id != version.id:
+                active_version.status = "retired"
+        version.status = "active"
+        version.activated_by = actor
+        version.activated_at = now
+        pack.status = "active"
+        pack.current_version_id = version.id
+    else:
+        version.status = "retired"
+        if str(pack.current_version_id or "") == str(version.id):
+            pack.current_version_id = None
+            pack.status = "retired"
+    _rule_pack_add_event(db, pack_id, version_id, action_name, actor, body.comment or "", {"status": version.status})
+    flag_modified(version, "validation")
+    db.commit()
+    db.refresh(pack)
+    return _serialize_rule_pack(pack, include_versions=True, include_events=True)
+
+
+def _rule_import_default_config() -> Dict[str, Any]:
+    return {
+        "rule_pack": {"name": "Imported Rule Pack", "version": "1.0", "status": "draft"},
+        "input_fields": [
+            {"id": "entity_id", "label": "Entity ID", "type": "string", "role": "entity", "required": True, "mapped_field": "entity_id"},
+            {"id": "event_date", "label": "Event Date", "type": "date", "role": "date", "required": True, "mapped_field": "event_date"},
+            {"id": "measure_value", "label": "Measure Value", "type": "number", "role": "measure", "required": False, "mapped_field": "measure_value"},
+            {"id": "category", "label": "Category", "type": "string", "role": "category", "required": False, "mapped_field": "category"},
+            {"id": "scope_id", "label": "Scope ID", "type": "string", "role": "identifier", "required": False, "mapped_field": "scope_id"},
+            {"id": "status", "label": "Status", "type": "string", "role": "status", "required": False, "mapped_field": "status"},
+        ],
+        "field_mapping": {
+            "entity_id": "entity_id",
+            "event_date": "event_date",
+            "measure_value": "measure_value",
+            "category": "category",
+            "scope_id": "scope_id",
+            "status_field": "status",
+            "status": "status",
+        },
+        "clusters": [
+            {"id": "eligibility", "name": "Eligibility", "sequence": 10, "enabled": True},
+            {"id": "commission", "name": "Commission Calculation", "sequence": 20, "enabled": True},
+            {"id": "target", "name": "Target Monitoring", "sequence": 30, "enabled": True},
+            {"id": "anomaly", "name": "Anomaly Monitoring", "sequence": 40, "enabled": True},
+            {"id": "output", "name": "Output Formatting", "sequence": 50, "enabled": True},
+        ],
+        "rules": [],
+        "targets": [],
+        "anomalies": [],
+        "output_layout": {"mode": "pivot", "row_fields": ["entity_id", "period"], "period_grain": "month", "include_audit": True},
+    }
+
+
+def _rule_import_number(value: Any, fallback: float = 0.0) -> float:
+    try:
+        if value is None:
+            return fallback
+        text = str(value).strip().replace("%", "").replace(",", "")
+        if not text:
+            return fallback
+        return float(text)
+    except Exception:
+        return fallback
+
+
+def _rule_import_rule_from_row(row: Dict[str, Any], index: int) -> Optional[Dict[str, Any]]:
+    lowered = {str(k or "").strip().lower().replace(" ", "_"): v for k, v in (row or {}).items()}
+    name = str(lowered.get("name") or lowered.get("rule_name") or lowered.get("service") or lowered.get("service_value") or "").strip()
+    service = str(lowered.get("service_value") or lowered.get("service") or lowered.get("service_name") or "").strip()
+    if not name and not service:
+        return None
+    method = str(lowered.get("method") or lowered.get("calculation_method") or lowered.get("calculation") or "percentage").strip().lower()
+    if method in {"percent", "%", "rate"}:
+        method = "percentage"
+    if method not in {"percentage", "flat", "formula", "slab"}:
+        method = "percentage"
+    calculation: Dict[str, Any] = {"method": method, "amount_field": str(lowered.get("amount_field") or "measure_value")}
+    if method == "percentage":
+        calculation["rate_percent"] = _rule_import_number(lowered.get("rate_percent") or lowered.get("rate") or lowered.get("percentage"), 0.0)
+    elif method == "flat":
+        calculation["amount"] = _rule_import_number(lowered.get("amount") or lowered.get("flat_amount"), 0.0)
+    elif method == "formula":
+        calculation["expression"] = str(lowered.get("expression") or lowered.get("formula") or "").strip()
+    cap_amount = lowered.get("cap_amount", lowered.get("cap"))
+    cap_enabled = cap_amount not in {None, "", "0", 0}
+    return {
+        "id": str(lowered.get("id") or f"imported_rule_{index}"),
+        "name": name or f"{service} Rule",
+        "enabled": str(lowered.get("enabled", "true")).strip().lower() not in {"false", "0", "no", "n"},
+        "priority": int(_rule_import_number(lowered.get("priority"), index * 10)),
+        "cluster_id": str(lowered.get("cluster_id") or "commission"),
+        "match_mode": "all",
+        "conditions": [
+            *([{"field": "category", "operator": "equals", "value": service, "enabled": True}] if service else []),
+            {"field": "measure_value", "operator": "greater_than", "value": 0, "enabled": True},
+        ],
+        "calculation": calculation,
+        "cap": {
+            "enabled": bool(cap_enabled),
+            "amount": _rule_import_number(cap_amount, 0.0),
+            "group_by": [part.strip() for part in str(lowered.get("cap_group_by") or "scope_id,event_date").split(",") if part.strip()],
+        },
+        "group_by": [part.strip() for part in str(lowered.get("group_by") or "entity_id,period,category").split(",") if part.strip()],
+        "period_grain": str(lowered.get("period_grain") or "month"),
+        "commission_type": str(lowered.get("commission_type") or "variable"),
+    }
+
+
+def _rule_import_config_from_rows(rows: List[Dict[str, Any]], source_name: str) -> Dict[str, Any]:
+    config = _rule_import_default_config()
+    config["rule_pack"]["name"] = Path(source_name or "Imported Rule Pack").stem or "Imported Rule Pack"
+    rules = []
+    for idx, row in enumerate(rows, start=1):
+        rule = _rule_import_rule_from_row(row, idx)
+        if rule:
+            rules.append(rule)
+    config["rules"] = rules
+    return config
+
+
+def _rule_import_extract_text_rule(text: str, source_name: str) -> Dict[str, Any]:
+    config = _rule_import_default_config()
+    config["rule_pack"]["name"] = Path(source_name or "Imported Rule Pack").stem or "Imported Rule Pack"
+    compact = " ".join(str(text or "").split())
+    service_match = re.search(r"service\s*(?:=|is|:)\s*([A-Za-z][A-Za-z ]+?)(?:\s+AND|\s+THEN|\s+amount|$)", compact, flags=re.I)
+    service = service_match.group(1).strip() if service_match else ("Cash Deposit" if re.search(r"cash\s+deposit", compact, flags=re.I) else "")
+    rate_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", compact)
+    cap_match = re.search(r"(?:cap|maximum|max).*?(?:rs\.?|inr|₹)?\s*([0-9]+(?:\.[0-9]+)?)", compact, flags=re.I)
+    if service or rate_match or cap_match:
+        config["rules"] = [{
+            "id": "imported_text_rule_1",
+            "name": f"{service or 'Imported'} Commission",
+            "enabled": True,
+            "priority": 10,
+            "cluster_id": "commission",
+            "match_mode": "all",
+            "conditions": [
+                {"field": "category", "operator": "equals", "value": service or "Cash Deposit", "enabled": True},
+                {"field": "measure_value", "operator": "greater_than", "value": 0, "enabled": True},
+            ],
+            "calculation": {
+                "method": "percentage",
+                "rate_percent": _rule_import_number(rate_match.group(1) if rate_match else 0.0, 0.0),
+                "amount_field": "measure_value",
+                "commission_type": "variable",
+            },
+            "cap": {
+                "enabled": bool(cap_match),
+                "amount": _rule_import_number(cap_match.group(1) if cap_match else 0.0, 0.0),
+                "group_by": ["scope_id", "event_date"],
+            },
+            "group_by": ["entity_id", "period", "category"],
+            "period_grain": "month",
+            "commission_type": "variable",
+        }]
+    return config
+
+
+def _rule_import_docx_text(payload: bytes) -> str:
+    with _zipfile.ZipFile(BytesIO(payload)) as zf:
+        xml = zf.read("word/document.xml").decode("utf-8", errors="ignore")
+    xml = re.sub(r"<[^>]+>", " ", xml)
+    return _html.unescape(xml)
+
+
+def _rule_import_pdf_text(payload: bytes) -> str:
+    for module_name in ("pypdf", "PyPDF2"):
+        try:
+            module = __import__(module_name)
+            reader_cls = getattr(module, "PdfReader")
+            reader = reader_cls(BytesIO(payload))
+            return "\n".join(str(page.extract_text() or "") for page in reader.pages[:20])
+        except Exception:
+            continue
+    return payload.decode("utf-8", errors="ignore")
+
+
+@app.post("/api/rule-intelligence/import")
+async def import_rule_intelligence_file(file: UploadFile = File(...)):
+    payload = await file.read()
+    filename = file.filename or "rules"
+    suffix = Path(filename).suffix.lower()
+    warnings: List[str] = []
+    try:
+        if suffix == ".json":
+            parsed = json.loads(payload.decode("utf-8"))
+            config = _rule_pack_config_from_body(parsed if isinstance(parsed, dict) else {"rules": parsed})
+        elif suffix in {".csv", ".txt"}:
+            text = payload.decode("utf-8-sig", errors="ignore")
+            rows = list(_csv.DictReader(text.splitlines()))
+            config = _rule_import_config_from_rows(rows, filename) if rows else _rule_import_extract_text_rule(text, filename)
+        elif suffix in {".xlsx", ".xlsm"}:
+            from openpyxl import load_workbook  # type: ignore
+            wb = load_workbook(BytesIO(payload), read_only=True, data_only=True)
+            combined: Dict[str, Any] = _rule_import_default_config()
+            combined["rule_pack"]["name"] = Path(filename).stem or "Imported Rule Pack"
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                rows_iter = ws.iter_rows(values_only=True)
+                headers = [str(cell or "").strip() for cell in next(rows_iter, [])]
+                sheet_rows = [
+                    {headers[idx]: value for idx, value in enumerate(row) if idx < len(headers) and headers[idx]}
+                    for row in rows_iter
+                ]
+                key = sheet_name.strip().lower()
+                if key.startswith("rule"):
+                    combined["rules"] = _rule_import_config_from_rows(sheet_rows, filename).get("rules", [])
+                elif key.startswith("target"):
+                    combined["targets"] = sheet_rows
+                elif key.startswith("anomal"):
+                    combined["anomalies"] = sheet_rows
+                elif key.startswith("field"):
+                    for row in sheet_rows:
+                        field_key = str(row.get("key") or row.get("name") or "").strip()
+                        field_value = str(row.get("value") or row.get("field") or "").strip()
+                        if field_key and field_value:
+                            combined["field_mapping"][field_key] = field_value
+            config = combined
+        elif suffix == ".docx":
+            config = _rule_import_extract_text_rule(_rule_import_docx_text(payload), filename)
+        elif suffix == ".pdf":
+            config = _rule_import_extract_text_rule(_rule_import_pdf_text(payload), filename)
+        else:
+            text = payload.decode("utf-8", errors="ignore")
+            config = _rule_import_extract_text_rule(text, filename)
+            warnings.append(f"Unknown file type '{suffix or 'none'}'; text extraction fallback was used.")
+    except Exception as exc:
+        raise HTTPException(400, f"Rule import failed: {exc}") from exc
+    errors, validation_warnings = _rule_intelligence_validate_config(config)
+    return {
+        "ok": len(errors) == 0,
+        "filename": filename,
+        "config": _json_safe_value(config),
+        "errors": errors,
+        "warnings": warnings + validation_warnings,
+        "rule_count": len(config.get("rules") or []),
+        "target_count": len(config.get("targets") or []),
+        "anomaly_count": len(config.get("anomalies") or []),
     }
 
 

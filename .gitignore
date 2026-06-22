@@ -42,6 +42,8 @@ yarn-error.log*
 *.db
 backend/*.db
 backend/*.db.bak*
+backend/*.db.backup*
+backend/*.db.backup_*
 backend/outputs/
 backend/uploads/
 backend/FRAMEWORK/
@@ -50,7 +52,16 @@ backend/state/profile_store.rocksdb/
 backend/state/*.mdb
 backend/state/*.sst
 backend/state/LOCK
+backend/state/*.lock
+backend/state/pipeline_runtime_state.json
+backend/state/data_ops_checkpoints.json
+backend/state/data_ops_schedule_activity.json
+backend/state/data_ops_schedules.json
+backend/state/data_ops_stop_signals.json
+backend/state/data_ops_mapper_sync_schedules.json
 backend/state/*.log
+backend/screenlog.*
+backend/uvicorn_*.pid
 stage1/*.csv
 stage1/*.json
 dump.rdb

@@ -1,9 +1,9 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEvent, type KeyboardEvent, type ReactNode } from 'react'
 import {
   Drawer, Form, Input, Select, Switch, InputNumber,
-  Button, Typography, Space, Tabs, Divider, Tag, Tooltip, Table, notification, Modal, Popover, AutoComplete, Tree, Popconfirm, Collapse
+  Button, Typography, Space, Tabs, Divider, Tag, Tooltip, Table, notification, Modal, Popover, AutoComplete, Tree, Popconfirm, Collapse, Checkbox
 } from 'antd'
-import { ArrowDownOutlined, ArrowUpOutlined, ArrowsAltOutlined, CloseOutlined, CopyOutlined, DeleteOutlined, EyeOutlined, InfoCircleOutlined, MinusSquareOutlined, PlusSquareOutlined, ReloadOutlined, SaveOutlined } from '@ant-design/icons'
+import { ArrowDownOutlined, ArrowLeftOutlined, ArrowRightOutlined, ArrowUpOutlined, ArrowsAltOutlined, CloseOutlined, CopyOutlined, DeleteOutlined, EyeOutlined, HolderOutlined, InfoCircleOutlined, MinusSquareOutlined, PlusSquareOutlined, ReloadOutlined, SaveOutlined } from '@ant-design/icons'
 import Editor, { type Monaco } from '@monaco-editor/react'
 import Plot from 'react-plotly.js'
 import ReactFlow, {
@@ -47,6 +47,529 @@ import { clearDrawerInteraction, markDrawerInteraction } from '../../utils/drawe
 import type { ConfigField, ETLNode, ETLNodeData } from '../../types'
 
 const { Text } = Typography
+
+const RULE_INTELLIGENCE_SAMPLE_ROWS: Array<Record<string, unknown>> = [
+  { entity_id: 'ENTITY-001', scope_id: 'SCOPE-10001', category: 'Sample Category', measure_value: 3000, event_date: '2026-06-01', status: 'success' },
+  { entity_id: 'ENTITY-001', scope_id: 'SCOPE-10001', category: 'Sample Category', measure_value: 5000, event_date: '2026-06-01', status: 'success' },
+  { entity_id: 'ENTITY-001', scope_id: 'SCOPE-10002', category: 'Other Category', measure_value: 1200, event_date: '2026-06-02', status: 'success' },
+  { entity_id: 'ENTITY-002', scope_id: 'SCOPE-20001', category: 'Sample Category', measure_value: 9000, event_date: '2026-06-03', status: 'success' },
+]
+
+const RULE_INTELLIGENCE_STARTER_FIELDS: Array<Record<string, unknown>> = [
+  { id: 'entity_id', label: 'Entity ID', type: 'string', role: 'entity', required: true, mapped_field: 'entity_id' },
+  { id: 'event_date', label: 'Event Date', type: 'date', role: 'date', required: true, mapped_field: 'event_date' },
+  { id: 'measure_value', label: 'Measure Value', type: 'number', role: 'measure', required: false, mapped_field: 'measure_value' },
+  { id: 'category', label: 'Category', type: 'string', role: 'category', required: false, mapped_field: 'category' },
+  { id: 'scope_id', label: 'Scope ID', type: 'string', role: 'identifier', required: false, mapped_field: 'scope_id' },
+  { id: 'status', label: 'Status', type: 'string', role: 'status', required: false, mapped_field: 'status' },
+]
+
+const RULE_INTELLIGENCE_FIELD_TYPES = [
+  { value: 'string', label: 'String' },
+  { value: 'number', label: 'Number' },
+  { value: 'date', label: 'Date' },
+  { value: 'boolean', label: 'Boolean' },
+]
+
+const RULE_INTELLIGENCE_FIELD_ROLES = [
+  { value: 'entity', label: 'Entity' },
+  { value: 'date', label: 'Date' },
+  { value: 'measure', label: 'Measure' },
+  { value: 'category', label: 'Category' },
+  { value: 'identifier', label: 'Identifier' },
+  { value: 'status', label: 'Status' },
+  { value: 'dimension', label: 'Dimension' },
+]
+
+const RULE_INTELLIGENCE_TARGET_CLUSTER_OPTIONS = [
+  { value: 'target_activity', label: 'BC Activity Targets' },
+  { value: 'target_service', label: 'Service Targets' },
+  { value: 'target_amount', label: 'Amount Targets' },
+  { value: 'target_commission', label: 'Commission Targets' },
+  { value: 'target_quality', label: 'Quality Targets' },
+  { value: 'target_compliance', label: 'Compliance Targets' },
+]
+
+const RULE_INTELLIGENCE_ANOMALY_CLUSTER_OPTIONS = [
+  { value: 'anomaly_transaction', label: 'Transaction Risk' },
+  { value: 'anomaly_agent', label: 'Agent Behavior' },
+  { value: 'anomaly_commission', label: 'Commission Control' },
+  { value: 'anomaly_data_quality', label: 'Data Quality' },
+  { value: 'anomaly_eligibility', label: 'Eligibility Control' },
+]
+
+const RULE_INTELLIGENCE_RECOMMENDED_CLUSTERS = [
+  { id: 'eligibility', name: 'Eligibility', type: 'calculation', sequence: 10, enabled: true },
+  { id: 'commission', name: 'Commission Calculation', type: 'calculation', sequence: 20, enabled: true },
+  { id: 'target_activity', name: 'BC Activity Targets', type: 'target', sequence: 110, enabled: true },
+  { id: 'target_service', name: 'Service Targets', type: 'target', sequence: 120, enabled: true },
+  { id: 'target_amount', name: 'Amount Targets', type: 'target', sequence: 130, enabled: true },
+  { id: 'target_commission', name: 'Commission Targets', type: 'target', sequence: 140, enabled: true },
+  { id: 'target_quality', name: 'Quality Targets', type: 'target', sequence: 150, enabled: true },
+  { id: 'target_compliance', name: 'Compliance Targets', type: 'target', sequence: 160, enabled: true },
+  { id: 'anomaly_transaction', name: 'Transaction Risk', type: 'anomaly', sequence: 210, enabled: true },
+  { id: 'anomaly_agent', name: 'Agent Behavior', type: 'anomaly', sequence: 220, enabled: true },
+  { id: 'anomaly_commission', name: 'Commission Control', type: 'anomaly', sequence: 230, enabled: true },
+  { id: 'anomaly_data_quality', name: 'Data Quality', type: 'anomaly', sequence: 240, enabled: true },
+  { id: 'anomaly_eligibility', name: 'Eligibility Control', type: 'anomaly', sequence: 250, enabled: true },
+  { id: 'output', name: 'Output Formatting', type: 'output', sequence: 300, enabled: true },
+]
+
+function parseRuleIntelligenceSection<T>(value: unknown, fallback: T): T {
+  if (value === null || value === undefined) return fallback
+  if (typeof value === 'string') {
+    const text = value.trim()
+    if (!text) return fallback
+    try {
+      return JSON.parse(text) as T
+    } catch {
+      return fallback
+    }
+  }
+  return value as T
+}
+
+function normalizeRuleIntelligenceFieldId(value: unknown): string {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+}
+
+function ruleIntelligenceOutputSlug(value: unknown, fallback = 'metric'): string {
+  return normalizeRuleIntelligenceFieldId(value) || fallback
+}
+
+function inferRuleIntelligenceFieldMeta(fieldName: string): Record<string, unknown> {
+  const id = normalizeRuleIntelligenceFieldId(fieldName) || `field_${Date.now()}`
+  const lower = id.toLowerCase()
+  let type = 'string'
+  let role = 'dimension'
+  if (/date|time|dt/.test(lower)) {
+    type = 'date'
+    role = 'date'
+  } else if (/amount|amt|value|total|balance|commission|qty|quantity|count|rate|percent|score/.test(lower)) {
+    type = 'number'
+    role = 'measure'
+  } else if (/status|state/.test(lower)) {
+    role = 'status'
+  } else if (/category|type|service|product|segment|class/.test(lower)) {
+    role = 'category'
+  } else if (/account|customer|vendor|scope|reference|ref|id|code|key/.test(lower)) {
+    role = lower.includes('entity') || lower.includes('agent') || lower.includes('branch') ? 'entity' : 'identifier'
+  }
+  return {
+    id,
+    label: String(fieldName || id).replace(/[_\.]+/g, ' ').replace(/\b\w/g, (m) => m.toUpperCase()),
+    type,
+    role,
+    required: role === 'entity' || role === 'date',
+    mapped_field: fieldName,
+  }
+}
+
+function normalizeRuleIntelligenceNodeConfig(config: Record<string, unknown>) {
+  const rulePack = parseRuleIntelligenceSection<Record<string, unknown>>(config.rule_pack, {})
+  const rawMapping = parseRuleIntelligenceSection<Record<string, unknown>>(config.field_mapping, {})
+  const parsedInputFields = parseRuleIntelligenceSection<Array<Record<string, unknown>>>(config.input_fields, [])
+  const inputFields = (parsedInputFields.length > 0 ? parsedInputFields : RULE_INTELLIGENCE_STARTER_FIELDS)
+    .map((field, index) => {
+      const id = normalizeRuleIntelligenceFieldId(field.id || field.name || field.label) || `field_${index + 1}`
+      return {
+        id,
+        label: String(field.label || field.name || id),
+        type: String(field.type || 'string'),
+        role: String(field.role || 'dimension'),
+        required: Boolean(field.required),
+        mapped_field: String(rawMapping[id] || field.mapped_field || field.upstream_field || field.source_field || id),
+      }
+    })
+  const fieldMapping = inputFields.reduce<Record<string, unknown>>((acc, field) => {
+    acc[String(field.id)] = field.mapped_field
+    return acc
+  }, { ...rawMapping })
+  const clusters = parseRuleIntelligenceSection<Array<Record<string, unknown>>>(config.clusters, [])
+  const rules = parseRuleIntelligenceSection<Array<Record<string, unknown>>>(config.rules, [])
+  const targets = parseRuleIntelligenceSection<Array<Record<string, unknown>>>(config.targets, [])
+  const anomalies = parseRuleIntelligenceSection<Array<Record<string, unknown>>>(config.anomalies, [])
+  const outputLayout: Record<string, unknown> = {
+    mode: 'pivot',
+    row_fields: ['entity', 'period'],
+    period_grain: 'month',
+    ...parseRuleIntelligenceSection<Record<string, unknown>>(config.output_layout, {}),
+  }
+  return { rulePack, inputFields, fieldMapping, clusters, rules, targets, anomalies, outputLayout }
+}
+
+function createRuleIntelligenceGenericCalculationRule(inputFields: Array<Record<string, unknown>> = []) {
+  const measure = String(inputFields.find((field) => String(field.role || '') === 'measure')?.id || 'measure_value')
+  const category = String(inputFields.find((field) => String(field.role || '') === 'category')?.id || inputFields[0]?.id || '')
+  const scope = String(inputFields.find((field) => String(field.role || '') === 'identifier')?.id || inputFields.find((field) => String(field.role || '') === 'entity')?.id || 'scope_id')
+  const date = String(inputFields.find((field) => String(field.role || '') === 'date')?.id || 'event_date')
+  const entity = String(inputFields.find((field) => String(field.role || '') === 'entity')?.id || inputFields[0]?.id || 'entity_id')
+  return {
+    id: `rule_${Date.now()}`,
+    name: 'New Calculation Rule',
+    enabled: true,
+    priority: 10,
+    cluster_id: 'commission',
+    match_mode: 'all',
+    conditions: category ? [{ field: category, operator: 'equals', value: '', enabled: true }] : [],
+    condition_tree: createRuleIntelligenceConditionGroup({
+      id: 'root',
+      match_mode: 'all',
+      conditions: category ? [{ field: category, operator: 'equals', value: '', enabled: true }] : [],
+    }),
+    calculation: {
+      method: 'percentage',
+      rate_percent: 0,
+      amount_field: measure,
+      commission_type: 'variable',
+    },
+    cap: {
+      enabled: false,
+      amount: 0,
+      group_by: [scope, date],
+    },
+    group_filter: {
+      enabled: false,
+      metric: 'service_amount',
+      operator: 'less_or_equal',
+      value: '',
+    },
+    group_by: [entity, 'period', ...(category ? [category] : [])],
+    period_grain: 'month',
+    commission_type: 'variable',
+  }
+}
+
+function createRuleIntelligenceTarget(_inputFields: Array<Record<string, unknown>> = []) {
+  const defaultMeasure = {
+    id: `target_measure_${Date.now()}`,
+    name: 'Transaction Count',
+    measure: 'count',
+    field: '',
+    target_value: 100,
+    warning_percent: 80,
+    weight: 1,
+    enabled: true,
+  }
+  return {
+    id: `target_${Date.now()}`,
+    name: 'Monthly Target',
+    cluster_id: 'target_activity',
+    enabled: true,
+    measure: 'count',
+    target_value: 100,
+    measures: [defaultMeasure],
+    group_by: ['entity_id', 'period'],
+    period_grain: 'month',
+    warning_percent: 80,
+  }
+}
+
+function createRuleIntelligenceAnomaly(inputFields: Array<Record<string, unknown>> = []) {
+  const measure = String(inputFields.find((field) => String(field.role || '') === 'measure')?.id || 'measure_value')
+  const defaultCheck = {
+    id: `anomaly_check_${Date.now()}`,
+    name: 'High Value Check',
+    type: 'threshold',
+    measure: 'sum',
+    field: measure,
+    operator: 'greater_than',
+    threshold: 100000,
+    severity: 'warning',
+    enabled: true,
+  }
+  return {
+    id: `anomaly_${Date.now()}`,
+    name: 'High Value Measure',
+    cluster_id: 'anomaly_transaction',
+    enabled: true,
+    type: 'threshold',
+    measure: 'sum',
+    field: measure,
+    operator: 'greater_than',
+    threshold: 100000,
+    checks: [defaultCheck],
+    group_by: ['entity_id', 'period'],
+    period_grain: 'month',
+    severity: 'warning',
+  }
+}
+
+function createRuleIntelligenceTargetMeasure(seed: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: String(seed.id || `target_measure_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+    name: String(seed.name || seed.label || 'Target Measure'),
+    measure: String(seed.measure || 'count'),
+    field: String(seed.field || seed.measure_field || ''),
+    target_value: Number(seed.target_value ?? seed.target ?? seed.value ?? 100),
+    warning_percent: Number(seed.warning_percent ?? seed.warn_at_percent ?? 80),
+    weight: Number(seed.weight ?? 1),
+    enabled: seed.enabled !== false,
+  }
+}
+
+function createRuleIntelligenceAnomalyCheck(seed: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: String(seed.id || `anomaly_check_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+    name: String(seed.name || seed.label || 'Anomaly Check'),
+    type: String(seed.type || 'threshold'),
+    measure: String(seed.measure || 'sum'),
+    field: String(seed.field || seed.measure_field || 'measure_value'),
+    operator: String(seed.operator || seed.condition || 'greater_than'),
+    threshold: Number(seed.threshold ?? seed.value ?? seed.threshold_value ?? 0),
+    severity: String(seed.severity || 'warning'),
+    enabled: seed.enabled !== false,
+  }
+}
+
+const RULE_INTELLIGENCE_CONDITION_OPERATORS = [
+  { value: 'equals', label: 'Equals' },
+  { value: 'not_equals', label: 'Not Equals' },
+  { value: 'contains', label: 'Contains' },
+  { value: 'not_contains', label: 'Not Contains' },
+  { value: 'starts_with', label: 'Starts With' },
+  { value: 'ends_with', label: 'Ends With' },
+  { value: 'greater_than', label: 'Greater Than' },
+  { value: 'greater_or_equal', label: 'Greater Or Equal' },
+  { value: 'less_than', label: 'Less Than' },
+  { value: 'less_or_equal', label: 'Less Or Equal' },
+  { value: 'between', label: 'Between' },
+  { value: 'in', label: 'In List' },
+  { value: 'not_in', label: 'Not In List' },
+  { value: 'is_null', label: 'Is Blank' },
+  { value: 'is_not_null', label: 'Is Not Blank' },
+]
+
+const RULE_INTELLIGENCE_METRIC_OPTIONS = [
+  { value: 'count', label: 'Count' },
+  { value: 'sum', label: 'Sum' },
+  { value: 'avg', label: 'Average' },
+  { value: 'min', label: 'Minimum' },
+  { value: 'max', label: 'Maximum' },
+  { value: 'distinct_count', label: 'Distinct Count' },
+  { value: 'distinct_day_count', label: 'Distinct Days' },
+]
+
+const RULE_INTELLIGENCE_ANOMALY_TYPE_OPTIONS = [
+  { value: 'threshold', label: 'Threshold' },
+  { value: 'spike', label: 'Spike' },
+  { value: 'drop', label: 'Drop' },
+]
+
+const RULE_INTELLIGENCE_COMPARE_OPERATOR_OPTIONS = [
+  { value: 'greater_than', label: 'Greater Than' },
+  { value: 'greater_or_equal', label: 'Greater Or Equal' },
+  { value: 'less_than', label: 'Less Than' },
+  { value: 'less_or_equal', label: 'Less Or Equal' },
+  { value: 'equals', label: 'Equals' },
+  { value: 'not_equals', label: 'Not Equals' },
+]
+
+const RULE_INTELLIGENCE_GROUP_FILTER_METRIC_OPTIONS = [
+  { value: 'service_amount', label: 'Service Amount' },
+  { value: 'service_count', label: 'Service Count' },
+  { value: 'raw_commission', label: 'Raw Commission' },
+  { value: 'final_commission', label: 'Final Commission' },
+  { value: 'count', label: 'Record Count' },
+  { value: 'sum', label: 'Sum Of Field' },
+  { value: 'avg', label: 'Average Of Field' },
+  { value: 'min', label: 'Minimum Of Field' },
+  { value: 'max', label: 'Maximum Of Field' },
+  { value: 'distinct_count', label: 'Distinct Count Of Field' },
+  { value: 'distinct_day_count', label: 'Distinct Days Of Field' },
+  { value: 'count_non_null', label: 'Non Blank Count Of Field' },
+  { value: 'funded_ratio', label: 'Funded Account Ratio %' },
+  { value: 'average_balance', label: 'Average Balance' },
+  { value: 'window_avg', label: 'Window Average' },
+  { value: 'window_sum', label: 'Window Sum' },
+  { value: 'elapsed_months', label: 'Elapsed Months' },
+  { value: 'elapsed_days', label: 'Elapsed Days' },
+]
+
+const RULE_INTELLIGENCE_GROUP_FILTER_FIELDLESS_METRICS = new Set([
+  'service_amount',
+  'service_count',
+  'raw_commission',
+  'final_commission',
+  'total_commission',
+  'amount_sum',
+  'group_amount',
+  'group_count',
+  'matched_rows',
+  'count',
+])
+
+function createRuleIntelligenceCondition(seed: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: String(seed.id || `cond_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+    type: 'condition',
+    field: String(seed.field || seed.left || seed.path || ''),
+    operator: String(seed.operator || 'equals'),
+    value: seed.value ?? '',
+    value_mode: seed.value_mode || 'literal',
+    draft: seed.draft === true,
+    enabled: seed.enabled !== false,
+  }
+}
+
+function createRuleIntelligenceGroupFilter(seed: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: String(seed.id || `group_filter_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+    enabled: seed.enabled === true,
+    metric: String(seed.metric || seed.measure || 'service_amount'),
+    field: String(seed.field || seed.measure_field || seed.field_name || ''),
+    operator: String(seed.operator || 'greater_or_equal'),
+    value: seed.value ?? '',
+    account_field: String(seed.account_field || seed.identifier_field || seed.distinct_by || ''),
+    balance_field: String(seed.balance_field || seed.funded_field || ''),
+    date_field: String(seed.date_field || seed.event_date_field || seed.metric_date_field || ''),
+    anchor_field: String(seed.anchor_field || seed.cohort_date_field || seed.opening_date_field || seed.account_opening_date_field || ''),
+    as_of_field: String(seed.as_of_field || seed.end_date_field || ''),
+    window_start_months: seed.window_start_months ?? seed.start_month_offset ?? '',
+    window_end_months: seed.window_end_months ?? seed.end_month_offset ?? '',
+    window_start_days: seed.window_start_days ?? seed.start_day_offset ?? '',
+    window_end_days: seed.window_end_days ?? seed.end_day_offset ?? '',
+    funded_threshold: seed.funded_threshold ?? seed.threshold ?? seed.minimum_balance ?? '',
+  }
+}
+
+function createRuleIntelligenceConditionGroup(seed: Record<string, unknown> = {}): Record<string, unknown> {
+  const rawChildren = (
+    Array.isArray(seed.conditions) ? seed.conditions :
+      Array.isArray(seed.children) ? seed.children :
+        Array.isArray(seed.items) ? seed.items :
+          Array.isArray(seed.rules) ? seed.rules : []
+  )
+  const rawMode = String(seed.match_mode || seed.mode || seed.operator || 'all').trim().toLowerCase()
+  return {
+    id: String(seed.id || `group_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+    type: 'group',
+    match_mode: ['any', 'or', 'some', 'one'].includes(rawMode) ? 'any' : 'all',
+    enabled: seed.enabled !== false,
+    conditions: rawChildren.length > 0
+      ? rawChildren.map((item) => normalizeRuleIntelligenceConditionItem(item))
+      : [createRuleIntelligenceCondition()],
+  }
+}
+
+function normalizeRuleIntelligenceConditionItem(item: unknown): Record<string, unknown> {
+  if (item && typeof item === 'object' && !Array.isArray(item)) {
+    const record = item as Record<string, unknown>
+    const itemType = String(record.type || record.kind || '').trim().toLowerCase()
+    const hasChildren = ['conditions', 'children', 'items', 'rules'].some((key) => Array.isArray(record[key]))
+    if (itemType === 'group' || hasChildren) {
+      return createRuleIntelligenceConditionGroup(record)
+    }
+    return createRuleIntelligenceCondition(record)
+  }
+  return createRuleIntelligenceCondition()
+}
+
+function normalizeRuleIntelligenceConditionTree(rule: Record<string, unknown>): Record<string, unknown> {
+  const rawTree = rule.condition_tree || rule.conditionTree
+  if (rawTree && typeof rawTree === 'object' && !Array.isArray(rawTree)) {
+    return createRuleIntelligenceConditionGroup({ id: 'root', ...(rawTree as Record<string, unknown>) })
+  }
+  const rawConditions = Array.isArray(rule.conditions) ? rule.conditions : []
+  return createRuleIntelligenceConditionGroup({
+    id: 'root',
+    match_mode: rule.match_mode || 'all',
+    conditions: rawConditions.length > 0 ? rawConditions : [createRuleIntelligenceCondition()],
+  })
+}
+
+function flattenRuleIntelligenceConditionTree(tree: unknown): Array<Record<string, unknown>> {
+  if (!tree || typeof tree !== 'object' || Array.isArray(tree)) return []
+  const record = tree as Record<string, unknown>
+  const children = Array.isArray(record.conditions) ? record.conditions : []
+  return children.flatMap((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+    const child = item as Record<string, unknown>
+    const childType = String(child.type || child.kind || '').trim().toLowerCase()
+    if (childType === 'group' || Array.isArray(child.conditions)) {
+      return flattenRuleIntelligenceConditionTree(child)
+    }
+    if (!isRuleIntelligenceConditionUsable(child)) return []
+    return [{
+      field: child.field || child.left || child.path || '',
+      operator: child.operator || 'equals',
+      value: child.value ?? '',
+      value_mode: child.value_mode || 'literal',
+      enabled: child.enabled !== false,
+    }]
+  })
+}
+
+function collectRuleIntelligenceConditionLeaves(tree: unknown): Array<Record<string, unknown>> {
+  if (!tree || typeof tree !== 'object' || Array.isArray(tree)) return []
+  const record = tree as Record<string, unknown>
+  const children = Array.isArray(record.conditions) ? record.conditions : []
+  return children.flatMap((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+    const child = item as Record<string, unknown>
+    const childType = String(child.type || child.kind || '').trim().toLowerCase()
+    if (childType === 'group' || Array.isArray(child.conditions)) {
+      return collectRuleIntelligenceConditionLeaves(child)
+    }
+    return [child]
+  })
+}
+
+function isRuleIntelligenceConditionUsable(condition: Record<string, unknown>): boolean {
+  const fieldToken = String(condition.field || condition.left || condition.path || '').trim()
+  if (!fieldToken) return false
+  const operator = String(condition.operator || 'equals').trim().toLowerCase()
+  if (['is_null', 'is null', 'is_blank', 'is blank', 'is_not_null', 'is not null', 'is_not_blank', 'is not blank'].includes(operator)) {
+    return true
+  }
+  const valueMode = String(condition.value_mode || '').trim().toLowerCase()
+  const value = condition.value
+  if (['field', 'path'].includes(valueMode)) {
+    return String(value || '').trim().length > 0
+  }
+  if (value === null || value === undefined) return false
+  if (typeof value === 'string') return value.trim().length > 0
+  if (Array.isArray(value)) return value.length > 0
+  return true
+}
+
+function isRuleIntelligenceConditionVisible(condition: Record<string, unknown>): boolean {
+  return isRuleIntelligenceConditionUsable(condition) || condition.draft === true
+}
+
+function summarizeRuleIntelligenceConditionTree(
+  tree: unknown,
+  fieldCaption: (fieldId: unknown, fallback?: string) => string,
+  depth = 0,
+): string {
+  if (!tree || typeof tree !== 'object' || Array.isArray(tree)) return 'select matching records'
+  const record = tree as Record<string, unknown>
+  const children = Array.isArray(record.conditions) ? record.conditions : []
+  const joiner = String(record.match_mode || 'all').trim().toLowerCase() === 'any' ? ' OR ' : ' AND '
+  const parts = children.map((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return ''
+    const child = item as Record<string, unknown>
+    const childType = String(child.type || child.kind || '').trim().toLowerCase()
+    if (childType === 'group' || Array.isArray(child.conditions)) {
+      const text = summarizeRuleIntelligenceConditionTree(child, fieldCaption, depth + 1)
+      return text ? `(${text})` : ''
+    }
+    if (!isRuleIntelligenceConditionVisible(child)) return ''
+    const fieldToken = String(child.field || child.left || child.path || '').trim()
+    if (!fieldToken) return ''
+    const operator = String(child.operator || 'equals').replace(/_/g, ' ')
+    if (['is null', 'is not null'].includes(operator)) {
+      return `${fieldCaption(child.field, 'condition field')} ${operator}`
+    }
+    return `${fieldCaption(child.field, 'condition field')} ${operator} ${String(child.value || '').trim() || '[enter value]'}`
+  }).filter(Boolean)
+  if (parts.length <= 0) return depth === 0 ? 'select matching records' : ''
+  return parts.join(joiner)
+}
 
 // File-type node types and which field maps to file/path
 const FILE_SOURCE_TYPES = ['csv_source', 'json_source', 'excel_source', 'xml_source', 'parquet_source']
@@ -151,6 +674,8 @@ type DataOpsFieldRow = {
   field?: string
   alias?: string
   aggregate?: string
+  nullHandling?: 'none' | 'nvl'
+  nullDefault?: string
   mode?: 'field' | 'case' | 'json'
   jsonPath?: string
   jsonReturnType?: string
@@ -216,6 +741,20 @@ type DataOpsQueryInputRow = {
   sourceMode?: 'default' | 'fixed' | 'field'
   sourceField?: string
   value?: string
+  enabled?: boolean
+}
+
+type DataOpsSubqueryConfig = {
+  id: string
+  name: string
+  usage?: 'exists' | 'in' | 'join' | 'select_value' | 'from'
+  sourceType?: 'table' | 'internal_query'
+  sourceTable?: string
+  sourceQueryId?: string
+  parentField?: string
+  subqueryField?: string
+  joinType?: DataOpsJoinRow['joinType']
+  aggregate?: 'MAX' | 'MIN' | 'SUM' | 'COUNT'
   enabled?: boolean
 }
 
@@ -330,6 +869,15 @@ type DataOpsQueryBuilderConfig = {
   id: string
   name: string
   description?: string
+  internalQueries?: DataOpsQueryBuilderConfig[]
+  activeInternalQueryId?: string
+  finalInternalQueryId?: string
+  sourceMode?: 'database' | 'internal_query'
+  inputQueryId?: string
+  inputMode?: 'set_based' | 'cursor' | 'batch_cursor'
+  outputAlias?: string
+  cursorMappings?: DataOpsQueryInputRow[]
+  subqueries?: DataOpsSubqueryConfig[]
   query?: string
   expression?: string
   tables?: DataOpsTableRow[]
@@ -643,6 +1191,8 @@ function normalizeDataOpsFieldRows(value: unknown): DataOpsFieldRow[] {
         field: String(row.field || ''),
         alias: String(row.alias || ''),
         aggregate: String(row.aggregate || row.agg || ''),
+        nullHandling: String(row.nullHandling || row.null_handling || '').toLowerCase() === 'nvl' ? 'nvl' : 'none',
+        nullDefault: String(row.nullDefault ?? row.null_default ?? ''),
         mode: row.mode === 'case' ? 'case' : row.mode === 'json' ? 'json' : 'field',
         jsonPath: String(row.jsonPath || row.json_path || ''),
         jsonReturnType: String(row.jsonReturnType || row.json_return_type || 'VARCHAR2(4000)'),
@@ -706,6 +1256,29 @@ function normalizeDataOpsQueryInputs(value: unknown): DataOpsQueryInputRow[] {
         sourceMode: (['fixed', 'field'].includes(rawMode) ? rawMode : 'default') as DataOpsQueryInputRow['sourceMode'],
         sourceField: String(row.sourceField || row.source_field || ''),
         value: String(row.value || row.defaultValue || row.default_value || ''),
+        enabled: row.enabled !== false,
+      }
+    })
+	    : []
+}
+
+function normalizeDataOpsSubqueryConfigs(value: unknown): DataOpsSubqueryConfig[] {
+  return Array.isArray(value)
+    ? value.map((item, idx) => {
+      const row = item && typeof item === 'object' ? item as Record<string, unknown> : {}
+      const rawUsage = String(row.usage || row.mode || 'exists').toLowerCase()
+      const rawSourceType = String(row.sourceType || row.source_type || 'table').toLowerCase()
+      return {
+        id: String(row.id || `subquery_${idx + 1}`),
+        name: String(row.name || row.label || `Subquery ${idx + 1}`),
+        usage: (['in', 'join', 'select_value', 'from'].includes(rawUsage) ? rawUsage : 'exists') as DataOpsSubqueryConfig['usage'],
+        sourceType: rawSourceType === 'internal_query' ? 'internal_query' : 'table',
+        sourceTable: String(row.sourceTable || row.source_table || row.table || ''),
+        sourceQueryId: String(row.sourceQueryId || row.source_query_id || row.queryId || row.query_id || ''),
+        parentField: String(row.parentField || row.parent_field || ''),
+        subqueryField: String(row.subqueryField || row.subquery_field || ''),
+        joinType: (['inner', 'left', 'right', 'full'].includes(String(row.joinType || row.join_type || '').toLowerCase()) ? String(row.joinType || row.join_type).toLowerCase() : 'left') as DataOpsJoinRow['joinType'],
+        aggregate: (['MIN', 'SUM', 'COUNT'].includes(String(row.aggregate || '').toUpperCase()) ? String(row.aggregate).toUpperCase() : 'MAX') as DataOpsSubqueryConfig['aggregate'],
         enabled: row.enabled !== false,
       }
     })
@@ -883,10 +1456,21 @@ function normalizeDataOpsQueryBuilderConfigs(value: unknown): DataOpsQueryBuilde
   return Array.isArray(value)
     ? value.map((item, idx) => {
       const row = item && typeof item === 'object' ? item as Record<string, unknown> : {}
+      const rawSourceMode = String(row.sourceMode || row.source_mode || 'database').toLowerCase()
+      const rawInputMode = String(row.inputMode || row.input_mode || 'set_based').toLowerCase()
       return {
         id: String(row.id || `query_builder_${idx + 1}`),
         name: String(row.name || row.label || `Query ${idx + 1}`),
         description: String(row.description || ''),
+        internalQueries: normalizeDataOpsQueryBuilderConfigs(row.internalQueries || row.internal_queries),
+        activeInternalQueryId: String(row.activeInternalQueryId || row.active_internal_query_id || ''),
+        finalInternalQueryId: String(row.finalInternalQueryId || row.final_internal_query_id || ''),
+        sourceMode: rawSourceMode === 'internal_query' ? 'internal_query' : 'database',
+        inputQueryId: String(row.inputQueryId || row.input_query_id || ''),
+        inputMode: (rawInputMode === 'cursor' ? 'cursor' : rawInputMode === 'batch_cursor' || rawInputMode === 'batch' ? 'batch_cursor' : 'set_based') as DataOpsQueryBuilderConfig['inputMode'],
+        outputAlias: String(row.outputAlias || row.output_alias || ''),
+        cursorMappings: normalizeDataOpsQueryInputs(row.cursorMappings || row.cursor_mappings || row.queryInputs || row.query_inputs),
+        subqueries: normalizeDataOpsSubqueryConfigs(row.subqueries || row.subQueries || row.subquery_configs),
         query: String(row.query || ''),
         expression: String(row.expression || row.sql || ''),
         tables: normalizeDataOpsTableRows(row.tables),
@@ -1033,6 +1617,43 @@ function normalizeDataOpsRouterConfigs(value: unknown): DataOpsRouterConfig[] {
       }
     })
     : []
+}
+
+function cloneDataOpsQueryInputRows(rows: DataOpsQueryInputRow[] | undefined): DataOpsQueryInputRow[] {
+  return (rows || []).map((row) => ({ ...row }))
+}
+
+function cloneDataOpsRouterRouteRows(rows: DataOpsRouterRouteRow[] | undefined): DataOpsRouterRouteRow[] {
+  return (rows || []).map((row) => ({
+    ...row,
+    criteria: (row.criteria || []).map((criterion) => ({ ...criterion })),
+  }))
+}
+
+function cloneDataOpsRouterConfig(config: DataOpsRouterConfig): DataOpsRouterConfig {
+  return {
+    ...config,
+    queryInputs: cloneDataOpsQueryInputRows(config.queryInputs),
+    routeRows: cloneDataOpsRouterRouteRows(config.routeRows),
+  }
+}
+
+function cloneDataOpsRouterConfigs(rows: DataOpsRouterConfig[] | undefined): DataOpsRouterConfig[] {
+  return (rows || []).map(cloneDataOpsRouterConfig)
+}
+
+function cloneDataOpsRouterConfigPatch<T extends Partial<DataOpsRouterConfig & DataOpsPipelineStep>>(patch: T): T {
+  const next = { ...patch } as T
+  if (Object.prototype.hasOwnProperty.call(patch, 'queryInputs')) {
+    ;(next as Partial<DataOpsRouterConfig>).queryInputs = cloneDataOpsQueryInputRows(patch.queryInputs)
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, 'routeRows')) {
+    ;(next as Partial<DataOpsRouterConfig>).routeRows = cloneDataOpsRouterRouteRows(patch.routeRows)
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, 'routerConfigs')) {
+    ;(next as Partial<DataOpsPipelineStep>).routerConfigs = cloneDataOpsRouterConfigs(patch.routerConfigs)
+  }
+  return next
 }
 
 function normalizeDataOpsStepKind(value: unknown, fallbackName = ''): DataOpsPipelineStepKind {
@@ -1268,7 +1889,13 @@ function dataOpsPipelineText(steps: DataOpsPipelineStep[]): string {
 }
 
 function cloneDataOpsPipelineSteps(steps: DataOpsPipelineStep[]): DataOpsPipelineStep[] {
-  return steps.map((step) => ({ ...step, position: { ...step.position } }))
+  return steps.map((step) => ({
+    ...step,
+    position: { ...step.position },
+    queryInputs: cloneDataOpsQueryInputRows(step.queryInputs),
+    routeRows: cloneDataOpsRouterRouteRows(step.routeRows),
+    routerConfigs: cloneDataOpsRouterConfigs(step.routerConfigs),
+  }))
 }
 
 const DATA_OPS_LIVE_SCHEDULE_KEYS = [
@@ -9993,6 +10620,179 @@ function dataOpsQueryBuilderOutputFields(queryConfig: Partial<DataOpsQueryBuilde
   return uniqueFieldNames(fields)
 }
 
+function dataOpsQueryAlias(queryConfig: Partial<DataOpsQueryBuilderConfig> | undefined, index = 0): string {
+  const raw = String(queryConfig?.outputAlias || queryConfig?.name || queryConfig?.id || `q${index + 1}`).trim()
+  const normalized = raw.replace(/[^A-Za-z0-9_]/g, '_').replace(/^_+|_+$/g, '')
+  const safe = normalized || `q${index + 1}`
+  return /^[A-Za-z_]/.test(safe) ? safe : `q_${safe}`
+}
+
+function dataOpsQueryCursorSourceField(field: string, inputAlias: string): string {
+  const raw = String(field || '').trim()
+  if (!raw) return ''
+  if (raw.includes('.')) return raw
+  return inputAlias ? `${inputAlias}.${raw}` : raw
+}
+
+function dataOpsQueryFieldLeaf(field: string, fallback = 'value'): string {
+  const raw = String(field || '').trim()
+  const leaf = (raw.split('.').pop() || raw || fallback).replace(/\W+/g, '_').replace(/^_+|_+$/g, '')
+  const safe = leaf || fallback
+  return /^[A-Za-z_]/.test(safe) ? safe : `f_${safe}`
+}
+
+function dataOpsQueryConfigForSql(
+  queryConfig: DataOpsQueryBuilderConfig,
+  allQueries: DataOpsQueryBuilderConfig[],
+  options: { cursorAsSetFilter?: boolean } = {},
+): {
+  tables: DataOpsTableRow[]
+  selectFields: DataOpsFieldRow[]
+  joinKeys: DataOpsJoinRow[]
+  filterRules: DataOpsRuleRow[]
+  subqueryConditions: string[]
+} {
+  const sourceMode = String(queryConfig.sourceMode || 'database')
+  const inputQuery = allQueries.find((item) => item.id === queryConfig.inputQueryId)
+  const inputIndex = Math.max(0, allQueries.findIndex((item) => item.id === queryConfig.inputQueryId))
+  const inputAlias = inputQuery ? dataOpsQueryAlias(inputQuery, inputIndex) : ''
+  const inputMode = String(queryConfig.inputMode || 'set_based')
+  const configuredTables = queryConfig.tables || []
+  const cursorMappings = queryConfig.cursorMappings || []
+  const activeCursorMappings = cursorMappings
+    .filter((item) => item.enabled !== false && String(item.param || '').trim() && String(item.sourceField || '').trim())
+  const cursorMap = new Map(
+    activeCursorMappings
+      .map((item) => {
+        const sourceField = dataOpsQueryCursorSourceField(String(item.sourceField || ''), inputAlias)
+        return [
+        String(item.param || '').replace(/^:/, '').trim().toLowerCase(),
+        sourceField,
+      ] as const
+      })
+  )
+
+  let tables = configuredTables
+  const selectFields = [...(queryConfig.selectFields || [])]
+  const joinKeys = [...(queryConfig.joinKeys || [])]
+  const filterRules: DataOpsRuleRow[] = []
+  const subqueryConditions: string[] = []
+  const cursorSetConditions: string[] = []
+  const currentTableAliases = configuredTables
+    .filter((item) => item.enabled !== false && String(item.table || '').trim())
+    .map((item, index) => String(item.alias || `t${index + 1}`).trim())
+    .filter(Boolean)
+  const normalizeCursorRuntimeField = (field: string) => {
+    const rawField = String(field || '').trim()
+    if (inputMode === 'set_based' || !inputAlias || !rawField) return rawField
+    if (rawField !== inputAlias && !rawField.startsWith(`${inputAlias}.`)) return rawField
+    const leaf = rawField.split('.').pop() || rawField
+    const currentAlias = currentTableAliases[0] || ''
+    return currentAlias && leaf ? `${currentAlias}.${leaf}` : leaf
+  }
+
+  if (sourceMode === 'internal_query' && inputAlias) {
+    const hasInputTable = configuredTables.some((item) => {
+      const table = String(item.table || '').trim()
+      const alias = String(item.alias || '').trim()
+      return table === inputAlias || alias === inputAlias
+    })
+    const inputTable: DataOpsTableRow = {
+      id: `internal_${queryConfig.id || 'query'}`,
+      table: inputAlias,
+      alias: inputAlias,
+      role: configuredTables.length > 0 ? 'lookup' : 'from',
+      enabled: true,
+    }
+    tables = configuredTables.length > 0 && inputMode === 'set_based'
+      ? hasInputTable ? configuredTables : [...configuredTables, inputTable]
+      : configuredTables.length > 0 ? configuredTables : [inputTable]
+  }
+
+  for (const rule of queryConfig.filterRules || []) {
+    const bindName = String(rule.bindParam || rule.value || '').replace(/^:/, '').trim().toLowerCase()
+    const mappedField = bindName ? cursorMap.get(bindName) : ''
+    const operator = String(rule.operator || 'equals').trim().toLowerCase()
+    if (
+      sourceMode === 'internal_query' &&
+      inputAlias &&
+      (inputMode === 'set_based' || options.cursorAsSetFilter) &&
+      mappedField &&
+      String(rule.field || '').trim()
+    ) {
+      const leftField = dataOpsSqlIdent(normalizeCursorRuntimeField(String(rule.field || '')))
+      const rightField = dataOpsSqlIdent(mappedField)
+      const operatorSql = dataOpsSqlOperatorExpression(operator, rightField)
+      if (leftField && rightField && operatorSql) {
+        cursorSetConditions.push(`${leftField} ${operatorSql}`)
+      }
+      continue
+    }
+    filterRules.push({
+      ...rule,
+      field: normalizeCursorRuntimeField(String(rule.field || '')),
+    })
+  }
+  if (cursorSetConditions.length > 0) {
+    subqueryConditions.push(`EXISTS (SELECT 1 FROM ${inputAlias} WHERE ${cursorSetConditions.join(' AND ')})`)
+  }
+
+  const subqueryRows = (queryConfig.subqueries || []).filter((item) => item.enabled !== false)
+  subqueryRows.forEach((row, index) => {
+    const usage = String(row.usage || 'exists')
+    const sourceQuery = allQueries.find((item) => item.id === row.sourceQueryId)
+    const sourceIndex = Math.max(0, allQueries.findIndex((item) => item.id === row.sourceQueryId))
+    const sourceName = row.sourceType === 'internal_query'
+      ? sourceQuery ? dataOpsQueryAlias(sourceQuery, sourceIndex) : ''
+      : String(row.sourceTable || '').trim()
+    if (!sourceName) return
+    const sourceAlias = dataOpsQueryAlias({ outputAlias: row.name || `sq${index + 1}` }, index).toLowerCase()
+    const parentField = String(row.parentField || '').trim()
+    const childField = String(row.subqueryField || '').trim()
+    const childRef = childField.includes('.') ? childField : `${sourceAlias}.${childField}`
+    const sourceSql = `${sourceName} ${sourceAlias}`
+    const matchSql = parentField && childField ? `${childRef} = ${parentField}` : ''
+
+    if (usage === 'join' || usage === 'from') {
+      tables = [...tables, { id: `subquery_${row.id || index}`, table: sourceName, alias: sourceAlias, role: usage === 'from' && tables.length <= 0 ? 'from' : 'lookup', enabled: true }]
+      if (usage === 'join' && matchSql) {
+        joinKeys.push({
+        id: `subquery_join_${row.id || index}`,
+          leftField: parentField,
+          rightField: childRef,
+          joinType: row.joinType || 'left',
+          enabled: true,
+        })
+      }
+      return
+    }
+
+    if (usage === 'in' && parentField && childField) {
+      subqueryConditions.push(`${parentField} IN (SELECT ${childRef} FROM ${sourceSql})`)
+      return
+    }
+
+    if (usage === 'select_value' && childField) {
+      const alias = dataOpsQueryFieldLeaf(row.name || childField, `subquery_${index + 1}`)
+      const aggregate = String(row.aggregate || 'MAX').toUpperCase()
+      selectFields.push({
+        id: `subquery_select_${row.id || index}`,
+        field: `(SELECT ${aggregate}(${childRef}) FROM ${sourceSql}${matchSql ? ` WHERE ${matchSql}` : ''})`,
+        alias,
+        mode: 'field',
+        enabled: true,
+      })
+      return
+    }
+
+    if (matchSql) {
+      subqueryConditions.push(`EXISTS (SELECT 1 FROM ${sourceSql} WHERE ${matchSql})`)
+    }
+  })
+
+  return { tables, selectFields, joinKeys, filterRules, subqueryConditions }
+}
+
 function dataOpsActiveQueryBuilderOutputFields(step: DataOpsPipelineStep): string[] {
   const queryBuilders = step.queryBuilders || []
   const activeId = String(step.activeQueryBuilderId || '').trim()
@@ -10003,7 +10803,22 @@ function dataOpsActiveQueryBuilderOutputFields(step: DataOpsPipelineStep): strin
   if (!activeConfig && queryBuilders.length === 1) {
     activeConfig = queryBuilders[0]
   }
-  return dataOpsQueryBuilderOutputFields(activeConfig)
+  return dataOpsQueryBuilderFinalOutputFields(activeConfig)
+}
+
+function dataOpsQueryBuilderFinalOutputFields(config?: DataOpsQueryBuilderConfig): string[] {
+  if (!config) return []
+  const internalRows = config.internalQueries || []
+  if (internalRows.length > 0) {
+    const finalId = String(config.finalInternalQueryId || '').trim()
+    const finalInternal = (
+      (finalId ? internalRows.find((item) => String(item.id || '') === finalId) : undefined)
+      || internalRows[internalRows.length - 1]
+      || internalRows.find((item) => String(item.id || '') === String(config.activeInternalQueryId || ''))
+    )
+    return dataOpsQueryBuilderOutputFields(finalInternal)
+  }
+  return dataOpsQueryBuilderOutputFields(config)
 }
 
 function dataOpsActiveQuerySqlFromStep(step: DataOpsPipelineStep): string {
@@ -10019,9 +10834,63 @@ function dataOpsActiveQuerySqlFromStep(step: DataOpsPipelineStep): string {
   return String(activeConfig?.query || activeConfig?.expression || step.query || step.expression || '').trim()
 }
 
-function dataOpsQueryBuilderSqlFromConfig(queryConfig: DataOpsQueryBuilderConfig): string {
+function dataOpsQueryBuilderSqlFromConfig(
+  queryConfig: DataOpsQueryBuilderConfig,
+  allQueries: DataOpsQueryBuilderConfig[] = [],
+  options: { cursorAsSetFilter?: boolean } = {},
+): string {
+  if ((queryConfig.internalQueries || []).length > 0) {
+    return dataOpsQueryBuilderChainSql(
+      queryConfig.internalQueries,
+      queryConfig.finalInternalQueryId || queryConfig.activeInternalQueryId,
+    )
+  }
+  const hasStructuredConfig = Boolean(
+    (queryConfig.tables || []).length ||
+    (queryConfig.selectFields || []).length ||
+    (queryConfig.filterRules || []).length ||
+    (queryConfig.joinKeys || []).length ||
+    (queryConfig.groupByFields || []).length ||
+    (queryConfig.havingRules || []).length ||
+    (queryConfig.orderByRows || []).length ||
+    (queryConfig.subqueries || []).length
+  )
   const stored = String(queryConfig.query || queryConfig.expression || '').trim()
-  if (stored) return stored
+  if (stored && !hasStructuredConfig) return stored
+  const materialized = dataOpsQueryConfigForSql(queryConfig, allQueries, options)
+  return buildDataOpsQueryBuilderSql({
+    id: String(queryConfig.id || 'query'),
+    name: String(queryConfig.name || 'Query'),
+    kind: 'prepare',
+    position: { x: 0, y: 0 },
+    enabled: true,
+    operation: 'query_builder',
+    tables: materialized.tables,
+    selectFields: materialized.selectFields,
+    filterRules: materialized.filterRules,
+    joinKeys: materialized.joinKeys,
+    groupByFields: queryConfig.groupByFields || [],
+    havingRules: queryConfig.havingRules || [],
+    orderByRows: queryConfig.orderByRows || [],
+    bindParameters: queryConfig.bindParameters || [],
+	    limitRows: queryConfig.limitRows,
+	    subqueryConditions: materialized.subqueryConditions,
+  } as DataOpsPipelineStep & { subqueryConditions?: string[] })
+}
+
+function dataOpsQueryBuilderTemplateSqlFromConfig(queryConfig: DataOpsQueryBuilderConfig, options: { includeLimit?: boolean } = {}): string {
+  const includeLimit = options.includeLimit !== false
+  const stored = String(queryConfig.query || queryConfig.expression || '').trim()
+  const hasStructuredConfig = Boolean(
+    (queryConfig.tables || []).length ||
+    (queryConfig.selectFields || []).length ||
+    (queryConfig.filterRules || []).length ||
+    (queryConfig.joinKeys || []).length ||
+    (queryConfig.groupByFields || []).length ||
+    (queryConfig.havingRules || []).length ||
+    (queryConfig.orderByRows || []).length
+  )
+  if (stored && !hasStructuredConfig) return stored
   return buildDataOpsQueryBuilderSql({
     id: String(queryConfig.id || 'query'),
     name: String(queryConfig.name || 'Query'),
@@ -10037,8 +10906,33 @@ function dataOpsQueryBuilderSqlFromConfig(queryConfig: DataOpsQueryBuilderConfig
     havingRules: queryConfig.havingRules || [],
     orderByRows: queryConfig.orderByRows || [],
     bindParameters: queryConfig.bindParameters || [],
-    limitRows: queryConfig.limitRows,
+    limitRows: includeLimit ? queryConfig.limitRows : undefined,
   })
+}
+
+function dataOpsQueryBuilderChainSql(
+  queries: DataOpsQueryBuilderConfig[] | undefined,
+  finalQueryId?: string,
+): string {
+  const rows = (queries || []).filter((item) => item && String(item.id || '').trim())
+  if (rows.length <= 0) return ''
+  const finalId = String(finalQueryId || '').trim() || rows[rows.length - 1]?.id || rows[0]?.id || ''
+  const finalIndex = Math.max(0, rows.findIndex((item) => item.id === finalId))
+  const includedRows = rows.slice(0, finalIndex + 1)
+  const finalRow = rows[finalIndex] || includedRows[includedRows.length - 1] || rows[0]
+  if (includedRows.length <= 1 && String(finalRow.sourceMode || 'database') !== 'internal_query') {
+    return dataOpsQueryBuilderSqlFromConfig(finalRow, rows)
+  }
+  const ctes = includedRows.map((queryConfig, index) => {
+    const alias = dataOpsQueryAlias(queryConfig, index)
+    const runtimeQueryConfig = index === finalIndex
+      ? queryConfig
+      : { ...queryConfig, limitRows: undefined }
+    const sql = dataOpsQueryBuilderSqlFromConfig(runtimeQueryConfig, rows, { cursorAsSetFilter: true }).trim().replace(/;+\s*$/, '')
+    return `${alias} AS (\n${sql.split('\n').map((line) => `  ${line}`).join('\n')}\n)`
+  })
+  const finalAlias = dataOpsQueryAlias(finalRow, finalIndex)
+  return `WITH\n${ctes.join(',\n')}\nSELECT *\nFROM ${finalAlias}`
 }
 
 function dataOpsSqlIdent(value: string): string {
@@ -10071,6 +10965,21 @@ function dataOpsSqlOperator(operator: string, value: string): string {
   if (op === 'exists') return 'IS NOT NULL'
   if (op === 'empty') return 'IS NULL'
   return `= ${dataOpsSqlLiteral(value)}`
+}
+
+function dataOpsSqlOperatorExpression(operator: string, expression: string): string {
+  const op = String(operator || 'equals')
+  const rhs = String(expression || '').trim()
+  if (op === 'exists') return 'IS NOT NULL'
+  if (op === 'empty') return 'IS NULL'
+  if (!rhs) return ''
+  if (op === 'not_equals') return `<> ${rhs}`
+  if (op === 'greater_than') return `> ${rhs}`
+  if (op === 'less_than') return `< ${rhs}`
+  if (op === 'greater_or_equal') return `>= ${rhs}`
+  if (op === 'less_or_equal') return `<= ${rhs}`
+  if (op === 'contains') return `LIKE '%' || ${rhs} || '%'`
+  return `= ${rhs}`
 }
 
 function dataOpsRuleBindName(rule: Pick<DataOpsRuleRow, 'valueMode' | 'bindParam'>): string {
@@ -10135,10 +11044,19 @@ function buildDataOpsQueryBuilderSql(step: DataOpsPipelineStep): string {
   }
   const fieldExpression = (item: DataOpsFieldRow) => {
     const agg = String(item.aggregate || '').trim().toUpperCase()
+    const applyNullHandling = (expr: string) => {
+      if (String(item.nullHandling || 'none') !== 'nvl') return expr
+      const fallback = String(item.nullDefault ?? '').trim()
+      if (!fallback) return expr
+      return `NVL(${expr}, ${dataOpsSqlLiteral(fallback)})`
+    }
     const applyAggregate = (expr: string) => {
-      if (agg === 'COUNT_DISTINCT') return `COUNT(DISTINCT ${expr})`
-      if (agg === 'SUM') return `NVL(SUM(${expr}), 0)`
-      return agg ? `${agg}(${expr})` : expr
+      const aggregated = (() => {
+        if (agg === 'COUNT_DISTINCT') return `COUNT(DISTINCT ${expr})`
+        if (agg === 'SUM') return `NVL(SUM(${expr}), 0)`
+        return agg ? `${agg}(${expr})` : expr
+      })()
+      return applyNullHandling(aggregated)
     }
     if (item.mode === 'case') {
       const branches = (item.caseBranches || [])
@@ -10196,6 +11114,9 @@ function buildDataOpsQueryBuilderSql(step: DataOpsPipelineStep): string {
   const whereSql = (step.filterRules || [])
     .filter((item) => item.enabled !== false && String(item.field || '').trim())
     .map((item) => dataOpsRuleConditionSql(item, 'equals'))
+  const subqueryWhereSql = Array.isArray((step as DataOpsPipelineStep & { subqueryConditions?: string[] }).subqueryConditions)
+    ? ((step as DataOpsPipelineStep & { subqueryConditions?: string[] }).subqueryConditions || []).map((item) => String(item || '').trim()).filter(Boolean)
+    : []
   const groupSql = selectedGroupRows.map((item) => dataOpsSqlIdent(String(item.field || '')))
   const havingSql = (step.havingRules || [])
     .filter((item) => item.enabled !== false && String(item.field || '').trim())
@@ -10204,7 +11125,7 @@ function buildDataOpsQueryBuilderSql(step: DataOpsPipelineStep): string {
   return [
     `SELECT\n  ${selectSql}`,
     `FROM\n  ${fromSql}`,
-    whereSql.length ? `WHERE\n  ${whereSql.join('\n  AND ')}` : '',
+    whereSql.length || subqueryWhereSql.length ? `WHERE\n  ${[...whereSql, ...subqueryWhereSql].join('\n  AND ')}` : '',
     groupSql.length ? `GROUP BY\n  ${groupSql.join(', ')}` : (hasAggregate ? '-- Add GROUP BY fields for non-aggregated dimensions when needed.' : ''),
     havingSql.length ? `HAVING\n  ${havingSql.join('\n  AND ')}` : '',
     orderSql.length ? `ORDER BY\n  ${orderSql.join(', ')}` : '',
@@ -10224,6 +11145,15 @@ function materializeDataOpsStepConfigsForSave(steps: DataOpsPipelineStep[]): Dat
         id: targetId,
         name: String(existing?.name || step.name || `Query ${rows.length + 1}`),
         description: String(existing?.description || ''),
+        internalQueries: existing?.internalQueries || [],
+        activeInternalQueryId: existing?.activeInternalQueryId || '',
+        finalInternalQueryId: existing?.finalInternalQueryId || existing?.activeInternalQueryId || '',
+        sourceMode: existing?.sourceMode || 'database',
+        inputQueryId: existing?.inputQueryId || '',
+        inputMode: existing?.inputMode || 'set_based',
+        outputAlias: existing?.outputAlias || '',
+        cursorMappings: existing?.cursorMappings || [],
+        subqueries: existing?.subqueries || [],
         query: querySql,
         expression: querySql,
         tables: step.tables || [],
@@ -10234,19 +11164,29 @@ function materializeDataOpsStepConfigsForSave(steps: DataOpsPipelineStep[]): Dat
         havingRules: step.havingRules || [],
         orderByRows: step.orderByRows || [],
         bindParameters: step.bindParameters || [],
-        limitRows: step.limitRows,
+        limitRows: (existing?.internalQueries || []).length > 0 ? undefined : step.limitRows,
         updatedAt: now,
       }
+      const nextRows = existing ? rows.map((item) => item.id === targetId ? nextConfig : item) : [...rows, nextConfig]
+      const finalSql = dataOpsQueryBuilderSqlFromConfig(nextConfig, nextRows) || dataOpsQueryBuilderChainSql(nextRows, targetId)
       return {
         ...step,
-        query: querySql,
-        expression: querySql,
+        query: finalSql || querySql,
+        expression: finalSql || querySql,
         activeQueryBuilderId: targetId,
-        queryBuilders: existing ? rows.map((item) => item.id === targetId ? nextConfig : item) : [...rows, nextConfig],
+        queryBuilders: nextRows.map((item) => ({
+          ...item,
+          query: (item.internalQueries || []).length > 0
+            ? dataOpsQueryBuilderChainSql(item.internalQueries, item.finalInternalQueryId || item.activeInternalQueryId) || item.query
+            : dataOpsQueryBuilderTemplateSqlFromConfig(item, { includeLimit: false }) || item.query,
+          expression: (item.internalQueries || []).length > 0
+            ? dataOpsQueryBuilderChainSql(item.internalQueries, item.finalInternalQueryId || item.activeInternalQueryId) || item.expression
+            : dataOpsQueryBuilderTemplateSqlFromConfig(item, { includeLimit: false }) || item.expression,
+        })),
       }
     }
     if (step.kind === 'router') {
-      const rows = step.routerConfigs || []
+      const rows = cloneDataOpsRouterConfigs(step.routerConfigs)
       const targetId = String(step.activeRouterConfigId || rows[0]?.id || dataOpsId('router'))
       const existing = rows.find((item) => item.id === targetId)
       const nextConfig: DataOpsRouterConfig = {
@@ -10254,10 +11194,10 @@ function materializeDataOpsStepConfigsForSave(steps: DataOpsPipelineStep[]): Dat
         name: String(existing?.name || step.name || `Router ${rows.length + 1}`),
         description: String(existing?.description || ''),
         routeSource: step.routeSource || '',
-        queryInputs: step.queryInputs || [],
+        queryInputs: cloneDataOpsQueryInputRows(step.queryInputs),
         routeMode: step.routeMode || 'multi',
         payloadMode: step.payloadMode || 'all_rows',
-        routeRows: step.routeRows || [],
+        routeRows: cloneDataOpsRouterRouteRows(step.routeRows),
         syncProcessingMode: step.syncProcessingMode || 'batch',
         syncBatchSize: step.syncBatchSize || 1000,
         syncCommitEvery: step.syncCommitEvery || 5000,
@@ -11177,6 +12117,107 @@ type PreviewExtractOptions = {
   includeConfigPreview?: boolean
   includeExecutionOutput?: boolean
   includeExecutionInput?: boolean
+  maxRows?: number
+}
+
+const PREVIEW_ROW_CONTAINER_KEYS = [
+  'rows',
+  'records',
+  'items',
+  'data',
+  'preview',
+  'sample',
+  'samples',
+  'result',
+  'results',
+  'output',
+  'outputs',
+  'values',
+  '_preview_rows',
+  'preview_rows',
+  'sample_rows',
+  'sample_input',
+  'sample_output',
+  'table_rows',
+  'result_rows',
+  'output_rows',
+]
+
+const PREVIEW_WRAPPER_METADATA_KEYS = new Set([
+  'columns',
+  'column_names',
+  'schema',
+  'row_count',
+  'total_rows',
+  'rows_loaded',
+  'loaded',
+  'preview_rows',
+  'max_rows',
+  'offset',
+  'page',
+  'page_size',
+  'file',
+  'file_path',
+  'filename',
+  'path',
+  'type',
+  'format',
+  'status',
+  'ok',
+  'message',
+  'meta',
+  'metadata',
+  'summary',
+])
+
+function extractTabularPreviewRows(
+  value: unknown,
+  maxRows = 1000,
+  depth = 0,
+): Array<Record<string, unknown>> {
+  const limit = Math.max(1, Math.min(Math.trunc(Number(maxRows || 1000)), 10000))
+  if (value == null || depth > 8) return []
+
+  const parsed = parseObjectLikeJsonString(value)
+  if (parsed && (Array.isArray(parsed) || typeof parsed === 'object')) {
+    return extractTabularPreviewRows(parsed, limit, depth + 1)
+  }
+
+  if (Array.isArray(value)) {
+    const out: Array<Record<string, unknown>> = []
+    for (const item of value) {
+      if (out.length >= limit) break
+      out.push(...extractTabularPreviewRows(item, limit - out.length, depth + 1))
+    }
+    return out.slice(0, limit)
+  }
+
+  if (!value || typeof value !== 'object') return []
+  const obj = value as Record<string, unknown>
+  const containerRows: Array<Record<string, unknown>> = []
+  const presentContainerKeys: string[] = []
+  PREVIEW_ROW_CONTAINER_KEYS.forEach((key) => {
+    if (containerRows.length >= limit || !(key in obj)) return
+    const childRows = extractTabularPreviewRows(obj[key], limit - containerRows.length, depth + 1)
+    if (!childRows.length) return
+    presentContainerKeys.push(key)
+    containerRows.push(...childRows)
+  })
+
+  if (containerRows.length > 0) {
+    const containerKeySet = new Set(PREVIEW_ROW_CONTAINER_KEYS)
+    const keys = Object.keys(obj).map((key) => String(key || '').trim().toLowerCase()).filter(Boolean)
+    const metadataCount = keys.filter((key) => PREVIEW_WRAPPER_METADATA_KEYS.has(key)).length
+    const nonWrapperKeys = keys.filter((key) => !PREVIEW_WRAPPER_METADATA_KEYS.has(key) && !containerKeySet.has(key))
+    const wrapperLike = (
+      nonWrapperKeys.length === 0
+      || metadataCount > 0
+      || keys.length <= presentContainerKeys.length + 2
+    )
+    if (wrapperLike) return containerRows.slice(0, limit)
+  }
+
+  return [obj]
 }
 
 function extractPreviewRowsFromNode(
@@ -11191,6 +12232,7 @@ function extractPreviewRowsFromNode(
   const includeConfigPreview = options?.includeConfigPreview !== false
   const includeExecutionOutput = options?.includeExecutionOutput !== false
   const includeExecutionInput = options?.includeExecutionInput !== false
+  const maxRows = Math.max(1, Math.min(Math.trunc(Number(options?.maxRows || 5000)), 10000))
 
   const candidateSets = [
     ...(includeConfigPreview ? [cfg._preview_rows] : []),
@@ -11211,24 +12253,15 @@ function extractPreviewRowsFromNode(
     }
   }
   const addRow = (rowObj: Record<string, unknown>) => {
+    if (out.length >= maxRows) return
     const sig = buildSignature(rowObj)
     if (sig && seen.has(sig)) return
     if (sig) seen.add(sig)
     out.push(rowObj)
   }
   const collectCandidate = (candidate: unknown) => {
-    if (candidate == null) return
-    if (Array.isArray(candidate)) {
-      candidate.forEach((item) => collectCandidate(item))
-      return
-    }
-    if (candidate && typeof candidate === 'object') {
-      addRow(candidate as Record<string, unknown>)
-      return
-    }
-    const parsed = parseObjectLikeJsonString(candidate)
-    if (parsed == null) return
-    collectCandidate(parsed)
+    if (out.length >= maxRows) return
+    extractTabularPreviewRows(candidate, maxRows - out.length).forEach(addRow)
   }
   candidateSets.forEach((candidate) => {
     collectCandidate(candidate)
@@ -11738,6 +12771,24 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   const fileViewerBrowseInputRef = useRef<HTMLInputElement>(null)
   const [fileViewerBrowseUploading, setFileViewerBrowseUploading] = useState(false)
   const [customFieldStudioOpen, setCustomFieldStudioOpen] = useState(false)
+  const [ruleIntelligenceStudioOpen, setRuleIntelligenceStudioOpen] = useState(false)
+  const [ruleIntelligenceActiveTab, setRuleIntelligenceActiveTab] = useState('setup')
+  const [ruleIntelligencePreviewLoading, setRuleIntelligencePreviewLoading] = useState(false)
+  const [ruleIntelligenceValidationLoading, setRuleIntelligenceValidationLoading] = useState(false)
+  const [ruleIntelligencePreviewResult, setRuleIntelligencePreviewResult] = useState<Record<string, unknown> | null>(null)
+  const [ruleIntelligencePreviewRowLimit, setRuleIntelligencePreviewRowLimit] = useState(1000)
+  const [ruleIntelligenceLivePreviewEnabled, setRuleIntelligenceLivePreviewEnabled] = useState(true)
+  const [ruleIntelligenceRemoteSampleRows, setRuleIntelligenceRemoteSampleRows] = useState<Array<Record<string, unknown>>>([])
+  const [ruleIntelligenceRemoteSampleLoading, setRuleIntelligenceRemoteSampleLoading] = useState(false)
+  const [ruleIntelligenceRemoteSampleError, setRuleIntelligenceRemoteSampleError] = useState('')
+  const [ruleIntelligenceRemoteSampleSource, setRuleIntelligenceRemoteSampleSource] = useState('')
+  const [ruleIntelligenceGovernanceLoading, setRuleIntelligenceGovernanceLoading] = useState(false)
+  const [ruleIntelligenceImportLoading, setRuleIntelligenceImportLoading] = useState(false)
+  const [ruleIntelligencePacks, setRuleIntelligencePacks] = useState<Array<Record<string, unknown>>>([])
+  const [ruleIntelligenceSelectedPackId, setRuleIntelligenceSelectedPackId] = useState('')
+  const [ruleIntelligenceOutputDragIndex, setRuleIntelligenceOutputDragIndex] = useState<number | null>(null)
+  const ruleIntelligenceImportInputRef = useRef<HTMLInputElement>(null)
+  const ruleIntelligencePreviewRunRef = useRef(0)
   const [customFieldDraft, setCustomFieldDraft] = useState<CustomFieldSpec[]>([])
   const [customFieldBeautifyUndoById, setCustomFieldBeautifyUndoById] = useState<Record<string, CustomFieldBeautifyBackup>>({})
   const [customIncludeSourceDraft, setCustomIncludeSourceDraft] = useState(true)
@@ -13669,7 +14720,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     : ''
   const upstreamReferenceFields = useMemo(
     () => (
-      (nodeType === 'map_transform' || nodeType === 'profile_query_transform' || nodeType === 'mlops_transform') && selectedNodeId
+      (nodeType === 'map_transform' || nodeType === 'profile_query_transform' || nodeType === 'mlops_transform' || nodeType === 'rule_intelligence_engine') && selectedNodeId
         ? inferUpstreamInputFields(selectedNodeId, nodes, edges)
         : []
     ),
@@ -13677,7 +14728,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
   )
   const upstreamPreviewReferenceFields = useMemo(
     () => {
-      if ((nodeType !== 'map_transform' && nodeType !== 'profile_query_transform' && nodeType !== 'mlops_transform') || !selectedNodeId) return []
+      if ((nodeType !== 'map_transform' && nodeType !== 'profile_query_transform' && nodeType !== 'mlops_transform' && nodeType !== 'rule_intelligence_engine') || !selectedNodeId) return []
       const previewRows = inferUpstreamPreviewRows(selectedNodeId, nodes, edges, 300)
       if (!previewRows.length) return []
       return filterUserFacingFieldNames(extractSampleFieldPaths(previewRows))
@@ -15228,6 +16279,768 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     () => filterUserFacingFieldNames([...expressionFieldOptions, ...customProfilePathOptions, ...expressionStudioProfilePathOptions]),
     [expressionFieldOptions, customProfilePathOptions, expressionStudioProfilePathOptions]
   )
+  const ruleIntelligenceConfig = useMemo(
+    () => normalizeRuleIntelligenceNodeConfig(nodeConfig),
+    [nodeConfig]
+  )
+  const ruleIntelligenceHasDirectUpstream = useMemo(
+    () => nodeType === 'rule_intelligence_engine'
+      && Boolean(selectedNodeId)
+      && edges.some((edge) => String(edge.target || '') === String(selectedNodeId || '')),
+    [nodeType, selectedNodeId, edges],
+  )
+  const ruleIntelligenceDirectUpstreamFieldOptions = useMemo(() => {
+    if (nodeType !== 'rule_intelligence_engine' || !selectedNodeId) return []
+    const nodesById = new Map(nodes.map((item) => [item.id, item] as const))
+    const directSourceIds = uniqueFieldNames(
+      edges
+        .filter((edge) => String(edge.target || '') === String(selectedNodeId || ''))
+        .map((edge) => String(edge.source || '').trim())
+        .filter(Boolean),
+    )
+    const schemaFields: string[] = []
+    directSourceIds.forEach((sourceId) => {
+      schemaFields.push(...extractDirectNodeFields(nodesById.get(sourceId)))
+    })
+    const selectedSchemaFields = filterUserFacingFieldNames(uniqueFieldNames(schemaFields))
+    if (selectedSchemaFields.length > 0) return selectedSchemaFields
+
+    const sampleFields: string[] = []
+    directSourceIds.forEach((sourceId) => {
+      const sourceNode = nodesById.get(sourceId)
+      const rows = extractPreviewRowsFromNode(sourceNode, {
+        includeConfigPreview: true,
+        includeExecutionOutput: true,
+        includeExecutionInput: false,
+        maxRows: 100,
+      })
+      sampleFields.push(...extractSampleFieldPaths(rows))
+    })
+    return filterUserFacingFieldNames(uniqueFieldNames(sampleFields))
+  }, [nodeType, selectedNodeId, nodes, edges])
+  const ruleIntelligenceUpstreamFieldOptions = useMemo(
+    () => filterUserFacingFieldNames([
+      ...ruleIntelligenceDirectUpstreamFieldOptions,
+      ...upstreamReferenceFields,
+      ...upstreamPreviewReferenceFields,
+      ...mapInputFieldOptions,
+      ...parseFieldList(nodeConfig._detected_columns),
+      ...parseDetectedJsonPaths(nodeConfig._json_paths),
+      ...Object.values(ruleIntelligenceConfig.fieldMapping).map((value) => String(value || '').trim()).filter(Boolean),
+    ]),
+    [
+      ruleIntelligenceDirectUpstreamFieldOptions,
+      upstreamReferenceFields,
+      upstreamPreviewReferenceFields,
+      mapInputFieldOptions,
+      nodeConfig._detected_columns,
+      nodeConfig._json_paths,
+      ruleIntelligenceConfig.fieldMapping,
+    ]
+  )
+  const ruleIntelligenceLogicalFieldOptions = useMemo(
+    () => ruleIntelligenceConfig.inputFields.map((field) => ({
+      value: String(field.id || ''),
+      label: `${String(field.label || field.id || '')} (${String(field.id || '')})`,
+    })).filter((option) => option.value),
+    [ruleIntelligenceConfig.inputFields]
+  )
+  const ruleIntelligenceLocalSampleRows = useMemo(() => {
+    if (nodeType !== 'rule_intelligence_engine') return []
+    const sampleLimit = Math.max(1, Math.min(Math.trunc(Number(ruleIntelligencePreviewRowLimit || 1000)), 1000))
+    const nodesById = new Map(nodes.map((item) => [item.id, item] as const))
+    const rows: Array<Record<string, unknown>> = []
+    const seen = new Set<string>()
+    const makeSignature = (row: Record<string, unknown>): string | null => {
+      try {
+        const json = JSON.stringify(row)
+        if (!json) return null
+        return json.length > MAX_PREVIEW_SIGNATURE_CHARS ? json.slice(0, MAX_PREVIEW_SIGNATURE_CHARS) : json
+      } catch {
+        return null
+      }
+    }
+    const pushRows = (candidateRows: Array<Record<string, unknown>>) => {
+      for (const row of candidateRows) {
+        if (rows.length >= sampleLimit) break
+        if (!row || typeof row !== 'object' || Array.isArray(row)) continue
+        const sig = makeSignature(row)
+        if (sig && seen.has(sig)) continue
+        if (sig) seen.add(sig)
+        rows.push(row)
+      }
+    }
+
+    const incomingSourceIds = uniqueFieldNames(
+      edges
+        .filter((edge) => String(edge.target || '') === String(selectedNodeId || ''))
+        .map((edge) => String(edge.source || '').trim())
+        .filter(Boolean),
+    )
+
+    incomingSourceIds.forEach((sourceId) => {
+      if (rows.length >= sampleLimit) return
+      const sourceNode = nodesById.get(sourceId)
+      pushRows(extractPreviewRowsFromNode(sourceNode, {
+        includeConfigPreview: false,
+        includeExecutionOutput: true,
+        includeExecutionInput: false,
+        maxRows: sampleLimit - rows.length,
+      }))
+      if (rows.length >= sampleLimit) return
+      pushRows(extractPreviewRowsFromNode(sourceNode, {
+        includeConfigPreview: true,
+        includeExecutionOutput: true,
+        includeExecutionInput: false,
+        maxRows: sampleLimit - rows.length,
+      }))
+    })
+
+    if (selectedNodeId && rows.length < sampleLimit) {
+      pushRows(inferUpstreamPreviewRows(
+        selectedNodeId,
+        nodes,
+        edges,
+        sampleLimit - rows.length,
+        undefined,
+        true,
+      ))
+    }
+
+    if (rows.length === 0) {
+      const selectedNode = nodes.find((item) => item.id === selectedNodeId)
+      pushRows(extractPreviewRowsFromNode(selectedNode, { maxRows: sampleLimit }))
+    }
+
+    return rows
+  }, [nodeType, nodes, selectedNodeId, edges, ruleIntelligencePreviewRowLimit])
+  const ruleIntelligenceSampleRows = useMemo(() => {
+    const sampleLimit = Math.max(1, Math.min(Math.trunc(Number(ruleIntelligencePreviewRowLimit || 1000)), 1000))
+    if (ruleIntelligenceRemoteSampleRows.length > 0) {
+      return ruleIntelligenceRemoteSampleRows.slice(0, sampleLimit)
+    }
+    return ruleIntelligenceLocalSampleRows.slice(0, sampleLimit)
+  }, [ruleIntelligenceLocalSampleRows, ruleIntelligencePreviewRowLimit, ruleIntelligenceRemoteSampleRows])
+  const ruleIntelligenceSampleSourceLabel = useMemo(() => {
+    if (ruleIntelligenceRemoteSampleRows.length > 0) return ruleIntelligenceRemoteSampleSource || 'server upstream'
+    if (ruleIntelligenceLocalSampleRows.length > 0) return 'canvas upstream'
+    return 'no upstream sample'
+  }, [ruleIntelligenceLocalSampleRows.length, ruleIntelligenceRemoteSampleRows.length, ruleIntelligenceRemoteSampleSource])
+  useEffect(() => {
+    if (nodeType !== 'rule_intelligence_engine' || !ruleIntelligenceStudioOpen || !activePipelineId || !selectedNodeId) {
+      setRuleIntelligenceRemoteSampleRows([])
+      setRuleIntelligenceRemoteSampleLoading(false)
+      setRuleIntelligenceRemoteSampleError('')
+      setRuleIntelligenceRemoteSampleSource('')
+      return
+    }
+    const sampleLimit = Math.max(1, Math.min(Math.trunc(Number(ruleIntelligencePreviewRowLimit || 1000)), 1000))
+    if (ruleIntelligenceLocalSampleRows.length >= Math.min(50, sampleLimit)) {
+      setRuleIntelligenceRemoteSampleRows([])
+      setRuleIntelligenceRemoteSampleLoading(false)
+      setRuleIntelligenceRemoteSampleError('')
+      setRuleIntelligenceRemoteSampleSource('')
+      return
+    }
+    let cancelled = false
+    const loadRemoteSample = async () => {
+      setRuleIntelligenceRemoteSampleLoading(true)
+      setRuleIntelligenceRemoteSampleError('')
+      try {
+        const result = await api.fetchRuleIntelligenceUpstreamSample({
+          pipeline_id: activePipelineId,
+          node_id: selectedNodeId,
+          max_rows: sampleLimit,
+        })
+        if (cancelled) return
+        const rows = Array.isArray(result?.rows)
+          ? result.rows.filter((row: unknown) => !!row && typeof row === 'object' && !Array.isArray(row)) as Array<Record<string, unknown>>
+          : []
+        setRuleIntelligenceRemoteSampleRows(rows.slice(0, sampleLimit))
+        const source = String(result?.source || '').trim()
+        setRuleIntelligenceRemoteSampleSource(
+          source === 'connected_file_output'
+            ? 'connected file output'
+            : source === 'latest_execution'
+              ? 'latest execution'
+              : source || '',
+        )
+        if (rows.length <= 0) {
+          setRuleIntelligenceRemoteSampleError(String(result?.message || 'No upstream sample rows found on the server.'))
+        }
+      } catch (err: any) {
+        if (!cancelled) {
+          setRuleIntelligenceRemoteSampleRows([])
+          setRuleIntelligenceRemoteSampleError(String(err?.message || 'Failed to load upstream sample rows.'))
+          setRuleIntelligenceRemoteSampleSource('')
+        }
+      } finally {
+        if (!cancelled) setRuleIntelligenceRemoteSampleLoading(false)
+      }
+    }
+    void loadRemoteSample()
+    return () => {
+      cancelled = true
+    }
+  }, [
+    activePipelineId,
+    nodeType,
+    ruleIntelligenceLocalSampleRows.length,
+    ruleIntelligencePreviewRowLimit,
+    ruleIntelligenceStudioOpen,
+    selectedNodeId,
+  ])
+  const ruleIntelligenceSampleFieldOptions = useMemo(
+    () => filterUserFacingFieldNames(extractSampleFieldPaths(ruleIntelligenceSampleRows)),
+    [ruleIntelligenceSampleRows]
+  )
+  const ruleIntelligenceMappingFieldOptions = useMemo(
+    () => filterUserFacingFieldNames([
+      ...ruleIntelligenceSampleFieldOptions,
+      ...ruleIntelligenceUpstreamFieldOptions,
+    ]),
+    [ruleIntelligenceSampleFieldOptions, ruleIntelligenceUpstreamFieldOptions]
+  )
+  const patchRuleIntelligenceConfig = useCallback((patch: Record<string, unknown>) => {
+    if (!selectedNodeId) return
+    updateNodeConfig(selectedNodeId, patch)
+  }, [selectedNodeId, updateNodeConfig])
+  const currentRuleIntelligencePayload = useCallback(() => {
+    const outputLayout: Record<string, unknown> = { ...ruleIntelligenceConfig.outputLayout }
+    const selectedFields = Array.isArray(outputLayout.selected_fields)
+      ? outputLayout.selected_fields.map((field) => String(field || '').trim()).filter(Boolean)
+      : []
+    if (selectedFields.length > 0) {
+      const rowFields = Array.isArray(outputLayout.row_fields) ? outputLayout.row_fields : ['entity_id', 'period']
+      const requiredFields = rowFields.map((field) => {
+        const token = String(field || '').trim()
+        const normalized = token.toLowerCase().replace(/\s+/g, '_')
+        if (['period', 'day', 'month', 'quarter', 'year'].includes(normalized)) return normalized === 'day' ? 'day' : normalized === 'month' ? 'month' : normalized === 'quarter' ? 'quarter' : normalized === 'year' ? 'year' : 'period'
+        return normalizeRuleIntelligenceFieldId(token) || token
+      }).filter(Boolean)
+      outputLayout.selected_fields = uniqueFieldNames([...requiredFields, ...selectedFields])
+    }
+    return {
+      ...nodeConfig,
+      rule_pack: ruleIntelligenceConfig.rulePack,
+      input_fields: ruleIntelligenceConfig.inputFields,
+      field_mapping: ruleIntelligenceConfig.fieldMapping,
+      clusters: ruleIntelligenceConfig.clusters,
+      rules: ruleIntelligenceConfig.rules,
+      targets: ruleIntelligenceConfig.targets,
+      anomalies: ruleIntelligenceConfig.anomalies,
+      output_layout: outputLayout,
+    }
+  }, [nodeConfig, ruleIntelligenceConfig])
+  const updateRuleIntelligenceInputFields = useCallback((inputFields: Array<Record<string, unknown>>) => {
+    const nextMapping = inputFields.reduce<Record<string, unknown>>((acc, field) => {
+      const id = normalizeRuleIntelligenceFieldId(field.id || field.name || field.label)
+      if (!id) return acc
+      acc[id] = String(field.mapped_field || ruleIntelligenceConfig.fieldMapping[id] || id)
+      return acc
+    }, {})
+    patchRuleIntelligenceConfig({
+      input_fields: inputFields,
+      field_mapping: nextMapping,
+    })
+  }, [patchRuleIntelligenceConfig, ruleIntelligenceConfig.fieldMapping])
+  const updateRuleIntelligenceInputField = useCallback((index: number, patch: Record<string, unknown>) => {
+    const next = ruleIntelligenceConfig.inputFields.map((field, idx) => {
+      if (idx !== index) return field
+      const updated = { ...field, ...patch }
+      if ('id' in patch) {
+        updated.id = normalizeRuleIntelligenceFieldId(patch.id)
+      }
+      return updated
+    })
+    updateRuleIntelligenceInputFields(next)
+  }, [ruleIntelligenceConfig.inputFields, updateRuleIntelligenceInputFields])
+  const addRuleIntelligenceInputField = useCallback(() => {
+    const id = `field_${ruleIntelligenceConfig.inputFields.length + 1}`
+    updateRuleIntelligenceInputFields([
+      ...ruleIntelligenceConfig.inputFields,
+      { id, label: 'New Field', type: 'string', role: 'dimension', required: false, mapped_field: id },
+    ])
+  }, [ruleIntelligenceConfig.inputFields, updateRuleIntelligenceInputFields])
+  const autoDetectRuleIntelligenceInputFields = useCallback(() => {
+    const sourceFields = ruleIntelligenceDirectUpstreamFieldOptions
+    if (sourceFields.length === 0) {
+      notification.warning({
+        message: 'No upstream fields found',
+        description: ruleIntelligenceHasDirectUpstream
+          ? 'Run or refresh the upstream node so its selected output fields are available.'
+          : 'Connect an upstream node before auto-detecting fields.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    const next = sourceFields.slice(0, 30).map((fieldName) => inferRuleIntelligenceFieldMeta(fieldName))
+    updateRuleIntelligenceInputFields(next)
+  }, [ruleIntelligenceDirectUpstreamFieldOptions, ruleIntelligenceHasDirectUpstream, updateRuleIntelligenceInputFields])
+  const updateRuleIntelligenceFieldMapping = useCallback((key: string, value: unknown) => {
+    const next = ruleIntelligenceConfig.inputFields.map((field) => (
+      String(field.id || '') === String(key || '')
+        ? { ...field, mapped_field: value }
+        : field
+    ))
+    updateRuleIntelligenceInputFields(next)
+  }, [ruleIntelligenceConfig.inputFields, updateRuleIntelligenceInputFields])
+  const updateRuleIntelligenceOutputLayout = useCallback((patch: Record<string, unknown>) => {
+    patchRuleIntelligenceConfig({
+      output_layout: {
+        ...ruleIntelligenceConfig.outputLayout,
+        ...patch,
+      },
+    })
+  }, [patchRuleIntelligenceConfig, ruleIntelligenceConfig.outputLayout])
+  const updateRuleIntelligenceRule = useCallback((index: number, patch: Record<string, unknown>) => {
+    const next = ruleIntelligenceConfig.rules.map((rule, idx) => (
+      idx === index ? { ...rule, ...patch } : rule
+    ))
+    patchRuleIntelligenceConfig({ rules: next })
+  }, [patchRuleIntelligenceConfig, ruleIntelligenceConfig.rules])
+  const updateRuleIntelligenceTarget = useCallback((index: number, patch: Record<string, unknown>) => {
+    patchRuleIntelligenceConfig({
+      targets: ruleIntelligenceConfig.targets.map((target, idx) => idx === index ? { ...target, ...patch } : target),
+    })
+  }, [patchRuleIntelligenceConfig, ruleIntelligenceConfig.targets])
+  const moveRuleIntelligenceTarget = useCallback((index: number, direction: -1 | 1) => {
+    const targetIndex = index + direction
+    if (targetIndex < 0 || targetIndex >= ruleIntelligenceConfig.targets.length) return
+    const next = [...ruleIntelligenceConfig.targets]
+    const [moved] = next.splice(index, 1)
+    next.splice(targetIndex, 0, moved)
+    patchRuleIntelligenceConfig({ targets: next })
+  }, [patchRuleIntelligenceConfig, ruleIntelligenceConfig.targets])
+  const updateRuleIntelligenceAnomaly = useCallback((index: number, patch: Record<string, unknown>) => {
+    patchRuleIntelligenceConfig({
+      anomalies: ruleIntelligenceConfig.anomalies.map((anomaly, idx) => idx === index ? { ...anomaly, ...patch } : anomaly),
+    })
+  }, [patchRuleIntelligenceConfig, ruleIntelligenceConfig.anomalies])
+  const moveRuleIntelligenceAnomaly = useCallback((index: number, direction: -1 | 1) => {
+    const targetIndex = index + direction
+    if (targetIndex < 0 || targetIndex >= ruleIntelligenceConfig.anomalies.length) return
+    const next = [...ruleIntelligenceConfig.anomalies]
+    const [moved] = next.splice(index, 1)
+    next.splice(targetIndex, 0, moved)
+    patchRuleIntelligenceConfig({ anomalies: next })
+  }, [patchRuleIntelligenceConfig, ruleIntelligenceConfig.anomalies])
+  const moveRuleIntelligenceRule = useCallback((index: number, direction: -1 | 1) => {
+    const targetIndex = index + direction
+    if (targetIndex < 0 || targetIndex >= ruleIntelligenceConfig.rules.length) return
+    const next = [...ruleIntelligenceConfig.rules]
+    const [moved] = next.splice(index, 1)
+    next.splice(targetIndex, 0, moved)
+    patchRuleIntelligenceConfig({ rules: next })
+  }, [patchRuleIntelligenceConfig, ruleIntelligenceConfig.rules])
+  const updateRuleIntelligenceRuleCalculation = useCallback((index: number, patch: Record<string, unknown>) => {
+    const current = ruleIntelligenceConfig.rules[index] || {}
+    const currentCalculation = (
+      current.calculation && typeof current.calculation === 'object' && !Array.isArray(current.calculation)
+        ? current.calculation as Record<string, unknown>
+        : {}
+    )
+    updateRuleIntelligenceRule(index, {
+      calculation: {
+        ...currentCalculation,
+        ...patch,
+      },
+    })
+  }, [ruleIntelligenceConfig.rules, updateRuleIntelligenceRule])
+  const updateRuleIntelligenceRuleAndCalculation = useCallback((index: number, rulePatch: Record<string, unknown>, calculationPatch: Record<string, unknown>) => {
+    const next = ruleIntelligenceConfig.rules.map((rule, idx) => {
+      if (idx !== index) return rule
+      const currentCalculation = (
+        rule.calculation && typeof rule.calculation === 'object' && !Array.isArray(rule.calculation)
+          ? rule.calculation as Record<string, unknown>
+          : {}
+      )
+      return {
+        ...rule,
+        ...rulePatch,
+        calculation: {
+          ...currentCalculation,
+          ...calculationPatch,
+        },
+      }
+    })
+    patchRuleIntelligenceConfig({ rules: next })
+  }, [patchRuleIntelligenceConfig, ruleIntelligenceConfig.rules])
+  const updateRuleIntelligenceRuleCap = useCallback((index: number, patch: Record<string, unknown>) => {
+    const current = ruleIntelligenceConfig.rules[index] || {}
+    const currentCap = (
+      current.cap && typeof current.cap === 'object' && !Array.isArray(current.cap)
+        ? current.cap as Record<string, unknown>
+        : {}
+    )
+    updateRuleIntelligenceRule(index, {
+      cap: {
+        ...currentCap,
+        ...patch,
+      },
+    })
+  }, [ruleIntelligenceConfig.rules, updateRuleIntelligenceRule])
+  const updateRuleIntelligenceCluster = useCallback((index: number, patch: Record<string, unknown>) => {
+    patchRuleIntelligenceConfig({
+      clusters: ruleIntelligenceConfig.clusters.map((cluster, idx) => idx === index ? { ...cluster, ...patch } : cluster),
+    })
+  }, [patchRuleIntelligenceConfig, ruleIntelligenceConfig.clusters])
+  const addRuleIntelligenceCluster = useCallback((type: 'calculation' | 'target' | 'anomaly' | 'output') => {
+    const sequenceBase = type === 'target' ? 100 : type === 'anomaly' ? 200 : type === 'output' ? 300 : 20
+    const label = type === 'target' ? 'New Target Cluster' : type === 'anomaly' ? 'New Anomaly Cluster' : type === 'output' ? 'New Output Cluster' : 'New Calculation Cluster'
+    patchRuleIntelligenceConfig({
+      clusters: [
+        ...ruleIntelligenceConfig.clusters,
+        {
+          id: normalizeRuleIntelligenceFieldId(`${type}_${Date.now()}`),
+          name: label,
+          type,
+          sequence: sequenceBase + ruleIntelligenceConfig.clusters.filter((cluster) => String(cluster.type || 'calculation') === type).length + 1,
+          enabled: true,
+        },
+      ],
+    })
+  }, [patchRuleIntelligenceConfig, ruleIntelligenceConfig.clusters])
+  const addRuleIntelligenceDefaultClusters = useCallback(() => {
+    const existing = Array.isArray(ruleIntelligenceConfig.clusters) ? ruleIntelligenceConfig.clusters : []
+    const existingIds = new Set(existing.map((cluster) => String(cluster.id || cluster.key || '').trim()).filter(Boolean))
+    patchRuleIntelligenceConfig({
+      clusters: [
+        ...existing,
+        ...RULE_INTELLIGENCE_RECOMMENDED_CLUSTERS.filter((cluster) => !existingIds.has(String(cluster.id))),
+      ],
+    })
+  }, [patchRuleIntelligenceConfig, ruleIntelligenceConfig.clusters])
+  const runRuleIntelligencePreview = useCallback(async (options?: { silent?: boolean; useUpstream?: boolean }) => {
+    const silent = Boolean(options?.silent)
+    const useUpstream = Boolean(options?.useUpstream)
+    const runId = ruleIntelligencePreviewRunRef.current + 1
+    ruleIntelligencePreviewRunRef.current = runId
+    setRuleIntelligencePreviewLoading(true)
+    try {
+      const result = await api.previewRuleIntelligence({
+        config: currentRuleIntelligencePayload(),
+        rows: useUpstream ? [] : ruleIntelligenceSampleRows,
+        max_rows: ruleIntelligencePreviewRowLimit,
+        output_max_rows: 1000,
+        use_upstream: useUpstream,
+        pipeline_id: activePipelineId || undefined,
+        node_id: selectedNodeId || undefined,
+      })
+      if (runId !== ruleIntelligencePreviewRunRef.current) return
+      setRuleIntelligencePreviewResult(result as Record<string, unknown>)
+      if (!silent && (result as any)?.ok) {
+        notification.success({
+          message: useUpstream ? 'Full upstream preview ready' : 'Rule preview ready',
+          description: `${Number((result as any)?.output_rows || 0).toLocaleString()} output row(s) generated from ${Number((result as any)?.input_rows || 0).toLocaleString()} input row(s).`,
+          placement: 'bottomRight',
+        })
+      } else if (!silent) {
+        notification.error({
+          message: 'Rule preview failed',
+          description: String(((result as any)?.errors || [])[0] || 'Review rule configuration.'),
+          placement: 'bottomRight',
+        })
+      }
+    } catch (err: any) {
+      if (runId !== ruleIntelligencePreviewRunRef.current) return
+      if (!silent) {
+        notification.error({
+          message: 'Rule preview failed',
+          description: String(err?.message || err || 'Preview API failed.'),
+          placement: 'bottomRight',
+        })
+      } else {
+        setRuleIntelligencePreviewResult({
+          ok: false,
+          input_rows: useUpstream ? 0 : ruleIntelligenceSampleRows.length,
+          output_rows: 0,
+          errors: [String(err?.message || err || 'Preview API failed.')],
+          warnings: [],
+          sample_input: [],
+          sample_output: [],
+        })
+      }
+    } finally {
+      if (runId === ruleIntelligencePreviewRunRef.current) {
+        setRuleIntelligencePreviewLoading(false)
+      }
+    }
+  }, [activePipelineId, currentRuleIntelligencePayload, ruleIntelligencePreviewRowLimit, ruleIntelligenceSampleRows, selectedNodeId])
+  useEffect(() => {
+    if (!ruleIntelligenceLivePreviewEnabled) return
+    if (nodeType !== 'rule_intelligence_engine' || !ruleIntelligenceStudioOpen) return
+    if (!['rules', 'output', 'preview', 'audit'].includes(String(ruleIntelligenceActiveTab || ''))) return
+    if (ruleIntelligenceSampleRows.length <= 0) return
+    const timer = window.setTimeout(() => {
+      void runRuleIntelligencePreview({ silent: true })
+    }, 800)
+    return () => window.clearTimeout(timer)
+  }, [
+    nodeType,
+    ruleIntelligenceActiveTab,
+    ruleIntelligenceLivePreviewEnabled,
+    ruleIntelligenceSampleRows.length,
+    ruleIntelligenceStudioOpen,
+    runRuleIntelligencePreview,
+  ])
+  const runRuleIntelligenceValidation = useCallback(async () => {
+    setRuleIntelligenceValidationLoading(true)
+    try {
+      const result = await api.validateRuleIntelligence({
+        config: currentRuleIntelligencePayload(),
+        rows: ruleIntelligenceSampleRows,
+        max_rows: ruleIntelligencePreviewRowLimit,
+      })
+      setRuleIntelligencePreviewResult(result as Record<string, unknown>)
+      if ((result as any)?.ok) {
+        notification.success({
+          message: 'Rule pack valid',
+          description: 'Configuration validation completed without errors.',
+          placement: 'bottomRight',
+        })
+      } else {
+        notification.error({
+          message: 'Rule pack has errors',
+          description: String(((result as any)?.errors || [])[0] || 'Review validation details.'),
+          placement: 'bottomRight',
+        })
+      }
+    } catch (err: any) {
+      notification.error({
+        message: 'Rule validation failed',
+        description: String(err?.message || err || 'Validation API failed.'),
+        placement: 'bottomRight',
+      })
+    } finally {
+      setRuleIntelligenceValidationLoading(false)
+    }
+  }, [currentRuleIntelligencePayload, ruleIntelligencePreviewRowLimit, ruleIntelligenceSampleRows])
+  const loadRuleIntelligencePacks = useCallback(async () => {
+    setRuleIntelligenceGovernanceLoading(true)
+    try {
+      const result = await api.listRuleIntelligencePacks()
+      const rows = Array.isArray(result) ? result as Array<Record<string, unknown>> : []
+      setRuleIntelligencePacks(rows)
+      notification.success({
+        message: 'Rule packs loaded',
+        description: `${rows.length.toLocaleString()} governed pack(s) found.`,
+        placement: 'bottomRight',
+      })
+    } catch (err: any) {
+      notification.error({
+        message: 'Load failed',
+        description: String(err?.message || err || 'Unable to load rule packs.'),
+        placement: 'bottomRight',
+      })
+    } finally {
+      setRuleIntelligenceGovernanceLoading(false)
+    }
+  }, [])
+  const applyRuleIntelligenceConfigFromPack = useCallback((pack: Record<string, unknown>) => {
+    const version = (
+      pack.current_version && typeof pack.current_version === 'object' && !Array.isArray(pack.current_version)
+        ? pack.current_version as Record<string, unknown>
+        : {}
+    )
+    const config = (
+      version.config && typeof version.config === 'object' && !Array.isArray(version.config)
+        ? version.config as Record<string, unknown>
+        : {}
+    )
+    if (!config || Object.keys(config).length === 0) {
+      notification.warning({
+        message: 'No version config',
+        description: 'Selected rule pack does not have a loadable version config.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    patchRuleIntelligenceConfig({
+      studio_name: String(pack.name || 'Rule Intelligence Engine'),
+      rule_pack: config.rule_pack || {},
+      input_fields: config.input_fields || [],
+      field_mapping: config.field_mapping || {},
+      clusters: config.clusters || [],
+      rules: config.rules || [],
+      targets: config.targets || [],
+      anomalies: config.anomalies || [],
+      output_layout: config.output_layout || {},
+    })
+    notification.success({
+      message: 'Rule pack applied',
+      description: String(pack.name || 'Selected rule pack'),
+      placement: 'bottomRight',
+    })
+  }, [patchRuleIntelligenceConfig])
+  const loadRuleIntelligencePackById = useCallback(async (packId: string) => {
+    const id = String(packId || '').trim()
+    if (!id) return
+    setRuleIntelligenceGovernanceLoading(true)
+    try {
+      const pack = await api.getRuleIntelligencePack(id)
+      setRuleIntelligenceSelectedPackId(id)
+      applyRuleIntelligenceConfigFromPack(pack as Record<string, unknown>)
+      setRuleIntelligencePacks((current) => {
+        const next = current.filter((item) => String(item.id || '') !== id)
+        return [pack as Record<string, unknown>, ...next]
+      })
+    } catch (err: any) {
+      notification.error({
+        message: 'Load failed',
+        description: String(err?.message || err || 'Unable to load selected rule pack.'),
+        placement: 'bottomRight',
+      })
+    } finally {
+      setRuleIntelligenceGovernanceLoading(false)
+    }
+  }, [applyRuleIntelligenceConfigFromPack])
+  const saveRuleIntelligencePackVersion = useCallback(async () => {
+    setRuleIntelligenceGovernanceLoading(true)
+    try {
+      const configPayload = currentRuleIntelligencePayload()
+      const packName = String(ruleIntelligenceConfig.rulePack.name || nodeConfig.studio_name || 'Rule Intelligence Engine').trim()
+      let result: any
+      if (ruleIntelligenceSelectedPackId) {
+        const versionLabel = String(ruleIntelligenceConfig.rulePack.version || '').trim() || undefined
+        result = await api.createRuleIntelligencePackVersion(ruleIntelligenceSelectedPackId, {
+          config: configPayload,
+          version_label: versionLabel,
+          notes: 'Saved from Rule Intelligence Studio',
+          created_by: 'admin',
+          validate: true,
+          rows: ruleIntelligenceSampleRows,
+          max_rows: ruleIntelligencePreviewRowLimit,
+        })
+        notification.success({
+          message: 'Version saved',
+          description: `${String(result?.version_label || 'New version')} stored as governed draft.`,
+          placement: 'bottomRight',
+        })
+      } else {
+        result = await api.createRuleIntelligencePack({
+          name: packName,
+          owner: 'admin',
+          source: 'studio',
+          tags: ['rule-intelligence'],
+          config: configPayload,
+          notes: 'Created from Rule Intelligence Studio',
+        })
+        const id = String(result?.id || '')
+        setRuleIntelligenceSelectedPackId(id)
+        notification.success({
+          message: 'Rule pack created',
+          description: packName,
+          placement: 'bottomRight',
+        })
+      }
+      await loadRuleIntelligencePacks()
+    } catch (err: any) {
+      notification.error({
+        message: 'Save failed',
+        description: String(err?.message || err || 'Unable to save rule pack.'),
+        placement: 'bottomRight',
+      })
+    } finally {
+      setRuleIntelligenceGovernanceLoading(false)
+    }
+  }, [
+    currentRuleIntelligencePayload,
+    loadRuleIntelligencePacks,
+    nodeConfig.studio_name,
+    ruleIntelligenceConfig.rulePack,
+    ruleIntelligencePreviewRowLimit,
+    ruleIntelligenceSampleRows,
+    ruleIntelligenceSelectedPackId,
+  ])
+  const updateRuleIntelligenceLifecycle = useCallback(async (action: 'submit' | 'approve' | 'reject' | 'activate' | 'retire') => {
+    const packId = String(ruleIntelligenceSelectedPackId || '').trim()
+    const pack = ruleIntelligencePacks.find((item) => String(item.id || '') === packId)
+    const currentVersion = (
+      pack?.current_version && typeof pack.current_version === 'object' && !Array.isArray(pack.current_version)
+        ? pack.current_version as Record<string, unknown>
+        : null
+    )
+    const versionId = String(currentVersion?.id || '')
+    if (!packId || !versionId) {
+      notification.warning({
+        message: 'Select a governed pack',
+        description: 'Save or load a rule pack before changing lifecycle status.',
+        placement: 'bottomRight',
+      })
+      return
+    }
+    setRuleIntelligenceGovernanceLoading(true)
+    try {
+      const result = await api.updateRuleIntelligencePackVersionLifecycle(packId, versionId, action, {
+        actor: 'admin',
+        comment: `${action} from Rule Intelligence Studio`,
+      })
+      setRuleIntelligencePacks((current) => [result as Record<string, unknown>, ...current.filter((item) => String(item.id || '') !== packId)])
+      notification.success({
+        message: `Rule pack ${action}`,
+        description: String((result as any)?.name || 'Governance status updated.'),
+        placement: 'bottomRight',
+      })
+    } catch (err: any) {
+      notification.error({
+        message: 'Lifecycle update failed',
+        description: String(err?.message || err || 'Unable to update lifecycle status.'),
+        placement: 'bottomRight',
+      })
+    } finally {
+      setRuleIntelligenceGovernanceLoading(false)
+    }
+  }, [ruleIntelligencePacks, ruleIntelligenceSelectedPackId])
+  const importRuleIntelligenceFile = useCallback(async (file?: File) => {
+    if (!file) return
+    setRuleIntelligenceImportLoading(true)
+    try {
+      const result = await api.importRuleIntelligenceFile(file)
+      const config = (
+        (result as any)?.config && typeof (result as any).config === 'object'
+          ? (result as any).config as Record<string, unknown>
+          : {}
+      )
+      patchRuleIntelligenceConfig({
+        studio_name: String((config.rule_pack as any)?.name || file.name || 'Imported Rule Pack'),
+        rule_pack: config.rule_pack || {},
+        input_fields: config.input_fields || [],
+        field_mapping: config.field_mapping || {},
+        clusters: config.clusters || [],
+        rules: config.rules || [],
+        targets: config.targets || [],
+        anomalies: config.anomalies || [],
+        output_layout: config.output_layout || {},
+      })
+      notification.success({
+        message: 'Rule file imported',
+        description: `${Number((result as any)?.rule_count || 0).toLocaleString()} rule(s) detected from ${file.name}.`,
+        placement: 'bottomRight',
+      })
+    } catch (err: any) {
+      notification.error({
+        message: 'Import failed',
+        description: String(err?.message || err || 'Unable to import rule file.'),
+        placement: 'bottomRight',
+      })
+    } finally {
+      setRuleIntelligenceImportLoading(false)
+      if (ruleIntelligenceImportInputRef.current) {
+        ruleIntelligenceImportInputRef.current.value = ''
+      }
+    }
+  }, [patchRuleIntelligenceConfig])
+  useEffect(() => {
+    if (!ruleIntelligenceStudioOpen || nodeType !== 'rule_intelligence_engine') return
+    if (ruleIntelligencePacks.length > 0) return
+    void loadRuleIntelligencePacks()
+  }, [
+    loadRuleIntelligencePacks,
+    nodeType,
+    ruleIntelligencePacks.length,
+    ruleIntelligenceStudioOpen,
+  ])
   const expressionCompletionEntries = useMemo<ExpressionCompletionEntry[]>(() => {
     const out: ExpressionCompletionEntry[] = []
     EXPRESSION_FUNCTION_SNIPPETS.forEach((fn) => {
@@ -30890,9 +32703,13 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     if (nodeType === 'file_viewer') {
       return false
     }
+    if (nodeType === 'rule_intelligence_engine') {
+      return false
+    }
     return true
   })
   const canUseCustomFieldStudio = nodeType === 'map_transform'
+  const canUseRuleIntelligenceStudio = nodeType === 'rule_intelligence_engine'
   const gatewayRuntimePath = gatewayDraftRuntimePath(gatewayStudioDraft)
   const loadDataOpsOracleCatalog = async (objectName = '', searchOverride?: string, schemaOverride?: string) => {
     if (!selectedNodeId) return
@@ -31974,28 +33791,29 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
       })
     }, 150)
   }, [dataOpsStepNameDraft, patchDataOpsStepNameDirect])
-  const buildDataOpsMapperSyncSql = useCallback((step: DataOpsPipelineStep): { sql: string; issue: string; sourceSql?: string } => {
+  const buildDataOpsMapperSyncSql = useCallback((step: DataOpsPipelineStep, stepsOverride?: DataOpsPipelineStep[]): { sql: string; issue: string; sourceSql?: string } => {
+    const sourceSteps = stepsOverride || dataOpsPipelineSteps
     const target = String(step.target || '').trim()
     const writeMode = String(step.writeMode || 'upsert')
     const activeMappings = (step.mappingRows || [])
       .filter((row) => row.enabled !== false && String(row.target || '').trim() && (String(row.source || '').trim() || String(row.defaultValue || '').trim()))
-    const mapperIndex = dataOpsPipelineSteps.findIndex((item) => item.id === step.id)
+    const mapperIndex = sourceSteps.findIndex((item) => item.id === step.id)
     const resolveMapperSourceSql = () => {
       const rawSource = String(step.lookupSource || '').trim()
       if (rawSource.startsWith('query:')) {
         const [, sourceStepId, queryId] = rawSource.split(':')
-        const sourceStep = dataOpsPipelineSteps.find((item) => item.id === sourceStepId)
+        const sourceStep = sourceSteps.find((item) => item.id === sourceStepId)
         const queryConfig = (sourceStep?.queryBuilders || []).find((item) => item.id === queryId)
-        return String(queryConfig?.query || queryConfig?.expression || '').trim().replace(/;\s*$/, '')
+        return String(queryConfig ? dataOpsQueryBuilderSqlFromConfig(queryConfig) : '').trim().replace(/;\s*$/, '')
       }
       if (rawSource.startsWith('step:')) {
         const sourceStepId = rawSource.slice('step:'.length)
-        const sourceStep = dataOpsPipelineSteps.find((item) => item.id === sourceStepId)
+        const sourceStep = sourceSteps.find((item) => item.id === sourceStepId)
         const activeQueryConfig = (sourceStep?.queryBuilders || []).find((item) => item.id === sourceStep?.activeQueryBuilderId)
-        return String(activeQueryConfig?.query || activeQueryConfig?.expression || sourceStep?.query || sourceStep?.expression || '').trim().replace(/;\s*$/, '')
+        return String(activeQueryConfig ? dataOpsQueryBuilderSqlFromConfig(activeQueryConfig) : sourceStep?.query || sourceStep?.expression || '').trim().replace(/;\s*$/, '')
       }
-      const sourceQueryStep = dataOpsPipelineSteps
-      .slice(0, mapperIndex < 0 ? dataOpsPipelineSteps.length : mapperIndex)
+      const sourceQueryStep = sourceSteps
+      .slice(0, mapperIndex < 0 ? sourceSteps.length : mapperIndex)
       .reverse()
       .find((item) => item.kind === 'prepare' && String(item.query || item.expression || '').trim())
       return String(sourceQueryStep?.query || sourceQueryStep?.expression || '').trim().replace(/;\s*$/, '')
@@ -33495,6 +35313,1021 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
     </Space>,
   )
 
+  const ruleFieldLabelStyle: CSSProperties = {
+    color: 'var(--app-text-subtle)',
+    fontSize: 11,
+    fontWeight: 700,
+    textTransform: 'uppercase',
+  }
+  const renderRuleIntelligenceMonitoringConditionEditor = (
+    owner: Record<string, unknown>,
+    onUpdate: (patch: Record<string, unknown>) => void,
+    options: { title: string; badge: string; accent: string },
+  ): ReactNode => {
+    const rootTree = normalizeRuleIntelligenceConditionTree(owner)
+    const conditionLeaves = collectRuleIntelligenceConditionLeaves(rootTree)
+    const hasEditableConditions = conditionLeaves.some((condition) => isRuleIntelligenceConditionVisible(condition))
+    const applyRootTree = (nextTree: Record<string, unknown>) => {
+      const normalizedTree = createRuleIntelligenceConditionGroup({ id: 'root', ...nextTree })
+      onUpdate({
+        condition_tree: normalizedTree,
+        conditions: flattenRuleIntelligenceConditionTree(normalizedTree),
+        match_mode: normalizedTree.match_mode || 'all',
+      })
+    }
+    const clearConditions = () => {
+      onUpdate({ condition_tree: null, conditions: [], match_mode: 'all' })
+    }
+    const startWithCondition = () => {
+      applyRootTree(createRuleIntelligenceConditionGroup({
+        id: 'root',
+        match_mode: 'all',
+        conditions: [createRuleIntelligenceCondition({ draft: true })],
+      }))
+    }
+    const startWithGroup = () => {
+      applyRootTree(createRuleIntelligenceConditionGroup({
+        id: 'root',
+        match_mode: 'all',
+        conditions: [createRuleIntelligenceConditionGroup({
+          match_mode: 'all',
+          conditions: [createRuleIntelligenceCondition({ draft: true })],
+        })],
+      }))
+    }
+    const renderGroup = (
+      groupRaw: Record<string, unknown>,
+      onGroupChange: (nextGroup: Record<string, unknown>) => void,
+      depth = 0,
+      removable = false,
+      onRemove?: () => void,
+    ): ReactNode => {
+      const group = createRuleIntelligenceConditionGroup(groupRaw)
+      const children = Array.isArray(group.conditions) ? group.conditions as Array<Record<string, unknown>> : []
+      const changeChild = (childIndex: number, nextChild: Record<string, unknown>) => {
+        onGroupChange({
+          ...group,
+          conditions: children.map((child, idx) => idx === childIndex ? nextChild : child),
+        })
+      }
+      const removeChild = (childIndex: number) => {
+        const nextChildren = children.filter((_child, idx) => idx !== childIndex)
+        onGroupChange({
+          ...group,
+          conditions: nextChildren,
+        })
+      }
+      const addCondition = () => {
+        onGroupChange({
+          ...group,
+          conditions: [...children, createRuleIntelligenceCondition({ draft: true })],
+        })
+      }
+      const addGroup = () => {
+        onGroupChange({
+          ...group,
+          conditions: [
+            ...children,
+            createRuleIntelligenceConditionGroup({
+              match_mode: 'all',
+              conditions: [createRuleIntelligenceCondition({ draft: true })],
+            }),
+          ],
+        })
+      }
+      return (
+        <div style={{
+          border: depth === 0 ? 'none' : '1px solid var(--app-border)',
+          borderRadius: depth === 0 ? 0 : 6,
+          padding: depth === 0 ? 0 : 8,
+          background: depth === 0 ? 'transparent' : 'var(--app-shell-bg)',
+        }}>
+          <Space style={{ width: '100%', justifyContent: 'space-between', marginBottom: 6 }} wrap>
+            <Space size={6} wrap>
+              {depth > 0 ? <Tag>Nested Group</Tag> : null}
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Match</Text>
+              <Select
+                size="small"
+                value={String(group.match_mode || 'all')}
+                onChange={(value) => onGroupChange({ ...group, match_mode: value })}
+                style={{ width: 94 }}
+                options={[
+                  { value: 'all', label: 'All' },
+                  { value: 'any', label: 'Any' },
+                ]}
+              />
+            </Space>
+            <Space size={6} wrap>
+              <Button size="small" onClick={addCondition}>Add Condition</Button>
+              <Button size="small" onClick={addGroup}>Add Group</Button>
+              {removable ? <Button size="small" danger onClick={onRemove}>Delete Group</Button> : null}
+            </Space>
+          </Space>
+          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+            {children.map((conditionItem, conditionIndex) => {
+              const isGroup = String(conditionItem.type || conditionItem.kind || '').toLowerCase() === 'group' || Array.isArray(conditionItem.conditions)
+              if (isGroup) {
+                return (
+                  <div key={String(conditionItem.id || conditionIndex)} style={{ marginLeft: depth >= 2 ? 0 : 18 }}>
+                    {renderGroup(
+                      conditionItem,
+                      (nextChild) => changeChild(conditionIndex, nextChild),
+                      depth + 1,
+                      true,
+                      () => removeChild(conditionIndex),
+                    )}
+                  </div>
+                )
+              }
+              return (
+                <div key={String(conditionItem.id || conditionIndex)} style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'minmax(220px, 1fr) minmax(160px, 220px) minmax(220px, 1.2fr) 34px',
+                  gap: 6,
+                  alignItems: 'end',
+                }}>
+                  <div>
+                    <Text style={ruleFieldLabelStyle}>Field</Text>
+                    <Select
+                      size="small"
+                      showSearch
+                      value={String(conditionItem.field || '') || undefined}
+                      onChange={(value) => changeChild(conditionIndex, createRuleIntelligenceCondition({ ...conditionItem, field: value || '' }))}
+                      options={ruleIntelligenceLogicalFieldOptions}
+                      style={{ width: '100%' }}
+                      placeholder="Select field"
+                    />
+                  </div>
+                  <div>
+                    <Text style={ruleFieldLabelStyle}>Operator</Text>
+                    <Select
+                      size="small"
+                      value={String(conditionItem.operator || 'equals')}
+                      onChange={(value) => changeChild(conditionIndex, createRuleIntelligenceCondition({ ...conditionItem, operator: value }))}
+                      style={{ width: '100%' }}
+                      options={RULE_INTELLIGENCE_CONDITION_OPERATORS}
+                    />
+                  </div>
+                  {!['is_null', 'is_not_null'].includes(String(conditionItem.operator || '')) ? (
+                    <div>
+                      <Text style={ruleFieldLabelStyle}>Value</Text>
+                      <Input
+                        size="small"
+                        value={String(conditionItem.value || '')}
+                        onChange={(event) => changeChild(conditionIndex, createRuleIntelligenceCondition({ ...conditionItem, value: event.target.value }))}
+                        placeholder="value or comma list"
+                        style={commonInputStyle}
+                      />
+                    </div>
+                  ) : <div />}
+                  <Button
+                    size="small"
+                    danger
+                    icon={<DeleteOutlined />}
+                    onClick={() => removeChild(conditionIndex)}
+                  />
+                </div>
+              )
+            })}
+          </Space>
+        </div>
+      )
+    }
+    const summary = summarizeRuleIntelligenceConditionTree(rootTree, (fieldId, fallback = 'field') => {
+      const id = String(fieldId || '').trim()
+      const field = ruleIntelligenceConfig.inputFields.find((item) => String(item.id || '') === id)
+      return String(field?.label || field?.mapped_field || id || fallback)
+    })
+    return (
+      <div style={{ border: `1px solid ${options.accent}`, borderRadius: 6, padding: 8, background: 'var(--app-card-bg)' }}>
+        <Space direction="vertical" size={8} style={{ width: '100%' }}>
+          <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+            <Space size={8} wrap>
+              <Tag color="blue">{options.badge}</Tag>
+              <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>{options.title}</Text>
+              <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>{hasEditableConditions && summary ? summary : 'All records included'}</Text>
+            </Space>
+            <Space size={6} wrap>
+              {hasEditableConditions ? <Button size="small" onClick={clearConditions}>Clear</Button> : null}
+              {!hasEditableConditions ? <Button size="small" onClick={startWithCondition}>Add Condition</Button> : null}
+              {!hasEditableConditions ? <Button size="small" onClick={startWithGroup}>Add Group</Button> : null}
+            </Space>
+          </Space>
+          {hasEditableConditions ? renderGroup(rootTree, applyRootTree) : null}
+        </Space>
+      </div>
+    )
+  }
+
+  const monitoringSectionStyle = (accent: string): CSSProperties => ({
+    border: '1px solid var(--app-border)',
+    borderLeft: `2px solid ${accent}`,
+    borderRadius: 6,
+    padding: 8,
+    background: 'var(--app-card-bg)',
+  })
+  const monitoringBodyGridStyle: CSSProperties = {
+    display: 'grid',
+    gridTemplateColumns: 'minmax(420px, 0.95fr) minmax(560px, 1.05fr)',
+    gap: 10,
+    alignItems: 'start',
+  }
+  const monitoringGridStyle: CSSProperties = {
+    display: 'grid',
+    gridTemplateColumns: 'minmax(260px, 1.4fr) minmax(220px, 1fr) minmax(180px, 0.9fr) minmax(110px, 0.5fr) 190px',
+    gap: 8,
+    alignItems: 'end',
+  }
+  const monitoringMeasureGridStyle: CSSProperties = {
+    display: 'grid',
+    gridTemplateColumns: '38px minmax(180px, 1.4fr) minmax(120px, 0.8fr) minmax(160px, 1fr) minmax(110px, 0.6fr) minmax(110px, 0.6fr) minmax(80px, 0.45fr) 34px',
+    gap: 6,
+    alignItems: 'end',
+  }
+  const monitoringCheckGridStyle: CSSProperties = {
+    display: 'grid',
+    gridTemplateColumns: '38px minmax(170px, 1.3fr) minmax(110px, 0.75fr) minmax(110px, 0.75fr) minmax(150px, 1fr) minmax(140px, 0.85fr) minmax(100px, 0.55fr) minmax(100px, 0.55fr) 34px',
+    gap: 6,
+    alignItems: 'end',
+  }
+  const renderRuleIntelligenceTargetEditor = (target: Record<string, unknown>, index: number): ReactNode => {
+    const derivedMeasure = createRuleIntelligenceTargetMeasure({
+      id: target.measure_id || target.id || 'target_measure',
+      name: target.measure_name || target.metric_name || 'Target Measure',
+      measure: target.measure || 'count',
+      field: target.field || target.measure_field || '',
+      target_value: target.target_value ?? target.target ?? target.value ?? 100,
+      warning_percent: target.warning_percent ?? target.warn_at_percent ?? 80,
+      weight: target.weight ?? 1,
+      enabled: true,
+    })
+    const targetMeasures = (
+      Array.isArray(target.measures) && target.measures.length > 0
+        ? target.measures as Array<Record<string, unknown>>
+        : [derivedMeasure]
+    ).map((measure) => createRuleIntelligenceTargetMeasure(measure))
+    const updateMeasures = (measures: Array<Record<string, unknown>>) => {
+      updateRuleIntelligenceTarget(index, { measures })
+    }
+    const conditionSummary = summarizeRuleIntelligenceConditionTree(
+      normalizeRuleIntelligenceConditionTree(target),
+      (fieldId, fallback = 'field') => {
+        const id = String(fieldId || '').trim()
+        const field = ruleIntelligenceConfig.inputFields.find((item) => String(item.id || '') === id)
+        return String(field?.label || field?.mapped_field || id || fallback)
+      },
+    )
+    const groupText = (Array.isArray(target.group_by) ? target.group_by : ['period']).join(' + ')
+    const summaryText = `IF ${conditionSummary || 'all records'} • GROUP ${groupText} • ${targetMeasures.length} measure${targetMeasures.length === 1 ? '' : 's'}`
+    const label = (
+      <div style={{ display: 'grid', gridTemplateColumns: '56px minmax(0, 1fr)', gap: 10, alignItems: 'center', width: '100%' }}>
+        <Space size={2} onClick={(event) => event.stopPropagation()}>
+          <Tooltip title="Move target up">
+            <Button size="small" icon={<ArrowUpOutlined />} disabled={index === 0} onClick={(event) => { event.stopPropagation(); moveRuleIntelligenceTarget(index, -1) }} style={{ width: 26, paddingInline: 0 }} />
+          </Tooltip>
+          <Tooltip title="Move target down">
+            <Button size="small" icon={<ArrowDownOutlined />} disabled={index >= ruleIntelligenceConfig.targets.length - 1} onClick={(event) => { event.stopPropagation(); moveRuleIntelligenceTarget(index, 1) }} style={{ width: 26, paddingInline: 0 }} />
+          </Tooltip>
+        </Space>
+        <div style={{ minWidth: 0 }}>
+          <Space size={6} wrap>
+            <Text style={{ color: 'var(--app-text)', fontWeight: 800 }}>{index + 1}. {String(target.name || 'Target Rule')}</Text>
+            <Tag color={target.enabled !== false ? 'green' : 'default'}>{target.enabled !== false ? 'Enabled' : 'Disabled'}</Tag>
+            <Tag color="green">{targetMeasures.length} measure{targetMeasures.length === 1 ? '' : 's'}</Tag>
+          </Space>
+          <Tooltip title={summaryText}>
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12, display: 'block', marginTop: 3 }} ellipsis>{summaryText}</Text>
+          </Tooltip>
+        </div>
+      </div>
+    )
+    return (
+      <Collapse
+        key={String(target.id || index)}
+        defaultActiveKey={index === 0 ? ['details'] : []}
+        style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-shell-bg)' }}
+        items={[{
+          key: 'details',
+          label,
+          children: (
+            <Space direction="vertical" size={8} style={{ width: '100%' }}>
+              <div style={monitoringSectionStyle('#64748b')}>
+                <div style={monitoringGridStyle}>
+                  <div>
+                    <Text style={ruleFieldLabelStyle}>Target Name</Text>
+                    <Input size="small" value={String(target.name || '')} onChange={(event) => updateRuleIntelligenceTarget(index, { name: event.target.value })} style={commonInputStyle} />
+                  </div>
+                  <div>
+                    <Text style={ruleFieldLabelStyle}>Description</Text>
+                    <Input size="small" value={String(target.description || '')} onChange={(event) => updateRuleIntelligenceTarget(index, { description: event.target.value })} style={commonInputStyle} placeholder="Business description" />
+                  </div>
+                  <div>
+                    <Text style={ruleFieldLabelStyle}>Cluster</Text>
+                    <Select size="small" value={String(target.cluster_id || 'target_activity')} onChange={(value) => updateRuleIntelligenceTarget(index, { cluster_id: value })} style={{ width: '100%' }} options={RULE_INTELLIGENCE_TARGET_CLUSTER_OPTIONS} />
+                  </div>
+                  <div>
+                    <Text style={ruleFieldLabelStyle}>Priority</Text>
+                    <InputNumber size="small" value={Number(target.priority || 10)} onChange={(value) => updateRuleIntelligenceTarget(index, { priority: Number(value || 10) })} style={{ width: '100%' }} />
+                  </div>
+                  <Space size={8} style={{ justifyContent: 'flex-end', alignItems: 'end' }}>
+                    <Switch size="small" checked={target.enabled !== false} onChange={(checked) => updateRuleIntelligenceTarget(index, { enabled: checked })} />
+                    <Button danger size="small" onClick={() => patchRuleIntelligenceConfig({ targets: ruleIntelligenceConfig.targets.filter((_item, idx) => idx !== index) })}>Delete</Button>
+                  </Space>
+                </div>
+              </div>
+              <div style={monitoringBodyGridStyle}>
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  {renderRuleIntelligenceMonitoringConditionEditor(
+                    target,
+                    (patch) => updateRuleIntelligenceTarget(index, patch),
+                    { title: 'Choose Matching Records', badge: 'IF', accent: 'var(--app-border-strong)' },
+                  )}
+                  <div style={monitoringSectionStyle('#9333ea')}>
+                    <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                      <Space size={8} wrap>
+                        <Tag color="purple">GROUP</Tag>
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 800 }}>Assessment Grouping</Text>
+                      </Space>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 1fr) 130px', gap: 8, alignItems: 'end' }}>
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Group Target By</Text>
+                          <Select size="small" mode="tags" value={Array.isArray(target.group_by) ? target.group_by as string[] : ['period']} onChange={(value) => updateRuleIntelligenceTarget(index, { group_by: value })} style={{ width: '100%' }} options={[...ruleIntelligenceLogicalFieldOptions, { value: 'period', label: 'Period' }, { value: 'day', label: 'Day' }, { value: 'month', label: 'Month' }, { value: 'quarter', label: 'Quarter' }]} />
+                        </div>
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Period Grain</Text>
+                          <Select size="small" value={String(target.period_grain || 'month')} onChange={(value) => updateRuleIntelligenceTarget(index, { period_grain: value })} style={{ width: '100%' }} options={[{ value: 'day', label: 'Daily' }, { value: 'month', label: 'Monthly' }, { value: 'quarter', label: 'Quarterly' }, { value: 'year', label: 'Yearly' }]} />
+                        </div>
+                      </div>
+                    </Space>
+                  </div>
+                </Space>
+                <div style={monitoringSectionStyle('#16a34a')}>
+                  <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                    <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+                      <Space size={8} wrap>
+                        <Tag color="green">MEASURES</Tag>
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 800 }}>Target Measures</Text>
+                      </Space>
+                      <Button size="small" onClick={() => updateMeasures([...targetMeasures, createRuleIntelligenceTargetMeasure()])}>Add Measure</Button>
+                    </Space>
+                    {targetMeasures.map((measure, measureIndex) => (
+                      <div key={String(measure.id || measureIndex)} style={monitoringMeasureGridStyle}>
+                        <Switch size="small" checked={measure.enabled !== false} onChange={(checked) => {
+                          const next = [...targetMeasures]
+                          next[measureIndex] = { ...measure, enabled: checked }
+                          updateMeasures(next)
+                        }} />
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Name</Text>
+                          <Input size="small" value={String(measure.name || '')} onChange={(event) => {
+                            const next = [...targetMeasures]
+                            next[measureIndex] = { ...measure, name: event.target.value }
+                            updateMeasures(next)
+                          }} style={commonInputStyle} />
+                        </div>
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Metric</Text>
+                          <Select size="small" value={String(measure.measure || 'count')} onChange={(value) => {
+                            const next = [...targetMeasures]
+                            next[measureIndex] = { ...measure, measure: value }
+                            updateMeasures(next)
+                          }} options={RULE_INTELLIGENCE_METRIC_OPTIONS} style={{ width: '100%' }} />
+                        </div>
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Field</Text>
+                          <Select size="small" showSearch disabled={String(measure.measure || 'count') === 'count'} value={String(measure.field || '') || undefined} onChange={(value) => {
+                            const next = [...targetMeasures]
+                            next[measureIndex] = { ...measure, field: value || '' }
+                            updateMeasures(next)
+                          }} options={ruleIntelligenceLogicalFieldOptions} style={{ width: '100%' }} placeholder="Measure field" />
+                        </div>
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Target</Text>
+                          <InputNumber size="small" value={Number(measure.target_value || 0)} onChange={(value) => {
+                            const next = [...targetMeasures]
+                            next[measureIndex] = { ...measure, target_value: Number(value || 0) }
+                            updateMeasures(next)
+                          }} style={{ width: '100%' }} />
+                        </div>
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Warn %</Text>
+                          <InputNumber size="small" value={Number(measure.warning_percent || 80)} onChange={(value) => {
+                            const next = [...targetMeasures]
+                            next[measureIndex] = { ...measure, warning_percent: Number(value || 0) }
+                            updateMeasures(next)
+                          }} style={{ width: '100%' }} />
+                        </div>
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Weight</Text>
+                          <InputNumber size="small" value={Number(measure.weight || 1)} onChange={(value) => {
+                            const next = [...targetMeasures]
+                            next[measureIndex] = { ...measure, weight: Number(value || 1) }
+                            updateMeasures(next)
+                          }} style={{ width: '100%' }} />
+                        </div>
+                        <Button size="small" danger icon={<DeleteOutlined />} disabled={targetMeasures.length <= 1} onClick={() => updateMeasures(targetMeasures.filter((_item, idx) => idx !== measureIndex))} />
+                      </div>
+                    ))}
+                  </Space>
+                </div>
+              </div>
+            </Space>
+          ),
+        }]}
+      />
+    )
+  }
+  const renderRuleIntelligenceAnomalyEditor = (anomaly: Record<string, unknown>, index: number): ReactNode => {
+    const derivedCheck = createRuleIntelligenceAnomalyCheck({
+      id: anomaly.check_id || anomaly.id || 'anomaly_check',
+      name: anomaly.check_name || anomaly.metric_name || 'Anomaly Check',
+      type: anomaly.type || 'threshold',
+      measure: anomaly.measure || 'sum',
+      field: anomaly.field || anomaly.measure_field || '',
+      operator: anomaly.operator || 'greater_than',
+      threshold: anomaly.threshold ?? anomaly.value ?? anomaly.threshold_value ?? 0,
+      severity: anomaly.severity || 'warning',
+      enabled: true,
+    })
+    const anomalyChecks = (
+      Array.isArray(anomaly.checks) && anomaly.checks.length > 0
+        ? anomaly.checks as Array<Record<string, unknown>>
+        : [derivedCheck]
+    ).map((check) => createRuleIntelligenceAnomalyCheck(check))
+    const updateChecks = (checks: Array<Record<string, unknown>>) => {
+      updateRuleIntelligenceAnomaly(index, { checks })
+    }
+    const conditionSummary = summarizeRuleIntelligenceConditionTree(
+      normalizeRuleIntelligenceConditionTree(anomaly),
+      (fieldId, fallback = 'field') => {
+        const id = String(fieldId || '').trim()
+        const field = ruleIntelligenceConfig.inputFields.find((item) => String(item.id || '') === id)
+        return String(field?.label || field?.mapped_field || id || fallback)
+      },
+    )
+    const groupText = (Array.isArray(anomaly.group_by) ? anomaly.group_by : ['period']).join(' + ')
+    const summaryText = `IF ${conditionSummary || 'all records'} • GROUP ${groupText} • ${anomalyChecks.length} check${anomalyChecks.length === 1 ? '' : 's'}`
+    const label = (
+      <div style={{ display: 'grid', gridTemplateColumns: '56px minmax(0, 1fr)', gap: 10, alignItems: 'center', width: '100%' }}>
+        <Space size={2} onClick={(event) => event.stopPropagation()}>
+          <Tooltip title="Move anomaly up">
+            <Button size="small" icon={<ArrowUpOutlined />} disabled={index === 0} onClick={(event) => { event.stopPropagation(); moveRuleIntelligenceAnomaly(index, -1) }} style={{ width: 26, paddingInline: 0 }} />
+          </Tooltip>
+          <Tooltip title="Move anomaly down">
+            <Button size="small" icon={<ArrowDownOutlined />} disabled={index >= ruleIntelligenceConfig.anomalies.length - 1} onClick={(event) => { event.stopPropagation(); moveRuleIntelligenceAnomaly(index, 1) }} style={{ width: 26, paddingInline: 0 }} />
+          </Tooltip>
+        </Space>
+        <div style={{ minWidth: 0 }}>
+          <Space size={6} wrap>
+            <Text style={{ color: 'var(--app-text)', fontWeight: 800 }}>{index + 1}. {String(anomaly.name || 'Anomaly Rule')}</Text>
+            <Tag color={anomaly.enabled !== false ? 'green' : 'default'}>{anomaly.enabled !== false ? 'Enabled' : 'Disabled'}</Tag>
+            <Tag color="orange">{anomalyChecks.length} check{anomalyChecks.length === 1 ? '' : 's'}</Tag>
+          </Space>
+          <Tooltip title={summaryText}>
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12, display: 'block', marginTop: 3 }} ellipsis>{summaryText}</Text>
+          </Tooltip>
+        </div>
+      </div>
+    )
+    return (
+      <Collapse
+        key={String(anomaly.id || index)}
+        defaultActiveKey={index === 0 ? ['details'] : []}
+        style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-shell-bg)' }}
+        items={[{
+          key: 'details',
+          label,
+          children: (
+            <Space direction="vertical" size={8} style={{ width: '100%' }}>
+              <div style={monitoringSectionStyle('#64748b')}>
+                <div style={monitoringGridStyle}>
+                  <div>
+                    <Text style={ruleFieldLabelStyle}>Anomaly Name</Text>
+                    <Input size="small" value={String(anomaly.name || '')} onChange={(event) => updateRuleIntelligenceAnomaly(index, { name: event.target.value })} style={commonInputStyle} />
+                  </div>
+                  <div>
+                    <Text style={ruleFieldLabelStyle}>Description</Text>
+                    <Input size="small" value={String(anomaly.description || '')} onChange={(event) => updateRuleIntelligenceAnomaly(index, { description: event.target.value })} style={commonInputStyle} placeholder="Business description" />
+                  </div>
+                  <div>
+                    <Text style={ruleFieldLabelStyle}>Cluster</Text>
+                    <Select size="small" value={String(anomaly.cluster_id || 'anomaly_transaction')} onChange={(value) => updateRuleIntelligenceAnomaly(index, { cluster_id: value })} style={{ width: '100%' }} options={RULE_INTELLIGENCE_ANOMALY_CLUSTER_OPTIONS} />
+                  </div>
+                  <div>
+                    <Text style={ruleFieldLabelStyle}>Priority</Text>
+                    <InputNumber size="small" value={Number(anomaly.priority || 10)} onChange={(value) => updateRuleIntelligenceAnomaly(index, { priority: Number(value || 10) })} style={{ width: '100%' }} />
+                  </div>
+                  <Space size={8} style={{ justifyContent: 'flex-end', alignItems: 'end' }}>
+                    <Switch size="small" checked={anomaly.enabled !== false} onChange={(checked) => updateRuleIntelligenceAnomaly(index, { enabled: checked })} />
+                    <Button danger size="small" onClick={() => patchRuleIntelligenceConfig({ anomalies: ruleIntelligenceConfig.anomalies.filter((_item, idx) => idx !== index) })}>Delete</Button>
+                  </Space>
+                </div>
+              </div>
+              <div style={monitoringBodyGridStyle}>
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  {renderRuleIntelligenceMonitoringConditionEditor(
+                    anomaly,
+                    (patch) => updateRuleIntelligenceAnomaly(index, patch),
+                    { title: 'Choose Matching Records', badge: 'IF', accent: 'var(--app-border-strong)' },
+                  )}
+                  <div style={monitoringSectionStyle('#9333ea')}>
+                    <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                      <Space size={8} wrap>
+                        <Tag color="purple">GROUP</Tag>
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 800 }}>Assessment Grouping</Text>
+                      </Space>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 1fr) 130px', gap: 8, alignItems: 'end' }}>
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Group Anomaly By</Text>
+                          <Select size="small" mode="tags" value={Array.isArray(anomaly.group_by) ? anomaly.group_by as string[] : ['period']} onChange={(value) => updateRuleIntelligenceAnomaly(index, { group_by: value })} style={{ width: '100%' }} options={[...ruleIntelligenceLogicalFieldOptions, { value: 'period', label: 'Period' }, { value: 'day', label: 'Day' }, { value: 'month', label: 'Month' }, { value: 'quarter', label: 'Quarter' }]} />
+                        </div>
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Period Grain</Text>
+                          <Select size="small" value={String(anomaly.period_grain || 'month')} onChange={(value) => updateRuleIntelligenceAnomaly(index, { period_grain: value })} style={{ width: '100%' }} options={[{ value: 'day', label: 'Daily' }, { value: 'month', label: 'Monthly' }, { value: 'quarter', label: 'Quarterly' }, { value: 'year', label: 'Yearly' }]} />
+                        </div>
+                      </div>
+                    </Space>
+                  </div>
+                </Space>
+                <div style={monitoringSectionStyle('#d97706')}>
+                  <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                    <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+                      <Space size={8} wrap>
+                        <Tag color="orange">CHECKS</Tag>
+                        <Text style={{ color: 'var(--app-text)', fontWeight: 800 }}>Anomaly Checks</Text>
+                      </Space>
+                      <Button size="small" onClick={() => updateChecks([...anomalyChecks, createRuleIntelligenceAnomalyCheck()])}>Add Check</Button>
+                    </Space>
+                    {anomalyChecks.map((check, checkIndex) => (
+                      <div key={String(check.id || checkIndex)} style={monitoringCheckGridStyle}>
+                        <Switch size="small" checked={check.enabled !== false} onChange={(checked) => {
+                          const next = [...anomalyChecks]
+                          next[checkIndex] = { ...check, enabled: checked }
+                          updateChecks(next)
+                        }} />
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Name</Text>
+                          <Input size="small" value={String(check.name || '')} onChange={(event) => {
+                            const next = [...anomalyChecks]
+                            next[checkIndex] = { ...check, name: event.target.value }
+                            updateChecks(next)
+                          }} style={commonInputStyle} />
+                        </div>
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Type</Text>
+                          <Select size="small" value={String(check.type || 'threshold')} onChange={(value) => {
+                            const next = [...anomalyChecks]
+                            next[checkIndex] = { ...check, type: value }
+                            updateChecks(next)
+                          }} options={RULE_INTELLIGENCE_ANOMALY_TYPE_OPTIONS} style={{ width: '100%' }} />
+                        </div>
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Metric</Text>
+                          <Select size="small" value={String(check.measure || 'sum')} onChange={(value) => {
+                            const next = [...anomalyChecks]
+                            next[checkIndex] = { ...check, measure: value }
+                            updateChecks(next)
+                          }} options={RULE_INTELLIGENCE_METRIC_OPTIONS} style={{ width: '100%' }} />
+                        </div>
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Field</Text>
+                          <Select size="small" showSearch disabled={String(check.measure || 'sum') === 'count'} value={String(check.field || '') || undefined} onChange={(value) => {
+                            const next = [...anomalyChecks]
+                            next[checkIndex] = { ...check, field: value || '' }
+                            updateChecks(next)
+                          }} options={ruleIntelligenceLogicalFieldOptions} style={{ width: '100%' }} placeholder="Measure field" />
+                        </div>
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Operator</Text>
+                          <Select size="small" value={String(check.operator || 'greater_than')} onChange={(value) => {
+                            const next = [...anomalyChecks]
+                            next[checkIndex] = { ...check, operator: value }
+                            updateChecks(next)
+                          }} options={RULE_INTELLIGENCE_COMPARE_OPERATOR_OPTIONS} style={{ width: '100%' }} />
+                        </div>
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Threshold</Text>
+                          <InputNumber size="small" value={Number(check.threshold || 0)} onChange={(value) => {
+                            const next = [...anomalyChecks]
+                            next[checkIndex] = { ...check, threshold: Number(value || 0) }
+                            updateChecks(next)
+                          }} style={{ width: '100%' }} />
+                        </div>
+                        <div>
+                          <Text style={ruleFieldLabelStyle}>Severity</Text>
+                          <Select size="small" value={String(check.severity || 'warning')} onChange={(value) => {
+                            const next = [...anomalyChecks]
+                            next[checkIndex] = { ...check, severity: value }
+                            updateChecks(next)
+                          }} style={{ width: '100%' }} options={[{ value: 'info', label: 'Info' }, { value: 'warning', label: 'Warning' }, { value: 'critical', label: 'Critical' }]} />
+                        </div>
+                        <Button size="small" danger icon={<DeleteOutlined />} disabled={anomalyChecks.length <= 1} onClick={() => updateChecks(anomalyChecks.filter((_item, idx) => idx !== checkIndex))} />
+                      </div>
+                    ))}
+                  </Space>
+                </div>
+              </div>
+            </Space>
+          ),
+        }]}
+      />
+    )
+  }
+
+  const readRuleIntelligenceResultRows = (key: string): Array<Record<string, unknown>> => (
+    Array.isArray(ruleIntelligencePreviewResult?.[key])
+      ? ruleIntelligencePreviewResult?.[key]
+      : []
+  ).filter((row): row is Record<string, unknown> => !!row && typeof row === 'object' && !Array.isArray(row))
+  const ruleIntelligenceCalculationPreviewRows = (
+    readRuleIntelligenceResultRows('calculation_output').length > 0
+      ? readRuleIntelligenceResultRows('calculation_output')
+      : readRuleIntelligenceResultRows('sample_output')
+  )
+  const ruleIntelligenceTargetPreviewRows = readRuleIntelligenceResultRows('target_output')
+  const ruleIntelligenceAnomalyPreviewRows = readRuleIntelligenceResultRows('anomaly_output')
+  const ruleIntelligencePreviewRows = ruleIntelligenceCalculationPreviewRows
+  const ruleIntelligencePreviewWarnings = Array.isArray(ruleIntelligencePreviewResult?.warnings)
+    ? ruleIntelligencePreviewResult.warnings as unknown[]
+    : []
+  const ruleIntelligencePreviewErrors = Array.isArray(ruleIntelligencePreviewResult?.errors)
+    ? ruleIntelligencePreviewResult.errors as unknown[]
+    : []
+  const ruleIntelligenceOutputGroupKeys = (() => {
+    const rowFields = Array.isArray(ruleIntelligenceConfig.outputLayout.row_fields)
+      ? ruleIntelligenceConfig.outputLayout.row_fields as unknown[]
+      : ['entity_id', 'period']
+    return uniqueFieldNames(rowFields.map((field) => {
+      const token = String(field || '').trim()
+      const normalized = token.toLowerCase().replace(/\s+/g, '_')
+      if (['period', 'day', 'month', 'quarter', 'year'].includes(normalized)) return normalized === 'day' ? 'day' : normalized === 'month' ? 'month' : normalized === 'quarter' ? 'quarter' : normalized === 'year' ? 'year' : 'period'
+      return normalizeRuleIntelligenceFieldId(token) || token
+    }).filter(Boolean))
+  })()
+  const ruleIntelligenceConfiguredTargetOutputFields = uniqueFieldNames(ruleIntelligenceConfig.targets.flatMap((target) => {
+    const rawMeasures = Array.isArray(target.measures) && target.measures.length > 0
+      ? target.measures as Array<Record<string, unknown>>
+      : [target]
+    return rawMeasures.flatMap((measure) => {
+      const slug = ruleIntelligenceOutputSlug(
+        measure.id || measure.key || target.measure_id || target.id || measure.name || target.name,
+        'target',
+      )
+      const prefix = `target_${slug}`
+      return [
+        `${prefix}_status`,
+        `${prefix}_actual`,
+        `${prefix}_target`,
+        `${prefix}_achievement_percent`,
+        `${prefix}_gap`,
+        `${prefix}_severity`,
+      ]
+    })
+  }))
+  const ruleIntelligenceConfiguredAnomalyOutputFields = uniqueFieldNames(ruleIntelligenceConfig.anomalies.flatMap((anomaly) => {
+    const rawChecks = Array.isArray(anomaly.checks) && anomaly.checks.length > 0
+      ? anomaly.checks as Array<Record<string, unknown>>
+      : [anomaly]
+    return rawChecks.flatMap((check) => {
+      const slug = ruleIntelligenceOutputSlug(
+        check.id || check.key || anomaly.check_id || anomaly.id || check.name || anomaly.name,
+        'anomaly',
+      )
+      const prefix = `anomaly_${slug}`
+      return [
+        `${prefix}_count`,
+        `${prefix}_severity`,
+        `${prefix}_actual`,
+        `${prefix}_threshold`,
+        `${prefix}_operator`,
+        `${prefix}_type`,
+      ]
+    })
+  }))
+  const ruleIntelligenceSelectedOutputFields = uniqueFieldNames((
+    Array.isArray(ruleIntelligenceConfig.outputLayout.selected_fields)
+      ? ruleIntelligenceConfig.outputLayout.selected_fields
+      : Array.isArray(ruleIntelligenceConfig.outputLayout.visible_fields)
+        ? ruleIntelligenceConfig.outputLayout.visible_fields
+        : Array.isArray(ruleIntelligenceConfig.outputLayout.columns)
+          ? ruleIntelligenceConfig.outputLayout.columns
+          : []
+  ).map((field) => String(field || '').trim()).filter(Boolean))
+  const ruleIntelligencePreviewFieldKeys = uniqueFieldNames([
+    ...ruleIntelligenceCalculationPreviewRows.flatMap((row) => Object.keys(row).filter((key) => !key.startsWith('_'))),
+    ...ruleIntelligenceTargetPreviewRows.flatMap((row) => Object.keys(row).filter((key) => !key.startsWith('_'))),
+    ...ruleIntelligenceAnomalyPreviewRows.flatMap((row) => Object.keys(row).filter((key) => !key.startsWith('_'))),
+  ])
+  const ruleIntelligenceRecommendedOutputFields = uniqueFieldNames([
+    ...ruleIntelligenceOutputGroupKeys,
+    'percent_total_service',
+    'fixed_commission',
+    'variable_commission',
+    'total_service_count',
+    'total_service_amount',
+    'total_commission',
+    'target_status',
+    'target_achievement_percent',
+    'target_gap',
+    ...ruleIntelligenceConfiguredTargetOutputFields,
+    'anomaly_count',
+    'max_anomaly_severity',
+    ...ruleIntelligenceConfiguredAnomalyOutputFields,
+  ])
+  const ruleIntelligenceOutputFieldOptions = uniqueFieldNames([
+    ...ruleIntelligenceRecommendedOutputFields,
+    ...ruleIntelligencePreviewFieldKeys,
+    ...ruleIntelligenceSelectedOutputFields,
+    'record_type',
+    '_audit_traces',
+  ]).map((field) => ({ value: field, label: field }))
+  const ruleIntelligenceOutputRequiredFields = ruleIntelligenceOutputGroupKeys
+  const ensureRuleIntelligenceRequiredOutputFields = (fields: string[]) => uniqueFieldNames([
+    ...ruleIntelligenceOutputRequiredFields,
+    ...fields,
+  ])
+  const orderRuleIntelligencePreviewKeys = (keys: string[]) => {
+    const unique = uniqueFieldNames(keys)
+    const used = new Set<string>()
+    const ordered: string[] = []
+    const addKey = (key: string) => {
+      const text = String(key || '').trim()
+      if (!text || used.has(text) || !unique.includes(text)) return
+      ordered.push(text)
+      used.add(text)
+    }
+    ruleIntelligenceOutputGroupKeys.forEach(addKey)
+    const serviceSlugs: string[] = []
+    unique.forEach((key) => {
+      const suffix = ['_count', '_amount', '_commission'].find((item) => key.endsWith(item))
+      if (!suffix) return
+      const slug = key.slice(0, -suffix.length)
+      if (!slug || ['total_service', 'target', 'anomaly', 'fixed', 'variable', 'total'].some((prefix) => slug === prefix || slug.startsWith(`${prefix}_`))) return
+      if (!serviceSlugs.includes(slug)) serviceSlugs.push(slug)
+    })
+    serviceSlugs.forEach((slug) => {
+      addKey(`${slug}_count`)
+      addKey(`${slug}_amount`)
+      addKey(`${slug}_commission`)
+    })
+    ;[
+      'percent_total_service',
+      'fixed_commission',
+      'variable_commission',
+      'total_service_count',
+      'total_service_amount',
+      'total_commission',
+      'target_status',
+      'target_achievement_percent',
+      'target_gap',
+    ].forEach(addKey)
+    unique
+      .filter((key) => key.startsWith('target_') && !['target_status', 'target_achievement_percent', 'target_gap'].includes(key))
+      .forEach(addKey)
+    ;[
+      'anomaly_count',
+      'max_anomaly_severity',
+    ].forEach(addKey)
+    unique
+      .filter((key) => key.startsWith('anomaly_') && key !== 'anomaly_count')
+      .forEach(addKey)
+    ;[
+      'record_type',
+    ].forEach(addKey)
+    unique.filter((key) => !key.startsWith('_')).forEach(addKey)
+    return ordered
+  }
+  const ruleIntelligenceCurrentPreviewOutputFields = orderRuleIntelligencePreviewKeys(ruleIntelligencePreviewFieldKeys)
+  const ruleIntelligenceSelectedOutputEffectiveFields = ensureRuleIntelligenceRequiredOutputFields(
+    ruleIntelligenceSelectedOutputFields.length > 0
+      ? ruleIntelligenceSelectedOutputFields
+      : ruleIntelligenceRecommendedOutputFields
+  )
+  const ruleIntelligenceSelectedOutputSet = new Set(ruleIntelligenceSelectedOutputEffectiveFields.map((field) => field.toLowerCase()))
+  const ruleIntelligenceRequiredOutputSet = new Set(ruleIntelligenceOutputRequiredFields.map((field) => field.toLowerCase()))
+  const ruleIntelligenceOutputFieldCategoryGroups = [
+    {
+      key: 'required',
+      title: 'Required Report Keys',
+      fields: ruleIntelligenceOutputRequiredFields,
+    },
+    {
+      key: 'service',
+      title: 'Service Metrics',
+      fields: ruleIntelligenceRecommendedOutputFields.filter((field) => (
+        /_(count|amount|commission)$/.test(field)
+        && !field.startsWith('target_')
+        && !field.startsWith('anomaly_')
+        && !['total_service_count', 'total_service_amount', 'total_commission', 'fixed_commission', 'variable_commission'].includes(field)
+      )),
+    },
+    {
+      key: 'summary',
+      title: 'Totals',
+      fields: ['percent_total_service', 'fixed_commission', 'variable_commission', 'total_service_count', 'total_service_amount', 'total_commission'].filter((field) => (
+        ruleIntelligenceRecommendedOutputFields.includes(field) || ruleIntelligencePreviewFieldKeys.includes(field) || ruleIntelligenceSelectedOutputFields.includes(field)
+      )),
+    },
+    {
+      key: 'targets',
+      title: 'Targets',
+      fields: uniqueFieldNames([
+        'target_status',
+        'target_achievement_percent',
+        'target_gap',
+        ...ruleIntelligenceConfiguredTargetOutputFields,
+        ...ruleIntelligencePreviewFieldKeys.filter((field) => field.startsWith('target_')),
+      ]),
+    },
+    {
+      key: 'anomalies',
+      title: 'Anomalies',
+      fields: uniqueFieldNames([
+        'anomaly_count',
+        'max_anomaly_severity',
+        ...ruleIntelligenceConfiguredAnomalyOutputFields,
+        ...ruleIntelligencePreviewFieldKeys.filter((field) => field.startsWith('anomaly_')),
+      ]),
+    },
+    {
+      key: 'other',
+      title: 'Other Fields',
+      fields: uniqueFieldNames([
+        ...ruleIntelligencePreviewFieldKeys,
+        ...ruleIntelligenceSelectedOutputFields,
+        'record_type',
+        '_audit_traces',
+      ]).filter((field) => (
+        !ruleIntelligenceOutputRequiredFields.includes(field)
+        && !ruleIntelligenceRecommendedOutputFields.includes(field)
+        && !field.startsWith('target_')
+        && !field.startsWith('anomaly_')
+      )),
+    },
+  ].map((group) => ({
+    ...group,
+    fields: uniqueFieldNames(group.fields).filter(Boolean),
+  })).filter((group) => group.fields.length > 0)
+  const updateRuleIntelligenceSelectedOutputFields = (fields: string[]) => {
+    updateRuleIntelligenceOutputLayout({
+      selected_fields: ensureRuleIntelligenceRequiredOutputFields(
+        fields.map((field) => String(field || '').trim()).filter(Boolean)
+      ),
+    })
+  }
+  const toggleRuleIntelligenceOutputField = (field: string, checked: boolean) => {
+    const base = ruleIntelligenceSelectedOutputEffectiveFields
+    const normalized = field.toLowerCase()
+    if (checked) {
+      updateRuleIntelligenceSelectedOutputFields([...base, field])
+    } else {
+      updateRuleIntelligenceSelectedOutputFields(base.filter((item) => item.toLowerCase() !== normalized))
+    }
+  }
+  const moveRuleIntelligenceOutputField = (index: number, direction: -1 | 1) => {
+    const nextIndex = index + direction
+    if (nextIndex < 0 || nextIndex >= ruleIntelligenceSelectedOutputEffectiveFields.length) return
+    const next = [...ruleIntelligenceSelectedOutputEffectiveFields]
+    const [moved] = next.splice(index, 1)
+    next.splice(nextIndex, 0, moved)
+    updateRuleIntelligenceSelectedOutputFields(next)
+  }
+  const reorderRuleIntelligenceOutputField = (fromIndex: number, toIndex: number) => {
+    if (fromIndex < 0 || toIndex < 0) return
+    if (fromIndex >= ruleIntelligenceSelectedOutputEffectiveFields.length || toIndex >= ruleIntelligenceSelectedOutputEffectiveFields.length) return
+    if (fromIndex === toIndex) return
+    const next = [...ruleIntelligenceSelectedOutputEffectiveFields]
+    const [moved] = next.splice(fromIndex, 1)
+    next.splice(toIndex, 0, moved)
+    updateRuleIntelligenceSelectedOutputFields(next)
+  }
+  const buildRuleIntelligencePreviewColumns = (
+    rows: Array<Record<string, unknown>>,
+    preferredKeys: string[] = [],
+    selectedKeys: string[] = [],
+  ) => (
+    selectedKeys.length > 0
+      ? selectedKeys
+      : orderRuleIntelligencePreviewKeys(Array.from(new Set([
+        ...preferredKeys,
+        ...rows.flatMap((row) => Object.keys(row).filter((key) => key !== '_audit_traces' && key !== '_rule_trace')),
+      ]))).slice(0, 32)
+  ).map((key) => ({
+    title: key,
+    dataIndex: key,
+    key,
+    width: 160,
+    ellipsis: true,
+    render: (value: unknown) => {
+      if (value === null || value === undefined || value === '') return <Text style={{ color: 'var(--app-text-dim)', fontSize: 11 }}>-</Text>
+      const text = typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+        ? String(value)
+        : JSON.stringify(value)
+      return (
+        <Tooltip title={text.length > 80 ? text : undefined}>
+          <Text style={{ color: 'var(--app-text)', fontSize: 11, fontFamily: 'monospace' }} ellipsis>
+            {text}
+          </Text>
+        </Tooltip>
+      )
+    },
+  }))
+  const ruleIntelligencePreviewColumns = buildRuleIntelligencePreviewColumns(
+    ruleIntelligencePreviewRows,
+    [],
+    ruleIntelligenceSelectedOutputFields.length > 0 ? ruleIntelligenceSelectedOutputEffectiveFields : [],
+  )
+  const ruleIntelligenceTargetPreviewColumns = buildRuleIntelligencePreviewColumns(ruleIntelligenceTargetPreviewRows, [
+    'cluster_name',
+    'target_name',
+    'target_measure_name',
+    'target_measure_id',
+    ...ruleIntelligenceOutputGroupKeys,
+    'target_measure',
+    'actual',
+    'target_value',
+    'achievement_percent',
+    'gap',
+    'target_status',
+    'target_severity',
+  ])
+  const ruleIntelligenceAnomalyPreviewColumns = buildRuleIntelligencePreviewColumns(ruleIntelligenceAnomalyPreviewRows, [
+    'cluster_name',
+    'anomaly_name',
+    'anomaly_check_name',
+    'anomaly_check_id',
+    ...ruleIntelligenceOutputGroupKeys,
+    'anomaly_type',
+    'anomaly_measure',
+    'actual',
+    'operator',
+    'threshold',
+    'anomaly_severity',
+  ])
+  const renderRuleIntelligencePreviewSection = (
+    title: string,
+    description: string,
+    rows: Array<Record<string, unknown>>,
+    columns: Array<Record<string, unknown>>,
+    emptyText: string,
+    tagColor?: string,
+  ) => (
+    <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-card-bg)', overflow: 'hidden' }}>
+      <div style={{ padding: '10px 12px', borderBottom: '1px solid var(--app-border)', background: 'var(--app-shell-bg)' }}>
+        <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+          <div>
+            <Space size={8} wrap>
+              <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>{title}</Text>
+              <Tag color={tagColor}>{rows.length.toLocaleString()} rows</Tag>
+            </Space>
+            <br />
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>{description}</Text>
+          </div>
+        </Space>
+      </div>
+      <Table
+        size="small"
+        rowKey={(_record, index) => String(index)}
+        scroll={{ x: 'max-content', y: rows.length > 0 ? 260 : undefined }}
+        pagination={{ pageSize: 10, size: 'small' }}
+        dataSource={rows}
+        columns={columns as any[]}
+        locale={{ emptyText }}
+      />
+    </div>
+  )
+  const parseRuleIntelligenceAuditTraces = (value: unknown): unknown[] => {
+    if (Array.isArray(value)) return value
+    if (value && typeof value === 'object') return [value]
+    const text = String(value || '').trim()
+    if (!text) return []
+    try {
+      const parsed = JSON.parse(text)
+      if (Array.isArray(parsed)) return parsed
+      if (parsed && typeof parsed === 'object') return [parsed]
+    } catch {
+      // Audit traces can be read back from CSV as text; keep the raw text visible.
+    }
+    return [{ raw_trace: text }]
+  }
+  const ruleIntelligenceAuditRows = ruleIntelligencePreviewRows
+    .flatMap((row, index) => {
+      const directTrace = parseRuleIntelligenceAuditTraces(row._rule_trace)
+        .map((trace, traceIndex) => ({ row: index + 1, trace: { trace_index: traceIndex + 1, trace } }))
+      const traces = parseRuleIntelligenceAuditTraces(row._audit_traces)
+        .map((trace, traceIndex) => ({ row: index + 1, trace: { trace_index: traceIndex + 1, trace } }))
+      return [...directTrace, ...traces]
+    })
+    .slice(0, 100)
+  const ruleIntelligenceSelectedPack = ruleIntelligencePacks.find((item) => String(item.id || '') === String(ruleIntelligenceSelectedPackId || '')) || null
+  const ruleIntelligenceSelectedVersion = (
+    ruleIntelligenceSelectedPack?.current_version
+    && typeof ruleIntelligenceSelectedPack.current_version === 'object'
+    && !Array.isArray(ruleIntelligenceSelectedPack.current_version)
+      ? ruleIntelligenceSelectedPack.current_version as Record<string, unknown>
+      : null
+  )
+
   return (
     <>
     <Drawer
@@ -34128,6 +36961,79 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               </div>
             ) : null}
 
+            {nodeType === 'rule_intelligence_engine' ? (
+              <div style={{
+                background: '#2563eb0f',
+                border: '1px solid #2563eb30',
+                borderRadius: 10,
+                padding: '10px 12px',
+                marginBottom: 12,
+              }}>
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  <Text style={{ color: '#60a5fa', fontSize: 12, fontWeight: 700 }}>
+                    Rule Intelligence Studio
+                  </Text>
+                  <Space size={6} wrap>
+                    <Tag style={{ background: '#2563eb14', border: '1px solid #2563eb40', color: '#60a5fa' }}>
+                      rules: {ruleIntelligenceConfig.rules.length}
+                    </Tag>
+                    <Tag style={{ background: '#14b8a614', border: '1px solid #14b8a640', color: '#14b8a6' }}>
+                      targets: {ruleIntelligenceConfig.targets.length}
+                    </Tag>
+                    <Tag style={{ background: '#f59e0b14', border: '1px solid #f59e0b30', color: '#f59e0b' }}>
+                      anomalies: {ruleIntelligenceConfig.anomalies.length}
+                    </Tag>
+                    <Tag style={{ background: '#8b5cf614', border: '1px solid #8b5cf630', color: '#8b5cf6' }}>
+                      output: {String(ruleIntelligenceConfig.outputLayout.mode || 'pivot')}
+                    </Tag>
+                  </Space>
+                  <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>
+                    Configure calculation rules, target bands, anomaly checks, output reports, and audit traces.
+                  </Text>
+                  <Space.Compact block>
+                    <Button
+                      size="small"
+                      onClick={() => setRuleIntelligenceStudioOpen(true)}
+                      style={{
+                        width: '50%',
+                        background: '#2563eb1a',
+                        border: '1px solid #2563eb40',
+                        color: '#60a5fa',
+                      }}
+                    >
+                      Open Rule Studio
+                    </Button>
+                    <Button
+                      size="small"
+                      loading={ruleIntelligenceValidationLoading}
+                      onClick={() => { void runRuleIntelligenceValidation() }}
+                      style={{
+                        width: '25%',
+                        background: '#14b8a61a',
+                        border: '1px solid #14b8a640',
+                        color: '#14b8a6',
+                      }}
+                    >
+                      Validate
+                    </Button>
+                    <Button
+                      size="small"
+                      loading={ruleIntelligencePreviewLoading}
+                      onClick={() => { void runRuleIntelligencePreview() }}
+                      style={{
+                        width: '25%',
+                        background: '#f59e0b1a',
+                        border: '1px solid #f59e0b40',
+                        color: '#f59e0b',
+                      }}
+                    >
+                      Preview
+                    </Button>
+                  </Space.Compact>
+                </Space>
+              </div>
+            ) : null}
+
             {nodeType === 'profile_query_transform' ? (
               <div style={{
                 background: '#a855f70f',
@@ -34295,7 +37201,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               </Form.Item>
             ))}
 
-            {visibleFields.length === 0 && nodeType !== 'file_viewer' && nodeType !== 'data_ops' && (
+            {visibleFields.length === 0 && nodeType !== 'file_viewer' && nodeType !== 'data_ops' && nodeType !== 'rule_intelligence_engine' && (
               <div style={{ textAlign: 'center', padding: '20px 0' }}>
                 <Text style={{ color: 'var(--app-text-dim)', fontSize: 12 }}>No configuration required.</Text>
               </div>
@@ -35601,6 +38507,29 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             const step = selectedDataOpsPipelineStep
             const tables = step.tables || []
             const selectFields = step.selectFields || []
+            const queryBuilderRows = step.queryBuilders || []
+            const activeQueryBuilder = queryBuilderRows.find((item) => item.id === step.activeQueryBuilderId)
+            const fallbackInternalQuery: DataOpsQueryBuilderConfig | undefined = activeQueryBuilder ? {
+              ...activeQueryBuilder,
+              id: activeQueryBuilder.activeInternalQueryId || `${activeQueryBuilder.id}_q1`,
+              name: activeQueryBuilder.internalQueries?.length ? activeQueryBuilder.name : 'Q1 Base Query',
+              internalQueries: [],
+              activeInternalQueryId: '',
+              finalInternalQueryId: '',
+              sourceMode: activeQueryBuilder.sourceMode || 'database',
+              inputQueryId: activeQueryBuilder.inputQueryId || '',
+              inputMode: activeQueryBuilder.inputMode || 'set_based',
+              outputAlias: activeQueryBuilder.outputAlias || 'q1',
+            } : undefined
+            const internalQueryRows = activeQueryBuilder?.internalQueries?.length
+              ? activeQueryBuilder.internalQueries
+              : fallbackInternalQuery ? [fallbackInternalQuery] : []
+            const activeInternalQueryId = activeQueryBuilder?.activeInternalQueryId || internalQueryRows[0]?.id || ''
+            const activeInternalQuery = internalQueryRows.find((item) => item.id === activeInternalQueryId) || internalQueryRows[0]
+            const currentQueryIndex = Math.max(0, internalQueryRows.findIndex((item) => item.id === activeInternalQuery?.id))
+            const currentQuerySourceMode = activeInternalQuery?.sourceMode || 'database'
+            const currentQueryInputMode = activeInternalQuery?.inputMode || 'set_based'
+            const currentInputQuery = internalQueryRows.find((item) => item.id === activeInternalQuery?.inputQueryId)
             const sourceConnections = dataOpsPipelineSteps
               .filter((item) => item.kind === 'source')
               .flatMap((item) => item.connections || [])
@@ -35616,6 +38545,9 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               ...uniqueFieldNames([...dataOpsManagedObjects, dataOpsDataTargetName].filter(Boolean)).map((value) => ({ value, label: value, schema: '', name: value })),
             ].filter((item, index, list) => item && list.findIndex((candidate) => String(candidate?.schema || '').toUpperCase() === String(item.schema || '').toUpperCase() && String(candidate?.value || '').toUpperCase() === String(item.value || '').toUpperCase()) === index) as Array<{ value: string; label: string; schema?: string; name?: string }>
             const sourceTables = tables.filter((item) => item.enabled !== false && String(item.table || '').trim())
+            const internalQueryOptions = internalQueryRows
+              .filter((item) => item.id !== activeInternalQuery?.id)
+              .map((item, index) => ({ value: item.id, label: `${dataOpsQueryAlias(item, index)} - ${item.name || item.id}` }))
             const tableAliases = uniqueFieldNames(sourceTables.map((item, index) => String(item.alias || item.table || `t${index + 1}`).trim()).filter(Boolean))
             const tableColumnCacheKey = (schemaName: string, tableName: string) => `${String(schemaName || '').trim().toUpperCase()}.${String(tableName || '').trim().toUpperCase()}`
             const rawColumnNames = uniqueFieldNames([
@@ -35646,7 +38578,27 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               ])
               return columns.map((field) => `${alias}.${field}`)
             }))
+            const internalSourceAlias = currentInputQuery ? dataOpsQueryAlias(currentInputQuery, Math.max(0, internalQueryRows.findIndex((item) => item.id === currentInputQuery.id))) : ''
+            const internalSourceFields = currentQuerySourceMode === 'internal_query' && currentInputQuery
+              ? dataOpsQueryBuilderOutputFields(currentInputQuery).flatMap((field) => {
+                const clean = String(field || '').trim()
+                if (!clean) return []
+                return internalSourceAlias ? [`${internalSourceAlias}.${clean}`, clean] : [clean]
+              })
+              : []
+            const internalQueryFieldOptions = (queryId?: string) => {
+              const sourceQuery = internalQueryRows.find((item) => item.id === queryId)
+              if (!sourceQuery) return []
+              const alias = dataOpsQueryAlias(sourceQuery, Math.max(0, internalQueryRows.findIndex((item) => item.id === sourceQuery.id)))
+              return dataOpsQueryBuilderOutputFields(sourceQuery).flatMap((field) => {
+                const clean = String(field || '').trim()
+                if (!clean) return []
+                return alias ? [`${alias}.${clean}`, clean] : [clean]
+              }).filter((value, index, list) => list.indexOf(value) === index).map((value) => ({ value, label: value }))
+            }
+            const includeInternalFieldsInBuilder = currentQuerySourceMode === 'internal_query' && currentQueryInputMode === 'set_based'
             const fieldNames = uniqueFieldNames([
+              ...(includeInternalFieldsInBuilder ? internalSourceFields : []),
               ...sourceFieldNames,
               ...(sourceFieldNames.length > 0 ? [] : rawColumnNames),
             ].filter(Boolean))
@@ -35858,7 +38810,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 return alias ? `${expr} AS ${alias}` : expr
               }).join(',\n  ')
               : '*'
-            const fromTables = tables.filter((item) => item.enabled !== false && String(item.table || '').trim())
+            const configuredFromTables = tables.filter((item) => item.enabled !== false && String(item.table || '').trim())
+            const fromTables = currentQuerySourceMode === 'internal_query' && internalSourceAlias && configuredFromTables.length <= 0
+              ? [{ id: `internal_${step.activeQueryBuilderId || 'query'}`, table: internalSourceAlias, alias: internalSourceAlias, role: 'from' as const, enabled: true }]
+              : configuredFromTables
             const enabledJoinRows = (step.joinKeys || []).filter((item) => item.enabled !== false && String(item.leftField || '').trim() && String(item.rightField || '').trim())
             const tableSql = (item: DataOpsTableRow, index: number) => {
               const schema = String(item.schema || '').trim()
@@ -35937,22 +38892,34 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 joinKeys: nextTables.length > 1 && (step.joinKeys || []).length <= 0 ? [{ id: dataOpsId('join'), leftField: '', rightField: '', joinType: 'left', enabled: true }] : step.joinKeys,
               })
             }
-            const queryBuilderRows = step.queryBuilders || []
-            const activeQueryBuilder = queryBuilderRows.find((item) => item.id === step.activeQueryBuilderId)
             const bindParameters = step.bindParameters || []
-            const configuredBindNames = new Set(bindParameters.map((item) => String(item.name || '').replace(/^:/, '').trim().toLowerCase()).filter(Boolean))
+            const cursorBindParameters = (activeInternalQuery?.cursorMappings || [])
+              .filter((item) => item.enabled !== false && String(item.param || '').trim())
+              .map((item) => ({
+                name: String(item.param || '').replace(/^:/, '').trim(),
+                label: String(item.sourceField || item.value || 'cursor field'),
+              }))
+              .filter((item) => item.name)
+            const configuredBindNames = new Set([
+              ...bindParameters.map((item) => String(item.name || '').replace(/^:/, '').trim().toLowerCase()).filter(Boolean),
+              ...cursorBindParameters.map((item) => item.name.toLowerCase()),
+            ])
             const checkpointWhereBindOptions = DATA_OPS_CHECKPOINT_BIND_PRESETS
               .filter((item) => !configuredBindNames.has(String(item.name || '').toLowerCase()))
               .map((item) => ({ value: item.name, label: `:${item.name} - ${item.label || 'checkpoint'}` }))
             const bindParameterOptions = [
+              ...cursorBindParameters.map((item) => ({ value: item.name, label: `:${item.name} - cursor ${item.label}` })),
               ...bindParameters
               .filter((item) => item.enabled !== false && String(item.name || '').trim())
               .map((item) => ({ value: String(item.name || '').trim(), label: `:${String(item.name || '').trim()}${item.defaultValue ? ` = ${item.defaultValue}` : item.label ? ` - ${item.label}` : ''}` })),
               ...checkpointWhereBindOptions,
             ]
-            const selectBindParameterOptions = bindParameters
-              .filter((item) => item.enabled !== false && String(item.name || '').trim())
-              .map((item) => ({ value: `:${String(item.name || '').replace(/^:/, '').trim()}`, label: `:${String(item.name || '').replace(/^:/, '').trim()}${item.defaultValue ? ` = ${item.defaultValue}` : item.label ? ` - ${item.label}` : ''}` }))
+            const selectBindParameterOptions = [
+              ...cursorBindParameters.map((item) => ({ value: `:${item.name}`, label: `:${item.name} - cursor ${item.label}` })),
+              ...bindParameters
+                .filter((item) => item.enabled !== false && String(item.name || '').trim())
+                .map((item) => ({ value: `:${String(item.name || '').replace(/^:/, '').trim()}`, label: `:${String(item.name || '').replace(/^:/, '').trim()}${item.defaultValue ? ` = ${item.defaultValue}` : item.label ? ` - ${item.label}` : ''}` })),
+            ]
             const selectFieldOptions = [
               {
                 label: 'Source Fields',
@@ -35976,6 +38943,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 acc[name] = item.defaultValue !== undefined && item.defaultValue !== '' ? item.defaultValue : null
                 return acc
               }, {}),
+              ...cursorBindParameters.reduce<Record<string, unknown>>((acc, item) => {
+                if (item.name) acc[item.name] = null
+                return acc
+              }, {}),
             }
             const patchBindParameter = (bindId: string, patch: Partial<DataOpsBindParam>) => {
               patchDataOpsPipelineStep(step.id, {
@@ -35995,8 +38966,14 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
             }
             const snapshotQueryBuilder = (base?: Partial<DataOpsQueryBuilderConfig>): DataOpsQueryBuilderConfig => ({
               id: String(base?.id || dataOpsId('query')),
-              name: String(base?.name || activeQueryBuilder?.name || `Query ${queryBuilderRows.length + 1}`),
+              name: String(base?.name || activeInternalQuery?.name || `Q${internalQueryRows.length + 1}`),
               description: String(base?.description || ''),
+              sourceMode: base?.sourceMode || activeInternalQuery?.sourceMode || 'database',
+              inputQueryId: base?.inputQueryId ?? activeInternalQuery?.inputQueryId ?? '',
+              inputMode: base?.inputMode || activeInternalQuery?.inputMode || 'set_based',
+              outputAlias: base?.outputAlias ?? activeInternalQuery?.outputAlias ?? '',
+              cursorMappings: base?.cursorMappings || activeInternalQuery?.cursorMappings || [],
+              subqueries: base?.subqueries || activeInternalQuery?.subqueries || [],
               query: builtQuerySql,
               expression: builtQuerySql,
               tables,
@@ -36010,40 +38987,85 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               limitRows: step.limitRows,
               updatedAt: new Date().toISOString(),
             })
-            const saveCurrentQueryBuilder = () => {
-              const targetId = step.activeQueryBuilderId || activeQueryBuilder?.id || dataOpsId('query')
-              const existing = queryBuilderRows.find((item) => item.id === targetId)
-              const nextConfig = snapshotQueryBuilder({
-                id: targetId,
-                name: existing?.name || activeQueryBuilder?.name || `Query ${queryBuilderRows.length + 1}`,
-                description: existing?.description || '',
+            const saveCurrentQueryBuilder = async () => {
+              const packageId = step.activeQueryBuilderId || activeQueryBuilder?.id || dataOpsId('query')
+              const existingPackage = queryBuilderRows.find((item) => item.id === packageId)
+              const internalId = activeInternalQuery?.id || `${packageId}_q1`
+              const nextInternal = snapshotQueryBuilder({
+                id: internalId,
+                name: activeInternalQuery?.name || `Q${internalQueryRows.length || 1}`,
+                description: activeInternalQuery?.description || '',
+                sourceMode: activeInternalQuery?.sourceMode || 'database',
+                inputQueryId: activeInternalQuery?.inputQueryId || '',
+                inputMode: activeInternalQuery?.inputMode || 'set_based',
+                outputAlias: activeInternalQuery?.outputAlias || dataOpsQueryAlias(activeInternalQuery, currentQueryIndex),
+                cursorMappings: activeInternalQuery?.cursorMappings || [],
+                subqueries: activeInternalQuery?.subqueries || [],
               })
-              const nextRows = existing
-                ? queryBuilderRows.map((item) => item.id === targetId ? nextConfig : item)
-                : [...queryBuilderRows, nextConfig]
+              const nextInternalRows = internalQueryRows.some((item) => item.id === internalId)
+                ? internalQueryRows.map((item) => item.id === internalId ? nextInternal : item)
+                : [...internalQueryRows, nextInternal]
+              const materializedInternalRows = nextInternalRows.map((item) => ({
+                ...item,
+                query: dataOpsQueryBuilderSqlFromConfig({ ...item, limitRows: undefined }, nextInternalRows),
+                expression: dataOpsQueryBuilderSqlFromConfig({ ...item, limitRows: undefined }, nextInternalRows),
+              }))
+              const finalInternalId = existingPackage?.finalInternalQueryId || internalId
+              const finalSql = dataOpsQueryBuilderChainSql(materializedInternalRows, finalInternalId) || dataOpsQueryBuilderTemplateSqlFromConfig(nextInternal)
+              const nextPackage: DataOpsQueryBuilderConfig = {
+                ...(existingPackage || {}),
+                id: packageId,
+                name: existingPackage?.name || activeQueryBuilder?.name || step.name || `Query ${queryBuilderRows.length + 1}`,
+                description: existingPackage?.description || activeQueryBuilder?.description || '',
+                internalQueries: materializedInternalRows,
+                activeInternalQueryId: internalId,
+                finalInternalQueryId: finalInternalId,
+                query: finalSql,
+                expression: finalSql,
+                tables: materializedInternalRows[0]?.tables || [],
+                selectFields: materializedInternalRows[0]?.selectFields || [],
+                filterRules: materializedInternalRows[0]?.filterRules || [],
+                joinKeys: materializedInternalRows[0]?.joinKeys || [],
+                groupByFields: materializedInternalRows[0]?.groupByFields || [],
+                havingRules: materializedInternalRows[0]?.havingRules || [],
+	                orderByRows: materializedInternalRows[0]?.orderByRows || [],
+	                bindParameters: materializedInternalRows[0]?.bindParameters || [],
+	                limitRows: undefined,
+	                updatedAt: new Date().toISOString(),
+	              }
+              const nextRows = existingPackage
+                ? queryBuilderRows.map((item) => item.id === packageId ? nextPackage : item)
+                : [...queryBuilderRows, nextPackage]
               patchDataOpsPipelineStep(step.id, {
                 queryBuilders: nextRows,
-                activeQueryBuilderId: targetId,
-                expression: builtQuerySql,
-                query: builtQuerySql,
+                activeQueryBuilderId: packageId,
+                expression: finalSql,
+                query: finalSql,
               })
               notification.success({ message: 'Query configuration saved', placement: 'bottomRight', duration: 2 })
               persistPipelineAfterConfigUpdate('Query configuration saved permanently')
             }
             const loadQueryBuilderConfig = (config: DataOpsQueryBuilderConfig) => {
+              const internalRows = config.internalQueries || []
+              const selectedInternal = internalRows.find((item) => item.id === config.activeInternalQueryId) || internalRows[0] || config
               patchDataOpsPipelineStep(step.id, {
                 activeQueryBuilderId: config.id,
-                tables: config.tables || [],
-                selectFields: config.selectFields || [],
-                filterRules: config.filterRules || [],
-                joinKeys: config.joinKeys || [],
-                groupByFields: config.groupByFields || [],
-                havingRules: config.havingRules || [],
-                orderByRows: config.orderByRows || [],
-                bindParameters: config.bindParameters || [],
-                limitRows: config.limitRows,
-                expression: config.expression || config.query || '',
-                query: config.query || config.expression || '',
+                queryBuilders: queryBuilderRows.map((item) => item.id === config.id ? {
+                  ...item,
+                  activeInternalQueryId: selectedInternal.id,
+                  finalInternalQueryId: item.finalInternalQueryId || selectedInternal.id,
+                } : item),
+                tables: selectedInternal.tables || [],
+                selectFields: selectedInternal.selectFields || [],
+                filterRules: selectedInternal.filterRules || [],
+                joinKeys: selectedInternal.joinKeys || [],
+                groupByFields: selectedInternal.groupByFields || [],
+                havingRules: selectedInternal.havingRules || [],
+                orderByRows: selectedInternal.orderByRows || [],
+                bindParameters: selectedInternal.bindParameters || [],
+                limitRows: selectedInternal.limitRows,
+                expression: selectedInternal.expression || selectedInternal.query || '',
+                query: selectedInternal.query || selectedInternal.expression || '',
               })
               setDataOpsQueryBuilderConfigOpen(true)
             }
@@ -36053,6 +39075,15 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 id: nextId,
                 name: `Query ${queryBuilderRows.length + 1}`,
                 description: '',
+                internalQueries: [],
+                activeInternalQueryId: '',
+                finalInternalQueryId: '',
+                sourceMode: 'database',
+                inputQueryId: '',
+                inputMode: 'set_based',
+                outputAlias: '',
+                cursorMappings: [],
+                subqueries: [],
                 query: '',
                 expression: '',
                 tables: [],
@@ -36107,6 +39138,395 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 queryBuilders: nextRows,
                 activeQueryBuilderId: step.activeQueryBuilderId === configId ? String(nextRows[0]?.id || '') : step.activeQueryBuilderId,
               })
+            }
+            const updateActiveInternalQueryConfig = (patch: Partial<DataOpsQueryBuilderConfig>) => {
+              const packageId = step.activeQueryBuilderId || activeQueryBuilder?.id || ''
+              const internalId = activeInternalQuery?.id || ''
+              if (!packageId || !internalId) return
+              const nextInternalRows = internalQueryRows.map((item) => item.id === internalId ? { ...item, ...patch, updatedAt: new Date().toISOString() } : item)
+              updateQueryBuilderConfig(packageId, {
+                internalQueries: nextInternalRows,
+                activeInternalQueryId: internalId,
+                finalInternalQueryId: activeQueryBuilder?.finalInternalQueryId || internalId,
+              })
+            }
+            const normalizeInternalQuerySequence = (rows: DataOpsQueryBuilderConfig[]) => {
+              const aliasById = new Map<string, { before: string; after: string }>()
+              rows.forEach((item, index) => {
+                aliasById.set(item.id, {
+                  before: dataOpsQueryAlias(item, index),
+                  after: `q${index + 1}`,
+                })
+              })
+              return rows.map((item, index) => {
+                const normalizedAlias = `q${index + 1}`
+                const defaultName = `Q${index + 1}`
+                const itemName = String(item.name || '').trim()
+                const shouldRefreshName = !itemName || /^Q\d+$/i.test(itemName) || (index === 0 && /^Q\d+\s+Base\s+Query$/i.test(itemName))
+                const inputAlias = item.inputQueryId ? aliasById.get(item.inputQueryId) : undefined
+                const cursorMappings = (item.cursorMappings || []).map((mapping) => {
+                  const rawSource = String(mapping.sourceField || '').trim()
+                  if (!rawSource || !inputAlias?.before || inputAlias.before === inputAlias.after) return mapping
+                  const nextSource = rawSource === inputAlias.before
+                    ? inputAlias.after
+                    : rawSource.startsWith(`${inputAlias.before}.`)
+                      ? `${inputAlias.after}${rawSource.slice(inputAlias.before.length)}`
+                      : rawSource
+                  return nextSource === rawSource ? mapping : { ...mapping, sourceField: nextSource }
+                })
+                return {
+                  ...item,
+                  name: shouldRefreshName ? (index === 0 ? 'Q1 Base Query' : defaultName) : item.name,
+                  outputAlias: normalizedAlias,
+                  cursorMappings,
+                  updatedAt: new Date().toISOString(),
+                }
+              })
+            }
+            const activateInternalQueryConfig = (config: DataOpsQueryBuilderConfig) => {
+              const packageId = step.activeQueryBuilderId || activeQueryBuilder?.id || ''
+              if (!packageId || !selectedNodeId) return
+              const currentInternalId = activeInternalQuery?.id || ''
+              const currentInternal = currentInternalId ? snapshotQueryBuilder({
+                id: currentInternalId,
+                name: activeInternalQuery?.name || `Q${currentQueryIndex + 1}`,
+                description: activeInternalQuery?.description || '',
+                sourceMode: activeInternalQuery?.sourceMode || 'database',
+                inputQueryId: activeInternalQuery?.inputQueryId || '',
+                inputMode: activeInternalQuery?.inputMode || 'set_based',
+                outputAlias: activeInternalQuery?.outputAlias || dataOpsQueryAlias(activeInternalQuery, currentQueryIndex),
+                cursorMappings: activeInternalQuery?.cursorMappings || [],
+                subqueries: activeInternalQuery?.subqueries || [],
+              }) : undefined
+              const savedInternalRows = internalQueryRows.map((item) => {
+                if (currentInternal && item.id === currentInternal.id) {
+                  return {
+                    ...currentInternal,
+                    query: dataOpsQueryBuilderSqlFromConfig({ ...currentInternal, limitRows: undefined }, internalQueryRows),
+                    expression: dataOpsQueryBuilderSqlFromConfig({ ...currentInternal, limitRows: undefined }, internalQueryRows),
+                  }
+                }
+                return item
+              })
+              const targetConfig = savedInternalRows.find((item) => item.id === config.id) || config
+              const finalInternalId = activeQueryBuilder?.finalInternalQueryId || targetConfig.id
+              const finalSql = dataOpsQueryBuilderChainSql(savedInternalRows, finalInternalId) || dataOpsQueryBuilderTemplateSqlFromConfig(targetConfig, { includeLimit: false })
+              const stepPatch: Partial<DataOpsPipelineStep> = {
+                queryBuilders: queryBuilderRows.map((item) => item.id === packageId ? {
+                  ...item,
+                  internalQueries: savedInternalRows,
+                  activeInternalQueryId: targetConfig.id,
+                  finalInternalQueryId: finalInternalId,
+                  query: finalSql,
+                  expression: finalSql,
+                  updatedAt: new Date().toISOString(),
+                } : item),
+                tables: targetConfig.tables || [],
+                selectFields: targetConfig.selectFields || [],
+                filterRules: targetConfig.filterRules || [],
+                joinKeys: targetConfig.joinKeys || [],
+                groupByFields: targetConfig.groupByFields || [],
+                havingRules: targetConfig.havingRules || [],
+                orderByRows: targetConfig.orderByRows || [],
+                bindParameters: targetConfig.bindParameters || [],
+                limitRows: targetConfig.limitRows,
+                expression: targetConfig.expression || targetConfig.query || '',
+                query: targetConfig.query || targetConfig.expression || '',
+              }
+              const nextDataOpsSteps = dataOpsPipelineSteps.map((item) => item.id === step.id ? { ...item, ...stepPatch } : item)
+              const nextNodeConfig = {
+                data_ops_pipeline_nodes: cloneDataOpsPipelineSteps(nextDataOpsSteps),
+                data_ops_pipeline_edges: serializeDataOpsPipelineEdges(cloneDataOpsPipelineEdges(dataOpsPipelineEdges)),
+                pipeline_steps: dataOpsPipelineText(nextDataOpsSteps),
+              }
+              updateNodeConfig(selectedNodeId, nextNodeConfig)
+              if (activePipelineId) {
+                const storeState = useWorkflowStore.getState()
+                const nextNodes = storeState.nodes.map((node) => {
+                  if (node.id !== selectedNodeId) return node
+                  const currentConfig = node.data?.config && typeof node.data.config === 'object'
+                    ? node.data.config as Record<string, unknown>
+                    : {}
+                  return {
+                    ...node,
+                    data: {
+                      ...node.data,
+                      config: {
+                        ...currentConfig,
+                        ...nextNodeConfig,
+                      },
+                    },
+                  }
+                })
+                void api.updatePipeline(activePipelineId, { nodes: nextNodes, edges: storeState.edges }).catch((err) => {
+                  notification.error({
+                    message: 'Permanent tab save failed',
+                    description: String(err?.message || 'Failed to save query tab configuration'),
+                    placement: 'bottomRight',
+                  })
+                })
+              }
+            }
+            const addInternalQueryConfig = () => {
+              const packageId = step.activeQueryBuilderId || activeQueryBuilder?.id || ''
+              if (!packageId) return
+              const nextId = dataOpsId('internal_query')
+              const nextConfig: DataOpsQueryBuilderConfig = {
+                id: nextId,
+                name: `Q${internalQueryRows.length + 1}`,
+                description: '',
+                sourceMode: internalQueryRows.length > 0 ? 'internal_query' : 'database',
+                inputQueryId: internalQueryRows[internalQueryRows.length - 1]?.id || '',
+                inputMode: 'set_based',
+                outputAlias: `q${internalQueryRows.length + 1}`,
+                cursorMappings: [],
+                subqueries: [],
+                query: '',
+                expression: '',
+                tables: [],
+                selectFields: [],
+                filterRules: [],
+                joinKeys: [],
+                groupByFields: [],
+                havingRules: [],
+                orderByRows: [],
+                bindParameters: [],
+                limitRows: undefined,
+                updatedAt: new Date().toISOString(),
+              }
+              patchDataOpsPipelineStep(step.id, {
+                queryBuilders: queryBuilderRows.map((item) => item.id === packageId ? {
+                  ...item,
+                  internalQueries: normalizeInternalQuerySequence([...internalQueryRows, nextConfig]),
+                  activeInternalQueryId: nextId,
+                  finalInternalQueryId: nextId,
+                  updatedAt: new Date().toISOString(),
+                } : item),
+                tables: [],
+                selectFields: [],
+                filterRules: [],
+                joinKeys: [],
+                groupByFields: [],
+                havingRules: [],
+                orderByRows: [],
+                bindParameters: [],
+                limitRows: undefined,
+                expression: '',
+                query: '',
+              })
+            }
+            const moveInternalQueryConfig = (queryId: string, direction: -1 | 1) => {
+              const packageId = step.activeQueryBuilderId || activeQueryBuilder?.id || ''
+              if (!packageId) return
+              const fromIndex = internalQueryRows.findIndex((item) => item.id === queryId)
+              if (fromIndex <= 0) return
+              const toIndex = fromIndex + direction
+              if (toIndex <= 0 || toIndex >= internalQueryRows.length) return
+              const nextRows = [...internalQueryRows]
+              const [movedQuery] = nextRows.splice(fromIndex, 1)
+              if (!movedQuery) return
+              nextRows.splice(toIndex, 0, movedQuery)
+              const nextInternalRows = normalizeInternalQuerySequence(nextRows.map((item, index) => {
+                if (index <= 0 || item.sourceMode !== 'internal_query') return item
+                const previousQueryId = nextRows[index - 1]?.id || ''
+                if (!previousQueryId || item.inputQueryId === previousQueryId) return item
+                return { ...item, inputQueryId: previousQueryId, updatedAt: new Date().toISOString() }
+              }))
+              patchDataOpsPipelineStep(step.id, {
+                queryBuilders: queryBuilderRows.map((item) => item.id === packageId ? {
+                  ...item,
+                  internalQueries: nextInternalRows,
+                  activeInternalQueryId: activeInternalQuery?.id || queryId,
+                  finalInternalQueryId: activeQueryBuilder?.finalInternalQueryId || activeInternalQuery?.id || queryId,
+                  updatedAt: new Date().toISOString(),
+                } : item),
+              })
+            }
+            const deleteInternalQueryConfig = (queryId: string) => {
+              const packageId = step.activeQueryBuilderId || activeQueryBuilder?.id || ''
+              if (!packageId) return
+              const removeIndex = internalQueryRows.findIndex((item) => item.id === queryId)
+              if (removeIndex <= 0) return
+              const nextInternalRowsRaw = internalQueryRows.filter((item) => item.id !== queryId)
+              const fallbackInputId = nextInternalRowsRaw[Math.max(0, removeIndex - 1)]?.id || nextInternalRowsRaw[0]?.id || ''
+              const nextInternalRows = normalizeInternalQuerySequence(nextInternalRowsRaw.map((item) => ({
+                ...item,
+                inputQueryId: item.inputQueryId === queryId ? fallbackInputId : item.inputQueryId,
+              })))
+              const wasActive = activeInternalQuery?.id === queryId
+              const nextActive = wasActive
+                ? nextInternalRows[Math.max(0, Math.min(removeIndex - 1, nextInternalRows.length - 1))]
+                : activeInternalQuery
+              const nextFinalId = activeQueryBuilder?.finalInternalQueryId === queryId
+                ? nextActive?.id || nextInternalRows[0]?.id || ''
+                : activeQueryBuilder?.finalInternalQueryId || nextActive?.id || nextInternalRows[0]?.id || ''
+              patchDataOpsPipelineStep(step.id, {
+                queryBuilders: queryBuilderRows.map((item) => item.id === packageId ? {
+                  ...item,
+                  internalQueries: nextInternalRows,
+                  activeInternalQueryId: nextActive?.id || '',
+                  finalInternalQueryId: nextFinalId,
+                  updatedAt: new Date().toISOString(),
+                } : item),
+                ...(wasActive && nextActive ? {
+                  tables: nextActive.tables || [],
+                  selectFields: nextActive.selectFields || [],
+                  filterRules: nextActive.filterRules || [],
+                  joinKeys: nextActive.joinKeys || [],
+                  groupByFields: nextActive.groupByFields || [],
+                  havingRules: nextActive.havingRules || [],
+                  orderByRows: nextActive.orderByRows || [],
+                  bindParameters: nextActive.bindParameters || [],
+                  limitRows: nextActive.limitRows,
+                  expression: nextActive.expression || nextActive.query || '',
+                  query: nextActive.query || nextActive.expression || '',
+                } : {}),
+              })
+            }
+            const addCursorMapping = () => {
+              updateActiveInternalQueryConfig({
+                cursorMappings: [
+                  ...(activeInternalQuery?.cursorMappings || []),
+                  { id: dataOpsId('cursor_map'), param: `param_${(activeInternalQuery?.cursorMappings || []).length + 1}`, sourceMode: 'field', sourceField: internalSourceFields[0] || '', value: '', enabled: true },
+                ],
+              })
+            }
+            const patchCursorMapping = (mappingId: string, patch: Partial<DataOpsQueryInputRow>) => {
+              updateActiveInternalQueryConfig({
+                cursorMappings: (activeInternalQuery?.cursorMappings || []).map((item) => item.id === mappingId ? { ...item, ...patch } : item),
+              })
+            }
+            const addSubqueryConfig = () => {
+              updateActiveInternalQueryConfig({
+                subqueries: [
+                  ...(activeInternalQuery?.subqueries || []),
+                  {
+                    id: dataOpsId('subquery'),
+                    name: `Subquery ${(activeInternalQuery?.subqueries || []).length + 1}`,
+                    usage: 'exists',
+                    sourceType: 'table',
+                    sourceTable: '',
+                    sourceQueryId: '',
+                    parentField: fieldNames[0] || '',
+                    subqueryField: '',
+                    joinType: 'left',
+                    aggregate: 'MAX',
+                    enabled: true,
+                  },
+                ],
+              })
+            }
+            const patchSubqueryConfig = (subqueryId: string, patch: Partial<DataOpsSubqueryConfig>) => {
+              updateActiveInternalQueryConfig({
+                subqueries: (activeInternalQuery?.subqueries || []).map((item) => item.id === subqueryId ? { ...item, ...patch } : item),
+              })
+            }
+            const currentQuerySnapshot = snapshotQueryBuilder({ id: activeInternalQuery?.id || dataOpsId('internal_query') })
+            const previewInternalRows = [
+              ...internalQueryRows.filter((item) => item.id !== (activeInternalQuery?.id || '')),
+              currentQuerySnapshot,
+            ].sort((left, right) => {
+              const leftIndex = internalQueryRows.findIndex((item) => item.id === left.id)
+              const rightIndex = internalQueryRows.findIndex((item) => item.id === right.id)
+              return (leftIndex < 0 ? internalQueryRows.length : leftIndex) - (rightIndex < 0 ? internalQueryRows.length : rightIndex)
+            })
+            const currentQuerySql = dataOpsQueryBuilderSqlFromConfig(currentQuerySnapshot, previewInternalRows) || builtQuerySql
+            const finalQuerySql = dataOpsQueryBuilderChainSql(previewInternalRows, activeQueryBuilder?.finalInternalQueryId || activeInternalQuery?.id) || builtQuerySql
+            const previewActiveInternalQueryResult = async () => {
+              const previewLimit = Math.max(1, Math.min(Number(step.limitRows || 100), 1000))
+              const targetId = activeInternalQuery?.id || previewInternalRows[previewInternalRows.length - 1]?.id || ''
+              const targetIndex = Math.max(0, previewInternalRows.findIndex((item) => item.id === targetId))
+              const includedRows = previewInternalRows.slice(0, targetIndex + 1)
+              const resultById = new Map<string, Array<Record<string, unknown>>>()
+              const resultByAlias = new Map<string, Array<Record<string, unknown>>>()
+              let latestRows: Array<Record<string, unknown>> = []
+
+              const rowValue = (row: Record<string, unknown>, field: string) => {
+                const raw = String(field || '').trim()
+                const leaf = raw.split('.').pop() || raw
+                const candidates = [raw, leaf, raw.toUpperCase(), leaf.toUpperCase(), raw.toLowerCase(), leaf.toLowerCase()].filter(Boolean)
+                for (const candidate of candidates) {
+                  if (Object.prototype.hasOwnProperty.call(row, candidate)) return row[candidate]
+                }
+                const lowered = Object.fromEntries(Object.entries(row).map(([key, value]) => [key.toLowerCase(), value]))
+                for (const candidate of candidates) {
+                  const key = candidate.toLowerCase()
+                  if (Object.prototype.hasOwnProperty.call(lowered, key)) return lowered[key]
+                }
+                return undefined
+              }
+
+              const queryBindDefaults = (queryConfig: DataOpsQueryBuilderConfig) => ({
+                ...queryBuilderPreviewBindParams,
+                ...(queryConfig.bindParameters || []).reduce<Record<string, unknown>>((acc, item) => {
+                  if (item.enabled === false) return acc
+                  const name = String(item.name || '').replace(/^:/, '').trim()
+                  if (!name) return acc
+                  acc[name] = item.defaultValue !== undefined && item.defaultValue !== '' ? item.defaultValue : null
+                  return acc
+                }, {}),
+              })
+
+              for (let idx = 0; idx < includedRows.length; idx += 1) {
+                const queryConfig = includedRows[idx]
+                const querySql = dataOpsQueryBuilderSqlFromConfig(queryConfig, previewInternalRows) || String(queryConfig.query || queryConfig.expression || '').trim()
+                const queryId = String(queryConfig.id || `q${idx + 1}`)
+                const alias = dataOpsQueryAlias(queryConfig, idx)
+                const inputMode = String(queryConfig.inputMode || 'set_based')
+                const bindDefaults = queryBindDefaults(queryConfig)
+                let rowsForQuery: Array<Record<string, unknown>> = []
+
+                if (queryConfig.sourceMode === 'internal_query' && (inputMode === 'cursor' || inputMode === 'batch_cursor')) {
+                  const inputQueryId = String(queryConfig.inputQueryId || '').trim()
+                  const inputRows = resultById.get(inputQueryId) || resultByAlias.get(inputQueryId) || latestRows
+                  const mappings = (queryConfig.cursorMappings || [])
+                    .filter((item) => item.enabled !== false && String(item.param || '').trim() && String(item.sourceField || '').trim())
+                  const seenBindSets = new Set<string>()
+                  for (const inputRow of inputRows) {
+                    if (rowsForQuery.length >= previewLimit) break
+                    const cursorBinds = mappings.reduce<Record<string, unknown>>((acc, mapping) => {
+                      const name = String(mapping.param || '').replace(/^:/, '').trim()
+                      if (!name) return acc
+                      acc[name] = rowValue(inputRow, String(mapping.sourceField || ''))
+                      return acc
+                    }, {})
+                    const marker = JSON.stringify(cursorBinds, Object.keys(cursorBinds).sort())
+                    if (seenBindSets.has(marker)) continue
+                    seenBindSets.add(marker)
+                    const response = await api.previewDataOpsOracleQuery({
+                      ...nodeConfig,
+                      _data_ops_task_bind_params: { ...bindDefaults, ...cursorBinds },
+                    }, querySql, previewLimit - rowsForQuery.length)
+                    rowsForQuery = [...rowsForQuery, ...((Array.isArray(response?.rows) ? response.rows : []) as Array<Record<string, unknown>>)]
+                  }
+                } else if (queryConfig.sourceMode === 'internal_query' && inputMode === 'set_based') {
+                  const chainSql = dataOpsQueryBuilderChainSql(includedRows.slice(0, idx + 1), queryId)
+                  const response = await api.previewDataOpsOracleQuery({
+                    ...nodeConfig,
+                    _data_ops_task_bind_params: bindDefaults,
+                  }, chainSql || querySql, previewLimit)
+                  rowsForQuery = (Array.isArray(response?.rows) ? response.rows : []) as Array<Record<string, unknown>>
+                } else {
+                  const response = await api.previewDataOpsOracleQuery({
+                    ...nodeConfig,
+                    _data_ops_task_bind_params: bindDefaults,
+                  }, querySql, previewLimit)
+                  rowsForQuery = (Array.isArray(response?.rows) ? response.rows : []) as Array<Record<string, unknown>>
+                }
+
+                latestRows = rowsForQuery.slice(0, previewLimit)
+                resultById.set(queryId, latestRows)
+                resultByAlias.set(alias, latestRows)
+              }
+
+              const columns = uniqueFieldNames(latestRows.flatMap((row) => Object.keys(row || {})))
+              return {
+                ok: true,
+                columns,
+                rows: latestRows,
+                limit: previewLimit,
+                row_count: latestRows.length,
+              }
             }
             return (
               <div style={{ display: 'grid', gap: 10 }}>
@@ -36175,9 +39595,159 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     header: { background: 'var(--app-panel-bg)' },
                     body: { background: 'var(--app-panel-bg)', flex: 1, overflowY: 'auto', overflowX: 'hidden', minHeight: 0 },
                   }}
-                >
-	                  <div onKeyDownCapture={stopDataOpsDeleteKeyPropagation} style={{ display: 'grid', gap: 10, minWidth: 0 }}>
-	                <Space size={6} wrap>
+	                >
+		                  <div onKeyDownCapture={stopDataOpsDeleteKeyPropagation} style={{ display: 'grid', gap: 10, minWidth: 0 }}>
+		                <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, background: 'var(--app-bg)', padding: 10, display: 'grid', gap: 10 }}>
+		                  <Space size={8} wrap style={{ justifyContent: 'space-between', width: '100%' }}>
+			                    <Space size={6} wrap>
+			                      {internalQueryRows.map((queryConfig, index) => {
+			                        const isActive = queryConfig.id === activeInternalQuery?.id
+			                        const canDelete = index > 0
+			                        const canMoveLeft = index > 1
+			                        const canMoveRight = index > 0 && index < internalQueryRows.length - 1
+			                        return (
+			                          <span
+			                            key={queryConfig.id}
+			                            style={{
+			                              display: 'inline-flex',
+			                              alignItems: 'center',
+			                              gap: 4,
+			                              border: `1px solid ${isActive ? '#1677ff' : 'var(--app-border)'}`,
+			                              background: isActive ? '#1677ff' : 'var(--app-card-bg)',
+			                              color: isActive ? '#fff' : 'var(--app-text)',
+			                              borderRadius: 6,
+			                              padding: '2px 5px 2px 8px',
+			                              minHeight: 24,
+			                            }}
+			                          >
+			                            <button
+			                              type="button"
+			                              onClick={() => activateInternalQueryConfig(queryConfig)}
+			                              style={{
+			                                border: 0,
+			                                background: 'transparent',
+			                                color: 'inherit',
+			                                padding: 0,
+			                                cursor: 'pointer',
+			                                fontSize: 12,
+			                                fontWeight: isActive ? 700 : 500,
+			                              }}
+			                            >
+			                              {dataOpsQueryAlias(queryConfig, index)} {queryConfig.name || `Query ${index + 1}`}
+			                            </button>
+			                            {canDelete ? (
+			                              <>
+			                                <Tooltip title="Move left">
+			                                  <Button
+			                                    size="small"
+			                                    type="text"
+			                                    icon={<ArrowLeftOutlined />}
+			                                    disabled={!canMoveLeft}
+			                                    style={{ width: 18, height: 18, minWidth: 18, padding: 0, color: 'inherit', opacity: canMoveLeft ? 1 : 0.45 }}
+			                                    onClick={(event) => {
+			                                      event.stopPropagation()
+			                                      moveInternalQueryConfig(queryConfig.id, -1)
+			                                    }}
+			                                  />
+			                                </Tooltip>
+			                                <Tooltip title="Move right">
+			                                  <Button
+			                                    size="small"
+			                                    type="text"
+			                                    icon={<ArrowRightOutlined />}
+			                                    disabled={!canMoveRight}
+			                                    style={{ width: 18, height: 18, minWidth: 18, padding: 0, color: 'inherit', opacity: canMoveRight ? 1 : 0.45 }}
+			                                    onClick={(event) => {
+			                                      event.stopPropagation()
+			                                      moveInternalQueryConfig(queryConfig.id, 1)
+			                                    }}
+			                                  />
+			                                </Tooltip>
+			                              <Popconfirm
+			                                title="Delete internal query?"
+			                                description="This removes only this query from the current configuration."
+			                                okText="Delete"
+			                                okButtonProps={{ danger: true }}
+			                                onConfirm={() => deleteInternalQueryConfig(queryConfig.id)}
+			                              >
+			                                <Button
+			                                  size="small"
+			                                  type="text"
+			                                  icon={<CloseOutlined />}
+			                                  style={{ width: 18, height: 18, minWidth: 18, padding: 0, color: 'inherit' }}
+			                                  onClick={(event) => event.stopPropagation()}
+			                                />
+			                              </Popconfirm>
+			                              </>
+			                            ) : null}
+			                          </span>
+			                        )
+			                      })}
+			                      <Button size="small" icon={<PlusSquareOutlined />} onClick={addInternalQueryConfig}>Query</Button>
+			                    </Space>
+		                    <Space size={8} wrap>
+		                      <Tag style={{ marginInlineEnd: 0 }}>queries: {internalQueryRows.length}</Tag>
+		                      <Tag style={{ marginInlineEnd: 0 }}>subqueries: {(activeInternalQuery?.subqueries || []).filter((item) => item.enabled !== false).length}</Tag>
+		                      <Tag style={{ marginInlineEnd: 0 }}>mappings: {(activeInternalQuery?.cursorMappings || []).filter((item) => item.enabled !== false).length}</Tag>
+		                    </Space>
+		                  </Space>
+		                  <div style={{ display: 'grid', gridTemplateColumns: 'minmax(150px, .75fr) minmax(180px, 1fr) minmax(120px, .65fr) minmax(150px, .75fr) minmax(140px, .75fr)', gap: 8, alignItems: 'end' }}>
+		                    <div style={{ display: 'grid', gap: 4 }}>
+		                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Source Type</Text>
+		                      <Select
+		                        size="small"
+		                        value={currentQuerySourceMode}
+		                        onChange={(value) => updateActiveInternalQueryConfig({ sourceMode: value as DataOpsQueryBuilderConfig['sourceMode'], inputQueryId: value === 'internal_query' ? activeInternalQuery?.inputQueryId || internalQueryRows.filter((item) => item.id !== activeInternalQuery?.id).slice(-1)[0]?.id || '' : '' })}
+		                        options={[{ value: 'database', label: 'Database tables' }, { value: 'internal_query', label: 'Internal query result' }]}
+		                        style={{ width: '100%' }}
+		                      />
+		                    </div>
+		                    <div style={{ display: 'grid', gap: 4 }}>
+		                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Input Query</Text>
+		                      <Select
+		                        size="small"
+		                        disabled={currentQuerySourceMode !== 'internal_query'}
+		                        value={activeInternalQuery?.inputQueryId || undefined}
+		                        onChange={(value) => updateActiveInternalQueryConfig({ inputQueryId: String(value || '') })}
+		                        options={internalQueryOptions}
+		                        placeholder="previous query"
+		                        style={{ width: '100%' }}
+		                      />
+		                    </div>
+		                    <div style={{ display: 'grid', gap: 4 }}>
+		                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Input Mode</Text>
+		                      <Select
+		                        size="small"
+		                        disabled={currentQuerySourceMode !== 'internal_query'}
+		                        value={currentQueryInputMode}
+		                        onChange={(value) => updateActiveInternalQueryConfig({ inputMode: value as DataOpsQueryBuilderConfig['inputMode'] })}
+		                        options={[{ value: 'set_based', label: 'Set based' }, { value: 'cursor', label: 'Cursor' }, { value: 'batch_cursor', label: 'Batch cursor' }]}
+		                        style={{ width: '100%' }}
+		                      />
+		                    </div>
+		                    <div style={{ display: 'grid', gap: 4 }}>
+		                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Output Alias</Text>
+		                      <Input
+		                        size="small"
+		                        value={activeInternalQuery?.outputAlias || ''}
+		                        onChange={(event) => updateActiveInternalQueryConfig({ outputAlias: event.target.value })}
+		                        placeholder={dataOpsQueryAlias(activeQueryBuilder, currentQueryIndex)}
+		                        style={commonInputStyle}
+		                      />
+		                    </div>
+		                    <div style={{ display: 'grid', gap: 4 }}>
+		                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 11 }}>Query Name</Text>
+		                      <Input
+		                        size="small"
+		                        value={activeInternalQuery?.name || ''}
+		                        onChange={(event) => updateActiveInternalQueryConfig({ name: event.target.value })}
+		                        placeholder={`Q${currentQueryIndex + 1}`}
+		                        style={commonInputStyle}
+		                      />
+		                    </div>
+		                  </div>
+		                </div>
+		                <Space size={6} wrap>
 	                  {dataOpsQueryLegendItems.map(([label, color]) => (
 	                    <Tag key={`data_ops_query_legend_${label}`} style={{ marginInlineEnd: 0, background: `${color}14`, border: `1px solid ${color}45`, color, fontSize: 10, fontWeight: 400 }}>
 	                      {label}
@@ -36198,9 +39768,38 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   ))}
                 </div>
                 <div className="data-ops-query-builder-layout">
-                  <div className="data-ops-query-builder-main">
-                {compactPanel(
-                  'Bind Parameters',
+	                  <div className="data-ops-query-builder-main">
+	                {currentQuerySourceMode === 'internal_query' && currentQueryInputMode !== 'set_based' ? compactPanel(
+	                  'Cursor Mapping',
+	                  <Button size="small" onClick={addCursorMapping}>Add Mapping</Button>,
+	                  <div style={{ display: 'grid', gap: 8 }}>
+	                    {(activeInternalQuery?.cursorMappings || []).length <= 0 ? (
+	                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+	                        Map parameters for cursor execution from the selected input query output.
+	                      </Text>
+	                    ) : null}
+	                    {(activeInternalQuery?.cursorMappings || []).map((row) => (
+	                      <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px minmax(140px, .8fr) minmax(180px, 1fr) 34px', gap: 8, alignItems: 'center' }}>
+	                        <Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchCursorMapping(row.id, { enabled: checked })} />
+	                        <Input size="small" value={row.param || ''} onChange={(event) => patchCursorMapping(row.id, { param: event.target.value.replace(/^:/, '').trim() })} prefix=":" placeholder="parameter" style={dataOpsInputStyle(dataOpsSectionColors.where)} />
+	                        <Select
+	                          size="small"
+	                          showSearch
+	                          allowClear
+	                          optionFilterProp="label"
+	                          value={row.sourceField || undefined}
+	                          onChange={(value) => patchCursorMapping(row.id, { sourceMode: 'field', sourceField: String(value || '') })}
+	                          options={internalSourceFields.map((value) => ({ value, label: value }))}
+	                          placeholder="input query field"
+	                          style={dataOpsControlStyle(dataOpsSectionColors.select)}
+	                        />
+	                        <Button size="small" danger icon={<DeleteOutlined />} onClick={() => updateActiveInternalQueryConfig({ cursorMappings: (activeInternalQuery?.cursorMappings || []).filter((item) => item.id !== row.id) })} />
+	                      </div>
+	                    ))}
+	                  </div>
+	                ) : null}
+	                {compactPanel(
+	                  'Bind Parameters',
                   <Space size={6}>
                     <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { bindParameters: [...bindParameters, { id: dataOpsId('bind'), name: `param_${bindParameters.length + 1}`, dataType: 'string', defaultValue: '', required: false, enabled: true }] })}>Add Bind</Button>
                   </Space>,
@@ -36293,7 +39892,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                       <div style={{ display: 'grid', gap: 6 }}>
                         {selectFields.map((row) => (
                           <div key={row.id} style={{ display: 'grid', gap: 6 }}>
-                            <div style={{ display: 'grid', gridTemplateColumns: '42px 92px 1fr 138px 1fr 34px', gap: 8, alignItems: 'center' }}>
+                            <div style={{ display: 'grid', gridTemplateColumns: '42px 92px minmax(160px, 1fr) 118px minmax(120px, .7fr) 112px minmax(90px, .55fr) 34px', gap: 8, alignItems: 'center' }}>
                             <Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} />
                             <Select size="small" value={row.mode || 'field'} onChange={(value) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, mode: value as DataOpsFieldRow['mode'] } : item) })} options={fieldModeOptions} />
                             {row.mode === 'case'
@@ -36348,6 +39947,21 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                 )}
 	                            <Select size="small" value={row.aggregate || ''} onChange={(value) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, aggregate: String(value || '') } : item) })} options={aggregateOptions} style={dataOpsControlStyle(dataOpsSectionColors.select)} />
 	                            <Input size="small" value={row.alias || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, alias: event.target.value } : item) })} placeholder="output alias" style={dataOpsInputStyle(dataOpsSectionColors.select)} />
+                              <Select
+                                size="small"
+                                value={row.nullHandling || 'none'}
+                                onChange={(value) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, nullHandling: value as DataOpsFieldRow['nullHandling'] } : item) })}
+                                options={[{ value: 'none', label: 'Null: none' }, { value: 'nvl', label: 'NVL' }]}
+                                style={dataOpsControlStyle(dataOpsSectionColors.select)}
+                              />
+                              <Input
+                                size="small"
+                                disabled={(row.nullHandling || 'none') !== 'nvl'}
+                                value={row.nullDefault || ''}
+                                onChange={(event) => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.map((item) => item.id === row.id ? { ...item, nullDefault: event.target.value } : item) })}
+                                placeholder="default"
+                                style={dataOpsInputStyle(dataOpsSectionColors.select)}
+                              />
                             <Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { selectFields: selectFields.filter((item) => item.id !== row.id) })} />
                             </div>
                             {row.mode === 'case' ? (
@@ -36424,8 +40038,50 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 10, alignItems: 'start' }}>
 	                  {compactPanel('5. Group By', <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { groupByFields: [...(step.groupByFields || []), { id: dataOpsId('group'), field: '', enabled: true }] })}>Add</Button>, <div style={{ display: 'grid', gap: 8 }}>{(step.groupByFields || []).map((row) => <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px 1fr 34px', gap: 8, alignItems: 'center' }}><Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchDataOpsPipelineStep(step.id, { groupByFields: (step.groupByFields || []).map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} />{pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { groupByFields: (step.groupByFields || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'group field', dataOpsSectionColors.group)}<Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { groupByFields: (step.groupByFields || []).filter((item) => item.id !== row.id) })} /></div>)}</div>)}
 	                  {compactPanel('Having', <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { havingRules: [...(step.havingRules || []), { id: dataOpsId('having'), field: '', operator: 'greater_than', value: '', valueMode: 'fixed', enabled: true }] })}>Add</Button>, <div style={{ display: 'grid', gap: 8 }}>{(step.havingRules || []).map((row) => <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px 1fr 112px 76px 1fr 34px', gap: 8, alignItems: 'center' }}><Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, enabled: checked } : item) })} />{pickField(row.field, (value) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, field: value } : item) }), 'metric', dataOpsSectionColors.having)}<Select size="small" value={row.operator || 'greater_than'} onChange={(value) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, operator: value } : item) })} options={compareOperatorOptions} style={dataOpsControlStyle(dataOpsSectionColors.having)} /><Select size="small" value={row.valueMode || 'fixed'} onChange={(value) => patchRuleBindMode('havingRules', row.id, value as DataOpsRuleRow['valueMode'])} options={[{ value: 'fixed', label: 'Fixed' }, { value: 'bind', label: 'Bind' }]} style={dataOpsControlStyle(dataOpsSectionColors.having)} />{row.valueMode === 'bind' ? <Select size="small" showSearch allowClear optionFilterProp="label" value={row.bindParam || undefined} onChange={(value) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, valueMode: 'bind', bindParam: String(value || ''), value: value ? `:${value}` : '' } : item) })} placeholder="bind parameter" options={bindParameterOptions} style={dataOpsControlStyle(dataOpsSectionColors.having)} /> : <Input size="small" value={row.value || ''} onChange={(event) => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).map((item) => item.id === row.id ? { ...item, value: event.target.value, valueMode: 'fixed', bindParam: '' } : item) })} style={dataOpsInputStyle(dataOpsSectionColors.having)} />}<Button size="small" danger icon={<DeleteOutlined />} onClick={() => patchDataOpsPipelineStep(step.id, { havingRules: (step.havingRules || []).filter((item) => item.id !== row.id) })} /></div>)}</div>)}
-                </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 10, alignItems: 'start' }}>
+	                </div>
+	                <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 10, alignItems: 'start' }}>
+	                  {compactPanel(
+	                    'Subqueries',
+	                    <Button size="small" onClick={addSubqueryConfig}>Add Subquery</Button>,
+	                    <div style={{ display: 'grid', gap: 8 }}>
+	                      {(activeInternalQuery?.subqueries || []).length <= 0 ? (
+	                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+	                          Add visual subquery definitions for EXISTS, IN, lookup joins, select values, or reusable FROM datasets.
+	                        </Text>
+	                      ) : null}
+	                      {(activeInternalQuery?.subqueries || []).map((row) => {
+	                        const sourceFieldOptions = row.sourceType === 'internal_query' ? internalQueryFieldOptions(row.sourceQueryId) : []
+	                        return (
+	                        <div key={row.id} style={{ display: 'grid', gridTemplateColumns: '42px minmax(130px, 1fr) 126px 126px minmax(140px, 1fr) minmax(140px, 1fr) minmax(140px, 1fr) 96px 34px', gap: 8, alignItems: 'center' }}>
+	                          <Switch size="small" checked={row.enabled !== false} onChange={(checked) => patchSubqueryConfig(row.id, { enabled: checked })} />
+	                          <Input size="small" value={row.name || ''} onChange={(event) => patchSubqueryConfig(row.id, { name: event.target.value })} placeholder="subquery name" style={dataOpsInputStyle(dataOpsSectionColors.having)} />
+	                          <Select size="small" value={row.usage || 'exists'} onChange={(value) => patchSubqueryConfig(row.id, { usage: value as DataOpsSubqueryConfig['usage'] })} options={[{ value: 'exists', label: 'EXISTS' }, { value: 'in', label: 'IN filter' }, { value: 'join', label: 'Join lookup' }, { value: 'select_value', label: 'Select value' }, { value: 'from', label: 'FROM' }]} style={dataOpsControlStyle(dataOpsSectionColors.having)} />
+	                          <Select size="small" value={row.sourceType || 'table'} onChange={(value) => patchSubqueryConfig(row.id, { sourceType: value as DataOpsSubqueryConfig['sourceType'] })} options={[{ value: 'table', label: 'Table' }, { value: 'internal_query', label: 'Internal query' }]} style={dataOpsControlStyle(dataOpsSectionColors.source)} />
+	                          {row.sourceType === 'internal_query' ? (
+	                            <Select size="small" showSearch allowClear optionFilterProp="label" value={row.sourceQueryId || undefined} onChange={(value) => patchSubqueryConfig(row.id, { sourceQueryId: String(value || '') })} options={internalQueryOptions} placeholder="source query" style={dataOpsControlStyle(dataOpsSectionColors.source)} />
+	                          ) : (
+	                            <Input size="small" value={row.sourceTable || ''} onChange={(event) => patchSubqueryConfig(row.id, { sourceTable: event.target.value })} placeholder="table/view" style={dataOpsInputStyle(dataOpsSectionColors.source)} />
+	                          )}
+	                          {pickField(row.parentField, (value) => patchSubqueryConfig(row.id, { parentField: value }), 'parent field', dataOpsSectionColors.having)}
+	                          {row.sourceType === 'internal_query' ? (
+	                            <Select size="small" showSearch allowClear optionFilterProp="label" value={row.subqueryField || undefined} onChange={(value) => patchSubqueryConfig(row.id, { subqueryField: String(value || '') })} options={sourceFieldOptions} placeholder="subquery field" style={dataOpsControlStyle(dataOpsSectionColors.having)} />
+	                          ) : (
+	                            <Input size="small" value={row.subqueryField || ''} onChange={(event) => patchSubqueryConfig(row.id, { subqueryField: event.target.value })} placeholder="subquery field" style={dataOpsInputStyle(dataOpsSectionColors.having)} />
+	                          )}
+	                          {row.usage === 'join' ? (
+	                            <Select size="small" value={row.joinType || 'left'} onChange={(value) => patchSubqueryConfig(row.id, { joinType: value as DataOpsJoinRow['joinType'] })} options={[{ value: 'inner', label: 'Inner' }, { value: 'left', label: 'Left' }, { value: 'right', label: 'Right' }, { value: 'full', label: 'Full' }]} style={dataOpsControlStyle(dataOpsSectionColors.join)} />
+	                          ) : row.usage === 'select_value' ? (
+	                            <Select size="small" value={row.aggregate || 'MAX'} onChange={(value) => patchSubqueryConfig(row.id, { aggregate: value as DataOpsSubqueryConfig['aggregate'] })} options={[{ value: 'MAX', label: 'MAX' }, { value: 'MIN', label: 'MIN' }, { value: 'SUM', label: 'SUM' }, { value: 'COUNT', label: 'COUNT' }]} style={dataOpsControlStyle(dataOpsSectionColors.select)} />
+	                          ) : (
+	                            <Tag style={{ marginInlineEnd: 0, textAlign: 'center' }}>{row.usage === 'from' ? 'FROM' : 'Filter'}</Tag>
+	                          )}
+	                          <Button size="small" danger icon={<DeleteOutlined />} onClick={() => updateActiveInternalQueryConfig({ subqueries: (activeInternalQuery?.subqueries || []).filter((item) => item.id !== row.id) })} />
+	                        </div>
+	                      )})}
+	                    </div>
+	                  )}
+	                </div>
+	                <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 10, alignItems: 'start' }}>
 	                  {compactPanel(
                       '6. Order By / Limit',
                       <Button size="small" onClick={() => patchDataOpsPipelineStep(step.id, { orderByRows: [...(step.orderByRows || []), { id: dataOpsId('order'), field: '', direction: 'asc', enabled: true }] })}>Add Sort</Button>,
@@ -36456,23 +40112,35 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   </div>
                   <div className="data-ops-query-result-side">
                 {compactPanel(
-                  'Final Query / Test Result',
+	                  'Current Query / Final Query / Test Result',
                   null,
                   <Tabs
                     size="small"
                     items={[
-                      {
-                        key: 'query',
-                        label: 'Final Query',
-                        children: (
-                          <div style={{ display: 'grid', gap: 8 }}>
-                            <Space style={{ justifyContent: 'flex-end' }}>
-                              <Button size="small" onClick={saveCurrentQueryBuilder}>Save SQL</Button>
-                            </Space>
-                            {renderDataOpsSqlPreview(builtQuerySql, 320)}
-                          </div>
-                        ),
-                      },
+	                      {
+	                        key: 'query',
+	                        label: 'Current Query',
+	                        children: (
+	                          <div style={{ display: 'grid', gap: 8 }}>
+	                            <Space style={{ justifyContent: 'flex-end' }}>
+	                              <Button size="small" onClick={saveCurrentQueryBuilder}>Save SQL</Button>
+	                            </Space>
+	                            {renderDataOpsSqlPreview(currentQuerySql, 320)}
+	                          </div>
+	                        ),
+	                      },
+	                      {
+	                        key: 'final',
+	                        label: 'Final Query',
+	                        children: (
+	                          <div style={{ display: 'grid', gap: 8 }}>
+	                            <Space style={{ justifyContent: 'flex-end' }}>
+	                              <Button size="small" onClick={saveCurrentQueryBuilder}>Save SQL</Button>
+	                            </Space>
+	                            {renderDataOpsSqlPreview(finalQuerySql, 320)}
+	                          </div>
+	                        ),
+	                      },
                       {
                         key: 'result',
                         label: 'Test Result',
@@ -36483,10 +40151,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                                 setDataOpsObjectDataLoading(true)
                                 setDataOpsObjectDataError(null)
                                 try {
-                                  const response = await api.previewDataOpsOracleQuery({
-                                    ...nodeConfig,
-                                    _data_ops_task_bind_params: queryBuilderPreviewBindParams,
-                                  }, builtQuerySql, Number(step.limitRows || 100))
+                                  const response = await previewActiveInternalQueryResult()
                                   setDataOpsObjectData(response)
                                   notification.success({ message: 'Query preview loaded', description: `${Number(response?.row_count || 0).toLocaleString()} row(s) returned.`, placement: 'bottomRight', duration: 2 })
                                 } catch (err: any) {
@@ -36613,10 +40278,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                     ...selectedDataOpsPipelineStep,
                     activeRouterConfigId: activeRouterConfig.id,
                     routeSource: activeRouterConfig.routeSource || '',
-                    queryInputs: activeRouterConfig.queryInputs || [],
+                    queryInputs: cloneDataOpsQueryInputRows(activeRouterConfig.queryInputs),
                     routeMode: activeRouterConfig.routeMode || 'multi',
                     payloadMode: activeRouterConfig.payloadMode || 'all_rows',
-                    routeRows: activeRouterConfig.routeRows || [],
+                    routeRows: cloneDataOpsRouterRouteRows(activeRouterConfig.routeRows),
                     syncProcessingMode: activeRouterConfig.syncProcessingMode || 'batch',
                     syncBatchSize: activeRouterConfig.syncBatchSize || 1000,
                     syncCommitEvery: activeRouterConfig.syncCommitEvery || 5000,
@@ -36659,10 +40324,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 const aggregate = String(field.aggregate || '').trim().toLowerCase()
                 return aggregate ? `${aggregate}_${baseName}` : rawField
               }
-              const routerFieldsFromQueryConfig = (config?: DataOpsQueryBuilderConfig) => uniqueFieldNames((config?.selectFields || [])
-                .filter((field) => field.enabled !== false)
-                .map(routerFieldLabel)
-                .filter(Boolean))
+              const routerFieldsFromQueryConfig = (config?: DataOpsQueryBuilderConfig) => dataOpsQueryBuilderFinalOutputFields(config)
 	              const routerSelectedSourceValue = String(routerEditorStep.routeSource || '')
               const routerSelectedSourceFields = (() => {
                 if (routerSelectedSourceValue.startsWith('query:')) {
@@ -36706,6 +40368,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 })
               const patchRouter = (patch: Partial<DataOpsPipelineStep>) => {
                 const activeConfigId = String(patch.activeRouterConfigId || selectedDataOpsPipelineStep.activeRouterConfigId || '').trim()
+                const safePatch = cloneDataOpsRouterConfigPatch(patch)
                 const mirrorKeys = new Set([
                   'routeSource',
                   'queryInputs',
@@ -36728,18 +40391,18 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   'syncErrorMode',
                 ])
                 const mirroredPatch = Object.fromEntries(
-                  Object.entries(patch).filter(([key]) => mirrorKeys.has(key))
+                  Object.entries(safePatch).filter(([key]) => mirrorKeys.has(key))
                 ) as Partial<DataOpsRouterConfig>
                 const shouldMirror = activeConfigId && Object.keys(mirroredPatch).length > 0
                 patchDataOpsPipelineStep(selectedDataOpsPipelineStep.id, {
-                  ...patch,
+                  ...safePatch,
                   ...(shouldMirror ? {
                     routerConfigs: routerConfigRows.map((config) => (
                       config.id === activeConfigId
                         ? {
                             ...config,
-                            ...mirroredPatch,
-                            checkpointEnabled: patch.checkpointEnabled ?? patch.checkpoint ?? mirroredPatch.checkpointEnabled ?? config.checkpointEnabled,
+                            ...cloneDataOpsRouterConfigPatch(mirroredPatch),
+                            checkpointEnabled: safePatch.checkpointEnabled ?? safePatch.checkpoint ?? mirroredPatch.checkpointEnabled ?? config.checkpointEnabled,
                             updatedAt: new Date().toISOString(),
                           }
                         : config
@@ -36889,10 +40552,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   enabled: base?.enabled !== false,
                   description: String(base?.description || ''),
                 routeSource: sourceStep.routeSource || '',
-                queryInputs: sourceStep.queryInputs || [],
+                queryInputs: cloneDataOpsQueryInputRows(sourceStep.queryInputs),
                 routeMode: sourceStep.routeMode || 'multi',
                 payloadMode: sourceStep.payloadMode || 'all_rows',
-                routeRows: sourceStep.routeRows || [],
+                routeRows: cloneDataOpsRouterRouteRows(sourceStep.routeRows),
                 syncProcessingMode: sourceStep.syncProcessingMode || 'batch',
                 syncBatchSize: sourceStep.syncBatchSize || 1000,
                 syncCommitEvery: sourceStep.syncCommitEvery || 5000,
@@ -36923,7 +40586,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               })
               const saveCurrentRouterConfig = (stepOverride?: DataOpsPipelineStep, notify = true) => {
                 const sourceStep = stepOverride || selectedDataOpsPipelineStep
-                const sourceRows = Array.isArray(sourceStep.routerConfigs) ? sourceStep.routerConfigs : routerConfigRows
+                const sourceRows = cloneDataOpsRouterConfigs(Array.isArray(sourceStep.routerConfigs) ? sourceStep.routerConfigs : routerConfigRows)
                 const targetId = sourceStep.activeRouterConfigId || activeRouterConfig?.id || dataOpsId('router')
                 const existing = sourceRows.find((item) => item.id === targetId)
                 const nextConfig = snapshotRouterConfig({
@@ -36952,10 +40615,10 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 patchRouter({
                   activeRouterConfigId: config.id,
                   routeSource: config.routeSource || '',
-                  queryInputs: config.queryInputs || [],
+                  queryInputs: cloneDataOpsQueryInputRows(config.queryInputs),
                   routeMode: config.routeMode || 'multi',
                   payloadMode: config.payloadMode || 'all_rows',
-                  routeRows: config.routeRows || [],
+                  routeRows: cloneDataOpsRouterRouteRows(config.routeRows),
                   syncProcessingMode: config.syncProcessingMode || 'batch',
                   syncBatchSize: config.syncBatchSize || 1000,
                   syncCommitEvery: config.syncCommitEvery || 5000,
@@ -36997,7 +40660,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   queryInputs: [],
                   routeMode: 'multi',
                   payloadMode: 'all_rows',
-                  routeRows: defaultRouteRows,
+                  routeRows: cloneDataOpsRouterRouteRows(defaultRouteRows),
                   syncProcessingMode: 'batch',
                   syncBatchSize: 1000,
                   syncCommitEvery: 5000,
@@ -37033,7 +40696,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   routeSource: nextConfig.routeSource,
                   routeMode: nextConfig.routeMode,
                   payloadMode: nextConfig.payloadMode,
-                  routeRows: nextConfig.routeRows,
+                  routeRows: cloneDataOpsRouterRouteRows(nextConfig.routeRows),
                   syncProcessingMode: 'batch',
                   syncBatchSize: 1000,
                   syncCommitEvery: 5000,
@@ -37062,7 +40725,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   scheduleNextRunAt: '',
                   scheduleLastRegisteredAt: '',
                 }
-                const nextRouterConfigs = [...routerConfigRows, nextConfig]
+                const nextRouterConfigs = [...cloneDataOpsRouterConfigs(routerConfigRows), cloneDataOpsRouterConfig(nextConfig)]
                 const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, ...nextPatch, routerConfigs: nextRouterConfigs } : step)
                 const nextDataOpsEdges = buildDataOpsRouterEdgesForConfigs(nextRouterConfigs)
                 syncMainPipelineRouterEdgesForConfigs(nextRouterConfigs)
@@ -37071,13 +40734,21 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               }
               const duplicateRouterConfig = (config: DataOpsRouterConfig) => {
                 const nextId = dataOpsId('router')
+                const nextConfig = cloneDataOpsRouterConfig({
+                  ...config,
+                  id: nextId,
+                  name: `${config.name || 'Router'} Copy`,
+                  enabled: config.enabled !== false,
+                  updatedAt: new Date().toISOString(),
+                })
                 patchRouter({
-                  routerConfigs: [...routerConfigRows, { ...config, id: nextId, name: `${config.name || 'Router'} Copy`, enabled: config.enabled !== false, updatedAt: new Date().toISOString() }],
+                  routerConfigs: [...cloneDataOpsRouterConfigs(routerConfigRows), nextConfig],
                   activeRouterConfigId: nextId,
                 })
               }
               const updateRouterConfig = (configId: string, patch: Partial<DataOpsRouterConfig>) => {
-                const nextRouterConfigs = routerConfigRows.map((item) => item.id === configId ? { ...item, ...patch, updatedAt: new Date().toISOString() } : item)
+                const safePatch = cloneDataOpsRouterConfigPatch(patch)
+                const nextRouterConfigs = routerConfigRows.map((item) => item.id === configId ? { ...item, ...safePatch, updatedAt: new Date().toISOString() } : cloneDataOpsRouterConfig(item))
                 patchRouter({
                   enabled: nextRouterConfigs.some((item) => item.enabled !== false),
                   routerConfigs: nextRouterConfigs,
@@ -37204,12 +40875,12 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 }
               })
               const patchRouterRoute = (routeId: string, patch: Partial<DataOpsRouterRouteRow>) => {
-                const nextRouteRows = routeRows.map((item) => item.id === routeId ? { ...item, ...patch } : item)
+                const nextRouteRows = cloneDataOpsRouterRouteRows(routeRows.map((item) => item.id === routeId ? { ...item, ...patch } : item))
                 const activeConfigId = String(routerEditorStep.activeRouterConfigId || selectedDataOpsPipelineStep.activeRouterConfigId || '').trim()
                 const nextRouterConfigs = activeConfigId
-                  ? routerConfigRows.map((config) => config.id === activeConfigId ? { ...config, routeRows: nextRouteRows, updatedAt: new Date().toISOString() } : config)
-                  : routerConfigRows
-                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, routeRows: nextRouteRows, routerConfigs: nextRouterConfigs } : step)
+                  ? routerConfigRows.map((config) => config.id === activeConfigId ? { ...config, routeRows: cloneDataOpsRouterRouteRows(nextRouteRows), updatedAt: new Date().toISOString() } : cloneDataOpsRouterConfig(config))
+                  : cloneDataOpsRouterConfigs(routerConfigRows)
+                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, routeRows: cloneDataOpsRouterRouteRows(nextRouteRows), routerConfigs: nextRouterConfigs } : step)
                 const nextDataOpsEdges = buildDataOpsRouterEdgesForConfigs(nextRouterConfigs.length > 0 ? nextRouterConfigs : [{ id: activeConfigId || 'current', routeRows: nextRouteRows }])
                 syncMainPipelineRouterEdgesForConfigs(nextRouterConfigs.length > 0 ? nextRouterConfigs : [{ id: activeConfigId || 'current', routeRows: nextRouteRows }])
                 persistDataOpsPipeline(nextSteps, nextDataOpsEdges)
@@ -37230,24 +40901,24 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   payloadMode: routerEditorStep.payloadMode || 'all_rows',
                   enabled: true,
                 }
-                const nextRouteRows = [...routeRows, nextRoute]
+                const nextRouteRows = cloneDataOpsRouterRouteRows([...routeRows, nextRoute])
                 const activeConfigId = String(routerEditorStep.activeRouterConfigId || selectedDataOpsPipelineStep.activeRouterConfigId || '').trim()
                 const nextRouterConfigs = activeConfigId
-                  ? routerConfigRows.map((config) => config.id === activeConfigId ? { ...config, routeRows: nextRouteRows, updatedAt: new Date().toISOString() } : config)
-                  : routerConfigRows
-                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, routeRows: nextRouteRows, routerConfigs: nextRouterConfigs } : step)
+                  ? routerConfigRows.map((config) => config.id === activeConfigId ? { ...config, routeRows: cloneDataOpsRouterRouteRows(nextRouteRows), updatedAt: new Date().toISOString() } : cloneDataOpsRouterConfig(config))
+                  : cloneDataOpsRouterConfigs(routerConfigRows)
+                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, routeRows: cloneDataOpsRouterRouteRows(nextRouteRows), routerConfigs: nextRouterConfigs } : step)
                 const nextDataOpsEdges = buildDataOpsRouterEdgesForConfigs(nextRouterConfigs.length > 0 ? nextRouterConfigs : [{ id: activeConfigId || 'current', routeRows: nextRouteRows }])
                 syncMainPipelineRouterEdgesForConfigs(nextRouterConfigs.length > 0 ? nextRouterConfigs : [{ id: activeConfigId || 'current', routeRows: nextRouteRows }])
                 persistDataOpsPipeline(nextSteps, nextDataOpsEdges)
                 setDataOpsRouterRouteConfigId(nextRoute.id)
               }
               const deleteRouterRoute = (routeId: string) => {
-                const nextRouteRows = routeRows.filter((item) => item.id !== routeId)
+                const nextRouteRows = cloneDataOpsRouterRouteRows(routeRows.filter((item) => item.id !== routeId))
                 const activeConfigId = String(routerEditorStep.activeRouterConfigId || selectedDataOpsPipelineStep.activeRouterConfigId || '').trim()
                 const nextRouterConfigs = activeConfigId
-                  ? routerConfigRows.map((config) => config.id === activeConfigId ? { ...config, routeRows: nextRouteRows, updatedAt: new Date().toISOString() } : config)
-                  : routerConfigRows
-                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, routeRows: nextRouteRows, routerConfigs: nextRouterConfigs } : step)
+                  ? routerConfigRows.map((config) => config.id === activeConfigId ? { ...config, routeRows: cloneDataOpsRouterRouteRows(nextRouteRows), updatedAt: new Date().toISOString() } : cloneDataOpsRouterConfig(config))
+                  : cloneDataOpsRouterConfigs(routerConfigRows)
+                const nextSteps = dataOpsPipelineSteps.map((step) => step.id === selectedDataOpsPipelineStep.id ? { ...step, routeRows: cloneDataOpsRouterRouteRows(nextRouteRows), routerConfigs: nextRouterConfigs } : step)
                 const nextDataOpsEdges = buildDataOpsRouterEdgesForConfigs(nextRouterConfigs.length > 0 ? nextRouterConfigs : [{ id: activeConfigId || 'current', routeRows: nextRouteRows }])
                 syncMainPipelineRouterEdgesForConfigs(nextRouterConfigs.length > 0 ? nextRouterConfigs : [{ id: activeConfigId || 'current', routeRows: nextRouteRows }])
                 persistDataOpsPipeline(nextSteps, nextDataOpsEdges)
@@ -37795,10 +41466,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                 const aggregate = String(field.aggregate || '').trim().toLowerCase()
                 return aggregate ? `${aggregate}_${baseName}` : rawField
               }
-              const mapperFieldsFromQueryConfig = (config?: DataOpsQueryBuilderConfig) => uniqueFieldNames((config?.selectFields || [])
-                .filter((field) => field.enabled !== false)
-                .map(mapperFieldLabel)
-                .filter(Boolean))
+              const mapperFieldsFromQueryConfig = (config?: DataOpsQueryBuilderConfig) => dataOpsQueryBuilderFinalOutputFields(config)
               const mapperSelectedSourceValue = String(selectedDataOpsPipelineStep.lookupSource || '')
               const mapperSelectedSourceFields = (() => {
                 if (mapperSelectedSourceValue.startsWith('query:')) {
@@ -38092,7 +41760,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
                   return true
                 })
               const taskLogRows = Array.from(rawTaskLogRows.reduce((acc, row) => {
-                const key = String(row.job_id || `${row.config_id || 'config'}:${row.last_run_started_at || row.at || ''}`)
+                const key = `${String(row.job_id || row.config_id || 'config')}:${String(row.last_run_started_at || row.at || '')}`
                 const current = acc.get(key)
                 if (!current) {
                   acc.set(key, { ...row })
@@ -38210,7 +41878,7 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               const taskLogSummaryStatus = (current: string, incoming: unknown) => taskLogStatusRank(incoming) > taskLogStatusRank(current) ? String(incoming || 'idle').toLowerCase() : current
               const taskLogRawRows = filteredTaskLogRows.map((row, index) => ({
                 ...row,
-                key: String(row.job_id || `${row.config_id || 'log'}:${row.last_run_started_at || row.at || index}`),
+                key: `${String(row.job_id || row.config_id || 'log')}:${String(row.last_run_started_at || row.at || index)}`,
                 task: taskLogTaskName(row),
                 subTask: taskLogSubTaskName(row),
                 window: taskLogWindowValue(row),
@@ -38521,8 +42189,11 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
               }
               const taskRuntimeStats = (taskId: string) => {
                 const latestRowsBySubTask = new Map<string, Record<string, unknown>>()
-                taskRuntimeRowsForTask(taskId)
+                const metricRows = taskRuntimeRowsForTask(taskId)
                   .filter((row) => row.source_rows || row.rows_processed || row.destination_rows || row.rejected_rows || row.mismatch_rows)
+                const mapperMetricRows = metricRows.filter((row) => String(row.kind || '') === 'mapper')
+                const rowsForStats = mapperMetricRows.length > 0 ? mapperMetricRows : metricRows
+                rowsForStats
                   .sort((a, b) => Date.parse(String(b.last_run_started_at || b.at || b.last_activity_at || '')) - Date.parse(String(a.last_run_started_at || a.at || a.last_activity_at || '')))
                   .forEach((row) => {
                     const key = String(row.config_id || row.job_id || '')
@@ -41981,6 +45652,2036 @@ export default function ConfigDrawer({ open, onClose }: ConfigDrawerProps) {
         </div>
       </div>
     </Modal>
+    {canUseRuleIntelligenceStudio && (
+      <Modal
+        open={ruleIntelligenceStudioOpen}
+        onCancel={() => setRuleIntelligenceStudioOpen(false)}
+        zIndex={2200}
+        footer={null}
+        closable={false}
+        maskClosable={false}
+        centered={false}
+        width="100vw"
+        style={{ top: 0, maxWidth: '100vw', paddingBottom: 0 }}
+        styles={{
+          content: {
+            padding: 0,
+            borderRadius: 0,
+            overflow: 'hidden',
+            border: 'none',
+            background: 'var(--app-panel-bg)',
+            height: '100vh',
+            display: 'flex',
+            flexDirection: 'column',
+          },
+          body: {
+            padding: 0,
+            height: '100vh',
+            flex: 1,
+            minHeight: 0,
+            display: 'flex',
+            flexDirection: 'column',
+          },
+        }}
+      >
+        <div style={{
+          borderBottom: '1px solid var(--app-border-strong)',
+          background: 'var(--app-card-bg)',
+          padding: '12px 16px',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: 12,
+        }}>
+          <div>
+            <Text style={{ color: 'var(--app-text)', fontWeight: 700, fontSize: 16 }}>
+              Rule Intelligence Studio
+            </Text>
+            <br />
+            <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+              No-code calculation, target, anomaly, output, and audit configuration.
+            </Text>
+          </div>
+          <Space wrap>
+            <Tag color="blue">rules {ruleIntelligenceConfig.rules.length}</Tag>
+            <Tag color="green">targets {ruleIntelligenceConfig.targets.length}</Tag>
+            <Tag color="orange">anomalies {ruleIntelligenceConfig.anomalies.length}</Tag>
+            {ruleIntelligenceSelectedPack ? (
+              <Tag color={String(ruleIntelligenceSelectedVersion?.status || ruleIntelligenceSelectedPack.status || 'draft') === 'active' ? 'green' : 'blue'}>
+                {String(ruleIntelligenceSelectedVersion?.version_label || 'v1')} · {String(ruleIntelligenceSelectedVersion?.status || ruleIntelligenceSelectedPack.status || 'draft')}
+              </Tag>
+            ) : null}
+            <Select
+              showSearch
+              allowClear
+              size="small"
+              placeholder="Governed pack"
+              value={ruleIntelligenceSelectedPackId || undefined}
+              loading={ruleIntelligenceGovernanceLoading}
+              onChange={(value) => { void loadRuleIntelligencePackById(String(value || '')) }}
+              options={ruleIntelligencePacks.map((pack) => ({
+                value: String(pack.id || ''),
+                label: `${String(pack.name || 'Rule Pack')} · ${String((pack.current_version as any)?.version_label || 'v1')} · ${String((pack.current_version as any)?.status || pack.status || 'draft')}`,
+              }))}
+              style={{ width: 260 }}
+            />
+            <Button size="small" loading={ruleIntelligenceGovernanceLoading} onClick={() => { void loadRuleIntelligencePacks() }}>
+              Load
+            </Button>
+            <Button size="small" type="primary" loading={ruleIntelligenceGovernanceLoading} onClick={() => { void saveRuleIntelligencePackVersion() }}>
+              Save Version
+            </Button>
+            <Button size="small" loading={ruleIntelligenceGovernanceLoading} onClick={() => { void updateRuleIntelligenceLifecycle('submit') }}>
+              Submit
+            </Button>
+            <Button size="small" loading={ruleIntelligenceGovernanceLoading} onClick={() => { void updateRuleIntelligenceLifecycle('approve') }}>
+              Approve
+            </Button>
+            <Button size="small" loading={ruleIntelligenceGovernanceLoading} onClick={() => { void updateRuleIntelligenceLifecycle('activate') }}>
+              Activate
+            </Button>
+            <Button size="small" loading={ruleIntelligenceImportLoading} onClick={() => ruleIntelligenceImportInputRef.current?.click()}>
+              Import File
+            </Button>
+            <Button loading={ruleIntelligenceValidationLoading} onClick={() => { void runRuleIntelligenceValidation() }}>
+              Validate
+            </Button>
+            <Button type="primary" loading={ruleIntelligencePreviewLoading} onClick={() => { void runRuleIntelligencePreview() }}>
+              Preview
+            </Button>
+            <Button icon={<CloseOutlined />} onClick={() => setRuleIntelligenceStudioOpen(false)} />
+          </Space>
+        </div>
+        <input
+          ref={ruleIntelligenceImportInputRef}
+          type="file"
+          accept=".json,.csv,.xlsx,.xlsm,.docx,.pdf,.txt"
+          style={{ display: 'none' }}
+          onChange={(event) => {
+            const file = event.target.files?.[0]
+            void importRuleIntelligenceFile(file)
+          }}
+        />
+        <div style={{ flex: 1, minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+          <Tabs
+            activeKey={ruleIntelligenceActiveTab}
+            onChange={setRuleIntelligenceActiveTab}
+            style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', padding: '0 16px' }}
+            tabBarStyle={{ marginBottom: 0 }}
+            items={[
+              {
+                key: 'setup',
+                label: 'Setup',
+                children: (
+                  <div style={{ padding: 16, overflow: 'auto', height: 'calc(100vh - 126px)' }}>
+                    <Space direction="vertical" size={14} style={{ width: '100%', maxWidth: 920 }}>
+                      <Space size={12} wrap>
+                        <div style={{ width: 320 }}>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Rule Pack Name</Text>
+                          <Input
+                            value={String(ruleIntelligenceConfig.rulePack.name || nodeConfig.studio_name || 'Rule Intelligence Engine')}
+                            onChange={(event) => patchRuleIntelligenceConfig({
+                              studio_name: event.target.value,
+                              rule_pack: { ...ruleIntelligenceConfig.rulePack, name: event.target.value },
+                            })}
+                            style={commonInputStyle}
+                          />
+                        </div>
+                        <div style={{ width: 140 }}>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Version</Text>
+                          <Input
+                            value={String(ruleIntelligenceConfig.rulePack.version || '1.0')}
+                            onChange={(event) => patchRuleIntelligenceConfig({
+                              rule_pack: { ...ruleIntelligenceConfig.rulePack, version: event.target.value },
+                            })}
+                            style={commonInputStyle}
+                          />
+                        </div>
+                        <div style={{ width: 180 }}>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Status</Text>
+                          <Select
+                            value={String(ruleIntelligenceConfig.rulePack.status || 'draft')}
+                            onChange={(value) => patchRuleIntelligenceConfig({
+                              rule_pack: { ...ruleIntelligenceConfig.rulePack, status: value },
+                            })}
+                            style={{ width: '100%' }}
+                            options={[
+                              { value: 'draft', label: 'Draft' },
+                              { value: 'active', label: 'Active' },
+                              { value: 'retired', label: 'Retired' },
+                            ]}
+                          />
+                        </div>
+                      </Space>
+                      <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 12, background: 'var(--app-shell-bg)' }}>
+                        <Space direction="vertical" size={8}>
+                          <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Execution Model</Text>
+                          <Space size={8} wrap>
+                            <Tag color="blue">1. Field Mapping</Tag>
+                            <Tag color="purple">2. Clusters</Tag>
+                            <Tag color="cyan">3. Rules</Tag>
+                            <Tag color="green">4. Targets</Tag>
+                            <Tag color="orange">5. Anomalies</Tag>
+                            <Tag color="geekblue">6. Output</Tag>
+                            <Tag color="magenta">7. Audit</Tag>
+                          </Space>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                            Rules execute by priority within clusters. Formula rules use the existing Custom Fields expression runtime.
+                          </Text>
+                        </Space>
+                      </div>
+                    </Space>
+                  </div>
+                ),
+              },
+              {
+                key: 'mapping',
+                label: 'Field Mapping',
+                children: (
+                  <div style={{ padding: 16, overflow: 'auto', height: 'calc(100vh - 126px)' }}>
+                    <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                      <Space wrap>
+                        <Button type="primary" onClick={addRuleIntelligenceInputField}>Add Field</Button>
+                        <Button onClick={autoDetectRuleIntelligenceInputFields}>Auto Detect From Upstream</Button>
+                        <Button onClick={() => updateRuleIntelligenceInputFields(RULE_INTELLIGENCE_STARTER_FIELDS)}>
+                          Load Generic Starter
+                        </Button>
+                      </Space>
+                      <Table
+                        size="small"
+                        rowKey={(record: any, index) => String(record.id || index)}
+                        pagination={false}
+                        dataSource={ruleIntelligenceConfig.inputFields}
+                        scroll={{ x: 1080 }}
+                        columns={[
+                          {
+                            title: 'Rule Field',
+                            dataIndex: 'id',
+                            key: 'id',
+                            width: 170,
+                            render: (value: unknown, _record: any, index: number) => (
+                              <Input
+                                value={String(value || '')}
+                                onChange={(event) => updateRuleIntelligenceInputField(index, { id: event.target.value })}
+                                style={commonInputStyle}
+                              />
+                            ),
+                          },
+                          {
+                            title: 'Label',
+                            dataIndex: 'label',
+                            key: 'label',
+                            width: 190,
+                            render: (value: unknown, _record: any, index: number) => (
+                              <Input
+                                value={String(value || '')}
+                                onChange={(event) => updateRuleIntelligenceInputField(index, { label: event.target.value })}
+                                style={commonInputStyle}
+                              />
+                            ),
+                          },
+                          {
+                            title: 'Type',
+                            dataIndex: 'type',
+                            key: 'type',
+                            width: 130,
+                            render: (value: unknown, _record: any, index: number) => (
+                              <Select
+                                value={String(value || 'string')}
+                                onChange={(next) => updateRuleIntelligenceInputField(index, { type: next })}
+                                options={RULE_INTELLIGENCE_FIELD_TYPES}
+                                style={{ width: '100%' }}
+                              />
+                            ),
+                          },
+                          {
+                            title: 'Role',
+                            dataIndex: 'role',
+                            key: 'role',
+                            width: 150,
+                            render: (value: unknown, _record: any, index: number) => (
+                              <Select
+                                value={String(value || 'dimension')}
+                                onChange={(next) => updateRuleIntelligenceInputField(index, { role: next })}
+                                options={RULE_INTELLIGENCE_FIELD_ROLES}
+                                style={{ width: '100%' }}
+                              />
+                            ),
+                          },
+                          {
+                            title: 'Upstream Field',
+                            dataIndex: 'mapped_field',
+                            key: 'mapped_field',
+                            width: 260,
+                            render: (value: unknown, record: any) => (
+                              <AutoComplete
+                                value={String(value || '')}
+                                onChange={(next) => updateRuleIntelligenceFieldMapping(String(record.id || ''), next)}
+                                options={ruleIntelligenceMappingFieldOptions.map((fieldName) => ({ value: fieldName, label: fieldName }))}
+                                filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(inputValue.toLowerCase())}
+                                style={{ width: '100%' }}
+                              >
+                                <Input style={commonInputStyle} />
+                              </AutoComplete>
+                            ),
+                          },
+                          {
+                            title: 'Required',
+                            dataIndex: 'required',
+                            key: 'required',
+                            width: 100,
+                            render: (value: unknown, _record: any, index: number) => (
+                              <Switch
+                                checked={Boolean(value)}
+                                onChange={(checked) => updateRuleIntelligenceInputField(index, { required: checked })}
+                              />
+                            ),
+                          },
+                          {
+                            title: '',
+                            key: 'actions',
+                            width: 80,
+                            render: (_value: unknown, _record: any, index: number) => (
+                              <Button
+                                size="small"
+                                danger
+                                icon={<DeleteOutlined />}
+                                onClick={() => updateRuleIntelligenceInputFields(ruleIntelligenceConfig.inputFields.filter((_field, idx) => idx !== index))}
+                              />
+                            ),
+                          },
+                        ] as any[]}
+                      />
+                    </Space>
+                  </div>
+                ),
+              },
+              {
+                key: 'clusters',
+                label: 'Clusters',
+                children: (
+                  <div style={{ padding: 16, overflow: 'auto', height: 'calc(100vh - 126px)' }}>
+                    <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                      <Space wrap>
+                        <Button onClick={addRuleIntelligenceDefaultClusters}>Load Recommended Clusters</Button>
+                        <Button onClick={() => addRuleIntelligenceCluster('calculation')}>Add Calculation Cluster</Button>
+                        <Button onClick={() => addRuleIntelligenceCluster('target')}>Add Target Cluster</Button>
+                        <Button onClick={() => addRuleIntelligenceCluster('anomaly')}>Add Anomaly Cluster</Button>
+                      </Space>
+                      <Table
+                        size="small"
+                        rowKey={(record: any) => String(record.id || record.name)}
+                        pagination={false}
+                        dataSource={ruleIntelligenceConfig.clusters}
+                        columns={[
+                          {
+                            title: 'Sequence',
+                            dataIndex: 'sequence',
+                            key: 'sequence',
+                            width: 120,
+                            render: (value: unknown, _record: any, index: number) => (
+                              <InputNumber
+                                size="small"
+                                value={Number(value || 0)}
+                                onChange={(next) => updateRuleIntelligenceCluster(index, { sequence: Number(next || 0) })}
+                                style={{ width: '100%' }}
+                              />
+                            ),
+                          },
+                          {
+                            title: 'Cluster',
+                            dataIndex: 'name',
+                            key: 'name',
+                            render: (value: unknown, _record: any, index: number) => (
+                              <Input
+                                size="small"
+                                value={String(value || '')}
+                                onChange={(event) => updateRuleIntelligenceCluster(index, { name: event.target.value })}
+                                style={commonInputStyle}
+                              />
+                            ),
+                          },
+                          {
+                            title: 'Type',
+                            dataIndex: 'type',
+                            key: 'type',
+                            width: 180,
+                            render: (value: unknown, _record: any, index: number) => (
+                              <Select
+                                size="small"
+                                value={String(value || 'calculation')}
+                                onChange={(next) => updateRuleIntelligenceCluster(index, { type: next })}
+                                style={{ width: '100%' }}
+                                options={[
+                                  { value: 'calculation', label: 'Calculation' },
+                                  { value: 'target', label: 'Target' },
+                                  { value: 'anomaly', label: 'Anomaly' },
+                                  { value: 'output', label: 'Output' },
+                                ]}
+                              />
+                            ),
+                          },
+                          {
+                            title: 'Enabled',
+                            dataIndex: 'enabled',
+                            key: 'enabled',
+                            width: 100,
+                            render: (value: unknown, _record: any, index: number) => (
+                              <Switch
+                                checked={value !== false}
+                                onChange={(checked) => updateRuleIntelligenceCluster(index, { enabled: checked })}
+                              />
+                            ),
+                          },
+                          {
+                            title: '',
+                            key: 'actions',
+                            width: 90,
+                            render: (_value: unknown, _record: any, index: number) => (
+                              <Button
+                                size="small"
+                                danger
+                                icon={<DeleteOutlined />}
+                                onClick={() => patchRuleIntelligenceConfig({ clusters: ruleIntelligenceConfig.clusters.filter((_cluster, idx) => idx !== index) })}
+                              />
+                            ),
+                          },
+                        ] as any[]}
+                      />
+                    </Space>
+                  </div>
+                ),
+              },
+              {
+                key: 'rules',
+                label: 'Rules',
+                children: (
+                  <div style={{ padding: 16, overflow: 'auto', height: 'calc(100vh - 126px)' }}>
+                    <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                      <Space wrap>
+                        <Button type="primary" onClick={() => patchRuleIntelligenceConfig({ rules: [...ruleIntelligenceConfig.rules, createRuleIntelligenceGenericCalculationRule(ruleIntelligenceConfig.inputFields)] })}>
+                          Add Calculation Rule
+                        </Button>
+                        <Button onClick={() => patchRuleIntelligenceConfig({ rules: [] })}>Clear Rules</Button>
+                      </Space>
+                      {ruleIntelligenceConfig.rules.map((rule, index) => {
+                        const calculation = rule.calculation && typeof rule.calculation === 'object' && !Array.isArray(rule.calculation)
+                          ? rule.calculation as Record<string, unknown>
+                          : {}
+                        const cap = rule.cap && typeof rule.cap === 'object' && !Array.isArray(rule.cap)
+                          ? rule.cap as Record<string, unknown>
+                          : {}
+                        const legacyGroupFilter = rule.group_filter && typeof rule.group_filter === 'object' && !Array.isArray(rule.group_filter)
+                          ? rule.group_filter as Record<string, unknown>
+                          : null
+                        const groupFilters = (
+                          Array.isArray(rule.group_filters)
+                            ? rule.group_filters as Array<Record<string, unknown>>
+                            : legacyGroupFilter
+                              ? [legacyGroupFilter]
+                              : []
+                        ).map((filter) => createRuleIntelligenceGroupFilter(filter))
+                        const method = String(calculation.method || 'percentage').trim().toLowerCase()
+                        const calculationApplyMode = method === 'flat'
+                          ? (calculation.per_distinct === true || calculation.per_account === true
+                            ? 'per_distinct'
+                            : calculation.per_row === false
+                              ? 'group'
+                              : 'per_row')
+                          : String(calculation.apply || calculation.apply_mode || 'group')
+                        const commissionShares = Array.isArray(calculation.shares) ? calculation.shares as Array<Record<string, unknown>> : []
+                        const allocationBaseKey = normalizeRuleIntelligenceFieldId(rule.component_id || rule.id || 'component') || 'component'
+                        const updateAllocationShare = (shareIndex: number, patch: Record<string, unknown>) => {
+                          const nextShares = commissionShares.map((share, idx) => idx === shareIndex ? { ...share, ...patch } : share)
+                          updateRuleIntelligenceRuleCalculation(index, { shares: nextShares })
+                        }
+                        const addAllocationShare = () => {
+                          const nextIndex = commissionShares.length + 1
+                          const recipient = `Recipient ${nextIndex}`
+                          const recipientKey = `recipient_${nextIndex}`
+                          updateRuleIntelligenceRuleCalculation(index, {
+                            shares: [
+                              ...commissionShares,
+                              {
+                                id: recipientKey,
+                                payee_type: recipient,
+                                component_id: `${allocationBaseKey}_${recipientKey}_share`,
+                                percent: 0,
+                                enabled: true,
+                              },
+                            ],
+                          })
+                        }
+                        const removeAllocationShare = (shareIndex: number) => {
+                          updateRuleIntelligenceRuleCalculation(index, { shares: commissionShares.filter((_share, idx) => idx !== shareIndex) })
+                        }
+                        const hasConfiguredCapAmount = cap.amount !== undefined || cap.max_amount !== undefined
+                        const capEnabled = cap.enabled === true || (
+                          cap.enabled !== false
+                          && hasConfiguredCapAmount
+                          && Number(cap.amount || cap.max_amount || 0) > 0
+                        )
+                        const eligibilityFilterEnabled = groupFilters.some((filter) => filter.enabled === true)
+                        const updateGroupFilters = (nextFilters: Array<Record<string, unknown>>) => {
+                          updateRuleIntelligenceRule(index, {
+                            group_filters: nextFilters,
+                            group_filter: nextFilters[0] || { enabled: false },
+                          })
+                        }
+                        const fieldCaption = (fieldId: unknown, fallback = 'select field') => {
+                          const id = String(fieldId || '').trim()
+                          if (!id) return fallback
+                          const field = ruleIntelligenceConfig.inputFields.find((item) => String(item.id || '') === id)
+                          const label = String(field?.label || '').trim()
+                          const mapped = String(field?.mapped_field || ruleIntelligenceConfig.fieldMapping[id] || '').trim()
+                          if (mapped && label && mapped.toLowerCase() !== label.toLowerCase()) return `${mapped} (${id})`
+                          return label || mapped || id
+                        }
+                        const conditionTree = normalizeRuleIntelligenceConditionTree(rule)
+                        const conditionItems = Array.isArray(conditionTree.conditions) ? conditionTree.conditions as Array<Record<string, unknown>> : []
+                        const conditionLeaves = collectRuleIntelligenceConditionLeaves(conditionTree)
+                        const updateConditionTree = (nextTree: Record<string, unknown>) => {
+                          const normalizedTree = createRuleIntelligenceConditionGroup({ id: 'root', ...nextTree })
+                          updateRuleIntelligenceRule(index, {
+                            condition_tree: normalizedTree,
+                            conditions: flattenRuleIntelligenceConditionTree(normalizedTree),
+                            match_mode: normalizedTree.match_mode || 'all',
+                            service_value: '',
+                          })
+                        }
+                        const updateConditionItem = (itemIndex: number, patch: Record<string, unknown>) => {
+                          const nextItems = conditionItems.map((item, itemIdx) => itemIdx === itemIndex ? { ...item, ...patch } : item)
+                          updateConditionTree({ ...conditionTree, conditions: nextItems })
+                        }
+                        const updateNestedConditionItem = (groupIndex: number, childIndex: number, patch: Record<string, unknown>) => {
+                          const nextItems = conditionItems.map((item, itemIdx) => {
+                            if (itemIdx !== groupIndex) return item
+                            const children = Array.isArray(item.conditions) ? item.conditions as Array<Record<string, unknown>> : []
+                            return {
+                              ...item,
+                              conditions: children.map((child, idx) => idx === childIndex ? { ...child, ...patch } : child),
+                            }
+                          })
+                          updateConditionTree({ ...conditionTree, conditions: nextItems })
+                        }
+                        const conditionText = summarizeRuleIntelligenceConditionTree(conditionTree, fieldCaption)
+                        const defaultDateFieldId = String(
+                          ruleIntelligenceConfig.inputFields.find((field) => String(field.type || '').trim().toLowerCase() === 'date')?.id
+                          || ruleIntelligenceConfig.inputFields.find((field) => String(field.role || '').trim().toLowerCase() === 'date')?.id
+                          || ''
+                        )
+                        const basisText = fieldCaption(calculation.amount_field || calculation.basis || '', 'basis field')
+                        const rateText = `${Number(calculation.rate_percent || 0)}% of ${basisText}`
+                        const flatText = `${Number(calculation.amount || calculation.flat_amount || 0)} ${calculation.per_row === false ? 'once per group' : `per ${basisText === 'basis field' ? 'matched row' : basisText}`}`
+                        const formulaText = String(calculation.expression || '').trim() || `formula using ${basisText}`
+                        const calculationText = method === 'flat'
+                          ? flatText
+                          : method === 'formula'
+                            ? formulaText
+                            : method === 'slab'
+                              ? `slab table on ${basisText}`
+                              : rateText
+                        const capText = capEnabled
+                          ? `cap ${Number(cap.amount || cap.max_amount || 0)} by ${(Array.isArray(cap.group_by) ? cap.group_by : []).map((item) => fieldCaption(item, String(item || 'field'))).join(' + ') || 'scope'}`
+                          : 'no cap'
+                        const reportText = (Array.isArray(rule.group_by) ? rule.group_by : []).map((item) => fieldCaption(item, String(item || 'field'))).join(' + ') || 'report grouping'
+                        const ruleWarnings = [
+                          conditionLeaves.some((condition) => !String(condition.field || '').trim()) ? 'Select condition field(s).' : '',
+                          conditionLeaves.some((condition) => !['is_null', 'is_not_null'].includes(String(condition.operator || '')) && !String(condition.value || '').trim()) ? 'Enter condition value(s).' : '',
+                          method === 'percentage' && Number(calculation.rate_percent || 0) === 0 ? 'Rate is 0. Enter the percentage, for example 0.40.' : '',
+                          method === 'formula' ? 'Formula is advanced. For 0.40% of amount, use Method = Percentage.' : '',
+                          capEnabled && Number(cap.amount || cap.max_amount || 0) <= 0 ? 'Cap is enabled but cap amount is 0.' : '',
+                          eligibilityFilterEnabled && groupFilters.some((filter) => !String(filter.value ?? '').trim()) ? 'Eligibility condition value is blank.' : '',
+                          eligibilityFilterEnabled && groupFilters.some((filter) => !RULE_INTELLIGENCE_GROUP_FILTER_FIELDLESS_METRICS.has(String(filter.metric || '').trim().toLowerCase()) && !String(filter.field || '').trim()) ? 'Select eligibility field(s).' : '',
+                        ].filter(Boolean)
+                        const ruleSectionStyle = (accent: string, _tint: string): CSSProperties => ({
+                          border: '1px solid var(--app-border-strong)',
+                          borderLeft: `3px solid ${accent}`,
+                          borderRadius: 8,
+                          padding: 12,
+                          background: 'var(--app-card-bg)',
+                          boxShadow: '0 1px 0 rgba(255,255,255,0.025) inset',
+                        })
+                        const rulePanelHeaderStyle = (accent: string): CSSProperties => ({
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          gap: 8,
+                          margin: '-2px 0 10px',
+                          paddingBottom: 8,
+                          borderBottom: '1px solid var(--app-border)',
+                          minHeight: 24,
+                        })
+                        const ruleStepBadgeStyle = (accent: string): CSSProperties => ({
+                          minWidth: 28,
+                          height: 22,
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          borderRadius: 6,
+                          border: `1px solid ${accent}`,
+                          background: 'var(--app-shell-bg)',
+                          color: accent,
+                          fontSize: 11,
+                          fontWeight: 800,
+                        })
+                        const rulePanelGridStyle: CSSProperties = {
+                          display: 'grid',
+                          gridTemplateColumns: 'minmax(420px, 2fr) minmax(250px, 1fr) minmax(250px, 1fr)',
+                          gap: 12,
+                          width: '100%',
+                          alignItems: 'stretch',
+                        }
+                        const ruleFieldGridStyle: CSSProperties = {
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+                          gap: 8,
+                          alignItems: 'end',
+                        }
+                        const ruleFieldLabelStyle: CSSProperties = {
+                          color: 'var(--app-text-subtle)',
+                          fontSize: 11,
+                          fontWeight: 700,
+                          textTransform: 'uppercase',
+                        }
+                        const conditionRowStyle: CSSProperties = {
+                          display: 'grid',
+                          gridTemplateColumns: '44px minmax(220px, 250px) minmax(160px, 180px) minmax(220px, 1fr) 34px',
+                          gap: 8,
+                          alignItems: 'end',
+                          width: '100%',
+                        }
+                        const eligibilityRowStyle: CSSProperties = {
+                          display: 'grid',
+                          gridTemplateColumns: '44px minmax(165px, 1.05fr) minmax(150px, 1fr) minmax(155px, 1fr) minmax(70px, 92px) 34px',
+                          gap: 8,
+                          alignItems: 'end',
+                          width: '100%',
+                        }
+                        const conditionConnectorStyle: CSSProperties = {
+                          display: 'flex',
+                          alignItems: 'end',
+                          justifyContent: 'flex-start',
+                          minHeight: 46,
+                        }
+                        const conditionCellStyle: CSSProperties = {
+                          minWidth: 0,
+                        }
+                        const ruleDescription = [
+                          `IF ${conditionText}`,
+                          `THEN ${calculationText}`,
+                          capEnabled ? capText.toUpperCase() : 'NO CAP',
+                          `REPORT ${reportText}`,
+                        ].join('  •  ')
+                        const ruleHeaderDescription = String(rule.description || rule.summary || '').trim() || ruleDescription
+                        const ruleSummary = (
+                          <div style={{ display: 'grid', gridTemplateColumns: '56px minmax(0, 1fr)', gap: 10, alignItems: 'center', width: '100%' }}>
+                            <Space size={2} onClick={(event) => event.stopPropagation()}>
+                              <Tooltip title="Move rule up">
+                                <Button
+                                  size="small"
+                                  icon={<ArrowUpOutlined />}
+                                  disabled={index === 0}
+                                  onClick={(event) => {
+                                    event.stopPropagation()
+                                    moveRuleIntelligenceRule(index, -1)
+                                  }}
+                                  style={{ width: 26, paddingInline: 0 }}
+                                />
+                              </Tooltip>
+                              <Tooltip title="Move rule down">
+                                <Button
+                                  size="small"
+                                  icon={<ArrowDownOutlined />}
+                                  disabled={index >= ruleIntelligenceConfig.rules.length - 1}
+                                  onClick={(event) => {
+                                    event.stopPropagation()
+                                    moveRuleIntelligenceRule(index, 1)
+                                  }}
+                                  style={{ width: 26, paddingInline: 0 }}
+                                />
+                              </Tooltip>
+                            </Space>
+                            <div style={{ minWidth: 0 }}>
+                              <Space size={6} wrap style={{ width: '100%' }}>
+                                <Text style={{ color: 'var(--app-text)', fontWeight: 800 }}>
+                                  {index + 1}. {String(rule.name || 'Calculation Rule')}
+                                </Text>
+                                <Tag color={rule.enabled !== false ? 'green' : 'default'}>{rule.enabled !== false ? 'Enabled' : 'Disabled'}</Tag>
+                                <Tag color="blue">priority {Number(rule.priority || 10)}</Tag>
+                              </Space>
+                              <Tooltip title={ruleHeaderDescription}>
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12, display: 'block', marginTop: 3 }} ellipsis>
+                                  {ruleHeaderDescription}
+                                </Text>
+                              </Tooltip>
+                            </div>
+                          </div>
+                        )
+                        return (
+                          <Collapse
+                            key={String(rule.id || index)}
+                            defaultActiveKey={index === 0 ? ['details'] : []}
+                            style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-shell-bg)' }}
+                            items={[{
+                              key: 'details',
+                              label: ruleSummary,
+                              children: (
+                                <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                              {ruleWarnings.length > 0 ? (
+                                <div style={{ border: '1px solid var(--app-border)', borderRadius: 8, padding: 8, background: 'var(--app-card-bg)' }}>
+                                  <Space size={6} wrap>
+                                    {ruleWarnings.map((warning) => (
+                                      <Tag key={warning} color="gold">{warning}</Tag>
+                                    ))}
+                                  </Space>
+                                </div>
+                              ) : null}
+                              <div style={ruleSectionStyle('#64748b', 'rgba(100,116,139,0.13)')}>
+                                <div style={rulePanelHeaderStyle('rgba(100,116,139,0.45)')}>
+                                  <Space size={8}>
+                                    <span style={ruleStepBadgeStyle('#64748b')}>0</span>
+                                    <Text style={{ color: 'var(--app-text)', fontWeight: 800 }}>Rule Details</Text>
+                                  </Space>
+                                </div>
+                                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(240px, 1.5fr) minmax(240px, 1fr) 120px auto auto', gap: 10, alignItems: 'end' }}>
+                                  <div>
+                                    <Text style={ruleFieldLabelStyle}>Rule Name</Text>
+                                    <Input size="small" value={String(rule.name || '')} onChange={(event) => updateRuleIntelligenceRule(index, { name: event.target.value })} style={commonInputStyle} />
+                                  </div>
+                                  <div>
+                                    <Text style={ruleFieldLabelStyle}>Description</Text>
+                                    <Input
+                                      size="small"
+                                      value={String(rule.description || rule.summary || '')}
+                                      onChange={(event) => updateRuleIntelligenceRule(index, { description: event.target.value })}
+                                      placeholder="Short business description"
+                                      style={commonInputStyle}
+                                    />
+                                  </div>
+                                  <div>
+                                    <Text style={ruleFieldLabelStyle}>Priority</Text>
+                                    <InputNumber size="small" value={Number(rule.priority || 10)} onChange={(value) => updateRuleIntelligenceRule(index, { priority: Number(value || 0) })} style={{ width: '100%' }} />
+                                  </div>
+                                  <Space size={8} align="center" style={{ minHeight: 24 }}>
+                                    <Switch size="small" checked={rule.enabled !== false} onChange={(checked) => updateRuleIntelligenceRule(index, { enabled: checked })} />
+                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Enabled</Text>
+                                  </Space>
+                                  <Button size="small" danger onClick={() => patchRuleIntelligenceConfig({ rules: ruleIntelligenceConfig.rules.filter((_item, idx) => idx !== index) })}>Delete</Button>
+                                </div>
+                              </div>
+                              <div style={ruleSectionStyle('#2563eb', 'rgba(37,99,235,0.14)')}>
+                                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                                  <div style={rulePanelHeaderStyle('rgba(37,99,235,0.45)')}>
+                                    <Space size={6} wrap>
+                                      <span style={ruleStepBadgeStyle('#2563eb')}>1</span>
+                                      <Tag color="blue">IF</Tag>
+                                      <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Choose Matching Records</Text>
+                                      <Tag color="blue">{String(conditionTree.match_mode || 'all').toUpperCase()}</Tag>
+                                    </Space>
+                                    <Space size={6} wrap>
+                                      <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Match</Text>
+                                      <Select
+                                        size="small"
+                                        value={String(conditionTree.match_mode || 'all')}
+                                        onChange={(value) => updateConditionTree({ ...conditionTree, match_mode: value })}
+                                        style={{ width: 100 }}
+                                        options={[
+                                          { value: 'all', label: 'All' },
+                                          { value: 'any', label: 'Any' },
+                                        ]}
+                                      />
+                                      <Button
+                                        size="small"
+                                        onClick={() => updateConditionTree({
+                                          ...conditionTree,
+                                          conditions: [...conditionItems, createRuleIntelligenceCondition()],
+                                        })}
+                                      >
+                                        Add Condition
+                                      </Button>
+                                      <Button
+                                        size="small"
+                                        onClick={() => updateConditionTree({
+                                          ...conditionTree,
+                                          conditions: [
+                                            ...conditionItems,
+                                            createRuleIntelligenceConditionGroup({
+                                              match_mode: 'any',
+                                              conditions: [createRuleIntelligenceCondition()],
+                                            }),
+                                          ],
+                                        })}
+                                      >
+                                        Add Group
+                                      </Button>
+                                    </Space>
+                                  </div>
+                                  {conditionItems.map((conditionItem, conditionIndex) => {
+                                    const itemType = String(conditionItem.type || conditionItem.kind || '').trim().toLowerCase()
+                                    const isGroup = itemType === 'group' || Array.isArray(conditionItem.conditions)
+                                    if (isGroup) {
+                                      const nestedConditions = Array.isArray(conditionItem.conditions)
+                                        ? conditionItem.conditions as Array<Record<string, unknown>>
+                                        : []
+                                      const groupMode = String(conditionItem.match_mode || 'any')
+                                      return (
+                                        <div key={`${String(rule.id || index)}_condition_group_${conditionIndex}`} style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 8, background: 'var(--app-shell-bg)' }}>
+                                          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                                            <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+                                              <Space size={6} wrap>
+                                                <Tag color="purple">{conditionIndex === 0 ? 'IF GROUP' : String(conditionTree.match_mode || 'all').toUpperCase()}</Tag>
+                                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>nested match</Text>
+                                                <Select
+                                                  size="small"
+                                                  value={groupMode}
+                                                  onChange={(value) => updateConditionItem(conditionIndex, { match_mode: value })}
+                                                  style={{ width: 100 }}
+                                                  options={[
+                                                    { value: 'all', label: 'All' },
+                                                    { value: 'any', label: 'Any' },
+                                                  ]}
+                                                />
+                                              </Space>
+                                              <Space size={6} wrap>
+                                                <Button
+                                                  size="small"
+                                                  onClick={() => updateConditionItem(conditionIndex, {
+                                                    conditions: [...nestedConditions, createRuleIntelligenceCondition()],
+                                                  })}
+                                                >
+                                                  Add Condition
+                                                </Button>
+                                                <Button
+                                                  size="small"
+                                                  danger
+                                                  icon={<DeleteOutlined />}
+                                                  onClick={() => {
+                                                    const nextItems = conditionItems.filter((_item, idx) => idx !== conditionIndex)
+                                                    updateConditionTree({ ...conditionTree, conditions: nextItems.length > 0 ? nextItems : [createRuleIntelligenceCondition()] })
+                                                  }}
+                                                />
+                                              </Space>
+                                            </Space>
+                                            {nestedConditions.map((nestedCondition, nestedIndex) => (
+                                              <div key={`${String(rule.id || index)}_condition_group_${conditionIndex}_${nestedIndex}`} style={conditionRowStyle}>
+                                                <div style={conditionConnectorStyle}>
+                                                  <Tag color="geekblue">{nestedIndex === 0 ? 'IF' : groupMode.toUpperCase()}</Tag>
+                                                </div>
+                                                <div style={conditionCellStyle}>
+                                                  <Text style={ruleFieldLabelStyle}>Field</Text>
+                                                  <Select
+                                                    size="small"
+                                                    allowClear
+                                                    showSearch
+                                                    value={String(nestedCondition.field || '') || undefined}
+                                                    onChange={(value) => updateNestedConditionItem(conditionIndex, nestedIndex, { field: value || '' })}
+                                                    options={ruleIntelligenceLogicalFieldOptions}
+                                                    style={{ width: '100%' }}
+                                                    placeholder="Select field"
+                                                  />
+                                                </div>
+                                                <div style={conditionCellStyle}>
+                                                  <Text style={ruleFieldLabelStyle}>Operator</Text>
+                                                  <Select
+                                                    size="small"
+                                                    value={String(nestedCondition.operator || 'equals')}
+                                                    onChange={(value) => updateNestedConditionItem(conditionIndex, nestedIndex, { operator: value })}
+                                                    style={{ width: '100%' }}
+                                                    options={RULE_INTELLIGENCE_CONDITION_OPERATORS}
+                                                  />
+                                                </div>
+                                                {!['is_null', 'is_not_null'].includes(String(nestedCondition.operator || '')) ? (
+                                                  <div style={conditionCellStyle}>
+                                                    <Text style={ruleFieldLabelStyle}>Value</Text>
+                                                    <Input
+                                                      size="small"
+                                                      value={String(nestedCondition.value || '')}
+                                                      onChange={(event) => updateNestedConditionItem(conditionIndex, nestedIndex, { value: event.target.value })}
+                                                      placeholder="value or comma list"
+                                                      style={commonInputStyle}
+                                                    />
+                                                  </div>
+                                                ) : <div style={conditionCellStyle} />}
+                                                <Button
+                                                  size="small"
+                                                  danger
+                                                  icon={<DeleteOutlined />}
+                                                  onClick={() => {
+                                                    const nextChildren = nestedConditions.filter((_item, idx) => idx !== nestedIndex)
+                                                    updateConditionItem(conditionIndex, { conditions: nextChildren.length > 0 ? nextChildren : [createRuleIntelligenceCondition()] })
+                                                  }}
+                                                />
+                                              </div>
+                                            ))}
+                                          </Space>
+                                        </div>
+                                      )
+                                    }
+                                    return (
+                                      <div key={`${String(rule.id || index)}_condition_${conditionIndex}`} style={conditionRowStyle}>
+                                        <div style={conditionConnectorStyle}>
+                                          <Tag color="blue">{conditionIndex === 0 ? 'IF' : String(conditionTree.match_mode || 'all').toUpperCase()}</Tag>
+                                        </div>
+                                        <div style={conditionCellStyle}>
+                                          <Text style={ruleFieldLabelStyle}>Field</Text>
+                                          <Select
+                                            size="small"
+                                            allowClear
+                                            showSearch
+                                            value={String(conditionItem.field || '') || undefined}
+                                            onChange={(value) => updateConditionItem(conditionIndex, { field: value || '' })}
+                                            options={ruleIntelligenceLogicalFieldOptions}
+                                            style={{ width: '100%' }}
+                                            placeholder="Select field"
+                                          />
+                                        </div>
+                                        <div style={conditionCellStyle}>
+                                          <Text style={ruleFieldLabelStyle}>Operator</Text>
+                                          <Select
+                                            size="small"
+                                            value={String(conditionItem.operator || 'equals')}
+                                            onChange={(value) => updateConditionItem(conditionIndex, { operator: value })}
+                                            style={{ width: '100%' }}
+                                            options={RULE_INTELLIGENCE_CONDITION_OPERATORS}
+                                          />
+                                        </div>
+                                        {!['is_null', 'is_not_null'].includes(String(conditionItem.operator || '')) ? (
+                                          <div style={conditionCellStyle}>
+                                            <Text style={ruleFieldLabelStyle}>Value</Text>
+                                            <Input
+                                              size="small"
+                                              value={String(conditionItem.value || '')}
+                                              onChange={(event) => updateConditionItem(conditionIndex, { value: event.target.value })}
+                                              placeholder="value or comma list"
+                                              style={commonInputStyle}
+                                            />
+                                          </div>
+                                        ) : <div style={conditionCellStyle} />}
+                                        <Button
+                                          size="small"
+                                          danger
+                                          icon={<DeleteOutlined />}
+                                          onClick={() => {
+                                            const nextItems = conditionItems.filter((_item, idx) => idx !== conditionIndex)
+                                            updateConditionTree({ ...conditionTree, conditions: nextItems.length > 0 ? nextItems : [createRuleIntelligenceCondition()] })
+                                          }}
+                                        />
+                                      </div>
+                                    )
+                                  })}
+                                </Space>
+                              </div>
+                              <div style={rulePanelGridStyle}>
+                                <div style={ruleSectionStyle('#16a34a', 'rgba(22,163,74,0.14)')}>
+                                  <div style={rulePanelHeaderStyle('rgba(22,163,74,0.45)')}>
+                                    <Space size={6}>
+                                      <span style={ruleStepBadgeStyle('#16a34a')}>2</span>
+                                      <Tag color="green">THEN</Tag>
+                                      <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Calculate Value</Text>
+                                    </Space>
+                                  </div>
+                                  <div style={ruleFieldGridStyle}>
+                                    <div>
+                                      <Text style={ruleFieldLabelStyle}>Method</Text>
+                                      <Select
+                                        size="small"
+                                        value={String(calculation.method || 'percentage')}
+                                        onChange={(value) => updateRuleIntelligenceRuleCalculation(index, { method: value })}
+                                        style={{ width: '100%' }}
+                                        options={[
+                                          { value: 'percentage', label: 'Percentage' },
+                                          { value: 'flat', label: 'Flat' },
+                                          { value: 'formula', label: 'Formula' },
+                                          { value: 'slab', label: 'Slab' },
+                                        ]}
+                                      />
+                                    </div>
+                                    <div>
+                                      <Text style={ruleFieldLabelStyle}>Basis Field</Text>
+                                      <Select
+                                        size="small"
+                                        showSearch
+                                        value={String(calculation.amount_field || '') || undefined}
+                                        onChange={(value) => updateRuleIntelligenceRuleCalculation(index, { amount_field: value || '' })}
+                                        options={ruleIntelligenceLogicalFieldOptions}
+                                        style={{ width: '100%' }}
+                                        placeholder="Select rule field"
+                                      />
+                                    </div>
+                                    {method === 'percentage' ? (
+                                      <div>
+                                        <Text style={ruleFieldLabelStyle}>Rate %</Text>
+                                        <InputNumber size="small" value={Number(calculation.rate_percent || 0)} onChange={(value) => updateRuleIntelligenceRuleCalculation(index, { rate_percent: Number(value || 0) })} step={0.01} style={{ width: '100%' }} />
+                                      </div>
+                                    ) : null}
+                                    {method === 'flat' ? (
+                                      <div>
+                                        <Text style={ruleFieldLabelStyle}>Flat Amount</Text>
+                                        <InputNumber size="small" value={Number(calculation.amount || 0)} onChange={(value) => updateRuleIntelligenceRuleCalculation(index, { amount: Number(value || 0) })} style={{ width: '100%' }} />
+                                      </div>
+                                    ) : null}
+	                                    {['flat', 'slab'].includes(method) ? (
+	                                      <div>
+	                                        <Text style={ruleFieldLabelStyle}>Apply</Text>
+	                                        <Select
+	                                          size="small"
+	                                          value={calculationApplyMode}
+	                                          onChange={(value) => {
+	                                            if (method === 'flat') {
+	                                              updateRuleIntelligenceRuleCalculation(index, {
+	                                                apply: value,
+	                                                per_row: value === 'per_row',
+	                                                per_distinct: value === 'per_distinct',
+	                                                per_account: value === 'per_distinct',
+	                                              })
+	                                            } else {
+	                                              updateRuleIntelligenceRuleCalculation(index, { apply: value })
+	                                            }
+	                                          }}
+	                                          style={{ width: '100%' }}
+	                                          options={[
+	                                            { value: 'group', label: 'Once Per Group' },
+	                                            { value: 'per_row', label: 'Per Matched Row' },
+	                                            { value: 'per_distinct', label: 'Per Distinct Account' },
+	                                          ]}
+	                                        />
+	                                      </div>
+	                                    ) : null}
+	                                    {['flat', 'slab'].includes(method) && calculationApplyMode === 'per_distinct' ? (
+	                                      <div>
+	                                        <Text style={ruleFieldLabelStyle}>Distinct Field</Text>
+	                                        <Select
+	                                          size="small"
+	                                          showSearch
+	                                          allowClear
+	                                          value={String(calculation.distinct_by || calculation.per_distinct_field || '') || undefined}
+	                                          onChange={(value) => updateRuleIntelligenceRuleCalculation(index, { distinct_by: value || '', per_distinct_field: value || '' })}
+	                                          options={ruleIntelligenceLogicalFieldOptions}
+	                                          style={{ width: '100%' }}
+	                                          placeholder="Account field"
+	                                        />
+	                                      </div>
+	                                    ) : null}
+	                                    <div>
+	                                      <Text style={ruleFieldLabelStyle}>Payout Offset M</Text>
+	                                      <InputNumber
+	                                        size="small"
+	                                        value={calculation.payout_offset_months === undefined || calculation.payout_offset_months === '' ? undefined : Number(calculation.payout_offset_months || 0)}
+	                                        onChange={(value) => updateRuleIntelligenceRuleCalculation(index, { payout_offset_months: value ?? 0 })}
+	                                        style={{ width: '100%' }}
+	                                        placeholder="0"
+	                                      />
+	                                    </div>
+	                                    <div>
+	                                      <Text style={ruleFieldLabelStyle}>Commission Type</Text>
+	                                      <Select
+	                                        size="small"
+	                                        value={String(rule.commission_type || calculation.commission_type || 'variable')}
+	                                        onChange={(value) => {
+	                                          updateRuleIntelligenceRuleAndCalculation(index, { commission_type: value }, { commission_type: value })
+	                                        }}
+                                        style={{ width: '100%' }}
+                                        options={[
+                                          { value: 'variable', label: 'Variable' },
+                                          { value: 'fixed', label: 'Fixed' },
+                                        ]}
+	                                      />
+	                                    </div>
+		                                  </div>
+		                                  <div style={{ marginTop: 8, border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 8, background: 'var(--app-shell-bg)' }}>
+		                                    <Space direction="vertical" size={8} style={{ width: '100%' }}>
+		                                      <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+		                                        <Space size={6}>
+		                                          <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Allocation Split</Text>
+		                                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>optional</Text>
+		                                        </Space>
+		                                        <Button size="small" onClick={addAllocationShare}>Add Allocation</Button>
+		                                      </Space>
+		                                      {commissionShares.length === 0 ? (
+		                                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+		                                          No split configured. The calculated value stays with this rule component.
+		                                        </Text>
+		                                      ) : null}
+		                                      {commissionShares.map((share, shareIndex) => {
+		                                        const recipient = String(share.payee_type || share.payee || share.name || share.id || `Recipient ${shareIndex + 1}`)
+		                                        const componentKey = String(share.component_id || share.component || `${allocationBaseKey}_${normalizeRuleIntelligenceFieldId(recipient) || `recipient_${shareIndex + 1}`}_share`)
+		                                        return (
+		                                          <div
+		                                            key={`${String(rule.id || index)}_allocation_${String(share.id || shareIndex)}`}
+		                                            style={{
+		                                              display: 'grid',
+		                                              gridTemplateColumns: '40px minmax(150px, 1fr) minmax(180px, 1.2fr) minmax(90px, 110px) 34px',
+		                                              gap: 8,
+		                                              alignItems: 'end',
+		                                            }}
+		                                          >
+		                                            <Switch
+		                                              size="small"
+		                                              checked={share.enabled !== false}
+		                                              onChange={(checked) => updateAllocationShare(shareIndex, { enabled: checked })}
+		                                            />
+		                                            <div>
+		                                              <Text style={ruleFieldLabelStyle}>Recipient</Text>
+		                                              <Input
+		                                                size="small"
+		                                                value={recipient}
+		                                                onChange={(event) => {
+		                                                  const nextRecipient = event.target.value
+		                                                  const nextKey = normalizeRuleIntelligenceFieldId(nextRecipient) || `recipient_${shareIndex + 1}`
+		                                                  updateAllocationShare(shareIndex, {
+		                                                    id: String(share.id || '').trim() ? share.id : nextKey,
+		                                                    payee_type: nextRecipient,
+		                                                    component_id: String(share.component_id || '').trim() ? share.component_id : `${allocationBaseKey}_${nextKey}_share`,
+		                                                  })
+		                                                }}
+		                                                style={commonInputStyle}
+		                                                placeholder="Recipient"
+		                                              />
+		                                            </div>
+		                                            <div>
+		                                              <Text style={ruleFieldLabelStyle}>Component Key</Text>
+		                                              <Input
+		                                                size="small"
+		                                                value={componentKey}
+		                                                onChange={(event) => updateAllocationShare(shareIndex, { component_id: normalizeRuleIntelligenceFieldId(event.target.value) || event.target.value })}
+		                                                style={commonInputStyle}
+		                                                placeholder={`${allocationBaseKey}_recipient_share`}
+		                                              />
+		                                            </div>
+		                                            <div>
+		                                              <Text style={ruleFieldLabelStyle}>Share %</Text>
+		                                              <InputNumber
+		                                                size="small"
+		                                                min={0}
+		                                                max={100}
+		                                                value={Number(share.percent ?? share.percentage ?? share.rate_percent ?? 0)}
+		                                                onChange={(value) => updateAllocationShare(shareIndex, { percent: Number(value || 0) })}
+		                                                style={{ width: '100%' }}
+		                                              />
+		                                            </div>
+		                                            <Tooltip title="Delete allocation">
+		                                              <Button
+		                                                size="small"
+		                                                danger
+		                                                icon={<DeleteOutlined />}
+		                                                onClick={() => removeAllocationShare(shareIndex)}
+		                                              />
+		                                            </Tooltip>
+		                                          </div>
+		                                        )
+		                                      })}
+		                                    </Space>
+		                                  </div>
+	                                  {String(calculation.method || 'percentage') === 'formula' ? (
+                                    <div style={{ marginTop: 8 }}>
+                                      <Text style={ruleFieldLabelStyle}>Formula Expression</Text>
+                                      <Input.TextArea
+                                        value={String(calculation.expression || '')}
+                                        onChange={(event) => updateRuleIntelligenceRuleCalculation(index, { expression: event.target.value })}
+                                        rows={3}
+                                        style={commonInputStyle}
+                                        placeholder={`sum(field('${String(calculation.amount_field || 'amount')}')) * 0.004`}
+                                      />
+                                    </div>
+                                  ) : null}
+                                  {String(calculation.method || 'percentage') === 'slab' ? (
+                                    <div style={{ marginTop: 8, border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 8, background: 'var(--app-shell-bg)' }}>
+                                      <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                                        <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+                                          <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Slab Table</Text>
+                                          <Space size={6} wrap>
+                                            <Select
+                                              size="small"
+                                              value={String(calculation.basis || 'amount')}
+                                              onChange={(value) => updateRuleIntelligenceRuleCalculation(index, { basis: value })}
+                                              style={{ width: 150 }}
+	                                              options={[
+	                                                { value: 'amount', label: 'Amount Basis' },
+	                                                { value: 'count', label: 'Count Basis' },
+	                                                { value: 'average_balance', label: 'Average Balance' },
+	                                              ]}
+                                            />
+                                            <Button
+                                              size="small"
+                                              onClick={() => {
+                                                const slabs = Array.isArray(calculation.slabs) ? calculation.slabs as Array<Record<string, unknown>> : []
+                                                updateRuleIntelligenceRuleCalculation(index, {
+                                                  slabs: [
+                                                    ...slabs,
+                                                    { min: 0, max: 0, method: 'percentage', rate_percent: 0, amount: 0 },
+                                                  ],
+                                                })
+                                              }}
+                                            >
+                                              Add Slab
+                                            </Button>
+                                          </Space>
+                                        </Space>
+                                        {(Array.isArray(calculation.slabs) ? calculation.slabs as Array<Record<string, unknown>> : []).map((slab, slabIndex) => (
+                                          <Space key={`${String(rule.id || index)}_slab_${slabIndex}`} wrap align="end">
+                                            <div style={{ width: 100 }}>
+                                              <Text style={ruleFieldLabelStyle}>Min</Text>
+                                              <InputNumber
+                                                size="small"
+                                                value={Number(slab.min || 0)}
+                                                onChange={(value) => {
+                                                  const slabs = Array.isArray(calculation.slabs) ? [...calculation.slabs as Array<Record<string, unknown>>] : []
+                                                  slabs[slabIndex] = { ...slab, min: Number(value || 0) }
+                                                  updateRuleIntelligenceRuleCalculation(index, { slabs })
+                                                }}
+                                                style={{ width: '100%' }}
+                                              />
+                                            </div>
+                                            <div style={{ width: 100 }}>
+                                              <Text style={ruleFieldLabelStyle}>Max</Text>
+                                              <InputNumber
+                                                size="small"
+                                                value={Number(slab.max || 0)}
+                                                onChange={(value) => {
+                                                  const slabs = Array.isArray(calculation.slabs) ? [...calculation.slabs as Array<Record<string, unknown>>] : []
+                                                  slabs[slabIndex] = { ...slab, max: Number(value || 0) }
+                                                  updateRuleIntelligenceRuleCalculation(index, { slabs })
+                                                }}
+                                                style={{ width: '100%' }}
+                                              />
+                                            </div>
+                                            <div style={{ width: 130 }}>
+                                              <Text style={ruleFieldLabelStyle}>Result</Text>
+                                              <Select
+                                                size="small"
+                                                value={String(slab.method || 'percentage')}
+                                                onChange={(value) => {
+                                                  const slabs = Array.isArray(calculation.slabs) ? [...calculation.slabs as Array<Record<string, unknown>>] : []
+                                                  slabs[slabIndex] = { ...slab, method: value }
+                                                  updateRuleIntelligenceRuleCalculation(index, { slabs })
+                                                }}
+                                                style={{ width: '100%' }}
+                                                options={[
+                                                  { value: 'percentage', label: 'Percentage' },
+                                                  { value: 'flat', label: 'Flat Amount' },
+                                                ]}
+                                              />
+                                            </div>
+                                            <div style={{ width: 110 }}>
+                                              <Text style={ruleFieldLabelStyle}>Rate %</Text>
+                                              <InputNumber
+                                                size="small"
+                                                value={Number(slab.rate_percent || slab.rate || 0)}
+                                                step={0.01}
+                                                onChange={(value) => {
+                                                  const slabs = Array.isArray(calculation.slabs) ? [...calculation.slabs as Array<Record<string, unknown>>] : []
+                                                  slabs[slabIndex] = { ...slab, rate_percent: Number(value || 0) }
+                                                  updateRuleIntelligenceRuleCalculation(index, { slabs })
+                                                }}
+                                                style={{ width: '100%' }}
+                                              />
+                                            </div>
+                                            <div style={{ width: 110 }}>
+                                              <Text style={ruleFieldLabelStyle}>Amount</Text>
+                                              <InputNumber
+                                                size="small"
+                                                value={Number(slab.amount || 0)}
+                                                onChange={(value) => {
+                                                  const slabs = Array.isArray(calculation.slabs) ? [...calculation.slabs as Array<Record<string, unknown>>] : []
+                                                  slabs[slabIndex] = { ...slab, amount: Number(value || 0) }
+                                                  updateRuleIntelligenceRuleCalculation(index, { slabs })
+                                                }}
+                                                style={{ width: '100%' }}
+                                              />
+                                            </div>
+                                            <Button
+                                              size="small"
+                                              danger
+                                              onClick={() => {
+                                                const slabs = (Array.isArray(calculation.slabs) ? calculation.slabs as Array<Record<string, unknown>> : []).filter((_slab, idx) => idx !== slabIndex)
+                                                updateRuleIntelligenceRuleCalculation(index, { slabs })
+                                              }}
+                                            >
+                                              Delete
+                                            </Button>
+                                          </Space>
+                                        ))}
+                                      </Space>
+                                    </div>
+                                  ) : null}
+                                  <div style={{ marginTop: 10, borderTop: '1px solid var(--app-border)', paddingTop: 10 }}>
+                                    <div style={rulePanelHeaderStyle('rgba(8,145,178,0.45)')}>
+                                      <Space size={6}>
+                                        <Tag color={eligibilityFilterEnabled ? 'cyan' : 'default'}>ELIGIBILITY</Tag>
+                                        <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>after grouping</Text>
+                                      </Space>
+                                      <Button
+                                        size="small"
+                                        onClick={() => updateGroupFilters([
+                                          ...groupFilters,
+                                          createRuleIntelligenceGroupFilter({
+                                            enabled: true,
+                                            metric: 'distinct_day_count',
+                                            field: defaultDateFieldId || '',
+                                            operator: 'greater_or_equal',
+                                            value: 21,
+                                          }),
+                                        ])}
+                                      >
+                                        Add Condition
+                                      </Button>
+                                    </div>
+                                    <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                                      {groupFilters.map((filter, filterIndex) => {
+                                        const metric = String(filter.metric || 'service_amount').trim().toLowerCase()
+                                        const needsField = !RULE_INTELLIGENCE_GROUP_FILTER_FIELDLESS_METRICS.has(metric)
+                                        const nextFilters = groupFilters
+                                        const updateFilter = (patch: Record<string, unknown>) => {
+                                          updateGroupFilters(nextFilters.map((item, idx) => idx === filterIndex ? { ...item, ...patch } : item))
+                                        }
+                                        const isFundedRatioMetric = ['funded_ratio', 'funded_percent', 'funding_ratio', 'funding_percent'].includes(metric)
+                                        const isWindowMetric = ['average_balance', 'avg_balance', 'window_avg', 'window_average', 'window_sum', 'window_total', 'window_count'].includes(metric)
+                                        const isElapsedMetric = ['elapsed_months', 'age_months', 'months_since', 'elapsed_days', 'age_days', 'days_since'].includes(metric)
+                                        const showMonthWindow = isFundedRatioMetric || isWindowMetric
+                                        const showDayWindow = metric === 'elapsed_days'
+                                        const fieldLabel = isFundedRatioMetric
+                                          ? 'Balance Field'
+                                          : isElapsedMetric
+                                            ? 'Start Date'
+                                            : 'Field'
+                                        const valuePlaceholder = isFundedRatioMetric
+                                          ? '90'
+                                          : isWindowMetric
+                                            ? 'target'
+                                            : isElapsedMetric
+                                              ? '3'
+                                              : '21'
+                                        return (
+                                          <div key={`${String(rule.id || index)}_eligibility_${String(filter.id || filterIndex)}`} style={{ display: 'grid', gap: 6 }}>
+                                            <div style={eligibilityRowStyle}>
+                                              <div style={conditionConnectorStyle}>
+                                                <Switch
+                                                  size="small"
+                                                  checked={filter.enabled === true}
+                                                  onChange={(checked) => updateFilter({ enabled: checked })}
+                                                />
+                                              </div>
+                                              <div style={conditionCellStyle}>
+                                                <Text style={ruleFieldLabelStyle}>Metric</Text>
+                                                <Select
+                                                  size="small"
+                                                  value={String(filter.metric || 'service_amount')}
+                                                  onChange={(value) => updateFilter({ metric: value })}
+                                                  style={{ width: '100%' }}
+                                                  options={RULE_INTELLIGENCE_GROUP_FILTER_METRIC_OPTIONS}
+                                                />
+                                              </div>
+                                              <div style={conditionCellStyle}>
+                                                <Text style={ruleFieldLabelStyle}>{fieldLabel}</Text>
+                                                <Select
+                                                  size="small"
+                                                  allowClear
+                                                  showSearch
+                                                  disabled={!needsField}
+                                                  value={String(filter.field || '') || undefined}
+                                                  onChange={(value) => updateFilter({ field: value || '' })}
+                                                  options={ruleIntelligenceLogicalFieldOptions}
+                                                  style={{ width: '100%' }}
+                                                  placeholder={needsField ? 'Select field' : 'Not required'}
+                                                />
+                                              </div>
+                                              <div style={conditionCellStyle}>
+                                                <Text style={ruleFieldLabelStyle}>Operator</Text>
+                                                <Select
+                                                  size="small"
+                                                  value={String(filter.operator || 'greater_or_equal')}
+                                                  onChange={(value) => updateFilter({ operator: value })}
+                                                  style={{ width: '100%' }}
+                                                  options={RULE_INTELLIGENCE_COMPARE_OPERATOR_OPTIONS}
+                                                />
+                                              </div>
+                                              <div style={conditionCellStyle}>
+                                                <Text style={ruleFieldLabelStyle}>Value</Text>
+                                                <Input
+                                                  size="small"
+                                                  value={String(filter.value ?? '')}
+                                                  onChange={(event) => updateFilter({ value: event.target.value })}
+                                                  style={commonInputStyle}
+                                                  placeholder={valuePlaceholder}
+                                                />
+                                              </div>
+                                              <Tooltip title="Delete eligibility condition">
+                                                <Button
+                                                  size="small"
+                                                  danger
+                                                  icon={<DeleteOutlined />}
+                                                  onClick={() => updateGroupFilters(nextFilters.filter((_item, idx) => idx !== filterIndex))}
+                                                  style={{ alignSelf: 'end' }}
+                                                />
+                                              </Tooltip>
+                                            </div>
+                                            {(isFundedRatioMetric || isWindowMetric || isElapsedMetric) ? (
+                                              <div
+                                                style={{
+                                                  display: 'grid',
+                                                  gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))',
+                                                  gap: 8,
+                                                  paddingLeft: 52,
+                                                }}
+                                              >
+                                                {isFundedRatioMetric ? (
+                                                  <div style={conditionCellStyle}>
+                                                    <Text style={ruleFieldLabelStyle}>Account Field</Text>
+                                                    <Select
+                                                      size="small"
+                                                      allowClear
+                                                      showSearch
+                                                      value={String(filter.account_field || '') || undefined}
+                                                      onChange={(value) => updateFilter({ account_field: value || '' })}
+                                                      options={ruleIntelligenceLogicalFieldOptions}
+                                                      style={{ width: '100%' }}
+                                                      placeholder="Account"
+                                                    />
+                                                  </div>
+                                                ) : null}
+                                                {(isFundedRatioMetric || isWindowMetric) ? (
+                                                  <div style={conditionCellStyle}>
+                                                    <Text style={ruleFieldLabelStyle}>Event Date</Text>
+                                                    <Select
+                                                      size="small"
+                                                      allowClear
+                                                      showSearch
+                                                      value={String(filter.date_field || '') || undefined}
+                                                      onChange={(value) => updateFilter({ date_field: value || '' })}
+                                                      options={ruleIntelligenceLogicalFieldOptions}
+                                                      style={{ width: '100%' }}
+                                                      placeholder="Date"
+                                                    />
+                                                  </div>
+                                                ) : null}
+                                                {(isFundedRatioMetric || isWindowMetric) ? (
+                                                  <div style={conditionCellStyle}>
+                                                    <Text style={ruleFieldLabelStyle}>Anchor Date</Text>
+                                                    <Select
+                                                      size="small"
+                                                      allowClear
+                                                      showSearch
+                                                      value={String(filter.anchor_field || '') || undefined}
+                                                      onChange={(value) => updateFilter({ anchor_field: value || '' })}
+                                                      options={ruleIntelligenceLogicalFieldOptions}
+                                                      style={{ width: '100%' }}
+                                                      placeholder="Opening date"
+                                                    />
+                                                  </div>
+                                                ) : null}
+                                                {isElapsedMetric ? (
+                                                  <div style={conditionCellStyle}>
+                                                    <Text style={ruleFieldLabelStyle}>As Of Date</Text>
+                                                    <Select
+                                                      size="small"
+                                                      allowClear
+                                                      showSearch
+                                                      value={String(filter.as_of_field || '') || undefined}
+                                                      onChange={(value) => updateFilter({ as_of_field: value || '' })}
+                                                      options={ruleIntelligenceLogicalFieldOptions}
+                                                      style={{ width: '100%' }}
+                                                      placeholder="Current date"
+                                                    />
+                                                  </div>
+                                                ) : null}
+                                                {isFundedRatioMetric ? (
+                                                  <div style={conditionCellStyle}>
+                                                    <Text style={ruleFieldLabelStyle}>Funded Min</Text>
+                                                    <InputNumber
+                                                      size="small"
+                                                      value={filter.funded_threshold === '' ? undefined : Number(filter.funded_threshold || 100)}
+                                                      onChange={(value) => updateFilter({ funded_threshold: value ?? '' })}
+                                                      style={{ width: '100%' }}
+                                                      placeholder="100"
+                                                    />
+                                                  </div>
+                                                ) : null}
+                                                {showMonthWindow ? (
+                                                  <>
+                                                    <div style={conditionCellStyle}>
+                                                      <Text style={ruleFieldLabelStyle}>Start M</Text>
+                                                      <InputNumber
+                                                        size="small"
+                                                        value={filter.window_start_months === '' ? undefined : Number(filter.window_start_months || 0)}
+                                                        onChange={(value) => updateFilter({ window_start_months: value ?? '' })}
+                                                        style={{ width: '100%' }}
+                                                        placeholder="1"
+                                                      />
+                                                    </div>
+                                                    <div style={conditionCellStyle}>
+                                                      <Text style={ruleFieldLabelStyle}>End M</Text>
+                                                      <InputNumber
+                                                        size="small"
+                                                        value={filter.window_end_months === '' ? undefined : Number(filter.window_end_months || 0)}
+                                                        onChange={(value) => updateFilter({ window_end_months: value ?? '' })}
+                                                        style={{ width: '100%' }}
+                                                        placeholder="3"
+                                                      />
+                                                    </div>
+                                                  </>
+                                                ) : null}
+                                                {showDayWindow ? (
+                                                  <>
+                                                    <div style={conditionCellStyle}>
+                                                      <Text style={ruleFieldLabelStyle}>Start Day</Text>
+                                                      <InputNumber
+                                                        size="small"
+                                                        value={filter.window_start_days === '' ? undefined : Number(filter.window_start_days || 0)}
+                                                        onChange={(value) => updateFilter({ window_start_days: value ?? '' })}
+                                                        style={{ width: '100%' }}
+                                                        placeholder="0"
+                                                      />
+                                                    </div>
+                                                    <div style={conditionCellStyle}>
+                                                      <Text style={ruleFieldLabelStyle}>End Day</Text>
+                                                      <InputNumber
+                                                        size="small"
+                                                        value={filter.window_end_days === '' ? undefined : Number(filter.window_end_days || 0)}
+                                                        onChange={(value) => updateFilter({ window_end_days: value ?? '' })}
+                                                        style={{ width: '100%' }}
+                                                        placeholder="14"
+                                                      />
+                                                    </div>
+                                                  </>
+                                                ) : null}
+                                              </div>
+                                            ) : null}
+                                          </div>
+                                        )
+                                      })}
+                                    </Space>
+                                  </div>
+                                </div>
+                                <div style={ruleSectionStyle('#d97706', 'rgba(217,119,6,0.14)')}>
+                                  <div style={rulePanelHeaderStyle('rgba(217,119,6,0.45)')}>
+                                    <Space size={6}>
+                                      <span style={ruleStepBadgeStyle('#d97706')}>3</span>
+                                      <Tag color={capEnabled ? 'orange' : 'default'}>CAP</Tag>
+                                      <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Limit Maximum</Text>
+                                    </Space>
+                                    <Switch size="small" checked={capEnabled} onChange={(checked) => updateRuleIntelligenceRuleCap(index, { enabled: checked })} />
+                                  </div>
+                                  <div style={ruleFieldGridStyle}>
+                                    <div>
+                                      <Text style={ruleFieldLabelStyle}>Cap Amount</Text>
+                                      <InputNumber size="small" disabled={!capEnabled} value={Number(cap.amount || 0)} onChange={(value) => updateRuleIntelligenceRuleCap(index, { amount: Number(value || 0) })} style={{ width: '100%' }} />
+                                    </div>
+                                    <div style={{ gridColumn: '1 / -1' }}>
+                                      <Text style={ruleFieldLabelStyle}>Cap Scope</Text>
+                                      <Select
+                                        size="small"
+                                        disabled={!capEnabled}
+                                        mode="tags"
+                                        value={Array.isArray(cap.group_by) ? cap.group_by as string[] : ['account', 'day']}
+                                        onChange={(value) => updateRuleIntelligenceRuleCap(index, { group_by: value })}
+                                        style={{ width: '100%' }}
+                                        options={[
+                                          ...ruleIntelligenceLogicalFieldOptions,
+                                          { value: 'period', label: 'Period' },
+                                          { value: 'day', label: 'Day' },
+                                          { value: 'month', label: 'Month' },
+                                          { value: 'quarter', label: 'Quarter' },
+                                        ]}
+                                      />
+                                    </div>
+                                  </div>
+                                </div>
+                                <div style={ruleSectionStyle('#9333ea', 'rgba(147,51,234,0.14)')}>
+                                  <div style={rulePanelHeaderStyle('rgba(147,51,234,0.45)')}>
+                                    <Space size={6}>
+                                      <span style={ruleStepBadgeStyle('#9333ea')}>4</span>
+                                      <Tag color="purple">REPORT</Tag>
+                                      <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Output Grouping</Text>
+                                    </Space>
+                                  </div>
+                                  <div>
+                                    <Text style={ruleFieldLabelStyle}>Group Output By</Text>
+                                    <Select
+                                      size="small"
+                                      mode="tags"
+                                      value={Array.isArray(rule.group_by) ? rule.group_by as string[] : ['entity', 'period', 'service']}
+                                      onChange={(value) => updateRuleIntelligenceRule(index, { group_by: value })}
+                                      style={{ width: '100%' }}
+                                      options={[
+                                        ...ruleIntelligenceLogicalFieldOptions,
+                                        { value: 'period', label: 'Period' },
+                                        { value: 'day', label: 'Day' },
+                                        { value: 'month', label: 'Month' },
+                                        { value: 'quarter', label: 'Quarter' },
+                                      ]}
+                                    />
+                                  </div>
+                                </div>
+                              </div>
+                                </Space>
+                              ),
+                            }]}
+                          />
+                        )
+                      })}
+                    </Space>
+                  </div>
+                ),
+              },
+              {
+                key: 'targets',
+                label: 'Targets',
+                children: (
+                  <div style={{ padding: 16, overflow: 'auto', height: 'calc(100vh - 126px)' }}>
+                    <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                      <Space wrap>
+                        <Button type="primary" onClick={() => patchRuleIntelligenceConfig({ targets: [...ruleIntelligenceConfig.targets, createRuleIntelligenceTarget(ruleIntelligenceConfig.inputFields)] })}>Add Target</Button>
+                        <Button onClick={addRuleIntelligenceDefaultClusters}>Load Target Clusters</Button>
+                      </Space>
+                      {ruleIntelligenceConfig.targets.map((target, index) => renderRuleIntelligenceTargetEditor(target, index))}
+                    </Space>
+                  </div>
+                ),
+              },
+              {
+                key: 'anomalies',
+                label: 'Anomalies',
+                children: (
+                  <div style={{ padding: 16, overflow: 'auto', height: 'calc(100vh - 126px)' }}>
+                    <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                      <Space wrap>
+                        <Button type="primary" onClick={() => patchRuleIntelligenceConfig({ anomalies: [...ruleIntelligenceConfig.anomalies, createRuleIntelligenceAnomaly(ruleIntelligenceConfig.inputFields)] })}>Add Anomaly</Button>
+                        <Button onClick={addRuleIntelligenceDefaultClusters}>Load Anomaly Clusters</Button>
+                      </Space>
+                      {ruleIntelligenceConfig.anomalies.map((anomaly, index) => renderRuleIntelligenceAnomalyEditor(anomaly, index))}
+                    </Space>
+                  </div>
+                ),
+              },
+              {
+                key: 'output',
+                label: 'Output',
+                children: (
+                  <div style={{ padding: 16, overflow: 'auto', height: 'calc(100vh - 126px)' }}>
+                    <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                      <Space wrap align="end">
+                        <div style={{ width: 220 }}>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Output Mode</Text>
+                          <Select
+                            value={String(ruleIntelligenceConfig.outputLayout.mode || 'pivot')}
+                            onChange={(value) => updateRuleIntelligenceOutputLayout({ mode: value })}
+                            style={{ width: '100%' }}
+                            options={[
+                              { value: 'pivot', label: 'Pivot Report' },
+                              { value: 'settlement', label: 'Settlement Report' },
+                              { value: 'ledger', label: 'Ledger Output' },
+                              { value: 'summary', label: 'Summary Output' },
+                              { value: 'ledger_and_pivot', label: 'Ledger + Pivot' },
+                            ]}
+                          />
+                        </div>
+                        <div style={{ width: 220 }}>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Period Grain</Text>
+                          <Select
+                            value={String(ruleIntelligenceConfig.outputLayout.period_grain || 'month')}
+                            onChange={(value) => updateRuleIntelligenceOutputLayout({ period_grain: value })}
+                            style={{ width: '100%' }}
+                            options={[
+                              { value: 'day', label: 'Daily' },
+                              { value: 'month', label: 'Monthly' },
+                              { value: 'quarter', label: 'Quarterly' },
+                              { value: 'year', label: 'Yearly' },
+                            ]}
+                          />
+                        </div>
+                        <div style={{ width: 360 }}>
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Report Rows</Text>
+                          <Select
+                            mode="tags"
+                            value={Array.isArray(ruleIntelligenceConfig.outputLayout.row_fields) ? ruleIntelligenceConfig.outputLayout.row_fields as string[] : ['entity_id', 'period']}
+                            onChange={(value) => updateRuleIntelligenceOutputLayout({ row_fields: value })}
+                            style={{ width: '100%' }}
+                            options={[
+                              ...ruleIntelligenceLogicalFieldOptions,
+                              { value: 'period', label: 'Period' },
+                              { value: 'day', label: 'Day' },
+                              { value: 'month', label: 'Month' },
+                              { value: 'quarter', label: 'Quarter' },
+                            ]}
+                          />
+                        </div>
+                        <Space size={8} align="center">
+                          <Switch
+                            checked={ruleIntelligenceConfig.outputLayout.include_audit !== false}
+                            onChange={(checked) => updateRuleIntelligenceOutputLayout({ include_audit: checked })}
+                          />
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Include Audit Trace</Text>
+                        </Space>
+                      </Space>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(520px, 1fr) minmax(420px, 0.72fr)', gap: 12, alignItems: 'start' }}>
+                        <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, background: 'var(--app-card-bg)', overflow: 'hidden' }}>
+                          <div style={{ padding: '10px 12px', borderBottom: '1px solid var(--app-border)', background: 'var(--app-shell-bg)' }}>
+                            <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+                              <div>
+                                <Text style={{ color: 'var(--app-text)', fontWeight: 800 }}>Available Output Fields</Text>
+                                <br />
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>{ruleIntelligenceOutputFieldOptions.length} fields listed</Text>
+                              </div>
+                              <Space size={6} wrap>
+                                <Button size="small" onClick={() => updateRuleIntelligenceSelectedOutputFields(ruleIntelligenceRecommendedOutputFields)}>Recommended</Button>
+                                <Button size="small" disabled={ruleIntelligenceCurrentPreviewOutputFields.length === 0} onClick={() => updateRuleIntelligenceSelectedOutputFields(ruleIntelligenceCurrentPreviewOutputFields)}>Use Preview</Button>
+                                <Button size="small" onClick={() => updateRuleIntelligenceOutputLayout({ selected_fields: [] })}>Auto</Button>
+                              </Space>
+                            </Space>
+                          </div>
+                          <div style={{ padding: 10, maxHeight: 460, overflow: 'auto' }}>
+                            <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                              {ruleIntelligenceOutputFieldCategoryGroups.map((group) => (
+                                <div key={group.key} style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: 8, background: 'var(--app-shell-bg)' }}>
+                                  <Space size={8} wrap style={{ marginBottom: 8 }}>
+                                    <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>{group.title}</Text>
+                                    <Tag>{group.fields.length}</Tag>
+                                  </Space>
+                                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 6 }}>
+                                    {group.fields.map((field) => {
+                                      const checked = ruleIntelligenceSelectedOutputSet.has(field.toLowerCase())
+                                      const required = ruleIntelligenceRequiredOutputSet.has(field.toLowerCase())
+                                      return (
+                                        <label key={`${group.key}-${field}`} style={{
+                                          display: 'grid',
+                                          gridTemplateColumns: '18px minmax(0, 1fr) auto',
+                                          gap: 8,
+                                          alignItems: 'center',
+                                          border: `1px solid ${checked ? 'rgba(59,130,246,0.45)' : 'var(--app-border)'}`,
+                                          borderRadius: 5,
+                                          padding: '6px 8px',
+                                          background: checked ? 'rgba(59,130,246,0.08)' : 'var(--app-card-bg)',
+                                          cursor: 'pointer',
+                                        }}>
+                                          <Checkbox
+                                            checked={checked}
+                                            onChange={(event) => toggleRuleIntelligenceOutputField(field, event.target.checked)}
+                                          />
+                                          <Text style={{ color: 'var(--app-text)', fontSize: 12, fontFamily: 'monospace' }} ellipsis>{field}</Text>
+                                          {required ? <Tag color="blue" style={{ marginInlineEnd: 0 }}>required</Tag> : null}
+                                        </label>
+                                      )
+                                    })}
+                                  </div>
+                                </div>
+                              ))}
+                            </Space>
+                          </div>
+                        </div>
+                        <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, background: 'var(--app-card-bg)', overflow: 'hidden' }}>
+                          <div style={{ padding: '10px 12px', borderBottom: '1px solid var(--app-border)', background: 'var(--app-shell-bg)' }}>
+                            <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+                              <div>
+                                <Text style={{ color: 'var(--app-text)', fontWeight: 800 }}>Selected Output Order</Text>
+                                <br />
+                                <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                                  {ruleIntelligenceSelectedOutputFields.length > 0 ? `${ruleIntelligenceSelectedOutputEffectiveFields.length} selected` : `${ruleIntelligenceSelectedOutputEffectiveFields.length} auto fields`} · drag to reorder
+                                </Text>
+                              </div>
+                              <Button size="small" onClick={() => updateRuleIntelligenceOutputLayout({ selected_fields: [] })}>Auto</Button>
+                            </Space>
+                          </div>
+                          <div style={{ padding: 10, maxHeight: 460, overflow: 'auto' }}>
+                            <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                              {ruleIntelligenceSelectedOutputEffectiveFields.map((field, fieldIndex) => {
+                                const required = ruleIntelligenceRequiredOutputSet.has(field.toLowerCase())
+                                return (
+                                  <div
+                                    key={`${field}-${fieldIndex}`}
+                                    draggable
+                                    onDragStart={(event) => {
+                                      setRuleIntelligenceOutputDragIndex(fieldIndex)
+                                      event.dataTransfer.effectAllowed = 'move'
+                                      event.dataTransfer.setData('text/plain', String(fieldIndex))
+                                    }}
+                                    onDragEnd={() => setRuleIntelligenceOutputDragIndex(null)}
+                                    onDragOver={(event) => {
+                                      event.preventDefault()
+                                      event.dataTransfer.dropEffect = 'move'
+                                    }}
+                                    onDrop={(event) => {
+                                      event.preventDefault()
+                                      const rawIndex = event.dataTransfer.getData('text/plain')
+                                      const fromIndex = ruleIntelligenceOutputDragIndex ?? Number(rawIndex)
+                                      if (Number.isFinite(fromIndex)) {
+                                        reorderRuleIntelligenceOutputField(Number(fromIndex), fieldIndex)
+                                      }
+                                      setRuleIntelligenceOutputDragIndex(null)
+                                    }}
+                                    style={{
+                                    display: 'grid',
+                                    gridTemplateColumns: '22px 32px minmax(0, 1fr) auto auto',
+                                    gap: 8,
+                                    alignItems: 'center',
+                                    border: `1px solid ${ruleIntelligenceOutputDragIndex === fieldIndex ? 'rgba(59,130,246,0.75)' : 'var(--app-border)'}`,
+                                    borderRadius: 5,
+                                    padding: '6px 8px',
+                                    background: ruleIntelligenceOutputDragIndex === fieldIndex ? 'rgba(59,130,246,0.12)' : 'var(--app-shell-bg)',
+                                    cursor: 'grab',
+                                  }}>
+                                    <HolderOutlined style={{ color: 'var(--app-text-subtle)', fontSize: 13 }} />
+                                    <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>{fieldIndex + 1}</Text>
+                                    <Space size={6} wrap>
+                                      <Text style={{ color: 'var(--app-text)', fontSize: 12, fontFamily: 'monospace' }} ellipsis>{field}</Text>
+                                      {required ? <Tag color="blue">required</Tag> : null}
+                                    </Space>
+                                    <Space size={2}>
+                                      <Button size="small" icon={<ArrowUpOutlined />} disabled={fieldIndex === 0} onClick={() => moveRuleIntelligenceOutputField(fieldIndex, -1)} style={{ width: 26, paddingInline: 0 }} />
+                                      <Button size="small" icon={<ArrowDownOutlined />} disabled={fieldIndex >= ruleIntelligenceSelectedOutputEffectiveFields.length - 1} onClick={() => moveRuleIntelligenceOutputField(fieldIndex, 1)} style={{ width: 26, paddingInline: 0 }} />
+                                    </Space>
+                                    <Button
+                                      size="small"
+                                      danger
+                                      icon={<DeleteOutlined />}
+                                      onClick={() => toggleRuleIntelligenceOutputField(field, false)}
+                                    />
+                                  </div>
+                                )
+                              })}
+                            </Space>
+                          </div>
+                        </div>
+                      </div>
+                    </Space>
+                  </div>
+                ),
+              },
+              {
+                key: 'preview',
+                label: 'Preview',
+                children: (
+                  <div style={{ padding: 16, overflow: 'auto', height: 'calc(100vh - 126px)' }}>
+                    <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                      <Space wrap>
+                        <Button type="primary" loading={ruleIntelligencePreviewLoading} onClick={() => { void runRuleIntelligencePreview() }}>Run Preview</Button>
+                        <Button
+                          loading={ruleIntelligencePreviewLoading}
+                          disabled={!activePipelineId || !selectedNodeId || !ruleIntelligenceHasDirectUpstream}
+                          onClick={() => { void runRuleIntelligencePreview({ useUpstream: true }) }}
+                        >
+                          Run Full Upstream Preview
+                        </Button>
+                        <Space size={6} align="center">
+                          <Switch
+                            size="small"
+                            checked={ruleIntelligenceLivePreviewEnabled}
+                            onChange={setRuleIntelligenceLivePreviewEnabled}
+                          />
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>live preview</Text>
+                        </Space>
+                        <Space size={6} align="center">
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>row limit</Text>
+                          <InputNumber
+                            min={25}
+                            max={250000}
+                            value={ruleIntelligencePreviewRowLimit}
+                            onChange={(value) => setRuleIntelligencePreviewRowLimit(Math.max(25, Math.min(Number(value || 1000), 250000)))}
+                            style={{ width: 120 }}
+                          />
+                        </Space>
+                        <Tag>input rows {Number(ruleIntelligencePreviewResult?.input_rows ?? ruleIntelligenceSampleRows.length).toLocaleString()}</Tag>
+                        <Tag>source: {String(ruleIntelligencePreviewResult?.source || '') || ruleIntelligenceSampleSourceLabel}</Tag>
+                        <Tag>report rows {Number(ruleIntelligencePreviewResult?.calculation_rows ?? ruleIntelligencePreviewResult?.output_rows ?? 0)}</Tag>
+                        <Tag color="green">target rows {Number(ruleIntelligencePreviewResult?.target_rows || 0)}</Tag>
+                        <Tag color="orange">anomaly rows {Number(ruleIntelligencePreviewResult?.anomaly_rows || 0)}</Tag>
+                        {ruleIntelligenceRemoteSampleLoading ? <Tag color="blue">loading upstream</Tag> : null}
+                        {ruleIntelligencePreviewLoading ? <Tag color="blue">refreshing</Tag> : null}
+                        <Tag color={ruleIntelligencePreviewResult?.ok ? 'green' : ruleIntelligencePreviewResult ? 'red' : 'default'}>
+                          {ruleIntelligencePreviewResult ? (ruleIntelligencePreviewResult.ok ? 'ok' : 'has errors') : 'not run'}
+                        </Tag>
+                      </Space>
+                      {!ruleIntelligencePreviewResult ? (
+                        <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 12, background: 'var(--app-card-bg)' }}>
+                          <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Preview has not run yet.</Text>
+                          <br />
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Click Run Preview to calculate sample output and audit traces from upstream sample rows.</Text>
+                        </div>
+	                      ) : null}
+                      {ruleIntelligenceRemoteSampleError ? (
+                        <div style={{ border: '1px solid #ef444440', borderRadius: 8, padding: 10, background: '#ef444410' }}>
+                          <Text style={{ color: '#ef4444', fontSize: 12 }}>{ruleIntelligenceRemoteSampleError}</Text>
+                        </div>
+                      ) : null}
+                      {ruleIntelligencePreviewResult?.ok && Number(ruleIntelligencePreviewResult?.output_rows || 0) === 0 ? (
+                        <div style={{ border: '1px solid #f59e0b55', borderRadius: 8, padding: 12, background: '#f59e0b10' }}>
+                          <Text style={{ color: '#f59e0b', fontWeight: 700 }}>Preview ran but produced no output rows.</Text>
+                          <br />
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                            Check IF conditions, Group Filter, and upstream sample rows. Input rows received: {Number(ruleIntelligencePreviewResult?.input_rows || 0).toLocaleString()}.
+                          </Text>
+                        </div>
+                      ) : null}
+                      {ruleIntelligencePreviewErrors.length > 0 ? (
+                        <div style={{ border: '1px solid #ef444440', borderRadius: 8, padding: 10, background: '#ef444410' }}>
+                          {ruleIntelligencePreviewErrors.slice(0, 5).map((error, idx) => (
+                            <Text key={idx} style={{ color: '#ef4444', display: 'block', fontSize: 12 }}>{String(error)}</Text>
+                          ))}
+                        </div>
+                      ) : null}
+                      {ruleIntelligencePreviewWarnings.length > 0 ? (
+                        <div style={{ border: '1px solid #f59e0b40', borderRadius: 8, padding: 10, background: '#f59e0b10' }}>
+                          {ruleIntelligencePreviewWarnings.slice(0, 5).map((warning, idx) => (
+                            <Text key={idx} style={{ color: '#f59e0b', display: 'block', fontSize: 12 }}>{String(warning)}</Text>
+                          ))}
+                        </div>
+                      ) : null}
+                      {renderRuleIntelligencePreviewSection(
+                        'Unified Report Output',
+                        'One row per configured output group. Calculation, target, and anomaly results are folded into columns.',
+                        ruleIntelligencePreviewRows,
+                        ruleIntelligencePreviewColumns,
+                        ruleIntelligencePreviewResult
+                          ? 'No report output rows. Check matching conditions and group filters.'
+                          : 'Run preview to see unified report rows.',
+                        'blue',
+                      )}
+                      <Collapse
+                        defaultActiveKey={[]}
+                        style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, background: 'var(--app-shell-bg)' }}
+                        items={[
+                          {
+                            key: 'target-details',
+                            label: (
+                              <Space size={8} wrap>
+                                <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Target Detail Rows</Text>
+                                <Tag color="green">{ruleIntelligenceTargetPreviewRows.length.toLocaleString()} rows</Tag>
+                              </Space>
+                            ),
+                            children: renderRuleIntelligencePreviewSection(
+                              'Target Monitoring',
+                              'Diagnostic target rows. Unified report columns above are the primary output.',
+                              ruleIntelligenceTargetPreviewRows,
+                              ruleIntelligenceTargetPreviewColumns,
+                              ruleIntelligencePreviewResult
+                                ? 'No target monitoring rows. Add or enable targets to review target status.'
+                                : 'Run preview to see target monitoring rows.',
+                              'green',
+                            ),
+                          },
+                          {
+                            key: 'anomaly-details',
+                            label: (
+                              <Space size={8} wrap>
+                                <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Anomaly Detail Rows</Text>
+                                <Tag color="orange">{ruleIntelligenceAnomalyPreviewRows.length.toLocaleString()} rows</Tag>
+                              </Space>
+                            ),
+                            children: renderRuleIntelligencePreviewSection(
+                              'Anomaly Monitoring',
+                              'Diagnostic anomaly rows. Unified report columns above are the primary output.',
+                              ruleIntelligenceAnomalyPreviewRows,
+                              ruleIntelligenceAnomalyPreviewColumns,
+                              ruleIntelligencePreviewResult
+                                ? 'No anomaly monitoring rows matched current thresholds.'
+                                : 'Run preview to see anomaly monitoring rows.',
+                              'orange',
+                            ),
+                          },
+                        ]}
+                      />
+                    </Space>
+                  </div>
+                ),
+              },
+              {
+                key: 'audit',
+                label: 'Audit',
+                children: (
+                  <div style={{ padding: 16, overflow: 'auto', height: 'calc(100vh - 126px)' }}>
+                    <Space direction="vertical" size={12} style={{ width: '100%' }}>
+	                      <Space wrap>
+	                        <Button type="primary" loading={ruleIntelligencePreviewLoading} onClick={() => { void runRuleIntelligencePreview() }}>Run Preview</Button>
+	                        <Button
+	                          loading={ruleIntelligencePreviewLoading}
+	                          disabled={!activePipelineId || !selectedNodeId || !ruleIntelligenceHasDirectUpstream}
+	                          onClick={() => { void runRuleIntelligencePreview({ useUpstream: true }) }}
+	                        >
+	                          Run Full Upstream Preview
+	                        </Button>
+	                        <Space size={6} align="center">
+                          <Switch
+                            size="small"
+                            checked={ruleIntelligenceLivePreviewEnabled}
+                            onChange={setRuleIntelligenceLivePreviewEnabled}
+                          />
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>live preview</Text>
+                        </Space>
+                        <Tag>input rows {ruleIntelligenceSampleRows.length}</Tag>
+                        <Tag>source: {ruleIntelligenceSampleSourceLabel}</Tag>
+                        <Tag>output rows {Number(ruleIntelligencePreviewResult?.output_rows || 0)}</Tag>
+                        <Tag>audit traces {ruleIntelligenceAuditRows.length}</Tag>
+                        {ruleIntelligenceRemoteSampleLoading ? <Tag color="blue">loading upstream</Tag> : null}
+                        {ruleIntelligencePreviewLoading ? <Tag color="blue">refreshing</Tag> : null}
+                        <Tag color={ruleIntelligencePreviewResult?.ok ? 'green' : ruleIntelligencePreviewResult ? 'red' : 'default'}>
+                          {ruleIntelligencePreviewResult ? (ruleIntelligencePreviewResult.ok ? 'ok' : 'has errors') : 'not run'}
+                        </Tag>
+                      </Space>
+                      {!ruleIntelligencePreviewResult ? (
+                        <div style={{ border: '1px solid var(--app-border-strong)', borderRadius: 8, padding: 12, background: 'var(--app-card-bg)' }}>
+                          <Text style={{ color: 'var(--app-text)', fontWeight: 700 }}>Audit has not run yet.</Text>
+                          <br />
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>Click Run Preview to generate audit traces for calculated output rows.</Text>
+                        </div>
+                      ) : null}
+                      {ruleIntelligencePreviewErrors.length > 0 ? (
+                        <div style={{ border: '1px solid #ef444440', borderRadius: 8, padding: 10, background: '#ef444410' }}>
+                          {ruleIntelligencePreviewErrors.slice(0, 5).map((error, idx) => (
+                            <Text key={idx} style={{ color: '#ef4444', display: 'block', fontSize: 12 }}>{String(error)}</Text>
+                          ))}
+                        </div>
+                      ) : null}
+                      {ruleIntelligencePreviewResult?.ok && Number(ruleIntelligencePreviewResult?.output_rows || 0) > 0 && ruleIntelligenceAuditRows.length === 0 ? (
+                        <div style={{ border: '1px solid #f59e0b55', borderRadius: 8, padding: 12, background: '#f59e0b10' }}>
+                          <Text style={{ color: '#f59e0b', fontWeight: 700 }}>No audit traces were found in preview output.</Text>
+                          <br />
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                            Enable Output → Include Audit Trace and run preview again.
+                          </Text>
+                        </div>
+                      ) : null}
+                      {ruleIntelligencePreviewResult?.ok && Number(ruleIntelligencePreviewResult?.output_rows || 0) === 0 ? (
+                        <div style={{ border: '1px solid #f59e0b55', borderRadius: 8, padding: 12, background: '#f59e0b10' }}>
+                          <Text style={{ color: '#f59e0b', fontWeight: 700 }}>Preview produced no output rows, so there are no audit traces.</Text>
+                          <br />
+                          <Text style={{ color: 'var(--app-text-subtle)', fontSize: 12 }}>
+                            Check IF conditions, Group Filter, and upstream sample rows.
+                          </Text>
+                        </div>
+                      ) : null}
+                      <Table
+                        size="small"
+                        rowKey={(_record, index) => String(index)}
+                        pagination={{ pageSize: 20, size: 'small' }}
+                        dataSource={ruleIntelligenceAuditRows}
+                        locale={{
+                          emptyText: ruleIntelligencePreviewResult
+                            ? 'No audit traces to display.'
+                            : 'Run preview to generate audit traces.',
+                        }}
+                        columns={[
+                          { title: 'Output Row', dataIndex: 'row', key: 'row', width: 110 },
+                          {
+                            title: 'Trace',
+                            dataIndex: 'trace',
+                            key: 'trace',
+                            render: (value: unknown) => (
+                              <pre style={{ margin: 0, whiteSpace: 'pre-wrap', color: 'var(--app-text)', fontSize: 11 }}>
+                                {JSON.stringify(value, null, 2)}
+                              </pre>
+                            ),
+                          },
+                        ] as any[]}
+                      />
+                    </Space>
+                  </div>
+                ),
+              },
+            ]}
+          />
+        </div>
+      </Modal>
+    )}
     {canUseCustomFieldStudio && (
       <Modal
         open={customFieldStudioOpen}

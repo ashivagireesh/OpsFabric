@@ -994,6 +994,94 @@ const api = {
     return r.data
   },
 
+  previewRuleIntelligence: async (payload: {
+    config: Record<string, unknown>
+    rows: Array<Record<string, unknown>>
+    max_rows?: number
+    output_max_rows?: number
+    use_upstream?: boolean
+    pipeline_id?: string
+    node_id?: string
+  }) => {
+    const r = await http.post('/api/rule-intelligence/preview', payload)
+    return r.data
+  },
+
+  fetchRuleIntelligenceUpstreamSample: async (payload: {
+    pipeline_id?: string
+    node_id?: string
+    max_rows?: number
+  }) => {
+    const r = await http.post('/api/rule-intelligence/upstream-sample', payload, {
+      timeout: 30000,
+    })
+    return r.data
+  },
+
+  validateRuleIntelligence: async (payload: {
+    config: Record<string, unknown>
+    rows?: Array<Record<string, unknown>>
+    max_rows?: number
+  }) => {
+    const r = await http.post('/api/rule-intelligence/validate', payload)
+    return r.data
+  },
+
+  listRuleIntelligencePacks: async (params?: { search?: string; status?: string }) => {
+    const r = await http.get('/api/rule-intelligence/rule-packs', { params })
+    return r.data
+  },
+
+  getRuleIntelligencePack: async (packId: string) => {
+    const r = await http.get(`/api/rule-intelligence/rule-packs/${packId}`)
+    return r.data
+  },
+
+  createRuleIntelligencePack: async (payload: {
+    name: string
+    description?: string
+    tags?: string[]
+    owner?: string
+    source?: string
+    config: Record<string, unknown>
+    notes?: string
+  }) => {
+    const r = await http.post('/api/rule-intelligence/rule-packs', payload)
+    return r.data
+  },
+
+  createRuleIntelligencePackVersion: async (packId: string, payload: {
+    config: Record<string, unknown>
+    version_label?: string
+    notes?: string
+    created_by?: string
+    validate?: boolean
+    rows?: Array<Record<string, unknown>>
+    max_rows?: number
+  }) => {
+    const r = await http.post(`/api/rule-intelligence/rule-packs/${packId}/versions`, payload)
+    return r.data
+  },
+
+  updateRuleIntelligencePackVersionLifecycle: async (
+    packId: string,
+    versionId: string,
+    action: 'submit' | 'approve' | 'reject' | 'activate' | 'retire',
+    payload: { actor?: string; comment?: string } = {},
+  ) => {
+    const r = await http.post(`/api/rule-intelligence/rule-packs/${packId}/versions/${versionId}/${action}`, payload)
+    return r.data
+  },
+
+  importRuleIntelligenceFile: async (file: File) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    const r = await http.post('/api/rule-intelligence/import', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    return r.data
+  },
+
   // ── MLOps Workflows ───────────────────────────────────────────────────────
   listMLOpsWorkflows: () => safeGet(async () => {
     const r = await http.get('/api/mlops/workflows')

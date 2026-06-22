@@ -646,7 +646,7 @@ export default function Settings() {
           <SettingRow label="API Key" description="Use this key to access the ETL Flow REST API">
             <Space>
               <Input.Password
-                defaultValue="sk-etlflow-xxxxxxxxxxxxx"
+                placeholder="No API key configured"
                 style={{ width: 240, background: 'var(--app-input-bg)', border: '1px solid var(--app-border-strong)', color: 'var(--app-text)' }}
                 readOnly
               />

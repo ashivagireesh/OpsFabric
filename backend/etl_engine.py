@@ -364,6 +364,9 @@ class ETLEngine:
         # files under backend/outputs, so let preview/read paths find them.
         if file_path.startswith("__local__://"):
             original_name = file_path.replace("__local__://", "", 1).strip().strip("/")
+            explicit_path = os.path.join(os.path.dirname(__file__), original_name)
+            if os.path.isfile(explicit_path):
+                return explicit_path
             output_name = self._safe_filename(original_name.rsplit("/", 1)[-1] or original_name)
             output_path = os.path.join(os.path.dirname(__file__), "outputs", output_name)
             if os.path.isfile(output_path):
@@ -7230,14 +7233,28 @@ END;"""
                             "output": output if isinstance(output, list) else [],
                             "output_false": [],
                         }
+                    suppress_generic_data_ops_output = False
                     if node_type == "data_ops" and isinstance(output, list):
                         route_target_by_handle: Dict[str, str] = {}
+                        route_payload_mode_by_handle: Dict[str, str] = {}
+                        route_bundle_by_handle: Dict[str, List[Any]] = {}
                         for item in output:
                             if not isinstance(item, dict):
                                 continue
                             route_meta = item.get("_data_ops_route")
                             if not isinstance(route_meta, dict):
                                 continue
+                            route_bundle_store = (
+                                node_execution_context_base.get("data_ops_route_bundles")
+                                if isinstance(node_execution_context_base, dict)
+                                else {}
+                            )
+                            if isinstance(route_bundle_store, dict):
+                                for bundle_map in route_bundle_store.values():
+                                    if isinstance(bundle_map, dict):
+                                        for bundle_handle, bundle_rows in bundle_map.items():
+                                            if isinstance(bundle_rows, list):
+                                                route_bundle_by_handle[str(bundle_handle)] = bundle_rows
                             for route_row in route_meta.get("routes") or []:
                                 if not isinstance(route_row, dict):
                                     continue
@@ -7247,10 +7264,12 @@ END;"""
                                 target_node_id = str(route_row.get("target_node_id") or "").strip()
                                 if handle and target_node_id:
                                     route_target_by_handle[handle] = target_node_id
+                                    route_payload_mode_by_handle[handle] = str(route_row.get("payload_mode") or "all_rows").strip().lower()
                             if route_target_by_handle:
                                 break
                         if route_target_by_handle:
                             dynamic_counts: Dict[str, int] = {}
+                            delivered_handles: set[str] = set()
                             for item in output:
                                 if not isinstance(item, dict):
                                     continue
@@ -7261,12 +7280,29 @@ END;"""
                                     target_node_id = route_target_by_handle.get(handle)
                                     if not target_node_id:
                                         continue
-                                    dynamic_route_inputs_by_node.setdefault(target_node_id, []).append(item)
-                                    dynamic_counts[target_node_id] = dynamic_counts.get(target_node_id, 0) + 1
+                                    managed_data_ops_route_pairs.add((str(nid), target_node_id))
+                                    payload_mode = route_payload_mode_by_handle.get(handle, "all_rows")
+                                    if payload_mode in {"all_rows", "batch"}:
+                                        if handle in delivered_handles:
+                                            continue
+                                        delivered_handles.add(handle)
+                                        bundle_rows = route_bundle_by_handle.get(handle)
+                                        routed_payload = list(bundle_rows) if isinstance(bundle_rows, list) else list(output)
+                                        dynamic_route_inputs_by_node.setdefault(target_node_id, []).extend(routed_payload)
+                                        dynamic_counts[target_node_id] = dynamic_counts.get(target_node_id, 0) + len(routed_payload)
+                                    else:
+                                        dynamic_route_inputs_by_node.setdefault(target_node_id, []).append(item)
+                                        dynamic_counts[target_node_id] = dynamic_counts.get(target_node_id, 0) + 1
                             if dynamic_counts:
                                 log_entry["query_result_router_targets"] = dict(dynamic_counts)
-                    pass_results[nid] = output
-                    pass_row_fanout[nid] = bool(
+                                suppress_generic_data_ops_output = True
+                    pass_results[nid] = [] if suppress_generic_data_ops_output else output
+                    if suppress_generic_data_ops_output:
+                        pass_results_by_handle[nid] = {
+                            "output": [],
+                            "output_false": [],
+                        }
+                    pass_row_fanout[nid] = False if node_type == "data_ops" else bool(
                         cursor_explicit_row_fanout
                         or delay_explicit_row_fanout
                         or effective_row_fanout_input
@@ -7875,6 +7911,8 @@ END;"""
             )
         elif node_type == "map_transform":
             return self._transform_map(upstream, config, execution_context=execution_context)
+        elif node_type == "rule_intelligence_engine":
+            return self._transform_rule_intelligence(upstream, config, execution_context=execution_context)
         elif node_type == "rename_transform":
             return self._transform_rename(upstream, config)
         elif node_type == "aggregate_transform":
@@ -10402,6 +10440,8 @@ END;"""
                                 continue
                             if active_query_id and str(query_config.get("id") or "") != active_query_id:
                                 continue
+                            if query_config.get("internalQueries") or query_config.get("internal_queries"):
+                                continue
                             row_count_candidates.extend([
                                 query_config.get("limitRows"),
                                 query_config.get("limit_rows"),
@@ -10432,13 +10472,25 @@ END;"""
                 step_kind = _kind(step)
                 if step_kind != "prepare":
                     continue
-                row_count_candidates.extend([
-                    step.get("limitRows"),
-                    step.get("limit_rows"),
-                    step.get("maxRows"),
-                    step.get("max_rows"),
-                ])
                 query_configs = step.get("queryBuilders") or step.get("query_builders") or []
+                active_internal_package = False
+                if isinstance(query_configs, list):
+                    active_query_id = str(step.get("activeQueryBuilderId") or step.get("active_query_builder_id") or "").strip()
+                    for query_config in query_configs:
+                        if not isinstance(query_config, dict):
+                            continue
+                        if active_query_id and str(query_config.get("id") or "") != active_query_id:
+                            continue
+                        if query_config.get("internalQueries") or query_config.get("internal_queries"):
+                            active_internal_package = True
+                            break
+                if not active_internal_package:
+                    row_count_candidates.extend([
+                        step.get("limitRows"),
+                        step.get("limit_rows"),
+                        step.get("maxRows"),
+                        step.get("max_rows"),
+                    ])
                 if not isinstance(query_configs, list):
                     continue
                 active_query_id = str(step.get("activeQueryBuilderId") or step.get("active_query_builder_id") or "").strip()
@@ -10446,6 +10498,8 @@ END;"""
                     if not isinstance(query_config, dict):
                         continue
                     if active_query_id and str(query_config.get("id") or "") != active_query_id:
+                        continue
+                    if query_config.get("internalQueries") or query_config.get("internal_queries"):
                         continue
                     row_count_candidates.extend([
                         query_config.get("limitRows"),
@@ -10758,7 +10812,8 @@ END;"""
             return value
 
         def _try_fetch_data_ops_query_rows(route_source_override: str = "") -> Tuple[List[Dict[str, Any]], bool]:
-            sql = _data_ops_query_sql_from_config(route_source_override).strip().rstrip(";").strip()
+            sql, query_config, _source_step = _data_ops_query_config_for_source(route_source_override)
+            sql = str(sql or "").strip().rstrip(";").strip()
             if not sql:
                 return [], False
             first_word = re.match(r"^\s*([A-Za-z]+)", sql)
@@ -10790,23 +10845,144 @@ END;"""
                     try:
                         batch_size = _query_result_row_limit()
                         total_limit = _query_result_total_limit()
-                        bind_params = _data_ops_query_bind_params(sql, route_source_override)
                         cursor.arraysize = max(1, min(batch_size, 5000))
-                        cursor.execute(
-                            f"SELECT * FROM ({sql}) WHERE ROWNUM <= :limit",
-                            {**bind_params, "limit": total_limit},
-                        )
-                        columns = [str(desc[0] or "") for desc in (cursor.description or [])]
-                        fetched = []
-                        while len(fetched) < total_limit:
-                            chunk = cursor.fetchmany(batch_size)
-                            if not chunk:
-                                break
-                            fetched.extend(chunk)
-                        return [
-                            {columns[idx]: _oracle_query_value(value) for idx, value in enumerate(record)}
-                            for record in fetched
-                        ], True
+
+                        def _row_value(row: Dict[str, Any], field: str) -> Any:
+                            raw = str(field or "").strip()
+                            leaf = raw.split(".")[-1] if raw else raw
+                            candidates = [raw, leaf, raw.upper(), leaf.upper(), raw.lower(), leaf.lower()]
+                            for candidate in candidates:
+                                if candidate and candidate in row:
+                                    return row.get(candidate)
+                            lowered = {str(key).lower(): value for key, value in row.items()}
+                            for candidate in candidates:
+                                key = str(candidate or "").lower()
+                                if key and key in lowered:
+                                    return lowered[key]
+                            return None
+
+                        def _bind_defaults(query_row: Dict[str, Any], query_sql: str) -> Dict[str, Any]:
+                            used_names = {
+                                str(match.group(1) or "").strip()
+                                for match in re.finditer(r":([A-Za-z_][A-Za-z0-9_$#]*)", str(query_sql or ""))
+                            }
+                            params: Dict[str, Any] = {}
+                            for row in query_row.get("bindParameters") or query_row.get("bind_parameters") or query_row.get("bindParams") or []:
+                                if not isinstance(row, dict) or row.get("enabled") is False:
+                                    continue
+                                name = str(row.get("name") or row.get("param") or row.get("key") or "").strip().lstrip(":")
+                                if name and name in used_names and (row.get("defaultValue") is not None or row.get("default_value") is not None):
+                                    params[name] = row.get("defaultValue") if row.get("defaultValue") is not None else row.get("default_value")
+                            return params
+
+                        def _fetch_select(query_sql: str, bind_params: Dict[str, Any], remaining_limit: int) -> List[Dict[str, Any]]:
+                            clean_sql = str(query_sql or "").strip().rstrip(";").strip()
+                            if not clean_sql or ";" in clean_sql:
+                                return []
+                            first = re.match(r"^\s*([A-Za-z]+)", clean_sql)
+                            if not first or first.group(1).upper() not in {"SELECT", "WITH"}:
+                                return []
+                            execution_binds = dict(bind_params or {})
+                            execution_binds["limit"] = max(1, int(remaining_limit or total_limit))
+                            cursor.execute(f"SELECT * FROM ({clean_sql}) WHERE ROWNUM <= :limit", execution_binds)
+                            columns = [str(desc[0] or "") for desc in (cursor.description or [])]
+                            fetched_rows: List[Dict[str, Any]] = []
+                            while len(fetched_rows) < remaining_limit:
+                                chunk = cursor.fetchmany(min(batch_size, max(1, remaining_limit - len(fetched_rows))))
+                                if not chunk:
+                                    break
+                                for record in chunk:
+                                    fetched_rows.append({
+                                        columns[idx]: _oracle_query_value(value)
+                                        for idx, value in enumerate(record)
+                                    })
+                            return fetched_rows
+
+                        def _strip_terminal_oracle_fetch_limit(query_sql: str) -> str:
+                            return re.sub(
+                                r"\s+FETCH\s+FIRST\s+\d+\s+ROWS\s+ONLY\s*$",
+                                "",
+                                str(query_sql or "").strip(),
+                                flags=re.IGNORECASE,
+                            ).strip()
+
+                        internal_queries = query_config.get("internalQueries") or query_config.get("internal_queries") if isinstance(query_config, dict) else []
+                        if isinstance(internal_queries, list) and internal_queries:
+                            final_internal_id = str(
+                                query_config.get("finalInternalQueryId")
+                                or query_config.get("final_internal_query_id")
+                                or query_config.get("activeInternalQueryId")
+                                or query_config.get("active_internal_query_id")
+                                or ""
+                            ).strip()
+                            final_index = 0
+                            for idx, query_row in enumerate(internal_queries):
+                                if isinstance(query_row, dict) and final_internal_id and str(query_row.get("id") or "") == final_internal_id:
+                                    final_index = idx
+                                    break
+                            if not final_internal_id:
+                                final_index = len(internal_queries) - 1
+                            result_by_query_id: Dict[str, List[Dict[str, Any]]] = {}
+                            result_by_alias: Dict[str, List[Dict[str, Any]]] = {}
+                            latest_rows: List[Dict[str, Any]] = []
+                            for idx, query_row in enumerate(internal_queries[:final_index + 1]):
+                                if not isinstance(query_row, dict):
+                                    continue
+                                query_sql = _strip_terminal_oracle_fetch_limit(str(query_row.get("query") or query_row.get("expression") or "").strip())
+                                query_id = str(query_row.get("id") or f"q{idx + 1}").strip()
+                                output_alias = re.sub(r"\W+", "_", str(query_row.get("outputAlias") or query_row.get("output_alias") or query_row.get("name") or f"q{idx + 1}").strip()).strip("_") or f"q{idx + 1}"
+                                input_mode = str(query_row.get("inputMode") or query_row.get("input_mode") or "set_based").strip().lower()
+                                query_limit = _positive_row_count(query_row.get("limitRows") or query_row.get("limit_rows"))
+                                query_total_limit = query_limit or total_limit
+                                params = _bind_defaults(query_row, query_sql)
+                                rows_for_query: List[Dict[str, Any]] = []
+                                if input_mode in {"cursor", "batch_cursor"}:
+                                    input_query_id = str(query_row.get("inputQueryId") or query_row.get("input_query_id") or "").strip()
+                                    input_rows = result_by_query_id.get(input_query_id) or result_by_alias.get(input_query_id) or latest_rows
+                                    cursor_mappings = query_row.get("cursorMappings") or query_row.get("cursor_mappings") or query_row.get("queryInputs") or query_row.get("query_inputs") or []
+                                    value_sets: Dict[str, List[Any]] = {}
+                                    for mapping in cursor_mappings:
+                                        if not isinstance(mapping, dict) or mapping.get("enabled") is False:
+                                            continue
+                                        name = str(mapping.get("param") or mapping.get("name") or "").strip().lstrip(":")
+                                        field = str(mapping.get("sourceField") or mapping.get("source_field") or "").strip()
+                                        if not name or not field:
+                                            continue
+                                        values: List[Any] = []
+                                        seen_values: set[str] = set()
+                                        for input_row in input_rows:
+                                            value = _row_value(input_row, field)
+                                            if value is None:
+                                                continue
+                                            marker = json.dumps(_oracle_query_value(value), sort_keys=True, default=str)
+                                            if marker in seen_values:
+                                                continue
+                                            seen_values.add(marker)
+                                            values.append(value)
+                                        value_sets[name] = values
+                                    primary_name = next(iter(value_sets.keys()), "")
+                                    if primary_name:
+                                        for value in value_sets.get(primary_name, []):
+                                            if len(rows_for_query) >= query_total_limit:
+                                                break
+                                            run_params = {**params, primary_name: value}
+                                            for other_name, other_values in value_sets.items():
+                                                if other_name != primary_name:
+                                                    run_params[other_name] = other_values[0] if other_values else None
+                                            rows_for_query.extend(_fetch_select(query_sql, run_params, max(1, query_total_limit - len(rows_for_query))))
+                                    else:
+                                        rows_for_query = _fetch_select(query_sql, params, query_total_limit)
+                                else:
+                                    rows_for_query = _fetch_select(query_sql, params, query_total_limit)
+                                latest_rows = rows_for_query[:query_total_limit]
+                                if query_id:
+                                    result_by_query_id[query_id] = latest_rows
+                                if output_alias:
+                                    result_by_alias[output_alias] = latest_rows
+                            return latest_rows[:total_limit], True
+
+                        bind_params = _data_ops_query_bind_params(sql, route_source_override)
+                        return _fetch_select(sql, bind_params, total_limit), True
                     finally:
                         cursor.close()
                 finally:
@@ -11131,8 +11307,37 @@ END;"""
                     if self._parse_bool_like(item.get("enabled", True), True)
                     and _enabled_rows(item.get("routeRows") or item.get("route_rows") or item.get("routes"))
                 ]
-                if not runtime_configs:
+                if not runtime_configs and not router_configs:
                     runtime_configs = [step]
+                if router_configs and not runtime_configs:
+                    route_meta = {
+                        "step": name,
+                        "route_source": str(step.get("routeSource") or step.get("route_source") or ""),
+                        "router_configs": [],
+                        "route_mode": "disabled",
+                        "payload_mode": str(step.get("payloadMode") or step.get("payload_mode") or "all_rows").strip().lower(),
+                        "input_rows": before_count,
+                        "output_rows": 0,
+                        "routes": [],
+                        "route_counts": {},
+                        "main_pipeline_targets": [],
+                        "data_ops_targets": [],
+                        "external_targets": [],
+                        "disabled_router_configs": [
+                            {
+                                "id": str(item.get("id") or ""),
+                                "name": str(item.get("name") or ""),
+                                "enabled": self._parse_bool_like(item.get("enabled", True), True),
+                                "route_count": len(_enabled_rows(item.get("routeRows") or item.get("route_rows") or item.get("routes"))),
+                            }
+                            for item in router_configs
+                        ],
+                    }
+                    if isinstance(execution_context, dict):
+                        execution_context.setdefault("data_ops_route_bundles", {})[str(step.get("id") or name)] = {}
+                        execution_context.setdefault("data_ops_route_metadata", {})[str(step.get("id") or name)] = route_meta
+                    rows = []
+                    continue
 
                 def _safe_handle(value: str, fallback: str) -> str:
                     safe = re.sub(r"[^a-z0-9_]+", "_", str(value or "").strip().lower()).strip("_")
@@ -24345,6 +24550,2407 @@ END;"""
             logger.warning("Select Fields matched zero fields; returning input rows unchanged")
             return data
         return result
+
+    def _rule_engine_json_value(self, value: Any, fallback: Any) -> Any:
+        if value is None:
+            return fallback
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return fallback
+            try:
+                return json.loads(text)
+            except Exception:
+                return fallback
+        return value
+
+    def _rule_engine_list(self, value: Any) -> List[Any]:
+        raw = self._rule_engine_json_value(value, value)
+        if raw is None:
+            return []
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, tuple):
+            return list(raw)
+        if isinstance(raw, str):
+            return [part.strip() for part in re.split(r"[,\n]", raw) if part.strip()]
+        return [raw]
+
+    def _rule_engine_mapping(self, config: dict) -> Dict[str, str]:
+        mapping_raw = self._rule_engine_json_value(config.get("field_mapping"), {})
+        mapping = mapping_raw if isinstance(mapping_raw, dict) else {}
+        input_fields_raw = self._rule_engine_json_value(config.get("input_fields"), [])
+        input_fields = input_fields_raw if isinstance(input_fields_raw, list) else []
+        out: Dict[str, str] = {
+            str(k or "").strip(): str(v or "").strip()
+            for k, v in mapping.items()
+            if str(k or "").strip() and str(v or "").strip()
+        }
+
+        role_to_field: Dict[str, str] = {}
+        for item in input_fields:
+            if not isinstance(item, dict):
+                continue
+            field_id = str(item.get("id") or item.get("name") or item.get("label") or "").strip()
+            if not field_id:
+                continue
+            mapped = str(
+                mapping.get(field_id)
+                or item.get("mapped_field")
+                or item.get("upstream_field")
+                or item.get("source_field")
+                or field_id
+            ).strip()
+            out[field_id] = mapped
+            role = str(item.get("role") or "").strip().lower().replace(" ", "_")
+            if role and role not in role_to_field:
+                role_to_field[role] = field_id
+                out.setdefault(role, mapped)
+                out.setdefault(f"{role}_field", mapped)
+            field_type = str(item.get("type") or "").strip().lower()
+            if field_type == "date":
+                role_to_field.setdefault("date", field_id)
+                out.setdefault("date_field", mapped)
+            elif field_type == "number":
+                role_to_field.setdefault("measure", field_id)
+                out.setdefault("amount_field", mapped)
+
+        legacy_defaults = {
+            "entity_field": "bc_code",
+            "agent_field": "bc_code",
+            "service_field": "service",
+            "category_field": "service",
+            "amount_field": "amount",
+            "measure_field": "amount",
+            "date_field": "transaction_date",
+            "account_field": "account_number",
+            "identifier_field": "account_number",
+            "customer_field": "customer_id",
+            "status_field": "status",
+        }
+        for key, default in legacy_defaults.items():
+            value = str(mapping.get(key) or mapping.get(key.replace("_field", "")) or default).strip()
+            out.setdefault(key, value or default)
+        if "service_field" in out:
+            out.setdefault("category", out["service_field"])
+            out.setdefault("category_field", out["service_field"])
+        if "amount_field" in out:
+            out.setdefault("measure", out["amount_field"])
+            out.setdefault("measure_field", out["amount_field"])
+        if "account_field" in out:
+            out.setdefault("identifier", out["account_field"])
+            out.setdefault("identifier_field", out["account_field"])
+        return out
+
+    def _rule_engine_resolve_field(self, field_name: Any, mapping: Dict[str, str]) -> str:
+        token = str(field_name or "").strip()
+        if not token:
+            return ""
+        normalized = token.lower().replace(" ", "_")
+        if token in mapping:
+            return mapping.get(token, token)
+        if normalized in mapping:
+            return mapping.get(normalized, token)
+        aliases = {
+            "entity": "entity_field",
+            "agent": "agent_field",
+            "bc": "entity_field",
+            "bc_code": "entity_field",
+            "service": "service_field",
+            "category": "category_field",
+            "measure": "amount_field",
+            "amount": "amount_field",
+            "date": "date_field",
+            "day": "date_field",
+            "month": "date_field",
+            "quarter": "date_field",
+            "period": "date_field",
+            "account": "account_field",
+            "account_number": "account_field",
+            "identifier": "identifier_field",
+            "scope": "identifier_field",
+            "customer": "customer_field",
+            "status": "status_field",
+        }
+        mapped_key = aliases.get(normalized)
+        if mapped_key:
+            return mapping.get(mapped_key, token)
+        if normalized.endswith("_field") and normalized in mapping:
+            return mapping.get(normalized, token)
+        return token
+
+    def _rule_engine_output_key(self, field_name: Any, mapping: Dict[str, str]) -> str:
+        token = str(field_name or "").strip()
+        normalized = token.lower().replace(" ", "_")
+        legacy_aliases = {
+            "entity", "agent", "bc", "bc_code", "service", "amount", "measure", "date",
+            "day", "month", "quarter", "period", "account", "account_number",
+            "identifier", "scope", "customer", "status", "category",
+        }
+        if normalized in mapping and normalized not in legacy_aliases and not normalized.endswith("_field"):
+            return normalized
+        for map_key, map_value in mapping.items():
+            key_norm = str(map_key or "").strip().lower().replace(" ", "_")
+            value_norm = str(map_value or "").strip().lower().replace(" ", "_")
+            if (
+                key_norm
+                and value_norm == normalized
+                and key_norm not in legacy_aliases
+                and not key_norm.endswith("_field")
+            ):
+                return key_norm
+        if token in mapping and normalized not in legacy_aliases and not normalized.endswith("_field"):
+            return normalized
+        return self._rule_engine_resolve_field(token, mapping)
+
+    def _rule_engine_slug(self, value: Any) -> str:
+        text = str(value or "").strip().lower()
+        text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+        return text or "service"
+
+    def _rule_engine_period(self, row: dict, mapping: Dict[str, str], grain: Any) -> Any:
+        normalized = str(grain or "").strip().lower()
+        if normalized in {"", "none", "all"}:
+            return None
+        date_field = mapping.get("date_field") or "transaction_date"
+        raw, found = self._extract_row_value_by_path(row, date_field)
+        if not found:
+            raw = row.get(date_field)
+        parsed = self._parse_profile_event_time(raw)
+        if parsed is None:
+            return str(raw or "unknown_period")
+        if normalized in {"day", "daily", "date"}:
+            return parsed.date().isoformat()
+        if normalized in {"month", "monthly"}:
+            return f"{parsed.year:04d}-{parsed.month:02d}"
+        if normalized in {"quarter", "quarterly"}:
+            quarter = ((parsed.month - 1) // 3) + 1
+            return f"{parsed.year:04d}-Q{quarter}"
+        if normalized in {"year", "yearly", "annual"}:
+            return f"{parsed.year:04d}"
+        return parsed.date().isoformat()
+
+    def _rule_engine_shift_period_months(self, value: Any, months: int) -> Any:
+        if not months:
+            return value
+        text = str(value or "").strip()
+        match = re.match(r"^(\d{4})-(\d{2})(?:-(\d{2}))?$", text)
+        if not match:
+            return value
+        year = int(match.group(1))
+        month = int(match.group(2))
+        day = match.group(3)
+        month_index = (year * 12) + (month - 1) + months
+        next_year = month_index // 12
+        next_month = (month_index % 12) + 1
+        if day:
+            return f"{next_year:04d}-{next_month:02d}-{int(day):02d}"
+        return f"{next_year:04d}-{next_month:02d}"
+
+    def _rule_engine_payout_offset_months(self, rule: Dict[str, Any], calculation: Dict[str, Any]) -> int:
+        for source in (calculation, rule):
+            raw = (
+                source.get("payout_offset_months")
+                if source.get("payout_offset_months") is not None
+                else source.get("payout_month_offset")
+                if source.get("payout_month_offset") is not None
+                else source.get("payable_offset_months")
+                if source.get("payable_offset_months") is not None
+                else source.get("settlement_offset_months")
+            )
+            numeric = self._to_number(raw)
+            if numeric is not None:
+                return int(numeric)
+        return 0
+
+    def _rule_engine_expand_calculation_stages(self, rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        expanded: List[Dict[str, Any]] = []
+        stage_meta_keys = {
+            "id", "key", "name", "label", "description", "enabled", "sequence", "priority",
+            "calculation", "cap", "group_filter", "group_filters", "eligibility",
+            "conditions", "condition_tree", "conditionTree", "match_mode", "group_by",
+            "period_grain", "component_id", "component", "settlement_component",
+            "component_name", "settlement_component_name", "payee_type", "commission_type",
+        }
+        for rule in rules:
+            calculation = rule.get("calculation") if isinstance(rule.get("calculation"), dict) else {}
+            raw_stages = (
+                rule.get("calculation_stages")
+                if rule.get("calculation_stages") is not None
+                else rule.get("payout_stages")
+                if rule.get("payout_stages") is not None
+                else calculation.get("stages")
+            )
+            stages = [
+                stage for stage in self._rule_engine_list(raw_stages)
+                if isinstance(stage, dict) and stage.get("enabled", True) is not False
+            ]
+            if not stages:
+                expanded.append(rule)
+                continue
+
+            base_calc = {key: value for key, value in calculation.items() if key != "stages"}
+            base_priority = self._to_number(rule.get("priority")) or 100.0
+            for index, stage in enumerate(stages):
+                stage_id = str(stage.get("id") or stage.get("key") or f"stage_{index + 1}").strip()
+                stage_calc = dict(base_calc)
+                nested_calc = stage.get("calculation") if isinstance(stage.get("calculation"), dict) else {}
+                stage_calc.update(nested_calc)
+                for key, value in stage.items():
+                    if key not in stage_meta_keys:
+                        stage_calc[key] = value
+
+                stage_rule = dict(rule)
+                stage_rule["id"] = f"{rule.get('id') or 'rule'}_{stage_id}"
+                stage_rule["name"] = str(stage.get("name") or stage.get("label") or f"{rule.get('name') or rule.get('id') or 'Rule'} - {stage_id}")
+                stage_rule["calculation"] = stage_calc
+                stage_priority = self._to_number(stage.get("priority"))
+                stage_rule["priority"] = stage_priority if stage_priority is not None else base_priority + ((index + 1) / 1000.0)
+                for key in (
+                    "cap", "group_filter", "group_filters", "conditions", "condition_tree",
+                    "conditionTree", "match_mode", "group_by", "period_grain",
+                    "commission_type", "payee_type",
+                ):
+                    if key in stage:
+                        stage_rule[key] = stage.get(key)
+                if "eligibility" in stage and "group_filters" not in stage:
+                    stage_rule["group_filters"] = stage.get("eligibility")
+                stage_rule["component_id"] = str(
+                    stage.get("component_id")
+                    or stage.get("component")
+                    or stage.get("settlement_component")
+                    or stage_id
+                )
+                stage_rule["component_name"] = str(
+                    stage.get("component_name")
+                    or stage.get("settlement_component_name")
+                    or stage.get("name")
+                    or stage.get("label")
+                    or stage_rule["name"]
+                )
+                stage_rule["_stage_id"] = stage_id
+                stage_rule["_stage_name"] = stage_rule["component_name"]
+                expanded.append(stage_rule)
+        return expanded
+
+    def _rule_engine_month_index(self, value: Any) -> Optional[int]:
+        parsed = self._parse_profile_event_time(value)
+        if parsed is None:
+            return None
+        return parsed.year * 12 + (parsed.month - 1)
+
+    def _rule_engine_month_delta(self, start_value: Any, end_value: Any) -> Optional[int]:
+        start_idx = self._rule_engine_month_index(start_value)
+        end_idx = self._rule_engine_month_index(end_value)
+        if start_idx is None or end_idx is None:
+            return None
+        return end_idx - start_idx
+
+    def _rule_engine_metric_window_bounds(self, spec: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+        def _first_number(*keys: str) -> Optional[int]:
+            for key in keys:
+                if key in spec and spec.get(key) is not None:
+                    numeric = self._to_number(spec.get(key))
+                    if numeric is not None:
+                        return int(numeric)
+            return None
+
+        month_start = _first_number("window_start_months", "start_month_offset", "from_month_offset", "months_from")
+        month_end = _first_number("window_end_months", "end_month_offset", "to_month_offset", "months_to")
+        if month_start is None and "window_month" in spec:
+            month_start = _first_number("window_month")
+        if month_end is None and month_start is not None:
+            month_end = month_start
+        window_months = _first_number("window_months", "duration_months")
+        if month_start is not None and month_end is None and window_months is not None:
+            month_end = month_start + max(window_months - 1, 0)
+
+        day_start = _first_number("window_start_days", "start_day_offset", "from_day_offset", "days_from")
+        day_end = _first_number("window_end_days", "end_day_offset", "to_day_offset", "days_to")
+        if day_start is None and "window_day" in spec:
+            day_start = _first_number("window_day")
+        if day_end is None and day_start is not None:
+            day_end = day_start
+        window_days = _first_number("window_days", "duration_days")
+        if day_start is not None and day_end is None and window_days is not None:
+            day_end = day_start + max(window_days - 1, 0)
+        return month_start, month_end, day_start, day_end
+
+    def _rule_engine_row_in_metric_window(self, row: dict, spec: Dict[str, Any], mapping: Dict[str, str]) -> bool:
+        month_start, month_end, day_start, day_end = self._rule_engine_metric_window_bounds(spec)
+        if month_start is None and month_end is None and day_start is None and day_end is None:
+            return True
+
+        event_field = str(
+            spec.get("date_field")
+            or spec.get("event_date_field")
+            or spec.get("metric_date_field")
+            or mapping.get("date_field")
+            or "transaction_date"
+        )
+        anchor_field = str(
+            spec.get("anchor_field")
+            or spec.get("cohort_date_field")
+            or spec.get("opening_date_field")
+            or spec.get("account_opening_date_field")
+            or spec.get("open_date_field")
+            or mapping.get("cohort_date_field")
+            or mapping.get("opening_date_field")
+            or mapping.get("account_opening_date_field")
+            or mapping.get("open_date_field")
+            or event_field
+        )
+        event_value = self._rule_engine_row_value(row, event_field, mapping)
+        anchor_value = self._rule_engine_row_value(row, anchor_field, mapping)
+        if month_start is not None or month_end is not None:
+            delta = self._rule_engine_month_delta(anchor_value, event_value)
+            if delta is None:
+                return False
+            if month_start is not None and delta < month_start:
+                return False
+            if month_end is not None and delta > month_end:
+                return False
+        if day_start is not None or day_end is not None:
+            event_dt = self._parse_profile_event_time(event_value)
+            anchor_dt = self._parse_profile_event_time(anchor_value)
+            if event_dt is None or anchor_dt is None:
+                return False
+            delta_days = (event_dt.date() - anchor_dt.date()).days
+            if day_start is not None and delta_days < day_start:
+                return False
+            if day_end is not None and delta_days > day_end:
+                return False
+        return True
+
+    def _rule_engine_rows_for_metric(
+        self,
+        rows: List[dict],
+        spec: Optional[Dict[str, Any]],
+        mapping: Dict[str, str],
+    ) -> List[dict]:
+        if not isinstance(spec, dict):
+            return rows
+        filtered = list(rows or [])
+        condition_tree = self._rule_engine_json_value(
+            spec.get("condition_tree") if spec.get("condition_tree") is not None else spec.get("conditionTree"),
+            None,
+        )
+        conditions = self._rule_engine_list(
+            spec.get("conditions")
+            if spec.get("conditions") is not None
+            else spec.get("filters")
+            if spec.get("filters") is not None
+            else spec.get("where")
+        )
+        condition_payload: Any = condition_tree if isinstance(condition_tree, (dict, list)) else conditions
+        if isinstance(condition_payload, (dict, list)):
+            match_mode = spec.get("match_mode") or "all"
+            filtered = [
+                row for row in filtered
+                if self._rule_engine_matches_conditions(row, condition_payload, mapping, match_mode)
+            ]
+        if any(value is not None for value in self._rule_engine_metric_window_bounds(spec)):
+            filtered = [
+                row for row in filtered
+                if self._rule_engine_row_in_metric_window(row, spec, mapping)
+            ]
+        return filtered
+
+    def _rule_engine_distinct_tokens(self, rows: List[dict], field_name: Any, mapping: Dict[str, str]) -> set[str]:
+        tokens: set[str] = set()
+        for row in rows:
+            raw = self._rule_engine_row_value(row, field_name, mapping)
+            if raw is not None and str(raw).strip() != "":
+                tokens.add(self._stable_json_token(raw))
+        return tokens
+
+    def _rule_engine_group_metric_value(
+        self,
+        rows: List[dict],
+        spec_or_metric: Any,
+        field_name: Any,
+        mapping: Dict[str, str],
+    ) -> float:
+        spec = spec_or_metric if isinstance(spec_or_metric, dict) else {}
+        metric = (
+            spec.get("metric")
+            or spec.get("measure")
+            or spec.get("type")
+            or spec_or_metric
+            or "sum"
+        )
+        metric_key = str(metric or "sum").strip().lower()
+        metric_rows = self._rule_engine_rows_for_metric(rows, spec, mapping)
+        field = (
+            spec.get("field")
+            or spec.get("field_name")
+            or spec.get("measure_field")
+            or spec.get("basis_field")
+            or field_name
+            or mapping.get("amount_field")
+            or "amount"
+        )
+
+        if metric_key in {"average_balance", "avg_balance", "balance_average", "window_avg", "window_average", "window_average_balance"}:
+            return self._rule_engine_metric_value(metric_rows, "avg", field, mapping)
+
+        if metric_key in {"window_sum", "window_total"}:
+            return self._rule_engine_metric_value(metric_rows, "sum", field, mapping)
+
+        if metric_key in {"window_count"}:
+            return self._rule_engine_metric_value(metric_rows, "count", field, mapping)
+
+        if metric_key in {"funded_ratio", "funded_percent", "funding_ratio", "funding_percent"}:
+            account_field = (
+                spec.get("account_field")
+                or spec.get("identifier_field")
+                or spec.get("distinct_by")
+                or mapping.get("account_field")
+                or mapping.get("identifier_field")
+                or "account_number"
+            )
+            balance_field = (
+                spec.get("balance_field")
+                or spec.get("funded_field")
+                or field
+                or "balance"
+            )
+            threshold = self._to_number(
+                spec.get("funded_threshold")
+                if spec.get("funded_threshold") is not None
+                else spec.get("threshold")
+                if spec.get("threshold") is not None
+                else spec.get("minimum_balance")
+            )
+            if threshold is None:
+                threshold = 100.0
+            operator = str(spec.get("funded_operator") or spec.get("threshold_operator") or "greater_than")
+            denominator = self._rule_engine_distinct_tokens(metric_rows, account_field, mapping)
+            funded_rows = [
+                row for row in metric_rows
+                if self._flow_condition_eval_operator(
+                    self._rule_engine_row_value(row, balance_field, mapping),
+                    operator,
+                    threshold,
+                )
+            ]
+            numerator = self._rule_engine_distinct_tokens(funded_rows, account_field, mapping)
+            if not denominator:
+                return 0.0
+            scale = self._to_number(spec.get("scale")) or 100.0
+            return round((len(numerator) / len(denominator)) * scale, 6)
+
+        if metric_key in {"ratio", "percent", "percentage", "conditional_ratio"}:
+            numerator_spec = spec.get("numerator") if isinstance(spec.get("numerator"), dict) else {
+                "metric": spec.get("numerator_metric") or "count",
+                "field": spec.get("numerator_field") or field,
+                "conditions": spec.get("numerator_conditions") or spec.get("conditions"),
+            }
+            denominator_spec = spec.get("denominator") if isinstance(spec.get("denominator"), dict) else {
+                "metric": spec.get("denominator_metric") or "count",
+                "field": spec.get("denominator_field") or field,
+                "conditions": spec.get("denominator_conditions"),
+            }
+            numerator = self._rule_engine_group_metric_value(rows, numerator_spec, numerator_spec.get("field"), mapping)
+            denominator = self._rule_engine_group_metric_value(rows, denominator_spec, denominator_spec.get("field"), mapping)
+            if not denominator:
+                return 0.0
+            scale = self._to_number(spec.get("scale")) or 100.0
+            return round((float(numerator or 0.0) / float(denominator or 0.0)) * scale, 6)
+
+        if metric_key in {"elapsed_months", "age_months", "months_since"}:
+            as_of_field = spec.get("as_of_field") or spec.get("end_date_field")
+            as_of_value = spec.get("as_of_date") or spec.get("evaluation_date")
+            values: List[float] = []
+            for row in metric_rows:
+                start_value = self._rule_engine_row_value(row, field, mapping)
+                end_value = self._rule_engine_row_value(row, as_of_field, mapping) if as_of_field else as_of_value
+                if end_value is None:
+                    end_value = self._rule_engine_row_value(row, mapping.get("date_field") or "transaction_date", mapping)
+                delta = self._rule_engine_month_delta(start_value, end_value)
+                if delta is not None:
+                    values.append(float(delta))
+            if not values:
+                return 0.0
+            aggregate = str(spec.get("aggregate") or "max").strip().lower()
+            if aggregate in {"min", "minimum"}:
+                return min(values)
+            if aggregate in {"avg", "average", "mean"}:
+                return round(sum(values) / len(values), 6)
+            return max(values)
+
+        if metric_key in {"elapsed_days", "age_days", "days_since"}:
+            as_of_field = spec.get("as_of_field") or spec.get("end_date_field")
+            as_of_value = spec.get("as_of_date") or spec.get("evaluation_date")
+            values = []
+            for row in metric_rows:
+                start_dt = self._parse_profile_event_time(self._rule_engine_row_value(row, field, mapping))
+                end_raw = self._rule_engine_row_value(row, as_of_field, mapping) if as_of_field else as_of_value
+                if end_raw is None:
+                    end_raw = self._rule_engine_row_value(row, mapping.get("date_field") or "transaction_date", mapping)
+                end_dt = self._parse_profile_event_time(end_raw)
+                if start_dt is not None and end_dt is not None:
+                    values.append(float((end_dt.date() - start_dt.date()).days))
+            if not values:
+                return 0.0
+            aggregate = str(spec.get("aggregate") or "max").strip().lower()
+            if aggregate in {"min", "minimum"}:
+                return min(values)
+            if aggregate in {"avg", "average", "mean"}:
+                return round(sum(values) / len(values), 6)
+            return max(values)
+
+        return self._rule_engine_metric_value(metric_rows, metric_key, field, mapping)
+
+    def _rule_engine_commission_share_specs(self, rule: Dict[str, Any], calculation: Dict[str, Any]) -> List[Dict[str, Any]]:
+        raw = (
+            calculation.get("shares")
+            if calculation.get("shares") is not None
+            else calculation.get("commission_shares")
+            if calculation.get("commission_shares") is not None
+            else rule.get("shares")
+            if rule.get("shares") is not None
+            else rule.get("commission_shares")
+            if rule.get("commission_shares") is not None
+            else rule.get("split")
+        )
+        if isinstance(raw, dict):
+            if any(key in raw for key in ("bc_percent", "cbc_percent", "bc_share", "cbc_share")):
+                shares: List[Dict[str, Any]] = []
+                bc_pct = raw.get("bc_percent") if raw.get("bc_percent") is not None else raw.get("bc_share")
+                cbc_pct = raw.get("cbc_percent") if raw.get("cbc_percent") is not None else raw.get("cbc_share")
+                if bc_pct is not None:
+                    shares.append({"id": "bc", "payee_type": "BC", "percent": bc_pct})
+                if cbc_pct is not None:
+                    shares.append({"id": "cbc", "payee_type": "CBC", "percent": cbc_pct})
+                raw = shares
+            else:
+                raw = raw.get("items") or raw.get("shares") or []
+        return [
+            share for share in self._rule_engine_list(raw)
+            if isinstance(share, dict) and share.get("enabled", True) is not False
+        ]
+
+    def _rule_engine_expand_commission_shares(
+        self,
+        output_row: Dict[str, Any],
+        rule: Dict[str, Any],
+        calculation: Dict[str, Any],
+        first_row: Dict[str, Any],
+        mapping: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        shares = self._rule_engine_commission_share_specs(rule, calculation)
+        if not shares:
+            return [output_row]
+
+        base_raw = float(self._to_number(output_row.get("raw_commission")) or 0.0)
+        base_final = float(self._to_number(output_row.get("final_commission")) or 0.0)
+        base_component = str(output_row.get("component_id") or rule.get("id") or "component")
+        condition_row = {**(first_row or {}), **output_row}
+        out: List[Dict[str, Any]] = []
+        for index, share in enumerate(shares):
+            condition_tree = self._rule_engine_json_value(
+                share.get("condition_tree") if share.get("condition_tree") is not None else share.get("conditionTree"),
+                None,
+            )
+            conditions = self._rule_engine_list(share.get("conditions"))
+            condition_payload: Any = condition_tree if isinstance(condition_tree, (dict, list)) else conditions
+            if isinstance(condition_payload, (dict, list)) and not self._rule_engine_matches_conditions(
+                condition_row,
+                condition_payload,
+                mapping,
+                share.get("match_mode") or "all",
+            ):
+                continue
+
+            percent = self._to_number(
+                share.get("percent")
+                if share.get("percent") is not None
+                else share.get("percentage")
+                if share.get("percentage") is not None
+                else share.get("rate_percent")
+            )
+            fixed_amount = self._to_number(share.get("amount") if share.get("amount") is not None else share.get("fixed_amount"))
+            if fixed_amount is not None:
+                final_value = fixed_amount
+                raw_value = fixed_amount
+                share_percent = round((fixed_amount / base_final) * 100.0, 6) if base_final else None
+            else:
+                if percent is None:
+                    percent = 0.0
+                final_value = base_final * (percent / 100.0)
+                raw_value = base_raw * (percent / 100.0)
+                share_percent = percent
+
+            share_id = str(share.get("id") or share.get("key") or share.get("payee_type") or f"share_{index + 1}").strip()
+            payee_type = str(share.get("payee_type") or share.get("payee") or share_id).strip()
+            share_component = str(
+                share.get("component_id")
+                or share.get("component")
+                or share.get("settlement_component")
+                or f"{base_component}_{self._rule_engine_slug(payee_type or share_id)}"
+            )
+            row = dict(output_row)
+            row.update({
+                "component_id": share_component,
+                "component_name": str(
+                    share.get("component_name")
+                    or share.get("settlement_component_name")
+                    or share.get("name")
+                    or f"{output_row.get('component_name') or base_component} {payee_type}".strip()
+                ),
+                "payee_type": payee_type,
+                "parent_component_id": base_component,
+                "commission_share_percent": share_percent,
+                "raw_commission": round(raw_value, 6),
+                "final_commission": round(final_value, 6),
+                "commission_split_applied": True,
+            })
+            trace = row.get("_rule_trace")
+            if isinstance(trace, dict):
+                row["_rule_trace"] = {
+                    **trace,
+                    "parent_component_id": base_component,
+                    "share_id": share_id,
+                    "payee_type": payee_type,
+                    "commission_share_percent": share_percent,
+                    "raw_value": round(raw_value, 6),
+                    "final_value": round(final_value, 6),
+                }
+            out.append(row)
+        return out
+
+    def _rule_engine_row_value(self, row: dict, field_name: Any, mapping: Dict[str, str]) -> Any:
+        field_path = self._rule_engine_resolve_field(field_name, mapping)
+        if not field_path:
+            return None
+        value, found = self._extract_row_value_by_path(row, field_path)
+        if found:
+            return value
+        return row.get(field_path)
+
+    def _rule_engine_group_parts(
+        self,
+        row: dict,
+        group_by: List[Any],
+        mapping: Dict[str, str],
+        period_grain: Any,
+    ) -> List[Tuple[str, Any]]:
+        parts: List[Tuple[str, Any]] = []
+        seen_keys: set[str] = set()
+        for raw_field in group_by:
+            token = str(raw_field or "").strip()
+            if not token:
+                continue
+            normalized = token.lower().replace(" ", "_")
+            if normalized in {"period", "day", "daily", "date", "month", "monthly", "quarter", "quarterly", "year", "yearly"}:
+                grain = normalized
+                if grain in {"period"}:
+                    grain = str(period_grain or "month")
+                label = "period" if normalized == "period" else (
+                    "day" if grain in {"day", "daily", "date"} else
+                    "month" if grain in {"month", "monthly"} else
+                    "quarter" if grain in {"quarter", "quarterly"} else
+                    "year"
+                )
+                if label in seen_keys:
+                    continue
+                parts.append((label, self._rule_engine_period(row, mapping, grain)))
+                seen_keys.add(label)
+                continue
+            output_key = self._rule_engine_output_key(token, mapping)
+            if output_key in seen_keys:
+                continue
+            parts.append((output_key, self._rule_engine_row_value(row, token, mapping)))
+            seen_keys.add(output_key)
+        return parts
+
+    def _rule_engine_group_key(
+        self,
+        row: dict,
+        group_by: List[Any],
+        mapping: Dict[str, str],
+        period_grain: Any,
+    ) -> Tuple[Tuple[str, Any], ...]:
+        return tuple(self._rule_engine_group_parts(row, group_by, mapping, period_grain))
+
+    def _rule_engine_numeric_sum(self, rows: List[dict], field_name: str, mapping: Dict[str, str]) -> float:
+        total = 0.0
+        for row in rows:
+            num = self._to_number(self._rule_engine_row_value(row, field_name, mapping))
+            if num is not None:
+                total += num
+        return total
+
+    def _rule_engine_metric_value(
+        self,
+        rows: List[dict],
+        measure: Any,
+        field_name: Any,
+        mapping: Dict[str, str],
+    ) -> float:
+        metric = str(measure or "sum").strip().lower()
+        if metric in {"count", "rows", "transactions", "transaction_count"}:
+            return float(len(rows))
+        field = str(field_name or mapping.get("amount_field") or "amount")
+        values: List[float] = []
+        distinct_values: set[str] = set()
+        non_null_count = 0
+        for row in rows:
+            raw = self._rule_engine_row_value(row, field, mapping)
+            if metric in {"count_non_null", "non_null_count", "present_count"}:
+                if raw is not None and str(raw).strip() != "":
+                    non_null_count += 1
+                continue
+            if metric in {"distinct_day_count", "distinct_days", "active_days", "attendance_days"}:
+                if raw is not None and str(raw).strip() != "":
+                    parsed = self._parse_profile_event_time(raw)
+                    distinct_values.add(parsed.date().isoformat() if parsed is not None else str(raw))
+                continue
+            if metric in {"distinct", "distinct_count", "unique", "unique_count"}:
+                if raw is not None and str(raw).strip() != "":
+                    distinct_values.add(str(raw))
+                continue
+            num = self._to_number(raw)
+            if num is not None:
+                values.append(float(num))
+        if metric in {"count_non_null", "non_null_count", "present_count"}:
+            return float(non_null_count)
+        if metric in {"distinct", "distinct_count", "unique", "unique_count"}:
+            return float(len(distinct_values))
+        if metric in {"distinct_day_count", "distinct_days", "active_days", "attendance_days"}:
+            return float(len(distinct_values))
+        if metric in {"avg", "average", "mean"}:
+            return round(sum(values) / len(values), 6) if values else 0.0
+        if metric in {"min", "minimum"}:
+            return min(values) if values else 0.0
+        if metric in {"max", "maximum"}:
+            return max(values) if values else 0.0
+        return round(sum(values), 6)
+
+    def _rule_engine_target_measures(self, target: Dict[str, Any]) -> List[Dict[str, Any]]:
+        measures = self._rule_engine_list(
+            target.get("measures")
+            if target.get("measures") is not None
+            else target.get("target_measures")
+        )
+        normalized = [item for item in measures if isinstance(item, dict) and item.get("enabled", True) is not False]
+        if normalized:
+            return normalized
+        return [{
+            "id": target.get("measure_id") or target.get("id") or "target_measure",
+            "name": target.get("measure_name") or target.get("metric_name") or target.get("name") or "Target Measure",
+            "measure": target.get("measure") or "count",
+            "field": target.get("field") or target.get("measure_field"),
+            "target_value": target.get("target_value") if target.get("target_value") is not None else target.get("target") if target.get("target") is not None else target.get("value"),
+            "warning_percent": target.get("warning_percent") if target.get("warning_percent") is not None else target.get("warn_at_percent"),
+            "operator": target.get("operator") or "greater_or_equal",
+            "weight": target.get("weight"),
+        }]
+
+    def _rule_engine_anomaly_checks(self, anomaly: Dict[str, Any]) -> List[Dict[str, Any]]:
+        checks = self._rule_engine_list(
+            anomaly.get("checks")
+            if anomaly.get("checks") is not None
+            else anomaly.get("anomaly_checks")
+        )
+        normalized = [item for item in checks if isinstance(item, dict) and item.get("enabled", True) is not False]
+        if normalized:
+            return normalized
+        return [{
+            "id": anomaly.get("check_id") or anomaly.get("id") or "anomaly_check",
+            "name": anomaly.get("check_name") or anomaly.get("metric_name") or anomaly.get("name") or "Anomaly Check",
+            "type": anomaly.get("type") or "threshold",
+            "measure": anomaly.get("measure") or "sum",
+            "field": anomaly.get("field") or anomaly.get("measure_field"),
+            "operator": anomaly.get("operator") or anomaly.get("condition") or "greater_than",
+            "threshold": anomaly.get("threshold") if anomaly.get("threshold") is not None else anomaly.get("value") if anomaly.get("value") is not None else anomaly.get("threshold_value"),
+            "severity": anomaly.get("severity") or "warning",
+            "baseline": anomaly.get("baseline") or anomaly.get("expected_value"),
+            "threshold_percent": anomaly.get("threshold_percent") or anomaly.get("percent"),
+        }]
+
+    def _rule_engine_condition_is_group(self, condition: Any) -> bool:
+        if not isinstance(condition, dict):
+            return False
+        condition_type = str(condition.get("type") or condition.get("kind") or "").strip().lower()
+        if condition_type == "group":
+            return True
+        return any(isinstance(condition.get(key), list) for key in ("conditions", "children", "rules", "items"))
+
+    def _rule_engine_condition_children(self, condition: Dict[str, Any]) -> List[Any]:
+        for key in ("conditions", "children", "rules", "items"):
+            value = condition.get(key)
+            if isinstance(value, list):
+                return value
+        return []
+
+    def _rule_engine_condition_match_mode(self, value: Any) -> str:
+        mode = str(value or "all").strip().lower()
+        if mode in {"any", "or", "some", "one"}:
+            return "any"
+        return "all"
+
+    def _rule_engine_matches_condition_item(
+        self,
+        row: dict,
+        condition: Any,
+        mapping: Dict[str, str],
+    ) -> Optional[bool]:
+        if not isinstance(condition, dict):
+            return None
+        if condition.get("enabled") is False:
+            return None
+        if self._rule_engine_condition_is_group(condition):
+            children = self._rule_engine_condition_children(condition)
+            match_mode = (
+                condition.get("match_mode")
+                or condition.get("mode")
+                or condition.get("operator")
+                or "all"
+            )
+            return self._rule_engine_matches_conditions(row, children, mapping, match_mode)
+
+        field_name = condition.get("field") or condition.get("left") or condition.get("path")
+        if not str(field_name or "").strip():
+            return None
+        operator = str(condition.get("operator") or "equals")
+        right_value = condition.get("value")
+        normalized_operator = operator.strip().lower().replace("_", " ")
+        value_mode = str(condition.get("value_mode") or "").strip().lower()
+        if normalized_operator not in {"is null", "is blank", "is not null", "is not blank"}:
+            if value_mode in {"field", "path"}:
+                if not str(right_value or "").strip():
+                    return None
+            elif right_value is None:
+                return None
+            elif isinstance(right_value, str) and not right_value.strip():
+                return None
+            elif isinstance(right_value, (list, tuple, set)) and not right_value:
+                return None
+        if value_mode in {"field", "path"}:
+            right_value = self._rule_engine_row_value(row, right_value, mapping)
+        left_value = self._rule_engine_row_value(row, field_name, mapping)
+        return self._flow_condition_eval_operator(
+            left_value,
+            operator,
+            right_value,
+            bool(condition.get("case_sensitive", False)),
+        )
+
+    def _rule_engine_matches_conditions(
+        self,
+        row: dict,
+        conditions: Any,
+        mapping: Dict[str, str],
+        match_mode: Any = "all",
+    ) -> bool:
+        if isinstance(conditions, dict):
+            if conditions.get("enabled") is False:
+                return True
+            if self._rule_engine_condition_is_group(conditions):
+                group_mode = (
+                    conditions.get("match_mode")
+                    or conditions.get("mode")
+                    or conditions.get("operator")
+                    or match_mode
+                )
+                return self._rule_engine_matches_conditions(
+                    row,
+                    self._rule_engine_condition_children(conditions),
+                    mapping,
+                    group_mode,
+                )
+            result = self._rule_engine_matches_condition_item(row, conditions, mapping)
+            return True if result is None else bool(result)
+
+        if not isinstance(conditions, list):
+            return True
+
+        checks: List[bool] = []
+        for condition in conditions:
+            result = self._rule_engine_matches_condition_item(row, condition, mapping)
+            if result is not None:
+                checks.append(bool(result))
+        if not checks:
+            return True
+        return any(checks) if self._rule_engine_condition_match_mode(match_mode) == "any" else all(checks)
+
+    def _rule_engine_calculate(
+        self,
+        rows: List[dict],
+        calculation: Dict[str, Any],
+        mapping: Dict[str, str],
+        rule: Dict[str, Any],
+    ) -> Tuple[float, Dict[str, Any]]:
+        method = str(
+            calculation.get("method")
+            or calculation.get("type")
+            or rule.get("calculation_type")
+            or "percentage"
+        ).strip().lower()
+        amount_field = str(calculation.get("amount_field") or mapping.get("amount_field") or "amount")
+        amount_sum = self._rule_engine_numeric_sum(rows, amount_field, mapping)
+        count_value = len(rows)
+        trace: Dict[str, Any] = {
+            "method": method,
+            "matched_count": count_value,
+            "amount_sum": round(amount_sum, 6),
+        }
+
+        if method in {"percentage", "percent", "rate"}:
+            raw_rate = calculation.get("rate_percent")
+            if raw_rate is None:
+                raw_rate = calculation.get("percentage")
+            if raw_rate is None:
+                raw_rate = calculation.get("rate")
+            rate = self._to_number(raw_rate)
+            if rate is None:
+                rate = 0.0
+            multiplier = rate / 100.0
+            if str(calculation.get("rate_mode") or "").strip().lower() in {"decimal", "multiplier"}:
+                multiplier = rate
+            basis_value = amount_sum
+            if any(calculation.get(key) is not None for key in ("basis_metric", "metric", "basis_field", "measure_field")):
+                basis_metric = calculation.get("basis_metric") or calculation.get("metric") or "sum"
+                basis_field = (
+                    calculation.get("basis_field")
+                    or calculation.get("measure_field")
+                    or calculation.get("amount_field")
+                    or amount_field
+                )
+                basis_value = self._rule_engine_group_metric_value(rows, {**calculation, "metric": basis_metric, "field": basis_field}, basis_field, mapping)
+            value = float(basis_value or 0.0) * multiplier
+            trace.update({"rate": rate, "rate_mode": calculation.get("rate_mode") or "percent", "basis_value": round(float(basis_value or 0.0), 6)})
+            return round(value, 6), trace
+
+        if method in {"flat", "fixed", "fixed_amount"}:
+            flat_amount = self._to_number(
+                calculation.get("amount")
+                if calculation.get("amount") is not None
+                else calculation.get("flat_amount")
+            )
+            if flat_amount is None:
+                flat_amount = 0.0
+            calc_rows = self._rule_engine_rows_for_metric(rows, calculation, mapping)
+            requested_distinct_field = calculation.get("per_distinct_field") or calculation.get("distinct_by")
+            per_distinct_field = requested_distinct_field if (
+                requested_distinct_field
+                or calculation.get("per_distinct") is True
+                or calculation.get("per_account") is True
+            ) else None
+            if per_distinct_field is True:
+                per_distinct_field = mapping.get("account_field") or mapping.get("identifier_field") or "account_number"
+            if per_distinct_field:
+                multiplier_count = len(self._rule_engine_distinct_tokens(calc_rows, per_distinct_field, mapping))
+                per_row = False
+            else:
+                per_row = bool(calculation.get("per_row", True))
+                multiplier_count = len(calc_rows) if per_row else 1
+            value = flat_amount * multiplier_count
+            trace.update({
+                "flat_amount": flat_amount,
+                "per_row": per_row,
+                "per_distinct_field": per_distinct_field,
+                "multiplier_count": multiplier_count,
+            })
+            return round(value, 6), trace
+
+        if method in {"formula", "expression"}:
+            expression = str(calculation.get("expression") or rule.get("expression") or "").strip()
+            if not expression:
+                return 0.0, {**trace, "expression": "", "error": "Missing expression"}
+            def _logical_row(row: dict) -> dict:
+                out = dict(row or {})
+                for logical_name, mapped_path in mapping.items():
+                    key = str(logical_name or "").strip()
+                    if not key or key.endswith("_field"):
+                        continue
+                    if key in out:
+                        continue
+                    value, found = self._extract_row_value_by_path(row, mapped_path)
+                    if found:
+                        out[key] = value
+                return out
+
+            mapped_rows = [_logical_row(row) for row in rows]
+            first_row = dict(mapped_rows[0]) if mapped_rows else {}
+            formula_row = {
+                **first_row,
+                "transaction_count": count_value,
+                "service_count": count_value,
+                "amount_sum": amount_sum,
+                "service_amount": amount_sum,
+            }
+            try:
+                value = self._evaluate_custom_expression(
+                    expression,
+                    formula_row,
+                    {},
+                    dataset_rows=mapped_rows,
+                )
+                numeric = self._to_number(value)
+                trace.update({"expression": expression, "formula_value": value})
+                return round(float(numeric or 0.0), 6), trace
+            except Exception as exc:
+                trace.update({"expression": expression, "error": str(exc)})
+                return 0.0, trace
+
+        if method in {"slab", "slabs", "tier"}:
+            basis = str(calculation.get("basis") or "amount").strip().lower()
+            slabs = self._rule_engine_list(calculation.get("slabs"))
+            normalized_slabs = [slab for slab in slabs if isinstance(slab, dict)]
+
+            def _basis_for(group_rows: List[dict]) -> float:
+                if basis in {"count", "transactions", "rows", "service_count"}:
+                    return float(len(group_rows))
+                if basis in {"amount", "sum", "service_amount"} and not any(
+                    calculation.get(key) is not None
+                    for key in ("basis_metric", "metric", "basis_field", "measure_field")
+                ):
+                    return self._rule_engine_numeric_sum(group_rows, amount_field, mapping)
+                basis_metric = (
+                    calculation.get("basis_metric")
+                    or calculation.get("metric")
+                    or ("avg" if basis in {"avg", "average", "average_balance", "avg_balance"} else "sum")
+                )
+                basis_field = (
+                    calculation.get("basis_field")
+                    or calculation.get("measure_field")
+                    or calculation.get("amount_field")
+                    or amount_field
+                )
+                return self._rule_engine_group_metric_value(group_rows, {**calculation, "metric": basis_metric, "field": basis_field}, basis_field, mapping)
+
+            def _select_slab(basis_value: float) -> Optional[Dict[str, Any]]:
+                for slab in normalized_slabs:
+                    min_value = self._to_number(slab.get("min"))
+                    max_value = self._to_number(slab.get("max"))
+                    if min_value is not None and basis_value < min_value:
+                        continue
+                    if max_value is not None and basis_value > max_value:
+                        continue
+                    return slab
+                return None
+
+            def _slab_value(selected_slab: Optional[Dict[str, Any]], basis_value: float, scoped_amount: float) -> float:
+                if not selected_slab:
+                    fallback = self._to_number(calculation.get("fallback_amount") if calculation.get("fallback_amount") is not None else calculation.get("default_amount"))
+                    return float(fallback or 0.0)
+                slab_method = str(selected_slab.get("method") or selected_slab.get("type") or "flat").strip().lower()
+                if slab_method in {"percentage", "percent", "rate"}:
+                    rate = self._to_number(
+                        selected_slab.get("rate_percent")
+                        if selected_slab.get("rate_percent") is not None
+                        else selected_slab.get("rate")
+                    ) or 0.0
+                    pct_basis = basis_value if selected_slab.get("percentage_basis") == "basis" else scoped_amount
+                    return float(pct_basis or 0.0) * (rate / 100.0)
+                return self._to_number(
+                    selected_slab.get("amount")
+                    if selected_slab.get("amount") is not None
+                    else selected_slab.get("value")
+                ) or 0.0
+
+            apply_mode = str(
+                calculation.get("apply")
+                or calculation.get("apply_mode")
+                or ("per_distinct" if calculation.get("per_account") is True or calculation.get("per_distinct") is True else "")
+            ).strip().lower()
+            calc_rows = self._rule_engine_rows_for_metric(rows, calculation, mapping)
+            if apply_mode in {"per_row", "per_record", "per_item"}:
+                total_value = 0.0
+                selected_count = 0
+                for row in calc_rows:
+                    row_basis = _basis_for([row])
+                    row_amount = self._rule_engine_numeric_sum([row], amount_field, mapping)
+                    selected_slab = _select_slab(row_basis)
+                    total_value += _slab_value(selected_slab, row_basis, row_amount)
+                    if selected_slab:
+                        selected_count += 1
+                trace.update({
+                    "basis": basis,
+                    "apply": apply_mode,
+                    "evaluated_items": len(calc_rows),
+                    "selected_count": selected_count,
+                    "slabs": normalized_slabs,
+                })
+                return round(total_value, 6), trace
+
+            if apply_mode in {"per_distinct", "per_account", "per_identifier"}:
+                distinct_field = (
+                    calculation.get("distinct_by")
+                    or calculation.get("per_distinct_field")
+                    or calculation.get("account_field")
+                    or mapping.get("account_field")
+                    or mapping.get("identifier_field")
+                    or "account_number"
+                )
+                buckets: Dict[str, List[dict]] = {}
+                for row in calc_rows:
+                    token_value = self._rule_engine_row_value(row, distinct_field, mapping)
+                    if token_value is None or str(token_value).strip() == "":
+                        continue
+                    buckets.setdefault(self._stable_json_token(token_value), []).append(row)
+                total_value = 0.0
+                selected_count = 0
+                for bucket_rows in buckets.values():
+                    bucket_basis = _basis_for(bucket_rows)
+                    bucket_amount = self._rule_engine_numeric_sum(bucket_rows, amount_field, mapping)
+                    selected_slab = _select_slab(bucket_basis)
+                    total_value += _slab_value(selected_slab, bucket_basis, bucket_amount)
+                    if selected_slab:
+                        selected_count += 1
+                trace.update({
+                    "basis": basis,
+                    "apply": apply_mode,
+                    "distinct_field": distinct_field,
+                    "evaluated_items": len(buckets),
+                    "selected_count": selected_count,
+                    "slabs": normalized_slabs,
+                })
+                return round(total_value, 6), trace
+
+            basis_value = _basis_for(calc_rows)
+            selected_slab = _select_slab(basis_value)
+            if not selected_slab:
+                return 0.0, {**trace, "basis": basis, "basis_value": basis_value, "slab": None}
+            value = _slab_value(selected_slab, basis_value, amount_sum)
+            trace.update({"basis": basis, "basis_value": basis_value, "slab": selected_slab})
+            return round(value, 6), trace
+
+        return 0.0, {**trace, "error": f"Unsupported calculation method '{method}'"}
+
+    def _rule_engine_apply_cap(
+        self,
+        raw_value: float,
+        cap: Dict[str, Any],
+    ) -> Tuple[float, Dict[str, Any]]:
+        if not isinstance(cap, dict) or cap.get("enabled") is False:
+            return raw_value, {"cap_applied": False, "cap_amount": None}
+        cap_amount = self._to_number(
+            cap.get("amount")
+            if cap.get("amount") is not None
+            else cap.get("max_amount")
+        )
+        if cap_amount is None or cap_amount < 0:
+            return raw_value, {"cap_applied": False, "cap_amount": None}
+        final_value = min(float(raw_value or 0.0), cap_amount)
+        return round(final_value, 6), {
+            "cap_applied": final_value < float(raw_value or 0.0),
+            "cap_amount": cap_amount,
+        }
+
+    def _rule_engine_matches_group_filters(
+        self,
+        group_filters: List[Any],
+        output_row: Dict[str, Any],
+        amount_sum: float,
+        group_count: int,
+        raw_commission: float,
+        final_commission: float,
+        group_rows: Optional[List[dict]] = None,
+        mapping: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        filters = [item for item in group_filters if isinstance(item, dict) and item.get("enabled", True) is not False]
+        if not filters:
+            return True
+
+        aggregate_metrics = {
+            "sum", "total", "avg", "average", "mean", "min", "minimum", "max", "maximum",
+            "distinct", "distinct_count", "unique", "unique_count", "distinct_day_count",
+            "distinct_days", "active_days", "attendance_days", "count_non_null",
+            "non_null_count", "present_count", "average_balance", "avg_balance",
+            "balance_average", "window_avg", "window_average", "window_average_balance",
+            "window_sum", "window_total", "window_count", "funded_ratio",
+            "funded_percent", "funding_ratio", "funding_percent", "ratio", "percent",
+            "percentage", "conditional_ratio", "elapsed_months", "age_months",
+            "months_since", "elapsed_days", "age_days", "days_since",
+        }
+
+        def _metric_value(filter_item: Dict[str, Any]) -> Any:
+            metric = filter_item.get("metric") or filter_item.get("measure") or filter_item.get("field") or "service_amount"
+            key = str(metric or "service_amount").strip().lower()
+            aliases = {
+                "amount": amount_sum,
+                "amount_sum": amount_sum,
+                "service_amount": amount_sum,
+                "group_amount": amount_sum,
+                "count": group_count,
+                "service_count": group_count,
+                "group_count": group_count,
+                "matched_rows": group_count,
+                "raw_commission": raw_commission,
+                "commission": final_commission,
+                "final_commission": final_commission,
+                "total_commission": final_commission,
+            }
+            if key in aliases:
+                return aliases[key]
+            if group_rows is not None and mapping is not None and key in aggregate_metrics:
+                field_name = (
+                    filter_item.get("field_name")
+                    or filter_item.get("source_field")
+                    or filter_item.get("measure_field")
+                    or filter_item.get("field")
+                    or filter_item.get("basis_field")
+                    or mapping.get("amount_field")
+                    or "amount"
+                )
+                return self._rule_engine_group_metric_value(group_rows, filter_item, field_name, mapping)
+            return output_row.get(str(metric or ""))
+
+        checks: List[bool] = []
+        for item in filters:
+            operator = str(item.get("operator") or "less_or_equal")
+            compare_value = item.get("value")
+            checks.append(self._flow_condition_eval_operator(
+                _metric_value(item),
+                operator,
+                compare_value,
+                bool(item.get("case_sensitive", False)),
+            ))
+        mode = self._rule_engine_condition_match_mode(
+            filters[0].get("match_mode") if len(filters) == 1 else None
+        )
+        return any(checks) if mode == "any" else all(checks)
+
+    def _rule_engine_target_rows(
+        self,
+        rows: List[dict],
+        targets: List[Any],
+        mapping: Dict[str, str],
+        output_layout: Dict[str, Any],
+    ) -> List[dict]:
+        out: List[dict] = []
+        default_group = output_layout.get("row_fields") or ["entity", "period"]
+        default_grain = output_layout.get("period_grain") or "month"
+        for target in targets:
+            if not isinstance(target, dict) or target.get("enabled") is False:
+                continue
+            target_conditions = self._rule_engine_list(target.get("conditions"))
+            condition_tree = self._rule_engine_json_value(
+                target.get("condition_tree") if target.get("condition_tree") is not None else target.get("conditionTree"),
+                None,
+            )
+            if not isinstance(condition_tree, (dict, list)):
+                condition_tree = None
+            match_mode = target.get("match_mode") or "all"
+            condition_payload: Any = condition_tree if condition_tree is not None else target_conditions
+            matched_rows = [
+                row for row in rows
+                if self._rule_engine_matches_conditions(row, condition_payload, mapping, match_mode)
+            ]
+            if not matched_rows:
+                continue
+            group_by = self._rule_engine_list(target.get("group_by") or default_group)
+            period_grain = target.get("period_grain") or default_grain
+            groups: Dict[Tuple[Tuple[str, Any], ...], List[dict]] = {}
+            for row in matched_rows:
+                key = self._rule_engine_group_key(row, group_by, mapping, period_grain)
+                groups.setdefault(key, []).append(row)
+            target_measures = self._rule_engine_target_measures(target)
+            for key, group_rows in groups.items():
+                for measure_spec in target_measures:
+                    measure = str(measure_spec.get("measure") or "count").strip().lower()
+                    field_name = str(measure_spec.get("field") or measure_spec.get("measure_field") or mapping.get("amount_field") or "amount")
+                    target_value = self._to_number(
+                        measure_spec.get("target_value")
+                        if measure_spec.get("target_value") is not None
+                        else measure_spec.get("target")
+                        if measure_spec.get("target") is not None
+                        else measure_spec.get("value")
+                    ) or 0.0
+                    warn_at = self._to_number(
+                        measure_spec.get("warning_percent")
+                        if measure_spec.get("warning_percent") is not None
+                        else measure_spec.get("warn_at_percent")
+                    ) or 80.0
+                    actual = self._rule_engine_group_metric_value(group_rows, {**measure_spec, "metric": measure, "field": field_name}, field_name, mapping)
+                    achievement = (actual / target_value * 100.0) if target_value else 0.0
+                    gap = max(target_value - actual, 0.0)
+                    if target_value and achievement >= 100:
+                        status = "achieved"
+                        severity = "ok"
+                    elif target_value and achievement >= warn_at:
+                        status = "at_risk"
+                        severity = "warning"
+                    else:
+                        status = "missed"
+                        severity = "critical"
+                    row_out = {str(part_key): part_value for part_key, part_value in key}
+                    measure_id = str(measure_spec.get("id") or measure_spec.get("key") or measure or "target_measure")
+                    measure_name = str(measure_spec.get("name") or measure_spec.get("label") or measure_id)
+                    row_out.update({
+                        "record_type": "target",
+                        "cluster_id": str(target.get("cluster_id") or target.get("cluster") or "target_activity"),
+                        "target_id": str(target.get("id") or ""),
+                        "target_name": str(target.get("name") or "Target"),
+                        "target_measure_id": measure_id,
+                        "target_measure_name": measure_name,
+                        "target_measure": measure,
+                        "actual": round(actual, 6),
+                        "target_value": round(target_value, 6),
+                        "achievement_percent": round(achievement, 2),
+                        "gap": round(gap, 6),
+                        "target_status": status,
+                        "target_severity": severity,
+                        "target_weight": self._to_number(measure_spec.get("weight")) or 1.0,
+                        "_rule_trace": {
+                            "type": "target",
+                            "target": str(target.get("name") or target.get("id") or "Target"),
+                            "target_measure_id": measure_id,
+                            "target_measure_name": measure_name,
+                            "cluster_id": str(target.get("cluster_id") or target.get("cluster") or "target_activity"),
+                            "matched_source_rows": len(matched_rows),
+                            "group": row_out.copy(),
+                            "actual": round(actual, 6),
+                            "target_value": round(target_value, 6),
+                            "achievement_percent": round(achievement, 2),
+                        },
+                    })
+                    out.append(row_out)
+        return out
+
+    def _rule_engine_anomaly_rows(
+        self,
+        rows: List[dict],
+        anomalies: List[Any],
+        mapping: Dict[str, str],
+        output_layout: Dict[str, Any],
+    ) -> List[dict]:
+        out: List[dict] = []
+        default_group = output_layout.get("row_fields") or ["entity", "period"]
+        default_grain = output_layout.get("period_grain") or "month"
+        for anomaly in anomalies:
+            if not isinstance(anomaly, dict) or anomaly.get("enabled") is False:
+                continue
+            anomaly_conditions = self._rule_engine_list(anomaly.get("conditions"))
+            condition_tree = self._rule_engine_json_value(
+                anomaly.get("condition_tree") if anomaly.get("condition_tree") is not None else anomaly.get("conditionTree"),
+                None,
+            )
+            if not isinstance(condition_tree, (dict, list)):
+                condition_tree = None
+            match_mode = anomaly.get("match_mode") or "all"
+            condition_payload: Any = condition_tree if condition_tree is not None else anomaly_conditions
+            matched_rows = [
+                row for row in rows
+                if self._rule_engine_matches_conditions(row, condition_payload, mapping, match_mode)
+            ]
+            if not matched_rows:
+                continue
+            group_by = self._rule_engine_list(anomaly.get("group_by") or default_group)
+            period_grain = anomaly.get("period_grain") or default_grain
+            groups: Dict[Tuple[Tuple[str, Any], ...], List[dict]] = {}
+            for row in matched_rows:
+                key = self._rule_engine_group_key(row, group_by, mapping, period_grain)
+                groups.setdefault(key, []).append(row)
+            anomaly_checks = self._rule_engine_anomaly_checks(anomaly)
+            for key, group_rows in groups.items():
+                for check_spec in anomaly_checks:
+                    measure = str(check_spec.get("measure") or "sum").strip().lower()
+                    field_name = str(check_spec.get("field") or check_spec.get("measure_field") or mapping.get("amount_field") or "amount")
+                    operator = str(check_spec.get("operator") or check_spec.get("condition") or "greater_than")
+                    threshold = self._to_number(
+                        check_spec.get("threshold")
+                        if check_spec.get("threshold") is not None
+                        else check_spec.get("value")
+                        if check_spec.get("value") is not None
+                        else check_spec.get("threshold_value")
+                    ) or 0.0
+                    rule_type = str(check_spec.get("type") or "threshold").strip().lower()
+                    actual = self._rule_engine_group_metric_value(group_rows, {**check_spec, "metric": measure, "field": field_name}, field_name, mapping)
+                    compare_value = threshold
+                    if rule_type in {"spike", "drop"}:
+                        baseline = self._to_number(check_spec.get("baseline") or check_spec.get("expected_value")) or 0.0
+                        pct = self._to_number(check_spec.get("threshold_percent") or check_spec.get("percent")) or threshold
+                        if baseline:
+                            change_pct = ((actual - baseline) / abs(baseline)) * 100.0
+                        else:
+                            change_pct = 100.0 if actual else 0.0
+                        actual_to_test = change_pct
+                        compare_value = pct
+                        operator = "greater_or_equal" if rule_type == "spike" else "less_or_equal"
+                    else:
+                        actual_to_test = actual
+                    matched = self._flow_condition_eval_operator(actual_to_test, operator, compare_value)
+                    if not matched:
+                        continue
+                    severity = str(check_spec.get("severity") or anomaly.get("severity") or "warning").strip().lower() or "warning"
+                    row_out = {str(part_key): part_value for part_key, part_value in key}
+                    check_id = str(check_spec.get("id") or check_spec.get("key") or measure or "anomaly_check")
+                    check_name = str(check_spec.get("name") or check_spec.get("label") or check_id)
+                    row_out.update({
+                        "record_type": "anomaly",
+                        "cluster_id": str(anomaly.get("cluster_id") or anomaly.get("cluster") or "anomaly_transaction"),
+                        "anomaly_id": str(anomaly.get("id") or ""),
+                        "anomaly_name": str(anomaly.get("name") or "Anomaly"),
+                        "anomaly_check_id": check_id,
+                        "anomaly_check_name": check_name,
+                        "anomaly_type": rule_type,
+                        "anomaly_measure": measure,
+                        "actual": round(actual, 6),
+                        "operator": operator,
+                        "threshold": round(compare_value, 6),
+                        "anomaly_severity": severity,
+                        "anomaly_count": 1,
+                        "_rule_trace": {
+                            "type": "anomaly",
+                            "anomaly": str(anomaly.get("name") or anomaly.get("id") or "Anomaly"),
+                            "anomaly_check_id": check_id,
+                            "anomaly_check_name": check_name,
+                            "cluster_id": str(anomaly.get("cluster_id") or anomaly.get("cluster") or "anomaly_transaction"),
+                            "matched_source_rows": len(matched_rows),
+                            "measure": measure,
+                            "actual": round(actual, 6),
+                            "operator": operator,
+                            "threshold": round(compare_value, 6),
+                            "severity": severity,
+                        },
+                    })
+                    out.append(row_out)
+        return out
+
+    def _rule_engine_extract_rows_from_payload(self, payload: Any) -> List[dict]:
+        """Normalize table-shaped upstream payloads into records.
+
+        Some upstream nodes expose their result as a single wrapper object such
+        as {"rows": [...], "columns": [...]} or {"data": [...]}. Rule
+        Intelligence must calculate on the wrapped records, not the wrapper.
+        """
+        row_container_keys = (
+            "rows",
+            "records",
+            "items",
+            "data",
+            "preview",
+            "sample",
+            "samples",
+            "result",
+            "results",
+            "output",
+            "outputs",
+            "values",
+            "_preview_rows",
+            "preview_rows",
+            "sample_rows",
+            "sample_input",
+            "sample_output",
+            "table_rows",
+            "result_rows",
+            "output_rows",
+        )
+        metadata_keys = {
+            "columns",
+            "column_names",
+            "schema",
+            "row_count",
+            "total_rows",
+            "rows_loaded",
+            "loaded",
+            "preview_rows",
+            "max_rows",
+            "offset",
+            "page",
+            "page_size",
+            "file",
+            "file_path",
+            "filename",
+            "path",
+            "type",
+            "format",
+            "status",
+            "ok",
+            "message",
+            "meta",
+            "metadata",
+            "summary",
+        }
+
+        def _parse_maybe_json(value: Any) -> Any:
+            if not isinstance(value, str):
+                return value
+            text = value.strip()
+            if not text or len(text) > 25_000_000:
+                return value
+            if not ((text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]"))):
+                return value
+            try:
+                return json.loads(text)
+            except Exception:
+                return value
+
+        def _rows_from(value: Any, depth: int = 0) -> List[dict]:
+            if value is None or depth > 8:
+                return []
+            value = _parse_maybe_json(value)
+            if isinstance(value, list):
+                out: List[dict] = []
+                for item in value:
+                    out.extend(_rows_from(item, depth + 1))
+                return out
+            if not isinstance(value, dict):
+                return []
+
+            container_rows: List[dict] = []
+            container_keys_present: List[str] = []
+            for key in row_container_keys:
+                if key not in value:
+                    continue
+                child_rows = _rows_from(value.get(key), depth + 1)
+                if child_rows:
+                    container_keys_present.append(key)
+                    container_rows.extend(child_rows)
+
+            if container_rows:
+                keys = {str(key or "").strip().lower() for key in value.keys()}
+                non_wrapper_keys = [
+                    key for key in keys
+                    if key not in metadata_keys and key not in set(row_container_keys)
+                ]
+                wrapper_like = (
+                    not non_wrapper_keys
+                    or bool(keys.intersection(metadata_keys))
+                    or (len(keys) <= len(container_keys_present) + 2)
+                )
+                if wrapper_like:
+                    return container_rows
+
+            return [value]
+
+        return _rows_from(payload)
+
+    def _rule_engine_selected_output_fields(self, output_layout: Dict[str, Any]) -> List[str]:
+        raw = (
+            output_layout.get("selected_fields")
+            if output_layout.get("selected_fields") is not None
+            else output_layout.get("visible_fields")
+            if output_layout.get("visible_fields") is not None
+            else output_layout.get("columns")
+            if output_layout.get("columns") is not None
+            else output_layout.get("fields")
+        )
+        fields: List[str] = []
+        seen: set[str] = set()
+        for item in self._rule_engine_list(raw):
+            if isinstance(item, dict):
+                field = str(item.get("field") or item.get("key") or item.get("name") or "").strip()
+            else:
+                field = str(item or "").strip()
+            if not field:
+                continue
+            dedupe_key = field.lower()
+            if dedupe_key in seen:
+                continue
+            fields.append(field)
+            seen.add(dedupe_key)
+        return fields
+
+    def _rule_engine_apply_output_field_selection(
+        self,
+        rows: List[dict],
+        output_layout: Dict[str, Any],
+        mapping: Optional[Dict[str, str]] = None,
+    ) -> List[dict]:
+        selected_fields = self._rule_engine_selected_output_fields(output_layout)
+        if not selected_fields:
+            return rows
+        safe_mapping = mapping or {}
+
+        def _row_lookup(row: dict, key: Any) -> Tuple[Any, bool]:
+            text = str(key or "").strip()
+            if not text:
+                return None, False
+            if text in row:
+                return row.get(text), True
+            value, found = self._extract_row_value_by_path(row, text)
+            if found:
+                return value, True
+            normalized = text.lower().replace(" ", "_")
+            for row_key, row_value in row.items():
+                row_key_norm = str(row_key or "").strip().lower().replace(" ", "_")
+                if row_key_norm == normalized:
+                    return row_value, True
+            return None, False
+
+        def _selected_field_value(row: dict, field: str) -> Any:
+            candidates: List[str] = [field]
+            if safe_mapping:
+                output_key = self._rule_engine_output_key(field, safe_mapping)
+                resolved_key = self._rule_engine_resolve_field(field, safe_mapping)
+                candidates.extend([output_key, resolved_key])
+                field_norm = field.lower().replace(" ", "_")
+                for map_key, map_value in safe_mapping.items():
+                    key_text = str(map_key or "").strip()
+                    value_text = str(map_value or "").strip()
+                    if not key_text and not value_text:
+                        continue
+                    key_norm = key_text.lower().replace(" ", "_")
+                    value_norm = value_text.lower().replace(" ", "_")
+                    if field_norm in {key_norm, value_norm}:
+                        candidates.extend([key_text, key_norm, value_text])
+            seen_candidates: set[str] = set()
+            for candidate in candidates:
+                candidate_text = str(candidate or "").strip()
+                if not candidate_text:
+                    continue
+                dedupe_key = candidate_text.lower().replace(" ", "_")
+                if dedupe_key in seen_candidates:
+                    continue
+                seen_candidates.add(dedupe_key)
+                value, found = _row_lookup(row, candidate_text)
+                if found:
+                    return value
+            return None
+
+        projected: List[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            projected.append({field: _selected_field_value(row, field) for field in selected_fields})
+        return projected
+
+    def _rule_engine_output_group_keys(
+        self,
+        output_layout: Dict[str, Any],
+        mapping: Dict[str, str],
+    ) -> List[str]:
+        row_fields = self._rule_engine_list(output_layout.get("row_fields") or ["entity", "period"])
+        output_group_keys: List[str] = []
+        for token in row_fields:
+            normalized = str(token or "").strip().lower().replace(" ", "_")
+            if normalized in {"period", "day", "daily", "date", "month", "monthly", "quarter", "quarterly", "year", "yearly"}:
+                key = "period" if normalized == "period" else (
+                    "day" if normalized in {"day", "daily", "date"} else
+                    "month" if normalized in {"month", "monthly"} else
+                    "quarter" if normalized in {"quarter", "quarterly"} else
+                    "year"
+                )
+            else:
+                key = self._rule_engine_output_key(token, mapping)
+            if key and key not in output_group_keys:
+                output_group_keys.append(key)
+        if not output_group_keys:
+            output_group_keys = [mapping.get("entity_field", "bc_code"), "period"]
+        return output_group_keys
+
+    def _rule_engine_component_slug(self, ledger: Dict[str, Any], output_layout: Dict[str, Any]) -> str:
+        component_field = str(
+            output_layout.get("component_field")
+            or output_layout.get("settlement_component_field")
+            or "component_id"
+        ).strip()
+        candidates = [
+            ledger.get(component_field) if component_field else None,
+            ledger.get("component_id"),
+            ledger.get("component"),
+            ledger.get("rule_component"),
+            ledger.get("rule_id"),
+            ledger.get("rule_name"),
+            ledger.get("service"),
+        ]
+        return self._rule_engine_slug(next((value for value in candidates if str(value or "").strip()), "component"))
+
+    def _rule_engine_settlement_output_rows(
+        self,
+        ledger_rows: List[dict],
+        target_rows: List[dict],
+        anomaly_rows: List[dict],
+        input_rows: List[dict],
+        mapping: Dict[str, str],
+        output_layout: Dict[str, Any],
+        output_group_keys: List[str],
+        include_audit: bool,
+        max_audit_traces: int,
+    ) -> List[dict]:
+        settlements: Dict[Tuple[Any, ...], dict] = {}
+        component_labels: Dict[str, str] = {}
+
+        for ledger in ledger_rows:
+            key_tuple = tuple(ledger.get(group_key) for group_key in output_group_keys)
+            out = settlements.setdefault(key_tuple, {group_key: ledger.get(group_key) for group_key in output_group_keys})
+            component_slug = self._rule_engine_component_slug(ledger, output_layout)
+            component_labels.setdefault(component_slug, str(
+                ledger.get("component_name")
+                or ledger.get("rule_name")
+                or ledger.get("component_id")
+                or component_slug
+            ))
+            count_value = self._to_number(ledger.get("service_count")) or 0.0
+            amount_value = self._to_number(ledger.get("service_amount")) or 0.0
+            final_value = self._to_number(ledger.get("final_commission")) or 0.0
+            raw_value = self._to_number(ledger.get("raw_commission")) or 0.0
+
+            out[f"{component_slug}_count"] = round((self._to_number(out.get(f"{component_slug}_count")) or 0.0) + count_value, 6)
+            out[f"{component_slug}_amount"] = round((self._to_number(out.get(f"{component_slug}_amount")) or 0.0) + amount_value, 6)
+            out[f"{component_slug}_raw_commission"] = round((self._to_number(out.get(f"{component_slug}_raw_commission")) or 0.0) + raw_value, 6)
+            out[f"{component_slug}_commission"] = round((self._to_number(out.get(f"{component_slug}_commission")) or 0.0) + final_value, 6)
+            for passthrough_key in ("earning_period", "payout_period", "payout_offset_months"):
+                if passthrough_key in ledger and passthrough_key not in out:
+                    out[passthrough_key] = ledger.get(passthrough_key)
+
+            commission_type = str(ledger.get("commission_type") or "variable").strip().lower()
+            if commission_type == "fixed":
+                out["fixed_commission"] = round((self._to_number(out.get("fixed_commission")) or 0.0) + final_value, 6)
+            else:
+                out["variable_commission"] = round((self._to_number(out.get("variable_commission")) or 0.0) + final_value, 6)
+            out["total_service_count"] = round((self._to_number(out.get("total_service_count")) or 0.0) + count_value, 6)
+            out["total_service_amount"] = round((self._to_number(out.get("total_service_amount")) or 0.0) + amount_value, 6)
+            out["total_commission"] = round((self._to_number(out.get("total_commission")) or 0.0) + final_value, 6)
+            out["component_count"] = int(self._to_number(out.get("component_count")) or 0) + 1
+            if include_audit:
+                traces = out.setdefault("_audit_traces", [])
+                if isinstance(traces, list) and len(traces) < max_audit_traces:
+                    traces.append(ledger.get("_rule_trace"))
+
+        for out in settlements.values():
+            out.setdefault("fixed_commission", 0.0)
+            out.setdefault("variable_commission", 0.0)
+            out.setdefault("total_service_count", 0.0)
+            out.setdefault("total_service_amount", 0.0)
+            out.setdefault("total_commission", round((out.get("fixed_commission") or 0.0) + (out.get("variable_commission") or 0.0), 6))
+            out["record_type"] = "settlement"
+            if output_layout.get("include_component_labels") is True:
+                out["component_labels"] = {
+                    slug: label
+                    for slug, label in component_labels.items()
+                    if f"{slug}_commission" in out
+                }
+
+        ordered = list(settlements.values())
+        ordered.sort(key=lambda row: tuple(str(row.get(group_key) or "") for group_key in output_group_keys))
+        return [
+            self._rule_engine_order_settlement_output_row(row, output_group_keys)
+            for row in ordered
+        ]
+
+    def _rule_engine_monitoring_slug(self, *values: Any) -> str:
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                return self._rule_engine_slug(text)
+        return "metric"
+
+    def _rule_engine_output_rows(
+        self,
+        ledger_rows: List[dict],
+        target_rows: List[dict],
+        anomaly_rows: List[dict],
+        input_rows: List[dict],
+        mapping: Dict[str, str],
+        output_layout: Dict[str, Any],
+    ) -> List[dict]:
+        mode = str(output_layout.get("mode") or output_layout.get("output_mode") or "pivot").strip().lower()
+        if mode == "ledger":
+            return self._rule_engine_apply_output_field_selection(ledger_rows, output_layout, mapping)
+        if mode == "summary":
+            mode = "pivot"
+        include_audit = bool(output_layout.get("include_audit", True))
+        try:
+            max_audit_traces = max(0, min(int(output_layout.get("max_audit_traces", 250) or 250), 5000))
+        except Exception:
+            max_audit_traces = 250
+
+        row_fields = self._rule_engine_list(output_layout.get("row_fields") or ["entity", "period"])
+        period_grain = output_layout.get("period_grain") or "month"
+        output_group_keys = self._rule_engine_output_group_keys(output_layout, mapping)
+
+        if mode in {"settlement", "settlement_summary", "settlement_report"}:
+            settlement_rows = self._rule_engine_settlement_output_rows(
+                ledger_rows,
+                target_rows,
+                anomaly_rows,
+                input_rows,
+                mapping,
+                output_layout,
+                output_group_keys,
+                include_audit,
+                max_audit_traces,
+            )
+            return self._rule_engine_apply_output_field_selection(settlement_rows, output_layout, mapping)
+
+        input_stats: Dict[Tuple[Any, ...], Dict[str, float]] = {}
+        for row in input_rows:
+            key_values: List[Any] = []
+            stat_row: Dict[str, Any] = {}
+            parts = self._rule_engine_group_parts(row, row_fields, mapping, period_grain)
+            for part_key, part_value in parts:
+                stat_row[str(part_key)] = part_value
+            for group_key in output_group_keys:
+                key_values.append(stat_row.get(group_key))
+            key_tuple = tuple(key_values)
+            stats = input_stats.setdefault(key_tuple, {"count": 0.0, "amount": 0.0})
+            stats["count"] += 1.0
+            amount = self._to_number(self._rule_engine_row_value(row, "measure", mapping))
+            if amount is not None:
+                stats["amount"] += amount
+
+        pivot: Dict[Tuple[Any, ...], dict] = {}
+        for ledger in ledger_rows:
+            key_tuple = tuple(ledger.get(group_key) for group_key in output_group_keys)
+            out = pivot.setdefault(key_tuple, {group_key: ledger.get(group_key) for group_key in output_group_keys})
+            service_slug = self._rule_engine_slug(ledger.get("service") or ledger.get("category") or ledger.get(mapping.get("service_field", "service")) or "category")
+            count_value = self._to_number(ledger.get("service_count")) or 0.0
+            amount_value = self._to_number(ledger.get("service_amount")) or 0.0
+            final_value = self._to_number(ledger.get("final_commission")) or 0.0
+            out[f"{service_slug}_count"] = round((self._to_number(out.get(f"{service_slug}_count")) or 0.0) + count_value, 6)
+            out[f"{service_slug}_amount"] = round((self._to_number(out.get(f"{service_slug}_amount")) or 0.0) + amount_value, 6)
+            out[f"{service_slug}_commission"] = round((self._to_number(out.get(f"{service_slug}_commission")) or 0.0) + final_value, 6)
+            commission_type = str(ledger.get("commission_type") or "variable").strip().lower()
+            if commission_type == "fixed":
+                out["fixed_commission"] = round((self._to_number(out.get("fixed_commission")) or 0.0) + final_value, 6)
+            else:
+                out["variable_commission"] = round((self._to_number(out.get("variable_commission")) or 0.0) + final_value, 6)
+            out["total_service_count"] = round((self._to_number(out.get("total_service_count")) or 0.0) + count_value, 6)
+            out["total_service_amount"] = round((self._to_number(out.get("total_service_amount")) or 0.0) + amount_value, 6)
+            out["total_commission"] = round((self._to_number(out.get("total_commission")) or 0.0) + final_value, 6)
+            traces = out.setdefault("_audit_traces", []) if include_audit else None
+            if isinstance(traces, list) and len(traces) < max_audit_traces:
+                traces.append(ledger.get("_rule_trace"))
+
+        for key_tuple, out in pivot.items():
+            stats = input_stats.get(key_tuple, {})
+            source_count = stats.get("count") or 0.0
+            total_service_count = self._to_number(out.get("total_service_count")) or 0.0
+            out["percent_total_service"] = round((total_service_count / source_count * 100.0), 2) if source_count else 0.0
+            out.setdefault("fixed_commission", 0.0)
+            out.setdefault("variable_commission", 0.0)
+            out.setdefault("total_commission", round((out.get("fixed_commission") or 0.0) + (out.get("variable_commission") or 0.0), 6))
+            out.setdefault("target_status", "not_configured")
+            out.setdefault("anomaly_count", 0)
+            out["record_type"] = "pivot"
+
+        def _target_key(row: dict) -> Tuple[Any, ...]:
+            return tuple(row.get(group_key) for group_key in output_group_keys)
+
+        def _has_complete_output_group(row: dict) -> bool:
+            for group_key in output_group_keys:
+                if group_key not in row:
+                    return False
+                value = row.get(group_key)
+                if value is None or str(value).strip() == "":
+                    return False
+            return True
+
+        def _target_status_rank(value: Any) -> int:
+            text = str(value or "").strip().lower()
+            if text in {"missed", "failed", "critical"}:
+                return 3
+            if text in {"at_risk", "warning", "partial"}:
+                return 2
+            if text in {"achieved", "ok", "met"}:
+                return 1
+            return 0
+
+        def _anomaly_severity_rank(value: Any) -> int:
+            text = str(value or "").strip().lower()
+            if text in {"critical", "high", "error"}:
+                return 3
+            if text in {"warning", "medium"}:
+                return 2
+            if text in {"info", "low"}:
+                return 1
+            return 0
+
+        for target in target_rows:
+            key = _target_key(target)
+            out = pivot.get(key)
+            if not out:
+                if not _has_complete_output_group(target):
+                    continue
+                out = pivot.setdefault(key, {group_key: target.get(group_key) for group_key in output_group_keys})
+                out["record_type"] = "pivot"
+            if _target_status_rank(target.get("target_status")) >= _target_status_rank(out.get("target_status")):
+                out["target_status"] = target.get("target_status")
+            current_achievement = self._to_number(out.get("target_achievement_percent"))
+            next_achievement = self._to_number(target.get("achievement_percent"))
+            if current_achievement is None or (next_achievement is not None and next_achievement < current_achievement):
+                out["target_achievement_percent"] = target.get("achievement_percent")
+            out["target_gap"] = round((self._to_number(out.get("target_gap")) or 0.0) + (self._to_number(target.get("gap")) or 0.0), 6)
+            target_slug = self._rule_engine_monitoring_slug(
+                target.get("target_measure_id"),
+                target.get("target_measure_name"),
+                target.get("target_name"),
+                target.get("target_id"),
+            )
+            target_prefix = f"target_{target_slug}"
+            specific_status_key = f"{target_prefix}_status"
+            if _target_status_rank(target.get("target_status")) >= _target_status_rank(out.get(specific_status_key)):
+                out[specific_status_key] = target.get("target_status")
+                out[f"{target_prefix}_severity"] = target.get("target_severity")
+                out[f"{target_prefix}_actual"] = target.get("actual")
+                out[f"{target_prefix}_target"] = target.get("target_value")
+                out[f"{target_prefix}_achievement_percent"] = target.get("achievement_percent")
+                out[f"{target_prefix}_gap"] = target.get("gap")
+
+        for anomaly in anomaly_rows:
+            key = tuple(anomaly.get(group_key) for group_key in output_group_keys)
+            out = pivot.get(key)
+            if not out:
+                if not _has_complete_output_group(anomaly):
+                    continue
+                out = pivot.setdefault(key, {group_key: anomaly.get(group_key) for group_key in output_group_keys})
+                out["record_type"] = "pivot"
+            out["anomaly_count"] = int(self._to_number(out.get("anomaly_count")) or 0) + 1
+            severity = str(anomaly.get("anomaly_severity") or "").strip()
+            if severity and _anomaly_severity_rank(severity) >= _anomaly_severity_rank(out.get("max_anomaly_severity")):
+                out["max_anomaly_severity"] = severity
+            anomaly_slug = self._rule_engine_monitoring_slug(
+                anomaly.get("anomaly_check_id"),
+                anomaly.get("anomaly_check_name"),
+                anomaly.get("anomaly_name"),
+                anomaly.get("anomaly_id"),
+            )
+            anomaly_prefix = f"anomaly_{anomaly_slug}"
+            out[f"{anomaly_prefix}_count"] = int(self._to_number(out.get(f"{anomaly_prefix}_count")) or 0) + 1
+            specific_severity_key = f"{anomaly_prefix}_severity"
+            if severity and _anomaly_severity_rank(severity) >= _anomaly_severity_rank(out.get(specific_severity_key)):
+                out[specific_severity_key] = severity
+                out[f"{anomaly_prefix}_actual"] = anomaly.get("actual")
+                out[f"{anomaly_prefix}_threshold"] = anomaly.get("threshold")
+                out[f"{anomaly_prefix}_operator"] = anomaly.get("operator")
+                out[f"{anomaly_prefix}_type"] = anomaly.get("anomaly_type")
+
+        ordered = list(pivot.values())
+        ordered.sort(key=lambda row: tuple(str(row.get(group_key) or "") for group_key in output_group_keys))
+        ordered = [
+            self._rule_engine_order_pivot_output_row(row, output_group_keys)
+            for row in ordered
+        ]
+        if mode in {"ledger_and_pivot", "all"}:
+            return self._rule_engine_apply_output_field_selection(ordered + ledger_rows + target_rows + anomaly_rows, output_layout, mapping)
+        return self._rule_engine_apply_output_field_selection(ordered, output_layout, mapping)
+
+    def _rule_engine_order_pivot_output_row(self, row: dict, group_keys: List[str]) -> dict:
+        if not isinstance(row, dict):
+            return row
+
+        used: set[str] = set()
+        out: Dict[str, Any] = {}
+
+        def add_key(key: str) -> None:
+            if key in used or key not in row:
+                return
+            out[key] = row.get(key)
+            used.add(key)
+
+        for key in group_keys:
+            add_key(str(key or ""))
+
+        service_slugs: List[str] = []
+        metric_suffixes = ("_count", "_amount", "_commission")
+        excluded_prefixes = {
+            "total_service",
+            "target",
+            "anomaly",
+            "fixed",
+            "variable",
+            "total",
+            "percent_total_service",
+            "record",
+        }
+        for key in row.keys():
+            text = str(key or "")
+            matched_suffix = next((suffix for suffix in metric_suffixes if text.endswith(suffix)), "")
+            if not matched_suffix:
+                continue
+            slug = text[: -len(matched_suffix)]
+            if not slug or any(slug == prefix or slug.startswith(f"{prefix}_") for prefix in excluded_prefixes):
+                continue
+            if slug not in service_slugs:
+                service_slugs.append(slug)
+
+        for slug in service_slugs:
+            add_key(f"{slug}_count")
+            add_key(f"{slug}_amount")
+            add_key(f"{slug}_commission")
+
+        for key in (
+            "percent_total_service",
+            "fixed_commission",
+            "variable_commission",
+            "total_service_count",
+            "total_service_amount",
+            "total_commission",
+            "target_status",
+            "target_achievement_percent",
+            "target_gap",
+        ):
+            add_key(key)
+
+        generic_target_keys = {
+            "target_status",
+            "target_achievement_percent",
+            "target_gap",
+        }
+        for key in row.keys():
+            text = str(key or "")
+            if text.startswith("target_") and text not in generic_target_keys:
+                add_key(text)
+
+        for key in (
+            "anomaly_count",
+            "max_anomaly_severity",
+        ):
+            add_key(key)
+
+        generic_anomaly_keys = {
+            "anomaly_count",
+        }
+        for key in row.keys():
+            text = str(key or "")
+            if text.startswith("anomaly_") and text not in generic_anomaly_keys:
+                add_key(text)
+
+        add_key("record_type")
+
+        for key in row.keys():
+            text = str(key or "")
+            if text.startswith("_"):
+                continue
+            add_key(text)
+
+        for key in ("_audit_traces", "_rule_trace"):
+            add_key(key)
+
+        for key in row.keys():
+            add_key(str(key or ""))
+
+        return out
+
+    def _rule_engine_order_settlement_output_row(self, row: dict, group_keys: List[str]) -> dict:
+        if not isinstance(row, dict):
+            return row
+
+        used: set[str] = set()
+        out: Dict[str, Any] = {}
+
+        def add_key(key: str) -> None:
+            if key in used or key not in row:
+                return
+            out[key] = row.get(key)
+            used.add(key)
+
+        for key in group_keys:
+            add_key(str(key or ""))
+
+        component_slugs: List[str] = []
+        component_suffixes = ("_count", "_amount", "_raw_commission", "_commission")
+        excluded_prefixes = {
+            "fixed",
+            "variable",
+            "total",
+            "component",
+            "record",
+        }
+        for key in row.keys():
+            text = str(key or "")
+            matched_suffix = next((suffix for suffix in component_suffixes if text.endswith(suffix)), "")
+            if not matched_suffix:
+                continue
+            slug = text[: -len(matched_suffix)]
+            if not slug or any(slug == prefix or slug.startswith(f"{prefix}_") for prefix in excluded_prefixes):
+                continue
+            if slug not in component_slugs:
+                component_slugs.append(slug)
+
+        for slug in component_slugs:
+            add_key(f"{slug}_count")
+            add_key(f"{slug}_amount")
+            add_key(f"{slug}_raw_commission")
+            add_key(f"{slug}_commission")
+
+        for key in (
+            "fixed_commission",
+            "variable_commission",
+            "total_service_count",
+            "total_service_amount",
+            "total_commission",
+            "component_count",
+            "record_type",
+            "component_labels",
+        ):
+            add_key(key)
+
+        for key in row.keys():
+            text = str(key or "")
+            if text.startswith("_"):
+                continue
+            add_key(text)
+
+        for key in ("_audit_traces", "_rule_trace"):
+            add_key(key)
+
+        for key in row.keys():
+            add_key(str(key or ""))
+
+        return out
+
+    def _transform_rule_intelligence(
+        self,
+        data: list,
+        config: dict,
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> list:
+        rows = self._rule_engine_extract_rows_from_payload(data or [])
+        if not rows:
+            return []
+
+        mapping = self._rule_engine_mapping(config or {})
+        rule_pack = self._rule_engine_json_value((config or {}).get("rule_pack"), {})
+        rule_pack = rule_pack if isinstance(rule_pack, dict) else {}
+        output_layout = self._rule_engine_json_value((config or {}).get("output_layout"), {})
+        output_layout = output_layout if isinstance(output_layout, dict) else {}
+        output_layout.setdefault("mode", "pivot")
+        output_layout.setdefault("row_fields", ["entity", "period"])
+        output_layout.setdefault("period_grain", "month")
+
+        rules = [
+            rule for rule in self._rule_engine_list((config or {}).get("rules"))
+            if isinstance(rule, dict) and rule.get("enabled", True) is not False
+        ]
+        rules = self._rule_engine_expand_calculation_stages(rules)
+        targets = self._rule_engine_list((config or {}).get("targets"))
+        anomalies = self._rule_engine_list((config or {}).get("anomalies"))
+        node_warnings = execution_context.get("node_warnings") if isinstance(execution_context, dict) else None
+        if not rules and isinstance(node_warnings, list):
+            warn_msg = "Rule Intelligence Engine has no enabled calculation rules; target/anomaly and empty pivot output may still be generated."
+            if warn_msg not in node_warnings:
+                node_warnings.append(warn_msg)
+
+        ledger_rows: List[dict] = []
+        sorted_rules = sorted(
+            rules,
+            key=lambda item: (
+                int(self._to_number(item.get("priority")) or 100),
+                str(item.get("name") or item.get("id") or ""),
+            ),
+        )
+        for rule in sorted_rules:
+            rule_conditions = self._rule_engine_list(rule.get("conditions"))
+            condition_tree = self._rule_engine_json_value(
+                rule.get("condition_tree") if rule.get("condition_tree") is not None else rule.get("conditionTree"),
+                None,
+            )
+            if not isinstance(condition_tree, (dict, list)):
+                condition_tree = None
+            service_value = str(rule.get("service_value") or rule.get("service") or "").strip()
+            service_condition = None
+            if service_value:
+                service_condition = {
+                    "field": "service",
+                    "operator": "in" if "," in service_value else "equals",
+                    "value": service_value,
+                    "enabled": True,
+                }
+                if condition_tree is None:
+                    rule_conditions = [service_condition, *rule_conditions]
+            match_mode = rule.get("match_mode") or "all"
+            condition_payload: Any = condition_tree if condition_tree is not None else rule_conditions
+            if service_condition and condition_tree is not None:
+                condition_payload = {
+                    "type": "group",
+                    "match_mode": "all",
+                    "conditions": [service_condition, condition_tree],
+                }
+                match_mode = "all"
+            matched_rows = [
+                row for row in rows
+                if self._rule_engine_matches_conditions(row, condition_payload, mapping, match_mode)
+            ]
+            if not matched_rows:
+                continue
+
+            calculation = rule.get("calculation") if isinstance(rule.get("calculation"), dict) else {}
+            cap = rule.get("cap") if isinstance(rule.get("cap"), dict) else {}
+            report_group_by = self._rule_engine_list(
+                rule.get("group_by")
+                or output_layout.get("row_fields")
+                or ["entity", "period"]
+            )
+            if service_value and not any(str(part or "").strip().lower() in {"service", "service_field", "category", "category_field"} for part in report_group_by):
+                report_group_by.append("service")
+            period_grain = rule.get("period_grain") or output_layout.get("period_grain") or "month"
+
+            cap_group_by = self._rule_engine_list(cap.get("group_by") if isinstance(cap, dict) else None)
+            group_filters = self._rule_engine_list(
+                rule.get("group_filters")
+                if rule.get("group_filters") is not None
+                else rule.get("group_filter")
+            )
+            if cap_group_by:
+                scoped: Dict[Tuple[Tuple[str, Any], ...], List[dict]] = {}
+                for row in matched_rows:
+                    key = self._rule_engine_group_key(row, cap_group_by, mapping, period_grain)
+                    scoped.setdefault(key, []).append(row)
+                report_acc: Dict[Tuple[Tuple[str, Any], ...], Dict[str, Any]] = {}
+                for cap_key, cap_rows in scoped.items():
+                    report_scoped: Dict[Tuple[Tuple[str, Any], ...], List[dict]] = {}
+                    for row in cap_rows:
+                        report_key = self._rule_engine_group_key(row, report_group_by, mapping, period_grain)
+                        report_scoped.setdefault(report_key, []).append(row)
+
+                    scoped_calcs: List[Dict[str, Any]] = []
+                    total_raw_value = 0.0
+                    for report_key, report_rows in report_scoped.items():
+                        raw_value, calc_trace = self._rule_engine_calculate(report_rows, calculation, mapping, rule)
+                        raw_value = float(raw_value or 0.0)
+                        total_raw_value += raw_value
+                        scoped_calcs.append({
+                            "report_key": report_key,
+                            "rows": report_rows,
+                            "raw_value": raw_value,
+                            "calculation": calc_trace,
+                        })
+
+                    final_scope_value, cap_trace = self._rule_engine_apply_cap(total_raw_value, cap)
+                    final_scope_value = float(final_scope_value or 0.0)
+                    cap_applied = bool(cap_trace.get("cap_applied"))
+                    for item in scoped_calcs:
+                        raw_value = float(item.get("raw_value") or 0.0)
+                        if total_raw_value > 0 and cap_applied:
+                            final_value = round((raw_value / total_raw_value) * final_scope_value, 6)
+                        else:
+                            final_value = raw_value
+                        report_key = item["report_key"]
+                        report_rows = item["rows"]
+                        bucket = report_acc.setdefault(report_key, {
+                            "rows": [],
+                            "raw_commission": 0.0,
+                            "final_commission": 0.0,
+                            "cap_applied_count": 0,
+                            "cap_scopes": [],
+                        })
+                        bucket["rows"].extend(report_rows)
+                        bucket["raw_commission"] += raw_value
+                        bucket["final_commission"] += final_value
+                        if cap_applied:
+                            bucket["cap_applied_count"] += 1
+                        bucket["cap_scopes"].append({
+                            "scope": {str(k): v for k, v in cap_key},
+                            "raw_value": raw_value,
+                            "final_value": final_value,
+                            "scope_raw_value": round(total_raw_value, 6),
+                            "scope_final_value": round(final_scope_value, 6),
+                            "allocation_ratio": round((raw_value / total_raw_value), 6) if total_raw_value else 0.0,
+                            **cap_trace,
+                            "calculation": item.get("calculation") or {},
+                        })
+                grouped_items = report_acc.items()
+            else:
+                grouped: Dict[Tuple[Tuple[str, Any], ...], List[dict]] = {}
+                for row in matched_rows:
+                    key = self._rule_engine_group_key(row, report_group_by, mapping, period_grain)
+                    grouped.setdefault(key, []).append(row)
+                grouped_items = []
+                for key, group_rows in grouped.items():
+                    raw_value, calc_trace = self._rule_engine_calculate(group_rows, calculation, mapping, rule)
+                    final_value, cap_trace = self._rule_engine_apply_cap(raw_value, cap)
+                    grouped_items.append((key, {
+                        "rows": group_rows,
+                        "raw_commission": raw_value,
+                        "final_commission": final_value,
+                        "cap_applied_count": 1 if cap_trace.get("cap_applied") else 0,
+                        "cap_scopes": [{
+                            "raw_value": raw_value,
+                            "final_value": final_value,
+                            **cap_trace,
+                            "calculation": calc_trace,
+                        }],
+                    }))
+
+            for report_key, bucket in grouped_items:
+                group_rows = bucket.get("rows") or []
+                first_row = group_rows[0] if group_rows else {}
+                output_row = {str(part_key): part_value for part_key, part_value in report_key}
+                service_name = self._rule_engine_row_value(first_row, "category", mapping)
+                if service_name is None:
+                    service_name = self._rule_engine_row_value(first_row, "service", mapping)
+                amount_sum = self._rule_engine_numeric_sum(group_rows, mapping.get("amount_field", "amount"), mapping)
+                raw_commission = float(bucket.get("raw_commission") or 0.0)
+                final_commission = float(bucket.get("final_commission") or 0.0)
+                if not self._rule_engine_matches_group_filters(
+                    group_filters,
+                    output_row,
+                    amount_sum,
+                    len(group_rows),
+                    raw_commission,
+                    final_commission,
+                    group_rows,
+                    mapping,
+                ):
+                    continue
+                payout_offset_months = self._rule_engine_payout_offset_months(rule, calculation)
+                if payout_offset_months and "period" in output_row:
+                    earning_period = output_row.get("period")
+                    output_row["earning_period"] = earning_period
+                    output_row["period"] = self._rule_engine_shift_period_months(earning_period, payout_offset_months)
+                    output_row["payout_period"] = output_row.get("period")
+                    output_row["payout_offset_months"] = payout_offset_months
+                output_row.update({
+                    "record_type": "ledger",
+                    "rule_pack": str(rule_pack.get("name") or config.get("studio_name") or "Rule Intelligence Engine"),
+                    "rule_id": str(rule.get("id") or ""),
+                    "rule_name": str(rule.get("name") or rule.get("id") or "Rule"),
+                    "component_id": str(
+                        rule.get("component_id")
+                        or rule.get("component")
+                        or rule.get("settlement_component")
+                        or rule.get("id")
+                        or ""
+                    ),
+                    "component_name": str(
+                        rule.get("component_name")
+                        or rule.get("settlement_component_name")
+                        or rule.get("name")
+                        or rule.get("id")
+                        or "Rule"
+                    ),
+                    "payee_type": str(
+                        rule.get("payee_type")
+                        or calculation.get("payee_type")
+                        or ""
+                    ),
+                    "cluster_id": str(rule.get("cluster_id") or ""),
+                    "service": service_name,
+                    "service_count": len(group_rows),
+                    "service_amount": round(amount_sum, 6),
+                    "commission_type": str(rule.get("commission_type") or calculation.get("commission_type") or "variable").strip().lower() or "variable",
+                    "raw_commission": round(raw_commission, 6),
+                    "final_commission": round(final_commission, 6),
+                    "cap_applied": int(bucket.get("cap_applied_count") or 0) > 0,
+                    "_rule_trace": {
+                        "type": "calculation",
+                        "rule_id": str(rule.get("id") or ""),
+                        "rule_name": str(rule.get("name") or rule.get("id") or "Rule"),
+                        "matched_rows": len(group_rows),
+                        "group": output_row.copy(),
+                        "payout_offset_months": payout_offset_months,
+                        "raw_value": round(raw_commission, 6),
+                        "final_value": round(final_commission, 6),
+                        "cap_applied": int(bucket.get("cap_applied_count") or 0) > 0,
+                        "cap_scopes": bucket.get("cap_scopes") or [],
+                    },
+                })
+                ledger_rows.extend(self._rule_engine_expand_commission_shares(
+                    output_row,
+                    rule,
+                    calculation,
+                    first_row,
+                    mapping,
+                ))
+
+        target_rows = self._rule_engine_target_rows(rows, targets, mapping, output_layout)
+        anomaly_rows = self._rule_engine_anomaly_rows(rows, anomalies, mapping, output_layout)
+        return self._rule_engine_output_rows(
+            ledger_rows,
+            target_rows,
+            anomaly_rows,
+            rows,
+            mapping,
+            output_layout,
+        )
 
     def _transform_rename(self, data: list, config: dict) -> list:
         mappings = {}
